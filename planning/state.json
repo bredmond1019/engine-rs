@@ -6,8 +6,8 @@
     "now": [],
     "next": [
       {
-        "id": "EN.2.A",
-        "title": "Claude Code step node",
+        "id": "EN.2.0",
+        "title": "Async Node trait",
         "status": null,
         "note": null,
         "repo": null,
@@ -15,6 +15,25 @@
       }
     ],
     "blocked": [
+      {
+        "id": "EN.2.A",
+        "title": "Claude Code step node",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.2.0",
+            "what": null
+          },
+          {
+            "type": "external",
+            "what": "SDK execute + credential isolation"
+          }
+        ]
+      },
       {
         "id": "EN.2.B",
         "title": "Cancellation + abort endpoint + cost/token budget gate",
@@ -64,7 +83,7 @@
   },
   "tracks": [
     {
-      "title": "engine-rs first milestone \u2014 engine core + contract emitter + SDLC-flow parity (D42)",
+      "title": "engine-rs first milestone — engine core + contract emitter + SDLC-flow parity (D42)",
       "blocks": [
         {
           "id": "EN.0.A",
@@ -135,8 +154,8 @@
           "origin": null
         },
         {
-          "id": "EN.2.A",
-          "title": "Claude Code step node",
+          "id": "EN.2.0",
+          "title": "Async Node trait",
           "status": "open",
           "depends_on": [
             {
@@ -144,6 +163,25 @@
               "repo": "engine-rs",
               "id": "EN.1.C",
               "what": null
+            }
+          ],
+          "wave": 2,
+          "origin": null
+        },
+        {
+          "id": "EN.2.A",
+          "title": "Claude Code step node",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.2.0",
+              "what": null
+            },
+            {
+              "type": "external",
+              "what": "SDK execute + credential isolation"
             }
           ],
           "wave": 2,
@@ -206,40 +244,39 @@
     {
       "slug": "transport-decision-uses-d4-not-d3",
       "scope": {
-        "repo": "engine-rs"
+        "repo": "engine-rs",
+        "tier": null,
+        "cross_repo": null
       },
       "kind": "constraint",
       "text": "EN.2.A's master-plan section names the transport decision file 'D3-claude-code-transport-choice.md', but D3 is already taken by the EN.1.C HTTP-framework decision (D3-http-framework-choice.md). Record the ClaudeCodeStep transport decision as D4 (next free number) and link it from planning/decisions/index.md.",
+      "related": [],
       "clears_when": "the EN.2.A transport decision file is written as D4",
       "created": "2026-07-03"
     },
     {
       "slug": "claude-sdk-rs-not-on-disk",
       "scope": {
-        "repo": "engine-rs"
+        "repo": "engine-rs",
+        "tier": null,
+        "cross_repo": null
       },
       "kind": "known_issue",
-      "text": "EN.2.A's native transport (claude-sdk-rs execute_claude + Config, post repair-pass) is NOT buildable/verifiable from engine-rs: the claude-sdk-rs repo is not on disk at ../../../claude-sdk-rs and its repair-pass state is unconfirmed. Per the master-plan block, if the repair pass hasn't landed, fall back to the tmux/file-drop 'bastion ask' seam (parity with orchestrator/app/services/claude_code/bastion_backend.py:128). The user wants to first review a Claude Code Rust SDK on GitHub and compare it against claude-sdk-rs before the transport is decided, so transport primacy is deliberately deferred.",
-      "clears_when": "the ClaudeCodeStep transport is decided and its decision file (D4) is written",
-      "created": "2026-07-03"
-    },
-    {
-      "slug": "resolve-async-node-question-before-en2a",
-      "scope": {
-        "repo": "engine-rs"
-      },
-      "kind": "deferred",
-      "text": "Before EN.2.A's spec is (re)written, decide whether engine-core's Node trait should become `async fn` (native RPITIT or async_trait). Full context, file/struct/function map of both the Rust and Python execution cores, and open questions are captured in planning/async-node/notes.md (also pointed to from the brain backlog). This is separate from, but related to, the transport decision (see the two carryover entries above) — the transport choice picks HOW ClaudeCodeStep talks to Claude Code; this question picks whether the Node trait itself can await that call cooperatively on Tokio instead of blocking a thread.",
-      "clears_when": "a decision is made on Node::process's sync-vs-async signature and (if async is chosen) the touched surface in planning/async-node/notes.md's Rough Scope is scoped into EN.2.A or its own block",
+      "text": "CORRECTION (2026-07-03): claude-sdk-rs IS on disk at portfolio/claude-sdk-rs (v2.0.0); the prior 'not on disk' claim was looking at the wrong relative path. RESOLVED BY PLAN: EN.2.A will NOT use claude-sdk-rs. Decision (this session): build a fresh lean SDK as its own repo core/claude-code-rs (source plan at brain planning/claude-code-rs/plan.md) and depend on it via path dep; keep claude-sdk-rs as the v1 portfolio artifact. The tmux/file-drop 'bastion ask' fallback is dropped. Formalize as engine-rs decision D4 when EN.2.A's spec is written.",
+      "related": [],
+      "clears_when": "the D4 transport decision file is written during EN.2.A",
       "created": "2026-07-03"
     },
     {
       "slug": "en2a-transport-decision-options",
       "scope": {
-        "repo": "engine-rs"
+        "repo": "engine-rs",
+        "tier": null,
+        "cross_repo": null
       },
       "kind": "constraint",
       "text": "Before generating EN.2.A tasks, decide between Option A, B, or C for the ClaudeCodeStep transport (clean up homegrown SDK, build a hybrid, or write a simple CLI wrapper node in engine-rs). Must support async, process kill_on_drop, and total_cost_usd reporting via subscription (not API credits). All context and options are in planning/claude-sdk/notes.md.",
+      "related": [],
       "clears_when": "the ClaudeCodeStep transport is decided and its decision file (D4) is written",
       "created": "2026-07-03"
     }
