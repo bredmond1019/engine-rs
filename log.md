@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-03T16:45:21Z"
+timestamp: "2026-07-03T18:45:05Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,38 @@ related: [status, context]
 ---
 
 ## 2026-07-03
+
+### Audited Claude SDKs and paused for transport decision
+- **What:** Audited homegrown `claude-sdk-rs`, the official Python SDK (`claude-agent-sdk-python`), and the native Rust SDK (`claude-agent-sdk-rust`). Discovered the Python SDK uses a Keychain interception trick to authenticate the CLI subprocess without API credits. Logged findings and options in `planning/claude-sdk/notes.md`. Recorded transport options in `state.json` carryover. Wrote `planning/handoff.md`.
+- **Why:** To figure out how to leverage the flat-rate Claude Code Subscription programmatically for the ClaudeCodeStep node (EN.2.A).
+- **Refs:** `planning/claude-sdk/notes.md`, `planning/handoff.md`, `planning/state.json`
+
+### Async-node question captured; handoff refreshed pointing at two now-related gating decisions
+- **What:** Answered a series of questions comparing engine-rs to the Python orchestrator (Execution Core scope, integration test coverage, async/concurrency posture), captured the async-node question in `planning/async-node/notes.md` with full file/struct/function detail for both codebases, added a carryover entry, and wrote a fresh handoff pointing at two now-related decisions (transport + async trait) both gating EN.2.A.
+
+  1. Answered a sequence of user questions comparing engine-rs (Rust) to the Python orchestrator:
+     - What "Execution Core" (Phase 1: EN.1.A/B/C) encompasses and how it relates to the Python orchestrator (D42 parallel-pilot rewrite, per-workflow graduation, byte-for-byte data-contract seam).
+     - Confirmed engine-rs already has an end-to-end integration test: `crates/engine-serve/tests/dispatch_integration.rs` — three tests covering dispatch -> HTTP -> workflow execution -> live-state recording -> durable-write `EventsRow` mapping, all exercised together (no live Postgres — self-skips with `pool: None`).
+     - A feature-for-feature comparison: orchestrator has 7 real workflows, richer node types (`AgentNode` w/ 8 model providers, `ToolUseNode`, `RouterNode`), Celery+Redis async dispatch, Brain/RAG wired in (pgvector) — vastly more built. engine-rs's one already-realized advantage: in-memory `LiveStateStore` with zero Postgres polling for the local Console read path.
+     - The async/concurrency question: user asked "where do we stand on getting things async, the real leverage of Rust, which Python already has." Two background research agents confirmed via direct file reads that **neither** codebase does real async/await concurrency at the node/workflow level. Rust: `Node::process` (`crates/engine-core/src/node.rs:49`) is a plain sync fn; `Workflow::run`'s pointer-walk loop (`engine-core/src/workflow.rs`) has no `.await`; `ParallelNode` (`engine-core/src/parallel.rs:53`) fans out via `std::thread::scope` (real OS threads). Async only exists at the infra edges: actix-web handlers, sqlx Postgres I/O, and the durable-writer's `tokio::spawn` background task (`engine-serve/src/durable.rs`). Python: `Workflow.run`, `Node.process`, and `AgentNode.process` (via `agent.run_sync`) are all plain sync `def`; `ParallelNode` uses `concurrent.futures.ThreadPoolExecutor` (thread-based, not `asyncio.gather`); even the Celery task and the FastAPI `POST /events/` route are plain sync `def`; Python's actual concurrency comes from Celery worker processes (process-level) and `ThreadPoolExecutor` (thread-level), not asyncio. Conclusion: Rust's fully-sync node core is a faithful port, not a regression — but making `Node::process` genuinely `async fn` is an unexploited opportunity Python can't easily retrofit (would require reworking `pydantic_ai`'s sync integration), and it's directly relevant to EN.2.A since spawning a Claude Code subprocess is inherently an async operation.
+
+  2. Created `planning/async-node/notes.md` (via `/capture async-node`, then populated with real verified content — file paths, struct/function signatures, line numbers for both Rust and Python — rather than the skill's default empty scaffold, at the user's explicit request for full detail "so the next agent knows exactly where to look"). Includes a side-by-side concurrency-model comparison table and open questions (should `Node::process` become `async fn` before EN.2.A's spec is written; does `ParallelNode`'s fan-out change from thread-based to `tokio::spawn` if so; does the `web::block` wrapper in `engine-serve/src/http.rs` retire; is this its own decision file D5 or folds into EN.2.A's scope).
+
+  3. Added a pointer entry to the brain's `planning/backlog.md` (Active section, dated 2026-07-03, `repo:engine-rs type:research status:idea`) linking to the notes file. Note: that edit lives in the brain repo (`agentic-portfolio/`), not in engine-rs itself, and is not part of engine-rs's own git commit. Already done in a prior step of this session.
+
+  4. Added a third carryover entry to `planning/state.json`: slug `resolve-async-node-question-before-en2a` (kind: `deferred`) — decide `Node::process` sync-vs-async before EN.2.A's spec, pointing at `planning/async-node/notes.md` for full context. The other two existing carryover entries (`transport-decision-uses-d4-not-d3`, `claude-sdk-rs-not-on-disk`) are unchanged/still open — nothing new resolved them this session. Already done in a prior step.
+
+  5. Hit and fixed a schema violation while adding that carryover entry: the first draft used `"related": ["async-node"]` (a bare string), but per `core/planning/state-schema.md`, `carryover[].related` must be `depends_on`-style edge objects (`{type:"block",...}`/`{type:"external",...}`) or omitted entirely. Since the entry doesn't point at a block/external dependency, `related` was omitted (correct per schema). Re-ran `mev emit-state --write` afterward to confirm engine-rs's own `state.json` is now schema-clean — it is. Already run twice this session.
+
+  6. `mev emit-state --write` surfaced a pre-existing, unrelated error this session: `core/orchestrator/planning/state.json` is malformed JSON. Not caused by this session, not touched, flagged as a heads-up only.
+
+  7. Confirmed the prior session's `planning/handoff.md` (which had pointed the next agent at reviewing a Claude Code Rust SDK on GitHub before deciding EN.2.A's transport) had already been consumed/deleted before this session started — its content is fully preserved in this log's prior "Paused EN.2.A spec generation..." entry and in the two pre-existing carryover entries, so nothing was lost. A fresh `planning/handoff.md` was written this session pointing at BOTH now-related open decisions (transport choice + async-node question) that gate EN.2.A, with first command: read `planning/async-node/notes.md` in full, then ask the user for the GitHub SDK URL. Already done in a prior step.
+
+  8. No architectural decision was settled this session (the async-node question and transport question are both still open) — no `planning/decisions/` file authored.
+
+  No code was changed this session — pure research/synthesis plus planning-doc updates. `planning/state.json`'s block statuses are unchanged this session (no block closed) — EN.2.A remains `open` and `focus.next` already correctly points at it.
+- **Why:** The user was assessing engine-rs's real-world maturity relative to the Python orchestrator (feature completeness, test coverage, and — critically — whether Rust's async/concurrency advantage was actually being exploited). Surfacing that neither codebase does true node-level async surfaced a concrete, EN.2.A-relevant design question that needed to be captured durably before it's lost, rather than answered ephemerally in chat.
+- **Refs:** `planning/async-node/notes.md`, `planning/state.json` (carryover: `resolve-async-node-question-before-en2a`, plus pre-existing `transport-decision-uses-d4-not-d3` and `claude-sdk-rs-not-on-disk`), `planning/handoff.md`, brain `planning/backlog.md`
 
 ### Paused EN.2.A spec generation at the transport-decision clarify gate
 - **What:** Started `/generate-tasks EN.2.A` (Claude Code step node) but paused at the transport-decision clarify gate **without writing a spec** — the working tree is clean of any EN.2.A files. EN.1.C is fully merged, so **Phase 1 (Execution Core) is Done**. Two blockers surfaced at the gate: (1) a **decision-number collision** — `master-plan.md` names the transport decision **D3**, but D3 is now the HTTP-framework decision (recorded during EN.1.C), so the transport decision must be recorded as **D4**; (2) **`claude-sdk-rs` is not on disk** in this environment, so the native transport for `ClaudeCodeStep` can't be built here. The user wants to first **review a Claude Code Rust SDK on GitHub and compare it against `claude-sdk-rs`** before deciding `ClaudeCodeStep`'s transport. Recorded two carryover entries in `planning/state.json` (`transport-decision-uses-d4-not-d3`, `claude-sdk-rs-not-on-disk`) and rewrote `planning/handoff.md` to refocus the next session on the external SDK review.
