@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-03T12:24:21Z"
+timestamp: "2026-07-03T15:00:54Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,13 @@ related: [status, context]
 ---
 
 ## 2026-07-03
+
+### Merged EN.1.C into main, cleaned up worktree, reconciled state.json, wrote handoff for EN.2.A
+- **What:** Ran `/code-review low` on the EN.1.C source diff (tests excluded) — no findings. Verified `docs/architecture.md`'s EN.1.C update (module map, dependency list, key types, data-flow narrative) was accurate — no further doc edits needed. Merged `EN.1.C-trigger-dispatch-serve-embedding-flow` into `main` via `/clean-worktree`: the first `--ff-only` attempt failed because `main` had advanced by one commit (routine harness sync from base-template, `2d25df2`); rebased the worktree branch onto `main` (clean, 17 commits, no conflicts) and retried `--ff-only`, which succeeded (merge commit `2248d5a`). Removed the worktree and deleted the branch. Reconciled `planning/state.json`: flipped `EN.1.C` from `"open"` to `"closed"`, moved `focus.next` from `EN.1.C` to `EN.2.A` (now unblocked), confirmed `EN.2.B`/`EN.3.A`/`EN.3.B` remain correctly blocked. Ran `mev emit-state --write` — clean, only informational `W_EMIT_NO_SENTINEL` warnings (expected/pre-existing). Wrote a fresh `planning/handoff.md` pointing at `EN.2.A` ("Claude Code step node") as next, first command `/generate-tasks EN.2.A`.
+- **Why:** Phase 1 (Execution Core) is now fully Done (`EN.1.A`, `EN.1.B`, `EN.1.C` all closed); closing out EN.1.C cleanly — merge, worktree cleanup, reconciled state, fresh handoff — lets the next session start EN.2.A (Phase 2) with no loose state.
+- **Refs:** `planning/master-plan.md`, `planning/handoff.md`, `planning/state.json`, PR #1 (`https://github.com/bredmond1019/engine-rs/pull/1`, on branch `EN.1.C-trigger-dispatch-serve-embedding-flow` — merged locally via `--ff-only` rather than through the PR; open question carried into the handoff on whether to push local `main` to `origin/main` and reconcile/close the PR)
+
+---
 
 ### Completed EN.1.C-trigger-dispatch-serve-embedding end to end (6 tasks, PASS)
 Ran `/sdlc-flow EN.1.C-trigger-dispatch-serve-embedding` to completion across 6 tasks, embedding the execution engine in `bastion serve`. Task 1 added a `Dispatcher` in `crates/engine-serve/src/dispatch.rs` implementing dual-registry (`workflow_registry` + `schema_registry`) dispatch keyed by `workflow_type`, rejecting unregistered types with `DispatchError::UnknownWorkflowType`. Task 2 added an in-memory `LiveStateStore` (`Arc<RwLock<HashMap<RunId, TaskContext>>>`) giving the local Console a no-DB-poll read path for live run state. Task 3 added `crates/engine-serve/src/durable.rs` — an mpsc-bridged async durable-write seam (`DurableHandle`/`spawn_durable_writer`/`durable_on_progress`) mapping `on_progress` snapshots to `engine_contract::EventsRow`, inserting the first (all-PENDING) snapshot and updating subsequent ones via `engine_store`, self-skipping Postgres I/O (not failing) with no `DATABASE_URL`. Task 4 built the four-endpoint `actix-web` HTTP surface (`POST /events/` with `X-API-Key` gating, `GET /health`, `GET /workflows`, `GET /workflows/{type}/graph`), wiring the D3 HTTP-framework decision (recorded earlier this run) into the dispatch/live-state/durable modules from tasks 1–3. Task 5 added the headline integration test (`crates/engine-serve/tests/dispatch_integration.rs`) covering live-state reads with no DB query, byte-identical durable `EventsRow` mapping, and a 422 for an unregistered `workflow_type`. Task 6 confirmed all four validation gates pass clean (fmt, clippy `-D warnings`, `cargo test` — 22+19+3+1+1 tests green across the workspace, `cargo build --release`) with zero further code changes. Review verdict: **PASS** — no findings. Notable decisions: kept `Dispatcher::register` generic via a boxed `WorkflowFactory` closure rather than a `NodeRegistry`-sharing convenience method; used `uuid::Uuid` as the `RunId` type to match `EventsRow.id`'s existing type; built the `OnProgress` trait-object closure inside `web::block`'s blocking closure to keep the outer closure `Send` for actix; did not edit `workflow.rs` in task 3 since no genuine signature gap surfaced (per the spec's own guidance) — no deviations from the spec surfaced across the six tasks. Next: merge `EN.1.C-trigger-dispatch-serve-embedding-flow` into `main` and define the next Phase 1/2 block.
