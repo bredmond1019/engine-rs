@@ -51,7 +51,7 @@ cargo build --release
 
 ## Notes
 - **Async durable-write pattern.** The `OnProgress` seam is a **synchronous** `FnMut(&TaskContext)`, but Postgres writes are async. Bridge with a channel: `on_progress` clones the snapshot and sends it on an `mpsc` sender; a background tokio task drains the channel and performs `insert_event` (first snapshot) / `update_event` (subsequent) against `engine-store`. This keeps writes off the run's hot path and keeps `workflow.rs`'s seam signature unchanged — prefer this over changing `Workflow::run`'s signature. Only touch `workflow.rs` if a genuine signature gap surfaces (append-only if so).
-- **HTTP framework.** `axum` is the natural tokio-native choice (aligns with D2's tokio runtime) and its `tower`/`oneshot` test harness makes endpoint tests cheap. Confirm and record in the decision file; if a different framework is chosen, update the file's rationale accordingly.
+- **HTTP framework.** `actix-web` is the chosen framework — it runs on tokio (aligns with D2), is the same framework `rag-engine-rs` uses, and its `actix_web::test` harness (`test::init_service` + `test::TestRequest` + `test::call_service`) makes endpoint tests cheap. Record the choice + rationale (familiarity/consistency with the sibling Rust service) in the decision file.
 - **Node identity = class/type name** is the join key across `nodes`/`node_runs`; preserve it when mapping `TaskContext` → `EventsRow`.
 
 ## Amendment Log
