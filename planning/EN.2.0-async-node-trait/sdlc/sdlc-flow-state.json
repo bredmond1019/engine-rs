@@ -2,10 +2,10 @@
   "spec_slug": "EN.2.0-async-node-trait",
   "branch": "EN.2.0-async-node-trait-flow",
   "started_at": "2026-07-03T19:32:14Z",
-  "updated_at": "2026-07-03T19:32:14Z",
+  "updated_at": "2026-07-03T19:38:34Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.2.0-async-node-trait-flow",
   "status": "running",
-  "current_task": 1,
+  "current_task": 2,
   "tasks": {
     "1": {
       "status": "passed",
@@ -19,6 +19,32 @@
         "Cargo.lock",
         "crates/engine-core/Cargo.toml",
         "crates/engine-serve/Cargo.toml"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "2": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Node::process is now async fn via #[async_trait::async_trait]; Workflow::run/node_context are async; ParallelNode fans out via futures::future::join_all instead of std::thread::scope; engine-serve's post_events awaits workflow.run directly with web::block removed.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Kept the module doc comment in http.rs referencing web::block only in the removal-rationale comment, not in code, per the acceptance criteria that web::block is gone from the file's logic",
+        "router_route_dispatch_matches_runner_behavior and cyclic_non_router_workflow_is_rejected_by_new_validated in validator.rs stayed #[test] (not tokio::test) since neither calls .process()/.run(), consistent with minimal-diff migration"
+      ],
+      "files_changed": [
+        "crates/engine-core/src/node.rs",
+        "crates/engine-core/src/parallel.rs",
+        "crates/engine-core/src/routing.rs",
+        "crates/engine-core/src/validate.rs",
+        "crates/engine-core/src/workflow.rs",
+        "crates/engine-core/tests/parallel.rs",
+        "crates/engine-core/tests/validator.rs",
+        "crates/engine-core/tests/workflow_runner.rs",
+        "crates/engine-serve/src/dispatch.rs",
+        "crates/engine-serve/src/http.rs",
+        "crates/engine-serve/tests/dispatch_integration.rs"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -71,13 +97,29 @@
         "filesReadKb": null,
         "inTokEst": 590,
         "outTok": 1384
+      },
+      {
+        "label": "implement-2-1",
+        "model": "sonnet",
+        "promptTokEst": 996,
+        "filesReadKb": null,
+        "inTokEst": 996,
+        "outTok": 29647
+      },
+      {
+        "label": "test-2-1",
+        "model": "haiku",
+        "promptTokEst": 590,
+        "filesReadKb": null,
+        "inTokEst": 590,
+        "outTok": 1996
       }
     ],
     "total": {
-      "promptTokEst": 2619,
+      "promptTokEst": 4205,
       "filesReadKb": 0,
-      "inTokEst": 2619,
-      "outTok": 11425
+      "inTokEst": 4205,
+      "outTok": 43068
     }
   }
 }
