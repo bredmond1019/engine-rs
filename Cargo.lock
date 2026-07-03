@@ -254,11 +254,13 @@ dependencies = [
 name = "engine-serve"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "engine-contract",
  "engine-core",
  "engine-store",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "uuid",
 ]
