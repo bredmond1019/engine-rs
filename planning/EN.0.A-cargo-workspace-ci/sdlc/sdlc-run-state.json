@@ -1,0 +1,60 @@
+{
+  "spec_slug": "EN.0.A-cargo-workspace-ci",
+  "started_at": "2026-07-03T00:38:24Z",
+  "updated_at": "2026-07-03T00:41:27Z",
+  "current_phase": "wrap-up",
+  "completed_phases": ["implement","test","review","ui-test","document","wrap-up"],
+  "failed_phase": null,
+  "task_number": null,
+  "resume_from": null,
+  "tokens": {
+    "stages": [
+      {
+        "label": "scout",
+        "model": "haiku",
+        "promptTokEst": 1001,
+        "filesReadKb": null,
+        "inTokEst": 1001,
+        "outTok": 3515
+      },
+      {
+        "label": "implement",
+        "model": "sonnet",
+        "promptTokEst": 1092,
+        "filesReadKb": null,
+        "inTokEst": 1092,
+        "outTok": 12098
+      },
+      {
+        "label": "test",
+        "model": "haiku",
+        "promptTokEst": 580,
+        "filesReadKb": null,
+        "inTokEst": 580,
+        "outTok": 1836
+      },
+      {
+        "label": "review-1",
+        "model": "sonnet",
+        "promptTokEst": 1126,
+        "filesReadKb": null,
+        "inTokEst": 1126,
+        "outTok": 3439
+      },
+      {
+        "label": "document",
+        "model": "sonnet",
+        "promptTokEst": 1126,
+        "filesReadKb": null,
+        "inTokEst": 1126,
+        "outTok": 3386
+      }
+    ],
+    "total": {
+      "promptTokEst": 4925,
+      "filesReadKb": 0,
+      "inTokEst": 4925,
+      "outTok": 24274
+    }
+  }
+}

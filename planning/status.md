@@ -6,8 +6,8 @@ doc_id: status
 layer: [factory]
 status: active
 timestamp: "2026-07-02"
-now: "Phase 0, EN.0.A — Cargo workspace + CI"
-next: "Define EN.0.A tasks via /generate-tasks EN.0.A"
+now: "Phase 0, EN.0.B — Data-contract serde types + Postgres round-trip"
+next: "Define EN.0.B tasks via /generate-tasks EN.0.B"
 blocked: []
 keywords: [status, progress tracker, current focus, blocks]
 related: [context, master-plan, planning-index, knowledge, memory]
@@ -15,8 +15,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-02 — Project initialized
-**Current focus:** Phase 0, EN.0.A — Cargo workspace + CI
+**Last updated:** 2026-07-02 — EN.0.A done, PASS
+**Current focus:** EN.0.B-data-contract-postgres
 
 ---
 
@@ -35,8 +35,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 > Working board — keep all five queues live. **Never end a meaningful session with every queue
 > empty.** The headlines of **now / next / blocked** mirror the frontmatter scalars above.
 
-- **now** — Phase 0, EN.0.A — Cargo workspace + CI
-- **next** — Define EN.0.A tasks (`/generate-tasks EN.0.A`)
+- **now** — Phase 0, EN.0.B — Data-contract serde types + Postgres round-trip
+- **next** — Define EN.0.B tasks (`/generate-tasks EN.0.B`)
 - **blocked** — _nothing yet — each entry names its blocker and the smallest missing answer_
 - **improve** — _self-improvement backlog: eval gaps, flaky workflows, repeated failures, missing skills, stale assumptions_
 - **recurring** — _schedules, monitors, sweeps, automations_
@@ -60,7 +60,7 @@ related: [context, master-plan, planning-index, knowledge, memory]
 ### Phase 0 — Foundation
 | Block | What | Status | Notes |
 |---|---|---|---|
-| EN.0.A | Cargo workspace + CI | Not started | Workspace skeleton, fmt/clippy/test CI, async-runtime decision |
+| EN.0.A | Cargo workspace + CI | Done | Workspace skeleton, fmt/clippy/test CI, async-runtime decision (D2) |
 | EN.0.B | Data-contract serde types + Postgres round-trip | Not started | Preserve the byte-for-byte seam |
 
 <!-- Add one sub-table per phase as the plan is fleshed out. -->

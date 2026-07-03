@@ -1,6 +1,6 @@
 # Task Spec — Phase 0, Block A (EN.0.A) — Cargo workspace + CI
 
-**Status:** Not started · **Last run:** never
+**Status:** Done · **Last run:** 2026-07-02
 
 ## Goal
 Stand up the `engine-rs` Cargo workspace (root + four member crates), wire CI to run fmt/clippy/test/build on every push, and settle the async-runtime + persistence stack as a recorded decision.
