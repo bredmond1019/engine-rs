@@ -26,8 +26,9 @@ use engine_serve::live_state::LiveStateStore;
 /// having run).
 struct IngestNode;
 
+#[async_trait::async_trait]
 impl Node for IngestNode {
-    fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         ctx.nodes
             .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
         Ok(ctx)
@@ -41,8 +42,9 @@ impl Node for IngestNode {
 /// Second node in the fixture graph.
 struct EmbedNode;
 
+#[async_trait::async_trait]
 impl Node for EmbedNode {
-    fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         ctx.nodes
             .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
         Ok(ctx)
@@ -174,7 +176,7 @@ async fn durable_seed_snapshot_maps_to_byte_identical_events_row() {
         snapshots_handle.lock().unwrap().push(ctx.clone());
     });
 
-    let result = workflow.run(data.clone(), on_progress);
+    let result = workflow.run(data.clone(), on_progress).await;
     assert!(result.is_ok());
 
     // Give the (self-skipping) background writer a moment to drain the

@@ -38,8 +38,9 @@ struct WriterBranch {
     value: serde_json::Value,
 }
 
+#[async_trait::async_trait]
 impl Node for WriterBranch {
-    fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         ctx.nodes
             .insert(self.write_key.to_string(), self.value.clone());
         ctx.node_runs
@@ -52,8 +53,8 @@ impl Node for WriterBranch {
     }
 }
 
-#[test]
-fn fanout_merge_resolves_key_collision_deterministically() {
+#[tokio::test]
+async fn fanout_merge_resolves_key_collision_deterministically() {
     let branches: Vec<Box<dyn Node>> = vec![
         Box::new(WriterBranch {
             identity: "BranchOne",
@@ -70,6 +71,7 @@ fn fanout_merge_resolves_key_collision_deterministically() {
 
     let out = fanout
         .process(empty_context())
+        .await
         .expect("fan-out/merge should succeed");
 
     // BranchTwo is declared after BranchOne in the branch list, so per the
@@ -87,6 +89,7 @@ fn fanout_merge_resolves_key_collision_deterministically() {
     // Run it again to confirm the winner is reproducible, not incidental.
     let out2 = fanout
         .process(empty_context())
+        .await
         .expect("fan-out/merge should succeed");
     assert_eq!(
         out2.nodes.get("Shared"),
@@ -94,8 +97,8 @@ fn fanout_merge_resolves_key_collision_deterministically() {
     );
 }
 
-#[test]
-fn fanout_merge_preserves_all_disjoint_branch_keys() {
+#[tokio::test]
+async fn fanout_merge_preserves_all_disjoint_branch_keys() {
     let branches: Vec<Box<dyn Node>> = vec![
         Box::new(WriterBranch {
             identity: "BranchA",
@@ -117,6 +120,7 @@ fn fanout_merge_preserves_all_disjoint_branch_keys() {
 
     let out = fanout
         .process(empty_context())
+        .await
         .expect("fan-out/merge should succeed");
 
     assert_eq!(

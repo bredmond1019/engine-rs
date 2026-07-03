@@ -42,11 +42,12 @@ impl std::error::Error for NodeError {}
 /// a `NodeError` on failure). `name` is the node's identity — a stable
 /// type-name string used as the map key in both `TaskContext::nodes` and
 /// `TaskContext::node_runs` (contract §1).
+#[async_trait::async_trait]
 pub trait Node: Send + Sync {
     /// Transform the context. The framework-owned envelope (see
     /// `crate::workflow::node_context`) handles `NodeRun` status/timing
     /// around this call — the node itself only does the work.
-    fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError>;
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError>;
 
     /// The node's identity — its type name, used as the registry/map key.
     fn name(&self) -> &str;
@@ -108,8 +109,9 @@ mod tests {
     /// its own identity.
     struct MarkerNode;
 
+    #[async_trait::async_trait]
     impl Node for MarkerNode {
-        fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
             ctx.nodes
                 .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
             Ok(ctx)
@@ -129,12 +131,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn node_process_transforms_task_context() {
+    #[tokio::test]
+    async fn node_process_transforms_task_context() {
         let node = MarkerNode;
         let ctx = empty_context();
 
-        let out = node.process(ctx).expect("process should succeed");
+        let out = node.process(ctx).await.expect("process should succeed");
 
         assert_eq!(
             out.nodes.get("MarkerNode"),

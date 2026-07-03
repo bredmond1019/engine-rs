@@ -24,8 +24,9 @@ struct CountingNode {
     runs: std::sync::Arc<AtomicUsize>,
 }
 
+#[async_trait::async_trait]
 impl Node for CountingNode {
-    fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         ctx.nodes.insert(
             self.identity.to_string(),
@@ -47,8 +48,9 @@ struct RetryRouter {
     visits: std::sync::Arc<AtomicUsize>,
 }
 
+#[async_trait::async_trait]
 impl Node for RetryRouter {
-    fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
         Ok(ctx)
     }
 
@@ -76,8 +78,9 @@ impl Router for RetryRouter {
 
 struct TerminalNode;
 
+#[async_trait::async_trait]
 impl Node for TerminalNode {
-    fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         ctx.nodes
             .insert("finish".to_string(), serde_json::json!({ "done": true }));
         Ok(ctx)
@@ -130,8 +133,8 @@ fn retry_workflow() -> (
     (registry, schema, retry_runs, router_visits)
 }
 
-#[test]
-fn router_with_undeclared_back_edge_passes_validation_and_retries_then_completes() {
+#[tokio::test]
+async fn router_with_undeclared_back_edge_passes_validation_and_retries_then_completes() {
     let (registry, schema, retry_runs, _router_visits) = retry_workflow();
 
     let workflow = Workflow::new_validated(registry, schema)
@@ -140,6 +143,7 @@ fn router_with_undeclared_back_edge_passes_validation_and_retries_then_completes
     let on_progress: engine_core::OnProgress<'_> = Box::new(|_c: &TaskContext| {});
     let result = workflow
         .run(serde_json::json!({}), on_progress)
+        .await
         .expect("workflow should run to completion");
 
     // The retry node ran twice: once on the initial pass, once via the
@@ -178,8 +182,9 @@ struct PlainNode {
     identity: &'static str,
 }
 
+#[async_trait::async_trait]
 impl Node for PlainNode {
-    fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
         Ok(ctx)
     }
 

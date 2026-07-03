@@ -51,8 +51,9 @@ mod tests {
     /// TaskContext state.
     struct ConditionalRouter;
 
+    #[async_trait::async_trait]
     impl Node for ConditionalRouter {
-        fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
             Ok(ctx)
         }
 
@@ -83,8 +84,9 @@ mod tests {
     /// A plain, non-router node — `as_router()` should default to `None`.
     struct PlainNode;
 
+    #[async_trait::async_trait]
     impl Node for PlainNode {
-        fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
             Ok(ctx)
         }
 

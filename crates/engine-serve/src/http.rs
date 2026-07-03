@@ -115,31 +115,25 @@ async fn post_events(
     let live = state.live.clone();
     let durable_handle = state.durable.clone();
 
-    // Build the `OnProgress` box *inside* the blocking closure: its captures
-    // (`live`, `durable_progress`) are individually `Send`, but the trait
-    // object `OnProgress<'a> = Box<dyn FnMut(&TaskContext) + 'a>` carries no
-    // `Send` bound of its own, so it cannot be moved across the
-    // `web::block`/`spawn_blocking` boundary as a value.
-    let result = web::block(move || {
-        let mut durable_progress =
-            durable_on_progress(durable_handle, run_id, workflow_type, data.clone());
-        let on_progress: OnProgress<'_> = Box::new(move |snapshot| {
-            live.record(run_id, snapshot);
-            durable_progress(snapshot);
-        });
-        workflow.run(data, on_progress)
-    })
-    .await
-    .map(|inner| inner.map_err(|err| err.to_string()));
+    // Build the `OnProgress` box inline: actix request futures run on a
+    // per-worker single-threaded runtime, so the non-`Send` `OnProgress`
+    // box (`Box<dyn FnMut(&TaskContext) + 'a>`, no `Send` bound) needs no
+    // thread-pool escape hatch — `.await` it directly, no `web::block`.
+    let mut durable_progress =
+        durable_on_progress(durable_handle, run_id, workflow_type, data.clone());
+    let on_progress: OnProgress<'_> = Box::new(move |snapshot| {
+        live.record(run_id, snapshot);
+        durable_progress(snapshot);
+    });
+    let result = workflow
+        .run(data, on_progress)
+        .await
+        .map_err(|err| err.to_string());
 
     match result {
-        Ok(Ok(_task_context)) => {
-            HttpResponse::Accepted().json(serde_json::json!({ "run_id": run_id }))
-        }
-        Ok(Err(message)) => HttpResponse::InternalServerError()
+        Ok(_task_context) => HttpResponse::Accepted().json(serde_json::json!({ "run_id": run_id })),
+        Err(message) => HttpResponse::InternalServerError()
             .json(serde_json::json!({ "error": message, "run_id": run_id })),
-        Err(err) => HttpResponse::InternalServerError()
-            .json(serde_json::json!({ "error": err.to_string(), "run_id": run_id })),
     }
 }
 
@@ -153,8 +147,9 @@ mod tests {
 
     struct MarkerNode;
 
+    #[async_trait::async_trait]
     impl Node for MarkerNode {
-        fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
             ctx.nodes
                 .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
             Ok(ctx)

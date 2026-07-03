@@ -19,8 +19,9 @@ struct MarkerNode {
     identity: &'static str,
 }
 
+#[async_trait::async_trait]
 impl Node for MarkerNode {
-    fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         ctx.nodes.insert(
             self.identity.to_string(),
             serde_json::json!({ "ran": self.identity }),
@@ -38,8 +39,9 @@ struct FailingNode {
     identity: &'static str,
 }
 
+#[async_trait::async_trait]
 impl Node for FailingNode {
-    fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
         Err(NodeError::new("node2 exploded"))
     }
 
@@ -75,8 +77,8 @@ fn success_registry() -> NodeRegistry {
     registry
 }
 
-#[test]
-fn linear_workflow_runs_end_to_end_through_all_three_nodes() {
+#[tokio::test]
+async fn linear_workflow_runs_end_to_end_through_all_three_nodes() {
     let workflow = Workflow::new(success_registry(), linear_schema());
 
     let snapshots: Rc<RefCell<Vec<TaskContext>>> = Rc::new(RefCell::new(Vec::new()));
@@ -86,6 +88,7 @@ fn linear_workflow_runs_end_to_end_through_all_three_nodes() {
 
     let result = workflow
         .run(serde_json::json!({ "trigger": "test" }), on_progress)
+        .await
         .expect("workflow should complete successfully");
 
     // (a) The produced TaskContext has the expected nodes/node_runs entries.
@@ -140,8 +143,8 @@ fn linear_workflow_runs_end_to_end_through_all_three_nodes() {
     assert!(initial.nodes.is_empty());
 }
 
-#[test]
-fn middle_node_failure_halts_walk_before_third_node_runs() {
+#[tokio::test]
+async fn middle_node_failure_halts_walk_before_third_node_runs() {
     let mut registry = NodeRegistry::new();
     registry.register(Box::new(MarkerNode {
         identity: "start_node",
@@ -154,6 +157,7 @@ fn middle_node_failure_halts_walk_before_third_node_runs() {
 
     let result = workflow
         .run(serde_json::json!({}), on_progress)
+        .await
         .expect("run should return Ok with the accumulated context even on node failure");
 
     // start_node ran to completion.
