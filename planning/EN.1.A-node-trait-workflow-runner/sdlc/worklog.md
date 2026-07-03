@@ -19,3 +19,8 @@ Validated: gating checks (fast tripwire)
 What: Added the fixture 3-node linear workflow integration test (workflow_runner.rs) covering full-success PENDING->RUNNING->SUCCESS transitions, initial on_progress PENDING snapshot, and a middle-node failure that halts the walk before the third node runs.
 Decisions: Used identity names start_node/node2/node3 to match schema.rs conventions while keeping the linear 3-node fixture clear; Asserted the initial on_progress snapshot's TaskContext::nodes is empty as an extra check that the PENDING seed snapshot precedes any node execution
 Validated: gating checks (fast tripwire)
+
+## Task 5 — PASSED (1 attempt)
+What: Ran the spec's four validation commands (cargo fmt --check, cargo clippy -- -D warnings, cargo test, cargo build --release); all pass with no code changes needed.
+Decisions: Task 5 is validation-only (no files listed); confirmed working tree was already clean/passing from prior tasks, so no commit was made.
+Validated: gating checks (fast tripwire)
