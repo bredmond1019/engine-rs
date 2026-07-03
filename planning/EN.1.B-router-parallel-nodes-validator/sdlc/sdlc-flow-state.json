@@ -1,0 +1,85 @@
+{
+  "spec_slug": "EN.1.B-router-parallel-nodes-validator",
+  "branch": "EN.1.B-router-parallel-nodes-validator-flow",
+  "started_at": "2026-07-03T10:37:31Z",
+  "updated_at": "2026-07-03T10:37:31Z",
+  "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow",
+  "status": "running",
+  "current_task": 1,
+  "tasks": {
+    "1": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-core now has a Router trait (supertrait of Node) with route(ctx) for runtime next-node selection (including undeclared back-edges), plus a Node::as_router() default hook for registry-based router detection, both re-exported from lib.rs.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Added dispatch_route(&dyn Router, &TaskContext) -> Option<String> as the small dispatch helper referenced by the task description, thinly wrapping router.route(ctx)",
+        "workflow.rs left untouched as required (runner wiring is task 4)"
+      ],
+      "files_changed": [
+        "crates/engine-core/src/routing.rs",
+        "crates/engine-core/src/node.rs",
+        "crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    }
+  },
+  "review": {
+    "verdict": null,
+    "findings": [],
+    "attempts": 0
+  },
+  "docs": {
+    "changed": [],
+    "created": []
+  },
+  "bail_reason": null,
+  "pr": {
+    "url": null,
+    "number": null
+  },
+  "tokens": {
+    "stages": [
+      {
+        "label": "worktree-setup",
+        "model": "haiku",
+        "promptTokEst": 808,
+        "filesReadKb": null,
+        "inTokEst": 808,
+        "outTok": 5257
+      },
+      {
+        "label": "enumerate",
+        "model": "haiku",
+        "promptTokEst": 270,
+        "filesReadKb": null,
+        "inTokEst": 270,
+        "outTok": 802
+      },
+      {
+        "label": "implement-1-1",
+        "model": "sonnet",
+        "promptTokEst": 1056,
+        "filesReadKb": null,
+        "inTokEst": 1056,
+        "outTok": 6571
+      },
+      {
+        "label": "test-1-1",
+        "model": "haiku",
+        "promptTokEst": 620,
+        "filesReadKb": null,
+        "inTokEst": 620,
+        "outTok": 1602
+      }
+    ],
+    "total": {
+      "promptTokEst": 2754,
+      "filesReadKb": 0,
+      "inTokEst": 2754,
+      "outTok": 14232
+    }
+  }
+}
