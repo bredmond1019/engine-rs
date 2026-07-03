@@ -1,0 +1,96 @@
+[
+  {
+    "task_id": 1,
+    "title": "Record the async-runtime + persistence decision (D2)",
+    "description": "Decide the async runtime and persistence stack that the workspace will standardize on (tokio as the async runtime; sqlx vs deadpool + tokio-postgres for the Postgres layer that engine-store/EN.0.B builds on). Write an atomic, append-only decision file planning/decisions/D2-async-runtime-choice.md with OKF YAML frontmatter (type: Decision) capturing the chosen stack, the rationale (async-JSON-column ergonomics, compile-time query checking vs. pool flexibility), and what it commits engine-store to. Add a row for D2 under the '## Decisions' list in planning/decisions/index.md linking the new file (standing rules 2 + 4). Do not write any Postgres code here — that is EN.0.B.",
+    "acceptance_criteria": [
+      "planning/decisions/D2-async-runtime-choice.md exists with valid OKF frontmatter and names the chosen async runtime + persistence crate(s) with rationale",
+      "planning/decisions/index.md has a new D2 row linking the file"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "planning/decisions/D2-async-runtime-choice.md",
+      "planning/decisions/index.md"
+    ],
+    "dependsOn": []
+  },
+  {
+    "task_id": 2,
+    "title": "Create the workspace root + four crate stubs",
+    "description": "Create the root Cargo.toml as a Cargo workspace (resolver = \"2\", edition 2021) listing the four members: crates/engine-core, crates/engine-contract, crates/engine-store, crates/engine-serve. Declare shared deps (tokio, and the persistence crate chosen in task 1) under [workspace.dependencies] so member crates inherit them. For each of the four crates create its Cargo.toml (referencing workspace deps as needed) and a compiling src/lib.rs stub. Include at least one trivial passing #[test] (e.g. in engine-core/src/lib.rs) so cargo test exercises a real test per standing rule 1. Every crate must compile clean under clippy -D warnings and be rustfmt-clean.",
+    "acceptance_criteria": [
+      "Root Cargo.toml declares all four members and a [workspace.dependencies] section including the task-1 stack",
+      "Each crate has a Cargo.toml and a compiling src/lib.rs stub",
+      "At least one #[test] exists and passes under cargo test",
+      "cargo fmt --check, cargo clippy -- -D warnings, cargo build --release, and cargo test all pass"
+    ],
+    "validation_commands": [
+      "cargo fmt --check",
+      "cargo clippy -- -D warnings",
+      "cargo test",
+      "cargo build --release"
+    ],
+    "max_attempts": 3,
+    "files": [
+      "Cargo.toml",
+      "crates/engine-core/Cargo.toml",
+      "crates/engine-core/src/lib.rs",
+      "crates/engine-contract/Cargo.toml",
+      "crates/engine-contract/src/lib.rs",
+      "crates/engine-store/Cargo.toml",
+      "crates/engine-store/src/lib.rs",
+      "crates/engine-serve/Cargo.toml",
+      "crates/engine-serve/src/lib.rs"
+    ],
+    "dependsOn": [1]
+  },
+  {
+    "task_id": 3,
+    "title": "Wire CI to run fmt/clippy/test/build on push + PR",
+    "description": "Create .github/workflows/ci.yml that, on push and pull_request, checks out the repo, installs a stable Rust toolchain with rustfmt + clippy components, caches Cargo, and runs the four gate commands: cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release. Keep the command set byte-identical to planning/harness.json's validation.checks[] so humans and CI run the same thing.",
+    "acceptance_criteria": [
+      ".github/workflows/ci.yml triggers on push and pull_request",
+      "The workflow runs cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release",
+      "The workflow installs rustfmt + clippy components on a stable toolchain"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      ".github/workflows/ci.yml"
+    ],
+    "dependsOn": [2]
+  },
+  {
+    "task_id": 4,
+    "title": "Confirm harness.json matches the real workspace layout",
+    "description": "Now that the workspace exists, verify planning/harness.json's validation.checks[] commands run correctly from the repo root against the real layout (fmt / clippy / test / build --release). Adjust only if a command needs a path/flag correction for the actual workspace; otherwise confirm no change is needed and leave it intact. Do not change the stack profile or add new checks.",
+    "acceptance_criteria": [
+      "Each command in planning/harness.json validation.checks[] runs successfully from the repo root against the workspace",
+      "No command/path drift remains between harness.json and the real layout"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "planning/harness.json"
+    ],
+    "dependsOn": [2]
+  },
+  {
+    "task_id": 5,
+    "title": "Validate",
+    "description": "Run the Validation Commands listed in tasks.md and confirm all pass on a clean checkout.",
+    "acceptance_criteria": [
+      "cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release all pass"
+    ],
+    "validation_commands": [
+      "cargo fmt --check",
+      "cargo clippy -- -D warnings",
+      "cargo test",
+      "cargo build --release"
+    ],
+    "max_attempts": 3,
+    "files": [],
+    "dependsOn": [1, 2, 3, 4]
+  }
+]
