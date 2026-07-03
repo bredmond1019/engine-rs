@@ -1,4 +1,4 @@
 template: base-template
-commit: 03fd9495d1c2ba0b8219fa0c5ef7fef981cbc943
+commit: 9ea6decce523300fb82ad18a65f50272edab7702
 generated: 2026-07-02
-synced: 2026-07-03 — docs: commit after breakdown.md creation
+synced: 2026-07-03 — chore(harness): sync wrap-up cross-repo constraints rule

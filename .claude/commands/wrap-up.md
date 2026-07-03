@@ -17,6 +17,7 @@ $ARGUMENTS — optional free-text note about what was done (passed straight thro
    not-yet-ticketed deferred follow-on — append it to `planning/state.json` `carryover[]` (field shape
    in `planning/state-schema.md`). `/wrap-up` writes no handoff file, so `carryover[]` is the only
    place this kind of note survives. Skip if the session produced none or the repo has no `state.json`.
+   **Cross-Repo Constraints Rule:** If a completed block spawns follow-up work in a different repo, **DO NOT** record it as a local `carryover`. You must actively open the downstream repo's `planning/state.json`, inject the new block into its `tracks` and `focus` arrays, and wire it into the `depends_on` DAG immediately.
 
 2. Run `/log-work $ARGUMENTS` — this syncs status.md, appends the log entry, and syncs
    the company brain. Wait for it to complete before continuing.
