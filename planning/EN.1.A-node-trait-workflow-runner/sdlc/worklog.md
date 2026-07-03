@@ -14,3 +14,8 @@ Validated: gating checks (fast tripwire)
 What: Added the Workflow pointer-walk runner (crates/engine-core/src/workflow.rs) with the on_progress persistence seam and node_context envelope, seeding all nodes PENDING before the walk, stamping RUNNING/SUCCESS/FAILED transitions with timing, and halting on node failure; wired into lib.rs and covered by unit tests.
 Decisions: Node::process consumes and only returns TaskContext on Ok, so node_context clones ctx before calling process to have a base context available for stamping the FAILED transition on Err (since NodeError carries no context back).; Used Rc<RefCell<Vec<TaskContext>>> in tests to capture on_progress snapshots, avoiding a borrow conflict between the FnMut closure (borrowed mutably during run) and post-call assertions on the captured Vec.; WorkflowError (distinct from NodeError) is returned only for graph-shape issues like an unregistered node identity; a node's own failure is captured in NodeRun and does not short-circuit run() with an Err — the accumulated TaskContext is still returned Ok.
 Validated: gating checks (fast tripwire)
+
+## Task 4 — PASSED (1 attempt)
+What: Added the fixture 3-node linear workflow integration test (workflow_runner.rs) covering full-success PENDING->RUNNING->SUCCESS transitions, initial on_progress PENDING snapshot, and a middle-node failure that halts the walk before the third node runs.
+Decisions: Used identity names start_node/node2/node3 to match schema.rs conventions while keeping the linear 3-node fixture clear; Asserted the initial on_progress snapshot's TaskContext::nodes is empty as an extra check that the PENDING seed snapshot precedes any node execution
+Validated: gating checks (fast tripwire)

@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.A-node-trait-workflow-runner",
   "branch": "EN.1.A-node-trait-workflow-runner-flow",
   "started_at": "2026-07-03T07:49:24Z",
-  "updated_at": "2026-07-03T07:54:51Z",
+  "updated_at": "2026-07-03T07:57:46Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.A-node-trait-workflow-runner-flow",
   "status": "running",
-  "current_task": 3,
+  "current_task": 4,
   "tasks": {
     "1": {
       "status": "passed",
@@ -58,6 +58,22 @@
       "files_changed": [
         "crates/engine-core/src/workflow.rs",
         "crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "4": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added the fixture 3-node linear workflow integration test (workflow_runner.rs) covering full-success PENDING->RUNNING->SUCCESS transitions, initial on_progress PENDING snapshot, and a middle-node failure that halts the walk before the third node runs.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Used identity names start_node/node2/node3 to match schema.rs conventions while keeping the linear 3-node fixture clear",
+        "Asserted the initial on_progress snapshot's TaskContext::nodes is empty as an extra check that the PENDING seed snapshot precedes any node execution"
+      ],
+      "files_changed": [
+        "crates/engine-core/tests/workflow_runner.rs"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -142,13 +158,29 @@
         "filesReadKb": null,
         "inTokEst": 610,
         "outTok": 1752
+      },
+      {
+        "label": "implement-4-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 5937
+      },
+      {
+        "label": "test-4-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 2431
       }
     ],
     "total": {
-      "promptTokEst": 6001,
+      "promptTokEst": 7647,
       "filesReadKb": 0,
-      "inTokEst": 6001,
-      "outTok": 33673
+      "inTokEst": 7647,
+      "outTok": 42041
     }
   }
 }
