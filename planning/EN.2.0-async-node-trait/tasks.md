@@ -1,6 +1,6 @@
 # Task Spec — Phase 2, Block 0 (EN.2.0 — Async `Node` trait)
 
-**Status:** Not started · **Last run:** never
+**Status:** Done · **Last run:** 2026-07-03 (PASS)
 
 ## Goal
 Make `engine-core`'s `Node::process` an `async fn` (via `async-trait`), converting the workflow
@@ -51,4 +51,4 @@ cargo build --release
 
 ## Amendment Log
 <!-- Append-only. Pipeline stages append one dated line here when they deviate from the spec. -->
-_No amendments yet._
+2026-07-03 [task 2] `validator.rs`'s `router_route_dispatch_matches_runner_behavior` and `cyclic_non_router_workflow_is_rejected_by_new_validated` were left as plain `#[test]` rather than migrated to `#[tokio::test]`, since neither test calls `.process()`/`.run()` and both remain valid under the sync `WorkflowValidator`/`Router::route` surface — a narrower reading of "every fixture and test harness must be migrated" than the spec's Context Pointers implied, kept for a minimal diff.

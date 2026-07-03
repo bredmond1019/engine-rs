@@ -16,6 +16,23 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-03]
+
+Implemented EN.2.0-async-node-trait end to end via `/sdlc-flow`: Task 1 added `async-trait` and `futures` as workspace dependencies (wired into `engine-core` for real use, `async-trait` only into `engine-serve`); Task 2 converted `Node::process` to `async fn` via `#[async_trait::async_trait]`, made `Workflow::run`/`node_context` async, switched `ParallelNode`'s fan-out from `std::thread::scope` to `futures::future::join_all`, and removed `engine-serve`'s `web::block` wrapper so `post_events` awaits `workflow.run` directly; Task 3 confirmed all four gated checks (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release`) pass against the converted codebase with `web::block` no longer live anywhere in `http.rs`. All three tasks passed on the first attempt, the review verdict was PASS with zero findings, and `docs/architecture.md` was updated to reflect the async runner. Notable decisions: `Router::route`/`OnProgress` stayed synchronous per the spec (D5), and two validator tests that never call `.process()`/`.run()` were left as plain `#[test]` rather than `tokio::test` for a minimal diff. Next: EN.2.A — Claude Code step node; first command `/generate-tasks EN.2.A`.
+
+```
+de07253 chore: flow state — docs
+b226d0b docs: update docs for EN.2.0-async-node-trait
+1c5afb7 chore: flow state — task 3 passed
+93af3ed chore: flow state — task 2 passed
+23cf690 feat: implement EN.2.0-async-node-trait-task2
+11421ae chore: flow state — task 1 passed
+63c06be feat: implement EN.2.0-async-node-trait-task1
+e251560 chore: reconcile state for EN.2.0 — focus + block, clear async-node carryover
+```
+
+---
+
 ## 2026-07-03
 
 ### Audited Claude SDKs and paused for transport decision

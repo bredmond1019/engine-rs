@@ -5,8 +5,8 @@ description: Current state and progress tracker for engine-rs.
 doc_id: status
 layer: [factory]
 status: active
-timestamp: "2026-07-03T18:45:05Z"
-now: "Paused EN.2.A to decide transport architecture (CLI wrapper vs hybrid) based on SDK audit"
+timestamp: "2026-07-03T19:43:30Z"
+now: "EN.2.0 — Async Node trait — Done; PASS review"
 next: "EN.2.A — Claude Code step node; first command /generate-tasks EN.2.A"
 blocked: []
 keywords: [status, progress tracker, current focus, blocks]
@@ -15,8 +15,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-03 — Audited Claude SDKs, wrote notes to `planning/claude-sdk/notes.md`, logged D4 transport options to `state.json` carryover, wrote handoff.
-**Current focus:** Paused EN.2.A to decide transport architecture (CLI wrapper vs hybrid) based on SDK audits.
+**Last updated:** 2026-07-03 — EN.2.0-async-node-trait shipped (async `Node`/`Workflow`, `join_all` fan-out, `web::block` removed); PASS review.
+**Current focus:** EN.2.0 done; next up is EN.2.A — Claude Code step node.
 
 ---
 
@@ -35,7 +35,7 @@ related: [context, master-plan, planning-index, knowledge, memory]
 > Working board — keep all five queues live. **Never end a meaningful session with every queue
 > empty.** The headlines of **now / next / blocked** mirror the frontmatter scalars above.
 
-- **now** — Phase 1 (Execution Core) fully Done — EN.1.A/EN.1.B/EN.1.C all closed; engine embedded in bastion serve
+- **now** — EN.2.0 (Async `Node` trait) Done — PASS review; `Node::process`/`Workflow::run` are async, `ParallelNode` uses `join_all`, `web::block` removed from `engine-serve`
 - **next** — EN.2.A — Claude Code step node; first command `/generate-tasks EN.2.A`
 - **blocked** — _nothing yet — each entry names its blocker and the smallest missing answer_
 - **improve** — _self-improvement backlog: eval gaps, flaky workflows, repeated failures, missing skills, stale assumptions_
@@ -69,6 +69,11 @@ related: [context, master-plan, planning-index, knowledge, memory]
 | EN.1.A | Node trait + Workflow runner | Done | `Node` trait + `NodeRegistry`, `WorkflowSchema`, pointer-walk `Workflow::run` with `on_progress` seam; PASS review |
 | EN.1.B | Router + parallel nodes + validator | Done | `Router` trait + `dispatch_route`, `ParallelNode` fan-out/merge, `WorkflowValidator` (reachability/cycle/arity) + `Workflow::new_validated`; PASS review |
 | EN.1.C | Trigger/dispatch + dual-registry + serve embedding | Done | Dual-registry `Dispatcher`, in-memory `LiveStateStore`, async durable-write seam (`durable.rs`) against `engine-store`, four-endpoint `actix-web` HTTP surface (D3), headline integration test; PASS review |
+
+### Phase 2 — Claude Code step + control loop
+| Block | What | Status | Notes |
+|---|---|---|---|
+| EN.2.0 | Async `Node` trait | Done | `Node::process` async via `async-trait`; `Workflow::run`/`node_context` async; `ParallelNode` fans out via `futures::future::join_all`; `web::block` removed from `engine-serve` (D5); all four gates green; PASS review |
 
 <!-- Add one sub-table per phase as the plan is fleshed out. -->
 
