@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.B-router-parallel-nodes-validator",
   "branch": "EN.1.B-router-parallel-nodes-validator-flow",
   "started_at": "2026-07-03T10:37:31Z",
-  "updated_at": "2026-07-03T10:37:31Z",
+  "updated_at": "2026-07-03T10:40:43Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow",
   "status": "running",
-  "current_task": 1,
+  "current_task": 2,
   "tasks": {
     "1": {
       "status": "passed",
@@ -21,6 +21,25 @@
         "crates/engine-core/src/routing.rs",
         "crates/engine-core/src/node.rs",
         "crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "2": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added ParallelNode (fan-out over branch nodes on std::thread::scope, deep-copied TaskContext per branch, deterministic last-write-wins merge of nodes/node_runs by declared branch order) with unit + integration tests; re-exported from engine-core lib.rs.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Deterministic merge tie-break = declared branch order (later branch in the Vec passed to ParallelNode::new wins on key collision), documented in module docs and asserted by tests",
+        "Used std::thread::scope for fan-out per the spec's preference, avoiding new runtime/thread-pool dependency",
+        "First branch NodeError encountered (in declared order) is propagated as ParallelNode::process's own error; no partial merge is returned on branch failure"
+      ],
+      "files_changed": [
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/src/parallel.rs",
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/tests/parallel.rs",
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/src/lib.rs"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -73,13 +92,29 @@
         "filesReadKb": null,
         "inTokEst": 620,
         "outTok": 1602
+      },
+      {
+        "label": "implement-2-1",
+        "model": "sonnet",
+        "promptTokEst": 1056,
+        "filesReadKb": null,
+        "inTokEst": 1056,
+        "outTok": 9457
+      },
+      {
+        "label": "test-2-1",
+        "model": "haiku",
+        "promptTokEst": 620,
+        "filesReadKb": null,
+        "inTokEst": 620,
+        "outTok": 2019
       }
     ],
     "total": {
-      "promptTokEst": 2754,
+      "promptTokEst": 4430,
       "filesReadKb": 0,
-      "inTokEst": 2754,
-      "outTok": 14232
+      "inTokEst": 4430,
+      "outTok": 25708
     }
   }
 }
