@@ -1,0 +1,87 @@
+{
+  "spec_slug": "EN.1.A-node-trait-workflow-runner",
+  "branch": "EN.1.A-node-trait-workflow-runner-flow",
+  "started_at": "2026-07-03T07:49:24Z",
+  "updated_at": "2026-07-03T07:49:24Z",
+  "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.A-node-trait-workflow-runner-flow",
+  "status": "running",
+  "current_task": 1,
+  "tasks": {
+    "1": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-core now defines the Node trait (process/name) and a NodeRegistry (HashMap<String, Box<dyn Node>>) with lookup, backed by engine-contract's TaskContext, with unit tests for transformation and identity-key matching.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "NodeError is a simple struct wrapping a String message, implementing Display + std::error::Error, rather than an enum — task 1 scope only needs a minimal failure carrier; richer variants can be added later if needed.",
+        "Node trait bounds Send + Sync so boxed trait objects work cleanly in a registry/runner context used across async boundaries later.",
+        "Dropped the crate_name() placeholder function and its test since nothing outside engine-core referenced it."
+      ],
+      "files_changed": [
+        "crates/engine-core/Cargo.toml",
+        "crates/engine-core/src/lib.rs",
+        "crates/engine-core/src/node.rs",
+        "Cargo.lock"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    }
+  },
+  "review": {
+    "verdict": null,
+    "findings": [],
+    "attempts": 0
+  },
+  "docs": {
+    "changed": [],
+    "created": []
+  },
+  "bail_reason": null,
+  "pr": {
+    "url": null,
+    "number": null
+  },
+  "tokens": {
+    "stages": [
+      {
+        "label": "worktree-setup",
+        "model": "haiku",
+        "promptTokEst": 798,
+        "filesReadKb": null,
+        "inTokEst": 798,
+        "outTok": 3999
+      },
+      {
+        "label": "enumerate",
+        "model": "haiku",
+        "promptTokEst": 265,
+        "filesReadKb": null,
+        "inTokEst": 265,
+        "outTok": 752
+      },
+      {
+        "label": "implement-1-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 5689
+      },
+      {
+        "label": "test-1-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 1950
+      }
+    ],
+    "total": {
+      "promptTokEst": 2709,
+      "filesReadKb": 0,
+      "inTokEst": 2709,
+      "outTok": 12390
+    }
+  }
+}
