@@ -27,3 +27,6 @@ Validated: gating checks (fast tripwire)
 
 ## Docs
 Patched: docs/architecture.md
+
+## Wrap-up — PASS
+Next: EN.1.B-router-parallel-nodes-validator (Define EN.1.B tasks via /generate-tasks EN.1.B)

@@ -2,9 +2,9 @@
   "spec_slug": "EN.1.A-node-trait-workflow-runner",
   "branch": "EN.1.A-node-trait-workflow-runner-flow",
   "started_at": "2026-07-03T07:49:24Z",
-  "updated_at": "2026-07-03T08:03:15Z",
+  "updated_at": "2026-07-03T08:05:56Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.A-node-trait-workflow-runner-flow",
-  "status": "docs",
+  "status": "done",
   "current_task": 5,
   "tasks": {
     "1": {
@@ -221,13 +221,21 @@
         "filesReadKb": null,
         "inTokEst": 846,
         "outTok": 6868
+      },
+      {
+        "label": "wrap-up",
+        "model": "sonnet",
+        "promptTokEst": 890,
+        "filesReadKb": null,
+        "inTokEst": 890,
+        "outTok": 6711
       }
     ],
     "total": {
-      "promptTokEst": 11181,
+      "promptTokEst": 12071,
       "filesReadKb": 0,
-      "inTokEst": 11181,
-      "outTok": 55159
+      "inTokEst": 12071,
+      "outTok": 61870
     }
   }
 }
