@@ -15,3 +15,6 @@ Validated: gating checks (fast tripwire)
 What: Confirmed all four gated checks (cargo fmt --check, cargo clippy -D warnings, cargo test, cargo build --release) pass against the Task 2 async-Node conversion, and web::block no longer appears as a live call in crates/engine-serve/src/http.rs (only in a comment).
 Decisions: Task 3 has no files listed in tasks.json and is purely a validation gate — no code changes were made and no commit was created since the working tree was already clean after Task 2.
 Validated: gating checks (fast tripwire)
+
+## Docs
+Patched: docs/architecture.md
