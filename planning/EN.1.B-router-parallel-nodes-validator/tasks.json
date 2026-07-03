@@ -1,0 +1,96 @@
+[
+  {
+    "task_id": 1,
+    "title": "Router trait + route(ctx) + router dispatch + Node router hook",
+    "description": "In engine-core, add crates/engine-core/src/routing.rs defining a Router trait (supertrait of Node): `fn route(&self, ctx: &TaskContext) -> Option<String>` returning the identity of the next node chosen at runtime — which MAY be a node not in the router's declared connections (the retry/back-edge), per the declared-acyclic/runtime-cyclic contract. Add a small dispatch helper that, given a node and the current TaskContext, returns the runtime next-node identity for a router. To let the runner and validator detect routers through the registry, extend the Node trait in crates/engine-core/src/node.rs with a default hook `fn as_router(&self) -> Option<&dyn Router> { None }` (default None; routers override it to return self). Declare `pub mod routing;` and re-export `Router` (and any dispatch helper) in crates/engine-core/src/lib.rs. Include unit tests: a fixture Router that routes conditionally on TaskContext state returns the expected next identity, and a plain Node's `as_router()` is None while a Router's is Some. Do NOT modify workflow.rs here (the runner wiring is task 4).",
+    "acceptance_criteria": [
+      "routing.rs defines a Router: Node trait with route(&self, ctx) -> Option<String>",
+      "Node gains a default `as_router(&self) -> Option<&dyn Router>` hook returning None; routers override it",
+      "route() may return an identity outside the declared connections (runtime back-edge supported)",
+      "Unit tests cover a conditional Router's route() result and as_router() detection for plain vs router nodes",
+      "workflow.rs is unchanged in this task"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/src/routing.rs",
+      "crates/engine-core/src/node.rs",
+      "crates/engine-core/src/lib.rs"
+    ],
+    "dependsOn": []
+  },
+  {
+    "task_id": 2,
+    "title": "ParallelNode fan-out/merge + tests/parallel.rs",
+    "description": "In engine-core, add crates/engine-core/src/parallel.rs defining ParallelNode: a Node that fans out to a set of branch nodes, deep-copies (clone) the incoming TaskContext once per branch, runs each branch (prefer std::thread::scope since Node is Send + Sync — no new runtime dep), and merges each branch's `nodes` and `node_runs` maps back into the parent with last-write-wins semantics (later/declared-order branch wins on key collision — pick and document a deterministic ordering so the merge is reproducible). ParallelNode itself implements Node (its `process` performs the fan-out/merge and returns the merged TaskContext). Declare `pub mod parallel;` and re-export `ParallelNode` in crates/engine-core/src/lib.rs. Add crates/engine-core/tests/parallel.rs: a fixture ParallelNode over branches where (a) two branches write the same nodes/node_runs key and the merge resolves to the documented deterministic winner, and (b) disjoint keys from every branch are all present post-merge. Shares src/lib.rs with task 1, so it is serialized after it.",
+    "acceptance_criteria": [
+      "ParallelNode deep-copies the TaskContext per branch and runs branches on a thread scope/pool",
+      "Merge combines nodes + node_runs with deterministic last-write-wins on key collision",
+      "tests/parallel.rs asserts the collision winner is deterministic and all disjoint keys survive the merge",
+      "ParallelNode implements Node and returns the merged TaskContext from process"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/src/parallel.rs",
+      "crates/engine-core/tests/parallel.rs",
+      "crates/engine-core/src/lib.rs"
+    ],
+    "dependsOn": [1]
+  },
+  {
+    "task_id": 3,
+    "title": "WorkflowValidator — BFS reachability + DFS cycle check",
+    "description": "In engine-core, add crates/engine-core/src/validate.rs defining WorkflowValidator and a ValidationError type. Implement `validate(&NodeRegistry, &WorkflowSchema) -> Result<(), ValidationError>` that: (a) BFS from schema.start_node over declared connections and confirms every node declared in the schema is reachable (report an unreachable node); (b) DFS cycle detection over declared connections that SKIPS edges out of router nodes (a node whose registry entry `as_router()` is Some) — a cycle formed only by non-router edges is an error; (c) enforces that only routers may declare >1 connection (a non-router with connections.len() > 1 is an error). Use the registry (from task 1's `as_router` hook) to classify routers. Declare `pub mod validate;` and re-export `WorkflowValidator` + `ValidationError` in crates/engine-core/src/lib.rs. Include unit tests: a valid linear/router schema passes; an unreachable node, a non-router >1-connection, and a non-router cycle each return the corresponding ValidationError. Shares src/lib.rs (serialized after tasks 1-2) and depends on task 1's Router/as_router hook.",
+    "acceptance_criteria": [
+      "validate() returns Ok for a well-formed schema and a typed ValidationError otherwise",
+      "BFS reachability flags a declared-but-unreachable node",
+      "DFS cycle check skips edges out of router nodes and flags a non-router cycle",
+      "A non-router declaring >1 connection is rejected; routers may declare >1",
+      "Unit tests cover the pass case and each rejection case"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/src/validate.rs",
+      "crates/engine-core/src/lib.rs"
+    ],
+    "dependsOn": [1, 2]
+  },
+  {
+    "task_id": 4,
+    "title": "Wire router dispatch + validator into Workflow + tests/validator.rs",
+    "description": "Modify crates/engine-core/src/workflow.rs to (a) make next-node selection router-aware: in the pointer-walk, if the current node's `as_router()` is Some, choose the next identity via `route(&ctx)` (which may be an undeclared back-edge); otherwise keep the existing `schema.next_after` / `connections[0]` path. Add termination safety appropriate to runtime cycles (e.g. the router's own route() returns None to stop) — do not introduce an unbounded loop guard beyond what the fixture needs. (b) Add a NEW fallible constructor `Workflow::new_validated(registry, schema) -> Result<Self, ValidationError>` that runs WorkflowValidator::validate before constructing — leave the existing infallible `Workflow::new` and its signature UNCHANGED so EN.1.A's tests/workflow_runner.rs and in-file unit tests still compile. Update/extend the in-file workflow.rs unit tests for the router-walk path as needed. Add crates/engine-core/tests/validator.rs: (1) a fixture workflow with a router whose declared connections are acyclic but whose route() returns a back-edge to re-run an earlier node under a runtime condition — assert it passes new_validated AND the run executes the retry path then completes; (2) a fixture cyclic non-router workflow is rejected by new_validated/validate. Owns workflow.rs exclusively; does not touch lib.rs (exports were added by tasks 1-3).",
+    "acceptance_criteria": [
+      "The runner selects the next node via route(ctx) for routers and connections[0] for non-routers",
+      "A new fallible Workflow::new_validated(...) -> Result<Self, ValidationError> runs the validator before constructing",
+      "Workflow::new stays infallible with its existing signature; tests/workflow_runner.rs compiles and passes unchanged",
+      "tests/validator.rs shows a router + undeclared back-edge passing validation and executing the retry path to completion",
+      "tests/validator.rs shows a cyclic non-router workflow rejected by validation"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/src/workflow.rs",
+      "crates/engine-core/tests/validator.rs"
+    ],
+    "dependsOn": [1, 3]
+  },
+  {
+    "task_id": 5,
+    "title": "Validate",
+    "description": "Run the Validation Commands listed in tasks.md and confirm all pass.",
+    "acceptance_criteria": [
+      "cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release all pass"
+    ],
+    "validation_commands": [
+      "cargo fmt --check",
+      "cargo clippy -- -D warnings",
+      "cargo test",
+      "cargo build --release"
+    ],
+    "max_attempts": 3,
+    "files": [],
+    "dependsOn": [1, 2, 3, 4]
+  }
+]
