@@ -223,8 +223,9 @@ mod tests {
         identity: &'static str,
     }
 
+    #[async_trait::async_trait]
     impl Node for PlainNode {
-        fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
             Ok(ctx)
         }
 
@@ -237,8 +238,9 @@ mod tests {
         identity: &'static str,
     }
 
+    #[async_trait::async_trait]
     impl Node for RouterNode {
-        fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
             Ok(ctx)
         }
 

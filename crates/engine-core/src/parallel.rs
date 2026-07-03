@@ -1,10 +1,10 @@
 //! `ParallelNode` — fan-out/merge over a fixed, ordered set of branch nodes.
 //!
 //! `ParallelNode` is itself a `Node`: its `process` deep-copies (`clone`) the
-//! incoming `TaskContext` once per branch, runs every branch (on a
-//! `std::thread::scope` — `Node` is `Send + Sync`, so no new async/thread-pool
-//! dependency is needed), and merges each branch's `nodes` + `node_runs` maps
-//! back into the parent.
+//! incoming `TaskContext` once per branch, runs every branch concurrently via
+//! `futures::future::join_all` (polled in-place on the current task, so
+//! borrowed `&self.branches` needs neither `Send` nor `'static`), and merges
+//! each branch's `nodes` + `node_runs` maps back into the parent.
 //!
 //! **Merge semantics — deterministic last-write-wins:** branches are merged in
 //! their declared order (the order they were passed to
@@ -41,31 +41,23 @@ impl ParallelNode {
     }
 }
 
+#[async_trait::async_trait]
 impl Node for ParallelNode {
-    fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
         // One cloned TaskContext per branch — branches never observe each
         // other's writes.
         let branch_inputs: Vec<TaskContext> = self.branches.iter().map(|_| ctx.clone()).collect();
 
-        // Run every branch to completion inside a scope so `&self.branches`
-        // (borrowed, `Send + Sync`) can be shared across the spawned threads
-        // without needing to be `'static`.
-        let branch_results: Vec<Result<TaskContext, NodeError>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = self
-                .branches
+        // Run every branch concurrently via `join_all`, which polls the
+        // branch futures in-place on the current task — no `Send`/`'static`
+        // bound is required, so borrowed `&self.branches` still works.
+        let branch_results: Vec<Result<TaskContext, NodeError>> = futures::future::join_all(
+            self.branches
                 .iter()
                 .zip(branch_inputs)
-                .map(|(node, input)| scope.spawn(move || node.process(input)))
-                .collect();
-
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(NodeError::new("parallel branch thread panicked")))
-                })
-                .collect()
-        });
+                .map(|(node, input)| node.process(input)),
+        )
+        .await;
 
         // Propagate the first branch failure, if any, as this node's error.
         let mut branch_outputs = Vec::with_capacity(branch_results.len());
@@ -135,8 +127,9 @@ mod tests {
         value: serde_json::Value,
     }
 
+    #[async_trait::async_trait]
     impl Node for WriterBranch {
-        fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
             ctx.nodes
                 .insert(self.write_key.to_string(), self.value.clone());
             ctx.node_runs
@@ -149,8 +142,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn collision_key_resolves_to_later_declared_branch() {
+    #[tokio::test]
+    async fn collision_key_resolves_to_later_declared_branch() {
         let branches: Vec<Box<dyn Node>> = vec![
             Box::new(WriterBranch {
                 identity: "BranchA",
@@ -167,6 +160,7 @@ mod tests {
 
         let out = parallel
             .process(empty_context())
+            .await
             .expect("process should succeed");
 
         // BranchB is declared after BranchA, so it wins the collision.
@@ -176,8 +170,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disjoint_keys_from_every_branch_all_survive_merge() {
+    #[tokio::test]
+    async fn disjoint_keys_from_every_branch_all_survive_merge() {
         let branches: Vec<Box<dyn Node>> = vec![
             Box::new(WriterBranch {
                 identity: "BranchA",
@@ -199,6 +193,7 @@ mod tests {
 
         let out = parallel
             .process(empty_context())
+            .await
             .expect("process should succeed");
 
         assert_eq!(
@@ -228,8 +223,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parallel_node_returns_merged_task_context_and_reports_name() {
+    #[tokio::test]
+    async fn parallel_node_returns_merged_task_context_and_reports_name() {
         let branches: Vec<Box<dyn Node>> = vec![Box::new(WriterBranch {
             identity: "BranchA",
             write_key: "KeyA",
@@ -241,6 +236,7 @@ mod tests {
 
         let out = parallel
             .process(empty_context())
+            .await
             .expect("process should succeed");
         assert!(out.nodes.contains_key("KeyA"));
     }

@@ -85,7 +85,7 @@ impl Workflow {
     /// `None` from `route` ends the walk. A node returning `Err` is stamped
     /// FAILED and halts the walk (the accumulated `TaskContext` is still
     /// returned).
-    pub fn run(
+    pub async fn run(
         &self,
         event: serde_json::Value,
         mut on_progress: OnProgress<'_>,
@@ -129,7 +129,7 @@ impl Workflow {
                 .as_router()
                 .map(|router| crate::routing::dispatch_route(router, &ctx));
 
-            let (next_ctx, failed) = node_context(node, ctx, &mut on_progress);
+            let (next_ctx, failed) = node_context(node, ctx, &mut on_progress).await;
             ctx = next_ctx;
 
             if failed {
@@ -151,7 +151,7 @@ impl Workflow {
 /// `Ok` or FAILED + `completed_at` + `error` on `Err`, invoking `on_progress`
 /// after each transition. Returns the updated `TaskContext` and whether the
 /// node failed (so the caller knows to halt the walk).
-fn node_context(
+async fn node_context(
     node: &dyn crate::node::Node,
     mut ctx: TaskContext,
     on_progress: &mut OnProgress<'_>,
@@ -179,7 +179,7 @@ fn node_context(
     // and return on `Err`.
     let pre_call_ctx = ctx.clone();
 
-    match node.process(ctx) {
+    match node.process(ctx).await {
         Ok(mut ok_ctx) => {
             if let Some(run) = ok_ctx.node_runs.get_mut(&identity) {
                 run.status = NodeRunStatus::Success;
@@ -208,8 +208,9 @@ mod tests {
 
     struct SuccessNode;
 
+    #[async_trait::async_trait]
     impl Node for SuccessNode {
-        fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
             ctx.nodes
                 .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
             Ok(ctx)
@@ -222,8 +223,9 @@ mod tests {
 
     struct FailNode;
 
+    #[async_trait::async_trait]
     impl Node for FailNode {
-        fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
             Err(NodeError::new("boom"))
         }
 
@@ -241,8 +243,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn node_context_stamps_success_transition() {
+    #[tokio::test]
+    async fn node_context_stamps_success_transition() {
         let node = SuccessNode;
         let mut ctx = empty_context();
         ctx.node_runs.insert(
@@ -262,7 +264,7 @@ mod tests {
         let mut on_progress: OnProgress<'_> =
             Box::new(move |c: &TaskContext| snapshots_handle.borrow_mut().push(c.clone()));
 
-        let (out, failed) = node_context(&node, ctx, &mut on_progress);
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
         drop(on_progress);
 
         assert!(!failed);
@@ -286,8 +288,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn node_context_stamps_failure_transition() {
+    #[tokio::test]
+    async fn node_context_stamps_failure_transition() {
         let node = FailNode;
         let mut ctx = empty_context();
         ctx.node_runs.insert(
@@ -304,7 +306,7 @@ mod tests {
 
         let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
 
-        let (out, failed) = node_context(&node, ctx, &mut on_progress);
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
 
         assert!(failed);
         let run = out.node_runs.get("FailNode").expect("run present");
@@ -314,8 +316,8 @@ mod tests {
         assert_eq!(run.error.as_deref(), Some("boom"));
     }
 
-    #[test]
-    fn run_seeds_all_nodes_pending_before_first_run() {
+    #[tokio::test]
+    async fn run_seeds_all_nodes_pending_before_first_run() {
         let mut registry = NodeRegistry::new();
         registry.register(Box::new(SuccessNode));
 
@@ -333,7 +335,7 @@ mod tests {
         let on_progress: OnProgress<'_> =
             Box::new(move |c: &TaskContext| snapshots_handle.borrow_mut().push(c.clone()));
 
-        let result = workflow.run(serde_json::json!({}), on_progress);
+        let result = workflow.run(serde_json::json!({}), on_progress).await;
 
         assert!(result.is_ok());
         // First snapshot is the initial PENDING seed, before any node runs.
@@ -351,8 +353,8 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn run_halts_walk_on_failure() {
+    #[tokio::test]
+    async fn run_halts_walk_on_failure() {
         let mut registry = NodeRegistry::new();
         registry.register(Box::new(FailNode));
         registry.register(Box::new(SuccessNode));
@@ -371,7 +373,10 @@ mod tests {
         let workflow = Workflow::new(registry, schema);
         let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
 
-        let result = workflow.run(serde_json::json!({}), on_progress).unwrap();
+        let result = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.node_runs.get("FailNode").unwrap().status,

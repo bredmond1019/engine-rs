@@ -106,8 +106,9 @@ mod tests {
 
     struct MarkerNode;
 
+    #[async_trait::async_trait]
     impl Node for MarkerNode {
-        fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
             ctx.nodes
                 .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
             Ok(ctx)
@@ -145,8 +146,8 @@ mod tests {
         assert!(dispatcher.resolve_schema("fixture").is_ok());
     }
 
-    #[test]
-    fn resolving_known_type_succeeds() {
+    #[tokio::test]
+    async fn resolving_known_type_succeeds() {
         let mut dispatcher = Dispatcher::new();
         dispatcher.register(fixture_schema("fixture"), fixture_factory());
 
@@ -154,7 +155,10 @@ mod tests {
 
         assert!(workflow.is_ok());
         let on_progress: engine_core::OnProgress<'_> = Box::new(|_ctx| {});
-        let result = workflow.unwrap().run(serde_json::json!({}), on_progress);
+        let result = workflow
+            .unwrap()
+            .run(serde_json::json!({}), on_progress)
+            .await;
         assert!(result.is_ok());
     }
 
