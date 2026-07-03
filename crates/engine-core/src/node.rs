@@ -10,6 +10,8 @@ use std::fmt;
 
 use engine_contract::TaskContext;
 
+use crate::routing::Router;
+
 /// Error returned by a node's `process` when it fails. Carries a human-readable
 /// message; the runner stores this in the node's `NodeRun.error` field and
 /// halts the walk.
@@ -48,6 +50,14 @@ pub trait Node: Send + Sync {
 
     /// The node's identity — its type name, used as the registry/map key.
     fn name(&self) -> &str;
+
+    /// Hook letting the runner/validator detect whether this node is a
+    /// `Router` (chooses its next node at runtime) without downcasting.
+    /// Defaults to `None`; router implementations override this to return
+    /// `Some(self)`.
+    fn as_router(&self) -> Option<&dyn Router> {
+        None
+    }
 }
 
 /// Maps a node's identity string to its boxed `Node` instance, so the runner

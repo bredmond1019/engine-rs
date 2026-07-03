@@ -5,9 +5,11 @@
 //! seam land in EN.1.A task 3 — see `docs/architecture.md` for the module map.
 
 pub mod node;
+pub mod routing;
 pub mod schema;
 pub mod workflow;
 
 pub use node::{Node, NodeError, NodeRegistry};
+pub use routing::{dispatch_route, Router};
 pub use schema::{NodeConfig, WorkflowSchema};
 pub use workflow::{OnProgress, Workflow, WorkflowError};
