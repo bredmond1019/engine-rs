@@ -6,6 +6,7 @@
 
 pub mod dispatch;
 pub mod durable;
+pub mod http;
 pub mod live_state;
 
 /// Placeholder identifying this crate; exists so the workspace has at least one
