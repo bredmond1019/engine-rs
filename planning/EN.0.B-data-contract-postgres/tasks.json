@@ -1,0 +1,93 @@
+[
+  {
+    "task_id": 1,
+    "title": "TaskContext / NodeRun / NodeRunStatus serde types",
+    "description": "In engine-contract, implement the core data-contract types: a NodeRunStatus enum with #[serde(rename_all = \"lowercase\")] mapping to pending|running|success|failed; a Usage type serializing as {input_tokens, output_tokens, model} and encoding null when absent (Option<Usage>); a NodeRun struct (status, started_at, completed_at as ISO-8601 UTC timestamps, error, input, usage); and a TaskContext struct ({event, nodes: Map<String, serde_json::Value>, metadata, node_runs: Map<String, NodeRun>}) keyed by node class name. Add the serde/serde_json and timestamp (chrono or time, per D2) deps to crates/engine-contract/Cargo.toml, and declare `pub mod task_context;` in crates/engine-contract/src/lib.rs. Include unit tests asserting the enum lowercase casing and the usage null/present serialization. Match orchestrator/docs/data-contract.md v1.0.1 exactly — no field/casing/type drift.",
+    "acceptance_criteria": [
+      "NodeRunStatus serializes/deserializes to lowercase pending|running|success|failed",
+      "usage serializes as {input_tokens, output_tokens, model} or null",
+      "TaskContext and NodeRun match the v1.0.1 shape (event, nodes, metadata, node_runs)",
+      "Unit tests for enum casing and usage null/present pass"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-contract/Cargo.toml",
+      "crates/engine-contract/src/lib.rs",
+      "crates/engine-contract/src/task_context.rs"
+    ],
+    "dependsOn": []
+  },
+  {
+    "task_id": 2,
+    "title": "EventsRow serde type",
+    "description": "In engine-contract, implement the EventsRow struct mirroring the events table: id (uuid), workflow_type (String, ≤150 chars), data (serde_json::Value), task_context (typed as the TaskContext from task 1), created_at and updated_at (timestamps per D2). Add serde impls and declare `pub mod events;` in crates/engine-contract/src/lib.rs. Include a unit test round-tripping an EventsRow through serde_json. Uses the deps task 1 added to engine-contract/Cargo.toml (do not re-edit the manifest). Depends on task 1 for the TaskContext type and shares src/lib.rs, so it is serialized after task 1.",
+    "acceptance_criteria": [
+      "EventsRow has id, workflow_type, data, task_context (TaskContext), created_at, updated_at",
+      "A serde_json round-trip unit test for EventsRow passes",
+      "engine-contract compiles clean under clippy -D warnings"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-contract/src/events.rs",
+      "crates/engine-contract/src/lib.rs"
+    ],
+    "dependsOn": [1]
+  },
+  {
+    "task_id": 3,
+    "title": "Captured Python fixture + byte-for-byte round-trip test",
+    "description": "Capture (or faithfully reconstruct per data-contract.md v1.0.1) a Python-emitted task_context/events payload into tests/fixtures/python_task_context.json. Write crates/engine-contract/tests/round_trip.rs that: (a) deserializes the fixture into the Rust EventsRow/TaskContext types and re-serializes, asserting semantic JSON equality with no field/casing/type difference (parse both sides to serde_json::Value and compare); and (b) constructs an equivalent EventsRow/TaskContext in Rust and asserts its emitted JSON matches the fixture's shape. This is the byte-for-byte seam guard.",
+    "acceptance_criteria": [
+      "tests/fixtures/python_task_context.json exists and reflects the v1.0.1 contract shape",
+      "round_trip.rs deserializes the fixture and re-serializes to a semantically identical JSON value (no field/casing/type drift)",
+      "round_trip.rs asserts a Rust-constructed EventsRow/TaskContext matches the contract shape",
+      "cargo test runs and passes the round-trip test"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "tests/fixtures/python_task_context.json",
+      "crates/engine-contract/tests/round_trip.rs"
+    ],
+    "dependsOn": [1, 2]
+  },
+  {
+    "task_id": 4,
+    "title": "engine-store Postgres read/write layer + gated live round-trip test",
+    "description": "In engine-store, implement crates/engine-store/src/postgres.rs: a connection pool built on the EN.0.A persistence stack (D2) and insert_event / update_event functions that write/read an EventsRow against the existing events table schema. Add the engine-contract dependency and the persistence/pool crate to crates/engine-store/Cargo.toml, and declare `pub mod postgres;` in crates/engine-store/src/lib.rs. Write crates/engine-store/tests/postgres_round_trip.rs that inserts an EventsRow and reads it back, asserting equality — but GATE it on DATABASE_URL: when the env var is unset the test returns early / is skipped (so CI's cargo test with no Postgres stays green); when set, it runs against that database. Do not invent a schema — target the existing events table (orchestrator/docs/data-contract.md v1.0.1).",
+    "acceptance_criteria": [
+      "engine-store exposes a connection pool + insert_event and update_event over EventsRow",
+      "crates/engine-store/Cargo.toml depends on engine-contract and the D2 persistence crate",
+      "The live round-trip test passes when DATABASE_URL is set and self-skips (does not fail) when it is unset",
+      "cargo test / clippy / fmt / build --release all pass with DATABASE_URL unset"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-store/Cargo.toml",
+      "crates/engine-store/src/lib.rs",
+      "crates/engine-store/src/postgres.rs",
+      "crates/engine-store/tests/postgres_round_trip.rs"
+    ],
+    "dependsOn": [1, 2]
+  },
+  {
+    "task_id": 5,
+    "title": "Validate",
+    "description": "Run the Validation Commands listed in tasks.md and confirm all pass (with DATABASE_URL unset, so the live Postgres test self-skips).",
+    "acceptance_criteria": [
+      "cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release all pass"
+    ],
+    "validation_commands": [
+      "cargo fmt --check",
+      "cargo clippy -- -D warnings",
+      "cargo test",
+      "cargo build --release"
+    ],
+    "max_attempts": 3,
+    "files": [],
+    "dependsOn": [1, 2, 3, 4]
+  }
+]
