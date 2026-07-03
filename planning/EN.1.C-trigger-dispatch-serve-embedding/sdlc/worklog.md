@@ -24,3 +24,8 @@ Validated: gating checks (fast tripwire)
 What: Added the EN.1.C headline integration test (crates/engine-serve/tests/dispatch_integration.rs) covering live-state read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow, and 422 for an unregistered workflow_type.
 Decisions: Used engine_serve::durable::message_to_row directly (a pure function) plus spawn_durable_writer(None) to assert both the self-skip behavior (no panic without DATABASE_URL) and the byte-identical EventsRow shape, since the writer itself performs no observable Postgres round trip when pool is None.; Drove the live-state assertion through the real HTTP POST /events/ handler (actix test harness) for full end-to-end realism, and used a separate direct Workflow::run invocation for the durable-mapping assertion so the seed (all-PENDING) snapshot could be captured explicitly.
 Validated: gating checks (fast tripwire)
+
+## Task 6 — PASSED (1 attempt)
+What: Task 6 (validation-only) confirmed all four gates pass: cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (all 22+19+3+1+1 tests green across engine-core/engine-serve/engine-store/engine-contract), and cargo build --release — all clean with zero code changes required.
+Decisions: Task 6 requires no code changes per its own description (pure validation gate); since the working tree was already clean after task 5, no commit was made — nothing to stage.
+Validated: gating checks (fast tripwire)

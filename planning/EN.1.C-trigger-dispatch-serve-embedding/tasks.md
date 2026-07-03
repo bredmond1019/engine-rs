@@ -12,7 +12,7 @@ related: [master-plan, status]
 
 # Task Spec — Phase 1, Block C (Trigger/dispatch + dual-registry + serve embedding)
 
-**Status:** All 4 tasks passed · **Last run:** 2026-07-03T14:38:55Z
+**Status:** All 6 tasks passed · **Last run:** 2026-07-03T14:45:53Z
 
 ## Goal
 Embed the engine in `bastion serve`: dual-registry dispatch keyed by `workflow_type`, the four-endpoint HTTP surface, in-memory live run state the local Console reads directly (no DB poll), and the async durable-write that implements EN.1.A's `on_progress` seam against `engine-store`.
