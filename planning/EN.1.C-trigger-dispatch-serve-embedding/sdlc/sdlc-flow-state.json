@@ -2,9 +2,9 @@
   "spec_slug": "EN.1.C-trigger-dispatch-serve-embedding",
   "branch": "EN.1.C-trigger-dispatch-serve-embedding-flow",
   "started_at": "2026-07-03T14:25:43Z",
-  "updated_at": "2026-07-03T14:50:06Z",
+  "updated_at": "2026-07-03T14:52:49Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow",
-  "status": "docs",
+  "status": "done",
   "current_task": 6,
   "tasks": {
     "1": {
@@ -244,13 +244,37 @@
         "filesReadKb": null,
         "inTokEst": 622,
         "outTok": 2441
+      },
+      {
+        "label": "review-1",
+        "model": "sonnet",
+        "promptTokEst": 1064,
+        "filesReadKb": null,
+        "inTokEst": 1064,
+        "outTok": 3716
+      },
+      {
+        "label": "docs",
+        "model": "sonnet",
+        "promptTokEst": 862,
+        "filesReadKb": null,
+        "inTokEst": 862,
+        "outTok": 6891
+      },
+      {
+        "label": "wrap-up",
+        "model": "sonnet",
+        "promptTokEst": 919,
+        "filesReadKb": null,
+        "inTokEst": 919,
+        "outTok": 5849
       }
     ],
     "total": {
-      "promptTokEst": 11173,
+      "promptTokEst": 14018,
       "filesReadKb": 0,
-      "inTokEst": 11173,
-      "outTok": 72587
+      "inTokEst": 14018,
+      "outTok": 89043
     }
   }
 }
