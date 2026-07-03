@@ -1,0 +1,252 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agentic-portfolio/base-template/harness.schema.json",
+  "title": "SDLC harness config",
+  "description": "Project policy the SDLC engines read from planning/harness.json. The harness (engine code) carries the mechanism; this file carries the project facts (validation commands, whether a UI-test stage exists, ports/routes). If the file is absent, the engines fall back to the spec's `## Validation Commands` section and disable the UI-test stage — they ship no stack defaults. Shape: validation.checks[] (each a plain command or one of the richer kinds — baseline-diff / count-delta / warning-scan / forbidden-pattern-scan) + uiTest.enabled (and its enabled-only fields). The richer kinds keep all stack-specific commands and patterns here; the engine only carries the interpretation mechanism.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Editor hint pointing at this schema (e.g. ../.claude/workflows/harness.schema.json)."
+    },
+    "stack": {
+      "type": "string",
+      "description": "Informational label only (e.g. 'rust', 'python-fastapi', 'nextjs'). Not consumed by engine logic."
+    },
+    "_comment": {
+      "type": "string",
+      "description": "Free-form note for humans editing the file. Ignored by the engines."
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The always-run validation suite the Test stage executes, in order.",
+      "properties": {
+        "checks": {
+          "type": "array",
+          "description": "Ordered checks run top-to-bottom in the Test stage.",
+          "items": { "$ref": "#/$defs/check" }
+        }
+      },
+      "required": ["checks"]
+    },
+    "uiTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional UI smoke-test stage. enabled:false makes the whole stage a no-op (verdict SKIPPED). The remaining fields are read only when enabled.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the pipeline runs a UI smoke check. Non-web projects set false."
+        },
+        "devServerCommand": {
+          "type": "string",
+          "description": "Command that starts the dev server (e.g. 'npm run dev')."
+        },
+        "readySignal": {
+          "type": "string",
+          "description": "Substring in the dev-server output that signals readiness (e.g. 'Ready in')."
+        },
+        "port": {
+          "type": "integer",
+          "description": "Base port the dev server listens on. In parallel task runs the engine uses port + taskNumber (hardcoded behavior)."
+        },
+        "routes": {
+          "type": "array",
+          "description": "Routes to smoke-check once the server is ready (e.g. ['/', '/about']).",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["enabled"]
+    },
+    "planning": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional planning-phase policy read by the authoring commands (/plan, /generate-tasks). Absent → all fields default to preserve today's zero-touch behavior.",
+      "properties": {
+        "clarify": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, the authoring commands surface 2-4 targeted clarifying questions for an ambiguous prompt BEFORE writing the spec. Default false preserves the zero-touch flow (write immediately). A user can always force this per-invocation with the --clarify flag regardless of this setting."
+        }
+      }
+    },
+    "breakdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional task-decomposition policy. Once the spec exists, the engines assess each task against a universal coarseness heuristic and, per `mode`, recommend or auto-generate a /breakdown before implementing. Absent → mode 'recommend' (advisory) with complexityThreshold 3. The heuristic is mechanism in the engines; only mode/threshold are project policy.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["recommend", "auto", "off"],
+          "default": "recommend",
+          "description": "recommend: log a breakdown recommendation for coarse tasks and proceed (no file written). auto: generate breakdown.md for the flagged tasks before implementing them (block: committed on main before the waves; standalone task: in its worktree). off: skip the assessment entirely."
+        },
+        "complexityThreshold": {
+          "type": "integer",
+          "default": 3,
+          "description": "A task that creates/modifies MORE than this many distinct files is a breakdown candidate (the file-count signal). Multi-concern / multi-layer tasks are flagged regardless of count."
+        }
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional policy for /sdlc-block (the block-level roadmap orchestrator: fans out one /sdlc-flow per independent block in its own worktree, runs blocks in dependency-ordered waves derived from a master-plan-format file, opens a PR per block by default). Absent → maxParallelBlocks 3, autoMerge false. Only read by /sdlc-block; other engines ignore it.",
+      "properties": {
+        "maxParallelBlocks": {
+          "type": "integer",
+          "default": 3,
+          "description": "Maximum number of blocks /sdlc-block fans out concurrently within a wave. A wave contains blocks that share no dependency; this cap limits concurrent worktree creation and /sdlc-flow runs. Lower for machines with tight disk/memory; raise for CI with ample resources."
+        },
+        "autoMerge": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, /sdlc-block merges each block's branch into the train branch as it completes (no PRs opened; human review bypassed). When false (default), one PR is opened per block and /merge-train handles the ordered merge after human review. CLI --auto-merge overrides this per run."
+        }
+      }
+    },
+    "flow": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional policy for /sdlc-flow (the default engine for non-trivial feature work: one shared worktree, per-task test-fix loop, single end-review, PR terminal step). Absent → CLI flag defaults apply. Only read by /sdlc-flow; other engines ignore it. CLI flags override these keys for a single run.",
+      "properties": {
+        "autoMerge": {
+          "type": "boolean",
+          "default": false,
+          "description": "Default for the --auto-merge flag. When true, /sdlc-flow merges the PR and tears down the worktree on a clean PASS (non-draft PR only). False: stop after opening the PR and let a human merge. CLI --auto-merge overrides this."
+        },
+        "testDepth": {
+          "type": "string",
+          "enum": ["fast", "full"],
+          "default": "fast",
+          "description": "Per-task validation depth. 'fast' (default): run only gates:true checks as a tripwire per task — cheap and catches regressions early. 'full': run the whole validation suite per task — more thorough but slower. The end-review always runs the full suite regardless of this setting. CLI --test-depth overrides this."
+        },
+        "prBase": {
+          "type": "string",
+          "default": "main",
+          "description": "Base branch for gh pr create --base. Defaults to 'main'. Set to 'develop' or another integration branch if the project does not use main as its primary target. No CLI override — set once per project here."
+        },
+        "bailReasons": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra project-specific immediate-bail reasons appended to the five universal ones. When the triage agent classifies a failure, it checks this list in addition to the hardcoded set. Format: plain-English sentences (one reason per string). Bias: 'when unsure, bail' — keep reasons concrete so the agent can make a clean yes/no call."
+        }
+      }
+    }
+  },
+  "required": ["validation", "uiTest"],
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One validation check. With no `kind` (or kind:'command') it is a plain command gated on exit code — the original shape. The richer kinds add engine-interpreted semantics while keeping every stack-specific command/pattern in this file.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["command", "baseline-diff", "count-delta", "warning-scan", "forbidden-pattern-scan"],
+          "default": "command",
+          "description": "How the engine runs this check. Omit (or 'command') for a plain exit-code gate. 'baseline-diff': snapshot a baseline at worktree creation and fail only on net-new items. 'count-delta': extract an integer and fail when it regresses vs the previous task. 'warning-scan': run a command (its exit code gates) and record matches of warningPatterns in its output, with severity per `gates`. 'forbidden-pattern-scan': grep source for patterns that must not appear."
+        },
+        "name": {
+          "type": "string",
+          "description": "Short identifier for the check (e.g. 'fmt', 'clippy', 'test', 'net-new-lint')."
+        },
+        "command": {
+          "type": "string",
+          "description": "Shell command to run. Required for all kinds except forbidden-pattern-scan. For baseline-diff this produces the CURRENT snapshot (same format as baselineCommand). For count-delta / warning-scan it is the command whose output is parsed / scanned."
+        },
+        "purpose": {
+          "type": "string",
+          "description": "One-line description of what the check gates. For the authoritative test command, say so here."
+        },
+        "gates": {
+          "type": "boolean",
+          "description": "Whether this check's failure blocks the review verdict. Replaces the old hardcoded 'jest is authoritative' rule. For warning-scan, gates:false reports matches as WARN; gates:true fails on any match."
+        },
+        "baselineCommand": {
+          "type": "string",
+          "description": "baseline-diff only: run once at worktree creation to capture the pre-task baseline artifact. Must emit the same format as `command` (e.g. a JSON array of violation objects)."
+        },
+        "compareKeys": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "baseline-diff only: the object fields whose tuple identifies a result item. The check fails on items in the current output whose key-tuple is absent from the baseline (net-new only); pre-existing items are ignored."
+        },
+        "countPattern": {
+          "type": "string",
+          "description": "count-delta only: a grep -E (ERE) pattern matching the line that carries the count; the engine extracts the first integer on the matched line (e.g. '[0-9]+ tests? collected')."
+        },
+        "failOn": {
+          "type": "string",
+          "enum": ["decrease", "zero-or-decrease"],
+          "description": "count-delta only: fail when the count drops below the previous task's recorded count ('decrease'), or also when it fails to increase ('zero-or-decrease'). First task / no prior record → the check is SKIPPED."
+        },
+        "warningPatterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "warning-scan only: grep -E (ERE) patterns matched against the command's combined stdout+stderr. Every match is recorded in the report; gating follows `gates`."
+        },
+        "rules": {
+          "type": "array",
+          "description": "forbidden-pattern-scan only: source patterns that must NOT appear. Any rule that matches is a violation.",
+          "items": { "$ref": "#/$defs/rule" }
+        }
+      },
+      "required": ["name", "purpose", "gates"],
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "baseline-diff" } }, "required": ["kind"] },
+          "then": { "required": ["command", "baselineCommand", "compareKeys"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "count-delta" } }, "required": ["kind"] },
+          "then": { "required": ["command", "countPattern", "failOn"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "warning-scan" } }, "required": ["kind"] },
+          "then": { "required": ["command", "warningPatterns"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "forbidden-pattern-scan" } }, "required": ["kind"] },
+          "then": { "required": ["rules"] }
+        },
+        {
+          "if": {
+            "anyOf": [
+              { "not": { "required": ["kind"] } },
+              { "properties": { "kind": { "const": "command" } } }
+            ]
+          },
+          "then": { "required": ["command"] }
+        }
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A forbidden-pattern-scan rule: source matching `pattern` (minus `allowlistPattern`) is a violation.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Short identifier for the rule (e.g. 'f-string-in-logging')."
+        },
+        "pattern": {
+          "type": "string",
+          "description": "A grep -E (ERE) pattern searched across the project's source."
+        },
+        "paths": {
+          "type": "string",
+          "description": "Optional path scope for the grep (e.g. 'app/'). Defaults to the whole worktree."
+        },
+        "allowlistPattern": {
+          "type": "string",
+          "description": "Optional grep -E pattern; matching lines are excluded as legitimate exceptions."
+        }
+      },
+      "required": ["id", "pattern"]
+    }
+  }
+}

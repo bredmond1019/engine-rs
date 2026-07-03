@@ -1,0 +1,31 @@
+{
+  "$schema": "../.claude/workflows/harness.schema.json",
+  "stack": "rust",
+  "validation": {
+    "checks": [
+      { "name": "fmt",    "command": "cargo fmt --check",            "purpose": "Format gate", "gates": true },
+      { "name": "clippy", "command": "cargo clippy -- -D warnings",  "purpose": "Lint gate",   "gates": true },
+      { "name": "test",   "command": "cargo test",                   "purpose": "Test suite — AUTHORITATIVE for verdict", "gates": true },
+      { "name": "build",  "command": "cargo build --release",        "purpose": "Build gate",  "gates": true }
+    ]
+  },
+  "uiTest": {
+    "enabled": false
+  },
+  "breakdown": {
+    "mode": "recommend",
+    "complexityThreshold": 3
+  },
+  "planning": {
+    "clarify": false
+  },
+  "block": {
+    "maxParallelBlocks": 3
+  },
+  "flow": {
+    "autoMerge": false,
+    "testDepth": "fast",
+    "prBase": "main",
+    "bailReasons": []
+  }
+}

@@ -1,0 +1,281 @@
+{
+  "repo": "engine-rs",
+  "kind": "project",
+  "updated": "2026-07-02",
+  "focus": {
+    "now": [],
+    "next": [
+      {
+        "id": "EN.0.A",
+        "title": "Cargo workspace + CI",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": []
+      }
+    ],
+    "blocked": [
+      {
+        "id": "EN.0.B",
+        "title": "Data-contract serde types + Postgres round-trip",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.0.A",
+            "what": null
+          }
+        ]
+      },
+      {
+        "id": "EN.1.A",
+        "title": "Node trait + Workflow runner",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.0.B",
+            "what": null
+          }
+        ]
+      },
+      {
+        "id": "EN.1.B",
+        "title": "Router + parallel nodes + validator",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.1.A",
+            "what": null
+          }
+        ]
+      },
+      {
+        "id": "EN.1.C",
+        "title": "Trigger/dispatch + dual-registry + serve embedding",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.1.B",
+            "what": null
+          }
+        ]
+      },
+      {
+        "id": "EN.2.A",
+        "title": "Claude Code step node",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.1.C",
+            "what": null
+          }
+        ]
+      },
+      {
+        "id": "EN.2.B",
+        "title": "Cancellation + abort endpoint + cost/token budget gate",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.2.A",
+            "what": null
+          }
+        ]
+      },
+      {
+        "id": "EN.3.A",
+        "title": "SDLC-flow setup + task loop port",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.2.B",
+            "what": null
+          }
+        ]
+      },
+      {
+        "id": "EN.3.B",
+        "title": "SDLC-flow docs/wrap-up/PR port + parity acceptance",
+        "status": null,
+        "note": null,
+        "repo": null,
+        "blocked_by": [
+          {
+            "type": "block",
+            "repo": "engine-rs",
+            "id": "EN.3.A",
+            "what": null
+          }
+        ]
+      }
+    ]
+  },
+  "tracks": [
+    {
+      "title": "engine-rs first milestone — engine core + contract emitter + SDLC-flow parity (D42)",
+      "blocks": [
+        {
+          "id": "EN.0.A",
+          "title": "Cargo workspace + CI",
+          "status": "open",
+          "depends_on": [],
+          "wave": 0,
+          "origin": null
+        },
+        {
+          "id": "EN.0.B",
+          "title": "Data-contract serde types + Postgres round-trip",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.0.A",
+              "what": null
+            }
+          ],
+          "wave": 0,
+          "origin": null
+        },
+        {
+          "id": "EN.1.A",
+          "title": "Node trait + Workflow runner",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.0.B",
+              "what": null
+            }
+          ],
+          "wave": 1,
+          "origin": null
+        },
+        {
+          "id": "EN.1.B",
+          "title": "Router + parallel nodes + validator",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.1.A",
+              "what": null
+            }
+          ],
+          "wave": 1,
+          "origin": null
+        },
+        {
+          "id": "EN.1.C",
+          "title": "Trigger/dispatch + dual-registry + serve embedding",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.1.B",
+              "what": null
+            }
+          ],
+          "wave": 1,
+          "origin": null
+        },
+        {
+          "id": "EN.2.A",
+          "title": "Claude Code step node",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.1.C",
+              "what": null
+            }
+          ],
+          "wave": 2,
+          "origin": null
+        },
+        {
+          "id": "EN.2.B",
+          "title": "Cancellation + abort endpoint + cost/token budget gate",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.2.A",
+              "what": null
+            }
+          ],
+          "wave": 2,
+          "origin": null
+        },
+        {
+          "id": "EN.3.A",
+          "title": "SDLC-flow setup + task loop port",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.2.B",
+              "what": null
+            }
+          ],
+          "wave": 3,
+          "origin": null
+        },
+        {
+          "id": "EN.3.B",
+          "title": "SDLC-flow docs/wrap-up/PR port + parity acceptance",
+          "status": "open",
+          "depends_on": [
+            {
+              "type": "block",
+              "repo": "engine-rs",
+              "id": "EN.3.A",
+              "what": null
+            }
+          ],
+          "wave": 3,
+          "origin": null
+        }
+      ]
+    }
+  ],
+  "repos": [],
+  "cross_repo": [],
+  "tiers": [],
+  "note": null,
+  "backlog": [],
+  "carryover": []
+}
