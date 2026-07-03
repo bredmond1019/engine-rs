@@ -1,6 +1,7 @@
 //! The `Workflow` pointer-walk runner: seeds every node PENDING, walks
-//! node-to-node via `WorkflowSchema::next_after` (`connections[0]` only — no
-//! router branching, that's EN.1.B), and stamps each `NodeRun` RUNNING then
+//! node-to-node via `WorkflowSchema::next_after` (`connections[0]`) for plain
+//! nodes or via `Router::route(ctx)` (which may return an undeclared runtime
+//! back-edge) for routers, and stamps each `NodeRun` RUNNING then
 //! SUCCESS/FAILED + timing around the framework-owned `node_context` envelope.
 //!
 //! The `on_progress` callback is the injected persistence seam (contract-facing
@@ -14,6 +15,7 @@ use engine_contract::{NodeRun, NodeRunStatus, TaskContext};
 
 use crate::node::NodeRegistry;
 use crate::schema::WorkflowSchema;
+use crate::validate::{ValidationError, WorkflowValidator};
 
 /// The injected persistence seam, invoked with a snapshot of the `TaskContext`
 /// at each node boundary (initial seed, and after every node transition).
@@ -55,14 +57,34 @@ impl Workflow {
         Self { registry, schema }
     }
 
+    /// Run `WorkflowValidator::validate` against `registry`/`schema` before
+    /// constructing. Use this constructor when the declared graph must be
+    /// guaranteed structurally sound (BFS reachability, DFS cycle check that
+    /// skips router edges, and router-only fan-out) before any node runs.
+    ///
+    /// `Workflow::new` stays infallible and unvalidated so EN.1.A callers and
+    /// tests keep compiling unchanged.
+    pub fn new_validated(
+        registry: NodeRegistry,
+        schema: WorkflowSchema,
+    ) -> Result<Self, ValidationError> {
+        WorkflowValidator::validate(&registry, &schema)?;
+        Ok(Self { registry, schema })
+    }
+
     /// Run the workflow to completion (or first failure).
     ///
     /// `event` seeds `TaskContext::event`; all nodes declared in the schema are
     /// seeded PENDING in `node_runs` before the walk starts, and the initial
     /// snapshot is emitted via `on_progress` before the first node runs. The
-    /// pointer-walk starts at the schema's start node and follows
-    /// `connections[0]` only. A node returning `Err` is stamped FAILED and
-    /// halts the walk (the accumulated `TaskContext` is still returned).
+    /// pointer-walk starts at the schema's start node. For a non-router node
+    /// the walk follows `connections[0]`; for a router (`Node::as_router()`
+    /// returns `Some`) the walk instead calls `Router::route(&ctx)` to choose
+    /// the next identity at runtime — which may be an identity outside the
+    /// router's declared `connections` (a retry/back-edge). A router returning
+    /// `None` from `route` ends the walk. A node returning `Err` is stamped
+    /// FAILED and halts the walk (the accumulated `TaskContext` is still
+    /// returned).
     pub fn run(
         &self,
         event: serde_json::Value,
@@ -98,6 +120,15 @@ impl Workflow {
                 WorkflowError::new(format!("no node registered for identity '{identity}'"))
             })?;
 
+            // Routers choose their next identity at runtime via `route(ctx)`
+            // (possibly an undeclared back-edge); plain nodes keep walking
+            // the statically declared `connections[0]`. Resolve this before
+            // `node_context` consumes `ctx` so the router sees the context
+            // as it stood on entry to this node.
+            let router_next = node
+                .as_router()
+                .map(|router| crate::routing::dispatch_route(router, &ctx));
+
             let (next_ctx, failed) = node_context(node, ctx, &mut on_progress);
             ctx = next_ctx;
 
@@ -105,7 +136,10 @@ impl Workflow {
                 break;
             }
 
-            current = self.schema.next_after(&identity).map(str::to_string);
+            current = match router_next {
+                Some(next) => next,
+                None => self.schema.next_after(&identity).map(str::to_string),
+            };
         }
 
         Ok(ctx)
