@@ -1,6 +1,6 @@
 # Task Spec — Phase 1, Block A (EN.1.A — Node trait + Workflow runner)
 
-**Status:** Not started · **Last run:** never
+**Status:** Done · **Last run:** 2026-07-03 (PASS)
 
 ## Goal
 Port the engine's execution core to idiomatic Rust: a `Node` trait plus a `Workflow` pointer-walk runner that seeds all nodes PENDING, walks node-to-node inside a framework-owned envelope, and stamps RUNNING → SUCCESS/FAILED + timing on each `NodeRun`.

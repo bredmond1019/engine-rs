@@ -5,9 +5,9 @@ description: Current state and progress tracker for engine-rs.
 doc_id: status
 layer: [factory]
 status: active
-timestamp: "2026-07-02"
-now: "Phase 1, EN.1.A — Node trait + Workflow runner"
-next: "Define EN.1.A tasks via /generate-tasks EN.1.A"
+timestamp: "2026-07-03"
+now: "Phase 1, EN.1.B — Router + parallel nodes + validator"
+next: "Define EN.1.B tasks via /generate-tasks EN.1.B"
 blocked: []
 keywords: [status, progress tracker, current focus, blocks]
 related: [context, master-plan, planning-index, knowledge, memory]
@@ -15,8 +15,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-02 — EN.0.B done, PASS
-**Current focus:** EN.1.A-node-trait-workflow-runner
+**Last updated:** 2026-07-03 — EN.1.A done, PASS
+**Current focus:** EN.1.B-router-parallel-nodes-validator
 
 ---
 
@@ -35,8 +35,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 > Working board — keep all five queues live. **Never end a meaningful session with every queue
 > empty.** The headlines of **now / next / blocked** mirror the frontmatter scalars above.
 
-- **now** — Phase 1, EN.1.A — Node trait + Workflow runner
-- **next** — Define EN.1.A tasks (`/generate-tasks EN.1.A`)
+- **now** — Phase 1, EN.1.B — Router + parallel nodes + validator
+- **next** — Define EN.1.B tasks (`/generate-tasks EN.1.B`)
 - **blocked** — _nothing yet — each entry names its blocker and the smallest missing answer_
 - **improve** — _self-improvement backlog: eval gaps, flaky workflows, repeated failures, missing skills, stale assumptions_
 - **recurring** — _schedules, monitors, sweeps, automations_
@@ -62,6 +62,11 @@ related: [context, master-plan, planning-index, knowledge, memory]
 |---|---|---|---|
 | EN.0.A | Cargo workspace + CI | Done | Workspace skeleton, fmt/clippy/test CI, async-runtime decision (D2) |
 | EN.0.B | Data-contract serde types + Postgres round-trip | Done | Byte-for-byte seam types + engine-store Postgres round-trip (self-skips without DATABASE_URL); PASS review |
+
+### Phase 1 — Execution Core
+| Block | What | Status | Notes |
+|---|---|---|---|
+| EN.1.A | Node trait + Workflow runner | Done | `Node` trait + `NodeRegistry`, `WorkflowSchema`, pointer-walk `Workflow::run` with `on_progress` seam; PASS review |
 
 <!-- Add one sub-table per phase as the plan is fleshed out. -->
 
