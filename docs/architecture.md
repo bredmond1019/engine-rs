@@ -23,10 +23,9 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 
 ## Module Map
 
-The Cargo workspace (EN.0.A) declares the four member crates below. `engine-core` now holds real
-types (EN.1.A — `Node` trait, `NodeRegistry`, `WorkflowSchema`/`NodeConfig`, `Workflow` pointer-walk
-runner); the other three crates still hold a compiling `src/lib.rs` stub with one trivial passing
-test pending their own Phase 0/1 blocks.
+The Cargo workspace (EN.0.A) declares the four member crates below. `engine-core` (EN.1.A),
+`engine-contract` (EN.0.B), and `engine-store` (EN.0.B) now hold real types; `engine-serve` still
+holds a compiling `src/lib.rs` stub with one trivial passing test, pending its Phase 1 blocks.
 
 ```
 engine-rs/
@@ -35,18 +34,24 @@ engine-rs/
 │   ├── engine-core/       ← node.rs (Node trait + NodeRegistry), schema.rs (WorkflowSchema/
 │   │                         NodeConfig), workflow.rs (Workflow pointer-walk runner +
 │   │                         on_progress seam); graph validator still to land
-│   ├── engine-contract/   ← data-contract serde types (events row, task_context, NodeRun)
-│   ├── engine-store/      ← Postgres read/write for the durable `events` record
+│   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
+│   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
+│   │                         orchestrator data-contract.md v1.0.1 byte-for-byte
+│   ├── engine-store/      ← postgres.rs: sqlx::PgPool connect/insert_event/update_event/
+│   │                         get_event for the durable `events` record
 │   └── engine-serve/      ← bastion serve embedding: in-memory run state, trigger/dispatch, HTTP surface
 └── tests/                 ← round-trip + integration fixtures
-    (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test)
+    (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
+    crates/engine-contract/tests/round_trip.rs — fixture byte-for-byte serde round-trip;
+    crates/engine-store/tests/postgres_round_trip.rs — DATABASE_URL-gated live Postgres round-trip)
 ```
 
 ## Build & CI
 
 Async runtime + persistence: `tokio` + `sqlx` (postgres, runtime-tokio, tls-rustls) — see
-`planning/decisions/D2-async-runtime-choice.md`. `engine-store` and `engine-serve` carry these as
-real dependencies; `engine-core`'s stub only needs `tokio` as a dev-dependency so far.
+`planning/decisions/D2-async-runtime-choice.md`. `engine-store` carries `sqlx` as a real
+dependency for its Postgres layer; `engine-contract` carries `chrono`/`uuid` for the data-contract
+types; `engine-core` and `engine-serve` only need `tokio` as a dev-dependency so far.
 
 CI (`.github/workflows/ci.yml`) runs on every push (all branches) and on pull requests, running
 the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
