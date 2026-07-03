@@ -23,3 +23,6 @@ Validated: gating checks (fast tripwire)
 ## Task 5 — PASSED (1 attempt)
 What: Task 5 (Validate) confirmed cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release all pass with no code changes needed.
 Validated: gating checks (fast tripwire)
+
+## Docs
+Patched: docs/architecture.md
