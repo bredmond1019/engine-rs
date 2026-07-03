@@ -243,6 +243,8 @@ dependencies = [
 name = "engine-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "engine-contract",
  "serde",
  "serde_json",
  "tokio",
