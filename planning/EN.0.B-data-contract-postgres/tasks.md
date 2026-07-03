@@ -1,6 +1,6 @@
 # Task Spec — Phase 0, Block B (EN.0.B) — Data-contract serde types + Postgres round-trip
 
-**Status:** Not started · **Last run:** never
+**Status:** Done · **Last run:** 2026-07-02
 
 ## Goal
 Implement the serde types for the preserved data-contract seam (`events` row, `TaskContext`, `NodeRun`) and the `engine-store` Postgres read/write layer, proven by a byte-for-byte round-trip test against a captured Python fixture and a live Postgres insert/read.

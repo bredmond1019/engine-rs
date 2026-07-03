@@ -1,0 +1,60 @@
+{
+  "spec_slug": "EN.0.B-data-contract-postgres",
+  "started_at": "2026-07-03T00:52:00Z",
+  "updated_at": "2026-07-03T00:55:34Z",
+  "current_phase": "wrap-up",
+  "completed_phases": ["implement","test","review","ui-test","document","wrap-up"],
+  "failed_phase": null,
+  "task_number": null,
+  "resume_from": null,
+  "tokens": {
+    "stages": [
+      {
+        "label": "scout",
+        "model": "haiku",
+        "promptTokEst": 1016,
+        "filesReadKb": null,
+        "inTokEst": 1016,
+        "outTok": 2684
+      },
+      {
+        "label": "implement",
+        "model": "sonnet",
+        "promptTokEst": 1106,
+        "filesReadKb": null,
+        "inTokEst": 1106,
+        "outTok": 24416
+      },
+      {
+        "label": "test",
+        "model": "haiku",
+        "promptTokEst": 586,
+        "filesReadKb": null,
+        "inTokEst": 586,
+        "outTok": 2258
+      },
+      {
+        "label": "review-1",
+        "model": "sonnet",
+        "promptTokEst": 1139,
+        "filesReadKb": null,
+        "inTokEst": 1139,
+        "outTok": 5495
+      },
+      {
+        "label": "document",
+        "model": "sonnet",
+        "promptTokEst": 1139,
+        "filesReadKb": null,
+        "inTokEst": 1139,
+        "outTok": 2850
+      }
+    ],
+    "total": {
+      "promptTokEst": 4986,
+      "filesReadKb": 0,
+      "inTokEst": 4986,
+      "outTok": 37703
+    }
+  }
+}
