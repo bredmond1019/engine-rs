@@ -18,3 +18,6 @@ Validated: gating checks (fast tripwire)
 
 ## Docs
 Patched: docs/architecture.md
+
+## Wrap-up — PASS
+Next: EN.2.A — Claude Code step node; first command /generate-tasks EN.2.A

@@ -2,9 +2,9 @@
   "spec_slug": "EN.2.0-async-node-trait",
   "branch": "EN.2.0-async-node-trait-flow",
   "started_at": "2026-07-03T19:32:14Z",
-  "updated_at": "2026-07-03T19:43:30Z",
+  "updated_at": "2026-07-03T19:45:35Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.2.0-async-node-trait-flow",
-  "status": "docs",
+  "status": "done",
   "current_task": 3,
   "tasks": {
     "1": {
@@ -160,13 +160,21 @@
         "filesReadKb": null,
         "inTokEst": 818,
         "outTok": 5441
+      },
+      {
+        "label": "wrap-up",
+        "model": "sonnet",
+        "promptTokEst": 840,
+        "filesReadKb": null,
+        "inTokEst": 840,
+        "outTok": 8911
       }
     ],
     "total": {
-      "promptTokEst": 7615,
+      "promptTokEst": 8455,
       "filesReadKb": 0,
-      "inTokEst": 7615,
-      "outTok": 55315
+      "inTokEst": 8455,
+      "outTok": 64226
     }
   }
 }
