@@ -222,6 +222,26 @@
       "text": "EN.2.A's native transport (claude-sdk-rs execute_claude + Config, post repair-pass) is NOT buildable/verifiable from engine-rs: the claude-sdk-rs repo is not on disk at ../../../claude-sdk-rs and its repair-pass state is unconfirmed. Per the master-plan block, if the repair pass hasn't landed, fall back to the tmux/file-drop 'bastion ask' seam (parity with orchestrator/app/services/claude_code/bastion_backend.py:128). The user wants to first review a Claude Code Rust SDK on GitHub and compare it against claude-sdk-rs before the transport is decided, so transport primacy is deliberately deferred.",
       "clears_when": "the ClaudeCodeStep transport is decided and its decision file (D4) is written",
       "created": "2026-07-03"
+    },
+    {
+      "slug": "resolve-async-node-question-before-en2a",
+      "scope": {
+        "repo": "engine-rs"
+      },
+      "kind": "deferred",
+      "text": "Before EN.2.A's spec is (re)written, decide whether engine-core's Node trait should become `async fn` (native RPITIT or async_trait). Full context, file/struct/function map of both the Rust and Python execution cores, and open questions are captured in planning/async-node/notes.md (also pointed to from the brain backlog). This is separate from, but related to, the transport decision (see the two carryover entries above) — the transport choice picks HOW ClaudeCodeStep talks to Claude Code; this question picks whether the Node trait itself can await that call cooperatively on Tokio instead of blocking a thread.",
+      "clears_when": "a decision is made on Node::process's sync-vs-async signature and (if async is chosen) the touched surface in planning/async-node/notes.md's Rough Scope is scoped into EN.2.A or its own block",
+      "created": "2026-07-03"
+    },
+    {
+      "slug": "en2a-transport-decision-options",
+      "scope": {
+        "repo": "engine-rs"
+      },
+      "kind": "constraint",
+      "text": "Before generating EN.2.A tasks, decide between Option A, B, or C for the ClaudeCodeStep transport (clean up homegrown SDK, build a hybrid, or write a simple CLI wrapper node in engine-rs). Must support async, process kill_on_drop, and total_cost_usd reporting via subscription (not API credits). All context and options are in planning/claude-sdk/notes.md.",
+      "clears_when": "the ClaudeCodeStep transport is decided and its decision file (D4) is written",
+      "created": "2026-07-03"
     }
   ]
 }
