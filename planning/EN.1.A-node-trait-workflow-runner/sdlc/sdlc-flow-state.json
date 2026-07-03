@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.A-node-trait-workflow-runner",
   "branch": "EN.1.A-node-trait-workflow-runner-flow",
   "started_at": "2026-07-03T07:49:24Z",
-  "updated_at": "2026-07-03T07:49:24Z",
+  "updated_at": "2026-07-03T07:51:21Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.A-node-trait-workflow-runner-flow",
   "status": "running",
-  "current_task": 1,
+  "current_task": 2,
   "tasks": {
     "1": {
       "status": "passed",
@@ -23,6 +23,23 @@
         "crates/engine-core/src/lib.rs",
         "crates/engine-core/src/node.rs",
         "Cargo.lock"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "2": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-core now defines WorkflowSchema/NodeConfig with helpers to resolve the start node and each node's connections[0] next-node, covered by unit tests on a linear 3-node schema.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "NodeConfig::next() returns connections.first() as &str, matching the 'connections[0] only' scope for this block",
+        "WorkflowSchema stores nodes as HashMap<String, NodeConfig> keyed by node identity for O(1) start/next lookups"
+      ],
+      "files_changed": [
+        "crates/engine-core/src/schema.rs",
+        "crates/engine-core/src/lib.rs"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -75,13 +92,29 @@
         "filesReadKb": null,
         "inTokEst": 610,
         "outTok": 1950
+      },
+      {
+        "label": "implement-2-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 4350
+      },
+      {
+        "label": "test-2-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 2306
       }
     ],
     "total": {
-      "promptTokEst": 2709,
+      "promptTokEst": 4355,
       "filesReadKb": 0,
-      "inTokEst": 2709,
-      "outTok": 12390
+      "inTokEst": 4355,
+      "outTok": 19046
     }
   }
 }
