@@ -1,0 +1,241 @@
+{
+  "spec_slug": "EN.1.A-node-trait-workflow-runner",
+  "branch": "EN.1.A-node-trait-workflow-runner-flow",
+  "started_at": "2026-07-03T07:49:24Z",
+  "updated_at": "2026-07-03T08:05:56Z",
+  "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.A-node-trait-workflow-runner-flow",
+  "status": "done",
+  "current_task": 5,
+  "tasks": {
+    "1": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-core now defines the Node trait (process/name) and a NodeRegistry (HashMap<String, Box<dyn Node>>) with lookup, backed by engine-contract's TaskContext, with unit tests for transformation and identity-key matching.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "NodeError is a simple struct wrapping a String message, implementing Display + std::error::Error, rather than an enum — task 1 scope only needs a minimal failure carrier; richer variants can be added later if needed.",
+        "Node trait bounds Send + Sync so boxed trait objects work cleanly in a registry/runner context used across async boundaries later.",
+        "Dropped the crate_name() placeholder function and its test since nothing outside engine-core referenced it."
+      ],
+      "files_changed": [
+        "crates/engine-core/Cargo.toml",
+        "crates/engine-core/src/lib.rs",
+        "crates/engine-core/src/node.rs",
+        "Cargo.lock"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "2": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-core now defines WorkflowSchema/NodeConfig with helpers to resolve the start node and each node's connections[0] next-node, covered by unit tests on a linear 3-node schema.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "NodeConfig::next() returns connections.first() as &str, matching the 'connections[0] only' scope for this block",
+        "WorkflowSchema stores nodes as HashMap<String, NodeConfig> keyed by node identity for O(1) start/next lookups"
+      ],
+      "files_changed": [
+        "crates/engine-core/src/schema.rs",
+        "crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "3": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added the Workflow pointer-walk runner (crates/engine-core/src/workflow.rs) with the on_progress persistence seam and node_context envelope, seeding all nodes PENDING before the walk, stamping RUNNING/SUCCESS/FAILED transitions with timing, and halting on node failure; wired into lib.rs and covered by unit tests.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Node::process consumes and only returns TaskContext on Ok, so node_context clones ctx before calling process to have a base context available for stamping the FAILED transition on Err (since NodeError carries no context back).",
+        "Used Rc<RefCell<Vec<TaskContext>>> in tests to capture on_progress snapshots, avoiding a borrow conflict between the FnMut closure (borrowed mutably during run) and post-call assertions on the captured Vec.",
+        "WorkflowError (distinct from NodeError) is returned only for graph-shape issues like an unregistered node identity; a node's own failure is captured in NodeRun and does not short-circuit run() with an Err — the accumulated TaskContext is still returned Ok."
+      ],
+      "files_changed": [
+        "crates/engine-core/src/workflow.rs",
+        "crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "4": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added the fixture 3-node linear workflow integration test (workflow_runner.rs) covering full-success PENDING->RUNNING->SUCCESS transitions, initial on_progress PENDING snapshot, and a middle-node failure that halts the walk before the third node runs.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Used identity names start_node/node2/node3 to match schema.rs conventions while keeping the linear 3-node fixture clear",
+        "Asserted the initial on_progress snapshot's TaskContext::nodes is empty as an extra check that the PENDING seed snapshot precedes any node execution"
+      ],
+      "files_changed": [
+        "crates/engine-core/tests/workflow_runner.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "5": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Ran the spec's four validation commands (cargo fmt --check, cargo clippy -- -D warnings, cargo test, cargo build --release); all pass with no code changes needed.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Task 5 is validation-only (no files listed); confirmed working tree was already clean/passing from prior tasks, so no commit was made."
+      ],
+      "files_changed": [],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    }
+  },
+  "review": {
+    "verdict": "PASS",
+    "findings": [],
+    "attempts": 1
+  },
+  "docs": {
+    "changed": [
+      "docs/architecture.md"
+    ],
+    "created": []
+  },
+  "bail_reason": null,
+  "pr": {
+    "url": null,
+    "number": null
+  },
+  "tokens": {
+    "stages": [
+      {
+        "label": "worktree-setup",
+        "model": "haiku",
+        "promptTokEst": 798,
+        "filesReadKb": null,
+        "inTokEst": 798,
+        "outTok": 3999
+      },
+      {
+        "label": "enumerate",
+        "model": "haiku",
+        "promptTokEst": 265,
+        "filesReadKb": null,
+        "inTokEst": 265,
+        "outTok": 752
+      },
+      {
+        "label": "implement-1-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 5689
+      },
+      {
+        "label": "test-1-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 1950
+      },
+      {
+        "label": "implement-2-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 4350
+      },
+      {
+        "label": "test-2-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 2306
+      },
+      {
+        "label": "implement-3-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 12875
+      },
+      {
+        "label": "test-3-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 1752
+      },
+      {
+        "label": "implement-4-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 5937
+      },
+      {
+        "label": "test-4-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 2431
+      },
+      {
+        "label": "implement-5-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 1470
+      },
+      {
+        "label": "test-5-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 1947
+      },
+      {
+        "label": "review-1",
+        "model": "sonnet",
+        "promptTokEst": 1042,
+        "filesReadKb": null,
+        "inTokEst": 1042,
+        "outTok": 2833
+      },
+      {
+        "label": "docs",
+        "model": "sonnet",
+        "promptTokEst": 846,
+        "filesReadKb": null,
+        "inTokEst": 846,
+        "outTok": 6868
+      },
+      {
+        "label": "wrap-up",
+        "model": "sonnet",
+        "promptTokEst": 890,
+        "filesReadKb": null,
+        "inTokEst": 890,
+        "outTok": 6711
+      }
+    ],
+    "total": {
+      "promptTokEst": 12071,
+      "filesReadKb": 0,
+      "inTokEst": 12071,
+      "outTok": 61870
+    }
+  }
+}
