@@ -31,9 +31,12 @@ holds a compiling `src/lib.rs` stub with one trivial passing test, pending its P
 engine-rs/
 ├── Cargo.toml            (workspace root — resolver 2, workspace.package, workspace.dependencies)
 ├── crates/
-│   ├── engine-core/       ← node.rs (Node trait + NodeRegistry), schema.rs (WorkflowSchema/
-│   │                         NodeConfig), workflow.rs (Workflow pointer-walk runner +
-│   │                         on_progress seam); graph validator still to land
+│   ├── engine-core/       ← node.rs (Node trait + NodeRegistry + as_router() hook), schema.rs
+│   │                         (WorkflowSchema/NodeConfig), workflow.rs (Workflow pointer-walk
+│   │                         runner + on_progress seam + Router-aware dispatch + new_validated()),
+│   │                         routing.rs (Router trait + dispatch_route()), parallel.rs
+│   │                         (ParallelNode fan-out/merge), validate.rs (WorkflowValidator graph
+│   │                         validator)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.0.1 byte-for-byte
@@ -42,6 +45,9 @@ engine-rs/
 │   └── engine-serve/      ← bastion serve embedding: in-memory run state, trigger/dispatch, HTTP surface
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
+    crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
+    crates/engine-core/tests/validator.rs — WorkflowValidator + router-aware Workflow::run
+    integration tests (valid/rejected schemas, router back-edge dispatch);
     crates/engine-contract/tests/round_trip.rs — fixture byte-for-byte serde round-trip;
     crates/engine-store/tests/postgres_round_trip.rs — DATABASE_URL-gated live Postgres round-trip)
 ```
@@ -72,12 +78,32 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   declarative graph description: `WorkflowSchema { workflow_type, start_node, nodes:
   HashMap<String, NodeConfig> }`; `NodeConfig { identity, connections: Vec<String> }` with a
   `next()` helper returning `connections[0]`. `WorkflowSchema::start()` resolves the start node's
-  `NodeConfig`; `next_after(identity)` resolves a node's `connections[0]` next-node identity. Only
-  `connections[0]` is walked in this block — branching over the rest is EN.1.B.
+  `NodeConfig`; `next_after(identity)` resolves a node's `connections[0]` next-node identity.
+  Plain nodes still walk only `connections[0]`; router nodes (below) select the next node at
+  runtime instead, including undeclared back-edges.
+- `Router` (trait, `engine-core::routing`, supertrait of `Node`) — `fn route(&self, ctx:
+  &TaskContext) -> Option<String>` for runtime next-node selection; `Node::as_router(&self) ->
+  Option<&dyn Router>` is a default `None` hook nodes override to be detected by the registry as
+  routers. `dispatch_route(&dyn Router, &TaskContext) -> Option<String>` is a thin dispatch
+  helper wrapping `router.route(ctx)`.
+- `ParallelNode` (`engine-core::parallel`) — fans out over a declared `Vec` of branch nodes on
+  `std::thread::scope`, deep-copies the `TaskContext` per branch, and merges `nodes`/`node_runs`
+  back with deterministic last-write-wins semantics (later branch in declared order wins on key
+  collision); the first branch `NodeError` encountered in declared order is propagated as the
+  `ParallelNode`'s own error, with no partial merge on branch failure.
+- `WorkflowValidator` / `ValidationError` (`engine-core::validate`) — static graph-shape checks
+  run before execution: BFS reachability from `start_node`, DFS cycle detection that skips edges
+  declared out of router nodes (routers are exempt so runtime back-edges are legal), and a
+  fan-out arity guard rejecting non-router nodes with more than one declared connection. Router
+  classification is via `NodeRegistry` lookup + `Node::as_router().is_some()`.
 - `Workflow` (`engine-core::workflow`) — pointer-walk runner (not a topo-scheduler); pairs a
   `NodeRegistry` with a `WorkflowSchema`. `run(event, on_progress) -> Result<TaskContext,
   WorkflowError>` seeds every declared node PENDING, emits the initial snapshot via `on_progress`,
-  then walks `current_node` via `next_after` until `None`, ported from `workflow.py`.
+  then walks `current_node` — resolving router nodes via `Router::route(ctx)` and plain nodes via
+  `next_after` (`connections[0]`) — until `None`, ported from `workflow.py`. `Workflow::
+  new_validated(registry, schema)` is a fallible constructor that runs `WorkflowValidator::
+  validate` first and rejects an invalid schema; the existing infallible `Workflow::new` is
+  unchanged.
 - `OnProgress<'a>` (`engine-core::workflow`, `type OnProgress<'a> = Box<dyn FnMut(&TaskContext) +
   'a>`) — the injected persistence seam invoked at every node boundary (initial seed, RUNNING
   entry, SUCCESS/FAILED exit). This block only defines the signature; EN.1.C wires it to Postgres.
@@ -102,8 +128,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
    emits the initial in-memory snapshot via `on_progress`, and (once EN.1.C lands) persists the
    first durable `events` row before the first node runs.
 4. The pointer-walk runs each node inside the framework-owned `node_context` envelope (RUNNING →
-   SUCCESS/FAILED + `started_at`/`completed_at` timing, following `connections[0]` only), invoking
-   `on_progress` after every transition; a node returning `Err` halts the walk but `run()` still
-   returns `Ok(TaskContext)` with the accumulated state.
+   SUCCESS/FAILED + `started_at`/`completed_at` timing), following `connections[0]` for plain
+   nodes or `Router::route(ctx)` for router nodes (including undeclared runtime back-edges),
+   invoking `on_progress` after every transition; a node returning `Err` halts the walk but
+   `run()` still returns `Ok(TaskContext)` with the accumulated state.
 5. Local Console reads live state directly from in-memory shared state/channel; remote observers
    (BastionUI) subscribe to serve's event stream / read-API rather than polling Postgres.
