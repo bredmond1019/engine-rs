@@ -35,3 +35,6 @@ Patched: docs/architecture.md
 
 ## Wrap-up — PASS
 Next: Merge EN.1.C-trigger-dispatch-serve-embedding-flow into main and define the next Phase 1/2 block
+
+## PR
+https://github.com/bredmond1019/engine-rs/pull/1

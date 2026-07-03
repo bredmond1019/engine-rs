@@ -2,7 +2,7 @@
   "spec_slug": "EN.1.C-trigger-dispatch-serve-embedding",
   "branch": "EN.1.C-trigger-dispatch-serve-embedding-flow",
   "started_at": "2026-07-03T14:25:43Z",
-  "updated_at": "2026-07-03T14:52:49Z",
+  "updated_at": "2026-07-03T14:55:16Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow",
   "status": "done",
   "current_task": 6,
@@ -128,8 +128,8 @@
   },
   "bail_reason": null,
   "pr": {
-    "url": null,
-    "number": null
+    "url": "https://github.com/bredmond1019/engine-rs/pull/1",
+    "number": 1
   },
   "tokens": {
     "stages": [
@@ -268,13 +268,21 @@
         "filesReadKb": null,
         "inTokEst": 919,
         "outTok": 5849
+      },
+      {
+        "label": "pr-create",
+        "model": "sonnet",
+        "promptTokEst": 835,
+        "filesReadKb": null,
+        "inTokEst": 835,
+        "outTok": 2476
       }
     ],
     "total": {
-      "promptTokEst": 14018,
+      "promptTokEst": 14853,
       "filesReadKb": 0,
-      "inTokEst": 14018,
-      "outTok": 89043
+      "inTokEst": 14853,
+      "outTok": 91519
     }
   }
 }
