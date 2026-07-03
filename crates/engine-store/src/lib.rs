@@ -1,8 +1,11 @@
 //! `engine-store` — Postgres read/write for the durable `events` record.
 //!
-//! Stub crate for EN.0.A (Cargo workspace + CI). The `sqlx::PgPool`-backed read/write path
-//! for the `events` row lands in EN.0.B per decision D2 — see
-//! `planning/decisions/D2-async-runtime-choice.md` and `docs/architecture.md`.
+//! `sqlx::PgPool`-backed read/write path for the `events` row (contract §4), per
+//! decision D2 — see `planning/decisions/D2-async-runtime-choice.md`.
+
+pub mod postgres;
+
+pub use postgres::{connect, get_event, insert_event, touch, update_event};
 
 /// Placeholder identifying this crate; exists so the workspace has at least one
 /// non-trivial symbol to build and test against before the real types land.
