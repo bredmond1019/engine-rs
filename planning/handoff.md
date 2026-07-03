@@ -3,72 +3,82 @@ type: Handoff
 created: 2026-07-03
 ---
 
-# Handoff — EN.1.B merged and on GitHub; EN.1.C is next
+# Handoff — EN.1.C merged and cleaned up; EN.2.A is next
 
 > **For the next agent:** Read this immediately after `/prime`. Delete this file once consumed.
 
 ## What we're doing and why
 
 `engine-rs` is porting the Python `orchestrator` engine core to Rust (the parallel-pilot
-rewrite, D42). This session drove EN.1.B (Router + parallel nodes + validator) end-to-end
-through `/sdlc-flow`, created this repo's first GitHub remote, reviewed and merged the block,
-and reconciled the state-tracking files that a prior session had left half-updated. `main` is
-now clean, pushed to GitHub, and Phase 1 blocks A and B are both Done.
+rewrite, D42). This session drove EN.1.C (trigger/dispatch + dual-registry + serve embedding)
+end-to-end through `/sdlc-flow`, ran a light code review, verified docs, merged the block into
+`main`, and cleaned up the worktree. Phase 1 (Execution Core) is now fully **Done** —
+`bastion serve` can trigger workflows over HTTP, hold live run state in memory, and durably
+record runs to Postgres. Phase 2 (EN.2.A — Claude Code step node) is next.
 
 ## Completed this session
 
-- `/sdlc-flow EN.1.B-router-parallel-nodes-validator` — PASS, 5 tasks. Added:
-  - `Router` trait + `Node::as_router()` hook + `dispatch_route()` (`crates/engine-core/src/routing.rs`, `node.rs`)
-  - `ParallelNode` fan-out/merge over `std::thread::scope` with deterministic last-write-wins merge (`crates/engine-core/src/parallel.rs`)
-  - `WorkflowValidator` — BFS reachability, DFS cycle detection (skips router-declared edges), non-router fan-out arity guard (`crates/engine-core/src/validate.rs`)
-  - `Workflow::run` wired to call `Router::route(ctx)` for router nodes; new fallible `Workflow::new_validated()` constructor (`workflow.rs`)
+- `/sdlc-flow EN.1.C-trigger-dispatch-serve-embedding` — PASS, 6 tasks. Added (all in
+  `crates/engine-serve/src/`):
+  - `dispatch.rs` — `Dispatcher` (dual `workflow_registry`/`schema_registry` keyed by
+    `workflow_type`, `DispatchError::UnknownWorkflowType`)
+  - `live_state.rs` — `LiveStateStore` (`Arc<RwLock<HashMap<RunId, TaskContext>>>`), the local
+    Console's no-DB-poll read path for live run state
+  - `durable.rs` — `DurableHandle`/`spawn_durable_writer`/`durable_on_progress`, an mpsc-bridged
+    async durable-write seam mapping `on_progress` snapshots to `engine_contract::EventsRow`
+    via `engine_store::insert_event`/`update_event`; self-skips Postgres I/O with no
+    `DATABASE_URL`
+  - `http.rs` — the four-endpoint `actix-web` HTTP surface (D3): `POST /events/` (X-API-Key
+    gated), `GET /health`, `GET /workflows`, `GET /workflows/{type}/graph`
+  - `tests/dispatch_integration.rs` — headline integration test (live-state read with no DB
+    query, byte-identical durable `EventsRow` mapping, 422 for an unregistered `workflow_type`)
   - Consolidated review: PASS, no findings. Docs patched: `docs/architecture.md`.
-- Created the repo's first GitHub remote: `bredmond1019/engine-rs` (private), matching the
-  naming convention of sibling repos (`bastion`, `bella`, `mev` — plain name, private, no
-  description). Pushed `main` and the feature branch.
-- Ran `/code-review low` on the EN.1.B source diff (tests excluded) — **(none)**, no findings.
-- Merged `EN.1.B-router-parallel-nodes-validator-flow` into `main` via `git merge --ff-only`
-  (commit `43637e2`). Removed the worktree and deleted the branch via `/clean-worktree`.
-- Reconciled `planning/state.json`, which had an uncommitted, half-finished edit left by the
-  prior session (closing EN.0.A/EN.0.B/EN.1.A but not EN.1.B, and still listing EN.1.B in
-  `focus.next` even though it's now done): closed the `EN.1.B` block entry, removed it from
-  `focus.next`/`focus.blocked`, and promoted `EN.1.C` to `focus.next` (no longer blocked).
-  Confirmed the file is still valid JSON after editing.
-- Pushed the merge commit to `origin/main`.
+  - PR #1 opened: https://github.com/bredmond1019/engine-rs/pull/1
+- Ran `/code-review low` on the EN.1.C source diff (tests excluded) — **(none)**, no findings.
+- Verified `docs/architecture.md` accurately reflects the new module map, dependency list, key
+  types, and data-flow narrative — no gaps found.
+- Merged `EN.1.C-trigger-dispatch-serve-embedding-flow` into `main`. The first `--ff-only`
+  attempt failed (main had advanced by one commit — a harness sync from base-template); rebased
+  the worktree branch onto `main` (clean, no conflicts across 17 commits) and retried
+  `--ff-only`, which then succeeded (commit `2248d5a`).
+- Removed the worktree and deleted the branch via `/clean-worktree`.
+- Reconciled `planning/state.json`: closed the `EN.1.C` block, moved `focus.next` from `EN.1.C`
+  to `EN.2.A` (now unblocked — its only blocker, `EN.1.C`, is closed), and confirmed `EN.2.B`/
+  `EN.3.A`/`EN.3.B` remain correctly `blocked`. Ran `mev emit-state --write` — clean (only
+  informational `W_EMIT_NO_SENTINEL` warnings for repos without wave-table sentinels, expected).
 
 ## Remaining work
 
-- **Next block: EN.1.C — Trigger/dispatch + dual-registry + serve embedding.** Not yet started.
-  Run `/generate-tasks EN.1.C` to produce its task spec, then drive it with `/sdlc-flow
-  EN.1.C-trigger-dispatch-serve-embedding` (confirm the exact slug from
+- **Next block: EN.2.A — Claude Code step node.** Not yet started. Run `/generate-tasks EN.2.A`
+  to produce its task spec, then drive it with `/sdlc-flow <slug>` (confirm the exact slug from
   `planning/master-plan.md` first).
-- No PR was opened for the EN.1.B merge — it was a direct `--ff-only` merge to `main` on the
-  same local repo the new GitHub remote was just attached to, before any PR-based workflow was
-  established. If a PR-based review workflow is wanted going forward for EN.1.C, branch off
-  `main` and push a PR instead of merging locally first.
+- PR #1 (EN.1.C) is open but not merged on GitHub — the local `main` already has the fast-forward
+  merge and the branch is deleted locally. Decide whether to close PR #1 as already-merged-locally
+  (and push `main` to sync GitHub), or reconcile GitHub's view separately.
 
 ## Durable State Updates
 
-- No new `carryover[]` entries. The previous session's `state-json-block-status-stale` entry
-  had already been cleared before this session started (that fix was sitting uncommitted in the
-  working tree at session start) — verified it's gone and stayed gone.
-- `planning/state.json`: `EN.1.B` block status flipped `open` → `closed`; `focus.next` now
-  points at `EN.1.C` (previously pointed at the already-done `EN.1.B`); `EN.1.C` removed from
-  `focus.blocked` since its only blocker (`EN.1.B`) is closed.
+- `planning/state.json`: `EN.1.C` block status flipped `open` → `closed`; `focus.next` now
+  points at `EN.2.A` (previously pointed at the now-closed `EN.1.C`); `EN.2.A`'s `blocked_by`
+  cleared (its only blocker, `EN.1.C`, is closed) and it was moved out of `focus.blocked` into
+  `focus.next`.
+- No new `carryover[]` entries this session (none needed — no durable caveats surfaced).
 - No block `tasks.json` was created or changed this session.
 
 ## Open questions / choices
 
-None — the approach is settled. EN.1.C is next in sequence per `master-plan.md`. Repo naming
-followed the existing sibling-repo convention (private, plain name) without confirming with the
-user first — flag if a different visibility/naming scheme is wanted going forward.
+- Whether to push the local `main` merge to `origin/main` and reconcile/close PR #1, or treat
+  GitHub PR #1 as the canonical merge record going forward (this session merged locally first,
+  per the same pattern used for EN.1.B).
+- Everything else — approach for EN.2.A — is unsettled and not yet scoped; that's expected, it
+  hasn't been planned yet.
 
 ## Context the next agent needs
 
-`git remote -v` now shows `origin` → `git@github.com:bredmond1019/engine-rs.git` (SSH, via
-`gh` auth). This is the first time this repo has had a remote — prior sessions' merges were
-all local-only.
+The rebase-before-merge step (main advanced by a routine harness sync commit) is a one-off from
+this session, not a recurring issue — no `carryover[]` entry needed. `git remote -v` still shows
+`origin` → `git@github.com:bredmond1019/engine-rs.git`, unchanged from the prior session.
 
 ## First command after `/prime`
 
-`/generate-tasks EN.1.C`
+`/generate-tasks EN.2.A`

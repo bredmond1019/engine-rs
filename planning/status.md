@@ -5,9 +5,9 @@ description: Current state and progress tracker for engine-rs.
 doc_id: status
 layer: [factory]
 status: active
-timestamp: "2026-07-03T12:24:21Z"
-now: "Phase 1 done through EN.1.C; engine embedded in bastion serve"
-next: "Merge EN.1.C-trigger-dispatch-serve-embedding-flow into main; define next Phase block"
+timestamp: "2026-07-03T15:00:54Z"
+now: "Phase 1 (Execution Core) fully Done — EN.1.A/EN.1.B/EN.1.C all closed; engine embedded in bastion serve"
+next: "EN.2.A — Claude Code step node; first command /generate-tasks EN.2.A"
 blocked: []
 keywords: [status, progress tracker, current focus, blocks]
 related: [context, master-plan, planning-index, knowledge, memory]
@@ -15,8 +15,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-03 — EN.1.C-trigger-dispatch-serve-embedding completed via `/sdlc-flow` (6 tasks, PASS review)
-**Current focus:** Phase 1 done through EN.1.C; engine embedded in `bastion serve`
+**Last updated:** 2026-07-03 — EN.1.C-trigger-dispatch-serve-embedding merged to `main` (`2248d5a`), worktree cleaned up, state.json reconciled, handoff written for EN.2.A
+**Current focus:** Phase 1 (Execution Core) fully Done — EN.1.A/EN.1.B/EN.1.C all closed; engine embedded in `bastion serve`
 
 ---
 
@@ -35,8 +35,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 > Working board — keep all five queues live. **Never end a meaningful session with every queue
 > empty.** The headlines of **now / next / blocked** mirror the frontmatter scalars above.
 
-- **now** — Phase 1 done through EN.1.C; engine embedded in bastion serve
-- **next** — Merge EN.1.C-trigger-dispatch-serve-embedding-flow into main; define next Phase block
+- **now** — Phase 1 (Execution Core) fully Done — EN.1.A/EN.1.B/EN.1.C all closed; engine embedded in bastion serve
+- **next** — EN.2.A — Claude Code step node; first command `/generate-tasks EN.2.A`
 - **blocked** — _nothing yet — each entry names its blocker and the smallest missing answer_
 - **improve** — _self-improvement backlog: eval gaps, flaky workflows, repeated failures, missing skills, stale assumptions_
 - **recurring** — _schedules, monitors, sweeps, automations_
