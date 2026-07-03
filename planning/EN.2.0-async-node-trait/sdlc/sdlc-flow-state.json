@@ -1,0 +1,83 @@
+{
+  "spec_slug": "EN.2.0-async-node-trait",
+  "branch": "EN.2.0-async-node-trait-flow",
+  "started_at": "2026-07-03T19:32:14Z",
+  "updated_at": "2026-07-03T19:32:14Z",
+  "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.2.0-async-node-trait-flow",
+  "status": "running",
+  "current_task": 1,
+  "tasks": {
+    "1": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added async-trait and futures as workspace dependencies, wired into engine-core (real deps) and engine-serve (async-trait only), with all four gates (fmt, clippy -D warnings, test, build --release) passing unchanged.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [],
+      "files_changed": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/engine-core/Cargo.toml",
+        "crates/engine-serve/Cargo.toml"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    }
+  },
+  "review": {
+    "verdict": null,
+    "findings": [],
+    "attempts": 0
+  },
+  "docs": {
+    "changed": [],
+    "created": []
+  },
+  "bail_reason": null,
+  "pr": {
+    "url": null,
+    "number": null
+  },
+  "tokens": {
+    "stages": [
+      {
+        "label": "worktree-setup",
+        "model": "haiku",
+        "promptTokEst": 778,
+        "filesReadKb": null,
+        "inTokEst": 778,
+        "outTok": 6707
+      },
+      {
+        "label": "enumerate",
+        "model": "haiku",
+        "promptTokEst": 255,
+        "filesReadKb": null,
+        "inTokEst": 255,
+        "outTok": 489
+      },
+      {
+        "label": "implement-1-1",
+        "model": "sonnet",
+        "promptTokEst": 996,
+        "filesReadKb": null,
+        "inTokEst": 996,
+        "outTok": 2845
+      },
+      {
+        "label": "test-1-1",
+        "model": "haiku",
+        "promptTokEst": 590,
+        "filesReadKb": null,
+        "inTokEst": 590,
+        "outTok": 1384
+      }
+    ],
+    "total": {
+      "promptTokEst": 2619,
+      "filesReadKb": 0,
+      "inTokEst": 2619,
+      "outTok": 11425
+    }
+  }
+}
