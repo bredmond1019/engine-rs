@@ -19,3 +19,7 @@ Validated: gating checks (fast tripwire)
 What: Workflow::run now selects the next node via Router::route(ctx) for router nodes (supporting undeclared runtime back-edges) and connections[0] for plain nodes; a new fallible Workflow::new_validated(registry, schema) runs WorkflowValidator::validate first, while the existing infallible Workflow::new is untouched.
 Decisions: Resolved router_next (via as_router()/dispatch_route) before calling node_context, since node_context takes ownership of ctx — this preserves the pre-node-run TaskContext snapshot for route() semantics.; Used a match block instead of expect_err/unwrap_err in the cyclic-rejection test because Workflow intentionally does not implement Debug.
 Validated: gating checks (fast tripwire)
+
+## Task 5 — PASSED (1 attempt)
+What: Task 5 (Validate) confirmed cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release all pass with no code changes needed.
+Validated: gating checks (fast tripwire)
