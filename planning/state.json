@@ -277,5 +277,23 @@
   "tiers": [],
   "note": null,
   "backlog": [],
-  "carryover": []
+  "carryover": [
+    {
+      "slug": "state-json-block-status-stale",
+      "scope": {
+        "repo": "engine-rs",
+        "tier": null,
+        "cross_repo": null
+      },
+      "kind": "known_issue",
+      "text": "tracks[].blocks[] status fields for EN.0.A, EN.0.B, and EN.1.A still read \"open\" even though all three are Done (PASS review) per planning/status.md's Progress Table. This session did not reconcile them since handoff scope only covers carryover[]. Treat planning/status.md as the authoritative block-status source, not this file's per-block status field, until a future session syncs them.",
+      "related": [
+        { "type": "block", "repo": "engine-rs", "id": "EN.0.A" },
+        { "type": "block", "repo": "engine-rs", "id": "EN.0.B" },
+        { "type": "block", "repo": "engine-rs", "id": "EN.1.A" }
+      ],
+      "clears_when": "tracks[].blocks[].status for EN.0.A/EN.0.B/EN.1.A is updated to done/closed",
+      "created": "2026-07-03"
+    }
+  ]
 }

@@ -5,7 +5,7 @@ description: Current state and progress tracker for engine-rs.
 doc_id: status
 layer: [factory]
 status: active
-timestamp: "2026-07-03"
+timestamp: "2026-07-03T09:14:19Z"
 now: "Phase 1, EN.1.B — Router + parallel nodes + validator"
 next: "Define EN.1.B tasks via /generate-tasks EN.1.B"
 blocked: []
@@ -15,7 +15,7 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-03 — EN.1.A done, PASS
+**Last updated:** 2026-07-03T09:14:19Z — EN.1.A merged to main (--no-ff, `a7906cc`), worktree cleaned up, handoff written for EN.1.B
 **Current focus:** EN.1.B-router-parallel-nodes-validator
 
 ---
