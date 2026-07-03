@@ -5,9 +5,9 @@ description: Current state and progress tracker for engine-rs.
 doc_id: status
 layer: [factory]
 status: active
-timestamp: "2026-07-03T10:54:30Z"
-now: "Phase 1, EN.1.B — Router + parallel nodes + validator — done, awaiting merge"
-next: "Merge EN.1.B into main, define next Phase 1 block"
+timestamp: "2026-07-03T12:24:21Z"
+now: "Phase 1 done through EN.1.B; EN.1.C not yet started"
+next: "Run /generate-tasks EN.1.C"
 blocked: []
 keywords: [status, progress tracker, current focus, blocks]
 related: [context, master-plan, planning-index, knowledge, memory]
@@ -15,8 +15,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-03 — EN.1.B-router-parallel-nodes-validator completed via `/sdlc-flow` (5 tasks, PASS review), on branch `EN.1.B-router-parallel-nodes-validator-flow`
-**Current focus:** EN.1.B-router-parallel-nodes-validator (Done — awaiting merge)
+**Last updated:** 2026-07-03 — EN.1.B-router-parallel-nodes-validator merged into `main` (commit `43637e2`), GitHub remote `bredmond1019/engine-rs` created and pushed, worktree cleaned up, `planning/state.json` reconciled
+**Current focus:** Phase 1 done through EN.1.B; EN.1.C not yet started
 
 ---
 
@@ -35,8 +35,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 > Working board — keep all five queues live. **Never end a meaningful session with every queue
 > empty.** The headlines of **now / next / blocked** mirror the frontmatter scalars above.
 
-- **now** — Phase 1, EN.1.B — Router + parallel nodes + validator — done, awaiting merge
-- **next** — Merge EN.1.B into main, define next Phase 1 block
+- **now** — Phase 1 done through EN.1.B; EN.1.C not yet started
+- **next** — Run /generate-tasks EN.1.C
 - **blocked** — _nothing yet — each entry names its blocker and the smallest missing answer_
 - **improve** — _self-improvement backlog: eval gaps, flaky workflows, repeated failures, missing skills, stale assumptions_
 - **recurring** — _schedules, monitors, sweeps, automations_

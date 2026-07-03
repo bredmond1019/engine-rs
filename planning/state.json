@@ -1,13 +1,13 @@
 {
   "repo": "engine-rs",
   "kind": "project",
-  "updated": "2026-07-02",
+  "updated": "2026-07-03",
   "focus": {
     "now": [],
     "next": [
       {
-        "id": "EN.0.A",
-        "title": "Cargo workspace + CI",
+        "id": "EN.1.C",
+        "title": "Trigger/dispatch + dual-registry + serve embedding",
         "status": null,
         "note": null,
         "repo": null,
@@ -15,66 +15,6 @@
       }
     ],
     "blocked": [
-      {
-        "id": "EN.0.B",
-        "title": "Data-contract serde types + Postgres round-trip",
-        "status": null,
-        "note": null,
-        "repo": null,
-        "blocked_by": [
-          {
-            "type": "block",
-            "repo": "engine-rs",
-            "id": "EN.0.A",
-            "what": null
-          }
-        ]
-      },
-      {
-        "id": "EN.1.A",
-        "title": "Node trait + Workflow runner",
-        "status": null,
-        "note": null,
-        "repo": null,
-        "blocked_by": [
-          {
-            "type": "block",
-            "repo": "engine-rs",
-            "id": "EN.0.B",
-            "what": null
-          }
-        ]
-      },
-      {
-        "id": "EN.1.B",
-        "title": "Router + parallel nodes + validator",
-        "status": null,
-        "note": null,
-        "repo": null,
-        "blocked_by": [
-          {
-            "type": "block",
-            "repo": "engine-rs",
-            "id": "EN.1.A",
-            "what": null
-          }
-        ]
-      },
-      {
-        "id": "EN.1.C",
-        "title": "Trigger/dispatch + dual-registry + serve embedding",
-        "status": null,
-        "note": null,
-        "repo": null,
-        "blocked_by": [
-          {
-            "type": "block",
-            "repo": "engine-rs",
-            "id": "EN.1.B",
-            "what": null
-          }
-        ]
-      },
       {
         "id": "EN.2.A",
         "title": "Claude Code step node",
@@ -144,7 +84,7 @@
         {
           "id": "EN.0.A",
           "title": "Cargo workspace + CI",
-          "status": "open",
+          "status": "closed",
           "depends_on": [],
           "wave": 0,
           "origin": null
@@ -152,7 +92,7 @@
         {
           "id": "EN.0.B",
           "title": "Data-contract serde types + Postgres round-trip",
-          "status": "open",
+          "status": "closed",
           "depends_on": [
             {
               "type": "block",
@@ -167,7 +107,7 @@
         {
           "id": "EN.1.A",
           "title": "Node trait + Workflow runner",
-          "status": "open",
+          "status": "closed",
           "depends_on": [
             {
               "type": "block",
@@ -182,7 +122,7 @@
         {
           "id": "EN.1.B",
           "title": "Router + parallel nodes + validator",
-          "status": "open",
+          "status": "closed",
           "depends_on": [
             {
               "type": "block",
@@ -277,23 +217,5 @@
   "tiers": [],
   "note": null,
   "backlog": [],
-  "carryover": [
-    {
-      "slug": "state-json-block-status-stale",
-      "scope": {
-        "repo": "engine-rs",
-        "tier": null,
-        "cross_repo": null
-      },
-      "kind": "known_issue",
-      "text": "tracks[].blocks[] status fields for EN.0.A, EN.0.B, and EN.1.A still read \"open\" even though all three are Done (PASS review) per planning/status.md's Progress Table. This session did not reconcile them since handoff scope only covers carryover[]. Treat planning/status.md as the authoritative block-status source, not this file's per-block status field, until a future session syncs them.",
-      "related": [
-        { "type": "block", "repo": "engine-rs", "id": "EN.0.A" },
-        { "type": "block", "repo": "engine-rs", "id": "EN.0.B" },
-        { "type": "block", "repo": "engine-rs", "id": "EN.1.A" }
-      ],
-      "clears_when": "tracks[].blocks[].status for EN.0.A/EN.0.B/EN.1.A is updated to done/closed",
-      "created": "2026-07-03"
-    }
-  ]
+  "carryover": []
 }
