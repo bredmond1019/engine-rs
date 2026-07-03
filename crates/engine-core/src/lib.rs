@@ -8,10 +8,12 @@ pub mod node;
 pub mod parallel;
 pub mod routing;
 pub mod schema;
+pub mod validate;
 pub mod workflow;
 
 pub use node::{Node, NodeError, NodeRegistry};
 pub use parallel::ParallelNode;
 pub use routing::{dispatch_route, Router};
 pub use schema::{NodeConfig, WorkflowSchema};
+pub use validate::{ValidationError, WorkflowValidator};
 pub use workflow::{OnProgress, Workflow, WorkflowError};
