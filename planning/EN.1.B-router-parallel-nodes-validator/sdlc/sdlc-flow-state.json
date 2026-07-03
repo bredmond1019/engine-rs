@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.B-router-parallel-nodes-validator",
   "branch": "EN.1.B-router-parallel-nodes-validator-flow",
   "started_at": "2026-07-03T10:37:31Z",
-  "updated_at": "2026-07-03T10:44:24Z",
+  "updated_at": "2026-07-03T10:48:19Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow",
   "status": "running",
-  "current_task": 3,
+  "current_task": 4,
   "tasks": {
     "1": {
       "status": "passed",
@@ -58,6 +58,23 @@
       "files_changed": [
         "crates/engine-core/src/validate.rs",
         "crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "4": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Workflow::run now selects the next node via Router::route(ctx) for router nodes (supporting undeclared runtime back-edges) and connections[0] for plain nodes; a new fallible Workflow::new_validated(registry, schema) runs WorkflowValidator::validate first, while the existing infallible Workflow::new is untouched.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Resolved router_next (via as_router()/dispatch_route) before calling node_context, since node_context takes ownership of ctx — this preserves the pre-node-run TaskContext snapshot for route() semantics.",
+        "Used a match block instead of expect_err/unwrap_err in the cyclic-rejection test because Workflow intentionally does not implement Debug."
+      ],
+      "files_changed": [
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/src/workflow.rs",
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/tests/validator.rs"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -142,13 +159,29 @@
         "filesReadKb": null,
         "inTokEst": 620,
         "outTok": 2755
+      },
+      {
+        "label": "implement-4-1",
+        "model": "sonnet",
+        "promptTokEst": 1056,
+        "filesReadKb": null,
+        "inTokEst": 1056,
+        "outTok": 9646
+      },
+      {
+        "label": "test-4-1",
+        "model": "haiku",
+        "promptTokEst": 620,
+        "filesReadKb": null,
+        "inTokEst": 620,
+        "outTok": 2176
       }
     ],
     "total": {
-      "promptTokEst": 6106,
+      "promptTokEst": 7782,
       "filesReadKb": 0,
-      "inTokEst": 6106,
-      "outTok": 38305
+      "inTokEst": 7782,
+      "outTok": 50127
     }
   }
 }
