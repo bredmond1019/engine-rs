@@ -1,0 +1,280 @@
+{
+  "spec_slug": "EN.1.C-trigger-dispatch-serve-embedding",
+  "branch": "EN.1.C-trigger-dispatch-serve-embedding-flow",
+  "started_at": "2026-07-03T14:25:43Z",
+  "updated_at": "2026-07-03T14:52:49Z",
+  "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow",
+  "status": "done",
+  "current_task": 6,
+  "tasks": {
+    "1": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added a Dispatcher in crates/engine-serve/src/dispatch.rs implementing dual-registry (workflow_registry + schema_registry) dispatch keyed by workflow_type, with DispatchError::UnknownWorkflowType for unregistered types, wired into lib.rs via pub mod dispatch, with 3 passing unit tests.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Kept Dispatcher::register generic via a boxed WorkflowFactory closure (Box<dyn Fn() -> Workflow + Send + Sync>) rather than adding a NodeRegistry-sharing convenience method, since NodeRegistry/Node trait objects aren't Clone and the task only requires register(...)/dispatch(...) resolution.",
+        "Used matches!/manual field comparison instead of assert_eq! against a dispatch() Result because engine_core::Workflow doesn't implement Debug/PartialEq (unwrap_err/assert_eq require those bounds on the Ok variant too)."
+      ],
+      "files_changed": [
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/dispatch.rs",
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "2": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-serve now has an in-memory LiveStateStore (Arc<RwLock<HashMap<RunId, TaskContext>>>) with record/get/list_active/remove, giving the local Console a no-DB-poll read path for live run state, wired into lib.rs and covered by 5 unit tests.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Used uuid::Uuid (already a workspace dependency) as the RunId type since no RunId type exists yet in engine-core/engine-contract, and EventsRow.id is already a Uuid, keeping identity consistent with the durable row.",
+        "Added a remove() method beyond the spec's minimum (record/get/list_active) since it's a natural complement for a live-state store and is trivial to test; did not add it to any public contract beyond the module."
+      ],
+      "files_changed": [
+        "crates/engine-serve/src/live_state.rs",
+        "crates/engine-serve/src/lib.rs",
+        "crates/engine-serve/Cargo.toml",
+        "Cargo.lock"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "3": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added crates/engine-serve/src/durable.rs — an mpsc-bridged async durable-write seam (DurableHandle/spawn_durable_writer/durable_on_progress) that maps on_progress TaskContext snapshots to engine_contract::EventsRow, inserts the first (all-PENDING) snapshot per run via engine_store::insert_event and updates subsequent ones via update_event/touch, and self-skips Postgres I/O (does not fail) when no pool/DATABASE_URL is configured.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Did not touch crates/engine-core/src/workflow.rs — no signature gap surfaced in the existing OnProgress seam, so the append-only edit there was unnecessary for this task.",
+        "Added a pure message_to_row(message, created_at, updated_at) -> EventsRow mapping function separate from the async writer so the byte-identical contract-shape assertion can be tested directly without a live Postgres connection.",
+        "Added chrono and sqlx as direct dependencies of engine-serve (workspace-pinned versions) since durable.rs needs DateTime<Utc> and PgPool/insert_event/update_event/touch types.",
+        "Used an unbounded mpsc channel and a HashSet<Uuid> of seen run ids in the background task to decide insert vs update per run, per the spec's guidance."
+      ],
+      "files_changed": [
+        "crates/engine-serve/src/durable.rs",
+        "crates/engine-serve/src/lib.rs",
+        "crates/engine-serve/Cargo.toml",
+        "Cargo.lock"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "4": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-serve now exposes the four-endpoint actix-web HTTP surface (POST /events/ with X-API-Key gating dispatch/live-state/durable-write, GET /health, GET /workflows, GET /workflows/{type}/graph), with the D3 decision record wired into the dispatch/live_state/durable modules from tasks 1-3.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Built the OnProgress trait-object closure inside the web::block blocking closure rather than moving it in pre-built, since OnProgress<'a> = Box<dyn FnMut(&TaskContext) + 'a> carries no Send bound even when its captures are Send — constructing it inside the FnOnce closure keeps the outer closure Send for actix's web::block."
+      ],
+      "files_changed": [
+        "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/Cargo.toml",
+        "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/Cargo.lock",
+        "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/Cargo.toml",
+        "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/lib.rs",
+        "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/http.rs",
+        "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/planning/decisions/D3-http-framework-choice.md",
+        "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/planning/decisions/index.md"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "5": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added the EN.1.C headline integration test (crates/engine-serve/tests/dispatch_integration.rs) covering live-state read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow, and 422 for an unregistered workflow_type.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Used engine_serve::durable::message_to_row directly (a pure function) plus spawn_durable_writer(None) to assert both the self-skip behavior (no panic without DATABASE_URL) and the byte-identical EventsRow shape, since the writer itself performs no observable Postgres round trip when pool is None.",
+        "Drove the live-state assertion through the real HTTP POST /events/ handler (actix test harness) for full end-to-end realism, and used a separate direct Workflow::run invocation for the durable-mapping assertion so the seed (all-PENDING) snapshot could be captured explicitly."
+      ],
+      "files_changed": [
+        "crates/engine-serve/tests/dispatch_integration.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "6": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Task 6 (validation-only) confirmed all four gates pass: cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (all 22+19+3+1+1 tests green across engine-core/engine-serve/engine-store/engine-contract), and cargo build --release — all clean with zero code changes required.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Task 6 requires no code changes per its own description (pure validation gate); since the working tree was already clean after task 5, no commit was made — nothing to stage."
+      ],
+      "files_changed": [],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    }
+  },
+  "review": {
+    "verdict": "PASS",
+    "findings": [],
+    "attempts": 1
+  },
+  "docs": {
+    "changed": [
+      "docs/architecture.md"
+    ],
+    "created": []
+  },
+  "bail_reason": null,
+  "pr": {
+    "url": null,
+    "number": null
+  },
+  "tokens": {
+    "stages": [
+      {
+        "label": "worktree-setup",
+        "model": "haiku",
+        "promptTokEst": 810,
+        "filesReadKb": null,
+        "inTokEst": 810,
+        "outTok": 3832
+      },
+      {
+        "label": "enumerate",
+        "model": "haiku",
+        "promptTokEst": 271,
+        "filesReadKb": null,
+        "inTokEst": 271,
+        "outTok": 852
+      },
+      {
+        "label": "implement-1-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 10392
+      },
+      {
+        "label": "test-1-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 1853
+      },
+      {
+        "label": "implement-2-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 6658
+      },
+      {
+        "label": "test-2-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 1928
+      },
+      {
+        "label": "implement-3-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 12480
+      },
+      {
+        "label": "test-3-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 2126
+      },
+      {
+        "label": "implement-4-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 13830
+      },
+      {
+        "label": "test-4-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 2067
+      },
+      {
+        "label": "implement-5-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 10279
+      },
+      {
+        "label": "test-5-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 2326
+      },
+      {
+        "label": "implement-6-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 1523
+      },
+      {
+        "label": "test-6-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 2441
+      },
+      {
+        "label": "review-1",
+        "model": "sonnet",
+        "promptTokEst": 1064,
+        "filesReadKb": null,
+        "inTokEst": 1064,
+        "outTok": 3716
+      },
+      {
+        "label": "docs",
+        "model": "sonnet",
+        "promptTokEst": 862,
+        "filesReadKb": null,
+        "inTokEst": 862,
+        "outTok": 6891
+      },
+      {
+        "label": "wrap-up",
+        "model": "sonnet",
+        "promptTokEst": 919,
+        "filesReadKb": null,
+        "inTokEst": 919,
+        "outTok": 5849
+      }
+    ],
+    "total": {
+      "promptTokEst": 14018,
+      "filesReadKb": 0,
+      "inTokEst": 14018,
+      "outTok": 89043
+    }
+  }
+}

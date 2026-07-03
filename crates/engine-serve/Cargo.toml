@@ -12,3 +12,7 @@ engine-store = { path = "../engine-store" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+actix-web = { workspace = true }

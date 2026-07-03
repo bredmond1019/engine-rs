@@ -18,6 +18,23 @@ related: [status, context]
 
 ## 2026-07-03
 
+### Completed EN.1.C-trigger-dispatch-serve-embedding end to end (6 tasks, PASS)
+Ran `/sdlc-flow EN.1.C-trigger-dispatch-serve-embedding` to completion across 6 tasks, embedding the execution engine in `bastion serve`. Task 1 added a `Dispatcher` in `crates/engine-serve/src/dispatch.rs` implementing dual-registry (`workflow_registry` + `schema_registry`) dispatch keyed by `workflow_type`, rejecting unregistered types with `DispatchError::UnknownWorkflowType`. Task 2 added an in-memory `LiveStateStore` (`Arc<RwLock<HashMap<RunId, TaskContext>>>`) giving the local Console a no-DB-poll read path for live run state. Task 3 added `crates/engine-serve/src/durable.rs` — an mpsc-bridged async durable-write seam (`DurableHandle`/`spawn_durable_writer`/`durable_on_progress`) mapping `on_progress` snapshots to `engine_contract::EventsRow`, inserting the first (all-PENDING) snapshot and updating subsequent ones via `engine_store`, self-skipping Postgres I/O (not failing) with no `DATABASE_URL`. Task 4 built the four-endpoint `actix-web` HTTP surface (`POST /events/` with `X-API-Key` gating, `GET /health`, `GET /workflows`, `GET /workflows/{type}/graph`), wiring the D3 HTTP-framework decision (recorded earlier this run) into the dispatch/live-state/durable modules from tasks 1–3. Task 5 added the headline integration test (`crates/engine-serve/tests/dispatch_integration.rs`) covering live-state reads with no DB query, byte-identical durable `EventsRow` mapping, and a 422 for an unregistered `workflow_type`. Task 6 confirmed all four validation gates pass clean (fmt, clippy `-D warnings`, `cargo test` — 22+19+3+1+1 tests green across the workspace, `cargo build --release`) with zero further code changes. Review verdict: **PASS** — no findings. Notable decisions: kept `Dispatcher::register` generic via a boxed `WorkflowFactory` closure rather than a `NodeRegistry`-sharing convenience method; used `uuid::Uuid` as the `RunId` type to match `EventsRow.id`'s existing type; built the `OnProgress` trait-object closure inside `web::block`'s blocking closure to keep the outer closure `Send` for actix; did not edit `workflow.rs` in task 3 since no genuine signature gap surfaced (per the spec's own guidance) — no deviations from the spec surfaced across the six tasks. Next: merge `EN.1.C-trigger-dispatch-serve-embedding-flow` into `main` and define the next Phase 1/2 block.
+
+```
+2c810dc chore: flow state — docs
+c6bd73a docs: update docs for EN.1.C-trigger-dispatch-serve-embedding
+a7164db chore: flow state — task 6 passed
+e523911 chore: flow state — task 5 passed
+96ea35c feat: implement EN.1.C-trigger-dispatch-serve-embedding-task5
+b9461a1 chore: flow state — task 4 passed
+fb8ae82 feat: implement EN.1.C-trigger-dispatch-serve-embedding-task4
+```
+
+---
+
+## 2026-07-03
+
 ### Created GitHub remote, merged EN.1.B, cleaned up worktree, reconciled state.json, wrote handoff for EN.1.C
 - **What:** Created this repo's first GitHub remote — `bredmond1019/engine-rs` (private) — matching the naming convention of sibling repos (bastion, bella, mev: plain name, private), and pushed `main` plus the feature branch. Ran `/code-review low` on the EN.1.B source diff (tests excluded) — no findings. Merged `EN.1.B-router-parallel-nodes-validator-flow` into `main` via `git merge --ff-only` (commit `43637e2`) and pushed the merge commit to `origin/main`. Removed the worktree and deleted the branch via `/clean-worktree`. Reconciled `planning/state.json`, which had an uncommitted, half-finished edit left over from a prior session (it closed EN.0.A/EN.0.B/EN.1.A but not EN.1.B, and still listed EN.1.B in `focus.next` even though it was now done): closed the EN.1.B block entry, removed it from `focus.next`/`focus.blocked`, and promoted EN.1.C to `focus.next` (no longer blocked by EN.1.B). Wrote a fresh `planning/handoff.md` pointing the next agent at EN.1.C (first command: `/generate-tasks EN.1.C`).
 - **Why:** EN.1.B (Router trait + `as_router()` hook + `dispatch_route()`, `ParallelNode` fan-out/merge via `std::thread::scope` with deterministic last-write-wins merge, `WorkflowValidator` with BFS reachability + DFS cycle detection skipping router edges + non-router fan-out arity guard, and `Workflow::run` wired to dispatch through routers plus the new fallible `Workflow::new_validated()`) had just landed via `/sdlc-flow` and needed a clean merge to `main`, a real GitHub remote for the repo, and reconciled planning state before the next block could start.

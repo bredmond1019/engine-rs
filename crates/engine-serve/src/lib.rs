@@ -4,6 +4,11 @@
 //! Stub crate for EN.0.A (Cargo workspace + CI). The trigger/dispatch path lands once
 //! `engine-core` and `engine-store` are real — see `docs/architecture.md` for the module map.
 
+pub mod dispatch;
+pub mod durable;
+pub mod http;
+pub mod live_state;
+
 /// Placeholder identifying this crate; exists so the workspace has at least one
 /// non-trivial symbol to build and test against before the real types land.
 pub fn crate_name() -> &'static str {

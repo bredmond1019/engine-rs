@@ -1,0 +1,62 @@
+[
+  {
+    "task_id": 1,
+    "title": "Dual-registry dispatch",
+    "description": "In crates/engine-serve/src/dispatch.rs, implement the dual-registry dispatch keyed by workflow_type. Hold a workflow_registry (workflow_type -> a factory/closure producing a runnable engine_core::Workflow, i.e. its NodeRegistry + WorkflowSchema) and a schema_registry (workflow_type -> WorkflowSchema) so both are populated per registration. Provide a Dispatcher (or equivalent) with register(...) and a dispatch(workflow_type, event) resolution that returns a runnable Workflow (or the resolved schema for the graph endpoint). Resolution of an unregistered workflow_type must return a typed error variant (e.g. DispatchError::UnknownWorkflowType) that the HTTP layer maps to 422 — matching the contract's 'trigger path 422s if a workflow is not in both registries'. Add `pub mod dispatch;` to crates/engine-serve/src/lib.rs (append-only). Add unit tests: registering a workflow populates both registries; resolving a known type succeeds; resolving an unknown type returns the UnknownWorkflowType error.",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": ["crates/engine-serve/src/dispatch.rs", "crates/engine-serve/src/lib.rs"],
+    "dependsOn": []
+  },
+  {
+    "task_id": 2,
+    "title": "In-memory live run-state store",
+    "description": "In crates/engine-serve/src/live_state.rs, implement the in-memory live run-state store the local Console reads directly (D42: no DB poll on the hot path). Keep the latest TaskContext snapshot per run id in shared state (e.g. Arc<RwLock<HashMap<RunId, TaskContext>>> or a channel-fed store). Expose: a record(run_id, &TaskContext) writer callable from within an on_progress closure (cheap clone of the snapshot), and a local read API get(run_id) -> Option<TaskContext> (plus list_active or equivalent) that returns live state with NO Postgres access. Add `pub mod live_state;` to crates/engine-serve/src/lib.rs (append-only). Add unit tests: recording a snapshot then reading it back returns the latest state; a later snapshot overwrites an earlier one; reads touch no database.",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": ["crates/engine-serve/src/live_state.rs", "crates/engine-serve/src/lib.rs"],
+    "dependsOn": [1]
+  },
+  {
+    "task_id": 3,
+    "title": "Async durable-write seam (engine-store bridge)",
+    "description": "In crates/engine-serve/src/durable.rs, implement the async durable-write that hooks engine-core's on_progress seam to engine-store. Build an OnProgress closure that, at each node boundary, maps the TaskContext snapshot to an engine_contract::EventsRow and persists it: the first snapshot (all nodes PENDING, before the first node runs) via engine_store::insert_event, every subsequent snapshot via engine_store::update_event (with engine_store::touch stamping updated_at). Because OnProgress is a synchronous FnMut but Postgres is async, bridge via a tokio mpsc channel: the closure clones + sends the snapshot; a spawned background writer task drains the channel and awaits the inserts/updates. Preserve node identity (type-name) as the join key when mapping to the row so the durable row stays byte-identical to the Python contract (reuse the EN.0.B round-trip shape). Do NOT change Workflow::run's signature — only touch crates/engine-core/src/workflow.rs if a genuine gap in the seam surfaces, and keep any such edit append-only. Add `pub mod durable;` to crates/engine-serve/src/lib.rs (append-only). Add tests: a run's snapshot sequence produces an EventsRow that is byte-identical per the EN.0.B round-trip oracle (first row all-PENDING); the Postgres insert/update path self-skips (not fails) when DATABASE_URL is unset.",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": ["crates/engine-serve/src/durable.rs", "crates/engine-serve/src/lib.rs", "crates/engine-core/src/workflow.rs"],
+    "dependsOn": [2]
+  },
+  {
+    "task_id": 4,
+    "title": "HTTP surface + X-API-Key + framework decision",
+    "description": "Record the HTTP-framework choice (actix-web, tokio-based per D2, consistent with rag-engine-rs) in a new planning/decisions/D3-http-framework-choice.md and link it from planning/decisions/index.md. Add actix-web to the workspace table in the root Cargo.toml and to crates/engine-serve/Cargo.toml. In crates/engine-serve/src/http.rs, implement the four contract endpoints wiring dispatch (task 1), live_state (task 2), and durable (task 3): POST /events/ — requires a valid X-API-Key header (401/403 without it), resolves workflow_type via the Dispatcher, runs the workflow feeding both the live_state recorder and the durable writer through on_progress, and returns 422 on an unregistered workflow_type; GET /health — 200; GET /workflows — the list of registered workflow types; GET /workflows/{type}/graph — the schema/graph for a registered type, 404 for unknown. Add `pub mod http;` to crates/engine-serve/src/lib.rs (append-only). Add endpoint tests using actix-web's test harness (actix_web::test::init_service + TestRequest + call_service): health returns 200; POST /events/ without a valid key is rejected; POST /events/ with an unregistered workflow_type returns 422; GET /workflows/{unknown}/graph returns 404.",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": ["crates/engine-serve/src/http.rs", "crates/engine-serve/src/lib.rs", "crates/engine-serve/Cargo.toml", "Cargo.toml", "planning/decisions/D3-http-framework-choice.md", "planning/decisions/index.md"],
+    "dependsOn": [1, 2, 3]
+  },
+  {
+    "task_id": 5,
+    "title": "End-to-end dispatch integration test",
+    "description": "In crates/engine-serve/tests/dispatch_integration.rs, add the block's headline integration test. Register a fixture workflow in both registries, trigger it through the dispatch path (via the HTTP POST /events/ handler or the Dispatcher directly), and assert: (a) the local live_state read returns live in-memory TaskContext with no Postgres query; (b) the durable EventsRow produced by the on_progress-driven writer is byte-identical per the EN.0.B round-trip oracle (Postgres round-trip portion self-skips when DATABASE_URL is unset); (c) an unregistered workflow_type returns a 422 / UnknownWorkflowType. Keep the fixture workflow small (a 2-3 node linear graph reusing the engine-core test-node pattern).",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": ["crates/engine-serve/tests/dispatch_integration.rs"],
+    "dependsOn": [4]
+  },
+  {
+    "task_id": 6,
+    "title": "Validate",
+    "description": "Run the Validation Commands listed in tasks.md and confirm all pass with no further changes: cargo fmt --check, cargo clippy -- -D warnings, cargo test, cargo build --release.",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [],
+    "dependsOn": [1, 2, 3, 4, 5]
+  }
+]

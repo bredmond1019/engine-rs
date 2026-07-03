@@ -6,8 +6,8 @@ doc_id: status
 layer: [factory]
 status: active
 timestamp: "2026-07-03T12:24:21Z"
-now: "Phase 1 done through EN.1.B; EN.1.C not yet started"
-next: "Run /generate-tasks EN.1.C"
+now: "Phase 1 done through EN.1.C; engine embedded in bastion serve"
+next: "Merge EN.1.C-trigger-dispatch-serve-embedding-flow into main; define next Phase block"
 blocked: []
 keywords: [status, progress tracker, current focus, blocks]
 related: [context, master-plan, planning-index, knowledge, memory]
@@ -15,8 +15,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-03 — EN.1.B-router-parallel-nodes-validator merged into `main` (commit `43637e2`), GitHub remote `bredmond1019/engine-rs` created and pushed, worktree cleaned up, `planning/state.json` reconciled
-**Current focus:** Phase 1 done through EN.1.B; EN.1.C not yet started
+**Last updated:** 2026-07-03 — EN.1.C-trigger-dispatch-serve-embedding completed via `/sdlc-flow` (6 tasks, PASS review)
+**Current focus:** Phase 1 done through EN.1.C; engine embedded in `bastion serve`
 
 ---
 
@@ -35,8 +35,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 > Working board — keep all five queues live. **Never end a meaningful session with every queue
 > empty.** The headlines of **now / next / blocked** mirror the frontmatter scalars above.
 
-- **now** — Phase 1 done through EN.1.B; EN.1.C not yet started
-- **next** — Run /generate-tasks EN.1.C
+- **now** — Phase 1 done through EN.1.C; engine embedded in bastion serve
+- **next** — Merge EN.1.C-trigger-dispatch-serve-embedding-flow into main; define next Phase block
 - **blocked** — _nothing yet — each entry names its blocker and the smallest missing answer_
 - **improve** — _self-improvement backlog: eval gaps, flaky workflows, repeated failures, missing skills, stale assumptions_
 - **recurring** — _schedules, monitors, sweeps, automations_
@@ -68,6 +68,7 @@ related: [context, master-plan, planning-index, knowledge, memory]
 |---|---|---|---|
 | EN.1.A | Node trait + Workflow runner | Done | `Node` trait + `NodeRegistry`, `WorkflowSchema`, pointer-walk `Workflow::run` with `on_progress` seam; PASS review |
 | EN.1.B | Router + parallel nodes + validator | Done | `Router` trait + `dispatch_route`, `ParallelNode` fan-out/merge, `WorkflowValidator` (reachability/cycle/arity) + `Workflow::new_validated`; PASS review |
+| EN.1.C | Trigger/dispatch + dual-registry + serve embedding | Done | Dual-registry `Dispatcher`, in-memory `LiveStateStore`, async durable-write seam (`durable.rs`) against `engine-store`, four-endpoint `actix-web` HTTP surface (D3), headline integration test; PASS review |
 
 <!-- Add one sub-table per phase as the plan is fleshed out. -->
 
