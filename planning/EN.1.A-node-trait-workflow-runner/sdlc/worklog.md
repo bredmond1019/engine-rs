@@ -24,3 +24,6 @@ Validated: gating checks (fast tripwire)
 What: Ran the spec's four validation commands (cargo fmt --check, cargo clippy -- -D warnings, cargo test, cargo build --release); all pass with no code changes needed.
 Decisions: Task 5 is validation-only (no files listed); confirmed working tree was already clean/passing from prior tasks, so no commit was made.
 Validated: gating checks (fast tripwire)
+
+## Docs
+Patched: docs/architecture.md
