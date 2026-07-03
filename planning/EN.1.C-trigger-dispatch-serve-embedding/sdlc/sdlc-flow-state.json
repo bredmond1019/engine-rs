@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.C-trigger-dispatch-serve-embedding",
   "branch": "EN.1.C-trigger-dispatch-serve-embedding-flow",
   "started_at": "2026-07-03T14:25:43Z",
-  "updated_at": "2026-07-03T14:25:43Z",
+  "updated_at": "2026-07-03T14:28:37Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow",
   "status": "running",
-  "current_task": 1,
+  "current_task": 2,
   "tasks": {
     "1": {
       "status": "passed",
@@ -20,6 +20,25 @@
       "files_changed": [
         "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/dispatch.rs",
         "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "2": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "engine-serve now has an in-memory LiveStateStore (Arc<RwLock<HashMap<RunId, TaskContext>>>) with record/get/list_active/remove, giving the local Console a no-DB-poll read path for live run state, wired into lib.rs and covered by 5 unit tests.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Used uuid::Uuid (already a workspace dependency) as the RunId type since no RunId type exists yet in engine-core/engine-contract, and EventsRow.id is already a Uuid, keeping identity consistent with the durable row.",
+        "Added a remove() method beyond the spec's minimum (record/get/list_active) since it's a natural complement for a live-state store and is trivial to test; did not add it to any public contract beyond the module."
+      ],
+      "files_changed": [
+        "crates/engine-serve/src/live_state.rs",
+        "crates/engine-serve/src/lib.rs",
+        "crates/engine-serve/Cargo.toml",
+        "Cargo.lock"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -72,13 +91,29 @@
         "filesReadKb": null,
         "inTokEst": 622,
         "outTok": 1853
+      },
+      {
+        "label": "implement-2-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 6658
+      },
+      {
+        "label": "test-2-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 1928
       }
     ],
     "total": {
-      "promptTokEst": 2763,
+      "promptTokEst": 4445,
       "filesReadKb": 0,
-      "inTokEst": 2763,
-      "outTok": 16929
+      "inTokEst": 4445,
+      "outTok": 25515
     }
   }
 }
