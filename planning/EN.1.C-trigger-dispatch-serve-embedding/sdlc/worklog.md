@@ -29,3 +29,6 @@ Validated: gating checks (fast tripwire)
 What: Task 6 (validation-only) confirmed all four gates pass: cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (all 22+19+3+1+1 tests green across engine-core/engine-serve/engine-store/engine-contract), and cargo build --release — all clean with zero code changes required.
 Decisions: Task 6 requires no code changes per its own description (pure validation gate); since the working tree was already clean after task 5, no commit was made — nothing to stage.
 Validated: gating checks (fast tripwire)
+
+## Docs
+Patched: docs/architecture.md
