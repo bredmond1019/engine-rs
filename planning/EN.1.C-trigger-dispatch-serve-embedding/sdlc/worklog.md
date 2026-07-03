@@ -19,3 +19,8 @@ Validated: gating checks (fast tripwire)
 What: engine-serve now exposes the four-endpoint actix-web HTTP surface (POST /events/ with X-API-Key gating dispatch/live-state/durable-write, GET /health, GET /workflows, GET /workflows/{type}/graph), with the D3 decision record wired into the dispatch/live_state/durable modules from tasks 1-3.
 Decisions: Built the OnProgress trait-object closure inside the web::block blocking closure rather than moving it in pre-built, since OnProgress<'a> = Box<dyn FnMut(&TaskContext) + 'a> carries no Send bound even when its captures are Send — constructing it inside the FnOnce closure keeps the outer closure Send for actix's web::block.
 Validated: gating checks (fast tripwire)
+
+## Task 5 — PASSED (1 attempt)
+What: Added the EN.1.C headline integration test (crates/engine-serve/tests/dispatch_integration.rs) covering live-state read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow, and 422 for an unregistered workflow_type.
+Decisions: Used engine_serve::durable::message_to_row directly (a pure function) plus spawn_durable_writer(None) to assert both the self-skip behavior (no panic without DATABASE_URL) and the byte-identical EventsRow shape, since the writer itself performs no observable Postgres round trip when pool is None.; Drove the live-state assertion through the real HTTP POST /events/ handler (actix test harness) for full end-to-end realism, and used a separate direct Workflow::run invocation for the durable-mapping assertion so the seed (all-PENDING) snapshot could be captured explicitly.
+Validated: gating checks (fast tripwire)

@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.C-trigger-dispatch-serve-embedding",
   "branch": "EN.1.C-trigger-dispatch-serve-embedding-flow",
   "started_at": "2026-07-03T14:25:43Z",
-  "updated_at": "2026-07-03T14:38:55Z",
+  "updated_at": "2026-07-03T14:43:22Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow",
   "status": "running",
-  "current_task": 4,
+  "current_task": 5,
   "tasks": {
     "1": {
       "status": "passed",
@@ -81,6 +81,22 @@
         "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/http.rs",
         "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/planning/decisions/D3-http-framework-choice.md",
         "core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/planning/decisions/index.md"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "5": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added the EN.1.C headline integration test (crates/engine-serve/tests/dispatch_integration.rs) covering live-state read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow, and 422 for an unregistered workflow_type.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Used engine_serve::durable::message_to_row directly (a pure function) plus spawn_durable_writer(None) to assert both the self-skip behavior (no panic without DATABASE_URL) and the byte-identical EventsRow shape, since the writer itself performs no observable Postgres round trip when pool is None.",
+        "Drove the live-state assertion through the real HTTP POST /events/ handler (actix test harness) for full end-to-end realism, and used a separate direct Workflow::run invocation for the durable-mapping assertion so the seed (all-PENDING) snapshot could be captured explicitly."
+      ],
+      "files_changed": [
+        "crates/engine-serve/tests/dispatch_integration.rs"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -181,13 +197,29 @@
         "filesReadKb": null,
         "inTokEst": 622,
         "outTok": 2067
+      },
+      {
+        "label": "implement-5-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 10279
+      },
+      {
+        "label": "test-5-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 2326
       }
     ],
     "total": {
-      "promptTokEst": 7809,
+      "promptTokEst": 9491,
       "filesReadKb": 0,
-      "inTokEst": 7809,
-      "outTok": 56018
+      "inTokEst": 9491,
+      "outTok": 68623
     }
   }
 }
