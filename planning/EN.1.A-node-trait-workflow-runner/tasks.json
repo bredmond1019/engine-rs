@@ -1,0 +1,94 @@
+[
+  {
+    "task_id": 1,
+    "title": "Node trait + node registry",
+    "description": "In engine-core, add crates/engine-core/src/node.rs defining the Node trait: a single `process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError>` method (framework-owned envelope handles status/timing, so the trait itself only transforms the context) and a `name(&self) -> &str` (or associated const) whose value is the node's type name and is the identity key used across TaskContext::nodes / node_runs. Define a lightweight NodeError type for a node returning failure. Add a node registry that maps a node's identity string to its boxed Node instance (e.g. HashMap<String, Box<dyn Node>>), with lookup used by the runner. Add the engine-contract path dependency and chrono to crates/engine-core/Cargo.toml (chrono for the envelope timestamps), and declare `pub mod node;` (plus re-exports) in crates/engine-core/src/lib.rs, dropping the crate_name placeholder if it is no longer needed. Include unit tests: a trivial Node impl transforms a TaskContext, and its identity string matches the registry key.",
+    "acceptance_criteria": [
+      "Node trait exposes a process(ctx) -> Result<TaskContext, _> method and a stable identity/name",
+      "A node registry maps identity string -> Node instance and supports lookup",
+      "engine-core/Cargo.toml depends on engine-contract (path) and chrono",
+      "Unit tests cover a Node impl transforming a TaskContext and its identity matching the registry key"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/Cargo.toml",
+      "crates/engine-core/src/lib.rs",
+      "crates/engine-core/src/node.rs"
+    ],
+    "dependsOn": []
+  },
+  {
+    "task_id": 2,
+    "title": "WorkflowSchema + NodeConfig types",
+    "description": "In engine-core, add crates/engine-core/src/schema.rs defining WorkflowSchema and NodeConfig: WorkflowSchema names the workflow_type, the start node identity, and the per-node NodeConfig entries; NodeConfig carries a node's identity plus its declared `connections` (a Vec of next-node identity strings — for this block only connections[0] is walked; multi-connection routing is EN.1.B). Include serde derives so a schema can be described declaratively, and a helper to look up a node's next connection and to resolve the start node. Declare `pub mod schema;` (plus re-exports) in crates/engine-core/src/lib.rs. Include unit tests constructing a 3-node linear schema and asserting start-node resolution and connections[0] next-node lookup. Shares src/lib.rs with task 1, so it is serialized after it.",
+    "acceptance_criteria": [
+      "WorkflowSchema carries workflow_type, a start node identity, and per-node NodeConfig entries",
+      "NodeConfig carries node identity + a connections list (next-node identities)",
+      "Helpers resolve the start node and a node's connections[0] next node",
+      "Unit tests build a linear 3-node schema and assert start + next-node lookups"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/src/schema.rs",
+      "crates/engine-core/src/lib.rs"
+    ],
+    "dependsOn": [1]
+  },
+  {
+    "task_id": 3,
+    "title": "Workflow pointer-walk runner + node_context envelope + on_progress seam",
+    "description": "In engine-core, add crates/engine-core/src/workflow.rs defining the Workflow struct (holds the node registry from task 1 + the WorkflowSchema from task 2) and its runner. Define the on_progress persistence seam as a signature only — a callback type (e.g. a boxed `Fn(&TaskContext)` or a small trait) invoked at each node boundary; this block does NOT implement Postgres persistence (that is EN.1.C). Implement `run`: (a) build the TaskContext from the triggering event parsed against the WorkflowSchema; (b) seed ALL nodes PENDING in node_runs and invoke on_progress with the initial snapshot BEFORE the first node runs; (c) pointer-walk `while let Some(current) = ...` starting at the schema start node, following connections[0] to the next node — no router branching (EN.1.B). Add a node_context envelope helper that, per node: stamps NodeRun status RUNNING + started_at on entry, calls node.process(ctx), then stamps SUCCESS + completed_at on Ok or FAILED + completed_at + error on Err, invoking on_progress after each transition; a FAILED node halts the walk. Node identity (type-name key) must key node_runs/nodes consistently. Declare `pub mod workflow;` (plus re-exports) in crates/engine-core/src/lib.rs. Include unit tests for the envelope status/timing transitions on a success and on a failure. Uses engine-contract TaskContext/NodeRun/NodeRunStatus (task 1 added the dep). Shares src/lib.rs and depends on Node (task 1) + WorkflowSchema (task 2), so it is serialized after both.",
+    "acceptance_criteria": [
+      "Workflow::run seeds all nodes PENDING and emits the initial snapshot via on_progress before the first node runs",
+      "The runner pointer-walks connections[0] from the start node with no router branching",
+      "node_context envelope stamps RUNNING+started_at on entry and SUCCESS or FAILED+completed_at(+error) on exit, calling on_progress at each boundary",
+      "A FAILED node halts the walk with error populated",
+      "on_progress is defined as a callback signature/seam only — no Postgres persistence implemented here",
+      "Unit tests assert the success and failure status/timing transitions"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/src/workflow.rs",
+      "crates/engine-core/src/lib.rs"
+    ],
+    "dependsOn": [1, 2]
+  },
+  {
+    "task_id": 4,
+    "title": "Fixture 3-node linear workflow integration test",
+    "description": "Add crates/engine-core/tests/workflow_runner.rs: define three trivial fixture Node impls that each write a marker into TaskContext::nodes, register them, build a linear WorkflowSchema (start -> node2 -> node3 via connections[0]), and run the full pointer-walk through Workflow::run. Assert: (a) the produced TaskContext has the expected nodes/node_runs entries after each step; (b) every node's NodeRun transitioned PENDING -> RUNNING -> SUCCESS with started_at <= completed_at; (c) all three nodes were seeded PENDING before the first ran (capture the initial on_progress snapshot); (d) a variant where the middle node returns Err halts the walk, leaves that node FAILED with error set, and never runs the third node. Uses the public engine-core API from tasks 1-3.",
+    "acceptance_criteria": [
+      "A fixture 3-node linear workflow runs end-to-end through Workflow::run and produces the expected TaskContext shape at each step",
+      "Each NodeRun transitions PENDING -> RUNNING -> SUCCESS with ordered timestamps",
+      "The initial snapshot shows all nodes seeded PENDING before the first node runs",
+      "A failure-path variant halts the walk, marks the failing node FAILED with error set, and does not run the downstream node",
+      "cargo test runs and passes workflow_runner.rs"
+    ],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/tests/workflow_runner.rs"
+    ],
+    "dependsOn": [3]
+  },
+  {
+    "task_id": 5,
+    "title": "Validate",
+    "description": "Run the Validation Commands listed in tasks.md and confirm all pass.",
+    "acceptance_criteria": [
+      "cargo fmt --check, cargo clippy -- -D warnings, cargo test, and cargo build --release all pass"
+    ],
+    "validation_commands": [
+      "cargo fmt --check",
+      "cargo clippy -- -D warnings",
+      "cargo test",
+      "cargo build --release"
+    ],
+    "max_attempts": 3,
+    "files": [],
+    "dependsOn": [1, 2, 3, 4]
+  }
+]
