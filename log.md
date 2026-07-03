@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-03T18:45:05Z"
+timestamp: "2026-07-03T19:57:01Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,15 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## 2026-07-03
+
+### Merged EN.2.0 into main, closed the block, wrote handoff for EN.2.A
+- **What:** Ran `/code-review low` on the full EN.2.0-async-node-trait diff — zero findings, nothing to fix. Merged `EN.2.0-async-node-trait-flow` into `main` via `/clean-worktree` (fast-forward, pushed to `origin/main`; GitHub auto-marked PR #2 as MERGED); removed the worktree and deleted the local branch. Flipped `EN.2.0`'s block status from `open` to `closed` in `planning/state.json`, ran `mev emit-state --write` to regenerate `focus` (EN.2.A now blocked only by the external SDK/D4 transport dependency, no longer by EN.2.0), and ran `mev validate-brain --state` — 0 errors, 2 pre-existing unrelated warnings. Wrote a fresh `planning/handoff.md` pointing the next agent at EN.2.A, still blocked on the D4 transport decision (see carryover entries `transport-decision-uses-d4-not-d3`, `claude-sdk-rs-not-on-disk`, `en2a-transport-decision-options` in `planning/state.json`).
+- **Why:** EN.2.0 (async `Node` trait) was implemented and reviewed in a prior turn this session; this follow-up closes it out cleanly — merge, worktree cleanup, state reconciliation, fresh handoff — so the next session can pick up EN.2.A with no loose state, still gated on the outstanding D4 transport decision.
+- **Refs:** `planning/handoff.md`, `planning/state.json` (carryover: `transport-decision-uses-d4-not-d3`, `claude-sdk-rs-not-on-disk`, `en2a-transport-decision-options`), PR #2
 
 ---
 
