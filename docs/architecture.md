@@ -23,11 +23,13 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 
 ## Module Map
 
-<!-- Stub — filled in as Phase 0/1 blocks land. Provisional layout per the master-plan skeleton. -->
+The Cargo workspace (EN.0.A) declares the four member crates below; each currently holds a
+compiling `src/lib.rs` stub with one trivial passing test. Real types land as Phase 0/1 blocks
+fill each crate in.
 
 ```
 engine-rs/
-├── Cargo.toml            (workspace root)
+├── Cargo.toml            (workspace root — resolver 2, workspace.package, workspace.dependencies)
 ├── crates/
 │   ├── engine-core/       ← Node trait, Workflow runner, WorkflowSchema/NodeConfig, validator
 │   ├── engine-contract/   ← data-contract serde types (events row, task_context, NodeRun)
@@ -35,6 +37,16 @@ engine-rs/
 │   └── engine-serve/      ← bastion serve embedding: in-memory run state, trigger/dispatch, HTTP surface
 └── tests/                 ← round-trip + integration fixtures
 ```
+
+## Build & CI
+
+Async runtime + persistence: `tokio` + `sqlx` (postgres, runtime-tokio, tls-rustls) — see
+`planning/decisions/D2-async-runtime-choice.md`. `engine-store` and `engine-serve` carry these as
+real dependencies; `engine-core`'s stub only needs `tokio` as a dev-dependency so far.
+
+CI (`.github/workflows/ci.yml`) runs on every push (all branches) and on pull requests, running
+the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
+`cargo clippy -- -D warnings`, `cargo test`, `cargo build --release`.
 
 ## Core Types
 
