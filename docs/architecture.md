@@ -24,8 +24,8 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 ## Module Map
 
 The Cargo workspace (EN.0.A) declares the four member crates below. `engine-core` (EN.1.A),
-`engine-contract` (EN.0.B), and `engine-store` (EN.0.B) now hold real types; `engine-serve` still
-holds a compiling `src/lib.rs` stub with one trivial passing test, pending its Phase 1 blocks.
+`engine-contract` (EN.0.B), `engine-store` (EN.0.B), and now `engine-serve` (EN.1.C) hold real
+types: dispatch, in-memory live state, the durable-write bridge, and the actix-web HTTP surface.
 
 ```
 engine-rs/
@@ -42,14 +42,28 @@ engine-rs/
 │   │                         orchestrator data-contract.md v1.0.1 byte-for-byte
 │   ├── engine-store/      ← postgres.rs: sqlx::PgPool connect/insert_event/update_event/
 │   │                         get_event for the durable `events` record
-│   └── engine-serve/      ← bastion serve embedding: in-memory run state, trigger/dispatch, HTTP surface
+│   └── engine-serve/      ← bastion serve embedding (EN.1.C): dispatch.rs (Dispatcher — dual
+│   │                         workflow_registry/schema_registry lookup by workflow_type,
+│   │                         DispatchError::UnknownWorkflowType), live_state.rs (LiveStateStore —
+│   │                         in-memory Arc<RwLock<HashMap<RunId, TaskContext>>> record/get/
+│   │                         list_active/remove, no-DB-poll read path for the local Console),
+│   │                         durable.rs (DurableHandle/spawn_durable_writer/durable_on_progress —
+│   │                         mpsc-bridged async writer mapping on_progress TaskContext snapshots to
+│   │                         engine_contract::EventsRow, inserting the first PENDING snapshot per
+│   │                         run and updating subsequent ones; self-skips Postgres I/O when no
+│   │                         pool/DATABASE_URL is configured), http.rs (actix-web surface: POST
+│   │                         /events/ with X-API-Key gating dispatch + live-state + durable-write,
+│   │                         GET /health, GET /workflows, GET /workflows/{type}/graph)
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
     crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
     crates/engine-core/tests/validator.rs — WorkflowValidator + router-aware Workflow::run
     integration tests (valid/rejected schemas, router back-edge dispatch);
     crates/engine-contract/tests/round_trip.rs — fixture byte-for-byte serde round-trip;
-    crates/engine-store/tests/postgres_round_trip.rs — DATABASE_URL-gated live Postgres round-trip)
+    crates/engine-store/tests/postgres_round_trip.rs — DATABASE_URL-gated live Postgres round-trip;
+    crates/engine-serve/tests/dispatch_integration.rs — headline EN.1.C integration test: live-state
+    read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow,
+    and 422 for an unregistered workflow_type)
 ```
 
 ## Build & CI
@@ -57,7 +71,9 @@ engine-rs/
 Async runtime + persistence: `tokio` + `sqlx` (postgres, runtime-tokio, tls-rustls) — see
 `planning/decisions/D2-async-runtime-choice.md`. `engine-store` carries `sqlx` as a real
 dependency for its Postgres layer; `engine-contract` carries `chrono`/`uuid` for the data-contract
-types; `engine-core` and `engine-serve` only need `tokio` as a dev-dependency so far.
+types; `engine-core` only needs `tokio` as a dev-dependency so far. `engine-serve` (EN.1.C) now
+carries `chrono`, `sqlx`, and `actix-web` as real dependencies alongside `tokio` — `actix-web` is
+the HTTP framework choice, see `planning/decisions/D3-http-framework-choice.md`.
 
 CI (`.github/workflows/ci.yml`) runs on every push (all branches) and on pull requests, running
 the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
@@ -110,6 +126,24 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 - `WorkflowError` (`engine-core::workflow`) — a `{ message: String }` struct for graph-shape
   failures (e.g. an unresolvable node identity); distinct from `NodeError` — a node's own failure
   is captured in its `NodeRun` and does not short-circuit `run()` with an `Err`.
+- `Dispatcher` (`engine-serve::dispatch`) — dual-registry (`workflow_registry` + `schema_registry`)
+  lookup keyed by `workflow_type`; `register` takes a boxed `WorkflowFactory` closure
+  (`Box<dyn Fn() -> Workflow + Send + Sync>`); `dispatch(workflow_type)` resolves a registered
+  `Workflow` or returns `DispatchError::UnknownWorkflowType`.
+- `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
+  (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
+  local Console's no-DB-poll read path for live run state.
+- `DurableHandle` / `spawn_durable_writer` / `durable_on_progress` (`engine-serve::durable`) — an
+  mpsc-bridged async durable-write seam mapping `on_progress` `TaskContext` snapshots to
+  `engine_contract::EventsRow`: inserts the first (all-PENDING) snapshot per run via
+  `engine_store::insert_event`, updates subsequent snapshots via `update_event`/`touch`, and
+  self-skips Postgres I/O (does not fail) when no pool/`DATABASE_URL` is configured. The pure
+  `message_to_row(message, created_at, updated_at) -> EventsRow` mapping is tested directly for a
+  byte-identical contract shape without a live Postgres connection.
+- HTTP surface (`engine-serve::http`, actix-web) — `configure(cfg)` registers four routes shared
+  by the serve binary and the test harness: `GET /health`, `GET /workflows` (list registered
+  workflow types), `GET /workflows/{type}/graph` (schema graph for a type), and `POST /events/`
+  (X-API-Key gated; dispatches the event, records live state, and enqueues the durable write).
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `orchestrator/docs/data-contract.md` v1.0.1).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
@@ -119,18 +153,24 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 
 ## Data Flow
 
-<!-- Trigger/dispatch + serve-embedding paths (items 1-2, 5) still stub — Phase 1 serve blocks. -->
-
-1. `bastion serve` receives a trigger (local CLI, remote BastionUI over Tailscale, or an
-   orchestrator-equivalent event POST).
-2. The dual registry (`workflow_registry` + `schema_registry`) resolves the event to a `Workflow`.
+1. `bastion serve` receives a trigger via the actix-web HTTP surface (`POST /events/`, X-API-Key
+   gated) — from local CLI, remote BastionUI over Tailscale, or an orchestrator-equivalent event
+   POST.
+2. `Dispatcher::dispatch(workflow_type)` resolves the event to a registered `Workflow` via the dual
+   registry (`workflow_registry` + `schema_registry`), returning `DispatchError::
+   UnknownWorkflowType` (surfaced as HTTP 422) for an unregistered type.
 3. `Workflow::run` seeds all nodes declared in the `WorkflowSchema` PENDING in `TaskContext::node_runs`,
-   emits the initial in-memory snapshot via `on_progress`, and (once EN.1.C lands) persists the
-   first durable `events` row before the first node runs.
+   emits the initial in-memory snapshot via `on_progress`, which fans out to both:
+   - `LiveStateStore::record` — the in-memory run-state map the local Console reads with no DB poll.
+   - `durable_on_progress` — the mpsc-bridged async writer that inserts the first (all-PENDING)
+     snapshot as the durable `events` row via `engine_store::insert_event` before the first node runs.
 4. The pointer-walk runs each node inside the framework-owned `node_context` envelope (RUNNING →
    SUCCESS/FAILED + `started_at`/`completed_at` timing), following `connections[0]` for plain
    nodes or `Router::route(ctx)` for router nodes (including undeclared runtime back-edges),
    invoking `on_progress` after every transition; a node returning `Err` halts the walk but
-   `run()` still returns `Ok(TaskContext)` with the accumulated state.
-5. Local Console reads live state directly from in-memory shared state/channel; remote observers
-   (BastionUI) subscribe to serve's event stream / read-API rather than polling Postgres.
+   `run()` still returns `Ok(TaskContext)` with the accumulated state. Each subsequent snapshot
+   updates `LiveStateStore` and is persisted via `update_event`/`touch` on the durable writer.
+5. Local Console reads live state directly via `LiveStateStore::get`/`list_active` (in-memory,
+   no DB poll); remote observers (BastionUI) subscribe to serve's `GET /workflows` /
+   `GET /workflows/{type}/graph` read-API rather than polling Postgres. The durable writer
+   self-skips Postgres I/O (without failing the request) when no pool/`DATABASE_URL` is configured.
