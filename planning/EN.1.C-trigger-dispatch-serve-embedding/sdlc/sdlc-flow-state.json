@@ -1,0 +1,84 @@
+{
+  "spec_slug": "EN.1.C-trigger-dispatch-serve-embedding",
+  "branch": "EN.1.C-trigger-dispatch-serve-embedding-flow",
+  "started_at": "2026-07-03T14:25:43Z",
+  "updated_at": "2026-07-03T14:25:43Z",
+  "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow",
+  "status": "running",
+  "current_task": 1,
+  "tasks": {
+    "1": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added a Dispatcher in crates/engine-serve/src/dispatch.rs implementing dual-registry (workflow_registry + schema_registry) dispatch keyed by workflow_type, with DispatchError::UnknownWorkflowType for unregistered types, wired into lib.rs via pub mod dispatch, with 3 passing unit tests.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Kept Dispatcher::register generic via a boxed WorkflowFactory closure (Box<dyn Fn() -> Workflow + Send + Sync>) rather than adding a NodeRegistry-sharing convenience method, since NodeRegistry/Node trait objects aren't Clone and the task only requires register(...)/dispatch(...) resolution.",
+        "Used matches!/manual field comparison instead of assert_eq! against a dispatch() Result because engine_core::Workflow doesn't implement Debug/PartialEq (unwrap_err/assert_eq require those bounds on the Ok variant too)."
+      ],
+      "files_changed": [
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/dispatch.rs",
+        "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.C-trigger-dispatch-serve-embedding-flow/crates/engine-serve/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    }
+  },
+  "review": {
+    "verdict": null,
+    "findings": [],
+    "attempts": 0
+  },
+  "docs": {
+    "changed": [],
+    "created": []
+  },
+  "bail_reason": null,
+  "pr": {
+    "url": null,
+    "number": null
+  },
+  "tokens": {
+    "stages": [
+      {
+        "label": "worktree-setup",
+        "model": "haiku",
+        "promptTokEst": 810,
+        "filesReadKb": null,
+        "inTokEst": 810,
+        "outTok": 3832
+      },
+      {
+        "label": "enumerate",
+        "model": "haiku",
+        "promptTokEst": 271,
+        "filesReadKb": null,
+        "inTokEst": 271,
+        "outTok": 852
+      },
+      {
+        "label": "implement-1-1",
+        "model": "sonnet",
+        "promptTokEst": 1060,
+        "filesReadKb": null,
+        "inTokEst": 1060,
+        "outTok": 10392
+      },
+      {
+        "label": "test-1-1",
+        "model": "haiku",
+        "promptTokEst": 622,
+        "filesReadKb": null,
+        "inTokEst": 622,
+        "outTok": 1853
+      }
+    ],
+    "total": {
+      "promptTokEst": 2763,
+      "filesReadKb": 0,
+      "inTokEst": 2763,
+      "outTok": 16929
+    }
+  }
+}
