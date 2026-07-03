@@ -1,0 +1,44 @@
+[
+  {
+    "task_id": 1,
+    "title": "Add async-trait + futures dependencies",
+    "description": "Add `async-trait = \"0.1\"` and `futures = \"0.3\"` to `[workspace.dependencies]` in the root `Cargo.toml`. Add `async-trait = { workspace = true }` and `futures = { workspace = true }` as real (non-dev) dependencies of `crates/engine-core/Cargo.toml`. Add `async-trait = { workspace = true }` as a real dependency of `crates/engine-serve/Cargo.toml`. Leave `engine-core`'s `tokio` as a dev-dependency (the run loop needs no runtime handle). This task adds deps only; the tree stays green because an added-but-unused dependency trips none of the four gates.",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": ["Cargo.toml", "crates/engine-core/Cargo.toml", "crates/engine-serve/Cargo.toml"],
+    "dependsOn": []
+  },
+  {
+    "task_id": 2,
+    "title": "Convert Node trait, runner, fan-out, and HTTP seam to async",
+    "description": "Single compile-coupled refactor across both crates (the trait change breaks every impl at once, so it lands together). (a) `crates/engine-core/src/node.rs`: annotate `Node` with `#[async_trait::async_trait]` and make `process` `async fn`; keep `name`/`as_router` sync. (b) `crates/engine-core/src/workflow.rs`: make `Workflow::run` and the private `node_context` `async`, add `.await` on `node.process(ctx)`; leave `OnProgress<'a> = Box<dyn FnMut(&TaskContext) + 'a>` and the router pre-resolution/`while let` walk unchanged; migrate the in-file `SuccessNode`/`FailNode` fixtures + their `#[test]`→`#[tokio::test]` callers. (c) `crates/engine-core/src/parallel.rs`: replace the `std::thread::scope` fan-out with `futures::future::join_all(self.branches.iter().zip(inputs).map(|(n,i)| n.process(i))).await`; keep the last-write-wins merge; migrate the `WriterBranch` fixture + tests. (d) `crates/engine-core/src/routing.rs` + `validate.rs`: migrate the `impl Node` test fixtures to async (`route` itself stays sync). (e) `crates/engine-serve/src/http.rs`: delete the `web::block` wrapper, `.await workflow.run(...)` directly with the non-Send `OnProgress` built inline, collapse the nested `Ok(Ok(_))` match to flat `Ok/Err`; migrate the in-file `MarkerNode` fixture. (f) `crates/engine-serve/src/dispatch.rs`: migrate its `MarkerNode` fixture + async test. (g) External test files: `crates/engine-core/tests/{workflow_runner.rs,validator.rs,parallel.rs}` and `crates/engine-serve/tests/dispatch_integration.rs` — add `#[async_trait]`/`async fn process` to fixtures and `#[tokio::test]`/`.await` to callers. `durable.rs`, `validate.rs`'s validator logic, and `dispatch.rs`'s `Dispatcher` need no signature change (they never call `process`).",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [
+      "crates/engine-core/src/node.rs",
+      "crates/engine-core/src/workflow.rs",
+      "crates/engine-core/src/parallel.rs",
+      "crates/engine-core/src/routing.rs",
+      "crates/engine-core/src/validate.rs",
+      "crates/engine-core/tests/workflow_runner.rs",
+      "crates/engine-core/tests/validator.rs",
+      "crates/engine-core/tests/parallel.rs",
+      "crates/engine-serve/src/http.rs",
+      "crates/engine-serve/src/dispatch.rs",
+      "crates/engine-serve/tests/dispatch_integration.rs"
+    ],
+    "dependsOn": [1]
+  },
+  {
+    "task_id": 3,
+    "title": "Validate",
+    "description": "Run the Validation Commands listed in tasks.md and confirm all pass with identical behavior; confirm `web::block` no longer appears in `crates/engine-serve/src/http.rs`.",
+    "acceptance_criteria": [],
+    "validation_commands": [],
+    "max_attempts": 3,
+    "files": [],
+    "dependsOn": [1, 2]
+  }
+]

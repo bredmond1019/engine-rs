@@ -254,27 +254,63 @@ overrides that default only to serialize same-phase blocks that edit the same fi
 
 ## Phase 2 — Claude Code step + control loop
 
+### EN.2.0 — Async `Node` trait
+- **What:** Make `engine-core`'s `Node::process` an `async fn` (via the `async-trait` crate, since
+  `Box<dyn Node>` is load-bearing across `NodeRegistry`, `ParallelNode.branches`, and the
+  `Router: Node` supertrait). Convert `Workflow::run`/`node_context` to `async`, rewrite
+  `ParallelNode`'s fan-out from `std::thread::scope` to `futures::future::join_all` (polls in-place —
+  no `Send`/`'static` forced on branches), and drop the `web::block` wrapper in
+  `engine-serve`'s `post_events` (actix request futures run on a per-worker single-threaded runtime,
+  so the non-`Send` `OnProgress` box can be awaited directly). `Router::route` and the `OnProgress`
+  seam stay **synchronous** (pure in-memory, no I/O). No behavior change.
+- **Why:** Spawning a Claude Code session (EN.2.A) is inherently async; a synchronous `Node::process`
+  would force `ClaudeCodeStep` to block a whole OS thread for the session's duration — the same
+  ceiling Python has. Making the trait async first is the load-bearing lever that lets concurrent
+  runs and I/O-bound branches share the Tokio runtime instead of each claiming a dedicated thread.
+  Done as its own pre-block so the workspace-wide refactor's diff stays separate from EN.2.A's
+  new-feature diff. See `planning/async-node/notes.md` for the full comparison + blast radius.
+- **Files:**
+  - *Modified* `crates/engine-core/src/node.rs` (`Node` trait → `#[async_trait] async fn process`),
+    `crates/engine-core/src/workflow.rs` (`run`/`node_context` async; `OnProgress` unchanged),
+    `crates/engine-core/src/parallel.rs` (`join_all` fan-out), `crates/engine-serve/src/http.rs`
+    (drop `web::block`), `crates/engine-core/Cargo.toml` + root `Cargo.toml` (`async-trait`,
+    `futures`)
+  - *Modified* all 19 test-fixture `impl Node` sites (mechanical `#[async_trait]` + `async fn` +
+    `#[tokio::test]`/`.await` on callers)
+  - *New* `planning/decisions/D5-async-node-trait.md`
+- **Interfaces / shared surface:** Touches the `Node` trait signature every node implementation
+  overrides — a workspace-wide change, but mechanical. `WorkflowValidator`, `Dispatcher`, and
+  `durable.rs` are untouched (they never call `process`).
+- **Out of scope:** Any new node type or feature (EN.2.A onward); making `Router::route` or
+  `OnProgress` async; changing `ParallelNode`'s merge semantics.
+- **Depends on:** Phase 1 (`EN.1.C`) — done.
+- **Acceptance criteria:** The workspace compiles and every existing test passes with identical
+  behavior; `web::block` is gone from `http.rs`; `crates/engine-serve/tests/dispatch_integration.rs`
+  still passes under the async runner; the async-trait choice is recorded in D5;
+  `cargo fmt`/`clippy -D warnings`/`test`/`build --release` all green.
+
 ### EN.2.A — Claude Code step node
 - **What:** Implement a `ClaudeCodeStep` node that spawns a Claude Code session and returns its
-  result into `TaskContext`, using the repaired `claude-sdk-rs` `execute_claude` + `Config`
-  launcher (kill-on-drop cancellation, `total_cost_usd` fix, `--max-tokens` flag removed) as the
-  default path, with the `bastion ask --session <name> --prompt-file <p> --out <o> --dir <workdir>
-  --timeout <n>` tmux/file-drop seam available as a fallback transport for parity with the
-  existing `orchestrator/app/services/claude_code/bastion_backend.py:128` integration.
+  result into `TaskContext`, depending on the new **`core/claude-code-rs`** SDK's async
+  `execute` (kill-on-drop cancellation, current-schema `total_cost_usd`/`usage` parsing,
+  subscription via isolated `CLAUDE_CONFIG_DIR`). The SDK — not this block — owns the subprocess
+  transport; this block wires it into a `Node` and maps its result into `NodeRun`/`TaskContext`.
+  The tmux/file-drop `bastion ask` seam is **dropped** (superseded by the clean native transport we
+  now own; recorded in D4).
 - **Why:** SDLC-flow (Phase 3) is Claude-Code-heavy — its task loop (implement → test → triage →
   review) is built on repeated Claude Code invocations; this node is the shared primitive Phase 3
-  ports the loop onto. Which transport is primary is an explicit open question in the source
-  notes — decide here, driven by SDLC-flow's real usage pattern.
+  ports the loop onto. Building the SDK fresh (rather than repairing the heavy/dated
+  `portfolio/claude-sdk-rs`) gives a lean, purpose-built transport we control and dogfood.
 - **Files:**
   - *New* `crates/engine-core/src/nodes/claude_code_step.rs` (`ClaudeCodeStep` node
     implementation)
-  - *New* `planning/decisions/D3-claude-code-transport-choice.md` (native launcher vs. tmux
-    file-drop seam — decision + rationale)
+  - *New* `planning/decisions/D4-claude-code-transport-choice.md` (native `core/claude-code-rs`
+    subprocess SDK; subscription via isolated `CLAUDE_CONFIG_DIR`; `bastion ask` fallback dropped)
+  - *Modified* workspace `Cargo.toml` (path dep on `../claude-code-rs`)
   - *New* `crates/engine-core/tests/claude_code_step.rs`
-- **Interfaces / shared surface:** Depends on the claude-sdk-rs repair pass landing upstream (a
-  cross-repo prerequisite, tracked in that repo's own planning — not built in this block); if the
-  repair pass is not yet landed when this block starts, fall back to the tmux/file-drop seam and
-  revisit the native path in a later block.
+- **Interfaces / shared surface:** Depends on `EN.2.0` (async `Node`) landing and on the
+  `core/claude-code-rs` SDK's milestone 1 (`execute` + credential isolation) — the SDK is a
+  standalone `core/` repo with its own planning, built in parallel with `EN.2.0`, not in this block.
 - **Out of scope:** Cancellation-token plumbing through the run loop and the abort endpoint
   (EN.2.B); cost/budget accounting beyond capturing a single node's `usage` (EN.2.B does the
   budget gate).
@@ -375,7 +411,8 @@ every phase above).*
 | 1 | A | Node trait + Workflow runner | Port the execution core | The engine's central abstraction |
 | 1 | B | Router + parallel nodes + validator | Port the two execution patterns + correctness guard | What SDLC-flow's task loop needs |
 | 1 | C | Trigger/dispatch + dual-registry + serve embedding | Make it a running engine inside `bastion serve` | Realizes the D42 transport architecture |
-| 2 | A | Claude Code step node | Shared Claude Code primitive | What SDLC-flow's task loop calls repeatedly |
+| 2 | 0 | Async `Node` trait | Unlock true async I/O at the node level | Lets `ClaudeCodeStep` await a subprocess without blocking a thread |
+| 2 | A | Claude Code step node (on `core/claude-code-rs`) | Shared Claude Code primitive | What SDLC-flow's task loop calls repeatedly |
 | 2 | B | Cancellation + abort + budget gate | Ship the features Python never shipped | Required before trusting unattended runs |
 | 3 | A | SDLC-flow setup + task loop port | Highest-volume, most-repeated part | De-risks the rest of the port |
 | 3 | B | SDLC-flow docs/wrap-up/PR + parity acceptance | Capstone: real block ships end-to-end | The named "ready" checkpoint for the milestone |
