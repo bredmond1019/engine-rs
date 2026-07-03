@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.A-node-trait-workflow-runner",
   "branch": "EN.1.A-node-trait-workflow-runner-flow",
   "started_at": "2026-07-03T07:49:24Z",
-  "updated_at": "2026-07-03T07:51:21Z",
+  "updated_at": "2026-07-03T07:54:51Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.A-node-trait-workflow-runner-flow",
   "status": "running",
-  "current_task": 2,
+  "current_task": 3,
   "tasks": {
     "1": {
       "status": "passed",
@@ -39,6 +39,24 @@
       ],
       "files_changed": [
         "crates/engine-core/src/schema.rs",
+        "crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "3": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added the Workflow pointer-walk runner (crates/engine-core/src/workflow.rs) with the on_progress persistence seam and node_context envelope, seeding all nodes PENDING before the walk, stamping RUNNING/SUCCESS/FAILED transitions with timing, and halting on node failure; wired into lib.rs and covered by unit tests.",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Node::process consumes and only returns TaskContext on Ok, so node_context clones ctx before calling process to have a base context available for stamping the FAILED transition on Err (since NodeError carries no context back).",
+        "Used Rc<RefCell<Vec<TaskContext>>> in tests to capture on_progress snapshots, avoiding a borrow conflict between the FnMut closure (borrowed mutably during run) and post-call assertions on the captured Vec.",
+        "WorkflowError (distinct from NodeError) is returned only for graph-shape issues like an unregistered node identity; a node's own failure is captured in NodeRun and does not short-circuit run() with an Err — the accumulated TaskContext is still returned Ok."
+      ],
+      "files_changed": [
+        "crates/engine-core/src/workflow.rs",
         "crates/engine-core/src/lib.rs"
       ],
       "commit": "",
@@ -108,13 +126,29 @@
         "filesReadKb": null,
         "inTokEst": 610,
         "outTok": 2306
+      },
+      {
+        "label": "implement-3-1",
+        "model": "sonnet",
+        "promptTokEst": 1036,
+        "filesReadKb": null,
+        "inTokEst": 1036,
+        "outTok": 12875
+      },
+      {
+        "label": "test-3-1",
+        "model": "haiku",
+        "promptTokEst": 610,
+        "filesReadKb": null,
+        "inTokEst": 610,
+        "outTok": 1752
       }
     ],
     "total": {
-      "promptTokEst": 4355,
+      "promptTokEst": 6001,
       "filesReadKb": 0,
-      "inTokEst": 4355,
-      "outTok": 19046
+      "inTokEst": 6001,
+      "outTok": 33673
     }
   }
 }

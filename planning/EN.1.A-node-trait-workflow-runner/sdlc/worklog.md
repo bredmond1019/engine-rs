@@ -9,3 +9,8 @@ Validated: gating checks (fast tripwire)
 What: engine-core now defines WorkflowSchema/NodeConfig with helpers to resolve the start node and each node's connections[0] next-node, covered by unit tests on a linear 3-node schema.
 Decisions: NodeConfig::next() returns connections.first() as &str, matching the 'connections[0] only' scope for this block; WorkflowSchema stores nodes as HashMap<String, NodeConfig> keyed by node identity for O(1) start/next lookups
 Validated: gating checks (fast tripwire)
+
+## Task 3 — PASSED (1 attempt)
+What: Added the Workflow pointer-walk runner (crates/engine-core/src/workflow.rs) with the on_progress persistence seam and node_context envelope, seeding all nodes PENDING before the walk, stamping RUNNING/SUCCESS/FAILED transitions with timing, and halting on node failure; wired into lib.rs and covered by unit tests.
+Decisions: Node::process consumes and only returns TaskContext on Ok, so node_context clones ctx before calling process to have a base context available for stamping the FAILED transition on Err (since NodeError carries no context back).; Used Rc<RefCell<Vec<TaskContext>>> in tests to capture on_progress snapshots, avoiding a borrow conflict between the FnMut closure (borrowed mutably during run) and post-call assertions on the captured Vec.; WorkflowError (distinct from NodeError) is returned only for graph-shape issues like an unregistered node identity; a node's own failure is captured in NodeRun and does not short-circuit run() with an Err — the accumulated TaskContext is still returned Ok.
+Validated: gating checks (fast tripwire)
