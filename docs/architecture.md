@@ -71,9 +71,10 @@ engine-rs/
 Async runtime + persistence: `tokio` + `sqlx` (postgres, runtime-tokio, tls-rustls) — see
 `planning/decisions/D2-async-runtime-choice.md`. `engine-store` carries `sqlx` as a real
 dependency for its Postgres layer; `engine-contract` carries `chrono`/`uuid` for the data-contract
-types; `engine-core` only needs `tokio` as a dev-dependency so far. `engine-serve` (EN.1.C) now
-carries `chrono`, `sqlx`, and `actix-web` as real dependencies alongside `tokio` — `actix-web` is
-the HTTP framework choice, see `planning/decisions/D3-http-framework-choice.md`.
+types; `engine-core` carries `async-trait` and `futures` as real dependencies (EN.2.0) alongside
+`tokio` as a dev-dependency. `engine-serve` (EN.1.C) now carries `chrono`, `sqlx`, `actix-web`, and
+`async-trait` (EN.2.0) as real dependencies alongside `tokio` — `actix-web` is the HTTP framework
+choice, see `planning/decisions/D3-http-framework-choice.md`.
 
 CI (`.github/workflows/ci.yml`) runs on every push (all branches) and on pull requests, running
 the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
@@ -81,10 +82,10 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 
 ## Core Types
 
-- `Node` (trait, `engine-core::node`) — `fn process(&self, ctx: TaskContext) -> Result<TaskContext,
-  NodeError>` + `fn name(&self) -> &str`; identity = the implementing type's own `name()` string,
-  ported from `orchestrator/app/core/nodes/base.py`. Bounded `Send + Sync` so boxed trait objects
-  work across async boundaries later.
+- `Node` (trait, `engine-core::node`, `#[async_trait::async_trait]`) — `async fn process(&self, ctx:
+  TaskContext) -> Result<TaskContext, NodeError>` + `fn name(&self) -> &str`; identity = the
+  implementing type's own `name()` string, ported from `orchestrator/app/core/nodes/base.py`.
+  Bounded `Send + Sync` so boxed trait objects work across async boundaries (EN.2.0).
 - `NodeError` (`engine-core::node`) — a `{ message: String }` struct implementing `Display` +
   `std::error::Error`; carried into the node's `NodeRun.error` on failure.
 - `NodeRegistry` (`engine-core::node`) — `HashMap<String, Box<dyn Node>>` keyed by `Node::name()`,
@@ -102,21 +103,24 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   Option<&dyn Router>` is a default `None` hook nodes override to be detected by the registry as
   routers. `dispatch_route(&dyn Router, &TaskContext) -> Option<String>` is a thin dispatch
   helper wrapping `router.route(ctx)`.
-- `ParallelNode` (`engine-core::parallel`) — fans out over a declared `Vec` of branch nodes on
-  `std::thread::scope`, deep-copies the `TaskContext` per branch, and merges `nodes`/`node_runs`
-  back with deterministic last-write-wins semantics (later branch in declared order wins on key
-  collision); the first branch `NodeError` encountered in declared order is propagated as the
-  `ParallelNode`'s own error, with no partial merge on branch failure.
+- `ParallelNode` (`engine-core::parallel`) — fans out over a declared `Vec` of branch nodes via
+  `futures::future::join_all` (EN.2.0; polled in-place on the current task, so borrowed
+  `&self.branches` needs neither `Send` nor `'static`), deep-copies the `TaskContext` per branch,
+  and merges `nodes`/`node_runs` back with deterministic last-write-wins semantics (later branch
+  in declared order wins on key collision); the first branch `NodeError` encountered in declared
+  order is propagated as the `ParallelNode`'s own error, with no partial merge on branch failure.
 - `WorkflowValidator` / `ValidationError` (`engine-core::validate`) — static graph-shape checks
   run before execution: BFS reachability from `start_node`, DFS cycle detection that skips edges
   declared out of router nodes (routers are exempt so runtime back-edges are legal), and a
   fan-out arity guard rejecting non-router nodes with more than one declared connection. Router
   classification is via `NodeRegistry` lookup + `Node::as_router().is_some()`.
 - `Workflow` (`engine-core::workflow`) — pointer-walk runner (not a topo-scheduler); pairs a
-  `NodeRegistry` with a `WorkflowSchema`. `run(event, on_progress) -> Result<TaskContext,
-  WorkflowError>` seeds every declared node PENDING, emits the initial snapshot via `on_progress`,
-  then walks `current_node` — resolving router nodes via `Router::route(ctx)` and plain nodes via
-  `next_after` (`connections[0]`) — until `None`, ported from `workflow.py`. `Workflow::
+  `NodeRegistry` with a `WorkflowSchema`. `async fn run(event, on_progress) -> Result<TaskContext,
+  WorkflowError>` (EN.2.0) seeds every declared node PENDING, emits the initial snapshot via
+  `on_progress`, then walks `current_node` — resolving router nodes via `Router::route(ctx)` and
+  plain nodes via `next_after` (`connections[0]`) — until `None`, ported from `workflow.py`;
+  `node_context` (the RUNNING → SUCCESS/FAILED envelope) is likewise async, `.await`ing each
+  node's `process`. `Workflow::
   new_validated(registry, schema)` is a fallible constructor that runs `WorkflowValidator::
   validate` first and rejects an invalid schema; the existing infallible `Workflow::new` is
   unchanged.
@@ -144,6 +148,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   by the serve binary and the test harness: `GET /health`, `GET /workflows` (list registered
   workflow types), `GET /workflows/{type}/graph` (schema graph for a type), and `POST /events/`
   (X-API-Key gated; dispatches the event, records live state, and enqueues the durable write).
+  `post_events` builds the `OnProgress` box inline and `.await`s `workflow.run` directly (EN.2.0)
+  — no `web::block`/thread-pool escape hatch, since actix request futures already run on a
+  per-worker single-threaded runtime and `Node::process` is now async.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `orchestrator/docs/data-contract.md` v1.0.1).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
