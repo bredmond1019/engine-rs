@@ -5,6 +5,7 @@
 //! `engine-core` and `engine-store` are real — see `docs/architecture.md` for the module map.
 
 pub mod dispatch;
+pub mod live_state;
 
 /// Placeholder identifying this crate; exists so the workspace has at least one
 /// non-trivial symbol to build and test against before the real types land.
