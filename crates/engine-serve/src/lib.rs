@@ -1,0 +1,21 @@
+//! `engine-serve` — the `bastion serve` embedding: in-memory run state, trigger/dispatch,
+//! HTTP surface.
+//!
+//! Stub crate for EN.0.A (Cargo workspace + CI). The trigger/dispatch path lands once
+//! `engine-core` and `engine-store` are real — see `docs/architecture.md` for the module map.
+
+/// Placeholder identifying this crate; exists so the workspace has at least one
+/// non-trivial symbol to build and test against before the real types land.
+pub fn crate_name() -> &'static str {
+    "engine-serve"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_name_is_engine_serve() {
+        assert_eq!(crate_name(), "engine-serve");
+    }
+}
