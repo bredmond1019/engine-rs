@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-03T15:00:54Z"
+timestamp: "2026-07-03T16:45:21Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,11 @@ related: [status, context]
 ---
 
 ## 2026-07-03
+
+### Paused EN.2.A spec generation at the transport-decision clarify gate
+- **What:** Started `/generate-tasks EN.2.A` (Claude Code step node) but paused at the transport-decision clarify gate **without writing a spec** — the working tree is clean of any EN.2.A files. EN.1.C is fully merged, so **Phase 1 (Execution Core) is Done**. Two blockers surfaced at the gate: (1) a **decision-number collision** — `master-plan.md` names the transport decision **D3**, but D3 is now the HTTP-framework decision (recorded during EN.1.C), so the transport decision must be recorded as **D4**; (2) **`claude-sdk-rs` is not on disk** in this environment, so the native transport for `ClaudeCodeStep` can't be built here. The user wants to first **review a Claude Code Rust SDK on GitHub and compare it against `claude-sdk-rs`** before deciding `ClaudeCodeStep`'s transport. Recorded two carryover entries in `planning/state.json` (`transport-decision-uses-d4-not-d3`, `claude-sdk-rs-not-on-disk`) and rewrote `planning/handoff.md` to refocus the next session on the external SDK review.
+- **Why:** The transport choice is a load-bearing decision for the whole Phase 2 Claude Code node; making it blind (wrong decision number, and without the actual SDK on disk to compare) would bake in rework. Pausing at the gate and pointing the next session at the SDK review keeps the decision honest and preserves clean state (no half-written spec).
+- **Refs:** `planning/handoff.md`, `planning/state.json` (carryover: `transport-decision-uses-d4-not-d3`, `claude-sdk-rs-not-on-disk`), `planning/master-plan.md` (EN.2.A)
 
 ### Merged EN.1.C into main, cleaned up worktree, reconciled state.json, wrote handoff for EN.2.A
 - **What:** Ran `/code-review low` on the EN.1.C source diff (tests excluded) — no findings. Verified `docs/architecture.md`'s EN.1.C update (module map, dependency list, key types, data-flow narrative) was accurate — no further doc edits needed. Merged `EN.1.C-trigger-dispatch-serve-embedding-flow` into `main` via `/clean-worktree`: the first `--ff-only` attempt failed because `main` had advanced by one commit (routine harness sync from base-template, `2d25df2`); rebased the worktree branch onto `main` (clean, 17 commits, no conflicts) and retried `--ff-only`, which succeeded (merge commit `2248d5a`). Removed the worktree and deleted the branch. Reconciled `planning/state.json`: flipped `EN.1.C` from `"open"` to `"closed"`, moved `focus.next` from `EN.1.C` to `EN.2.A` (now unblocked), confirmed `EN.2.B`/`EN.3.A`/`EN.3.B` remain correctly blocked. Ran `mev emit-state --write` — clean, only informational `W_EMIT_NO_SENTINEL` warnings (expected/pre-existing). Wrote a fresh `planning/handoff.md` pointing at `EN.2.A` ("Claude Code step node") as next, first command `/generate-tasks EN.2.A`.
