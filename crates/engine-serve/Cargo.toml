@@ -16,3 +16,4 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 actix-web = { workspace = true }
+async-trait = { workspace = true }
