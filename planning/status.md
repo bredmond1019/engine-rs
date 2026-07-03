@@ -5,9 +5,9 @@ description: Current state and progress tracker for engine-rs.
 doc_id: status
 layer: [factory]
 status: active
-timestamp: "2026-07-03T09:14:19Z"
-now: "Phase 1, EN.1.B — Router + parallel nodes + validator"
-next: "Define EN.1.B tasks via /generate-tasks EN.1.B"
+timestamp: "2026-07-03T10:54:30Z"
+now: "Phase 1, EN.1.B — Router + parallel nodes + validator — done, awaiting merge"
+next: "Merge EN.1.B into main, define next Phase 1 block"
 blocked: []
 keywords: [status, progress tracker, current focus, blocks]
 related: [context, master-plan, planning-index, knowledge, memory]
@@ -15,8 +15,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-03T09:14:19Z — EN.1.A merged to main (--no-ff, `a7906cc`), worktree cleaned up, handoff written for EN.1.B
-**Current focus:** EN.1.B-router-parallel-nodes-validator
+**Last updated:** 2026-07-03 — EN.1.B-router-parallel-nodes-validator completed via `/sdlc-flow` (5 tasks, PASS review), on branch `EN.1.B-router-parallel-nodes-validator-flow`
+**Current focus:** EN.1.B-router-parallel-nodes-validator (Done — awaiting merge)
 
 ---
 
@@ -35,8 +35,8 @@ related: [context, master-plan, planning-index, knowledge, memory]
 > Working board — keep all five queues live. **Never end a meaningful session with every queue
 > empty.** The headlines of **now / next / blocked** mirror the frontmatter scalars above.
 
-- **now** — Phase 1, EN.1.B — Router + parallel nodes + validator
-- **next** — Define EN.1.B tasks (`/generate-tasks EN.1.B`)
+- **now** — Phase 1, EN.1.B — Router + parallel nodes + validator — done, awaiting merge
+- **next** — Merge EN.1.B into main, define next Phase 1 block
 - **blocked** — _nothing yet — each entry names its blocker and the smallest missing answer_
 - **improve** — _self-improvement backlog: eval gaps, flaky workflows, repeated failures, missing skills, stale assumptions_
 - **recurring** — _schedules, monitors, sweeps, automations_
@@ -67,6 +67,7 @@ related: [context, master-plan, planning-index, knowledge, memory]
 | Block | What | Status | Notes |
 |---|---|---|---|
 | EN.1.A | Node trait + Workflow runner | Done | `Node` trait + `NodeRegistry`, `WorkflowSchema`, pointer-walk `Workflow::run` with `on_progress` seam; PASS review |
+| EN.1.B | Router + parallel nodes + validator | Done | `Router` trait + `dispatch_route`, `ParallelNode` fan-out/merge, `WorkflowValidator` (reachability/cycle/arity) + `Workflow::new_validated`; PASS review |
 
 <!-- Add one sub-table per phase as the plan is fleshed out. -->
 

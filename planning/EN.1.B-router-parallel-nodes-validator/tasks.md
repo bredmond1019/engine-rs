@@ -1,6 +1,6 @@
 # Task Spec — Phase 1, Block B (EN.1.B — Router + parallel nodes + validator)
 
-**Status:** Not started · **Last run:** never
+**Status:** Done · **Last run:** 2026-07-03 (5/5 tasks passed, review PASS)
 
 ## Goal
 Port the two execution patterns (runtime routing, parallel fan-out/merge) and the structural correctness guard (the acyclic graph validator) onto the EN.1.A `Node`/`Workflow` core.
