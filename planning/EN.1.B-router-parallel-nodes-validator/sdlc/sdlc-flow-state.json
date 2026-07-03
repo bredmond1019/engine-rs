@@ -2,10 +2,10 @@
   "spec_slug": "EN.1.B-router-parallel-nodes-validator",
   "branch": "EN.1.B-router-parallel-nodes-validator-flow",
   "started_at": "2026-07-03T10:37:31Z",
-  "updated_at": "2026-07-03T10:40:43Z",
+  "updated_at": "2026-07-03T10:44:24Z",
   "worktree_path": "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow",
   "status": "running",
-  "current_task": 2,
+  "current_task": 3,
   "tasks": {
     "1": {
       "status": "passed",
@@ -40,6 +40,24 @@
         "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/src/parallel.rs",
         "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/tests/parallel.rs",
         "/Users/brandon/Dev/agentic-portfolio/core/engine-rs/trees/EN.1.B-router-parallel-nodes-validator-flow/crates/engine-core/src/lib.rs"
+      ],
+      "commit": "",
+      "validated": "gating checks (fast tripwire)"
+    },
+    "3": {
+      "status": "passed",
+      "attempts": 1,
+      "summary": "Added WorkflowValidator (BFS reachability, DFS cycle check skipping router edges, non-router fan-out arity guard) with ValidationError enum, re-exported from lib.rs, with 6 unit tests covering valid linear/router-fanout schemas and each rejection case (unreachable node, non-router multi-connection, non-router cycle, router back-edge exemption).",
+      "issues": [],
+      "fixes": [],
+      "decisions": [
+        "Classified a node as router purely via NodeRegistry lookup + Node::as_router().is_some(); an unregistered identity is treated as non-router (its unreachable/unregistered status is caught by the reachability check instead)",
+        "Validation order is deterministic: fan-out arity checked first (over all nodes), then reachability (BFS), then cycles (DFS) — each pass iterates schema.nodes keys in sorted order for reproducible error reporting",
+        "DFS cycle check completely skips walking connections declared out of a router node (rather than just ignoring back-edges), per spec's 'skips edges out of router nodes' language"
+      ],
+      "files_changed": [
+        "crates/engine-core/src/validate.rs",
+        "crates/engine-core/src/lib.rs"
       ],
       "commit": "",
       "validated": "gating checks (fast tripwire)"
@@ -108,13 +126,29 @@
         "filesReadKb": null,
         "inTokEst": 620,
         "outTok": 2019
+      },
+      {
+        "label": "implement-3-1",
+        "model": "sonnet",
+        "promptTokEst": 1056,
+        "filesReadKb": null,
+        "inTokEst": 1056,
+        "outTok": 9842
+      },
+      {
+        "label": "test-3-1",
+        "model": "haiku",
+        "promptTokEst": 620,
+        "filesReadKb": null,
+        "inTokEst": 620,
+        "outTok": 2755
       }
     ],
     "total": {
-      "promptTokEst": 4430,
+      "promptTokEst": 6106,
       "filesReadKb": 0,
-      "inTokEst": 4430,
-      "outTok": 25708
+      "inTokEst": 6106,
+      "outTok": 38305
     }
   }
 }
