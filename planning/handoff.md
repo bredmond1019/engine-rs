@@ -3,82 +3,89 @@ type: Handoff
 created: 2026-07-03
 ---
 
-# Handoff — EN.1.C merged and cleaned up; EN.2.A is next
+# Handoff — EN.2.A paused: review a Claude Code Rust SDK before deciding transport
 
 > **For the next agent:** Read this immediately after `/prime`. Delete this file once consumed.
 
 ## What we're doing and why
 
 `engine-rs` is porting the Python `orchestrator` engine core to Rust (the parallel-pilot
-rewrite, D42). This session drove EN.1.C (trigger/dispatch + dual-registry + serve embedding)
-end-to-end through `/sdlc-flow`, ran a light code review, verified docs, merged the block into
-`main`, and cleaned up the worktree. Phase 1 (Execution Core) is now fully **Done** —
-`bastion serve` can trigger workflows over HTTP, hold live run state in memory, and durably
-record runs to Postgres. Phase 2 (EN.2.A — Claude Code step node) is next.
+rewrite, D42). **Phase 1 is fully done** — EN.1.C merged, `bastion serve` can trigger workflows
+over HTTP, hold live run state in memory, and durably record runs to Postgres. The next block is
+**EN.2.A — Claude Code step node** (`ClaudeCodeStep`, the shared Claude-Code primitive Phase 3's
+SDLC-flow port leans on).
+
+We started `/generate-tasks EN.2.A` but **paused before writing the spec** because the block hinges
+on an unresolved, load-bearing decision: **which transport `ClaudeCodeStep` uses to invoke Claude
+Code** — the native `claude-sdk-rs` launcher (`execute_claude` + `Config`, post its repair pass) vs.
+the tmux/file-drop `bastion ask` seam (parity with `orchestrator/app/services/claude_code/bastion_backend.py:128`).
+The master-plan explicitly frames transport primacy as an open question to "decide here." Two facts
+block a clean decision (both recorded as `carryover[]`): the `claude-sdk-rs` repo **is not on disk**
+here, so its native path can't be built/verified; and **the user wants to first review a Claude Code
+Rust SDK on GitHub and compare it against the existing `claude-sdk-rs`** before choosing. So the
+immediate task is that review/comparison, not writing the spec.
 
 ## Completed this session
 
-- `/sdlc-flow EN.1.C-trigger-dispatch-serve-embedding` — PASS, 6 tasks. Added (all in
-  `crates/engine-serve/src/`):
-  - `dispatch.rs` — `Dispatcher` (dual `workflow_registry`/`schema_registry` keyed by
-    `workflow_type`, `DispatchError::UnknownWorkflowType`)
-  - `live_state.rs` — `LiveStateStore` (`Arc<RwLock<HashMap<RunId, TaskContext>>>`), the local
-    Console's no-DB-poll read path for live run state
-  - `durable.rs` — `DurableHandle`/`spawn_durable_writer`/`durable_on_progress`, an mpsc-bridged
-    async durable-write seam mapping `on_progress` snapshots to `engine_contract::EventsRow`
-    via `engine_store::insert_event`/`update_event`; self-skips Postgres I/O with no
-    `DATABASE_URL`
-  - `http.rs` — the four-endpoint `actix-web` HTTP surface (D3): `POST /events/` (X-API-Key
-    gated), `GET /health`, `GET /workflows`, `GET /workflows/{type}/graph`
-  - `tests/dispatch_integration.rs` — headline integration test (live-state read with no DB
-    query, byte-identical durable `EventsRow` mapping, 422 for an unregistered `workflow_type`)
-  - Consolidated review: PASS, no findings. Docs patched: `docs/architecture.md`.
-  - PR #1 opened: https://github.com/bredmond1019/engine-rs/pull/1
-- Ran `/code-review low` on the EN.1.C source diff (tests excluded) — **(none)**, no findings.
-- Verified `docs/architecture.md` accurately reflects the new module map, dependency list, key
-  types, and data-flow narrative — no gaps found.
-- Merged `EN.1.C-trigger-dispatch-serve-embedding-flow` into `main`. The first `--ff-only`
-  attempt failed (main had advanced by one commit — a harness sync from base-template); rebased
-  the worktree branch onto `main` (clean, no conflicts across 17 commits) and retried
-  `--ff-only`, which then succeeded (commit `2248d5a`).
-- Removed the worktree and deleted the branch via `/clean-worktree`.
-- Reconciled `planning/state.json`: closed the `EN.1.C` block, moved `focus.next` from `EN.1.C`
-  to `EN.2.A` (now unblocked — its only blocker, `EN.1.C`, is closed), and confirmed `EN.2.B`/
-  `EN.3.A`/`EN.3.B` remain correctly `blocked`. Ran `mev emit-state --write` — clean (only
-  informational `W_EMIT_NO_SENTINEL` warnings for repos without wave-table sentinels, expected).
+- **EN.1.C fully landed** (from the prior sub-session, already merged): `/sdlc-flow` PASS across 6
+  tasks, PR #1 opened, merged `--ff-only` to `main` (`2248d5a`), worktree cleaned, `state.json`
+  reconciled. Phase 1 Done. (Detail preserved in `log.md`.)
+- Authored the **EN.1.C spec + breakdown** earlier this session (`planning/EN.1.C-.../tasks.md`,
+  `tasks.json`, `breakdown.md`) and switched its HTTP framework from axum to **actix-web** at the
+  user's request — recorded as **D3** (`planning/decisions/D3-http-framework-choice.md`), linked in
+  the decisions index. (These are what EN.1.C then implemented.)
+- Started `/generate-tasks EN.2.A`; **stopped at the transport-decision clarify gate** (no spec
+  written — working tree was clean of EN.2.A files). Surfaced two blockers → recorded as
+  `carryover[]` (see below).
 
 ## Remaining work
 
-- **Next block: EN.2.A — Claude Code step node.** Not yet started. Run `/generate-tasks EN.2.A`
-  to produce its task spec, then drive it with `/sdlc-flow <slug>` (confirm the exact slug from
-  `planning/master-plan.md` first).
-- PR #1 (EN.1.C) is open but not merged on GitHub — the local `main` already has the fast-forward
-  merge and the branch is deleted locally. Decide whether to close PR #1 as already-merged-locally
-  (and push `main` to sync GitHub), or reconcile GitHub's view separately.
+1. **Review the Claude Code Rust SDK on GitHub the user wants to compare.** Ask the user for the
+   repo URL (not yet provided). Compare it against the existing `claude-sdk-rs`
+   (`agentic-portfolio/claude-sdk-rs/`, its brain cache: `docs/projects/claude-sdk-rs.md`) —
+   feature surface, session/launcher API, cost/token reporting, cancellation (kill-on-drop),
+   maintenance/health. Goal: decide whether to adopt/reuse it, keep `claude-sdk-rs`, or continue
+   with the tmux/file-drop seam.
+2. **Decide `ClaudeCodeStep`'s transport** (blocked on #1). Candidate framing offered this session:
+   a `ClaudeTransport` trait with the buildable `bastion ask` file-drop seam as the default *now*
+   and a native SDK impl behind the trait for when it's available — but the user has not chosen; do
+   not assume.
+3. **Then** resume `/generate-tasks EN.2.A`. When writing it: honor the two `carryover[]` constraints —
+   **use D4, not D3**, for the transport decision file (`carryover: transport-decision-uses-d4-not-d3`),
+   and account for the native path possibly being unbuildable here
+   (`carryover: claude-sdk-rs-not-on-disk`). Block files per master-plan:
+   `crates/engine-core/src/nodes/claude_code_step.rs` (new — no `nodes/` dir exists yet),
+   the transport decision file (→ **D4**), `crates/engine-core/tests/claude_code_step.rs`.
+   Out of scope (EN.2.B): cancellation-token plumbing through the run loop, abort endpoint, budget gate.
+4. **Housekeeping (optional):** PR #1 (EN.1.C) is open on GitHub but `main` already has the local
+   fast-forward merge — decide whether to close it as already-merged and push `main`, or reconcile
+   GitHub's view. (Carried from the prior handoff; still open.)
 
 ## Durable State Updates
 
-- `planning/state.json`: `EN.1.C` block status flipped `open` → `closed`; `focus.next` now
-  points at `EN.2.A` (previously pointed at the now-closed `EN.1.C`); `EN.2.A`'s `blocked_by`
-  cleared (its only blocker, `EN.1.C`, is closed) and it was moved out of `focus.blocked` into
-  `focus.next`.
-- No new `carryover[]` entries this session (none needed — no durable caveats surfaced).
-- No block `tasks.json` was created or changed this session.
+- `planning/state.json` `carryover[]` — two new entries:
+  - `transport-decision-uses-d4-not-d3` (`kind: constraint`) — the EN.2.A transport decision file
+    must be **D4**, since D3 is now the HTTP-framework decision.
+  - `claude-sdk-rs-not-on-disk` (`kind: known_issue`) — native transport unbuildable/unverifiable
+    here; tmux/file-drop seam is the fallback; transport primacy deliberately deferred pending the
+    GitHub-SDK review.
+- Ran `mev emit-state --write` after editing `carryover[]`.
+- `focus.next` already points at `EN.2.A` (status `open`); no block `tasks.json` created/changed.
 
 ## Open questions / choices
 
-- Whether to push the local `main` merge to `origin/main` and reconcile/close PR #1, or treat
-  GitHub PR #1 as the canonical merge record going forward (this session merged locally first,
-  per the same pattern used for EN.1.B).
-- Everything else — approach for EN.2.A — is unsettled and not yet scoped; that's expected, it
-  hasn't been planned yet.
+- **The GitHub Claude Code Rust SDK URL** — the user referenced it but hasn't pasted the link yet.
+  Ask for it first thing.
+- **Transport primacy** — unresolved by design; it's the output of the review in remaining-work #1.
 
 ## Context the next agent needs
 
-The rebase-before-merge step (main advanced by a routine harness sync commit) is a one-off from
-this session, not a recurring issue — no `carryover[]` entry needed. `git remote -v` still shows
-`origin` → `git@github.com:bredmond1019/engine-rs.git`, unchanged from the prior session.
+The transport decision is not a blind pick — the user is actively evaluating an external SDK against
+their own `claude-sdk-rs` and wants that comparison done before committing. Lead with the review, not
+the spec. Everything durable is in `carryover[]`; this file just points at it.
 
 ## First command after `/prime`
 
-`/generate-tasks EN.2.A`
+Ask the user for the GitHub URL of the Claude Code Rust SDK they want reviewed, then compare it
+against `claude-sdk-rs` (start from the brain cache `docs/projects/claude-sdk-rs.md`). Resume
+`/generate-tasks EN.2.A` only after the transport is decided.

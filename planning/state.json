@@ -64,7 +64,7 @@
   },
   "tracks": [
     {
-      "title": "engine-rs first milestone — engine core + contract emitter + SDLC-flow parity (D42)",
+      "title": "engine-rs first milestone \u2014 engine core + contract emitter + SDLC-flow parity (D42)",
       "blocks": [
         {
           "id": "EN.0.A",
@@ -202,5 +202,26 @@
   "tiers": [],
   "note": null,
   "backlog": [],
-  "carryover": []
+  "carryover": [
+    {
+      "slug": "transport-decision-uses-d4-not-d3",
+      "scope": {
+        "repo": "engine-rs"
+      },
+      "kind": "constraint",
+      "text": "EN.2.A's master-plan section names the transport decision file 'D3-claude-code-transport-choice.md', but D3 is already taken by the EN.1.C HTTP-framework decision (D3-http-framework-choice.md). Record the ClaudeCodeStep transport decision as D4 (next free number) and link it from planning/decisions/index.md.",
+      "clears_when": "the EN.2.A transport decision file is written as D4",
+      "created": "2026-07-03"
+    },
+    {
+      "slug": "claude-sdk-rs-not-on-disk",
+      "scope": {
+        "repo": "engine-rs"
+      },
+      "kind": "known_issue",
+      "text": "EN.2.A's native transport (claude-sdk-rs execute_claude + Config, post repair-pass) is NOT buildable/verifiable from engine-rs: the claude-sdk-rs repo is not on disk at ../../../claude-sdk-rs and its repair-pass state is unconfirmed. Per the master-plan block, if the repair pass hasn't landed, fall back to the tmux/file-drop 'bastion ask' seam (parity with orchestrator/app/services/claude_code/bastion_backend.py:128). The user wants to first review a Claude Code Rust SDK on GitHub and compare it against claude-sdk-rs before the transport is decided, so transport primacy is deliberately deferred.",
+      "clears_when": "the ClaudeCodeStep transport is decided and its decision file (D4) is written",
+      "created": "2026-07-03"
+    }
+  ]
 }

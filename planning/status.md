@@ -5,7 +5,7 @@ description: Current state and progress tracker for engine-rs.
 doc_id: status
 layer: [factory]
 status: active
-timestamp: "2026-07-03T15:00:54Z"
+timestamp: "2026-07-03T16:45:21Z"
 now: "Phase 1 (Execution Core) fully Done — EN.1.A/EN.1.B/EN.1.C all closed; engine embedded in bastion serve"
 next: "EN.2.A — Claude Code step node; first command /generate-tasks EN.2.A"
 blocked: []
@@ -15,7 +15,7 @@ related: [context, master-plan, planning-index, knowledge, memory]
 
 # STATUS — Current State & Progress
 
-**Last updated:** 2026-07-03 — EN.1.C-trigger-dispatch-serve-embedding merged to `main` (`2248d5a`), worktree cleaned up, state.json reconciled, handoff written for EN.2.A
+**Last updated:** 2026-07-03 — EN.1.C-trigger-dispatch-serve-embedding merged to `main` (`2248d5a`), worktree cleaned up, state.json reconciled, handoff written for EN.2.A. EN.2.A is **paused** at the transport-decision clarify gate pending an external Claude Code Rust SDK review (see handoff)
 **Current focus:** Phase 1 (Execution Core) fully Done — EN.1.A/EN.1.B/EN.1.C all closed; engine embedded in `bastion serve`
 
 ---
