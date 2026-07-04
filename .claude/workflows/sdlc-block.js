@@ -637,7 +637,9 @@ STEP 3 — Find every block: any heading that appears under a "## Phase N — <n
 Return using StructuredOutput: planFormatOk, blocks (in document order), notes.
 `, { label: 'enumerate-blocks', schema: ENUMERATE_BLOCKS_SCHEMA, phase: 'Enumerate', model: 'sonnet' })
 
-if (!enumResult || !enumResult.planFormatOk || !(enumResult.blocks || []).length) {
+// A non-empty blocks array IS the format-ok signal — planFormatOk is optional in the schema and the
+// agent may omit it even on a clean parse, so do not treat its absence as a parse failure.
+if (!enumResult || !(enumResult.blocks || []).length) {
   log(`ABORTED — ${planFile} has no parseable "## Phase N" / block-heading structure.`)
   log(`Fix: author it with /generate-master-plan (or /plan), which emits the canonical "### <Prefix>.<N>.<Letter>" block headings, commit, then re-run.`)
   return { error: 'Plan not in master-plan format', planFile, notes: enumResult?.notes }
@@ -789,7 +791,7 @@ Write to:        ${blockTasks} (prose) and ${blockTasksJson} (task list)
    dependsOn } — 1-indexed task_ids, dependency-ordered, no gaps; each task names the concrete
    file(s) it owns in "files" so tasks are disjoint and merge-safe (final Validate task exempt, and
    its "dependsOn" lists every other task_id); the final task is always titled "Validate".
-   acceptance_criteria/validation_commands can stay `[]` per task — the spec-level markdown
+   acceptance_criteria/validation_commands can stay \`[]\` per task — the spec-level markdown
    sections are authoritative; max_attempts defaults to 3.
 
 4. Commit on the train branch (stage explicitly):
