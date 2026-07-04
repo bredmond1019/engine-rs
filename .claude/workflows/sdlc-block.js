@@ -30,8 +30,10 @@
 //     --resume                load block-orchestration-state.json, skip done blocks, continue.
 //
 // MODEL
-//   sonnet : pre-flight, enumerate-blocks, merge, report   |   opus : per-block generate-tasks (planning)
-//   haiku  : state-writer   |   the inner /sdlc-flow carries its OWN model tiering per stage.
+//   sonnet : pre-flight, enumerate-blocks, merge, gap-check, pr-open, final close-out, report
+//   opus   : per-block generate-tasks (planning)
+//   haiku  : state-writer, state.json status sync
+//   the inner /sdlc-flow carries its OWN model tiering per stage.
 //
 // BRANCH TRAIN
 //   The orchestrator keeps a "train" branch checked out at the MAIN repo root; every wave's child
@@ -507,13 +509,26 @@ STEP 3 — AUTHORED EDIT ONLY (see state-schema.md's Authored-vs-derived table).
 
 STEP 4 — Validate the JSON is still well-formed:
   python3 -c "import json;json.load(open('planning/state.json'))"
-  If that fails, revert your edit and return updated=false, reason="edit produced invalid JSON".
+  If that fails: git checkout -- planning/state.json (discard the bad edit), then return updated=false,
+  reason="edit produced invalid JSON".
 
 STEP 5 — Commit on the current branch (stage explicitly):
   git add planning/state.json
   git commit -m "chore: state.json — ${id} -> ${newStatus}" || echo "NOTHING_TO_COMMIT"
 
-Return via StructuredOutput: updated (true iff the status was actually changed and committed), reason.
+STEP 6 — MANDATORY verification (this call must NEVER leave the tree dirty — a later merge step
+  requires a clean working tree, and a stray uncommitted planning/state.json would silently block it):
+  git status --porcelain -- planning/state.json
+  If that prints anything (the commit above did not actually land — e.g. a hook rejected it), retry
+  once: git add -A -- planning/state.json && git commit -m "chore: state.json — ${id} -> ${newStatus} (retry)".
+  Check again: git status --porcelain -- planning/state.json
+  If STILL not empty, give up on the sync but restore cleanliness: git checkout -- planning/state.json
+  (this discards the status flip — the pipeline degrading gracefully to "not synced" beats leaving the
+  train branch dirty and blocking every subsequent block's merge). Return updated=false in that case,
+  reason="commit did not land after retry; discarded the edit to keep the tree clean".
+
+Return via StructuredOutput: updated (true iff the status was actually changed AND committed AND
+git status --porcelain -- planning/state.json is confirmed empty), reason.
 `, { label: `state-sync:${id}:${newStatus}`, schema: STATE_SYNC_SCHEMA, model: 'haiku' })
   if (!r || !r.updated) log(`(state.json) ${id} -> ${newStatus}: skipped — ${r?.reason || 'sync agent returned null'}`)
   else log(`(state.json) ${id} -> ${newStatus}`)
@@ -877,7 +892,7 @@ If any files were written or edited in STEPs 2-3, commit them:
   git log --oneline -1   (capture commitHash)
 
 Return via StructuredOutput: passed, fixesMade, commitHash, notes.
-`, { label: `gap-check-${slug}`, schema: GAP_CHECK_SCHEMA, phase: 'Gap-check' })
+`, { label: `gap-check-${slug}`, schema: GAP_CHECK_SCHEMA, phase: 'Gap-check', model: 'sonnet' })
 }
 
 // Open a GitHub PR for a completed block (PR mode only). Called after the per-block gap-check.
@@ -926,7 +941,7 @@ EOF
    If gh reports a PR already exists for this branch, treat created=true and capture its url/number.
 
 Return via StructuredOutput: created, url, number, notes.
-`, { label: `pr-open-${slug}`, schema: BLOCK_PR_SCHEMA, phase: 'Gap-check' })
+`, { label: `pr-open-${slug}`, schema: BLOCK_PR_SCHEMA, phase: 'Gap-check', model: 'sonnet' })
 }
 
 // ================================================================
@@ -1070,8 +1085,14 @@ next wave's blocks (which fork off "${trainBranch}") see this block's work.
 STEP 1 — Safety: confirm you are on the train branch and the tree is clean:
   git rev-parse --abbrev-ref HEAD      (must be "${trainBranch}")
   git status --porcelain               (must be EMPTY)
-  If HEAD is not "${trainBranch}" or the tree is dirty, STOP — return merged=false, escalated=true,
-  notes="train branch not clean/checked out; resolve manually then re-run".
+  If HEAD is not "${trainBranch}", STOP — return merged=false, escalated=true, notes="train branch not
+  checked out; resolve manually then re-run".
+  If the ONLY dirty path is "planning/state.json" (the orchestrator's own state.json status-sync step
+  can occasionally leave it uncommitted), self-heal instead of escalating:
+    git add planning/state.json && git commit -m "chore: state.json sync (recovered before merge)"
+    git status --porcelain   (must now be EMPTY — if not, fall through to the escalation below)
+  If ANY OTHER path is dirty (or the state.json self-heal above didn't produce a clean tree), STOP —
+  return merged=false, escalated=true, notes="train branch not clean; resolve manually then re-run".
 
 STEP 2 — Merge (no fast-forward so the block stays an identifiable unit; do NOT --ff-only):
   git merge --no-ff --no-edit ${p.branch}
@@ -1241,6 +1262,19 @@ block), fills any remaining coverage gaps, and patches docs — without triggeri
 
 Report the result in plain text: "Final close-out: <PASS|FAIL> — <one-line summary>".
 `, { label: 'final-close-out', phase: 'Close-out', model: 'sonnet' })
+
+// Final planning/state.json refresh — the run may have flipped several blocks' authored status
+// (syncBlockState, per wave) without ever regenerating the derived views (focus, wave tables, tier
+// rollups) that read off them. Best-effort: no-ops cleanly if this repo has no state.json or mev isn't
+// on PATH. Runs on the MAIN repo root (the train branch), same as the report/close-out steps above.
+await agent(`
+You run from the MAIN repo root, checked out on the train branch "${trainBranch}".
+If planning/state.json exists in this repo AND \`mev\` is on PATH:
+  mev emit-state --write || true
+  If that produced any file changes: git add -A && git commit -m "chore: emit-state refresh after ${planSlug} orchestration" || echo "nothing to commit"
+If planning/state.json is absent, or mev is not on PATH, do nothing — this is not an error.
+Report in plain text what (if anything) was committed.
+`, { label: 'final-state-refresh', phase: 'Close-out', model: 'haiku' })
 
 // ----------------------------------------------------------------
 // Final console summary
