@@ -1,4 +1,4 @@
-# Log Work — Append a Log entry, sync status, and refresh the brain cache + tier rollup.
+# Log Work — Append a Log entry, sync status, and regenerate the freshness spine via `mev emit-state`.
 
 This command is **`brain.toml`-driven and depth-agnostic**. It works unchanged whether this repo lives
 at the brain root, inside a tier sub-brain (`core/`, `portfolio/`, `side/`, `client/`), or standalone
@@ -14,9 +14,11 @@ narrative from git history and the task spec.
 ## Execution Model
 
 Spawn a subagent (Agent tool) to execute all steps below; pass the resolved `$ARGUMENTS` and this whole
-Instructions section in its prompt; return its result to the user. This command writes the **freshness
-spine** (the watermarked cache + generated rollup that `mev validate-brain --sync` checks), so favour
-accuracy over speed — use a capable model, not the cheapest.
+Instructions section in its prompt; return its result to the user. This command **authors state**
+(flips closed-block status, appends the Log entry, surgically updates `status.md`, offers to record a
+decision) and then shells out to `mev emit-state --write`, which is what actually regenerates the
+**freshness spine** (the watermarked caches + generated rollups that `mev validate-brain --sync`
+checks) — so favour accuracy over speed in the authored parts, use a capable model, not the cheapest.
 
 ## Instructions
 
@@ -24,8 +26,9 @@ accuracy over speed — use a capable model, not the cheapest.
 
 1. **Find the brain root.** From the current working directory, walk **up** parent by parent looking for a
    `brain.toml` file (its first line begins `# brain.toml`). The directory containing it is `BRAIN_ROOT`.
-   - **If no `brain.toml` is found**, this is a **standalone repo**. Skip all brain-sync steps (3–4):
-     do only Steps 1–2 (local `log.md` + `planning/status.md`) and say so in the report.
+   - **If no `brain.toml` is found**, this is a **standalone repo**. Skip the brain-sync Step 3
+     (`mev emit-state --write` has nothing to resolve without a `brain.toml`): do only Steps 1–2
+     (local `log.md` + `planning/status.md`), then go to Step 4 and say so in the report.
 2. **Identify this repo in the manifest.** Compute this repo's path **relative to `BRAIN_ROOT`** (`.` if
    you are at the root). Read `brain.toml` and find the `[[repos]]` entry whose `repo_path` equals that
    relative path. From it read: `slug`, `tier`, `status_file`, `cache_doc`, `heading`.
@@ -54,14 +57,23 @@ accuracy over speed — use a capable model, not the cheapest.
 6. **First, flip any block this session closed.** If a block completed (review PASS / merged), set its
    `status` to `closed` in `planning/state.json` `tracks[].blocks[]` **before** deriving — that authored
    field is the *input* the derivation reads; `emit-state` never infers completion from `status.md`
-   (the sync is one-way by design). Skipping this leaves `focus` and every tier rollup stale until a
-   future session reconciles by hand (the engine-rs `state-json-block-status-stale` incident, 2026-07-03).
-   Then shell out to `mev emit-state --write` to automatically regenerate the **Current focus** line, the `now` / `next` / `blocked` scalars, and the tier rollup tables. Do NOT manually reimplement focus derivation.
-   Then open this repo's `status_file` (`type: ProjectStatus`) and update **surgically**:
+   (the sync is one-way by design). Skipping this leaves `focus` and every generated surface stale until
+   a future session reconciles by hand (the engine-rs `state-json-block-status-stale` incident,
+   2026-07-03).
+
+   Then open this repo's `status_file` (`type: ProjectStatus`) and update **surgically** — only the
+   parts `emit-state` does not derive:
    - the `timestamp` frontmatter field → current ISO-8601 time;
-   - bump the `## Metrics` counters if present (cheap; skip if the file has none).
+   - bump the `## Metrics` counters if present (cheap; skip if the file has none);
+   - any hand-maintained prose (`## Momentum`, narrative callouts) that reflects this session's work.
    - If you are **not certain** what the new focus is, state your
-     proposed change and ask before writing.
+     proposed change and ask before writing. (You do not need to hand-write the focus line itself —
+     `emit-state` derives it from `tracks[]` in the next step.)
+
+   Step 3 below shells out to `mev emit-state --write` to regenerate every derived surface from this
+   authored state. Do NOT manually reimplement focus derivation, cache-watermark reconciliation, or
+   rollup-table rendering here — that duplicates what the derivation engine now owns and risks
+   drifting out of sync with it.
 7. **Settled decision?** If a settled architectural choice was made, ask whether to record it in
    `planning/decisions/` (never auto-author). On yes: next number from `planning/decisions/index.md`,
    create `D{N+1}-<kebab-title>.md` with OKF frontmatter, append a row to the decisions index.
@@ -69,46 +81,46 @@ accuracy over speed — use a capable model, not the cheapest.
 
 > If `BRAIN_ROOT` was not found (standalone repo), stop here and report.
 
-### Step 3 — Brain cache (the one watermarked source per repo)
+### Step 3 — Regenerate derived surfaces (`mev emit-state --write`)
 
-9. **Skip this step when `slug == "brain"`** (the brain root's `cache_doc` is its own `README.md` — handle
-   that in Step 3b). Otherwise update the cache at `BRAIN_ROOT/<cache_doc>`:
-   - Update its **Current Status** date + focus line and any changed rows to match the new
-     `status.md` state (surgical edits only).
-   - Set its frontmatter **`synced_from`** to the **source `status.md`'s `timestamp`** value (full
-     ISO-8601). This watermark is what `mev validate-brain --sync` compares — `source.timestamp ==
-     cache.synced_from` must hold, so copy it verbatim.
-   - If the cache is genuinely already in sync, say so (don't skip silently).
+9. Shell out to `mev emit-state --write` (it walks up from the current directory to find
+   `brain.toml` itself — no need to `cd` to `BRAIN_ROOT` first). This is the **single derivation
+   engine** and it regenerates, in place, every generated surface from the `tracks[]` you just
+   authored in Step 2:
+   - this repo's leaf `state.json` focus fields (`now` / `next` / `blocked`);
+   - the brain `state.json`'s `repos[]` / `cross_repo[]` rollup and its own `focus`;
+   - the per-project cache doc's focus headline + `synced_from` watermark
+     (`docs/projects/<slug>.md`) — the one exception is `slug == "brain"`, whose cache is its own
+     `README.md` `## Quick Status` subsection, handled manually in Step 3b below because that
+     subsection carries no `generated:` sentinel;
+   - the tier sub-brain's tier-rollup table (tiered repos only);
+   - the HQ Operating Board;
+   - `master-plan.md`'s wave/dependency tables.
 
-   **Step 3b — `_root` repos.** For repos whose `tier == "_root"` (the brain itself, `learn-ai`,
-   `base-template`), there is **no tier rollup**. The brain root additionally keeps a hand-maintained
-   `## Quick Status` in its `README.md`; update only THIS repo's `###` subsection there (verify the
-   heading matches `heading` before writing — never touch another project's subsection). Then go to
-   Step 5.
+   Do NOT manually reimplement any of the above — hand-editing a cache's `synced_from`, a tier
+   rollup table, or a wave table now duplicates what `emit-state` owns and risks drifting out of
+   sync with it. Confirm the run reported no `W_EMIT_NO_SENTINEL` warning against a target this repo
+   feeds; if one lands, report it rather than hand-authoring the missing sentinel pair (sentinels
+   are never invented into prose — that's a separate fix to the target doc).
 
-### Step 4 — Regenerate the tier rollup (tiered repos only)
+   **Step 3b — `_root` repos' Quick Status (the one surviving manual edit).** For repos whose
+   `tier == "_root"` (the brain itself, `learn-ai`, `base-template`), the brain root additionally
+   keeps a hand-maintained `## Quick Status` in its `README.md` — `emit-state` does not generate
+   this subsection (no `generated:` sentinel around it), so it stays a manual surgical edit: update
+   only THIS repo's `###` subsection there (verify the heading matches `heading` before writing —
+   never touch another project's subsection).
 
-10. If `tier` is one of `core` / `portfolio` / `side` / `client`, regenerate that tier's rollup table:
-    - Open `BRAIN_ROOT/<tier>/planning/status.md`.
-    - Replace **only** the lines between `<!-- ROLLUP:BEGIN ... -->` and `<!-- ROLLUP:END -->`. **Do not
-      touch** the `## Momentum`, `## Metrics`, or any other section — those are hand-maintained.
-    - Rebuild the table with one row per `[[repos]]` entry sharing this `tier` (in manifest order). Each
-      row: the project name linked to its cache (`../docs/projects/<slug>.md`), its one-line current
-      focus (from that cache's Current Status line), and its `synced_from` date (or `—` if unset). This
-      is light reading of each cache's focus line + watermark — no deep parsing.
-    - If the markers are missing (older tier file), insert them under a `## Rollup — repos in this tier`
-      heading and report that you added them.
+### Step 4 — Report
 
-### Step 5 — Report
-
-11. Show the user: the `log.md` entry added; the `status.md` fields changed; the cache file written +
-    its new `synced_from`; the tier rollup regenerated (or "_root — no rollup"); and any decision
-    recorded. If standalone, say the brain sync was skipped.
+10. Show the user: the `log.md` entry added; the `status.md` fields changed; the `emit-state --write`
+    summary (which surfaces it touched, and any `W_EMIT_NO_SENTINEL` warning); the `_root` Quick
+    Status edit if applicable; and any decision recorded. If standalone, say the brain sync was
+    skipped.
 
 ## Context / Files to Read
 
 - `brain.toml` (at `BRAIN_ROOT` — the manifest; resolve everything from it)
 - this repo's `log.md` and `status_file` (`planning/status.md`)
 - the current `planning/<concept>/tasks.md`, if any
-- `BRAIN_ROOT/<cache_doc>` (brain cache target — except `slug == brain`)
-- `BRAIN_ROOT/<tier>/planning/status.md` (tier rollup target — tiered repos only)
+- `core/mev/docs/cli.md` (`emit-state` section) if unfamiliar with exactly what it regenerates
+- `BRAIN_ROOT/README.md` (`## Quick Status` — the one manual target, `_root` repos only)

@@ -188,6 +188,12 @@ to any block registered here.
      blocks in the same phase on the same wave.
    - `depends_on`: one `{ "type": "block", "repo": "<this-repo-slug>", "id": "<ID>" }` entry per explicit
      "Depends on" line in the block; `[]` if none.
+   - **Cross-repo-edge prompt.** A "Depends on" line only ever names a same-repo sibling block, so a
+     dependency on *another repo's* block never surfaces on its own — ask explicitly: "Does this block
+     depend on work landing in another repo first?" If yes, resolve that repo's `slug` from `brain.toml`
+     and add `{ "type": "block", "repo": "<other-repo-slug>", "id": "<their-ID>" }` to this block's
+     `depends_on` (in addition to any same-repo edges); if the dependency is non-block (hardware, a
+     paid-API budget, a manual step), use `{ "type": "external", "what": "<gloss>" }` instead.
    - `origin`: omit unless this plan was promoted from an HQ backlog item, in which case
      `{ "type": "backlog", "slug": "<backlog-slug>" }`.
 3. Save `planning/state.json` and validate it is still valid JSON:

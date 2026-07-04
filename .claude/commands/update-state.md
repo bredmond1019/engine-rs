@@ -3,10 +3,11 @@
 ## Purpose
 
 `planning/state.json` is the **authoritative work-block dependency graph** for a repo — not a status
-report. Almost every planning command (`/generate-master-plan`, `/handoff`, `/wrap-up`,
-`/backlog-ticket`, a manual fix after `mev validate-brain --state` flags something) ends up editing
-part of it. This command is the one place that spells out **how** to do that safely, so every agent
-edits the same file the same way instead of re-deriving the rules from scratch (or worse, guessing).
+report. Almost every planning command (`/generate-master-plan`, `/plan`, `/chore`, `/ticket`,
+`/start-block`, `/handoff`, `/wrap-up`, `/backlog-ticket`, a manual fix after `mev validate-brain
+--state` flags something) ends up editing part of it. This command is the one place that spells out
+**how** to do that safely, so every agent edits the same file the same way instead of re-deriving the
+rules from scratch (or worse, guessing).
 
 **The schema itself lives in one place — do not duplicate its field shapes here or anywhere else:**
 [`core/planning/state-schema.md`](../../../core/planning/state-schema.md) (path relative to the brain

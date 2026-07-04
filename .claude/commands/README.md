@@ -90,7 +90,7 @@ predictably-named output file.
 | Session Start | `/process-tasks` | Check which specs are eligible to start | chat only |
 | Session End | `/wrap-up [note]` | Log work + commit; clean close without a handoff file | status.md, log.md, git |
 | Session End | `/handoff [note]` | Write handoff + log work + commit; hands off to a fresh session | `planning/handoff.md`, status.md, log.md, git |
-| Session End | `/close-out [--skip-coverage] [note]` | Verify coverage → patch docs → hand off; the quality-close pipeline after sdlc-run/sdlc-flow | status.md, log.md, docs/, git |
+| Session End | `/close-out [--skip-coverage] [--no-review] [--review-level <level>] [--clean-worktree] [note]` | Verify coverage → review code → patch docs → clean worktree (opt.) → hand off; the quality-close pipeline | status.md, log.md, docs/, git |
 | Block Setup | `/start-block [name]` | Flip a spec to `In progress` in status.md | status.md |
 | **1 — Roadmap** | `/generate-master-plan [desc]` | Author the full roadmap as canonical block definitions | `planning/master-plan.md` |
 | **1 — Plan** | `/generate-tasks <name>` · `/generate-tasks --from <path>` | Write the full task spec from a master-plan block, **or** from a standalone block file (`--from`) | `planning/<name>/tasks.md` |
@@ -270,16 +270,17 @@ remaining, open questions, first command for the next agent), then invokes `/log
 `/commit`. `/prime` in the next session detects the handoff file and surfaces it first.
 Delete `planning/handoff.md` once the new session has consumed it.
 
-### `/close-out [--gap-check-only] [--skip-coverage] [note]`
-Quality-close pipeline for the end of an `sdlc-run` or `sdlc-flow` session. Runs four
+### `/close-out [--gap-check-only] [--skip-coverage] [--no-review] [--review-level <level>] [--clean-worktree] [note]`
+Quality-close pipeline for the end of an `sdlc-run` or `sdlc-flow` session. Runs five
 steps in sequence: **(1)** the full validation suite from `planning/harness.json` — stops
 immediately if any gating check fails; **(2)** coverage gap scan — reads changed source
 files, classifies gaps as adequate/non-blocking/blocking, writes minimal targeted tests for
-blocking gaps and re-runs the suite to confirm; **(3)** `/update-docs --patch`; **(4)**
-`/handoff` with the provided note. Pass `--skip-coverage` to skip step 2 when coverage was
-already verified by a prior `/review-task`. Pass `--gap-check-only` to skip step 4 (the
-handoff) — used by `/sdlc-block` for automated per-block gap-checks mid-run. Non-blocking
-gaps are noted in the handoff rather than blocking it.
+blocking gaps and re-runs the suite to confirm; **(2.5)** code review — runs a light,
+low-overhead `/code-review` check (defaults to `low`, overridden via `--review-level <level>`,
+or skipped via `--no-review`); **(3)** `/update-docs --patch`; **(4)** `/handoff` with the
+provided note (skips if `--gap-check-only` is set); **(5)** `/clean-worktree` for the current
+branch to merge and remove the worktree (only when explicitly requested via `--clean-worktree`).
+Non-blocking gaps/findings do not block the pipeline unless critical errors occur.
 
 ### `/session-recap`
 Start-of-session briefing: reads the three most recent Log entries, status.md, the current
@@ -303,8 +304,11 @@ the files needed for the task at hand. Takes an optional argument; defaults to r
 
 ### `/prime`
 Orient to this repo at session start: reads `README.md`, `CLAUDE.md`, `planning/context.md`,
-`planning/status.md`; runs `git ls-files`; summarizes the codebase, layout, focus, and standing
-rules. Read-only. Embedded in every pipeline command.
+`planning/status.md`; runs `git ls-files`; surfaces an active `planning/handoff.md` first if
+present; runs a read-only `mev validate-brain --sync` freshness gate (if this repo participates
+in a brain) and offers — never auto-runs — `mev emit-state --write` on drift; summarizes the
+codebase, layout, focus, carryover, and standing rules. Read-only except for that one
+user-confirmed emit. Embedded in every pipeline command.
 
 ### `/status`
 Reads only `planning/status.md` and reports the Current focus line, what's In progress, and
@@ -437,8 +441,13 @@ or Modified** table to scope updates, then surgically patches only affected sect
 ### `/log-work`
 Reads `status.md`, the current spec, and `log.md`; runs `git diff --stat`. Updates
 `status.md` and appends a `log.md` entry. Prompts you to add settled choices to
-`planning/decisions/` — never edits decisions directly. Also syncs the company brain
-(`docs/projects/<slug>.md`, `README.md`) to match the new status.
+`planning/decisions/` — never edits decisions directly. Then shells out to
+`mev emit-state --write`, the single derivation engine that regenerates every generated
+surface from the authored state: this repo's `state.json` focus fields, the brain rollup,
+the per-project cache doc's `synced_from` watermark, the tier rollup table, the HQ Operating
+Board, and `master-plan.md`'s wave tables. `brain.toml`-driven and depth-agnostic — resolves
+the brain root and this repo's manifest entry at runtime, no baked paths. Standalone repos
+(no `brain.toml`) skip the brain-sync step entirely.
 
 ---
 
@@ -477,7 +486,8 @@ to `/document` — use for periodic doc health checks outside the pipeline.
 
 ## Company Brain Integration
 
-`/log-work` automatically mirrors status updates to the parent `agentic-portfolio/` company
-brain (`docs/projects/<slug>.md`, `README.md`). To run brain-level commands (briefing,
-sync-status, log-decision, add-project, log-correspondence), open Claude Code in the
-`agentic-portfolio/` root.
+`/log-work` resolves the brain root from `brain.toml` and shells out to `mev emit-state
+--write`, which regenerates this repo's per-project cache doc (`docs/projects/<slug>.md`)
+and rollup entries in the parent `agentic-portfolio/` company brain. To run brain-level
+commands (briefing, sync-status, log-decision, add-project, log-correspondence), open
+Claude Code in the `agentic-portfolio/` root.

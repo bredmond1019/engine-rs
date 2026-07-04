@@ -24,13 +24,28 @@ Return the subagent's result to the user.
 5. Update the **Current focus** line to reflect this block.
 6. Bump the **Last updated** date.
 7. Write the updated status.md.
+8. **Flip the matching block's status in `planning/state.json`, if the repo has one.** `status.md` and
+   `state.json` both name the same block — a `/start-block` that touches only `status.md` leaves the
+   authoritative graph stale. Resolve the target block's canonical ID (the `<BlockID>` in `status.md`'s
+   row, or the id it maps to in `state.json`'s `tracks[].blocks[]` if `status.md` only carries a bare
+   letter) and:
+   - Find that block in `tracks[].blocks[]` (search every track). If it does not exist, report that and
+     stop — do not fabricate a new block entry here (that's `/generate-master-plan`/`/plan`/`/chore`/
+     `/ticket`'s job).
+   - Set its `status` to `"in_progress"` (an authored value — never hand-set `"blocked"`, see
+     `core/planning/state-schema.md`).
+   - Save `planning/state.json` and validate it is still valid JSON:
+     `python3 -c "import json;json.load(open('planning/state.json'))"`.
+   - Run `mev emit-state --write` to refresh `focus.now`/`focus.next` from the new status.
 
 ## Context / Files to Read
 
 - `planning/status.md`
+- `planning/state.json` (if present)
 
 ## Report
 
 - Which block was marked in-progress.
 - The updated Current focus line.
-- Success or failure of the file write.
+- Whether `planning/state.json` was updated (and to what status), or that no `state.json` exists.
+- Success or failure of the file write(s).

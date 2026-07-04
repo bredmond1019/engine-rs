@@ -190,19 +190,20 @@ const ENUMERATE_BLOCKS_SCHEMA = {
   type: 'object',
   required: ['blocks'],
   properties: {
-    planFormatOk: { type: 'boolean', description: 'true if the file has at least one "## Phase N" with a "### Block X" subsection' },
+    planFormatOk: { type: 'boolean', description: 'true if the file has at least one "## Phase N" heading with a parseable block subsection (either "### <Prefix>.<N>.<Letter>" canonical-id or legacy "### Block <Letter>")' },
     blocks: {
       type: 'array',
-      description: 'One entry per "### Block X" found under a "## Phase N" heading, in document order.',
+      description: 'One entry per block heading found under a "## Phase N" heading, in document order.',
       items: {
         type: 'object',
         required: ['phase', 'block', 'slug'],
         properties: {
           phase:     { type: 'integer', description: 'the N from "## Phase N"' },
-          block:     { type: 'string', description: 'the X from "### Block X" (single letter, uppercase)' },
-          slug:      { type: 'string', description: 'the parseable identifier phaseN-blockX, lowercased (e.g. phase0-blocka)' },
+          block:     { type: 'string', description: 'the single uppercase block letter (the last segment of the canonical id)' },
+          id:        { type: 'string', description: 'the canonical "<Prefix>.<PhaseNumber>.<BlockLetter>" id (e.g. "LA.1.A") — read verbatim off a canonical-id heading, or constructed from the repo\'s brain.toml prefix + phase + letter for a legacy "### Block X" heading. Empty string only if no prefix could be resolved (standalone repo, no brain.toml) for a legacy heading.' },
+          slug:      { type: 'string', description: 'the filesystem-safe directory slug: the id lowercased with dots replaced by dashes (e.g. "la-1-a"), or the legacy "phase<N>-block<x>" form when id could not be resolved.' },
           title:     { type: 'string', description: 'the block title after the em-dash, if any' },
-          dependsOn: { type: 'array', items: { type: 'string' }, description: 'slugs of blocks this block depends on, from an explicit "- **Depends on:** ..." line (resolved to phaseN-blockX). Empty when none.' },
+          dependsOn: { type: 'array', items: { type: 'string' }, description: 'slugs of blocks this block depends on (normalized the same way as this block\'s own slug), from an explicit "- **Depends on:** ..." line — accepts a bare letter, a legacy phaseN-blockX ref, or a fully-qualified canonical id (e.g. "LA.1.A"). Empty when none.' },
           forwardLooking: { type: 'boolean', description: 'true if the block is flagged forward-looking / provisional' }
         }
       }
@@ -478,6 +479,46 @@ final git log line (empty string if nothing was committed).
   if (!r || !r.written) log(`(state) could not persist orchestration state for "${label}" — continuing`)
 }
 
+// Flip ONE block's authored status in this repo's planning/state.json (the graph /start-block,
+// /plan, /chore etc. all write to — see core/planning/state-schema.md). `id` is the canonical
+// "<Prefix>.<N>.<Letter>" id resolved during enumeration; null/empty when it couldn't be resolved
+// (a legacy heading with no brain.toml prefix) or when this repo has no state.json at all — both are
+// silent no-ops, never a hard failure, so this stays optional for repos that don't use the convention.
+const STATE_SYNC_SCHEMA = { type: 'object', required: ['updated'], properties: { updated: { type: 'boolean' }, reason: { type: 'string' } } }
+async function syncBlockState(id, newStatus) {
+  if (!id) return
+  const r = await agent(`
+You maintain this repo's planning/state.json — the authoritative work-block graph (see
+core/planning/state-schema.md for the schema; the brain root is found by walking up from CWD until
+you find brain.toml, then planning/state.json sits in THIS repo, not the brain root). You run from the
+MAIN repo root.
+
+STEP 1 — Read it:
+  cat planning/state.json 2>/dev/null || echo "__NO_STATE__"
+  If the output is "__NO_STATE__", return updated=false, reason="no state.json in this repo".
+
+STEP 2 — Find the block whose "id" field is exactly "${id}" inside ANY tracks[].blocks[] entry (search
+  every track). If not found, return updated=false, reason="block ${id} not registered in state.json".
+
+STEP 3 — AUTHORED EDIT ONLY (see state-schema.md's Authored-vs-derived table). Set that block's
+  "status" field to "${newStatus}" (one of open/in_progress/closed — never hand-author "blocked", that
+  value is always derived). Touch NOTHING else on the block and do not touch "focus", "repos[]", or
+  "cross_repo[]" anywhere in the file (all derived — never hand-edit).
+
+STEP 4 — Validate the JSON is still well-formed:
+  python3 -c "import json;json.load(open('planning/state.json'))"
+  If that fails, revert your edit and return updated=false, reason="edit produced invalid JSON".
+
+STEP 5 — Commit on the current branch (stage explicitly):
+  git add planning/state.json
+  git commit -m "chore: state.json — ${id} -> ${newStatus}" || echo "NOTHING_TO_COMMIT"
+
+Return via StructuredOutput: updated (true iff the status was actually changed and committed), reason.
+`, { label: `state-sync:${id}:${newStatus}`, schema: STATE_SYNC_SCHEMA, model: 'haiku' })
+  if (!r || !r.updated) log(`(state.json) ${id} -> ${newStatus}: skipped — ${r?.reason || 'sync agent returned null'}`)
+  else log(`(state.json) ${id} -> ${newStatus}`)
+}
+
 // ================================================================
 // PHASE: PRE-FLIGHT — clean tree, committed plan file, train branch ready
 // ================================================================
@@ -556,20 +597,40 @@ per block. You run from the MAIN repo root. Do NOT modify anything.
 
 Plan file: ${planFile}
 
-STEP 1 — Read the plan:
+STEP 1 — Resolve this repo's block-ID prefix (needed only for legacy headings — see STEP 3):
+  Walk up from CWD until you find brain.toml, then find this repo's own entry in it (matched by this
+  repo's directory name / git remote) and read its "prefix" field (e.g. "LA"). If no brain.toml exists
+  anywhere above CWD (a standalone repo not part of a brain), there is no prefix — note that and
+  continue; legacy headings will then be left without a resolvable canonical id (see STEP 3).
+
+STEP 2 — Read the plan:
   cat ${planFile}
 
-STEP 2 — Find every block. A block is a "### Block X — <title>" heading (X is a single letter) that
-  appears under a "## Phase N — <name>" heading (N is an integer). For EACH block emit:
+STEP 3 — Find every block: any heading that appears under a "## Phase N — <name>" heading (N is an
+  integer) and matches EITHER of these two forms:
+    (a) CANONICAL — "### <Prefix>.<N>.<Letter> — <title>" (e.g. "### LA.1.A — <name>"), no literal
+        "Block" word. Use the id verbatim: id = "<Prefix>.<N>.<Letter>", block = <Letter>.
+    (b) LEGACY — "### Block <Letter> — <title>" (e.g. "### Block A — <name>"). block = <Letter>. If
+        STEP 1 resolved a prefix, construct id = "<prefix>.<N>.<Letter>" (matching what that same
+        block would be registered as in planning/state.json — this is the bridge for plans authored
+        before the canonical-id heading convention). If no prefix was resolvable, id = "" (empty).
+  For EACH block emit:
     - phase: the integer N of its enclosing "## Phase N".
-    - block: the single uppercase letter X.
-    - slug:  the lowercased identifier "phase<N>-block<x>" (e.g. "phase0-blocka", "phase1-blockb").
-    - title: the text after the em-dash on the "### Block X" line (or "").
-    - dependsOn: slugs of OTHER blocks this block depends on. Take these ONLY from an explicit
-        "- **Depends on:** <ref>" line in the block's body (the master-plan convention). Resolve each
-        <ref> to a "phase<N>-block<x>" slug: a bare "Block A" means Block A of THIS SAME phase; a
-        "Phase 0 Block B" or "phase0-blockB" means that block. If the block has no "Depends on:" line,
-        dependsOn is []. Do NOT invent dependencies from prose — phase ordering is handled by the engine.
+    - block: the single uppercase block letter.
+    - id: as derived above ("" only when a legacy heading has no resolvable prefix).
+    - slug: id.toLowerCase() with every "." replaced by "-" (e.g. "LA.1.A" -> "la-1-a") when id is
+        non-empty; otherwise fall back to the lowercased "phase<N>-block<x>" form (e.g. "phase0-blocka")
+        so the block still gets a stable, filesystem-safe directory name.
+    - title: the text after the em-dash on the heading line (or "").
+    - dependsOn: slugs of OTHER blocks this block depends on, normalized the SAME way as this block's
+        own slug above. Take these ONLY from an explicit "- **Depends on:** <ref>" line in the block's
+        body (the master-plan convention) — accept any of: a bare letter ("Block A" / "A", meaning that
+        letter in THIS SAME phase), a legacy "Phase 0 Block B" / "phase0-blockB" ref, or a
+        fully-qualified canonical id ("LA.1.A"). Resolve whichever form appears to the OTHER block's own
+        slug (do not just lowercase the raw ref — recompute it the same way you computed slugs above,
+        so a canonical-id ref and a legacy ref to the same block always agree). If the block has no
+        "Depends on:" line, dependsOn is []. Do NOT invent dependencies from prose — phase ordering is
+        handled by the engine.
     - forwardLooking: true if the block says it is forward-looking / provisional, else false.
   Set planFormatOk=true iff at least one block was found under a "## Phase N" heading.
 
@@ -577,8 +638,8 @@ Return using StructuredOutput: planFormatOk, blocks (in document order), notes.
 `, { label: 'enumerate-blocks', schema: ENUMERATE_BLOCKS_SCHEMA, phase: 'Enumerate', model: 'sonnet' })
 
 if (!enumResult || !enumResult.planFormatOk || !(enumResult.blocks || []).length) {
-  log(`ABORTED — ${planFile} has no parseable "## Phase N" / "### Block X" structure.`)
-  log(`Fix: author it with /generate-master-plan (or /plan), which emits the canonical block headings, commit, then re-run.`)
+  log(`ABORTED — ${planFile} has no parseable "## Phase N" / block-heading structure.`)
+  log(`Fix: author it with /generate-master-plan (or /plan), which emits the canonical "### <Prefix>.<N>.<Letter>" block headings, commit, then re-run.`)
   return { error: 'Plan not in master-plan format', planFile, notes: enumResult?.notes }
 }
 
@@ -610,8 +671,9 @@ for (const b of blocks) {
   const idx = slugToIndex[b.slug]
   const deps = new Set()
   for (const depSlug of (b.dependsOn || [])) {
-    // slugToIndex keys are the lowercased phaseN-blockX slugs the enumerate agent emits; normalize the
-    // dependency ref the same way so a mixed-case "Depends on:" entry (e.g. phase0-blockB) still resolves.
+    // slugToIndex keys are the slugs the enumerate agent emits (id-derived "la-1-a", or the legacy
+    // "phase<N>-block<x>" fallback); normalize the dependency ref the same way so a mixed-case
+    // "Depends on:" entry (canonical id or legacy phaseN-blockX) still resolves.
     const depIdx = slugToIndex[String(depSlug).toLowerCase()]
     if (depIdx && depIdx !== idx) deps.add(depIdx)
   }
@@ -620,7 +682,9 @@ for (const b of blocks) {
       if (other.phase === prevPhaseOf[b.phase]) deps.add(slugToIndex[other.slug])
     }
   }
-  blockMap[idx] = { num: idx, slug: b.slug, dependsOn: [...deps], filesModified: [] }
+  // b.id is the canonical "<Prefix>.<N>.<Letter>" id (matches planning/state.json), or "" when a legacy
+  // heading had no resolvable brain.toml prefix (standalone repo) — state.json sync is skipped for those.
+  blockMap[idx] = { num: idx, slug: b.slug, id: b.id || null, dependsOn: [...deps], filesModified: [] }
 }
 
 let waves
@@ -634,7 +698,7 @@ try {
 // Seed the per-block state + record the wave plan.
 for (const b of blocks) {
   state.blocks[b.slug] = state.blocks[b.slug] || {
-    phase: b.phase, block: b.block, title: b.title || '', status: 'pending',
+    phase: b.phase, block: b.block, id: b.id || null, title: b.title || '', status: 'pending',
     branch: null, verdict: null, pr: null, reasons: [], tokensTotal: null,
   }
 }
@@ -690,13 +754,13 @@ Return via StructuredOutput: exists=true iff the output is valid JSON and is a n
 `, { label: `tasks-check-${slug}`, schema: { type: 'object', required: ['exists'], properties: { exists: { type: 'boolean' } } }, model: 'haiku' })
   if (present?.exists) { log(`Block ${slug}: tasks.json present — reusing.`); return { success: true, tasksFile: blockTasks } }
 
-  log(`Block ${slug}: no tasks.json — generating from the plan's "### Block ${blk.block}" section...`)
+  log(`Block ${slug}: no tasks.json — generating from the plan's block ${blk.id || blk.block} section...`)
   return tracedAgent(`
 You are the spec generator for one roadmap block (mirroring /generate-tasks). You run from the MAIN repo
 root, on the train branch. Read ONE block's definition out of the plan file and explode it into a
 runnable, decomposed tasks.md + tasks.json. Do NOT implement anything.
 
-Block:           ${slug}  (Phase ${blk.phase}, Block ${blk.block}${blk.title ? ' — ' + blk.title : ''})
+Block:           ${slug}  (Phase ${blk.phase}, Block ${blk.block}${blk.id ? `, canonical id ${blk.id}` : ''}${blk.title ? ' — ' + blk.title : ''})
 Plan file:       ${planFile}
 Write to:        ${blockTasks} (prose) and ${blockTasksJson} (task list)
 
@@ -704,9 +768,11 @@ Write to:        ${blockTasks} (prose) and ${blockTasksJson} (task list)
    - cat CLAUDE.md planning/context.md   (CLAUDE.md is the authority; assume no stack/locale/narrative/
      content rule unless written there. Universal: no fabricated metrics or quotes, no emoji, every
      change ships with tests.)
-   - cat ${planFile}   → find the "## Phase ${blk.phase}" → "### Block ${blk.block}" section. Read ONLY
-     that block's What / Why / Files / Interfaces / Out of scope / Acceptance criteria. Carry its named
-     Files (New vs Modified) through to per-task ownership and its Out-of-scope as a hard boundary.
+   - cat ${planFile}   → find the "## Phase ${blk.phase}" section, then within it the block heading for
+     letter "${blk.block}" — either the canonical "### ${blk.id || '<Prefix>.' + blk.phase + '.' + blk.block} — <title>" form or the legacy
+     "### Block ${blk.block} — <title>" form (only one will be present; use whichever matches). Read
+     ONLY that block's What / Why / Files / Interfaces / Out of scope / Acceptance criteria. Carry its
+     named Files (New vs Modified) through to per-task ownership and its Out-of-scope as a hard boundary.
    - cat .claude/workflows/templates/spec-template.md   → the FORMAT reference (includes the tasks.json
      schema).
 
@@ -730,6 +796,13 @@ Write to:        ${blockTasks} (prose) and ${blockTasksJson} (task list)
    git add planning/${slug}
    git commit -m "chore: generate tasks for ${slug}"
    git log --oneline -1   (capture the short hash)
+
+5. State refresh (best-effort, do NOT hand-author state.json's "tasks" field — it is derived). If
+   planning/state.json exists in this repo AND \`mev\` is on PATH:
+     mev emit-state --write || true
+   If that produced any file changes, commit them separately (do not fold into the tasks.json commit):
+     git add -A && git commit -m "chore: emit-state refresh after generating ${slug}" || echo "nothing to commit"
+   If planning/state.json is absent, or mev is not on PATH, skip this step silently — it is not an error.
 
 Return via StructuredOutput: success (true iff tasks.md + tasks.json were written and committed),
 tasksFile="${blockTasks}", taskCount, commitHash, notes.
@@ -912,6 +985,9 @@ for (let wi = 0; wi < waves.length; wi++) {
   for (let k = 0; k < ready.length; k += effectiveMaxParallel) {
     const batch = ready.slice(k, k + effectiveMaxParallel)
     for (const n of batch) state.blocks[indexToBlock[n].slug].status = 'running'
+    // Flip each starting block's authored status open -> in_progress in planning/state.json (mirrors
+    // /start-block). No-ops per-block when id is unresolved or the repo has no state.json.
+    await parallel(batch.map(n => () => syncBlockState(indexToBlock[n].id, 'in_progress')))
     const batchResults = await parallel(batch.map(n => () => runBlockFlow(indexToBlock[n].slug).then(r => ({ n, r })).catch(() => ({ n, r: null }))))
 
     for (const item of batchResults) {
@@ -976,7 +1052,7 @@ for (let wi = 0; wi < waves.length; wi++) {
   // ---- Advance the train: merge this wave's passed block branches in dependency (index) order ----
   const toMerge = wave.mergeOrder
     .filter(n => state.blocks[indexToBlock[n].slug].status === 'passed')
-    .map(n => ({ n, slug: indexToBlock[n].slug, branch: state.blocks[indexToBlock[n].slug].branch }))
+    .map(n => ({ n, slug: indexToBlock[n].slug, id: indexToBlock[n].id, branch: state.blocks[indexToBlock[n].slug].branch }))
     .filter(p => p.branch)
 
   if (toMerge.length) {
@@ -1022,6 +1098,11 @@ Return using StructuredOutput: merged, escalated, conflictedFiles, commitHash, n
         b.status = mode === 'auto-merge' ? 'merged' : 'done'
         b.mergeCommit = m.commitHash || null
         state.merge_order.push(p.slug)
+        // auto-merge is the only mode where the train IS the base — that merge is genuinely final, so
+        // close the block in state.json here. In default/no-pr mode "done" only means merged into the
+        // disposable train branch (a PR or a manual merge to base is still pending), so state.json stays
+        // in_progress until /merge-train (default) or a manual merge (--no-pr) lands it on base.
+        if (mode === 'auto-merge') await syncBlockState(p.id, 'closed')
       }
     }
   }

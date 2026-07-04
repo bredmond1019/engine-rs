@@ -240,6 +240,13 @@ After writing/revising `master-plan.md`, register every block (new or changed) i
      **Depends on:** line on the block (resolve a bare letter `X` to `<Prefix>.<PhaseNumber>.X`). Omit or
      use `[]` when the block has no explicit "Depends on" line — do **not** encode the implicit
      phase-sequential default as a `depends_on` edge; `wave` already expresses that ordering.
+   - **Cross-repo-edge prompt.** A "Depends on" line only ever names a same-repo sibling block, so a
+     dependency on *another repo's* block never surfaces on its own — ask explicitly: "Does this block
+     depend on work landing in another repo first?" If yes, resolve that repo's `slug` from `brain.toml`
+     and add `{ "type": "block", "repo": "<other-repo-slug>", "id": "<their-ID>" }` to this block's
+     `depends_on` (in addition to any same-repo edges); if the dependency is non-block (hardware, a
+     paid-API budget, a manual step), use `{ "type": "external", "what": "<gloss>" }` instead. Skip the
+     question only when the plan explicitly says the phase is fully self-contained.
    - If the block was promoted from an HQ backlog item, add `"origin": { "type": "backlog", "slug": "<slug>" }`.
    - **Do not overwrite** an existing block's `status` or `tasks` (the derived pointer + status
      summary — see `core/planning/state-schema.md`) if it is already `in_progress` / `closed` /

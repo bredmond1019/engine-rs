@@ -31,10 +31,13 @@ list), explicit Acceptance Criteria, and a Testing Strategy, feeding directly in
    - Every task in `tasks.json` must name ≥1 concrete file in its `files[]` (the Validate task is
      exempt).
 5. Choose a short descriptive slug (e.g. `fix-null-deref`, `add-rate-limit`, `patch-auth-refresh`).
+   This is the `<slug>` referenced in "Register the block in state.json" below.
 6. Create `planning/ticket-{slug}/` if it does not exist, then write **both**
    `planning/ticket-{slug}/tasks.md` (prose) and `planning/ticket-{slug}/tasks.json` (task list)
    using the Plan Format below.
-7. **Property self-check.** Before reporting, re-read the spec and **revise in place** until every
+7. Register this ticket's block in `planning/state.json` — see "Register the block in state.json"
+   below.
+8. **Property self-check.** Before reporting, re-read the spec and **revise in place** until every
    property holds, then re-check:
    - **`tasks.json` parses as valid JSON** and is a non-empty bare array (not wrapped in an object).
    - **Every task names ≥1 concrete file** in its `files[]` (Validate is exempt).
@@ -44,7 +47,7 @@ list), explicit Acceptance Criteria, and a Testing Strategy, feeding directly in
      supplies them as the fallback).
    - **No leftover template sentinels** — no `{{TOKEN}}`, unfilled `<placeholder>`-style angle
      stubs, or empty bullets. Legitimate `<...>` in code/prose is fine.
-8. Report the path and next step.
+9. Report the path and next step.
 
 ## Codebase Structure
 
@@ -111,6 +114,35 @@ tooling uses:
   { "task_id": "N", "title": "Validate", "description": "Run the Validation Commands listed below and confirm all pass.", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": [], "dependsOn": [1, 2] }
 ]
 ```
+
+### Register the block in state.json
+
+If this repo has a `planning/state.json`, also register this ticket's block — a ticket is a
+standalone block, not one already sitting in `master-plan.md`.
+1. Determine this ticket's Block ID: find this repo's `prefix` in `brain.toml` at the brain root
+   (e.g. `BA`), then `<BlockID> = <Prefix>.ticket.<slug>` (tickets don't have a phase number — the
+   literal string `ticket` fills that slot, mirroring `/chore`'s convention).
+2. Open `planning/state.json`. Find or create a `tracks[]` entry titled `"Tickets"` (reuse it if it
+   already exists).
+3. Add an entry to that track's `blocks[]` for this ticket's `<BlockID>`, if it doesn't already exist:
+   - `id`: the ticket's Block ID
+   - `title`: the ticket name
+   - `status`: `"open"`
+   - `wave`: default to one past this repo's current highest wave (tickets queue behind roadmap work
+     unless the user says it's urgent — ask before assigning an earlier wave)
+   - `depends_on`: `[]` unless the ticket explicitly names a prerequisite block, in which case
+     `{ "type": "block", "repo": "<this-repo-slug>", "id": "<ID>" }`
+   - **Cross-repo-edge prompt.** Before defaulting to `[]` or a same-repo edge, ask explicitly: "Does
+     this ticket depend on work landing in another repo first?" If yes, resolve that repo's `slug`
+     from `brain.toml` and add `{ "type": "block", "repo": "<other-repo-slug>", "id": "<their-ID>" }`;
+     if the dependency is non-block (hardware, a paid-API budget, a manual step), use
+     `{ "type": "external", "what": "<gloss>" }` instead.
+4. Do **not** hand-author a `tasks` array on that block — `tracks[].blocks[].tasks` is a *derived*
+   pointer + status summary (`{ file, generated, counts }`, see `core/planning/state-schema.md`),
+   not a copy of the task list. `mev emit-state --write` (next step) derives it from the `tasks.json`
+   you just wrote. (Not implemented in `mev` yet — the step is a no-op until it ships.)
+5. Save `planning/state.json` and validate it is still valid JSON:
+   `python3 -c "import json;json.load(open('planning/state.json'))"`.
 
 ### State refresh (do not hand-author `state.json`'s `tasks` field)
 

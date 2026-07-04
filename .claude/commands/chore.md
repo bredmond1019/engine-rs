@@ -106,6 +106,11 @@ After writing `tasks.md` + `tasks.json`, also register this chore's block in `pl
      unless the user says it's urgent — ask before assigning an earlier wave)
    - `depends_on`: `[]` unless the chore explicitly names a prerequisite block, in which case
      `{ "type": "block", "repo": "<this-repo-slug>", "id": "<ID>" }`
+   - **Cross-repo-edge prompt.** Before defaulting to `[]` or a same-repo edge, ask explicitly: "Does
+     this chore depend on work landing in another repo first?" If yes, resolve that repo's `slug` from
+     `brain.toml` and add `{ "type": "block", "repo": "<other-repo-slug>", "id": "<their-ID>" }`; if the
+     dependency is non-block (hardware, a paid-API budget, a manual step), use
+     `{ "type": "external", "what": "<gloss>" }` instead.
 3. Do **not** hand-author a `tasks` array on that block — `tracks[].blocks[].tasks` is a *derived*
    pointer + status summary (`{ file, generated, counts }`, see `core/planning/state-schema.md`),
    not a copy of the task list. `mev emit-state --write` (Step below) derives it from the
