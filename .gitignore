@@ -1,2 +1,9 @@
 /target
 /trees
+.env
+*.sqlite
+*.db
+state.json
+planning/
+node_modules/
+target/

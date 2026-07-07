@@ -15,24 +15,27 @@ Bastion's native Rust execution engine — a graph-validated workflow runtime th
 
 ## Prerequisites
 
-<!-- What must be installed (runtime, package manager, services). -->
+- Rust 1.78+ (via rustup)
 
 ## Setup
 
 ```bash
-# Numbered steps from zero to running.
+# 1. Clone the repository
+git clone https://github.com/bredmond1019/engine-rs
+# 2. Build the project
+cargo build
 ```
 
 ## Running locally
 
 ```bash
-# The exact commands from CLAUDE.md.
+cargo run --release
 ```
 
 ## Tests
 
 ```bash
-# One-liner to run the test suite.
+cargo test
 ```
 
 ## Directory map
