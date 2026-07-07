@@ -53,10 +53,10 @@ engine-rs/
 
 | Doc | Contents |
 |---|---|
-| [planning/context.md](planning/context.md) | Orientation + governing principles |
-| [planning/master-plan.md](planning/master-plan.md) | Strategy + phase specifications |
-| [planning/status.md](planning/status.md) | Current progress |
-| [planning/harness.json](planning/harness.json) | SDLC validation/UI-test config (see `harness.examples.md`) |
+| `planning/context.md` | Orientation + governing principles |
+| `planning/master-plan.md` | Strategy + phase specifications |
+| `planning/status.md` | Current progress |
+| `planning/harness.json` | SDLC validation/UI-test config (see `harness.examples.md`) |
 
 ## Roadmap / Known limitations
 
