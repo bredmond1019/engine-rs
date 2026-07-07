@@ -56,6 +56,11 @@ engine-rs/
 | [planning/status.md](planning/status.md) | Current progress |
 | [planning/harness.json](planning/harness.json) | SDLC validation/UI-test config (see `harness.examples.md`) |
 
+## Roadmap / Known limitations
+
+- **Cancellation:** The `Node` trait currently lacks a cancellation hook (no `CancellationToken` integration yet).
+- **Merge Semantics:** Parallel merge is literal last-write-wins on whole `Value`s; evolving to deep JSON merge for concurrent branches is planned.
+
 ---
 
 *Initialized 2026-07-02 from `base-template` (commit `7f2cbada68bdb0433133cf213777994030f7b7d6`).*
