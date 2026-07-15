@@ -128,6 +128,9 @@ and uses the same skeleton:
 
 - **What** — the scope, in implementation terms.
 - **Why** — the motivation (keeps the generator from over- or under-scoping).
+- **SDLC workflow?** — `Yes (patch/task/run/flow)` or `No — <reason>`.
+- **Model** — `Sonnet` | `Gemini Pro` | `Gemini Flash` | `Either`. Rule of thumb: Opus = reasoning/breakdown only; Sonnet = high-risk/complex; Gemini Pro = intermediate; Gemini Flash = simple.
+- **Workflow & Model Rationale** — prose explaining the choices.
 - **Files** — *new* vs *modified*, named by path. Load-bearing: tasks sharing a file must be
   serialized (`dependsOn`) or append-only; tasks owning distinct files may run in parallel.
 - **Interfaces / shared surface** *(optional)* — shared exports/APIs consumed or added. Omit when
@@ -146,6 +149,9 @@ and uses the same skeleton:
   parses it as one.
 - **What:** <scope in implementation terms>
 - **Why:** <why this block, why now in the sequence>
+- **SDLC workflow?:** <Yes (patch/task/run/flow) or No — reason>
+- **Model:** <Sonnet | Gemini Pro | Gemini Flash | Either>
+- **Workflow & Model Rationale:** <why this model and workflow were chosen>
 - **Files:**
   - *New* `<path>` — <what it holds>
   - *Modified* `<path>` — <what changes>
@@ -159,9 +165,9 @@ and uses the same skeleton:
 
 ## Quick Reference Sequence Table
 
-| Phase | Block | What | Why | Role in destination |
-|---|---|---|---|---|
-| 0 | A | <short> | <short> | <short> |
+| Phase | Block | What | Why | SDLC workflow? | Model | Role in destination |
+|---|---|---|---|---|---|---|
+| 0 | A | <short> | <short> | <short> | <short> | <short> |
 
 ---
 
@@ -183,6 +189,8 @@ to any block registered here.
      prefixed form; the plan.md *heading* stays the bare letter)
    - `title`: the block's name
    - `status`: `"open"`
+   - `sdlc_workflow`: the block's chosen workflow (`none` | `patch` | `task` | `run` | `flow`). (Map 'No' to `none`, and 'Yes (task)' to `task`, etc.)
+   - `model`: the block's chosen model (`sonnet` | `gemini-pro` | `gemini-flash` | `either`).
    - `wave`: an integer rank placing it after this repo's current highest wave (so ad-hoc plans queue
      behind committed roadmap work) — default to `10 * (floor(highest existing wave / 10) + 1)`, keeping
      blocks in the same phase on the same wave.

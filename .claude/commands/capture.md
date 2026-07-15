@@ -1,15 +1,12 @@
-# Capture — Scaffold a pre-plan notes file and add a backlog pointer
+# Capture — Scaffold a pre-plan notes file and optionally add a backlog ticket
 
-Captures rich conversation content that is too detailed for a `/backlog-ticket` but not
-ready to be a `/plan`. Creates `planning/<slug>/notes.md` in the current repo as a
-structured holding area, then appends a pointer ticket to the brain's
-`planning/backlog.md` (found via `brain.toml` walk-up).
+Captures rich conversation content from a planning or research session. Creates `planning/<slug>/notes.md` in the current repo as a structured holding area. If the `--backlog` flag is provided, it calls the `/backlog-ticket` command to create a backlog item pointing to these notes.
 
 ## Variables
 
-$ARGUMENTS — title or free-form description of what to capture.
+$ARGUMENTS — title or free-form description of what to capture, optionally including the `--backlog` flag.
              A slug is derived from this automatically.
-             Example: "Work email setup with instructions"
+             Example: "--backlog Work email setup with instructions"
              Example: "notion-dashboard Notion API read-only dashboard concept"
 
 ## Execution Model
@@ -25,8 +22,7 @@ to the user.
 1. From the current working directory, walk **up** parent by parent looking for a
    `brain.toml` file (its first line begins `# brain.toml`). The directory containing it
    is `BRAIN_ROOT`.
-   - **If no `brain.toml` is found**, this is a standalone repo. Skip the backlog step
-     (Step 4) and note that no brain pointer was created. Still create the local notes file.
+   - **If no `brain.toml` is found**, this is a standalone repo. If `--backlog` is provided, `/backlog-ticket` will handle standalone logic. Still create the local notes file.
 2. The brain backlog path is `<BRAIN_ROOT>/planning/backlog.md`.
 
 ### Step 1 — Parse arguments
@@ -47,40 +43,21 @@ to the user.
 
 ### Step 3 — Create the notes file
 
-5. Create `planning/<slug>/notes.md` using the Output Format below. Leave the body sections
-   as scaffolded prompts — **do not invent content** the user hasn't provided. The user will
-   fill in the detail (paste conversation content) after the file exists.
+5. Create `planning/<slug>/notes.md` using the Output Format below. You must populate the body sections with all the important details discussed during the session, but **do not invent content the user or agent hasn't provided/visually seen**. Ensure you capture file paths, class/struct names, functions, important snippets of code, and any additional content that will make it EXTREMELY easy for the next agent or the user to go dig into this note and know exactly what was discussed, how you got to this conclusion or initial research, where to go look to review/investigate further, etc.
    - **Populate `related:` with ≥1 real `doc_id`** — the project's `master-plan` doc_id, a
      governing decision, or the parent `index`. Never ship `related: []`: a doc_id-bearing file
      with zero outbound edges is an isolated graph node (`mev`'s `W_GRAPH_ISOLATED_NODE`). Use
      genuine doc_ids that exist in the corpus — do not invent one to satisfy the rule.
 
-### Step 4 — Brain backlog pointer (skip if standalone)
+### Step 4 — Backlog ticket (only if --backlog flag is present)
 
-6. Append a pointer ticket to `<BRAIN_ROOT>/planning/backlog.md` in the `## Active` section
-   (before `## Promoted`) using this format:
-
-   ```
-   ### [YYYY-MM-DD] <title>
-   `repo:<repo-slug>` `type:<type>` `status:idea`
-   **notes:** `<repo-path>/planning/<slug>/notes.md`
-
-   <One sentence: what this capture is and why it matters.>
-
-   ---
-   ```
-
-   Use today's date. `<repo-path>` is this repo's path relative to `BRAIN_ROOT`
-   (from the `[[repos]]` `repo_path` field). The `**notes:**` line is the link back to
-   the detail — the backlog entry stays a one-liner pointer.
+6. If the `--backlog` flag is provided in `$ARGUMENTS`, call the `/backlog-ticket` command, passing the title and referencing the newly created `planning/<slug>/notes.md` file. If the flag is not provided, skip this step.
 
 ### Step 5 — Report
 
 7. Shell out to `mev emit-state --write` to update the brain's focus derivation and state.
 
-8. Confirm: output the local path created and (if applicable) the brain backlog entry.
-   Tell the user to open `planning/<slug>/notes.md` and paste their conversation content
-   into the relevant sections.
+8. Confirm: output the local path created and (if applicable) confirm the backlog ticket was created.
 
 ## Output Format — `planning/<slug>/notes.md`
 
@@ -101,7 +78,6 @@ related: [<≥1 real doc_id>]   # required — never leave empty; else this file
 
 > **Status:** draft — pre-plan holding area.
 > **Promote with:** `/plan "<title>"` · `/chore "<title>"` · `/generate-master-plan "<title>"`
-> **Backlog entry:** `<BRAIN_ROOT>/planning/backlog.md`
 
 ## What & Why
 
@@ -114,8 +90,11 @@ related: [<≥1 real doc_id>]   # required — never leave empty; else this file
 
 ## Key Information / Instructions
 
-<!-- Paste the detailed content from your conversation here: instructions, research,
-     decisions made, links, commands, config snippets, etc. -->
+<!-- Detailed content captured from the session. MUST include:
+     - File paths
+     - Class/struct names, functions
+     - Important snippets of code
+     - Any additional content that makes it EXTREMELY easy for the next agent or user to dig into this note, know exactly what was discussed, how the conclusion or initial research was reached, and where to go look to review/investigate further. -->
 
 ## Open Questions
 
@@ -130,7 +109,7 @@ related: [<≥1 real doc_id>]   # required — never leave empty; else this file
 
 ## Notes
 
-- This is a scaffold + pointer only — do not generate content for the body sections.
+- Populate the body sections based on the conversation context, but do not invent new content the user or agent hasn't provided/visually seen.
 - The notes file is the primary input when you later run `/plan`, `/chore`, or
   `/generate-master-plan` — those commands will read it as context for the feature.
 - If the user says the idea is ALSO a content piece, suggest they also run `/add-idea`

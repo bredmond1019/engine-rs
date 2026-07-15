@@ -28,7 +28,7 @@ Read these files (all relative to the project root):
 - Any in-flight task spec visible from status.md (e.g. `planning/<current-block>/tasks.md`)
 - `planning/handoff.md` — if it exists, read it (you are updating it, not replacing blindly)
 - `planning/state.json` — the existing `carryover[]` (you are appending to it, not duplicating)
-- `planning/state-schema.md` — the `carryover[]` section, for the field shape
+- `docs/state/state-schema.md` — the `carryover[]` section, for the field shape
 
 Run:
 - `git log --oneline -10` — recent commits
@@ -51,7 +51,7 @@ leave it living only in the prose below:
   - `kind: env` — a transient environmental caveat (e.g. "installed binary is stale, rebuild first").
   - `kind: deferred` — a real follow-on you haven't ticketed yet; promote it to a block/backlog when ready.
 
-  Follow the `carryover[]` field shape in `planning/state-schema.md` (`slug`, `scope`, `kind`, `text`,
+  Follow the `carryover[]` field shape in `docs/state/state-schema.md` (`slug`, `scope`, `kind`, `text`,
   optional `related` + `clears_when`, `created`). Keep it valid JSON; append, don't duplicate an existing
   slug. **Delete** any existing `carryover[]` entry whose `clears_when` resolved this session. If this repo
   has no `planning/state.json` yet, skip this step.
@@ -59,7 +59,7 @@ leave it living only in the prose below:
 After making any changes to `planning/state.json`'s `carryover[]`, or after writing/updating a
 block's `tasks.json`, run `mev emit-state --write` to ensure the new state is tracked across
 brains. Never hand-edit a block's `tasks` field yourself — it's a derived pointer + status summary
-(see `core/planning/state-schema.md`), not something you inject entries into.
+(see `docs/state/state-schema.md`), not something you inject entries into.
 
 The handoff prose in Step 3 then *points at* these slugs instead of being their only home.
 
@@ -143,4 +143,4 @@ Tell the user:
 - `log.md` (last 3 entries)
 - The current in-flight task spec (path from status.md, if any)
 - `planning/handoff.md` (if it already exists)
-- `planning/state.json` (existing `carryover[]`) + `planning/state-schema.md` (`carryover[]` field shape)
+- `planning/state.json` (existing `carryover[]`) + `docs/state/state-schema.md` (`carryover[]` field shape)

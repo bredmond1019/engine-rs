@@ -292,7 +292,7 @@ The canonical workflow for hand-editing any repo's `planning/state.json`: the au
 field boundary, which `kind` (`project` / `brain` / `portfolio`) applies and what it requires, the
 `<Prefix>.<Phase>.<Letter>` block-ID convention and what has to move in lockstep when an id is
 renamed, and the edit → validate → `mev emit-state --write` → `mev validate-brain --state`
-procedure. Points to `core/planning/state-schema.md` as the single source of truth for field
+procedure. Points to `docs/state/state-schema.md` as the single source of truth for field
 shapes rather than duplicating them. Use before any non-trivial `state.json` edit, or when another
 command's instructions say "update state.json" without repeating the mechanics.
 

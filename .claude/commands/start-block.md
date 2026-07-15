@@ -33,7 +33,7 @@ Return the subagent's result to the user.
      stop — do not fabricate a new block entry here (that's `/generate-master-plan`/`/plan`/`/chore`/
      `/ticket`'s job).
    - Set its `status` to `"in_progress"` (an authored value — never hand-set `"blocked"`, see
-     `core/planning/state-schema.md`).
+     `docs/state/state-schema.md`).
    - Save `planning/state.json` and validate it is still valid JSON:
      `python3 -c "import json;json.load(open('planning/state.json'))"`.
    - Run `mev emit-state --write` to refresh `focus.now`/`focus.next` from the new status.

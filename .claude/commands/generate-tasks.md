@@ -252,7 +252,7 @@ depends on every other id.
 
 If this repo has a `planning/state.json`, run `mev emit-state --write` after committing — it derives
 `tracks[].blocks[].tasks` (a `{ file, generated, counts }` pointer + status summary, **not** a copy
-of the task list — see `core/planning/state-schema.md`) from the `tasks.json` you just wrote. Do not
+of the task list — see `docs/state/state-schema.md`) from the `tasks.json` you just wrote. Do not
 hand-edit a `tasks` array into `state.json` yourself; that field is derived, same as `focus`. (This
 derivation isn't implemented in `mev` yet — running the command is a no-op until it ships; it's
 listed here so the step is already in place when it does.)
