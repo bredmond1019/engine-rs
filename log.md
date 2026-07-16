@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-16T00:00:00Z"
+timestamp: "2026-07-16T09:52:29Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,13 @@ related: [status, context]
 ---
 
 ## [2026-07-16]
+
+### Investigated EN.2.A's PARTIAL root cause — claude-code-rs schema drift, priority handoff for a data-contract redesign
+- **What:** Investigated the root cause of the upstream `claude-code-rs` parser bug behind EN.2.A's PARTIAL verdict. Ran `claude -p "reply with the single word: ok" --output-format json` directly to see the real CLI output shape, and compared it against `core/claude-code-rs/src/parse.rs`'s `Outcome` struct (which expects `total_cost_usd`, `usage`, `model: String`, `content: Vec<ContentBlock>`). Found the CLI's JSON schema has drifted in two ways since that parser was written: (1) no top-level `model` field anymore — the model name is now a key inside a `modelUsage: {"<model>": {...}}` object; (2) no top-level `content` blocks array anymore — response text now lives in a top-level `result: String` field instead. The second drift is the more dangerous one: it silently degrades to empty output even once the `model` field is fixed, because `content` carries `#[serde(default)]` and swallows the mismatch rather than failing loudly. Expanded the existing `planning/state.json` carryover entry `claude-code-rs-parser-missing-model-field` with these full findings, and added a new carryover entry `claude-code-rs-engine-rs-data-contract-design` (kind: `deferred`, `cross_repo: true`) capturing the ask to design a versioned data-contract between `engine-rs` and `core/claude-code-rs`, mirroring the D20/D47 orchestrator↔bastion pattern. Rewrote `planning/handoff.md` in full, framed as a priority handoff for an Opus-tier agent to design that contract before picking up EN.2.B. Re-ran `mev emit-state --write` as an idempotency safety check.
+- **Why:** EN.2.A's PARTIAL verdict was provisionally attributed to a narrow upstream parser bug (a single missing `model` field); this session's direct CLI probe revealed the actual problem is broader schema drift with no versioned contract governing the `claude-code-rs`↔CLI boundary, and — worse — a second, currently-masked drift (`content` vs. `result`) that would silently break output once the first fix landed. That combination makes an ad hoc field patch unsafe; a real data-contract design (in the spirit of D20/D47) needs to happen and be reviewed before EN.2.B builds further on top of this seam.
+- **Refs:** `planning/handoff.md`, `planning/state.json` (carryover: `claude-code-rs-parser-missing-model-field` expanded, `claude-code-rs-engine-rs-data-contract-design` added), `docs/decisions/D20-shared-data-contract.md`, `docs/decisions/D47-workspace-contract.md` (pattern referenced, not modified), `core/claude-code-rs/src/parse.rs`
+
+---
 
 ### EN.2.A-claude-code-step-node closed out PARTIAL — ClaudeCodeStep node shipped, docs patched
 - **What:** Ran `/sdlc-run EN.2.A-claude-code-step-node` (implement → test → review [PARTIAL x2] → fix → wrap-up-partial-failure-due-to-session-limit), then ran `/close-out` manually to finish the loop: re-verified all four gating checks (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release`) green, ran `/code-review low` on the diff (zero findings), and patched `docs/architecture.md` (added `ClaudeCodeStep` to Module Map / Build & CI / Core Types). `ClaudeCodeStep` node implemented, tested, and reviewed clean; the sole gap is an upstream `core/claude-code-rs` parser bug (missing `"model"` field) blocking the live `#[ignore]` acceptance test, confirmed out of `engine-rs`'s scope per the D4 transport boundary. Shipped in commit `364d8cf` on `main`: `crates/engine-core/src/nodes/claude_code_step.rs` (new), `crates/engine-core/src/nodes/mod.rs` (new), `crates/engine-core/src/lib.rs`, `crates/engine-core/Cargo.toml`, root `Cargo.toml`, `crates/engine-core/tests/claude_code_step.rs` (new). Flipped `EN.2.A` to `closed` in `planning/state.json`, added a carryover entry `claude-code-rs-parser-missing-model-field` (kind: `known_issue`, scope: `engine-rs`) tracking the upstream bug, and regenerated derived state via `mev emit-state --write` (focus now surfaces `EN.2.B` as next).
