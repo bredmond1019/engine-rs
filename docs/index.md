@@ -16,5 +16,6 @@ related: [core:engine-rs]
 |---|---|
 | [architecture.md](architecture.md) | Overview, module map, core types, data flow |
 | [cli.md](cli.md) | Synopsis, subcommands, global flags, exit codes, examples |
+| [data-contract.md](data-contract.md) | Pinned orchestrator data-contract version, field mappings to `engine_contract` Rust types, HTTP surface parity, re-pin checklist |
 
 For project strategy and current focus, see [`planning/`](../planning/index.md).

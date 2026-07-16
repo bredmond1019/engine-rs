@@ -45,7 +45,8 @@ engine-rs/
 │   │                         with_cancellation_token(), EN.2.B)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
-│   │                         orchestrator data-contract.md v1.0.1 byte-for-byte
+│   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
+│   │                         docs/data-contract.md for the full pin)
 │   ├── engine-store/      ← postgres.rs: sqlx::PgPool connect/insert_event/update_event/
 │   │                         get_event for the durable `events` record
 │   └── engine-serve/      ← bastion serve embedding (EN.1.C): dispatch.rs (Dispatcher — dual
@@ -206,7 +207,7 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   finished), `202 Accepted` on success (matching `post_events`'s existing `202` convention) —
   calls `token.cancel()`, which `Workflow::run_with` observes at the next node boundary.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
-  — the preserved data-contract shape (see `orchestrator/docs/data-contract.md` v1.0.1).
+  — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
   `input`, `usage` (`{input_tokens, output_tokens, model}` for LLM nodes). Stamped RUNNING →
   SUCCESS/FAILED by the framework-owned `node_context` envelope in `workflow.rs`, not by the node
@@ -231,7 +232,7 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   several. `content` comes from the SDK's `text`, and `model` from
   `Outcome::primary_model()` — an SDK-side heuristic (cost, then output tokens, then key order) that
   returns `None` when no model ran. Because `engine_contract::Usage::model` is a required `String`
-  (the orchestrator data contract's shape, v1.0.1 §6), this node supplies the literal `"unknown"`
+  (the orchestrator data contract's shape, §6), this node supplies the literal `"unknown"`
   when the SDK reports none. That fallback lives here, at the seam, rather than loosening a contract
   type that `bastion` also reads — see `docs/data-contract.md` §6 and D20.
 
