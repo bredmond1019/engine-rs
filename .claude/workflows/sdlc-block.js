@@ -829,9 +829,14 @@ tasksFile="${blockTasks}", taskCount, commitHash, notes.
 // Run ONE block through /sdlc-flow as the inner engine. Returns the child flow's result (or null).
 // Always passes --no-pr so the orchestrator can run the per-block gap-check before opening the PR
 // (PR mode) or skip PR creation entirely (no-pr / auto-merge modes where the orchestrator owns merging).
+// Always passes --worktree: /sdlc-flow defaults to a plain branch in the MAIN working tree, but this
+// orchestrator fans out blocks CONCURRENTLY (a wave runs up to effectiveMaxParallel children at once),
+// so each child needs its own isolated worktree — a shared main tree would collide. The worktree is
+// also what the per-block gap-check (gapCheckBlock) and PR-open run in (they read the child's
+// returned worktreePath).
 async function runBlockFlow(slug) {
-  log(`Block ${slug}: running /sdlc-flow --no-pr...`)
-  const r = await workflow('sdlc-flow', `${slug} --no-pr`)
+  log(`Block ${slug}: running /sdlc-flow --no-pr --worktree...`)
+  const r = await workflow('sdlc-flow', `${slug} --no-pr --worktree`)
   return r
 }
 

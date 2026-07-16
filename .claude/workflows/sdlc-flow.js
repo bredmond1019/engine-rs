@@ -1,11 +1,18 @@
 // =============================================================================
-// sdlc-flow — shared-worktree, single-review, PR-terminating SDLC engine
+// sdlc-flow — single-branch, single-review, PR-terminating SDLC engine
 // =============================================================================
 //
 // The default engine for non-trivial feature work. Runs one spec's tasks
-// SEQUENTIALLY in a SINGLE shared worktree (so there are no inter-task merges to
+// SEQUENTIALLY on a SINGLE shared branch (so there are no inter-task merges to
 // conflict — sdlc-block's #1 failure mode), with a per-task test→fix loop, ONE
 // consolidated review at the end, a docs patch, and a PR as the terminal step.
+//
+// ISOLATION MODE
+//   Default: a plain branch (<spec>-flow) checked out IN THE MAIN WORKING TREE. No
+//   sparse-checkout worktree, so a relative planning/ symlink (brain-vaulted repos)
+//   stays intact. main is left on the branch until the PR merges.
+//   --worktree: the isolated sparse-checkout worktree under trees/<spec>-flow/ —
+//   opt in when you need true isolation (e.g. /sdlc-block fans out parallel children).
 //
 // A compact, COMMITTED, AUTHORITATIVE state.json + one worklog.md replace the 5×N
 // per-stage report files: resume + review + wrap-up read a structured index instead
@@ -15,16 +22,17 @@
 // USAGE
 //   /sdlc-flow <spec-slug>                  run every task in the spec, open a PR, stop
 //   /sdlc-flow <spec-slug> 1-3              scope to a task range (1-3, 1,3,5, 5)
-//   /sdlc-flow <spec-slug> --auto-merge     merge the PR + clean the worktree on success
+//   /sdlc-flow <spec-slug> --auto-merge     merge the PR + clean up on success
 //   /sdlc-flow <spec-slug> --no-pr          stop after wrap-up; do not create a PR
-//   /sdlc-flow <spec-slug> --resume         re-attach the worktree, resume from state.json
+//   /sdlc-flow <spec-slug> --worktree       run in an isolated worktree (default: plain branch)
+//   /sdlc-flow <spec-slug> --resume         re-attach the branch/worktree, resume from state.json
 //   /sdlc-flow <spec-slug> --test-depth full  run the FULL gating suite per task (default: fast)
 //
 // PIPELINE
 //   worktree-setup → enumerate (D16 lint) → [resume load] → per-task loop
 //     → end-review → docs (gated on PASS) → wrap-up(PR)
 //
-//   Per-task loop (sequential, in the one worktree):
+//   Per-task loop (sequential, on the one branch):
 //     implement → fast-test → (triage → fix/​bail) ×≤3
 //     One state-commit per task. A triage MAJOR / immediate-bail reason breaks
 //     straight to wrap-up (draft PR) — it does NOT burn three attempts.
@@ -42,7 +50,7 @@
 //   chore: wrap up <spec>               wrap-up agent (status/log/amendment-log)
 //
 // MODEL TIERING (the token lever — see the MODEL map below)
-//   haiku : worktree-setup, enumerate, scout/state-load, test, state-writer
+//   haiku : setup, enumerate, scout/state-load, test, state-writer
 //   sonnet: implement, fix, review, triage, docs, wrap-up
 //   opus  : ESCALATION on the FINAL per-task fix pass and the FINAL review attempt
 //
@@ -53,10 +61,10 @@
 
 export const meta = {
   name: 'sdlc-flow',
-  description: 'Run a spec sequentially in one shared worktree with a per-task test→fix loop, one end review, a docs patch, and a PR',
-  whenToUse: 'The default for non-trivial feature work — many moving parts in one spec. Sequential, no inter-task merges, one consolidated review, terminates in a PR. Usage: /sdlc-flow <spec-slug> [range] [--auto-merge] [--no-pr] [--resume]',
+  description: 'Run a spec sequentially on one branch (or --worktree) with a per-task test→fix loop, one end review, a docs patch, and a PR',
+  whenToUse: 'The default for non-trivial feature work — many moving parts in one spec. Sequential, no inter-task merges, one consolidated review, terminates in a PR. Runs on a plain branch in the main tree by default; pass --worktree for isolation. Usage: /sdlc-flow <spec-slug> [range] [--auto-merge] [--no-pr] [--worktree] [--resume]',
   phases: [
-    { title: 'Worktree', detail: 'Create (or re-attach) the one shared worktree for the whole spec' },
+    { title: 'Setup',    detail: 'Create (or re-attach) the branch (or --worktree) for the whole spec' },
     { title: 'Plan',     detail: 'Enumerate tasks from tasks.json (D16 lint) + load resume state' },
     { title: 'Tasks',    detail: 'Per task: implement → fast-test → (triage → fix/bail)' },
     { title: 'Review',   detail: 'ONE consolidated review of the integrated tree; full gating suite' },
@@ -66,12 +74,12 @@ export const meta = {
 }
 
 // ----------------------------------------------------------------
-// Parse args: "<spec-slug> [range] [--auto-merge] [--no-pr] [--resume] [--test-depth fast|full]"
+// Parse args: "<spec-slug> [range] [--auto-merge] [--no-pr] [--worktree] [--resume] [--test-depth fast|full]"
 // ----------------------------------------------------------------
 const rawArgs = typeof args === 'string' ? args.trim() : ''
 if (!rawArgs) {
   log('ERROR: No spec name provided.')
-  log('Usage: /sdlc-flow <spec-slug> [range] [--auto-merge] [--no-pr] [--resume] [--test-depth fast|full]')
+  log('Usage: /sdlc-flow <spec-slug> [range] [--auto-merge] [--no-pr] [--worktree] [--resume] [--test-depth fast|full]')
   return { error: 'Missing required argument: spec name (e.g. "<spec-slug>" or "<spec-slug> 1-3")' }
 }
 
@@ -98,6 +106,10 @@ function parseRange(spec) {
 const autoMergeFlag = hasFlag('--auto-merge')
 const noPr          = hasFlag('--no-pr')
 const resumeMode    = hasFlag('--resume')
+// Isolation mode: default runs on a plain branch checked out in the MAIN working tree (keeps a relative
+// planning/ symlink intact — worktrees break it). --worktree opts back into the isolated sparse-checkout
+// worktree (needed for true parallelism — e.g. /sdlc-block fans out concurrent children).
+const useWorktree   = hasFlag('--worktree')
 
 const VALID_TEST_DEPTHS = ['fast', 'full']
 const testDepthFlag = flagStr('--test-depth')
@@ -131,7 +143,7 @@ const MAX_TASK_ATTEMPTS   = 3   // implement→test→fix attempts per task befo
 const MAX_REVIEW_ATTEMPTS = 3   // consolidated-review fix passes before bail
 
 log(`Target: ${blockId} (${selectedTasks ? [...selectedTasks].sort((a, b) => a - b).join(', ') : 'all tasks'})`)
-log(`Spec: ${specFile} | branch: ${baseBranchName}${resumeMode ? ' | RESUME' : ''}`)
+log(`Spec: ${specFile} | branch: ${baseBranchName} | mode: ${useWorktree ? 'worktree' : 'branch'}${resumeMode ? ' | RESUME' : ''}`)
 
 // ================================================================
 // Schemas
@@ -147,6 +159,7 @@ const SETUP_SCHEMA = {
     blockStatus:    { type: 'string', description: "This spec's Status in status.md (title-case), or 'Unknown'" },
     specThin:       { type: 'boolean', description: 'D19: true ONLY on a fresh run (wasCreated && specFileExists) with a structurally-valid but substantively-thin spec. false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
+    setupError:     { type: 'string', description: 'Non-empty when setup could not proceed safely (e.g. branch mode aborted on a dirty working tree). The engine aborts and reports this. Empty string on success.' },
     notes:          { type: 'string' }
   }
 }
@@ -172,6 +185,7 @@ const STATE_LOAD_SCHEMA = {
     startedAt:   { type: 'string',  description: "the file's started_at value, or '' when absent" },
     passedTasks: { type: 'array', items: { type: 'integer' }, description: 'task numbers whose status is "passed"' },
     bailReason:  { type: 'string',  description: 'the prior bail_reason, or "" when none' },
+    tasksJson:   { type: 'string',  description: 'Verbatim JSON (as a string) of the state file\'s top-level "tasks" object, so the engine can carry the full prior task history forward. "{}" when absent/no state.' },
     notes:       { type: 'string' }
   }
 }
@@ -275,8 +289,9 @@ const MERGE_SCHEMA = {
   required: ['merged'],
   properties: {
     merged:        { type: 'boolean' },
-    worktreeRemoved: { type: 'boolean' },
+    worktreeRemoved: { type: 'boolean', description: 'true if a worktree was removed; false in branch mode (there is none)' },
     branchDeleted: { type: 'boolean' },
+    emitStateRan:  { type: 'boolean', description: 'true if `mev emit-state --write` regenerated derived surfaces on the base; false when skipped (mev/brain.toml absent or merge did not complete)' },
     notes:         { type: 'string' }
   }
 }
@@ -312,7 +327,7 @@ const MODEL = {
   docs:          'sonnet',   // surgical doc patches, gated on PASS
   wrapup:        'sonnet',   // human-facing status/log prose + the D18 amendment log (judgment)
   pr:            'sonnet',   // push + gh pr create with a handoff body; degrades if gh absent
-  merge:         'sonnet',   // --auto-merge: merge the PR + clean the worktree
+  merge:         'sonnet',   // --auto-merge: merge the PR + clean up + emit-state on the base
   stateWriter:   'haiku',    // stamps timestamps, writes state.json + worklog.md, commits
 }
 
@@ -594,6 +609,7 @@ Return using StructuredOutput: done=true, and note which baselines were written 
 const state = {
   spec_slug: blockId,
   branch: baseBranchName,
+  mode: useWorktree ? 'worktree' : 'branch',
   worktree_path: '',
   status: 'running',
   current_task: null,
@@ -652,29 +668,21 @@ the final git log line (empty string if nothing was committed).
 }
 
 // ================================================================
-// PHASE 0: WORKTREE SETUP — one shared worktree for the whole spec
+// PHASE 0: SETUP — one branch (default) or one shared worktree (--worktree) for the whole spec
 // ================================================================
-phase('Worktree')
-log(`Setting up the shared worktree for ${blockId}${resumeMode ? ' (resume — reuse existing if present)' : ''}...`)
+phase('Setup')
+log(`Setting up the ${useWorktree ? 'shared worktree' : 'branch'} for ${blockId}${resumeMode ? ' (resume — reuse existing if present)' : ''}...`)
 
-const setupResult = await tracedAgent(`
-You are the worktree setup agent. Create (or locate) ONE isolated git worktree for this whole spec —
-every task in the run shares it (sequential, so there are no inter-task merges). All bash commands run
-from the MAIN REPO ROOT (your current CWD).
+// The working directory the STEP 6 reads run from once the branch/worktree is live. [placeholders]
+// are filled by the agent with the resolved values.
+const setupWorkdir = useWorktree ? 'trees/[branchName]' : '[repoRoot]'
 
-Target:
-  Spec:       ${blockId}
-  Base name:  ${baseBranchName}
-
-STEP 1 — Get the absolute repo root:
-  Run: git rev-parse --show-toplevel
-  Store the trimmed output as repoRoot.
-${resumeMode ? `
+const worktreeRecipe = `${resumeMode ? `
 RESUME MODE IS ON — reuse the existing worktree for this spec instead of creating a fresh one.
   a. git worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
   b. git branch --list "${baseBranchName}"
   Then:
-  - WT_EXISTS → REUSE verbatim. branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 4.
+  - WT_EXISTS → REUSE verbatim. branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 3.5.
   - WT_MISSING but branch "${baseBranchName}" exists (orphan branch, dir removed) → re-attach (NO -b flag):
        mkdir -p trees
        git worktree add --no-checkout trees/${baseBranchName} ${baseBranchName}
@@ -683,14 +691,27 @@ RESUME MODE IS ON — reuse the existing worktree for this spec instead of creat
        git -C trees/${baseBranchName} checkout
        if [ -f .env ]; then cp .env trees/${baseBranchName}/.env; fi
        if [ -f .env.local ]; then cp .env.local trees/${baseBranchName}/.env.local; fi
-    branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 4.
+    branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 3.5.
   - Neither exists → fall through to STEP 2/3 and create a fresh worktree as normal.
 ` : ''}
-STEP 2 — Find a free worktree name. Start with candidate "${baseBranchName}"; for each candidate run:
+STEP 2 — Find a free worktree name. FIRST check the exact base candidate "${baseBranchName}":
+    git worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
+    git branch --list "${baseBranchName}"
+  If EITHER exists, that is evidence of a PRIOR /sdlc-flow run on this exact spec — do NOT silently
+  bump to a "-2" name and orphan it (this is how prior progress has been lost before: an agent
+  restarts the pipeline after a failure/interruption without realizing --resume was needed, and a
+  fresh "-2" worktree quietly starts the spec over from task 1). STOP instead: set wasCreated=false
+  and setupError="A branch/worktree named '${baseBranchName}' already exists from a prior /sdlc-flow
+  run on this spec. Re-run with --resume to continue it — this is required even if you are restarting
+  via a cached Workflow resumeFromRunId, which does NOT by itself skip already-completed tasks. If you
+  are certain you want to discard it and start over: git worktree remove trees/${baseBranchName}
+  --force && git branch -D ${baseBranchName}, then re-run without --resume." Skip to STEP 6 and return.
+  Otherwise (the base candidate is genuinely free), for each candidate run:
     git worktree list | grep "trees/<candidate>"
     git branch --list "<candidate>"
   If BOTH return nothing → the candidate is free; use it. Otherwise try "${baseBranchName}-2",
-  "${baseBranchName}-3", … up to "-10". Store the chosen name as branchName.
+  "${baseBranchName}-3", … up to "-10" (an unrelated name collision, not a prior attempt on this
+  spec — bumping past those is fine). Store the chosen name as branchName.
 
 STEP 3 — Create the worktree (replace [branchName] / [repoRoot] with actual values):
   a. mkdir -p trees
@@ -703,40 +724,119 @@ STEP 3 — Create the worktree (replace [branchName] / [repoRoot] with actual va
   g. if [ -f .env.local ]; then cp .env.local trees/[branchName]/.env.local; fi
   h. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
 
+STEP 3.5 — Fix the planning/ symlink for the worktree (run from the MAIN repo root, for ALL paths —
+  fresh create, re-attach, or reuse). In brain-vaulted repos the MAIN repo's \`planning\` is a
+  RELATIVE symlink into a vault (e.g. planning -> ../_planning/<repo>) and is gitignored. Evaluated
+  from inside trees/[branchName]/ that relative target breaks — so agents would hit a broken link,
+  delete it, and write a real planning/ dir that later clobbers the symlink on merge. Prevent that by
+  pointing the worktree's planning/ at the SAME real vault via an ABSOLUTE symlink (gitignored, so it
+  is never committed or merged):
+    if [ -L planning ]; then
+      TARGET="$(python3 -c "import os; print(os.path.realpath('planning'))")"
+      rm -f trees/[branchName]/planning
+      ln -s "$TARGET" trees/[branchName]/planning
+      echo "PLANNING_SYMLINK_FIXED -> $TARGET"
+    else
+      echo "PLANNING_REAL_DIR (no symlink fix needed)"
+    fi
+  If \`planning\` is a real tracked directory (non-vaulted repo), the sparse-checkout already
+  populated it — do nothing.
+
 STEP 4 — Verify:
   Run: git worktree list
   Run: ls trees/[branchName]/
-  Confirm it contains the tracked top-level directories — at minimum planning/ and .claude/.
+  Confirm it contains the tracked top-level directories — at minimum planning/ (real dir or the fixed
+  symlink) and .claude/. Confirm planning/ resolves: ls trees/[branchName]/planning/ >/dev/null 2>&1 && echo "PLANNING_OK".
 
-STEP 5 — Compute worktreePath = repoRoot + "/trees/" + branchName
+STEP 5 — Compute worktreePath = repoRoot + "/trees/" + branchName`
 
-STEP 6 — Report pipeline-start inputs:
+const branchRecipe = `${resumeMode ? `
+RESUME MODE IS ON — reuse the existing branch for this spec instead of creating a fresh one.
+  a. git branch --list "${baseBranchName}"
+  Then:
+  - If branch "${baseBranchName}" exists → check it out: git checkout ${baseBranchName}
+    branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 4.
+  - If it does NOT exist → fall through to STEP 2/3 and create a fresh branch as normal.
+` : ''}
+STEP 2 — Find a free branch name. FIRST check the exact base candidate "${baseBranchName}":
+    git branch --list "${baseBranchName}"
+  If it exists, that is evidence of a PRIOR /sdlc-flow run on this exact spec — do NOT silently bump
+  to a "-2" name and orphan it (this is how prior progress has been lost before: an agent restarts the
+  pipeline after a failure/interruption without realizing --resume was needed, and a fresh "-2" branch
+  quietly starts the spec over from task 1). STOP instead: set wasCreated=false and setupError="A
+  branch named '${baseBranchName}' already exists from a prior /sdlc-flow run on this spec. Re-run
+  with --resume to continue it — this is required even if you are restarting via a cached Workflow
+  resumeFromRunId, which does NOT by itself skip already-completed tasks. If you are certain you want
+  to discard it and start over: git branch -D ${baseBranchName}, then re-run without --resume." Skip
+  to STEP 6 and return.
+  Otherwise (the base candidate is genuinely free), for each candidate run:
+    git branch --list "<candidate>"
+  If it returns nothing → the candidate is free; use it. Otherwise try "${baseBranchName}-2",
+  "${baseBranchName}-3", … up to "-10" (an unrelated name collision, not a prior attempt on this
+  spec — bumping past those is fine). Store the chosen name as branchName.
+
+STEP 3 — Create the branch and check it out IN THE MAIN WORKING TREE (no worktree, no trees/ dir):
+  a. Guard against a dirty tree — uncommitted changes would ride onto the branch and into the run's
+     commits. Run: git status --porcelain
+     If it prints ANYTHING, STOP: do NOT create the branch. Set wasCreated=false and
+     setupError="Working tree is not clean — commit or stash your changes, then re-run (or use --worktree
+     for an isolated checkout). Dirty paths: <the porcelain output>". Then skip to STEP 6 and return.
+  b. git checkout -b [branchName]
+  No sparse-checkout, no env copy, no init commit — this is the real repo checkout, so the working tree
+  (including any relative planning/ symlink) is already fully present and intact.
+
+STEP 4 — Verify:
+  Run: git branch --show-current      (must print [branchName])
+  Run: ls planning/ .claude/ >/dev/null 2>&1 && echo "TREE_OK" || echo "TREE_MISSING"
+
+STEP 5 — worktreePath = repoRoot  (branch mode runs in the main working tree — there is no separate worktree dir)`
+
+const setupResult = await tracedAgent(`
+You are the setup agent. ${useWorktree
+  ? 'Create (or locate) ONE isolated git worktree for this whole spec — every task in the run shares it (sequential, so there are no inter-task merges).'
+  : 'Create (or re-attach) ONE plain git branch for this whole spec and check it out IN THE MAIN WORKING TREE — every task in the run shares it (sequential, so there are no inter-task merges). No worktree is used, which keeps a relative planning/ symlink intact.'}
+All bash commands run from the MAIN REPO ROOT (your current CWD).
+
+Target:
+  Spec:       ${blockId}
+  Base name:  ${baseBranchName}
+
+STEP 1 — Get the absolute repo root:
+  Run: git rev-parse --show-toplevel
+  Store the trimmed output as repoRoot.
+${useWorktree ? worktreeRecipe : branchRecipe}
+
+STEP 6 — Report pipeline-start inputs (run these from the live checkout):
   a. Spec file:
-       cd trees/[branchName] && ls ${specFile} 2>/dev/null && echo "SPEC_EXISTS" || echo "SPEC_MISSING"
+       cd ${setupWorkdir} && ls ${specFile} 2>/dev/null && echo "SPEC_EXISTS" || echo "SPEC_MISSING"
      specFileExists = true iff "SPEC_EXISTS" printed.
   b. Block status — find this spec's row in status.md:
-       cd trees/[branchName] && grep -iE "${blockId}" planning/status.md | head -5
+       cd ${setupWorkdir} && grep -iE "${blockId}" planning/status.md | head -5
      blockStatus = the title-case Status value (Not started / In progress / Done / Blocked / Skipped),
      or "Unknown" if no row is found.
   c. Thin-spec check (D19) — ONLY when wasCreated AND specFileExists (a fresh run about to spend
      implement tokens; skip on resume). Set specThin=true ONLY on these high-confidence signals (a
      blocked valid spec is far costlier than a missed thin one — when in doubt do NOT flag):
-       - cd trees/[branchName] && grep -n '{{' ${specFile}  → any unfilled {{TOKEN}} is thin.
+       - cd ${setupWorkdir} && grep -n '{{' ${specFile}  → any unfilled {{TOKEN}} is thin.
        - The '## Acceptance Criteria' section has no real '- ' bullet (empty, or only a template seed) → thin.
      Do NOT flag bare 'TODO'/'TBD' prose, do NOT treat '<...>' as a token (legitimate in 'Vec<T>', globs),
      never flag the Amendment Log seed '_No amendments yet._'. Else specThin=false, thinReason="".
 
-Return your result using the StructuredOutput tool.
-`, withModel({ label: 'worktree-setup', schema: SETUP_SCHEMA, phase: 'Worktree' }, MODEL.worktreeSetup))
+Set setupError="" unless STEP 3 aborted (branch mode, dirty tree). Return your result using the StructuredOutput tool.
+`, withModel({ label: 'setup', schema: SETUP_SCHEMA, phase: 'Setup' }, MODEL.worktreeSetup))
 
 if (!setupResult) {
-  log('Worktree setup agent returned null — aborting pipeline')
-  return { error: 'Worktree setup failed', blockId }
+  log('Setup agent returned null — aborting pipeline')
+  return { error: 'Setup failed', blockId }
+}
+if (setupResult.setupError) {
+  log(`Setup aborted: ${setupResult.setupError}`)
+  return { error: 'Setup aborted', reason: setupResult.setupError, blockId }
 }
 const { branchName, worktreePath } = setupResult
 state.branch = branchName
 state.worktree_path = worktreePath
-log(`Worktree ready: ${worktreePath} (branch: ${branchName})`)
+log(`${useWorktree ? 'Worktree' : 'Branch'} ready: ${worktreePath} (branch: ${branchName})`)
 
 // D19 — thin-spec guard for a fresh run.
 if (setupResult.specThin) {
@@ -745,10 +845,17 @@ if (setupResult.specThin) {
   return { error: 'Thin spec (D19)', reason: setupResult.thinReason || '', blockId }
 }
 
-// Worktree path injection header — prepended to every agent prompt that runs inside the worktree.
-const W = `WORKTREE (not the main repo). repo root = ${worktreePath}
+// Run-context injection header — prepended to every agent prompt that runs on the branch/worktree.
+// In branch mode worktreePath === repoRoot, so the same `cd ${worktreePath}` prefix works in both modes.
+const W = useWorktree
+  ? `WORKTREE (not the main repo). repo root = ${worktreePath}
 Shell state does NOT persist between Bash calls — START EVERY Bash call with: cd ${worktreePath} &&
 Run all build/test/validation from the repo root; relative paths (planning/...) resolve from there.
+`
+  : `MAIN WORKING TREE, on branch ${branchName} (a plain branch — no worktree). repo root = ${worktreePath}
+Shell state does NOT persist between Bash calls — START EVERY Bash call with: cd ${worktreePath} &&
+You are already on branch ${branchName}; commit here and do NOT switch branches. Run all
+build/test/validation from the repo root; relative paths (planning/...) resolve from there.
 `
 
 // ================================================================
@@ -786,19 +893,32 @@ const allTasks = enumResult.allTasks
 let taskList = selectedTasks ? allTasks.filter(n => selectedTasks.has(n)) : allTasks.slice()
 log(`Tasks in spec: ${allTasks.join(', ')}${selectedTasks ? ` | selected: ${taskList.join(', ')}` : ''}`)
 
-// Resume: load the committed state.json to skip already-passed tasks.
+// Resume: load the committed state.json to skip already-passed tasks. Also seeds the in-memory
+// `state.tasks` with the FULL prior tasks object — writeFlowState() serializes `state` wholesale on
+// every write, and the per-task loop below only ever populates `state.tasks[N]` for tasks it actually
+// runs (skipped/already-passed tasks never re-enter it) — so without this seed, the first write after
+// a resume would silently drop the earlier-passed tasks from the committed file, and the *next*
+// resume would see them as never-passed and re-run them.
 const passedFromState = new Set()
 if (resumeMode) {
   const loaded = await tracedAgent(`${W}
 You read the COMMITTED run-state for an /sdlc-flow resume. Do NOT modify anything.
   cd ${worktreePath} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-If "__NO_STATE__" or invalid JSON → exists=false. Otherwise exists=true, startedAt = its started_at,
-passedTasks = the task numbers whose tasks[N].status == "passed", bailReason = its bail_reason or "".
+If "__NO_STATE__" or invalid JSON → exists=false, tasksJson="{}". Otherwise exists=true,
+startedAt = its started_at, passedTasks = the task numbers whose tasks[N].status == "passed",
+bailReason = its bail_reason or "", tasksJson = the exact JSON (as a string) of its top-level "tasks"
+object, verbatim — this is how the engine carries the full prior task history forward across a resume.
 Return via StructuredOutput.
 `, withModel({ label: 'state-load', schema: STATE_LOAD_SCHEMA, phase: 'Plan' }, MODEL.stateLoad))
   if (loaded && loaded.exists) {
     for (const n of (loaded.passedTasks || [])) passedFromState.add(n)
     log(`Resume: ${passedFromState.size} task(s) already passed (${[...passedFromState].sort((a, b) => a - b).join(', ') || 'none'}); skipping them.`)
+    try {
+      const priorTasks = JSON.parse(loaded.tasksJson || '{}')
+      if (priorTasks && typeof priorTasks === 'object') Object.assign(state.tasks, priorTasks)
+    } catch {
+      log('(resume) could not parse prior tasks JSON from state.json — already-passed tasks may drop out of the committed history on the next write.')
+    }
   } else {
     log('Resume requested but no valid state.json found — running all selected tasks fresh.')
   }
@@ -1256,10 +1376,12 @@ Target:
       authored close value). If NOT found, report it in notes and do NOT fabricate a block entry.
     - Validate the file is still valid JSON:
         cd ${worktreePath} && python3 -c "import json;json.load(open('planning/state.json'))"
-    - Do NOT run \`mev emit-state --write\` here: this is a linked git worktree, where emit-state
-      refuses to run. The authored flip is committed on the branch below (step 5); the derived
-      surfaces regenerate on MAIN when the branch merges (/clean-worktree or /merge-train run
-      emit-state after the fast-forward).
+    - Do NOT run \`mev emit-state --write\` here. ${useWorktree
+        ? 'This is a linked git worktree, where emit-state refuses to run.'
+        : 'This run is on a feature branch, not the base branch — emit-state must run on the base, and only after the branch merges (deriving from the branch checkout would be wrong).'} The authored flip is
+      committed on the branch below (step 5); the derived surfaces regenerate on the base branch when
+      this branch merges (/clean-worktree, /merge-train, or /close-out --merge-branch run emit-state
+      after integration).
     - Set blockStatusFlipped to the block id you closed (or "" if none).
 
 3. Prepend a new log.md entry (newest first):
@@ -1291,7 +1413,7 @@ blockStatusFlipped (the state.json block id closed in step 2b, or ""), notes.
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
 if (wrapupResult?.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended.`)
-if (wrapupResult?.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch; derived surfaces regenerate on merge (/clean-worktree or /merge-train).`)
+if (wrapupResult?.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch; derived surfaces regenerate on merge (/clean-worktree, /merge-train, or /close-out --merge-branch).`)
 
 // Final state write (status reflects the terminal state; PR fields filled after creation).
 state.status = bailed ? 'blocked' : 'done'
@@ -1368,45 +1490,63 @@ Return via StructuredOutput: created, url, number, draft=${isDraft}, pushed, ghP
 }
 
 // ----------------------------------------------------------------
-// --auto-merge: merge the PR + clean the worktree. ONLY on a clean success (PASS, not bailed).
+// --auto-merge: merge the PR + clean up + regenerate derived surfaces. ONLY on a clean success (PASS, not bailed).
 // ----------------------------------------------------------------
 let mergeInfo = null
 if (autoMerge && !bailed && finalVerdict === 'PASS' && prInfo?.created && !prInfo.draft) {
-  log('--auto-merge — merging the PR and cleaning the worktree...')
+  log(`--auto-merge — merging the PR and cleaning up (${useWorktree ? 'worktree' : 'branch'} mode)...`)
   mergeInfo = await tracedAgent(`
-You complete an --auto-merge for an /sdlc-flow run. You run from the MAIN repo root (NOT the worktree).
-Merge the PR, then remove the worktree and delete the branch. Be careful and report honestly.
+You complete an --auto-merge for an /sdlc-flow run. Merge the PR, ${useWorktree
+    ? 'then remove the worktree and delete the branch'
+    : 'switch back to the base branch and delete the merged local branch'}, then regenerate derived
+surfaces on the base. Be careful and report honestly.
 
 Branch:   ${branchName}
-Worktree: ${worktreePath}
-PR:       ${prInfo.number ? '#' + prInfo.number : prInfo.url || '(look it up)'}
+${useWorktree ? `Worktree: ${worktreePath}\n` : ''}PR:       ${prInfo.number ? '#' + prInfo.number : prInfo.url || '(look it up)'}
 Base:     ${prBase}
 
 1. Merge the PR via gh (delete the remote branch as part of the merge):
    gh pr merge ${prInfo.number || prInfo.url} --merge --delete-branch
-   If gh errors (not mergeable, checks pending), STOP — do NOT remove the worktree. Report merged=false + the error in notes.
+   If gh errors (not mergeable, checks pending), STOP — do NOT clean up. Report merged=false + the error in notes.
 
-2. Bring local ${prBase} up to date:
+2. Bring local ${prBase} up to date (this also moves the working tree onto ${prBase}):
    git checkout ${prBase} && git pull --ff-only
-
+${useWorktree ? `
 3. Remove the worktree + delete the local branch (mirrors /clean-worktree teardown):
    git worktree remove ${worktreePath} --force
    git worktree prune
    git branch -D ${branchName} 2>/dev/null || true
+   Set worktreeRemoved / branchDeleted accordingly.
 
 4. Verify:
    git worktree list
    git branch --list ${branchName}
+` : `
+3. Delete the merged local branch (no worktree to remove in branch mode):
+   git branch -d ${branchName} 2>/dev/null || git branch -D ${branchName} 2>/dev/null || true
+   Set worktreeRemoved=false, branchDeleted accordingly.
 
-Return via StructuredOutput: merged, worktreeRemoved, branchDeleted, notes.
+4. Verify:
+   git branch --show-current   (should print ${prBase})
+   git branch --list ${branchName}
+`}
+5. Regenerate derived surfaces on ${prBase} (you are now on ${prBase} in the main tree — emit-state is safe here):
+   mev emit-state --write
+   This re-derives the one-way surfaces (focus, rollups, cache synced_from watermarks, tier tables,
+   the HQ Operating Board, master-plan wave tables) from the authored state.json block-status flip the
+   merge just landed. If \`mev\` or brain.toml is absent (a standalone repo), skip it silently and set
+   emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement any derived surface. If it warns
+   W_EMIT_NO_SENTINEL, surface it in notes rather than hand-authoring the sentinel.
+
+Return via StructuredOutput: merged, worktreeRemoved, branchDeleted, emitStateRan, notes.
 `, withModel({ label: 'auto-merge', schema: MERGE_SCHEMA, phase: 'Wrap-up' }, MODEL.merge))
   if (mergeInfo?.merged) {
-    log(`Merged into ${prBase}. Worktree ${mergeInfo.worktreeRemoved ? 'removed' : 'NOT removed'}; branch ${mergeInfo.branchDeleted ? 'deleted' : 'kept'}.`)
+    log(`Merged into ${prBase}.${useWorktree ? ` Worktree ${mergeInfo.worktreeRemoved ? 'removed' : 'NOT removed'};` : ''} branch ${mergeInfo.branchDeleted ? 'deleted' : 'kept'}; emit-state ${mergeInfo.emitStateRan ? 'ran' : 'skipped'}.`)
   } else {
-    log(`Auto-merge did not complete: ${mergeInfo?.notes || 'unknown'}. Worktree left intact at ${worktreePath}.`)
+    log(`Auto-merge did not complete: ${mergeInfo?.notes || 'unknown'}. ${useWorktree ? `Worktree left intact at ${worktreePath}.` : `Branch ${branchName} left intact.`}`)
   }
 } else if (autoMerge) {
-  log(`--auto-merge skipped: ${bailed ? 'run bailed' : finalVerdict !== 'PASS' ? `verdict ${finalVerdict}` : 'no PR created'}. Worktree left intact for review.`)
+  log(`--auto-merge skipped: ${bailed ? 'run bailed' : finalVerdict !== 'PASS' ? `verdict ${finalVerdict}` : 'no PR created'}. ${useWorktree ? 'Worktree' : 'Branch'} left intact for review.`)
 }
 
 // ----------------------------------------------------------------
@@ -1418,6 +1558,7 @@ if (!noPr && !autoMerge) log('Next: run /close-out to verify coverage + patch do
 return {
   blockId,
   branch: branchName,
+  mode: useWorktree ? 'worktree' : 'branch',
   worktreePath,
   finalVerdict,
   bailed,

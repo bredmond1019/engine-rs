@@ -617,7 +617,7 @@ WORKTREE MODE (--worktree) — create or reuse an isolated worktree:
 ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if present:
     a. git worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
     b. git branch --list "${baseBranchName}"
-    - WT_EXISTS → REUSE verbatim. branchName="${baseBranchName}", wasCreated=false. Skip to STEP 3.
+    - WT_EXISTS → REUSE verbatim. branchName="${baseBranchName}", wasCreated=false. Skip to STEP 2c.
     - WT_MISSING but branch "${baseBranchName}" exists (orphan branch, dir removed) → re-attach (NO -b flag):
         mkdir -p trees
         git worktree add --no-checkout trees/${baseBranchName} ${baseBranchName}
@@ -626,7 +626,7 @@ ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if presen
         git -C trees/${baseBranchName} checkout
         if [ -f .env ]; then cp .env trees/${baseBranchName}/.env; fi
         if [ -f .env.local ]; then cp .env.local trees/${baseBranchName}/.env.local; fi
-      branchName="${baseBranchName}", wasCreated=false. Skip to STEP 3.
+      branchName="${baseBranchName}", wasCreated=false. Skip to STEP 2c.
     - Neither exists → fall through and create a fresh worktree as normal.
 ` : ''}  STEP 2 — Find a free worktree name. Start with candidate "${baseBranchName}"; for each candidate run:
       git worktree list | grep "trees/<candidate>"
@@ -645,6 +645,23 @@ ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if presen
     g. if [ -f .env.local ]; then cp .env.local trees/[branchName]/.env.local; fi
     h. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
     Set wasCreated=true.
+
+  STEP 2c — Fix the planning/ symlink for the worktree (run from the MAIN repo root, for ALL worktree
+    paths — fresh create, re-attach, or reuse). In brain-vaulted repos the MAIN repo's \`planning\` is
+    a RELATIVE symlink into a vault (e.g. planning -> ../_planning/<repo>) and is gitignored; from
+    inside trees/[branchName]/ that relative target breaks. Point the worktree's planning/ at the SAME
+    real vault via an ABSOLUTE symlink (gitignored, so never committed/merged) so reads+writes hit the
+    vault and no real planning/ dir is created to clobber the link on merge:
+      if [ -L planning ]; then
+        TARGET="$(python3 -c "import os; print(os.path.realpath('planning'))")"
+        rm -f trees/[branchName]/planning
+        ln -s "$TARGET" trees/[branchName]/planning
+        echo "PLANNING_SYMLINK_FIXED -> $TARGET"
+      else
+        echo "PLANNING_REAL_DIR (no symlink fix needed)"
+      fi
+    If \`planning\` is a real tracked directory (non-vaulted repo), the sparse-checkout already
+    populated it — do nothing.
 ` : `
 IN-PLACE MODE — no worktree. branchName=currentBranch, wasCreated=false. runDir=repoRoot.
 `}
