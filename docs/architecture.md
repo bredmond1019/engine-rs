@@ -169,6 +169,21 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   Per `planning/decisions/D4-claude-code-transport-choice.md`, this node owns none of the
   subprocess/argv/parse logic — that surface belongs entirely to `core/claude-code-rs`.
 
+  **Model attribution (as of the 2026-07-16 SDK fix, claude-code-rs D2).** The `claude` CLI has no
+  top-level `model` field; it reports a *map* of models (`modelUsage`), since one call can bill
+  several. `content` comes from the SDK's `text`, and `model` from
+  `Outcome::primary_model()` — an SDK-side heuristic (cost, then output tokens, then key order) that
+  returns `None` when no model ran. Because `engine_contract::Usage::model` is a required `String`
+  (the orchestrator data contract's shape, v1.0.1 §6), this node supplies the literal `"unknown"`
+  when the SDK reports none. That fallback lives here, at the seam, rather than loosening a contract
+  type that `bastion` also reads — see `docs/data-contract.md` §6 and D20.
+
+  In practice `"unknown"` is a defensive backstop on the default transport: `modelUsage` is empty
+  only on the CLI's error envelope, and `claude_code_rs::execute` now returns `Err(Error::Api)` for
+  that case, so the node fails before stamping usage. It remains reachable via a custom `Transport`,
+  and would become reachable by default if the CLI ever emitted a success envelope with no
+  `modelUsage`.
+
 ## Data Flow
 
 1. `bastion serve` receives a trigger via the actix-web HTTP surface (`POST /events/`, X-API-Key
