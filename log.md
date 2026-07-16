@@ -16,6 +16,22 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-16]
+
+Implemented EN.2.B — cancellation token, abort endpoint, and cost/token budget gate — across 7 tasks, PASS review. Task 1 added `CancellationToken` (backed by `tokio::sync::watch`, using `send_replace` rather than `send` to avoid a silent no-op/deadlock when `cancel()` races a subscriber, decision D6) and `stamp_cancelled` metadata merging; promoted tokio to a real `[dependencies]` entry in `engine-core`. Task 2 added `Budget`/`BudgetLedger` (`crates/engine-core/src/budget.rs`) as a pre-dispatch check gate accumulating tokens/cost, absent-config always-allow. Task 3 wired both into a new `Workflow::run_with(event, on_progress, RunOptions)` entry point that checks cancellation and budget at each node boundary before dispatch and stamps the halt reason into `TaskContext::metadata`, leaving `run()` unchanged for existing callers. Task 4 gave `ClaudeCodeStep` an optional token raced via `tokio::select!` against its transport future, so mid-flight cancel drops the future and returns `Ok(ctx)` unchanged rather than a `NodeError`. Task 5 added an authenticated `POST /events/{run_id}/abort` endpoint backed by a new per-run `RunRegistry`, covering 401/404/success plus a concurrency race test. Task 6 registered both surfaces in the canonical orchestrator data contract at v1.1.0 and re-pinned bastion's consumer doc from 1.0.0 straight to 1.1.0 (resolving prior drift), reconciling the "observers, never writers" prose with D25's write-side abort trigger — no engine-rs source changed. Task 7 confirmed all four gates (fmt, clippy `-D warnings`, test, release build) green on the branch. Notable decisions: `NodeRunStatus` stays `pending|running|success|failed` per the contract's minor-bump constraint — cancellation is spelled in `TaskContext::metadata`, not a new status variant; a budget cap is enforced reached-before-dispatch (>=, not strictly >). Next: EN.3.A — SDLC-flow setup + task loop port.
+
+```
+a769526 docs: update docs for EN.2.B-cancellation-abort-budget
+3997922 feat: implement EN.2.B-cancellation-abort-budget-task5
+68184cf feat: implement EN.2.B-cancellation-abort-budget-task4
+fceb544 feat: implement EN.2.B-cancellation-abort-budget-task3
+dcd876b feat: implement EN.2.B-cancellation-abort-budget-task2
+fefe24b fix: fix pass 1 for EN.2.B-cancellation-abort-budget-task1
+4c92dbe feat: implement EN.2.B-cancellation-abort-budget-task1
+```
+
+---
+
 ## [2026-07-16]
 
 ### Closed carryover `orchestrator-contract-conformance` Gap 1 — round_trip.rs now asserts against a real orchestrator-emitted fixture
