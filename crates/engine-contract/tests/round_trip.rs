@@ -1,25 +1,71 @@
 //! Byte-for-byte (semantic JSON) round-trip guard against the orchestrator data
 //! contract (`orchestrator/docs/data-contract.md` v1.0.1). Any drift here breaks
 //! `bastion` (engine-rs context.md governing principle 4).
+//!
+//! `FIXTURE` is a **captured, code-path-produced** `task_context` — the output of a
+//! real `ResearchAgentWorkflow` run in the orchestrator repo
+//! (`orchestrator/scripts/emit_task_context_fixture.py`), not hand-authored here. See
+//! `tests/fixtures/README.md` for full provenance and the `python_task_context.json`
+//! it replaced (a fixture this crate had written about itself during EN.0.B — see
+//! `orchestrator/planning/task-context-fixture/notes.md` for the finding).
 
-use engine_contract::EventsRow;
+use engine_contract::{EventsRow, TaskContext};
 
-const FIXTURE: &str = include_str!("../../../tests/fixtures/python_task_context.json");
+const FIXTURE: &str = include_str!("../../../tests/fixtures/research_agent_task_context.json");
 
-/// (a) Deserialize the captured Python-shaped fixture into the Rust types and
+/// (a) Deserialize the captured orchestrator-shaped fixture into `TaskContext` and
 /// re-serialize; assert semantic JSON equality (parse both sides to
 /// `serde_json::Value`, field order doesn't matter) with no field/casing/type drift.
+///
+/// This asserts against `TaskContext` (contract §5), not `EventsRow` (contract §4):
+/// the orchestrator emits and owns a `task_context` value, not a full `events` row —
+/// the surrounding row fields (`id`, `created_at`, ...) are engine-rs/Postgres's own
+/// concern and are exercised separately by `rust_constructed_events_row_matches_contract_shape`.
 #[test]
 fn fixture_round_trips_with_no_field_or_casing_drift() {
     let original: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture is valid JSON");
 
-    let row: EventsRow =
-        serde_json::from_str(FIXTURE).expect("fixture deserializes into EventsRow");
-    let re_serialized = serde_json::to_value(&row).expect("EventsRow serializes back to JSON");
+    let task_context: TaskContext =
+        serde_json::from_str(FIXTURE).expect("fixture deserializes into TaskContext");
+    let re_serialized =
+        serde_json::to_value(&task_context).expect("TaskContext serializes back to JSON");
 
     assert_eq!(
         re_serialized, original,
-        "re-serialized EventsRow must be semantically identical to the captured fixture"
+        "re-serialized TaskContext must be semantically identical to the captured fixture"
+    );
+}
+
+/// Divergence guard for the "owner-local + checked-in copy" fixture-sharing pattern
+/// (see `tests/fixtures/README.md`): if a sibling `orchestrator` checkout is present
+/// (both repos cloned under the same parent, the common layout), assert this crate's
+/// copy of the fixture is byte-identical to the orchestrator-owned original. Skips
+/// silently when the sibling isn't present — this crate must stay standalone-clonable.
+#[test]
+fn fixture_matches_orchestrator_owned_original_when_sibling_checkout_present() {
+    let sibling = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../orchestrator/tests/fixtures/task_context/research_agent_task_context.json");
+
+    let Ok(canonical) = sibling.canonicalize() else {
+        eprintln!(
+            "skipping: no sibling orchestrator checkout at {}",
+            sibling.display()
+        );
+        return;
+    };
+
+    let owned = std::fs::read_to_string(&canonical)
+        .expect("sibling orchestrator fixture exists but could not be read");
+    let owned_value: serde_json::Value =
+        serde_json::from_str(&owned).expect("orchestrator fixture is valid JSON");
+    let copy_value: serde_json::Value =
+        serde_json::from_str(FIXTURE).expect("checked-in copy is valid JSON");
+
+    assert_eq!(
+        copy_value, owned_value,
+        "engine-rs's checked-in fixture copy has diverged from the orchestrator-owned \
+         original at {} — re-copy it and re-run `cargo test`",
+        canonical.display()
     );
 }
 

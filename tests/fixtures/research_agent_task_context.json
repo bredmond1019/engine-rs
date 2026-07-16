@@ -1,0 +1,42 @@
+{
+  "event": {
+    "artifact_id": "00000000-0000-0000-0000-000000000000",
+    "company_name": "Initech",
+    "timestamp": "2026-07-16T00:00:00Z"
+  },
+  "metadata": {},
+  "node_runs": {
+    "CompanyResearchNode": {
+      "completed_at": "2026-07-16T00:00:00Z",
+      "error": null,
+      "input": [
+        {
+          "content": "Please research the following company and produce a brief: Initech\n\nSystem context:\nmocked prompt",
+          "role": "user"
+        }
+      ],
+      "started_at": "2026-07-16T00:00:00Z",
+      "status": "success",
+      "usage": {
+        "input_tokens": 15,
+        "model": "claude-haiku-4-5-20251001",
+        "output_tokens": 25
+      }
+    }
+  },
+  "nodes": {
+    "CompanyResearchNode": {
+      "brief": {
+        "automation_hypothesis": "Automating the weekly status report aggregation via API integration could recover 6+ hours per PM per week",
+        "company_name": "Initech",
+        "likely_time_sinks": [
+          "Manual weekly status report compilation",
+          "Client onboarding spreadsheet handoff",
+          "Ad-hoc invoice reconciliation"
+        ],
+        "what_they_do": "Mid-market B2B SaaS for project management"
+      },
+      "output": ""
+    }
+  }
+}
