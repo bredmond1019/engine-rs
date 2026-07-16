@@ -4,6 +4,7 @@
 //! land in EN.1.A task 2. The `Workflow` pointer-walk runner + `on_progress`
 //! seam land in EN.1.A task 3 — see `docs/architecture.md` for the module map.
 
+pub mod budget;
 pub mod cancellation;
 pub mod node;
 pub mod nodes;
@@ -13,6 +14,7 @@ pub mod schema;
 pub mod validate;
 pub mod workflow;
 
+pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
 pub use node::{Node, NodeError, NodeRegistry};
 pub use nodes::ClaudeCodeStep;
