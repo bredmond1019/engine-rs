@@ -15,6 +15,7 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRun, NodeRunStatus, TaskContext, Usage};
 use futures::future::BoxFuture;
 
+use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
 
 /// Stand-in for `Usage::model` when the SDK reports no model.
@@ -66,6 +67,7 @@ pub struct ClaudeCodeStep {
     config: Config,
     prompt: PromptSource,
     transport: Transport,
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl fmt::Debug for ClaudeCodeStep {
@@ -96,6 +98,7 @@ impl ClaudeCodeStep {
             config,
             prompt: PromptSource::Fixed(prompt.into()),
             transport: Arc::new(default_transport),
+            cancellation_token: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl ClaudeCodeStep {
             config,
             prompt: PromptSource::Builder(Arc::new(builder)),
             transport: Arc::new(default_transport),
+            cancellation_token: None,
         }
     }
 
@@ -128,6 +132,25 @@ impl ClaudeCodeStep {
         self.transport = Arc::new(transport);
         self
     }
+
+    /// Attach a `CancellationToken` (EN.2.B task 1) that is raced against the
+    /// awaited transport future in `process` (task 4). Absent a token,
+    /// `process` behaves exactly as before — the transport future is simply
+    /// awaited to completion.
+    ///
+    /// A cancel win drops the in-flight transport future (per D4 the SDK owns
+    /// kill-on-drop — this is not subprocess signalling) and returns `Ok(ctx)`
+    /// with the context untouched. `process` never stamps its own `NodeRun`
+    /// (that envelope is framework-owned, see `crate::node::Node`), so this
+    /// deliberately does *not* return a `NodeError` for a cancel: task 3's
+    /// `Workflow::run_with` re-checks the token at the very next node
+    /// boundary and stamps the run cancelled there — an `Err` here would
+    /// instead be read as FAILED by `workflow::node_context`.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -138,9 +161,28 @@ impl Node for ClaudeCodeStep {
             PromptSource::Builder(builder) => builder(&ctx),
         };
 
-        let outcome = (self.transport)(self.config.clone(), prompt)
-            .await
-            .map_err(|err| NodeError::new(err.to_string()))?;
+        let transport_fut = (self.transport)(self.config.clone(), prompt);
+
+        let outcome = match &self.cancellation_token {
+            Some(token) => {
+                tokio::select! {
+                    // A cancel win drops `transport_fut` (tokio::select!
+                    // drops the losing branch's future) rather than awaiting
+                    // it to completion. Returning `Ok(ctx)` unchanged here —
+                    // not `Err` — is deliberate: see
+                    // `with_cancellation_token`'s doc comment.
+                    _ = token.cancelled() => {
+                        return Ok(ctx);
+                    }
+                    result = transport_fut => {
+                        result.map_err(|err| NodeError::new(err.to_string()))?
+                    }
+                }
+            }
+            None => transport_fut
+                .await
+                .map_err(|err| NodeError::new(err.to_string()))?,
+        };
 
         // `primary_model` is a heuristic over the SDK's `modelUsage` map and is
         // `None` when no model ran. `engine_contract::Usage::model` is a required
