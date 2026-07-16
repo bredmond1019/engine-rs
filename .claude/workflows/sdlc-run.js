@@ -215,6 +215,7 @@ const WRAPUP_SCHEMA = {
     commitMessage:      { type: 'string' },
     commitHash:         { type: 'string' },
     amendments:         { type: 'array', items: { type: 'string' }, description: 'D18: the dated amendment-log lines appended to the spec for genuine deviations this run (empty array if none).' },
+    blockStatusFlipped: { type: 'string', description: 'The state.json tracks[].blocks[].id flipped to "closed" this run, or "" if none flipped (spec not fully done, no state.json, or block not found).' },
     notes:              { type: 'string' }
   }
 }
@@ -1724,6 +1725,26 @@ PART A — Update status.md + log (code/doc changes are already committed by the
         - Update "Current focus" to the next spec or phase.`}
    - Update "Last updated" — run: date +%Y-%m-%d
 
+5b. Flip the block's AUTHORED status in planning/state.json (skip this entire step silently if the
+    repo has no planning/state.json). state.json is the authoritative block graph — leaving it stale
+    poisons every derived surface, because \`mev emit-state\` reads this field and NEVER infers
+    completion from status.md (the sync is one-way by design).
+    ${taskNumber !== null
+      ? `- Only proceed if you flipped the spec's status.md status to "Done" above (i.e. this was the last task). If tasks remain, leave state.json untouched and set blockStatusFlipped to "".`
+      : `- The full spec is done, so proceed.`}
+    - Resolve the block's canonical ID from the status.md Progress Table row you just edited (the
+      <BlockID> column, or the id that row maps to in state.json). Find that block in state.json
+      tracks[].blocks[] — search EVERY track. If found, set its "status" to "closed" (the only
+      authored close value). If NOT found, report it in notes and do NOT fabricate a block entry.
+    - Validate the file is still valid JSON:
+        python3 -c "import json;json.load(open('planning/state.json'))"
+    - Then regenerate the derived surfaces from the authored graph. This run is ON MAIN (not a linked
+      worktree), so emit-state is safe here:
+        mev emit-state --write
+      If \`mev\` or brain.toml is absent (a standalone repo), skip this command silently — the
+      state.json flip still stands. Do NOT hand-reimplement focus/rollup/wave-table derivation.
+    - Set blockStatusFlipped to the block id you closed (or "" if none).
+
 6. Append a new entry to log.md (prepend at the TOP, newest entries first):
 
    ## [YYYY-MM-DD — run date +%Y-%m-%d to get this]
@@ -1793,6 +1814,7 @@ PART C — Commit the remaining planning files as a single chore commit.
 
   Stage them:
     git add planning/status.md log.md ${workflowReport}
+    git add planning/state.json 2>/dev/null || true
     git add ${stateFile} 2>/dev/null || true
     git add ${specFile} 2>/dev/null || true
     git add ${testReport} 2>/dev/null || true
@@ -1821,6 +1843,7 @@ Return your result using the StructuredOutput tool:
   commitMessage: "chore: wrap up ${stem}"
   commitHash: the 7-character short hash from git log --oneline -1
   amendments: the dated amendment-log lines you appended to the spec in PART A.5 (empty array if none)
+  blockStatusFlipped: the state.json block id you flipped to "closed" in PART A step 5b (or "" if none)
   notes: any follow-up items (settled decisions to add to planning/decisions/, NEEDS_REVIEW doc flags)
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
@@ -1828,6 +1851,7 @@ if (wrapupResult) {
   stageResults.push({ stage: 'wrap-up', ...wrapupResult, success: wrapupResult.statusUpdated && wrapupResult.devlogUpdated })
   if (wrapupResult.notes) log(`Decisions to log: ${wrapupResult.notes}`)
   if (wrapupResult.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended to ${specFile}`)
+  if (wrapupResult.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed; derived surfaces regenerated (mev emit-state --write).`)
   log(`Committed: ${wrapupResult.commitMessage}`)
   log(`Workflow report: ${wrapupResult.workflowReportFile}`)
 } else {

@@ -251,6 +251,7 @@ const WRAPUP_SCHEMA = {
     nextFocus:     { type: 'string' },
     amendments:    { type: 'array', items: { type: 'string' }, description: 'D18 dated amendment-log lines appended to the spec (empty if none)' },
     commitHash:    { type: 'string' },
+    blockStatusFlipped: { type: 'string', description: 'The state.json tracks[].blocks[].id flipped to "closed" on the branch this run, or "" if none (spec not fully done, no state.json, or block not found).' },
     notes:         { type: 'string' }
   }
 }
@@ -1240,6 +1241,27 @@ Target:
      : `- ${selectedTasks ? `Tasks ${taskList.join(', ')} of "${blockId}" are done.` : `Full spec "${blockId}" is done.`} ${selectedTasks ? 'If tasks remain, keep status "In progress" and point Current focus at the next task; if this was the last, flip to "Done".' : 'Flip its Status to "Done".'} Update "Current focus" accordingly.`}
    - Update "Last updated" — run: date +%Y-%m-%d
 
+2b. Flip the block's AUTHORED status in planning/state.json (skip this entire step silently if the
+    repo has no planning/state.json). state.json is the authoritative block graph — leaving it stale
+    poisons every derived surface, because \`mev emit-state\` reads this field and NEVER infers
+    completion from status.md.
+    ${bailed
+      ? `- This run BAILED — do NOT flip anything. Set blockStatusFlipped to "".`
+      : selectedTasks
+        ? `- Only proceed if you flipped the spec's status.md status to "Done" above (this was the last task). If tasks remain, leave state.json untouched and set blockStatusFlipped to "".`
+        : `- The full spec is done, so proceed.`}
+    - Resolve the block's canonical ID from the status.md Progress Table row you just edited (the
+      <BlockID> column, or the id that row maps to in state.json). Find that block in state.json
+      tracks[].blocks[] — search EVERY track. If found, set its "status" to "closed" (the only
+      authored close value). If NOT found, report it in notes and do NOT fabricate a block entry.
+    - Validate the file is still valid JSON:
+        cd ${worktreePath} && python3 -c "import json;json.load(open('planning/state.json'))"
+    - Do NOT run \`mev emit-state --write\` here: this is a linked git worktree, where emit-state
+      refuses to run. The authored flip is committed on the branch below (step 5); the derived
+      surfaces regenerate on MAIN when the branch merges (/clean-worktree or /merge-train run
+      emit-state after the fast-forward).
+    - Set blockStatusFlipped to the block id you closed (or "" if none).
+
 3. Prepend a new log.md entry (newest first):
    ## [run: date +%Y-%m-%d]
    [One paragraph: what was implemented across tasks ${taskList.join(', ')}, the ${finalVerdict} verdict${bailed ? ` and why it bailed (${bailReason})` : ''}, notable decisions. End with "Next: ...".]
@@ -1256,6 +1278,7 @@ Target:
 
 5. Commit on the branch (stage explicitly — never git add -A):
    cd ${worktreePath} && git add planning/status.md log.md
+   cd ${worktreePath} && git add planning/state.json 2>/dev/null || true
    cd ${worktreePath} && git add ${specFile} 2>/dev/null || true
    cd ${worktreePath} && git commit -m "$(cat <<'EOF'
 chore: wrap up ${stem}
@@ -1263,10 +1286,12 @@ EOF
 )"
    cd ${worktreePath} && git log --oneline -1
 
-Return via StructuredOutput: statusUpdated, devlogUpdated, nextFocus, amendments[], commitHash, notes.
+Return via StructuredOutput: statusUpdated, devlogUpdated, nextFocus, amendments[], commitHash,
+blockStatusFlipped (the state.json block id closed in step 2b, or ""), notes.
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
 if (wrapupResult?.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended.`)
+if (wrapupResult?.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch; derived surfaces regenerate on merge (/clean-worktree or /merge-train).`)
 
 // Final state write (status reflects the terminal state; PR fields filled after creation).
 state.status = bailed ? 'blocked' : 'done'

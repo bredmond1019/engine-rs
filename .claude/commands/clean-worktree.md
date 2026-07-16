@@ -144,6 +144,21 @@ The literal single-token form is output by `/sdlc-task` when it creates a suffix
    **If log file not found:** report "No task log found — STATUS/Log not updated.
    If this task was run with /sdlc-task, check that the pipeline completed its wrap-up stage."
 
+6.6. **Regenerate derived surfaces (`mev emit-state --write`):**
+
+   The merged branch may carry an authored `planning/state.json` block-status flip to `"closed"`
+   (written by `/sdlc-flow`'s or `/sdlc-task`'s in-worktree wrap-up, which could not run `emit-state`
+   inside the linked worktree). Now that it has landed on `main`, regenerate every derived surface
+   from the authored graph — this is the one-way derivation (`focus`, rollups, cache `synced_from`
+   watermarks, tier tables, the HQ Operating Board, `master-plan.md` wave tables):
+   ```bash
+   mev emit-state --write
+   ```
+   Run it from the main working tree (never a linked worktree — `emit-state` refuses there). If `mev`
+   or `brain.toml` is absent (a standalone repo), skip this step silently — the authored flip already
+   merged and still stands. Do NOT hand-reimplement any derived surface. If it reports a
+   `W_EMIT_NO_SENTINEL` warning, surface it rather than hand-authoring the missing sentinel.
+
 7. **Remove the worktree and delete the branch:**
    ```bash
    git worktree remove <worktreePath> --force

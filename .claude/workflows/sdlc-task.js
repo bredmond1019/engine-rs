@@ -5,9 +5,13 @@
 // The cheap rung of the pipeline ladder, for one small unit of behaviour-changing
 // work (a /ticket or /chore). Runs a spec's task(s) through a tight per-task loop —
 //   implement → fast gating-test → triage → fix (≤3 attempts, Opus on the last)
-//   → commit
-// and nothing else. No scout, no separate review, no document stage, no ui-test,
-// no wrap-up agent, no PR. When you need a consolidated review + docs + a PR, use
+//   → commit → lean bookkeep close-out
+// and nothing else. No scout, no separate review, no document stage, no ui-test, no
+// PR. The bookkeep close-out is deliberately lean: on a passing full run it flips the
+// authored status markers (tasks.md task status, the status.md Progress row, the
+// state.json block status) and — in place, on main — runs `mev emit-state --write`; it
+// does NOT write a log.md narrative, a D18 amendment log, or run review/docs/PR. Run
+// /log-work for the narrative. When you need a consolidated review + docs + a PR, use
 // /sdlc-flow; for a whole spec in place, /sdlc-run; for a roadmap, /sdlc-block.
 //
 // ISOLATION
@@ -25,7 +29,7 @@
 //
 // PIPELINE
 //   setup (locate repo / create worktree) → enumerate (D16 lint) → [resume load]
-//     → per-task loop → final state commit
+//     → per-task loop → lean bookkeep close-out (on pass) → final state commit
 //
 //   Per-task loop (sequential):
 //     implement → fast-test → (triage → fix/bail) ×≤3 → one state write per task
@@ -43,9 +47,10 @@
 //   feat: implement <stem>         implement agent (per task)
 //   fix:  fix pass P for <stem>    fix agent (per pass)
 //   chore: sdlc-task state — <…>   state-writer (committed writes)
+//   chore: sdlc-task bookkeep — <…>  bookkeep close-out (on a passing run)
 //
 // MODEL TIERING (the token lever — see the MODEL map below)
-//   haiku : setup, enumerate, state-load, test, state-writer
+//   haiku : setup, enumerate, state-load, test, state-writer, bookkeep
 //   sonnet: implement, fix, triage
 //   opus  : ESCALATION on the FINAL per-task fix pass
 //
@@ -222,6 +227,19 @@ const STATE_WRITE_SCHEMA = {
   }
 }
 
+const BOOKKEEP_SCHEMA = {
+  type: 'object',
+  required: ['statusUpdated'],
+  properties: {
+    statusUpdated:      { type: 'boolean', description: 'true if planning/status.md was updated' },
+    tasksMarked:        { type: 'boolean', description: 'true if tasks.md task markers were updated' },
+    blockStatusFlipped: { type: 'string', description: 'the state.json tracks[].blocks[].id flipped to "closed", or "" if none (partial run, no state.json, or block not found)' },
+    emitStateRan:       { type: 'boolean', description: 'true if mev emit-state --write ran successfully (false when skipped: worktree mode or mev/brain.toml absent)' },
+    commitHash:         { type: 'string' },
+    notes:              { type: 'string' }
+  }
+}
+
 // ----------------------------------------------------------------
 // MODEL TIERING — the primary token lever for this pipeline.
 //
@@ -237,6 +255,7 @@ const MODEL = {
   test:        'haiku',    // runs the project's validation suite, reads exit codes
   triage:      'sonnet',   // classifies a failure RETRYABLE vs MAJOR — light judgment
   stateWriter: 'haiku',    // stamps timestamps, writes state.json, commits when asked
+  bookkeep:    'haiku',    // lean close-out: mark tasks.md done, flip status.md + state.json block status, emit-state — a fixed procedure (mirrors /start-block)
 }
 
 // Final per-task fix pass before the loop gives up runs on a stronger model. The common path
@@ -954,6 +973,76 @@ Return via StructuredOutput:
 const passedTasks = taskList.filter(n => state.tasks[String(n)]?.status === 'passed' || passedFromState.has(n))
 state.status = bailed ? 'blocked' : 'done'
 
+// ----------------------------------------------------------------
+// LEAN BOOKKEEP CLOSE-OUT — the one bit of authored state the lean engine still owes.
+// Not a full wrap-up: no prose log.md entry, no D18 amendment log, no review/docs/PR (run /log-work
+// for the narrative). It only flips the AUTHORED markers a passing run leaves stale — tasks.md task
+// status, the status.md Progress row, and the state.json block status — then (in place, on main only)
+// regenerates the derived surfaces via `mev emit-state --write`. Mirrors /start-block's flip pattern.
+// Skipped entirely on a bail (the block is not done) and on a partial task selection (can't close the block).
+// ----------------------------------------------------------------
+const fullRun = !selectedTasks   // no explicit selection = every task in the spec ran
+const blockDone = !bailed && fullRun && passedTasks.length === taskList.length
+let bookkeepResult = null
+if (!bailed) {
+  bookkeepResult = await tracedAgent(`${W}
+You are the lean bookkeeping close-out for an /sdlc-task run. Flip ONLY the authored status markers a
+passing run leaves stale, then commit. Do NOT write a log.md narrative entry, a D18 amendment log, or
+any prose — that is /log-work's job. All Bash from the run root.
+
+Target:
+  Spec:        ${blockId}
+  Tasks run:   ${taskList.join(', ')}  (passed: ${passedTasks.join(', ') || 'none'})
+  Full spec run: ${fullRun ? 'yes (every task in the spec)' : 'no (a task subset — do NOT close the block)'}
+  Block done:  ${blockDone ? 'yes — the whole spec is complete this run' : 'no — keep the block open/in-progress'}
+
+1. Read the surfaces:
+   cd ${runDir} && cat ${specFile}
+   cd ${runDir} && cat planning/status.md
+   cd ${runDir} && cat ${stateFile}
+
+2. Mark the passed tasks (${passedTasks.join(', ') || 'none'}) done in ${specFile} (Edit tool): add the
+   engine's task-done marker to each passed task's line if the spec uses one (e.g. a leading "[done]"),
+   mirroring how completed tasks are already marked in that file. If the spec has no such marker
+   convention, leave it and set tasksMarked=false.
+
+3. Update planning/status.md (Edit tool, surgical):
+   ${blockDone
+     ? `- The full spec "${blockId}" is done — flip its Status to "Done" in the Progress Table and update "Current focus".`
+     : `- Keep the spec "In progress" (a task subset ran). Point "Current focus" at the next task if helpful.`}
+   - Update "Last updated" — run: date +%Y-%m-%d
+
+4. Flip the block's AUTHORED status in planning/state.json (skip this entire step silently if the repo
+   has no planning/state.json, OR if "Block done" above is "no"). state.json is the authoritative block
+   graph — leaving it stale poisons every derived surface, because \`mev emit-state\` reads this field
+   and NEVER infers completion from status.md.
+   - Resolve the block's canonical ID from the status.md Progress Table row (the <BlockID> column, or
+     the id that row maps to in state.json). Find that block in state.json tracks[].blocks[] — search
+     EVERY track. If found, set its "status" to "closed". If NOT found, report it in notes and do NOT
+     fabricate a block entry. Set blockStatusFlipped to the id you closed (or "").
+   - Validate: cd ${runDir} && python3 -c "import json;json.load(open('planning/state.json'))"
+   ${useWorktree
+     ? `- Do NOT run \`mev emit-state --write\`: this is a linked git worktree, where emit-state refuses to run. The derived surfaces regenerate on MAIN when the branch merges (/clean-worktree or /merge-train). Set emitStateRan=false.`
+     : `- Then regenerate derived surfaces (this run is IN PLACE on main, so emit-state is safe): cd ${runDir} && mev emit-state --write . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation.`}
+
+5. Commit your edits (stage explicitly — never git add -A):
+   cd ${runDir} && git add ${specFile} planning/status.md
+   cd ${runDir} && git add planning/state.json 2>/dev/null || true
+   cd ${runDir} && git commit -m "$(cat <<'EOF'
+chore: sdlc-task bookkeep — ${blockId}
+EOF
+)" || echo "NOTHING_TO_COMMIT"
+   cd ${runDir} && git log --oneline -1
+
+Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emitStateRan, commitHash, notes.
+`, withModel({ label: 'bookkeep', schema: BOOKKEEP_SCHEMA }, MODEL.bookkeep))
+  if (bookkeepResult?.blockStatusFlipped) {
+    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed${bookkeepResult.emitStateRan ? '; derived surfaces regenerated (mev emit-state --write).' : useWorktree ? '; derived surfaces regenerate on merge (/clean-worktree or /merge-train).' : '.'}`)
+  } else if (blockDone) {
+    log(`Bookkeep: no state.json block flipped (${bookkeepResult?.notes || 'no state.json, or block not found'}).`)
+  }
+}
+
 // In-place mode wrote state uncommitted per task — sweep it into ONE final commit now. Worktree mode
 // already committed each write, so a final commit is a cheap no-op (NOTHING_TO_COMMIT).
 await writeTaskState(`run ${state.status} (${passedTasks.length}/${taskList.length})`, { cwd: runDir, commit: true })
@@ -969,6 +1058,8 @@ if (useWorktree) {
 }
 if (bailed) {
   log(`Pick up: read ${stateFile} for per-task state, fix the blocker, then re-run with --resume.`)
+} else {
+  log(`Run /log-work to record the narrative log.md entry (the lean bookkeep flipped status only — no prose was written).`)
 }
 
 return {

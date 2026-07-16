@@ -169,6 +169,22 @@ gh pr merge <pr.number> --merge --delete-branch
   git pull --ff-only origin <base_branch>
   ```
 
+### Step 4.5 — Regenerate derived surfaces (`mev emit-state --write`)
+
+Each merged block PR may carry an authored `planning/state.json` block-status flip to `"closed"`
+(written by the child `/sdlc-flow`'s in-worktree wrap-up, which could not run `emit-state` inside the
+linked worktree). Now that the train has landed on `<base_branch>`, regenerate every derived surface
+from the authored graph in one pass — the one-way derivation (`focus`, rollups, cache `synced_from`
+watermarks, tier tables, the HQ Operating Board, `master-plan.md` wave tables):
+```bash
+mev emit-state --write
+```
+Run once, after all merges, from the base branch (never a linked worktree — `emit-state` refuses
+there). Skip this step silently if `mev` or `brain.toml` is absent (a standalone repo) — the authored
+flips already merged and still stand. Do NOT hand-reimplement any derived surface. Surface any
+`W_EMIT_NO_SENTINEL` warning rather than hand-authoring the missing sentinel. If nothing merged this
+run (all blocks already merged), skip it.
+
 ### Step 5 — Final report
 
 ```bash
