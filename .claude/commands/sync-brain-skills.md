@@ -39,6 +39,7 @@ generic session/planning skills — not any brain-specific command.
      --include="wrap-up/***"\
      --include="backlog-ticket/***"\
      --include="generate-master-plan/***"\
+     --include="next/***"\
      --exclude="*" \
      base-template/.agents/skills/ <tier>/.agents/skills/
    ```

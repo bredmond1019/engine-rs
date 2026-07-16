@@ -28,7 +28,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 
   archive.md        capture.md       commit.md        handoff.md
   log-work.md       prime.md         session-recap.md status.md
-  wrap-up.md        update-state.md
+  wrap-up.md        update-state.md  next.md
 
   breakdown.md      chore.md         generate-master-plan.md  generate-tasks.md
   plan.md           ticket.md
@@ -50,7 +50,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 
 | Group | Commands |
 |---|---|
-| Session | `/prime`, `/session-recap`, `/status`, `/handoff`, `/wrap-up`, `/log-work`, `/archive`, `/capture` |
+| Session | `/prime`, `/session-recap`, `/status`, `/next`, `/handoff`, `/wrap-up`, `/log-work`, `/archive`, `/capture` |
 | State | `/update-state` — how to safely edit `planning/state.json` per `state-schema.md` |
 | Planning | `/generate-master-plan`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` |
 | SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-workflow`, `/review-PR`, `/close-out` |
@@ -88,6 +88,7 @@ predictably-named output file.
 | Session Start | `/session-recap` | Briefing: recent Log entries, where you left off, next step | chat only |
 | Session Start | `/status` | Check current focus and what's in progress | chat only |
 | Session Start | `/process-tasks` | Check which specs are eligible to start | chat only |
+| Session Start | `/next` | Briefing on what's up next, blocked, and recommend next action based on goals | chat only |
 | Session End | `/wrap-up [note]` | Log work + commit; clean close without a handoff file | status.md, log.md, git |
 | Session End | `/handoff [note]` | Write handoff + log work + commit; hands off to a fresh session | `planning/handoff.md`, status.md, log.md, git |
 | Session End | `/close-out [--skip-coverage] [--no-review] [--review-level <level>] [--clean-worktree] [note]` | Verify coverage → review code → patch docs → clean worktree (opt.) → hand off; the quality-close pipeline | status.md, log.md, docs/, git |
@@ -315,6 +316,9 @@ user-confirmed emit. Embedded in every pipeline command.
 ### `/status`
 Reads only `planning/status.md` and reports the Current focus line, what's In progress, and
 what's Next. Read-only.
+
+### `/next`
+Show what's up next, what's blocked and by what, and recommend the next action based on local status and HQ/business/core goals. Read-only.
 
 ### `/process-tasks`
 Reads `status.md`, applies sequential eligibility rules (a spec is ready only if all specs above
