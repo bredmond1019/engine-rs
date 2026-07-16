@@ -22,4 +22,4 @@ pub use parallel::ParallelNode;
 pub use routing::{dispatch_route, Router};
 pub use schema::{NodeConfig, WorkflowSchema};
 pub use validate::{ValidationError, WorkflowValidator};
-pub use workflow::{OnProgress, Workflow, WorkflowError};
+pub use workflow::{OnProgress, RunOptions, Workflow, WorkflowError, BUDGET_METADATA_KEY};

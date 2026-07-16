@@ -13,9 +13,47 @@ use std::collections::HashMap;
 use chrono::Utc;
 use engine_contract::{NodeRun, NodeRunStatus, TaskContext};
 
+use crate::budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
+use crate::cancellation::{stamp_cancelled, CancellationToken};
 use crate::node::NodeRegistry;
 use crate::schema::WorkflowSchema;
 use crate::validate::{ValidationError, WorkflowValidator};
+
+/// The `TaskContext::metadata` key under which a budget-halted run's reason
+/// is recorded — see [`stamp_budget_halt`]. Sibling to
+/// `cancellation::CANCELLATION_METADATA_KEY`.
+pub const BUDGET_METADATA_KEY: &str = "budget";
+
+/// Optional cancellation/budget wiring for [`Workflow::run_with`]. Every
+/// field defaults to `None`, matching [`Workflow::run`]'s behavior exactly —
+/// no token means no cancellation check, no budget means no gate.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Checked at each node boundary before dispatching the next node. On
+    /// cancellation the walk stops, the cancelled marker is stamped into
+    /// `ctx.metadata` (D6), a final `on_progress` snapshot is emitted, and
+    /// `run_with` returns `Ok(ctx)` — not an `Err` — so a cancelled run is
+    /// distinguishable from a failed one.
+    pub cancellation_token: Option<CancellationToken>,
+    /// Consulted before dispatching each node via `BudgetLedger::check`. On
+    /// halt the walk stops, the reason is stamped into `ctx.metadata`, and a
+    /// final `on_progress` snapshot is emitted. `None` means no gate at all
+    /// (existing `run` callers keep their unmodified behavior).
+    pub budget: Option<Budget>,
+}
+
+/// Stamps `metadata` with the budget-halt marker:
+/// `{ "budget": { "halted": true, "reason": { "cap": ..., "spent": ...,
+/// "limit": ... } } }`. Mirrors `cancellation::stamp_cancelled`'s shape.
+fn stamp_budget_halt(metadata: &mut serde_json::Value, reason: BudgetHaltReason) {
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+    metadata[BUDGET_METADATA_KEY] = serde_json::json!({
+        "halted": true,
+        "reason": reason.to_json(),
+    });
+}
 
 /// The injected persistence seam, invoked with a snapshot of the `TaskContext`
 /// at each node boundary (initial seed, and after every node transition).
@@ -88,7 +126,28 @@ impl Workflow {
     pub async fn run(
         &self,
         event: serde_json::Value,
+        on_progress: OnProgress<'_>,
+    ) -> Result<TaskContext, WorkflowError> {
+        self.run_with(event, on_progress, RunOptions::default())
+            .await
+    }
+
+    /// Like [`Workflow::run`], but with optional cancellation and budget-gate
+    /// wiring (EN.2.B task 3). `RunOptions::default()` (both fields `None`)
+    /// behaves exactly like `run` — no token means no cancellation check, no
+    /// budget means no gate, no metadata change, no behavior change.
+    ///
+    /// Both checks happen at the node boundary, before dispatching the next
+    /// node: cancellation is checked first, then the budget gate. On either
+    /// halt the walk stops, the reason is stamped into `ctx.metadata`, a
+    /// final `on_progress` snapshot is emitted, and this returns `Ok(ctx)` —
+    /// nodes not yet reached stay `Pending`. After each node completes
+    /// successfully, its `NodeRun.usage` is folded into the budget ledger.
+    pub async fn run_with(
+        &self,
+        event: serde_json::Value,
         mut on_progress: OnProgress<'_>,
+        options: RunOptions,
     ) -> Result<TaskContext, WorkflowError> {
         let mut ctx = TaskContext {
             event,
@@ -114,8 +173,23 @@ impl Workflow {
         on_progress(&ctx);
 
         let mut current = Some(self.schema.start_node.clone());
+        let mut ledger = BudgetLedger::new();
 
         while let Some(identity) = current {
+            if let Some(token) = &options.cancellation_token {
+                if token.is_cancelled() {
+                    stamp_cancelled(&mut ctx.metadata);
+                    on_progress(&ctx);
+                    return Ok(ctx);
+                }
+            }
+
+            if let BudgetDecision::Halt(reason) = ledger.check(options.budget.as_ref()) {
+                stamp_budget_halt(&mut ctx.metadata, reason);
+                on_progress(&ctx);
+                return Ok(ctx);
+            }
+
             let node = self.registry.get(&identity).ok_or_else(|| {
                 WorkflowError::new(format!("no node registered for identity '{identity}'"))
             })?;
@@ -134,6 +208,10 @@ impl Workflow {
 
             if failed {
                 break;
+            }
+
+            if let Some(run) = ctx.node_runs.get(&identity) {
+                ledger.record(run.usage.as_ref(), None);
             }
 
             current = match router_next {
