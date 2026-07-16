@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use claude_code_rs::parse::{ContentBlock, Usage as SdkUsage};
+use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::{ClaudeCodeStep, Node, NodeConfig, NodeRegistry, Workflow, WorkflowSchema};
@@ -28,10 +28,23 @@ fn stub_outcome() -> Outcome {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         },
-        model: "claude-sonnet-4-5".to_string(),
-        content: vec![ContentBlock::Text {
-            text: "ok".to_string(),
-        }],
+        // The CLI names the model only as a `modelUsage` key — there is no
+        // top-level `model` field to stub.
+        model_usage: [(
+            "claude-sonnet-4-5".to_string(),
+            SdkModelUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: 0.02,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        text: "ok".to_string(),
+        is_error: false,
+        api_error_status: None,
     }
 }
 

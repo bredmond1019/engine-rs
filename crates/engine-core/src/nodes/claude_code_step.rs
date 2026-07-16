@@ -11,11 +11,20 @@
 use std::fmt;
 use std::sync::Arc;
 
-use claude_code_rs::{parse::ContentBlock, Config, Outcome};
+use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRun, NodeRunStatus, TaskContext, Usage};
 use futures::future::BoxFuture;
 
 use crate::node::{Node, NodeError};
+
+/// Stand-in for `Usage::model` when the SDK reports no model.
+///
+/// The CLI names models only as keys in its `modelUsage` map, which is empty on
+/// the error envelope — so `Outcome::primary_model()` is an `Option`. The
+/// orchestrator data contract (v1.0.1 §6) requires `usage.model` to be a
+/// non-null string, so absence has to be spelled *somehow*; it is spelled here,
+/// at the seam, rather than by loosening the contract type for a vendor quirk.
+const UNKNOWN_MODEL: &str = "unknown";
 
 /// The injectable transport signature: takes an owned `Config` + prompt and
 /// returns a boxed future resolving to a `claude_code_rs::Result<Outcome>`.
@@ -119,21 +128,6 @@ impl ClaudeCodeStep {
         self.transport = Arc::new(transport);
         self
     }
-
-    /// Concatenate the response's `ContentBlock::Text` blocks into a single
-    /// string (unrecognized block types are ignored here, not an error — the
-    /// SDK already preserves them as `ContentBlock::Unknown`).
-    fn text_output(outcome: &Outcome) -> String {
-        outcome
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                ContentBlock::Unknown { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
 }
 
 #[async_trait::async_trait]
@@ -148,17 +142,23 @@ impl Node for ClaudeCodeStep {
             .await
             .map_err(|err| NodeError::new(err.to_string()))?;
 
+        // `primary_model` is a heuristic over the SDK's `modelUsage` map and is
+        // `None` when no model ran. `engine_contract::Usage::model` is a required
+        // `String` (the orchestrator data contract's shape, v1.0.1) — so the
+        // fallback belongs here, at the seam, rather than in the contract type.
+        let model = outcome.primary_model().unwrap_or(UNKNOWN_MODEL).to_string();
+
         let output = serde_json::json!({
-            "content": Self::text_output(&outcome),
+            "content": outcome.text,
             "cost_usd": outcome.cost_usd,
-            "model": outcome.model,
+            "model": model,
         });
         ctx.nodes.insert(self.name.clone(), output);
 
         let usage = Usage {
             input_tokens: Some(outcome.usage.input_tokens),
             output_tokens: Some(outcome.usage.output_tokens),
-            model: outcome.model.clone(),
+            model,
         };
         ctx.node_runs
             .entry(self.name.clone())
@@ -185,7 +185,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use claude_code_rs::parse::Usage as SdkUsage;
+    use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
 
     fn empty_context() -> TaskContext {
         TaskContext {
@@ -197,6 +197,12 @@ mod tests {
     }
 
     fn stub_outcome() -> Outcome {
+        stub_outcome_with_models(&[("claude-sonnet-4-5", 0.01, 34)])
+    }
+
+    /// Build an `Outcome` whose `modelUsage` carries the given
+    /// `(name, cost_usd, output_tokens)` entries.
+    fn stub_outcome_with_models(models: &[(&str, f64, u64)]) -> Outcome {
         Outcome {
             cost_usd: 0.01,
             usage: SdkUsage {
@@ -205,10 +211,24 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
             },
-            model: "claude-sonnet-4-5".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "ok".to_string(),
-            }],
+            model_usage: models
+                .iter()
+                .map(|(name, cost_usd, output_tokens)| {
+                    (
+                        (*name).to_string(),
+                        SdkModelUsage {
+                            input_tokens: 12,
+                            output_tokens: *output_tokens,
+                            cache_read_input_tokens: 0,
+                            cache_creation_input_tokens: 0,
+                            cost_usd: *cost_usd,
+                        },
+                    )
+                })
+                .collect(),
+            text: "ok".to_string(),
+            is_error: false,
+            api_error_status: None,
         }
     }
 
@@ -239,6 +259,59 @@ mod tests {
         assert_eq!(usage.model, "claude-sonnet-4-5");
     }
 
+    /// The SDK reports no model when `modelUsage` is empty. The contract's
+    /// `usage.model` is a required `String`, so the seam must supply a stand-in
+    /// rather than panic or drop the `NodeRun`.
+    #[tokio::test]
+    async fn absent_model_usage_falls_back_to_unknown_model() {
+        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+            .with_transport(|_config, _prompt| {
+                Box::pin(async { Ok(stub_outcome_with_models(&[])) })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("an empty modelUsage must not fail the node");
+
+        let run = ctx
+            .node_runs
+            .get("ClaudeCodeStep")
+            .expect("node_runs entry");
+        assert_eq!(run.usage.as_ref().expect("usage stamped").model, "unknown");
+        assert_eq!(ctx.nodes["ClaudeCodeStep"]["model"], "unknown");
+    }
+
+    /// A single call can bill several models. Attribution follows the SDK's
+    /// cost-ranked heuristic, so the expensive model that did the work wins over
+    /// a chatty cheap one.
+    #[tokio::test]
+    async fn multi_model_usage_attributes_to_the_primary_model() {
+        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+            .with_transport(|_config, _prompt| {
+                Box::pin(async {
+                    Ok(stub_outcome_with_models(&[
+                        ("claude-haiku-4-5", 0.001, 900),
+                        ("claude-opus-4-8", 0.42, 12),
+                    ]))
+                })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let run = ctx
+            .node_runs
+            .get("ClaudeCodeStep")
+            .expect("node_runs entry");
+        assert_eq!(
+            run.usage.as_ref().expect("usage stamped").model,
+            "claude-opus-4-8"
+        );
+    }
+
     #[tokio::test]
     async fn sdk_error_maps_to_node_error() {
         let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
@@ -264,7 +337,7 @@ mod tests {
         .with_transport(|_config, prompt| {
             Box::pin(async move {
                 let mut outcome = stub_outcome();
-                outcome.content = vec![ContentBlock::Text { text: prompt }];
+                outcome.text = prompt;
                 Ok(outcome)
             })
         });
