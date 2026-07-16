@@ -33,11 +33,16 @@ engine-rs/
 ├── crates/
 │   ├── engine-core/       ← node.rs (Node trait + NodeRegistry + as_router() hook), schema.rs
 │   │                         (WorkflowSchema/NodeConfig), workflow.rs (Workflow pointer-walk
-│   │                         runner + on_progress seam + Router-aware dispatch + new_validated()),
+│   │                         runner + on_progress seam + Router-aware dispatch + new_validated() +
+│   │                         run_with() cancellation/budget-aware entry point, EN.2.B),
 │   │                         routing.rs (Router trait + dispatch_route()), parallel.rs
 │   │                         (ParallelNode fan-out/merge), validate.rs (WorkflowValidator graph
-│   │                         validator), nodes/ (claude_code_step.rs — ClaudeCodeStep, a reusable
-│   │                         Node wrapping core/claude-code-rs's execute(), EN.2.A)
+│   │                         validator), cancellation.rs (CancellationToken, watch-backed,
+│   │                         + stamp_cancelled(), EN.2.B), budget.rs (Budget config + BudgetLedger
+│   │                         + pre-dispatch check() gate, EN.2.B), nodes/ (claude_code_step.rs —
+│   │                         ClaudeCodeStep, a reusable Node wrapping core/claude-code-rs's
+│   │                         execute(), EN.2.A; now cancellation-aware via
+│   │                         with_cancellation_token(), EN.2.B)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.0.1 byte-for-byte
@@ -54,7 +59,10 @@ engine-rs/
 │   │                         run and updating subsequent ones; self-skips Postgres I/O when no
 │   │                         pool/DATABASE_URL is configured), http.rs (actix-web surface: POST
 │   │                         /events/ with X-API-Key gating dispatch + live-state + durable-write,
-│   │                         GET /health, GET /workflows, GET /workflows/{type}/graph)
+│   │                         GET /health, GET /workflows, GET /workflows/{type}/graph), abort.rs
+│   │                         (POST /events/{run_id}/abort, X-API-Key gated, EN.2.B — backed by a
+│   │                         per-run CancellationToken RunRegistry minted/registered/deregistered
+│   │                         around each post_events run_with call)
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
     crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
@@ -72,8 +80,10 @@ engine-rs/
 Async runtime + persistence: `tokio` + `sqlx` (postgres, runtime-tokio, tls-rustls) — see
 `planning/decisions/D2-async-runtime-choice.md`. `engine-store` carries `sqlx` as a real
 dependency for its Postgres layer; `engine-contract` carries `chrono`/`uuid` for the data-contract
-types; `engine-core` carries `async-trait` and `futures` as real dependencies (EN.2.0) alongside
-`tokio` as a dev-dependency. `engine-serve` (EN.1.C) now carries `chrono`, `sqlx`, `actix-web`, and
+types; `engine-core` carries `async-trait` and `futures` as real dependencies (EN.2.0), and `tokio` as a real dependency
+(promoted from dev-only in EN.2.B — `CancellationToken::cancelled()` is public async API, not
+test-only code; see `planning/decisions/D6-cancellation-and-budget-semantics.md`).
+`engine-serve` (EN.1.C) now carries `chrono`, `sqlx`, `actix-web`, and
 `async-trait` (EN.2.0) as real dependencies alongside `tokio` — `actix-web` is the HTTP framework
 choice, see `planning/decisions/D3-http-framework-choice.md`. `engine-core` also carries
 `claude-code-rs` (a workspace path dependency on the sibling `core/claude-code-rs`) as a real
@@ -126,7 +136,38 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   node's `process`. `Workflow::
   new_validated(registry, schema)` is a fallible constructor that runs `WorkflowValidator::
   validate` first and rejects an invalid schema; the existing infallible `Workflow::new` is
-  unchanged.
+  unchanged. `async fn run_with(event, on_progress, RunOptions) -> Result<TaskContext,
+  WorkflowError>` (EN.2.B) is the cancellation/budget-aware entry point `run()` now delegates to:
+  at each node boundary, before dispatch, it checks an optional `CancellationToken` and consults an
+  optional `Budget` ledger, halting the walk (nodes not yet reached stay Pending) and stamping the
+  reason into `TaskContext::metadata` — via `cancellation::stamp_cancelled` for a cancel, or the
+  private `stamp_budget_halt` (keyed `BUDGET_METADATA_KEY = "budget"`) for a budget halt — while
+  still returning `Ok(TaskContext)` with the accumulated state, mirroring how a node's own `Err`
+  is handled. `RunOptions { cancellation_token: Option<CancellationToken>, budget: Option<Budget>
+  }` (`#[derive(Default)]`) carries the two optional gates; `run()` itself is unchanged for
+  existing callers (`engine-serve/http.rs` and pre-EN.2.B tests).
+- `CancellationToken` (`engine-core::cancellation`) — a `tokio::sync::watch`-backed cooperative
+  cancel signal (not `AtomicBool`+`Notify`): `cancel()` calls `tx.send_replace(true)` rather than
+  `tx.send(true)`, since `watch::Sender::send` silently no-ops with zero live receivers (the case
+  right after `new()`) — `send_replace` updates the retained value unconditionally, so a cancel
+  issued before any `cancelled()` waiter subscribes is still observed. `async fn cancelled(&self)`
+  awaits the first `true` value via `Receiver::changed`, race-free against the
+  check-then-subscribe-then-await pattern. `stamp_cancelled(&mut Value)` merges a `"cancellation"`
+  key into `TaskContext::metadata` (preserving other metadata keys) rather than overwriting it.
+  Promoted `tokio` from a dev-dependency to a real `engine-core` dependency (EN.2.B) since
+  `cancelled()` is now public async API, not test-only code — see
+  `planning/decisions/D6-cancellation-and-budget-semantics.md`.
+- `Budget` / `BudgetLedger` (`engine-core::budget`, EN.2.B) — `Budget` is a config struct (token
+  and/or cost caps); `BudgetLedger` accumulates spend from each completed node's `NodeRun.usage`
+  (tokens) plus an optional per-call `cost_usd` (folded in separately, since
+  `engine_contract::Usage` carries no cost field per the data contract — a later caller with an
+  actual cost figure, e.g. `ClaudeCodeStep`'s SDK `Outcome::cost_usd`, supplies it).
+  `check()` is the pre-dispatch gate `Workflow::run_with` calls before each node: returns
+  `Allow` or `Halt(BudgetHaltReason)` when accumulated spend is *reached* (`>=`) the configured
+  cap — a cap hit exactly by the last completed node stops the walk before the node that would
+  exceed it. `BudgetHaltReason::to_json()` renders `{cap, spent, limit}` for the metadata stamp;
+  `budget.rs` itself never mutates a `TaskContext` — `Workflow::run_with` owns the write.
+  Absent `Budget` config, `check()` always allows.
 - `OnProgress<'a>` (`engine-core::workflow`, `type OnProgress<'a> = Box<dyn FnMut(&TaskContext) +
   'a>`) — the injected persistence seam invoked at every node boundary (initial seed, RUNNING
   entry, SUCCESS/FAILED exit). This block only defines the signature; EN.1.C wires it to Postgres.
@@ -151,9 +192,19 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   by the serve binary and the test harness: `GET /health`, `GET /workflows` (list registered
   workflow types), `GET /workflows/{type}/graph` (schema graph for a type), and `POST /events/`
   (X-API-Key gated; dispatches the event, records live state, and enqueues the durable write).
-  `post_events` builds the `OnProgress` box inline and `.await`s `workflow.run` directly (EN.2.0)
-  — no `web::block`/thread-pool escape hatch, since actix request futures already run on a
-  per-worker single-threaded runtime and `Node::process` is now async.
+  `post_events` builds the `OnProgress` box inline and `.await`s `workflow.run_with` directly
+  (EN.2.B; previously `workflow.run`, EN.2.0) — no `web::block`/thread-pool escape hatch, since
+  actix request futures already run on a per-worker single-threaded runtime and `Node::process` is
+  now async. `post_events` mints a `CancellationToken` per run, registers it in `RunRegistry`
+  keyed by `run_id` for the duration of the run, and deregisters it unconditionally after
+  `run_with` returns (`Ok` or `Err`) — so a finished run's `run_id` 404s on a later abort call
+  rather than staying abort-able forever.
+- Abort endpoint (`engine-serve::abort`, EN.2.B) — `POST /events/{run_id}/abort`, gated by the
+  same `check_api_key` (widened from private to `pub(crate)`) as `/events/`, backed by
+  `RunRegistry` (a registry of live per-run `CancellationToken`s). Looks up `run_id`: `401` on a
+  missing/invalid API key, `404` if the run isn't currently registered (unknown or already
+  finished), `202 Accepted` on success (matching `post_events`'s existing `202` convention) —
+  calls `token.cancel()`, which `Workflow::run_with` observes at the next node boundary.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `orchestrator/docs/data-contract.md` v1.0.1).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
@@ -168,6 +219,12 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   (`with_transport`) so the gated test suite stubs it instead of spawning a real `claude` process.
   Per `planning/decisions/D4-claude-code-transport-choice.md`, this node owns none of the
   subprocess/argv/parse logic — that surface belongs entirely to `core/claude-code-rs`.
+  Also carries an optional `CancellationToken` (`with_cancellation_token`, EN.2.B): `process()`
+  races it against the awaited transport future via `tokio::select!`, and on a cancellation win
+  drops the in-flight future and returns `Ok(ctx)` unchanged (rather than a `NodeError`) — a `Node`
+  never touches its own `NodeRun` status, so this lets `node_context` mark the node `Success` and
+  defers the actual cancelled-terminal-state stamping to `Workflow::run_with`'s per-boundary
+  cancellation check before the next node dispatch.
 
   **Model attribution (as of the 2026-07-16 SDK fix, claude-code-rs D2).** The `claude` CLI has no
   top-level `model` field; it reports a *map* of models (`modelUsage`), since one call can bill
@@ -188,7 +245,8 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 
 1. `bastion serve` receives a trigger via the actix-web HTTP surface (`POST /events/`, X-API-Key
    gated) — from local CLI, remote BastionUI over Tailscale, or an orchestrator-equivalent event
-   POST.
+   POST. A live run can be cancelled mid-flight via `POST /events/{run_id}/abort` (EN.2.B, same
+   API-key gate), which resolves the run's registered `CancellationToken` and calls `cancel()`.
 2. `Dispatcher::dispatch(workflow_type)` resolves the event to a registered `Workflow` via the dual
    registry (`workflow_registry` + `schema_registry`), returning `DispatchError::
    UnknownWorkflowType` (surfaced as HTTP 422) for an unregistered type.
@@ -201,8 +259,12 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
    SUCCESS/FAILED + `started_at`/`completed_at` timing), following `connections[0]` for plain
    nodes or `Router::route(ctx)` for router nodes (including undeclared runtime back-edges),
    invoking `on_progress` after every transition; a node returning `Err` halts the walk but
-   `run()` still returns `Ok(TaskContext)` with the accumulated state. Each subsequent snapshot
-   updates `LiveStateStore` and is persisted via `update_event`/`touch` on the durable writer.
+   `run()`/`run_with()` still return `Ok(TaskContext)` with the accumulated state. Each subsequent
+   snapshot updates `LiveStateStore` and is persisted via `update_event`/`touch` on the durable
+   writer. Before each node dispatch, `run_with` (EN.2.B) also checks the run's optional
+   `CancellationToken` and optional `Budget` ledger, halting the walk the same way a node error
+   does (still `Ok`, nodes not yet reached stay Pending) and stamping the reason
+   (`metadata.cancellation` or `metadata.budget`) into `TaskContext::metadata`.
 5. Local Console reads live state directly via `LiveStateStore::get`/`list_active` (in-memory,
    no DB poll); remote observers (BastionUI) subscribe to serve's `GET /workflows` /
    `GET /workflows/{type}/graph` read-API rather than polling Postgres. The durable writer
