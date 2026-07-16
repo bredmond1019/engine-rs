@@ -4,6 +4,7 @@
 //! Stub crate for EN.0.A (Cargo workspace + CI). The trigger/dispatch path lands once
 //! `engine-core` and `engine-store` are real — see `docs/architecture.md` for the module map.
 
+pub mod abort;
 pub mod dispatch;
 pub mod durable;
 pub mod http;

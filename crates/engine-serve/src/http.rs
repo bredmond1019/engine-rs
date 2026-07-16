@@ -13,14 +13,19 @@
 //! - `GET /workflows` — the list of registered workflow types.
 //! - `GET /workflows/{type}/graph` — the schema/graph for a registered type,
 //!   404 for an unknown one.
+//! - `POST /events/{run_id}/abort` — requires the same `X-API-Key` header
+//!   (401 without it); 404 for an unknown/finished `run_id`; otherwise
+//!   triggers that run's `CancellationToken` and returns 202 (task 5, see
+//!   `crate::abort`).
 
 use std::sync::Arc;
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
-use engine_core::OnProgress;
+use engine_core::{CancellationToken, OnProgress, RunOptions};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::abort::RunRegistry;
 use crate::dispatch::{DispatchError, Dispatcher};
 use crate::durable::{durable_on_progress, DurableHandle};
 use crate::live_state::LiveStateStore;
@@ -30,11 +35,12 @@ pub struct AppState {
     pub dispatcher: Arc<Dispatcher>,
     pub live: LiveStateStore,
     pub durable: DurableHandle,
+    pub runs: RunRegistry,
     pub api_key: String,
 }
 
-/// Register all four routes on `cfg`, so the serve binary and the test
-/// harness share one route table.
+/// Register all routes on `cfg`, so the serve binary and the test harness
+/// share one route table.
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/health", web::get().to(health))
         .route("/workflows", web::get().to(list_workflows))
@@ -42,7 +48,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             "/workflows/{workflow_type}/graph",
             web::get().to(workflow_graph),
         )
-        .route("/events/", web::post().to(post_events));
+        .route("/events/", web::post().to(post_events))
+        .route(
+            "/events/{run_id}/abort",
+            web::post().to(crate::abort::abort_run),
+        );
 }
 
 async fn health() -> impl Responder {
@@ -77,8 +87,9 @@ struct TriggerBody {
     data: serde_json::Value,
 }
 
-/// Whether `req` carries an `X-API-Key` header matching `expected`.
-fn check_api_key(req: &HttpRequest, expected: &str) -> bool {
+/// Whether `req` carries an `X-API-Key` header matching `expected`. Shared
+/// with `crate::abort::abort_run`, which reuses this exact gate.
+pub(crate) fn check_api_key(req: &HttpRequest, expected: &str) -> bool {
     req.headers()
         .get("X-API-Key")
         .and_then(|value| value.to_str().ok())
@@ -90,6 +101,12 @@ fn check_api_key(req: &HttpRequest, expected: &str) -> bool {
 /// on an unregistered `workflow_type`, otherwise runs the workflow feeding the
 /// live-state store and the durable writer through `on_progress`, returning
 /// the freshly-minted `run_id` the local Console reads live state by.
+///
+/// Mints a `CancellationToken` alongside `run_id` and registers it on
+/// `state.runs` (task 5) so `POST /events/{run_id}/abort` can trigger it
+/// while the run is live; the token is deregistered once the run ends
+/// (success, failure, or cancellation) so a later abort against the same
+/// `run_id` correctly reads as unknown (404).
 async fn post_events(
     req: HttpRequest,
     body: web::Json<TriggerBody>,
@@ -115,6 +132,9 @@ async fn post_events(
     let live = state.live.clone();
     let durable_handle = state.durable.clone();
 
+    let token = CancellationToken::new();
+    state.runs.register(run_id, token.clone());
+
     // Build the `OnProgress` box inline: actix request futures run on a
     // per-worker single-threaded runtime, so the non-`Send` `OnProgress`
     // box (`Box<dyn FnMut(&TaskContext) + 'a>`, no `Send` bound) needs no
@@ -125,10 +145,16 @@ async fn post_events(
         live.record(run_id, snapshot);
         durable_progress(snapshot);
     });
+    let options = RunOptions {
+        cancellation_token: Some(token),
+        budget: None,
+    };
     let result = workflow
-        .run(data, on_progress)
+        .run_with(data, on_progress, options)
         .await
         .map_err(|err| err.to_string());
+
+    state.runs.deregister(run_id);
 
     match result {
         Ok(_task_context) => HttpResponse::Accepted().json(serde_json::json!({ "run_id": run_id })),
@@ -184,6 +210,7 @@ mod tests {
             dispatcher: Arc::new(dispatcher),
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }

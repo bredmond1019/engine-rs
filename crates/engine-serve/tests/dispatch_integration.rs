@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use actix_web::{test, web, App};
 use engine_contract::{EventsRow, TaskContext};
 use engine_core::{Node, NodeConfig, NodeError, NodeRegistry, Workflow, WorkflowSchema};
+use engine_serve::abort::RunRegistry;
 use engine_serve::dispatch::Dispatcher;
 use engine_serve::durable::{message_to_row, spawn_durable_writer, DurableMessage};
 use engine_serve::http::{configure, AppState};
@@ -85,6 +86,7 @@ fn test_app_state() -> AppState {
         dispatcher: Arc::new(dispatcher),
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(None),
+        runs: RunRegistry::new(),
         api_key: "integration-test-key".to_string(),
     }
 }
