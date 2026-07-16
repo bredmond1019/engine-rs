@@ -36,7 +36,8 @@ engine-rs/
 │   │                         runner + on_progress seam + Router-aware dispatch + new_validated()),
 │   │                         routing.rs (Router trait + dispatch_route()), parallel.rs
 │   │                         (ParallelNode fan-out/merge), validate.rs (WorkflowValidator graph
-│   │                         validator)
+│   │                         validator), nodes/ (claude_code_step.rs — ClaudeCodeStep, a reusable
+│   │                         Node wrapping core/claude-code-rs's execute(), EN.2.A)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.0.1 byte-for-byte
@@ -74,7 +75,9 @@ dependency for its Postgres layer; `engine-contract` carries `chrono`/`uuid` for
 types; `engine-core` carries `async-trait` and `futures` as real dependencies (EN.2.0) alongside
 `tokio` as a dev-dependency. `engine-serve` (EN.1.C) now carries `chrono`, `sqlx`, `actix-web`, and
 `async-trait` (EN.2.0) as real dependencies alongside `tokio` — `actix-web` is the HTTP framework
-choice, see `planning/decisions/D3-http-framework-choice.md`.
+choice, see `planning/decisions/D3-http-framework-choice.md`. `engine-core` also carries
+`claude-code-rs` (a workspace path dependency on the sibling `core/claude-code-rs`) as a real
+dependency (EN.2.A) — see `planning/decisions/D4-claude-code-transport-choice.md`.
 
 CI (`.github/workflows/ci.yml`) runs on every push (all branches) and on pull requests, running
 the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
@@ -157,6 +160,14 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `input`, `usage` (`{input_tokens, output_tokens, model}` for LLM nodes). Stamped RUNNING →
   SUCCESS/FAILED by the framework-owned `node_context` envelope in `workflow.rs`, not by the node
   itself.
+- `ClaudeCodeStep` (`engine-core::nodes::claude_code_step`, EN.2.A) — a reusable `Node` that spawns
+  a Claude Code session via `claude_code_rs::execute` and maps its `Outcome` into the node's
+  `TaskContext::nodes` output (`{content, cost_usd, model}`) and `NodeRun.usage`. Constructed with a
+  fixed prompt (`new`) or a prompt built fresh from the live `TaskContext` on each call
+  (`with_prompt_builder`); its subprocess call goes through an injectable `Transport` closure
+  (`with_transport`) so the gated test suite stubs it instead of spawning a real `claude` process.
+  Per `planning/decisions/D4-claude-code-transport-choice.md`, this node owns none of the
+  subprocess/argv/parse logic — that surface belongs entirely to `core/claude-code-rs`.
 
 ## Data Flow
 

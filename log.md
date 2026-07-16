@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-03T19:57:01Z"
+timestamp: "2026-07-16T00:00:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,15 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [2026-07-16]
+
+### EN.2.A-claude-code-step-node closed out PARTIAL — ClaudeCodeStep node shipped, docs patched
+- **What:** Ran `/sdlc-run EN.2.A-claude-code-step-node` (implement → test → review [PARTIAL x2] → fix → wrap-up-partial-failure-due-to-session-limit), then ran `/close-out` manually to finish the loop: re-verified all four gating checks (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release`) green, ran `/code-review low` on the diff (zero findings), and patched `docs/architecture.md` (added `ClaudeCodeStep` to Module Map / Build & CI / Core Types). `ClaudeCodeStep` node implemented, tested, and reviewed clean; the sole gap is an upstream `core/claude-code-rs` parser bug (missing `"model"` field) blocking the live `#[ignore]` acceptance test, confirmed out of `engine-rs`'s scope per the D4 transport boundary. Shipped in commit `364d8cf` on `main`: `crates/engine-core/src/nodes/claude_code_step.rs` (new), `crates/engine-core/src/nodes/mod.rs` (new), `crates/engine-core/src/lib.rs`, `crates/engine-core/Cargo.toml`, root `Cargo.toml`, `crates/engine-core/tests/claude_code_step.rs` (new). Flipped `EN.2.A` to `closed` in `planning/state.json`, added a carryover entry `claude-code-rs-parser-missing-model-field` (kind: `known_issue`, scope: `engine-rs`) tracking the upstream bug, and regenerated derived state via `mev emit-state --write` (focus now surfaces `EN.2.B` as next).
+- **Why:** EN.2.A's implementation and review were functionally complete, but the review loop hit a session limit before a formal close-out; this session finished that loop — re-confirming the gate is green, closing the block cleanly, documenting the upstream blocker so it isn't mistaken for an engine-rs defect, and handing off with `EN.2.B` as the next action.
+- **Refs:** `planning/handoff.md`, `planning/state.json` (carryover: `claude-code-rs-parser-missing-model-field`), commit `364d8cf`, `docs/architecture.md`, D4 (transport boundary decision)
 
 ---
 
