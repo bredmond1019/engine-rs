@@ -62,7 +62,8 @@ fn fixture_matches_orchestrator_owned_original_when_sibling_checkout_present() {
         serde_json::from_str(FIXTURE).expect("checked-in copy is valid JSON");
 
     assert_eq!(
-        copy_value, owned_value,
+        copy_value,
+        owned_value,
         "engine-rs's checked-in fixture copy has diverged from the orchestrator-owned \
          original at {} — re-copy it and re-run `cargo test`",
         canonical.display()
