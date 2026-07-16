@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-16T12:17:52Z"
+timestamp: "2026-07-16T15:01:57Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -29,6 +29,11 @@ dcd876b feat: implement EN.2.B-cancellation-abort-budget-task2
 fefe24b fix: fix pass 1 for EN.2.B-cancellation-abort-budget-task1
 4c92dbe feat: implement EN.2.B-cancellation-abort-budget-task1
 ```
+
+### Close-out: EN.2.B cancellation-abort-budget
+- **What:** validation suite green (fmt/clippy/test/build/emoji), coverage scan clean, code-review low found no findings, docs audit confirmed already current, handoff.md written pointing at EN.3.A.
+- **Why:** close-out gate for the just-completed EN.2.B block, to safely hand off to the next session/block.
+- **Refs:** PR #3, planning/handoff.md.
 
 ---
 
