@@ -1,12 +1,17 @@
 //! Live Postgres insert/read round-trip for the `events` table.
 //!
-//! Gated on `DATABASE_URL`: self-skips (does not fail) when the env var is unset so
-//! `cargo test` stays green in CI, which runs with no Postgres available (per
-//! EN.0.A). Run against a live database with:
+//! This test is `#[ignore]`d: it requires a live Postgres, which CI does not have
+//! (per EN.0.A). `cargo test` reports it as `ignored`, never as `passed` — an
+//! honest signal that it did not run. To actually execute it against a live
+//! database, opt in explicitly:
 //!
 //! ```sh
-//! DATABASE_URL=postgres://... cargo test -p engine-store
+//! DATABASE_URL=postgres://... cargo test -p engine-store -- --ignored
 //! ```
+//!
+//! Reaching the test body at all means a developer explicitly requested the
+//! `--ignored` run, so an unset `DATABASE_URL` at that point is a hard failure,
+//! not a silent skip.
 //!
 //! The target `events` table is the orchestrator's existing schema (contract §4):
 //! `id uuid, workflow_type varchar(150), data json, task_context json,
@@ -20,11 +25,10 @@ use engine_store::{connect, get_event, insert_event, update_event};
 use uuid::Uuid;
 
 #[tokio::test]
+#[ignore = "requires a live Postgres; run with `cargo test -p engine-store -- --ignored`"]
 async fn insert_then_read_round_trips_an_events_row() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        eprintln!("DATABASE_URL unset — skipping live Postgres round-trip test");
-        return;
-    };
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this ignored test (see file header)");
 
     let pool = connect(&database_url)
         .await
