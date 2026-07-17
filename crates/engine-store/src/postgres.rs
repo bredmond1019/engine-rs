@@ -4,7 +4,7 @@
 //! per the orchestrator data contract) — this crate is `engine-serve`'s persistence
 //! layer for the run state it owns. Built on the D2 persistence stack (`sqlx::PgPool`).
 
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
 use engine_contract::EventsRow;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
@@ -69,8 +69,8 @@ pub async fn get_event(pool: &PgPool, id: Uuid) -> Result<EventsRow, sqlx::Error
         task_context: row
             .try_get::<Json<engine_contract::TaskContext>, _>("task_context")?
             .0,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
+        created_at: row.try_get::<NaiveDateTime, _>("created_at")?.and_utc(),
+        updated_at: row.try_get::<NaiveDateTime, _>("updated_at")?.and_utc(),
     })
 }
 
@@ -78,4 +78,27 @@ pub async fn get_event(pool: &PgPool, id: Uuid) -> Result<EventsRow, sqlx::Error
 /// so callers don't have to import `chrono::Utc` themselves.
 pub fn touch(row: &mut EventsRow) {
     row.updated_at = Utc::now();
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{NaiveDate, TimeZone, Utc};
+
+    /// Non-live coverage for the `get_event` decode fix: the orchestrator's `events`
+    /// table stores `created_at`/`updated_at` as `timestamp without time zone`
+    /// (contract §4), so sqlx yields a `NaiveDateTime` on read. This asserts the
+    /// `.and_utc()` conversion used in `get_event` produces the expected
+    /// `DateTime<Utc>` without needing a database connection.
+    #[test]
+    fn naive_datetime_and_utc_round_trips_to_expected_utc_datetime() {
+        let naive = NaiveDate::from_ymd_opt(2026, 7, 17)
+            .unwrap()
+            .and_hms_opt(12, 30, 45)
+            .unwrap();
+
+        let converted = naive.and_utc();
+
+        let expected = Utc.with_ymd_and_hms(2026, 7, 17, 12, 30, 45).unwrap();
+        assert_eq!(converted, expected);
+    }
 }
