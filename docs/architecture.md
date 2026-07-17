@@ -70,7 +70,9 @@ engine-rs/
     crates/engine-core/tests/validator.rs — WorkflowValidator + router-aware Workflow::run
     integration tests (valid/rejected schemas, router back-edge dispatch);
     crates/engine-contract/tests/round_trip.rs — fixture byte-for-byte serde round-trip;
-    crates/engine-store/tests/postgres_round_trip.rs — DATABASE_URL-gated live Postgres round-trip;
+    crates/engine-store/tests/postgres_round_trip.rs — `#[ignore]`d live Postgres round-trip (CI has
+    no Postgres, per EN.0.A); run explicitly with `cargo test -p engine-store -- --ignored` and
+    `DATABASE_URL` set — an unset `DATABASE_URL` at that point is a hard failure, not a silent skip;
     crates/engine-serve/tests/dispatch_integration.rs — headline EN.1.C integration test: live-state
     read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow,
     and 422 for an unregistered workflow_type)

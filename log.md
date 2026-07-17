@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-16T15:01:57Z"
+timestamp: "2026-07-17T16:30:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,38 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [run: 2026-07-17]
+
+### Fixed engine-store timestamp decode and killed the false-green Postgres round-trip test
+- **What:** Ran `ticket-engine-store-round-trip-false-green` through `/sdlc-task` (authoring
+  `breakdown.md` + `tasks.json` first, since the ticket had only a `/ticket`-authored `tasks.md`).
+  Task 1 fixed `engine_store::get_event`'s `ColumnDecode` failure by reading `created_at`/`updated_at`
+  as `NaiveDateTime` and converting with `.and_utc()`, since the orchestrator's `events` table columns
+  are `timestamp without time zone` (contract §4) while `EventsRow`'s public fields stay `DateTime<Utc>`
+  — the D20 contract surface is untouched, the fix lands purely on the consumer side. Added a non-live
+  unit test covering the conversion. Task 2 killed the false green in
+  `crates/engine-store/tests/postgres_round_trip.rs`: added `#[ignore]` to
+  `insert_then_read_round_trips_an_events_row` and hardened the `DATABASE_URL` guard from a silent
+  early `return` (which reported `1 passed` even though the test never ran) to a hard `.expect(...)`
+  failure, and rewrote the header comment to document the `--ignored` contract. Ran `/close-out`:
+  all gates green, `cargo test` with `DATABASE_URL` unset now reports the round-trip as `ignored`
+  (never `passed`), coverage scan found no blocking gaps, `/code-review low` found no findings,
+  `/update-docs --patch` made one surgical fix to `docs/architecture.md`'s module map. Wrote
+  `planning/handoff.md` pointing at EN.3.A as the next unblocked block.
+- **Why:** `get_event` could not decode the real orchestrator-owned `events` table at all (a live
+  `ColumnDecode` failure against `orchestration_dev` on both sqlx 0.8 and 0.9), and the test that
+  should have caught this had never actually run in CI since EN.0.B — an accepted block's acceptance
+  criterion was silently unverified. Found during BA.7.C's decomposition; not a blocker for EN.3.A/EN.3.B.
+- **Refs:** `planning/ticket-engine-store-round-trip-false-green/tasks.md` (+ `breakdown.md`/`tasks.json`
+  committed to the brain repo), `orchestrator/docs/data-contract.md` §4, `planning/handoff.md`.
+
+```
+472c492 feat: implement ticket-engine-store-round-trip-false-green-task2
+d30a43a feat: implement ticket-engine-store-round-trip-false-green-task1
+```
 
 ---
 
