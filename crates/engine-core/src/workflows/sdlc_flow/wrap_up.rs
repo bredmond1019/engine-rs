@@ -9,17 +9,25 @@
 //! `ReviewRouterNode` as well as the natural end of a fully-passing run, so
 //! it must tolerate being reached with any telemetry shape.
 //!
-//! Writes no files itself (the templates are handed back for a later
-//! step/human) — mirrors the Python node exactly.
+//! Renders its three text artifacts for a later step/human (mirrors the
+//! Python node), and additionally persists the resolved-policy + outcomes
+//! snapshot it stamps into `SDLCState` to the on-disk
+//! `planning/{spec_slug}/sdlc-flow-state.json` (EN.3.C task 6 fix) — the
+//! same file `task_loop::SaveStateNode` writes, since `SaveStateNode` never
+//! runs again after `WrapUpNode` in the assembled graph.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use chrono::Utc;
 use engine_contract::TaskContext;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
 
-use super::schema::SDLCState;
+use super::policy::SdlcPolicy;
+use super::schema::{RunOutcomes, SDLCState};
+use super::setup::RESOLVED_POLICY_IDENTITY;
 use super::{get_result, put_result};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
@@ -57,6 +65,41 @@ fn civil_from_days(z: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Read the worktree path stamped by `SetupWorktreeNode`, if the run went
+/// through it. Absent in unit tests that drive `WrapUpNode` directly (no
+/// `SetupWorktreeNode` in `ctx`) — those skip the on-disk persist below,
+/// mirroring how `task_loop.rs`'s node tests operate without a worktree.
+fn worktree_path(ctx: &TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")
+        .and_then(|value| value.get("worktree_path"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// Persist `state` (already stamped with `policy`/`outcomes`) to
+/// `planning/{spec_slug}/sdlc-flow-state.json` inside `worktree` — the same
+/// path convention `task_loop::SaveStateNode` writes to. This is the only
+/// point in the run where the resolved policy + outcome summary reach the
+/// durable on-disk state file: `SaveStateNode` runs earlier in the graph
+/// (inside the task loop) and never re-runs after `WrapUpNode`, so without
+/// this write the policy/outcomes blocks are computed here and then
+/// discarded when the run ends.
+fn persist_state(worktree: &str, state: &SDLCState) -> Result<String, NodeError> {
+    let state_dir = std::path::Path::new(worktree)
+        .join("planning")
+        .join(&state.spec_slug);
+    std::fs::create_dir_all(&state_dir).map_err(|err| {
+        NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
+    })?;
+    let state_path = state_dir.join("sdlc-flow-state.json");
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+    std::fs::write(&state_path, json).map_err(|err| {
+        NodeError::new(format!("failed to write {}: {err}", state_path.display()))
+    })?;
+    Ok(state_path.to_string_lossy().to_string())
+}
+
 /// Resolve the most recently mutated `SDLCState`: `UpdateTaskStatusNode`'s
 /// output if the loop has run at least once, else `LoadTaskStateNode`'s
 /// initial load. Mirrors the equivalent helper in `task_loop.rs` (kept as a
@@ -72,6 +115,137 @@ fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
         })?;
     serde_json::from_value(value.clone())
         .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))
+}
+
+/// Read the resolved `SdlcPolicy` stamped by `SetupWorktreeNode`
+/// (`setup::RESOLVED_POLICY_IDENTITY`). Falls back to the built-in default
+/// when absent or unparsable — the same defensive fallback `task_loop.rs`
+/// uses (kept as a local copy per this module's no-`mod.rs`-touch rule).
+fn resolved_policy(ctx: &TaskContext) -> SdlcPolicy {
+    get_result(ctx, RESOLVED_POLICY_IDENTITY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Wall-clock seconds from `SetupWorktreeNode`'s framework-stamped
+/// `started_at` (contract §6) to `now`. `0.0` if the run never went through
+/// `SetupWorktreeNode` (e.g. a unit test driving `WrapUpNode` directly).
+fn wall_clock_secs(ctx: &TaskContext, now: chrono::DateTime<Utc>) -> f64 {
+    ctx.node_runs
+        .get("SetupWorktreeNode")
+        .and_then(|run| run.started_at)
+        .map(|started| (now - started).num_milliseconds().max(0) as f64 / 1000.0)
+        .unwrap_or(0.0)
+}
+
+/// Sum of every task's attempts beyond its first — total retries triggered
+/// by `RETRYABLE`/minor-`FAIL` back-edges.
+fn total_retries(state: &SDLCState) -> u32 {
+    state
+        .tasks
+        .iter()
+        .map(|task| task.attempt_count.saturating_sub(1))
+        .sum()
+}
+
+/// The verdict-bearing model-judgment stages this snapshot inspects, in
+/// declared run order.
+const VERDICT_STAGES: [&str; 2] = ["TriageTaskNode", "ConsolidatedReviewNode"];
+
+/// Collect `"<stage>:<verdict>"` entries for every verdict-bearing stage
+/// that has run by the time this snapshot is taken.
+fn review_verdicts(ctx: &TaskContext) -> Vec<String> {
+    VERDICT_STAGES
+        .iter()
+        .filter_map(|stage| {
+            get_result(ctx, stage)
+                .and_then(|value| value.get("verdict").and_then(|v| v.as_str()))
+                .map(|verdict| format!("{stage}:{verdict}"))
+        })
+        .collect()
+}
+
+/// Sum the input/output tokens last recorded in `ctx.node_runs` (contract
+/// §6 `Usage`) across every node that ran a model this run.
+fn total_tokens(ctx: &TaskContext) -> (u64, u64) {
+    ctx.node_runs
+        .values()
+        .fold((0u64, 0u64), |(inp, out), run| match &run.usage {
+            Some(usage) => (
+                inp + usage.input_tokens.unwrap_or(0),
+                out + usage.output_tokens.unwrap_or(0),
+            ),
+            None => (inp, out),
+        })
+}
+
+/// The model-node identities whose `ctx.nodes` output may carry a
+/// `"cost_usd"` field (`ClaudeCodeStep`'s output shape).
+const COST_BEARING_STAGES: [&str; 4] = [
+    "ImplementTaskNode",
+    "TriageTaskNode",
+    "ConsolidatedReviewNode",
+    "GenerateTasksNode",
+];
+
+/// Sum every model-bearing stage's last recorded `cost_usd`.
+fn total_cost_usd(ctx: &TaskContext) -> f64 {
+    COST_BEARING_STAGES
+        .iter()
+        .filter_map(|stage| {
+            get_result(ctx, stage).and_then(|value| value.get("cost_usd")?.as_f64())
+        })
+        .sum()
+}
+
+/// The resolved policy's per-stage tier, keyed by `ModelTiers` field name —
+/// "actually used" for this run (`registry_for_policy` wires the stage's
+/// transport from exactly this assignment; a local-endpoint failure falls
+/// back to cloud per-call without changing the resolved policy snapshot).
+fn model_tier_used(policy: &SdlcPolicy) -> BTreeMap<String, String> {
+    let tiers = &policy.model_tiers;
+    let tier_str = |tier: super::policy::ModelTier| {
+        serde_json::to_value(tier)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    BTreeMap::from([
+        ("implement".to_string(), tier_str(tiers.implement)),
+        (
+            "implement_simple".to_string(),
+            tier_str(tiers.implement_simple),
+        ),
+        ("triage".to_string(), tier_str(tiers.triage)),
+        ("review".to_string(), tier_str(tiers.review)),
+        ("generate".to_string(), tier_str(tiers.generate)),
+    ])
+}
+
+/// Finalize the resolved-policy snapshot + outcome-metrics block for a
+/// completed (or bailed) run (EN.3.C task 6): deterministic — reads only
+/// `ctx`'s already-accumulated `SDLCState`/`node_runs`/`nodes`, spends no
+/// model tokens, and stays a pure function of `ctx` + `now` so tests can
+/// pin the clock.
+fn finalize_outcomes(
+    ctx: &TaskContext,
+    state: &SDLCState,
+    policy: &SdlcPolicy,
+    now: chrono::DateTime<Utc>,
+) -> RunOutcomes {
+    let (total_input_tokens, total_output_tokens) = total_tokens(ctx);
+    RunOutcomes {
+        wall_clock_secs: wall_clock_secs(ctx, now),
+        total_attempts: state.telemetry.total_attempts,
+        total_retries: total_retries(state),
+        tasks_passed: state.telemetry.tasks_passed,
+        tasks_failed: state.telemetry.tasks_failed,
+        review_verdicts: review_verdicts(ctx),
+        total_input_tokens,
+        total_output_tokens,
+        total_cost_usd: total_cost_usd(ctx),
+        model_tier_used: model_tier_used(policy),
+    }
 }
 
 /// Deterministic node: renders the wrap-up artifacts for a completed (or
@@ -106,8 +280,13 @@ impl Default for WrapUpNode {
 #[async_trait::async_trait]
 impl Node for WrapUpNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        let state = latest_state(&ctx)?;
+        let mut state = latest_state(&ctx)?;
         let date = (self.clock)();
+
+        let policy = resolved_policy(&ctx);
+        let outcomes = finalize_outcomes(&ctx, &state, &policy, Utc::now());
+        state.policy = Some(policy);
+        state.outcomes = Some(outcomes);
 
         let spec_slug = &state.spec_slug;
         let tasks_passed = state.telemetry.tasks_passed;
@@ -148,15 +327,30 @@ impl Node for WrapUpNode {
             )
         };
 
-        put_result(
-            &mut ctx,
-            "WrapUpNode",
-            json!({
-                "log_entry": log_entry,
-                "report": report,
-                "status_suggestion": status_suggestion,
-            }),
-        );
+        let state_value = serde_json::to_value(&state)
+            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+
+        // Persist the policy/outcomes-stamped state to the durable on-disk
+        // file (EN.3.C task 6 fix) when this run went through
+        // `SetupWorktreeNode`. Absent in unit tests that drive `WrapUpNode`
+        // directly with no worktree — that's not a real run, so there is
+        // nothing to persist to.
+        let saved_to = match worktree_path(&ctx) {
+            Some(worktree) => Some(persist_state(&worktree, &state)?),
+            None => None,
+        };
+
+        let mut output = json!({
+            "log_entry": log_entry,
+            "report": report,
+            "status_suggestion": status_suggestion,
+            "state": state_value,
+        });
+        if let Some(saved_to) = saved_to {
+            output["saved_to"] = json!(saved_to);
+        }
+
+        put_result(&mut ctx, "WrapUpNode", output);
 
         Ok(ctx)
     }
@@ -272,6 +466,284 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         let result = &out.nodes["WrapUpNode"];
         assert!(result["log_entry"].as_str().unwrap().contains("PASS"));
+    }
+
+    #[tokio::test]
+    async fn wrap_up_stamps_resolved_policy_and_outcomes_into_state() {
+        use crate::workflows::sdlc_flow::policy::{ModelTier, ModelTiers, SdlcPolicy};
+
+        let mut state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        task.attempt_count = 2;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 2;
+
+        let mut ctx = ctx_with_state(&state);
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                triage: ModelTier::Haiku,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PASS", "summary": "s", "issues": [] }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        let stamped_state: SDLCState = serde_json::from_value(result["state"].clone())
+            .expect("WrapUpNode output carries a parseable SDLCState");
+
+        let stamped_policy = stamped_state.policy.expect("policy block populated");
+        assert_eq!(stamped_policy, policy);
+
+        let outcomes = stamped_state.outcomes.expect("outcomes block populated");
+        assert_eq!(outcomes.total_attempts, 2);
+        assert_eq!(outcomes.tasks_passed, 1);
+        assert_eq!(outcomes.tasks_failed, 0);
+        assert_eq!(outcomes.total_retries, 1);
+        assert_eq!(
+            outcomes.review_verdicts,
+            vec!["ConsolidatedReviewNode:PASS".to_string()]
+        );
+        assert_eq!(outcomes.model_tier_used["triage"], "haiku");
+        assert_eq!(outcomes.model_tier_used["implement"], "sonnet");
+    }
+
+    #[tokio::test]
+    async fn wrap_up_falls_back_to_default_policy_when_none_stamped() {
+        let state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        let ctx = ctx_with_state(&state);
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        let stamped_state: SDLCState = serde_json::from_value(result["state"].clone()).unwrap();
+        assert_eq!(
+            stamped_state.policy,
+            Some(crate::workflows::sdlc_flow::policy::SdlcPolicy::default())
+        );
+        assert_eq!(stamped_state.outcomes.unwrap().wall_clock_secs, 0.0);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_sums_tokens_and_cost_across_model_nodes() {
+        use engine_contract::{NodeRun, NodeRunStatus, Usage};
+
+        let state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        let mut ctx = ctx_with_state(&state);
+
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({ "content": "x", "cost_usd": 0.01, "model": "claude-haiku-4-5" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({
+                "content": "x",
+                "cost_usd": 0.02,
+                "model": "claude-sonnet-4-5",
+                "verdict": "PASS",
+            }),
+        );
+        ctx.node_runs.insert(
+            "TriageTaskNode".to_string(),
+            NodeRun {
+                status: NodeRunStatus::Success,
+                started_at: None,
+                completed_at: None,
+                error: None,
+                input: None,
+                usage: Some(Usage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    model: "claude-haiku-4-5".to_string(),
+                }),
+            },
+        );
+        ctx.node_runs.insert(
+            "ConsolidatedReviewNode".to_string(),
+            NodeRun {
+                status: NodeRunStatus::Success,
+                started_at: None,
+                completed_at: None,
+                error: None,
+                input: None,
+                usage: Some(Usage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(8),
+                    model: "claude-sonnet-4-5".to_string(),
+                }),
+            },
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let stamped_state: SDLCState = serde_json::from_value(result["state"].clone()).unwrap();
+        let outcomes = stamped_state.outcomes.unwrap();
+
+        assert_eq!(outcomes.total_input_tokens, 30);
+        assert_eq!(outcomes.total_output_tokens, 13);
+        assert!((outcomes.total_cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn two_different_policies_yield_different_recorded_tiers() {
+        use crate::workflows::sdlc_flow::policy::{ModelTier, ModelTiers, SdlcPolicy};
+
+        let state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+
+        let mut ctx_a = ctx_with_state(&state);
+        ctx_a.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).unwrap(),
+        );
+
+        let mut ctx_b = ctx_with_state(&state);
+        let policy_b = SdlcPolicy {
+            model_tiers: ModelTiers {
+                review: ModelTier::Local,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        ctx_b.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy_b).unwrap(),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out_a = node
+            .process(ctx_a)
+            .await
+            .expect("process should succeed")
+            .nodes["WrapUpNode"]
+            .clone();
+        let out_b = WrapUpNode::new()
+            .with_clock(fixed_clock("2026-07-18"))
+            .process(ctx_b)
+            .await
+            .expect("process should succeed")
+            .nodes["WrapUpNode"]
+            .clone();
+
+        let state_a: SDLCState = serde_json::from_value(out_a["state"].clone()).unwrap();
+        let state_b: SDLCState = serde_json::from_value(out_b["state"].clone()).unwrap();
+
+        assert_eq!(
+            state_a.outcomes.unwrap().model_tier_used["review"],
+            "sonnet"
+        );
+        assert_eq!(state_b.outcomes.unwrap().model_tier_used["review"], "local");
+    }
+
+    fn temp_worktree() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-core-sdlc-flow-wrap-up-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn wrap_up_persists_policy_and_outcomes_to_on_disk_state_file() {
+        use crate::workflows::sdlc_flow::policy::{ModelTier, ModelTiers, SdlcPolicy};
+
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        task.attempt_count = 2;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 2;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                triage: ModelTier::Haiku,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PASS", "summary": "s", "issues": [] }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"]
+            .as_str()
+            .expect("saved_to present when a worktree is set");
+        assert!(saved_to.ends_with("sdlc-flow-state.json"));
+
+        // Re-read the actual on-disk file the aggregator (task 7) reads
+        // from — not the transient ctx output — to confirm the policy +
+        // outcomes blocks are populated there.
+        let on_disk = std::fs::read_to_string(saved_to).expect("state file exists on disk");
+        let on_disk_state: SDLCState =
+            serde_json::from_str(&on_disk).expect("on-disk file parses as SDLCState");
+
+        let stamped_policy = on_disk_state
+            .policy
+            .expect("policy block populated on disk");
+        assert_eq!(stamped_policy, policy);
+
+        let outcomes = on_disk_state
+            .outcomes
+            .expect("outcomes block populated on disk");
+        assert_eq!(outcomes.total_attempts, 2);
+        assert_eq!(outcomes.tasks_passed, 1);
+        assert_eq!(outcomes.tasks_failed, 0);
+        assert_eq!(outcomes.total_retries, 1);
+        assert_eq!(
+            outcomes.review_verdicts,
+            vec!["ConsolidatedReviewNode:PASS".to_string()]
+        );
+        assert_eq!(outcomes.model_tier_used["triage"], "haiku");
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_skips_disk_persist_without_a_worktree() {
+        let state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        let ctx = ctx_with_state(&state);
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        assert!(result.get("saved_to").is_none());
     }
 
     #[test]

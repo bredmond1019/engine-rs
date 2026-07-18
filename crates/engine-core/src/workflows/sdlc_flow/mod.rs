@@ -17,6 +17,9 @@
 //! - `emit_state` — `EmitStateNode` (bottom-half, EN.3.B).
 //! - `graph` — assembles the declared `WorkflowSchema` + `NodeRegistry` for
 //!   the whole workflow.
+//! - `aggregate` — the cross-run `(policy -> cost, time, quality)`
+//!   aggregator (EN.3.C task 7): reads a set of `sdlc-flow-state.json`
+//!   snapshots and tabulates one row per distinct resolved policy.
 //!
 //! The node-plumbing seams shared by every submodule — `CommandOutput` /
 //! `CommandRunner` / `ModelTransport` / `default_command_runner` and the
@@ -32,9 +35,11 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
 use futures::future::BoxFuture;
 
+pub mod aggregate;
 pub mod docs;
 pub mod emit_state;
 pub mod graph;
+pub mod policy;
 pub mod pr;
 pub mod schema;
 pub mod setup;

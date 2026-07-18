@@ -12,6 +12,7 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 claude-code-rs = { workspace = true }
 engine-contract = { path = "../engine-contract" }
 
