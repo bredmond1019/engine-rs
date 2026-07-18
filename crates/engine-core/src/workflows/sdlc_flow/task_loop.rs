@@ -34,21 +34,49 @@ use super::{get_result, put_result, CommandOutput, CommandRunner, ModelTransport
 /// `review_router_node._STRUCTURAL_ISSUE_THRESHOLD` in Python.
 const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
 
-/// Return the most recently mutated `SDLCState` (`UpdateTaskStatusNode`'s
-/// output if this is not the first pass through the loop, else
-/// `LoadTaskStateNode`'s initial load). Mirrors the `_latest_state_dict`
+/// Return the most recently mutated `SDLCState` among every node identity
+/// that can write one: `IncrementAttemptNode` (the retry back-edge target,
+/// EN.3.B), `UpdateTaskStatusNode` (a task's eventual PASS/MAJOR_BAIL), and
+/// `LoadTaskStateNode` (the initial load). Mirrors the `_latest_state_dict`
 /// helper shared by `TaskQueueRouterNode`/`UpdateTaskStatusNode`/
-/// `SaveStateNode` in Python.
+/// `SaveStateNode` in Python, extended for the new retry-increment source.
+///
+/// A fixed priority order (`IncrementAttemptNode` before `UpdateTaskStatusNode`
+/// before `LoadTaskStateNode`) is NOT correct here: across a whole run,
+/// `IncrementAttemptNode` may hold a *stale* entry from an earlier task's
+/// retries while a *later* task's `UpdateTaskStatusNode` write is actually
+/// the newest state (or vice versa, mid-retry, within the same task). Instead
+/// this compares each candidate's `telemetry.total_attempts` — a counter every
+/// state-mutating node in this loop increments by exactly one on every write,
+/// so it is a monotonically increasing logical clock for the whole run — and
+/// keeps whichever candidate's value is highest. No wall-clock/`node_runs`
+/// dependency needed.
 fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
-    let value = get_result(ctx, "UpdateTaskStatusNode")
-        .or_else(|| get_result(ctx, "LoadTaskStateNode"))
-        .ok_or_else(|| {
-            NodeError::new(
-                "no SDLCState found: neither UpdateTaskStatusNode nor LoadTaskStateNode has run",
-            )
-        })?;
-    serde_json::from_value(value.clone())
-        .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))
+    let mut best: Option<SDLCState> = None;
+    for identity in [
+        "IncrementAttemptNode",
+        "UpdateTaskStatusNode",
+        "LoadTaskStateNode",
+    ] {
+        let Some(value) = get_result(ctx, identity) else {
+            continue;
+        };
+        let state: SDLCState = serde_json::from_value(value.clone())
+            .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))?;
+        let is_newer = best
+            .as_ref()
+            .map(|current| state.telemetry.total_attempts > current.telemetry.total_attempts)
+            .unwrap_or(true);
+        if is_newer {
+            best = Some(state);
+        }
+    }
+    best.ok_or_else(|| {
+        NodeError::new(
+            "no SDLCState found: none of IncrementAttemptNode, UpdateTaskStatusNode, \
+             LoadTaskStateNode has run",
+        )
+    })
 }
 
 fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
@@ -499,19 +527,36 @@ impl Node for TriageTaskNode {
             .cloned()
             .ok_or_else(|| NodeError::new("TestTaskNode has not run yet"))?;
         let current = current_task_fields(&ctx)?.clone();
+        let current_task_id = current
+            .get("current_task_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
+            as u32;
+
+        // `attempt_count`/`max_attempts` must come from the *live* durable
+        // state, not `current` (`TaskQueueRouterNode`'s snapshot, frozen at
+        // task dispatch): `IncrementAttemptNode` mutates the durable state on
+        // every retry back-edge but never re-runs `TaskQueueRouterNode`, so a
+        // read from `current` would see `attempt_count == 0` forever and the
+        // bail gate below would never fire. See this spec's Amendment Log
+        // (EN.3.B retry-bail fix).
+        let state = latest_state(&ctx)?;
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.task_id == current_task_id)
+            .ok_or_else(|| {
+                NodeError::new(format!(
+                    "TriageTaskNode: no task with task_id={current_task_id} found in state"
+                ))
+            })?;
+        let attempt_count = u64::from(task.attempt_count);
+        let max_attempts = u64::from(task.max_attempts);
 
         let all_passed = test_result
             .get("all_passed")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let attempt_count = current
-            .get("attempt_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let max_attempts = current
-            .get("max_attempts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3);
 
         if all_passed {
             put_result(
@@ -635,7 +680,11 @@ impl Router for TriageRouterNode {
             .as_str()?;
         match verdict {
             "PASS" => Some("ConsolidatedReviewNode".to_string()),
-            "RETRYABLE" => Some("ImplementTaskNode".to_string()),
+            // Retry back-edge (EN.3.B fix): routes through `IncrementAttemptNode`
+            // first (not straight to `ImplementTaskNode`) so the durable
+            // `attempt_count`/`total_attempts` counters actually advance —
+            // `Router::route` takes `&ctx` and cannot mutate state itself.
+            "RETRYABLE" => Some("IncrementAttemptNode".to_string()),
             "MAJOR_BAIL" => Some("WrapUpNode".to_string()),
             _ => None,
         }
@@ -789,7 +838,11 @@ impl Router for ReviewRouterNode {
                 if issues == 0 || issues > STRUCTURAL_ISSUE_THRESHOLD {
                     Some("WrapUpNode".to_string())
                 } else {
-                    Some("ImplementTaskNode".to_string())
+                    // Minor-issue retry back-edge (EN.3.B fix): same reasoning
+                    // as `TriageRouterNode`'s `RETRYABLE` branch — route
+                    // through `IncrementAttemptNode` so the retry counters
+                    // advance in lockstep across both back-edges.
+                    Some("IncrementAttemptNode".to_string())
                 }
             }
             _ => None,
@@ -797,11 +850,70 @@ impl Router for ReviewRouterNode {
     }
 }
 
+/// Bump the task identified by `task_id`'s `attempt_count` and the state's
+/// `telemetry.total_attempts`, both by exactly one. Shared by
+/// [`IncrementAttemptNode`] (the live retry back-edge target) and
+/// `UpdateTaskStatusNode`'s now-unreachable `Retryable` arm (see its doc
+/// comment) so the two counters can never drift apart.
+fn bump_attempt(state: &mut SDLCState, task_id: u32) -> Result<(), NodeError> {
+    let spec_slug = state.spec_slug.clone();
+    let task = state
+        .tasks
+        .iter_mut()
+        .find(|task| task.task_id == task_id)
+        .ok_or_else(|| {
+            NodeError::new(format!(
+                "no task with task_id={task_id} found in state for spec {spec_slug:?}"
+            ))
+        })?;
+    task.attempt_count += 1;
+    state.telemetry.total_attempts += 1;
+    Ok(())
+}
+
+// --- IncrementAttemptNode ---------------------------------------------------
+
+/// Deterministic node: the retry back-edge target for both
+/// `TriageRouterNode`'s `RETRYABLE` verdict and `ReviewRouterNode`'s minor
+/// `FAIL`/`PARTIAL` verdict (EN.3.B retry-bail fix). Bumps the current
+/// task's `attempt_count` and `telemetry.total_attempts` in the durable
+/// `SDLCState` via [`bump_attempt`], then hands off to `ImplementTaskNode`
+/// for the retry (the forward hop is a declared graph connection — see
+/// `graph.rs`).
+///
+/// `Router::route(&self, ctx: &TaskContext)` takes `&ctx` and cannot mutate
+/// state, so the increment cannot live in `TriageRouterNode`'s or
+/// `ReviewRouterNode`'s routing logic itself — it must be a real `Node`
+/// sitting on both back-edges, between the router and `ImplementTaskNode`.
+pub struct IncrementAttemptNode;
+
+#[async_trait::async_trait]
+impl Node for IncrementAttemptNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        let current_task_id = current_task_fields(&ctx)?
+            .get("current_task_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
+            as u32;
+
+        let mut state = latest_state(&ctx)?;
+        bump_attempt(&mut state, current_task_id)?;
+
+        let value = serde_json::to_value(&state)
+            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        put_result(&mut ctx, "IncrementAttemptNode", value);
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "IncrementAttemptNode"
+    }
+}
+
 // --- UpdateTaskStatusNode --------------------------------------------------
 
-/// Deterministic node: mutates the current task's status (and, on a retry,
-/// its `attempt_count`) in the durable `SDLCState`, keeping
-/// `SDLCTelemetry` counters in lockstep.
+/// Deterministic node: mutates the current task's status in the durable
+/// `SDLCState`, keeping `SDLCTelemetry` counters in lockstep.
 pub struct UpdateTaskStatusNode;
 
 #[async_trait::async_trait]
@@ -830,31 +942,52 @@ impl Node for UpdateTaskStatusNode {
 
         let mut state = latest_state(&ctx)?;
         let spec_slug = state.spec_slug.clone();
-        let task = state
-            .tasks
-            .iter_mut()
-            .find(|task| task.task_id == current_task_id)
-            .ok_or_else(|| {
-                NodeError::new(format!(
-                    "UpdateTaskStatusNode: no task with task_id={current_task_id} found \
-                     in state for spec {spec_slug:?}"
-                ))
-            })?;
 
         match verdict {
             SDLCTriageVerdict::Pass => {
+                let task = state
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.task_id == current_task_id)
+                    .ok_or_else(|| {
+                        NodeError::new(format!(
+                            "UpdateTaskStatusNode: no task with task_id={current_task_id} found \
+                             in state for spec {spec_slug:?}"
+                        ))
+                    })?;
                 task.status = SDLCTaskStatus::Done;
                 state.telemetry.tasks_passed += 1;
+                state.telemetry.total_attempts += 1;
             }
             SDLCTriageVerdict::MajorBail => {
+                let task = state
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.task_id == current_task_id)
+                    .ok_or_else(|| {
+                        NodeError::new(format!(
+                            "UpdateTaskStatusNode: no task with task_id={current_task_id} found \
+                             in state for spec {spec_slug:?}"
+                        ))
+                    })?;
                 task.status = SDLCTaskStatus::Failed;
                 state.telemetry.tasks_failed += 1;
+                state.telemetry.total_attempts += 1;
             }
             SDLCTriageVerdict::Retryable => {
-                task.attempt_count += 1;
+                // Unreachable via the assembled graph as of EN.3.B: both
+                // `TriageRouterNode`'s `RETRYABLE` and `ReviewRouterNode`'s
+                // minor `FAIL`/`PARTIAL` back-edges now target
+                // `IncrementAttemptNode` directly (see their `Router::route`
+                // impls above), so `UpdateTaskStatusNode` is only ever
+                // reached with a `PASS` verdict (via `ReviewRouterNode`) —
+                // never `RETRYABLE`. Kept for defensive completeness and
+                // direct unit-test coverage (`update_status_mutations`),
+                // reusing `bump_attempt` so the counters can't drift apart
+                // from `IncrementAttemptNode`'s if this is ever hit.
+                bump_attempt(&mut state, current_task_id)?;
             }
         }
-        state.telemetry.total_attempts += 1;
 
         let value = serde_json::to_value(&state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
@@ -1124,7 +1257,7 @@ mod tests {
             json!({ "verdict": "RETRYABLE", "reason": "retry" }),
         );
         let router = TriageRouterNode;
-        assert_eq!(router.route(&ctx), Some("ImplementTaskNode".to_string()));
+        assert_eq!(router.route(&ctx), Some("IncrementAttemptNode".to_string()));
     }
 
     #[test]
@@ -1132,7 +1265,7 @@ mod tests {
         let router = TriageRouterNode;
         for (verdict, expected) in [
             ("PASS", "ConsolidatedReviewNode"),
-            ("RETRYABLE", "ImplementTaskNode"),
+            ("RETRYABLE", "IncrementAttemptNode"),
             ("MAJOR_BAIL", "WrapUpNode"),
         ] {
             let mut ctx = empty_context(json!({}));
@@ -1142,6 +1275,131 @@ mod tests {
             );
             assert_eq!(router.route(&ctx), Some(expected.to_string()));
         }
+    }
+
+    // --- IncrementAttemptNode / retry-bail (EN.3.B) -------------------------
+
+    #[tokio::test]
+    async fn increment_attempt_node_bumps_state() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let node = IncrementAttemptNode;
+        let out = node.process(ctx).await.expect("process should succeed");
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["IncrementAttemptNode"].clone()).unwrap();
+
+        assert_eq!(bumped.tasks[0].attempt_count, 1);
+        assert_eq!(bumped.telemetry.total_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn increment_attempt_node_compounds_across_retries() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let node = IncrementAttemptNode;
+        let out = node.process(ctx).await.expect("first retry should succeed");
+        let out = node
+            .process(out)
+            .await
+            .expect("second retry should succeed");
+
+        // `latest_state` must pick up its own prior write (via the
+        // `total_attempts` logical clock), not fall back to the stale
+        // `LoadTaskStateNode` snapshot, or this would still read 1.
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["IncrementAttemptNode"].clone()).unwrap();
+        assert_eq!(bumped.tasks[0].attempt_count, 2);
+        assert_eq!(bumped.telemetry.total_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_bail_fires_at_exactly_max_attempts_via_triage_back_edge() {
+        // A never-passing task with max_attempts = 2: drive the loop by hand
+        // (TriageTaskNode -> IncrementAttemptNode, repeated) and assert the
+        // bail fires at exactly the 2nd retry attempt, never earlier, never
+        // later — proving `IncrementAttemptNode` actually advances the
+        // counter `TriageTaskNode`'s bail gate reads.
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 2;
+        let mut ctx = ctx_with_test_result(false, &task);
+
+        let triage = TriageTaskNode::new().with_transport(panicking_transport());
+        let increment = IncrementAttemptNode;
+
+        // Attempt 0 (initial dispatch, attempt_count == 0 < max_attempts):
+        // RETRYABLE.
+        ctx = triage.process(ctx).await.expect("triage should succeed");
+        assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+        ctx = increment
+            .process(ctx)
+            .await
+            .expect("first increment should succeed");
+
+        // Re-seed TestTaskNode's failing result for the retry (TriageTaskNode
+        // reads it fresh every pass) and triage again: attempt_count == 1 <
+        // max_attempts (2) -> still RETRYABLE, one retry left.
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({ "all_passed": false, "check_results": [], "failure_summary": "" }),
+        );
+        ctx = triage.process(ctx).await.expect("triage should succeed");
+        assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+        ctx = increment
+            .process(ctx)
+            .await
+            .expect("second increment should succeed");
+
+        // attempt_count is now 2 == max_attempts -> MAJOR_BAIL, exactly here,
+        // not before.
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({ "all_passed": false, "check_results": [], "failure_summary": "" }),
+        );
+        ctx = triage.process(ctx).await.expect("triage should succeed");
+        assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+
+        let router = TriageRouterNode;
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+
+        let final_state: SDLCState =
+            serde_json::from_value(ctx.nodes["IncrementAttemptNode"].clone()).unwrap();
+        assert_eq!(final_state.tasks[0].attempt_count, 2);
+        assert_eq!(final_state.telemetry.total_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn both_retry_back_edges_increment_attempt_count() {
+        // TriageRouterNode's RETRYABLE and ReviewRouterNode's minor
+        // FAIL/PARTIAL both route to IncrementAttemptNode; assert both
+        // paths actually advance the counter (not just one of them).
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let node = IncrementAttemptNode;
+
+        // Simulates the TriageRouterNode::RETRYABLE back-edge.
+        let after_triage_retry = node.process(ctx).await.expect("process should succeed");
+        let state_after_triage: SDLCState =
+            serde_json::from_value(after_triage_retry.nodes["IncrementAttemptNode"].clone())
+                .unwrap();
+        assert_eq!(state_after_triage.tasks[0].attempt_count, 1);
+
+        // Simulates the ReviewRouterNode minor FAIL/PARTIAL back-edge,
+        // continuing from the same accumulated context.
+        let after_review_retry = node
+            .process(after_triage_retry)
+            .await
+            .expect("process should succeed");
+        let state_after_review: SDLCState =
+            serde_json::from_value(after_review_retry.nodes["IncrementAttemptNode"].clone())
+                .unwrap();
+        assert_eq!(state_after_review.tasks[0].attempt_count, 2);
+        assert_eq!(state_after_review.telemetry.total_attempts, 2);
     }
 
     // --- ReviewRouterNode --------------------------------------------------
@@ -1162,7 +1420,7 @@ mod tests {
 
         assert_eq!(
             router.route(&review_ctx("FAIL", 3)),
-            Some("ImplementTaskNode".to_string())
+            Some("IncrementAttemptNode".to_string())
         );
         assert_eq!(
             router.route(&review_ctx("FAIL", 6)),
@@ -1178,7 +1436,7 @@ mod tests {
         );
         assert_eq!(
             router.route(&review_ctx("PARTIAL", 2)),
-            Some("ImplementTaskNode".to_string())
+            Some("IncrementAttemptNode".to_string())
         );
     }
 

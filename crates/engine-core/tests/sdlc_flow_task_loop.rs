@@ -19,22 +19,22 @@
 //! `PatchDocsNode`) runs for real against fixture files written to the temp
 //! worktree, exercising the same code path production traffic would use.
 //!
-//! **Telemetry note (documented deviation from the task-decomposition
-//! prose):** `UpdateTaskStatusNode` — ported faithfully from
-//! `orchestrator/app/workflows/sdlc_flow_workflow_nodes/task_queue_router_node.py`
-//! / `triage_task_node.py` — is only reached via `ReviewRouterNode`'s `PASS`
-//! branch (after a task's *final*, passing review), never via
-//! `TriageRouterNode`'s `RETRYABLE` back-edge (which routes straight back to
-//! `ImplementTaskNode`, bypassing `UpdateTaskStatusNode`/`SaveStateNode`
-//! entirely — see `sdlc_flow_workflow.py`'s module docstring graph). So for
-//! a single-task fixture, `SDLCTelemetry.total_attempts` reaches `1` (one
-//! `UpdateTaskStatusNode` call, at the task's eventual PASS), not `2`, no
-//! matter how many retry back-edges fired in between; only `tasks_passed`
-//! and the retry-back-edge count are sensitive to intra-task retries. This
-//! test asserts the two-value pair that is actually reachable
-//! (`total_attempts == 1`, `tasks_passed == 1`) alongside direct proof that
-//! the retry back-edge fired (`ImplementTaskNode` ran twice). See this
-//! spec's Amendment Log.
+//! **Retry-bail fix (EN.3.B task 5):** `TriageRouterNode`'s `RETRYABLE`
+//! back-edge no longer routes straight to `ImplementTaskNode` — it routes
+//! through `IncrementAttemptNode` first, which bumps the durable state's
+//! `attempt_count`/`telemetry.total_attempts` before handing off to
+//! `ImplementTaskNode` for the retry. This test's fixture registry adds
+//! `IncrementAttemptNode` and locally amends `graph::schema()` with its
+//! declared forward hop (`IncrementAttemptNode -> ImplementTaskNode`) plus a
+//! second `TriageRouterNode` fan-out target so the declared graph stays
+//! reachable (`WorkflowValidator` requires every declared node be reachable;
+//! the retry back-edge itself stays runtime-only per D42 — see
+//! `build_workflow` below). This keeps `graph.rs` itself untouched (that
+//! wiring is EN.3.B task 6's job) while still exercising the real fix here.
+//! So for this single-task, one-retry fixture, `SDLCTelemetry.total_attempts`
+//! now correctly reaches `2` (one `IncrementAttemptNode` bump for the retry,
+//! one `UpdateTaskStatusNode` bump at the task's eventual PASS) and
+//! `task.attempt_count` reaches `1`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,8 +49,9 @@ use engine_core::workflows::sdlc_flow::setup::{
     CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode, SpecExistsRouterNode,
 };
 use engine_core::workflows::sdlc_flow::task_loop::{
-    ConsolidatedReviewNode, ImplementTaskNode, ReviewRouterNode, SaveStateNode,
-    TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode, UpdateTaskStatusNode,
+    ConsolidatedReviewNode, ImplementTaskNode, IncrementAttemptNode, ReviewRouterNode,
+    SaveStateNode, TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode,
+    UpdateTaskStatusNode,
 };
 use serde_json::json;
 
@@ -240,8 +241,33 @@ fn build_workflow(
         SaveStateNode::new().with_runner(noop_git_runner()),
     ));
     registry.register(Box::new(PatchDocsNode));
+    registry.register(Box::new(IncrementAttemptNode));
 
-    Workflow::new_validated(registry, graph::schema())
+    // `graph::schema()` doesn't declare `IncrementAttemptNode` yet (wiring
+    // it in is EN.3.B task 6's job) — amend a local copy so this test can
+    // exercise the retry-bail fix through the real `Workflow` runner without
+    // touching `graph.rs`. `IncrementAttemptNode -> ImplementTaskNode` is the
+    // declared forward hop out of the increment node; `TriageRouterNode`
+    // fanning out to it too is *only* to satisfy `WorkflowValidator`'s
+    // declared-reachability check (a router may declare >1 connection) — the
+    // actual retry back-edge stays a runtime-only `Router::route` decision
+    // per D42, never walked by the declared-cycle check since edges *out of*
+    // a router are skipped by it.
+    let mut schema = graph::schema();
+    schema.nodes.insert(
+        "IncrementAttemptNode".to_string(),
+        engine_core::schema::NodeConfig::new(
+            "IncrementAttemptNode",
+            vec!["ImplementTaskNode".to_string()],
+        ),
+    );
+    if let Some(triage_router) = schema.nodes.get_mut("TriageRouterNode") {
+        triage_router
+            .connections
+            .push("IncrementAttemptNode".to_string());
+    }
+
+    Workflow::new_validated(registry, schema)
         .expect("SDLC_FLOW declared graph must pass WorkflowValidator::validate")
 }
 
@@ -309,11 +335,12 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
     );
     assert_eq!(state.telemetry.tasks_passed, 1);
     assert_eq!(state.telemetry.tasks_failed, 0);
-    // See the module doc's "Telemetry note": UpdateTaskStatusNode only runs
-    // once per task (at its eventual PASS through ReviewRouterNode), never
-    // on the TriageRouterNode RETRYABLE back-edge, so total_attempts reaches
-    // 1 here regardless of how many retries preceded it.
-    assert_eq!(state.telemetry.total_attempts, 1);
+    // Retry-bail fix (EN.3.B task 5): IncrementAttemptNode bumps
+    // attempt_count/total_attempts once for the retry back-edge, then
+    // UpdateTaskStatusNode bumps total_attempts again at the eventual PASS —
+    // see the module doc's "Retry-bail fix" note.
+    assert_eq!(state.tasks[0].attempt_count, 1);
+    assert_eq!(state.telemetry.total_attempts, 2);
 
     // --- The walk terminated at the PatchDocsNode stub ---------------------
     let patch_docs_run = final_ctx
@@ -332,6 +359,7 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "TestTaskNode",
         "TriageTaskNode",
         "TriageRouterNode",
+        "IncrementAttemptNode",
         "ConsolidatedReviewNode",
         "ReviewRouterNode",
         "UpdateTaskStatusNode",
@@ -369,6 +397,7 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "TestTaskNode",
         "TriageTaskNode",
         "TriageRouterNode",
+        "IncrementAttemptNode",
         "ReviewRouterNode",
         "UpdateTaskStatusNode",
         "SaveStateNode",
