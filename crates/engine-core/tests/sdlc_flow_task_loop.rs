@@ -23,18 +23,19 @@
 //! back-edge no longer routes straight to `ImplementTaskNode` — it routes
 //! through `IncrementAttemptNode` first, which bumps the durable state's
 //! `attempt_count`/`telemetry.total_attempts` before handing off to
-//! `ImplementTaskNode` for the retry. This test's fixture registry adds
-//! `IncrementAttemptNode` and locally amends `graph::schema()` with its
-//! declared forward hop (`IncrementAttemptNode -> ImplementTaskNode`) plus a
-//! second `TriageRouterNode` fan-out target so the declared graph stays
-//! reachable (`WorkflowValidator` requires every declared node be reachable;
-//! the retry back-edge itself stays runtime-only per D42 — see
-//! `build_workflow` below). This keeps `graph.rs` itself untouched (that
-//! wiring is EN.3.B task 6's job) while still exercising the real fix here.
-//! So for this single-task, one-retry fixture, `SDLCTelemetry.total_attempts`
+//! `ImplementTaskNode` for the retry. The wiring lives in the real
+//! `graph::schema()` (EN.3.B task 6) now, so this test uses it unamended.
+//! For this single-task, one-retry fixture, `SDLCTelemetry.total_attempts`
 //! now correctly reaches `2` (one `IncrementAttemptNode` bump for the retry,
 //! one `UpdateTaskStatusNode` bump at the task's eventual PASS) and
 //! `task.attempt_count` reaches `1`.
+//!
+//! **Bottom-half tail (EN.3.B task 6):** the declared graph no longer stops
+//! at `PatchDocsNode` — it continues `PatchDocsNode -> WrapUpNode ->
+//! PullRequestNode -> EmitStateNode`. This test stubs `PatchDocsNode`'s
+//! model transport, drives the fixture event with `auto_pr: false` so
+//! `PullRequestNode` no-ops without touching git/gh, and stubs
+//! `EmitStateNode`'s runner so no real `mev` subprocess spawns.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,7 +45,10 @@ use claude_code_rs::Outcome;
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
-use engine_core::workflows::sdlc_flow::graph::{self, PatchDocsNode};
+use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
+use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
+use engine_core::workflows::sdlc_flow::graph;
+use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
 use engine_core::workflows::sdlc_flow::setup::{
     CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode, SpecExistsRouterNode,
 };
@@ -53,6 +57,7 @@ use engine_core::workflows::sdlc_flow::task_loop::{
     SaveStateNode, TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode,
     UpdateTaskStatusNode,
 };
+use engine_core::workflows::sdlc_flow::wrap_up::WrapUpNode;
 use serde_json::json;
 
 /// Replaces the real `SetupWorktreeNode` for this test: writes a controlled
@@ -240,32 +245,22 @@ fn build_workflow(
     registry.register(Box::new(
         SaveStateNode::new().with_runner(noop_git_runner()),
     ));
-    registry.register(Box::new(PatchDocsNode));
+    registry.register(Box::new(PatchDocsNode::new().with_transport(Arc::new(
+        |_config, _prompt| {
+            let outcome = stub_outcome(
+                &json!({ "summary": "no stale docs found", "files_patched": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        },
+    ))));
     registry.register(Box::new(IncrementAttemptNode));
+    registry.register(Box::new(WrapUpNode::new()));
+    registry.register(Box::new(PullRequestNode::new()));
+    registry.register(Box::new(
+        EmitStateNode::new().with_runner(noop_git_runner()),
+    ));
 
-    // `graph::schema()` doesn't declare `IncrementAttemptNode` yet (wiring
-    // it in is EN.3.B task 6's job) — amend a local copy so this test can
-    // exercise the retry-bail fix through the real `Workflow` runner without
-    // touching `graph.rs`. `IncrementAttemptNode -> ImplementTaskNode` is the
-    // declared forward hop out of the increment node; `TriageRouterNode`
-    // fanning out to it too is *only* to satisfy `WorkflowValidator`'s
-    // declared-reachability check (a router may declare >1 connection) — the
-    // actual retry back-edge stays a runtime-only `Router::route` decision
-    // per D42, never walked by the declared-cycle check since edges *out of*
-    // a router are skipped by it.
-    let mut schema = graph::schema();
-    schema.nodes.insert(
-        "IncrementAttemptNode".to_string(),
-        engine_core::schema::NodeConfig::new(
-            "IncrementAttemptNode",
-            vec!["ImplementTaskNode".to_string()],
-        ),
-    );
-    if let Some(triage_router) = schema.nodes.get_mut("TriageRouterNode") {
-        triage_router
-            .connections
-            .push("IncrementAttemptNode".to_string());
-    }
+    let schema = graph::schema();
 
     Workflow::new_validated(registry, schema)
         .expect("SDLC_FLOW declared graph must pass WorkflowValidator::validate")
@@ -281,7 +276,7 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
 
     let workflow = build_workflow(&worktree, implement_calls.clone(), test_runner);
 
-    let event = json!({ "spec_slug": "fixture-spec" });
+    let event = json!({ "spec_slug": "fixture-spec", "auto_pr": false });
     let snapshots: Arc<Mutex<Vec<TaskContext>>> = Arc::new(Mutex::new(Vec::new()));
     let snapshots_handle = snapshots.clone();
     let on_progress: engine_core::OnProgress<'_> =
@@ -342,12 +337,33 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
     assert_eq!(state.tasks[0].attempt_count, 1);
     assert_eq!(state.telemetry.total_attempts, 2);
 
-    // --- The walk terminated at the PatchDocsNode stub ---------------------
+    // --- The walk reaches the full bottom-half tail -------------------------
     let patch_docs_run = final_ctx
         .node_runs
         .get("PatchDocsNode")
         .expect("PatchDocsNode should be present in node_runs");
     assert_eq!(patch_docs_run.status, NodeRunStatus::Success);
+
+    let wrap_up_result = final_ctx
+        .nodes
+        .get("WrapUpNode")
+        .expect("WrapUpNode should have stamped a result");
+    assert!(wrap_up_result.get("log_entry").is_some());
+    assert!(wrap_up_result.get("report").is_some());
+    assert!(wrap_up_result.get("status_suggestion").is_some());
+
+    let pr_result = final_ctx
+        .nodes
+        .get("PullRequestNode")
+        .expect("PullRequestNode should have stamped a result");
+    assert_eq!(pr_result["skipped"], json!(true));
+    assert_eq!(pr_result["pr_url"], json!(null));
+
+    let emit_state_result = final_ctx
+        .nodes
+        .get("EmitStateNode")
+        .expect("EmitStateNode should have stamped a result");
+    assert_eq!(emit_state_result["emitted"], json!(true));
 
     // --- Parity-shape assertions (contract §6) -----------------------------
     for identity in [
@@ -365,6 +381,9 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "UpdateTaskStatusNode",
         "SaveStateNode",
         "PatchDocsNode",
+        "WrapUpNode",
+        "PullRequestNode",
+        "EmitStateNode",
     ] {
         let run = final_ctx
             .node_runs
@@ -382,7 +401,11 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
     }
 
     // Model nodes carry usage; deterministic nodes don't.
-    for identity in ["ImplementTaskNode", "ConsolidatedReviewNode"] {
+    for identity in [
+        "ImplementTaskNode",
+        "ConsolidatedReviewNode",
+        "PatchDocsNode",
+    ] {
         let run = final_ctx.node_runs.get(identity).unwrap();
         assert!(
             run.usage.is_some(),
@@ -401,7 +424,9 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "ReviewRouterNode",
         "UpdateTaskStatusNode",
         "SaveStateNode",
-        "PatchDocsNode",
+        "WrapUpNode",
+        "PullRequestNode",
+        "EmitStateNode",
     ] {
         let run = final_ctx.node_runs.get(identity).unwrap();
         assert!(
@@ -441,8 +466,9 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
 #[tokio::test]
 async fn workflow_terminal_stub_reachable_when_no_pending_tasks() {
     // A degenerate fixture (task already DONE) exercises the "no pending
-    // task" branch straight through to PatchDocsNode without ever touching
-    // the model nodes.
+    // task" branch straight through PatchDocsNode -> WrapUpNode ->
+    // PullRequestNode -> EmitStateNode without ever touching the task-loop
+    // model nodes.
     let worktree = temp_worktree();
     let spec_dir = worktree.join("planning").join("fixture-spec");
     let state = json!({
@@ -461,7 +487,7 @@ async fn workflow_terminal_stub_reachable_when_no_pending_tasks() {
     let (test_runner, _test_calls) = fail_then_pass_runner();
     let workflow = build_workflow(&worktree, implement_calls.clone(), test_runner);
 
-    let event = json!({ "spec_slug": "fixture-spec" });
+    let event = json!({ "spec_slug": "fixture-spec", "auto_pr": false });
     let final_ctx = workflow
         .run(event, Box::new(|_ctx: &TaskContext| {}))
         .await
