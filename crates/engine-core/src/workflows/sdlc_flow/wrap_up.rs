@@ -9,8 +9,12 @@
 //! `ReviewRouterNode` as well as the natural end of a fully-passing run, so
 //! it must tolerate being reached with any telemetry shape.
 //!
-//! Writes no files itself (the templates are handed back for a later
-//! step/human) — mirrors the Python node exactly.
+//! Renders its three text artifacts for a later step/human (mirrors the
+//! Python node), and additionally persists the resolved-policy + outcomes
+//! snapshot it stamps into `SDLCState` to the on-disk
+//! `planning/{spec_slug}/sdlc-flow-state.json` (EN.3.C task 6 fix) — the
+//! same file `task_loop::SaveStateNode` writes, since `SaveStateNode` never
+//! runs again after `WrapUpNode` in the assembled graph.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -59,6 +63,41 @@ fn civil_from_days(z: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Read the worktree path stamped by `SetupWorktreeNode`, if the run went
+/// through it. Absent in unit tests that drive `WrapUpNode` directly (no
+/// `SetupWorktreeNode` in `ctx`) — those skip the on-disk persist below,
+/// mirroring how `task_loop.rs`'s node tests operate without a worktree.
+fn worktree_path(ctx: &TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")
+        .and_then(|value| value.get("worktree_path"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// Persist `state` (already stamped with `policy`/`outcomes`) to
+/// `planning/{spec_slug}/sdlc-flow-state.json` inside `worktree` — the same
+/// path convention `task_loop::SaveStateNode` writes to. This is the only
+/// point in the run where the resolved policy + outcome summary reach the
+/// durable on-disk state file: `SaveStateNode` runs earlier in the graph
+/// (inside the task loop) and never re-runs after `WrapUpNode`, so without
+/// this write the policy/outcomes blocks are computed here and then
+/// discarded when the run ends.
+fn persist_state(worktree: &str, state: &SDLCState) -> Result<String, NodeError> {
+    let state_dir = std::path::Path::new(worktree)
+        .join("planning")
+        .join(&state.spec_slug);
+    std::fs::create_dir_all(&state_dir).map_err(|err| {
+        NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
+    })?;
+    let state_path = state_dir.join("sdlc-flow-state.json");
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+    std::fs::write(&state_path, json).map_err(|err| {
+        NodeError::new(format!("failed to write {}: {err}", state_path.display()))
+    })?;
+    Ok(state_path.to_string_lossy().to_string())
 }
 
 /// Resolve the most recently mutated `SDLCState`: `UpdateTaskStatusNode`'s
@@ -291,16 +330,27 @@ impl Node for WrapUpNode {
         let state_value = serde_json::to_value(&state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
 
-        put_result(
-            &mut ctx,
-            "WrapUpNode",
-            json!({
-                "log_entry": log_entry,
-                "report": report,
-                "status_suggestion": status_suggestion,
-                "state": state_value,
-            }),
-        );
+        // Persist the policy/outcomes-stamped state to the durable on-disk
+        // file (EN.3.C task 6 fix) when this run went through
+        // `SetupWorktreeNode`. Absent in unit tests that drive `WrapUpNode`
+        // directly with no worktree — that's not a real run, so there is
+        // nothing to persist to.
+        let saved_to = match worktree_path(&ctx) {
+            Some(worktree) => Some(persist_state(&worktree, &state)?),
+            None => None,
+        };
+
+        let mut output = json!({
+            "log_entry": log_entry,
+            "report": report,
+            "status_suggestion": status_suggestion,
+            "state": state_value,
+        });
+        if let Some(saved_to) = saved_to {
+            output["saved_to"] = json!(saved_to);
+        }
+
+        put_result(&mut ctx, "WrapUpNode", output);
 
         Ok(ctx)
     }
@@ -598,6 +648,102 @@ mod tests {
             "sonnet"
         );
         assert_eq!(state_b.outcomes.unwrap().model_tier_used["review"], "local");
+    }
+
+    fn temp_worktree() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-core-sdlc-flow-wrap-up-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn wrap_up_persists_policy_and_outcomes_to_on_disk_state_file() {
+        use crate::workflows::sdlc_flow::policy::{ModelTier, ModelTiers, SdlcPolicy};
+
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        task.attempt_count = 2;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 2;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                triage: ModelTier::Haiku,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PASS", "summary": "s", "issues": [] }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"]
+            .as_str()
+            .expect("saved_to present when a worktree is set");
+        assert!(saved_to.ends_with("sdlc-flow-state.json"));
+
+        // Re-read the actual on-disk file the aggregator (task 7) reads
+        // from — not the transient ctx output — to confirm the policy +
+        // outcomes blocks are populated there.
+        let on_disk = std::fs::read_to_string(saved_to).expect("state file exists on disk");
+        let on_disk_state: SDLCState =
+            serde_json::from_str(&on_disk).expect("on-disk file parses as SDLCState");
+
+        let stamped_policy = on_disk_state
+            .policy
+            .expect("policy block populated on disk");
+        assert_eq!(stamped_policy, policy);
+
+        let outcomes = on_disk_state
+            .outcomes
+            .expect("outcomes block populated on disk");
+        assert_eq!(outcomes.total_attempts, 2);
+        assert_eq!(outcomes.tasks_passed, 1);
+        assert_eq!(outcomes.tasks_failed, 0);
+        assert_eq!(outcomes.total_retries, 1);
+        assert_eq!(
+            outcomes.review_verdicts,
+            vec!["ConsolidatedReviewNode:PASS".to_string()]
+        );
+        assert_eq!(outcomes.model_tier_used["triage"], "haiku");
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_skips_disk_persist_without_a_worktree() {
+        let state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        let ctx = ctx_with_state(&state);
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        assert!(result.get("saved_to").is_none());
     }
 
     #[test]
