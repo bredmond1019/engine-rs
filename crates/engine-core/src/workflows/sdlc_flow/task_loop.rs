@@ -25,8 +25,102 @@ use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
+use super::policy::{ModelTier, OutputVerbosity, SdlcPolicy};
 use super::schema::{SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
+use super::setup::RESOLVED_POLICY_IDENTITY;
 use super::{get_result, put_result, CommandOutput, CommandRunner, ModelTransport};
+
+/// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
+/// anchor when `policy.prompt_cache` is true (lever #2b). `claude-code-rs`'s
+/// `Config` has no dedicated `cache_control` field, so the seam this Config
+/// type exposes is `system_prompt`: keeping it byte-identical across calls
+/// gives the underlying `claude` CLI a stable prefix to cache against,
+/// instead of folding the same boilerplate into the ever-changing per-call
+/// prompt string.
+const STABLE_SYSTEM_PROMPT: &str =
+    "You are running inside the engine-rs SDLC Flow task loop. This system \
+     prompt is held constant across calls so its tokens can be cached.";
+
+/// Stage identity used to look up the resolved policy's per-stage
+/// [`ModelTier`] (`policy::ModelTiers` field names).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Implement,
+    Triage,
+    Review,
+}
+
+/// Read the resolved [`SdlcPolicy`] stamped by `SetupWorktreeNode`
+/// (`setup::RESOLVED_POLICY_IDENTITY`). Falls back to the built-in default
+/// (today's hardcoded behavior) when absent or unparsable — defensive, so a
+/// ctx driven directly in a unit test (no `SetupWorktreeNode` run) still
+/// gets sane behavior rather than an error.
+fn resolved_policy(ctx: &TaskContext) -> SdlcPolicy {
+    get_result(ctx, RESOLVED_POLICY_IDENTITY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Map a stage's resolved [`ModelTier`] to a concrete `claude` CLI model
+/// string. `Local` resolves to the policy's configured local model name for
+/// display/bookkeeping purposes only — routing a `local`-tier stage through
+/// `openai_compat_transport` instead of the real `claude` CLI is EN.3.C
+/// task 5's `with_transport` injection in `graph.rs`; this function only
+/// picks the tier, never the transport.
+fn model_tier_to_model_string(tier: ModelTier, policy: &SdlcPolicy) -> String {
+    match tier {
+        ModelTier::Sonnet => "claude-sonnet-4-5".to_string(),
+        ModelTier::Haiku => "claude-haiku-4-5".to_string(),
+        ModelTier::Opus => "claude-opus-4-8".to_string(),
+        ModelTier::Local => policy.local.model.clone(),
+    }
+}
+
+/// Prompt directive injected when `output_verbosity` deviates from the
+/// baseline `Normal` (lever #2a). `Normal` intentionally injects nothing so
+/// the built-in-default prompt text is byte-identical to pre-EN.3.C.
+fn output_verbosity_directive(verbosity: OutputVerbosity) -> Option<&'static str> {
+    match verbosity {
+        OutputVerbosity::Normal => None,
+        OutputVerbosity::Terse => Some(
+            "\n\nBe terse: keep your response as short as possible while still \
+             satisfying the request. Target well under 200 output tokens where \
+             the task allows it.",
+        ),
+        OutputVerbosity::Verbose => Some(
+            "\n\nBe thorough: explain your reasoning and any trade-offs in \
+             detail before giving the final answer.",
+        ),
+    }
+}
+
+/// Apply the resolved policy's model-tier + prompt-cache knobs to a stage's
+/// `Config`, then append the `output_verbosity` directive to `prompt`.
+/// Returns `(config, prompt)`.
+fn apply_policy(
+    mut config: Config,
+    prompt: String,
+    policy: &SdlcPolicy,
+    stage: Stage,
+) -> (Config, String) {
+    let tier = match stage {
+        Stage::Implement => policy.model_tiers.implement,
+        Stage::Triage => policy.model_tiers.triage,
+        Stage::Review => policy.model_tiers.review,
+    };
+    config.model = Some(model_tier_to_model_string(tier, policy));
+
+    if policy.prompt_cache {
+        config.system_prompt = Some(STABLE_SYSTEM_PROMPT.to_string());
+    }
+
+    let prompt = match output_verbosity_directive(policy.output_verbosity) {
+        Some(directive) => format!("{prompt}{directive}"),
+        None => prompt,
+    };
+
+    (config, prompt)
+}
 
 /// A review with more than this many distinct issues is treated as a
 /// structural failure (re-implementation is unlikely to converge) rather
@@ -234,7 +328,10 @@ impl Node for ImplementTaskNode {
              {description}\nAcceptance criteria: {acceptance_criteria}"
         );
 
-        let mut step = ClaudeCodeStep::new("ImplementTaskNode", self.config.clone(), prompt);
+        let policy = resolved_policy(&ctx);
+        let (config, prompt) = apply_policy(self.config.clone(), prompt, &policy, Stage::Implement);
+
+        let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -621,7 +718,10 @@ impl Node for TriageTaskNode {
             attempt_count + 1
         );
 
-        let mut step = ClaudeCodeStep::new("TriageTaskNode", self.config.clone(), prompt);
+        let policy = resolved_policy(&ctx);
+        let (config, prompt) = apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
+
+        let mut step = ClaudeCodeStep::new("TriageTaskNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -764,7 +864,10 @@ impl Node for ConsolidatedReviewNode {
              {acceptance_criteria}\n\nDiff:\n{diff}"
         );
 
-        let mut step = ClaudeCodeStep::new("ConsolidatedReviewNode", self.config.clone(), prompt);
+        let policy = resolved_policy(&ctx);
+        let (config, prompt) = apply_policy(self.config.clone(), prompt, &policy, Stage::Review);
+
+        let mut step = ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -1088,6 +1191,7 @@ fn log_noop_commit(_stderr: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflows::sdlc_flow::policy::ModelTiers;
     use claude_code_rs::Outcome;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1641,6 +1745,279 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(*diff_called.lock().unwrap());
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
+    // --- Policy consumption (EN.3.C task 3) ---------------------------------
+
+    /// Stamp a resolved [`SdlcPolicy`] into `ctx` under the same identity
+    /// `SetupWorktreeNode` uses, so a node's `resolved_policy(&ctx)` read
+    /// sees it.
+    fn ctx_with_policy(mut ctx: TaskContext, policy: &SdlcPolicy) -> TaskContext {
+        put_result(
+            &mut ctx,
+            RESOLVED_POLICY_IDENTITY,
+            serde_json::to_value(policy).expect("SdlcPolicy serializes"),
+        );
+        ctx
+    }
+
+    fn canned_outcome(text: String) -> Outcome {
+        Outcome {
+            cost_usd: 0.0,
+            usage: claude_code_rs::parse::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            model_usage: std::collections::BTreeMap::new(),
+            text,
+            is_error: false,
+            api_error_status: None,
+        }
+    }
+
+    /// A node built with `model_tiers.implement = haiku` produces a
+    /// `Config` carrying the haiku model string.
+    #[tokio::test]
+    async fn implement_node_consumes_resolved_model_tier() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                implement: ModelTier::Haiku,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    /// `output_verbosity = terse` injects the terseness directive into the
+    /// stage prompt; the default (`normal`) leaves the prompt untouched.
+    #[tokio::test]
+    async fn implement_node_injects_terse_directive() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let policy = SdlcPolicy {
+            output_verbosity: OutputVerbosity::Terse,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let seen_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_prompt_clone = seen_prompt.clone();
+        let transport: ModelTransport = Arc::new(move |_config, prompt| {
+            *seen_prompt_clone.lock().unwrap() = Some(prompt);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompt = seen_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert!(prompt.contains("Be terse"));
+    }
+
+    /// The `normal` (default) verbosity injects no directive, reproducing
+    /// the pre-EN.3.C prompt text.
+    #[tokio::test]
+    async fn implement_node_normal_verbosity_adds_no_directive() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+        // No RESOLVED_POLICY_IDENTITY stamped -> falls back to built-in
+        // default, which is `normal`.
+
+        let seen_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_prompt_clone = seen_prompt.clone();
+        let transport: ModelTransport = Arc::new(move |_config, prompt| {
+            *seen_prompt_clone.lock().unwrap() = Some(prompt);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompt = seen_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert!(!prompt.contains("Be terse"));
+        assert!(!prompt.contains("Be thorough"));
+    }
+
+    /// `prompt_cache = true` sets a stable `system_prompt` cache breakpoint
+    /// on the composed `ClaudeCodeStep`'s `Config`; the default
+    /// (`prompt_cache = false`) leaves it unset.
+    #[tokio::test]
+    async fn implement_node_sets_cache_breakpoint_when_prompt_cache_enabled() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let policy = SdlcPolicy {
+            prompt_cache: true,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(config.system_prompt.as_deref(), Some(STABLE_SYSTEM_PROMPT));
+
+        // Baseline: no policy stamped -> falls back to the built-in
+        // default (`prompt_cache = false`) -> no breakpoint set.
+        let ctx2 = ctx_with_current_task(&state, &task);
+        let seen_config2: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config2_clone = seen_config2.clone();
+        let transport2: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config2_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+        let node2 = ImplementTaskNode::new().with_transport(transport2);
+        node2.process(ctx2).await.expect("process should succeed");
+        let config2 = seen_config2
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(config2.system_prompt, None);
+    }
+
+    /// `TriageTaskNode`'s `llm_triage` model branch also consumes the
+    /// resolved policy's `triage` tier.
+    #[tokio::test]
+    async fn triage_node_llm_branch_consumes_resolved_model_tier() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                triage: ModelTier::Opus,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome =
+                canned_outcome(json!({ "verdict": "RETRYABLE", "reason": "r" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = TriageTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(config.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    /// `ConsolidatedReviewNode` consumes the resolved policy's `review`
+    /// tier.
+    #[tokio::test]
+    async fn review_node_consumes_resolved_model_tier() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                review: ModelTier::Haiku,
+                ..ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(
+                json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
     }
 
     // --- SaveStateNode -------------------------------------------------------
