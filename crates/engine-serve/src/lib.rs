@@ -9,6 +9,7 @@ pub mod dispatch;
 pub mod durable;
 pub mod http;
 pub mod live_state;
+pub mod workflows;
 
 /// Placeholder identifying this crate; exists so the workspace has at least one
 /// non-trivial symbol to build and test against before the real types land.
