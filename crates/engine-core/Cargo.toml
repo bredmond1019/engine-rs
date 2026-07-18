@@ -17,3 +17,4 @@ engine-contract = { path = "../engine-contract" }
 
 [dev-dependencies]
 tokio = { workspace = true }
+uuid = { workspace = true }
