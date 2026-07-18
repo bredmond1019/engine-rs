@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::policy::PartialPolicy;
+
 /// Lifecycle states for a single SDLC task (`SDLCTaskStatus` in Python).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +123,13 @@ pub struct SDLCFlowEventSchema {
     /// `RETRYABLE` vs `MAJOR_BAIL` (early-bail heuristic).
     #[serde(default)]
     pub llm_triage: bool,
+    /// Optional per-run policy override (EN.3.C) — the highest-precedence of
+    /// the three `SdlcPolicy` resolution layers (event override >
+    /// `harness.json` `sdlc.policy` defaults > built-in default). Additive:
+    /// every existing field above is untouched byte-for-byte. `None`/absent
+    /// means "no per-run override", falling through to the next layer down.
+    #[serde(default)]
+    pub policy: Option<PartialPolicy>,
 }
 
 /// Parse a task-range string like `"1-3,5"` into a sorted, deduplicated list
@@ -319,6 +328,23 @@ mod tests {
         assert!(event.auto_pr);
         assert_eq!(event.branch_name, None);
         assert!(!event.llm_triage);
+        assert_eq!(event.policy, None);
+    }
+
+    #[test]
+    fn sdlc_flow_event_schema_deserializes_policy_override() {
+        let json = serde_json::json!({
+            "spec_slug": "EN.3.C",
+            "policy": { "output_verbosity": "terse", "max_attempts": 5 },
+        });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes with policy override");
+        let policy = event.policy.expect("policy override present");
+        assert_eq!(
+            policy.output_verbosity,
+            Some(super::super::policy::OutputVerbosity::Terse)
+        );
+        assert_eq!(policy.max_attempts, Some(5));
     }
 
     #[test]

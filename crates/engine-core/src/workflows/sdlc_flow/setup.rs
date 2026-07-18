@@ -22,8 +22,58 @@ use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
+use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
 use super::{get_result, put_result};
+
+/// The `ctx.nodes` identity the resolved policy is stamped under, so every
+/// downstream node reads one resolved value rather than re-deriving it.
+pub const RESOLVED_POLICY_IDENTITY: &str = "ResolvedPolicy";
+
+/// Read `planning/harness.json`'s `sdlc.policy` section (a [`PartialPolicy`])
+/// out of a worktree, if the file and section exist. Reuses the same
+/// `worktree/planning/harness.json` path `TestTaskNode` reads
+/// (`task_loop.rs`) rather than duplicating its check-running logic — this
+/// helper only cares about the `sdlc.policy` subsection.
+fn read_harness_policy_defaults(worktree: &Path) -> Result<Option<PartialPolicy>, NodeError> {
+    let harness_path = worktree.join("planning").join("harness.json");
+    if !harness_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
+        NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
+    })?;
+    let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
+    })?;
+
+    let Some(policy_value) = harness.get("sdlc").and_then(|v| v.get("policy")) else {
+        return Ok(None);
+    };
+
+    let partial: PartialPolicy = serde_json::from_value(policy_value.clone()).map_err(|err| {
+        NodeError::new(format!(
+            "failed to parse {} sdlc.policy: {err}",
+            harness_path.display()
+        ))
+    })?;
+    Ok(Some(partial))
+}
+
+/// Resolve the three-layer [`SdlcPolicy`] for this run: the inbound event's
+/// `policy` override, the worktree's `planning/harness.json` `sdlc.policy`
+/// defaults, and the built-in default, high->low precedence via
+/// [`policy::resolve`].
+pub fn resolve_policy_for_run(ctx: &TaskContext, worktree: &Path) -> Result<SdlcPolicy, NodeError> {
+    let event = parse_event(ctx)?;
+    let harness_defaults = read_harness_policy_defaults(worktree)?;
+    Ok(policy::resolve(
+        SdlcPolicy::default(),
+        harness_defaults.as_ref(),
+        event.policy.as_ref(),
+    ))
+}
 
 pub use super::{default_command_runner, CommandOutput, CommandRunner, ModelTransport};
 
@@ -128,8 +178,15 @@ impl Node for SetupWorktreeNode {
         put_result(
             &mut ctx,
             "SetupWorktreeNode",
-            json!({ "worktree_path": worktree_path, "branch_name": branch }),
+            json!({ "worktree_path": worktree_path.clone(), "branch_name": branch }),
         );
+
+        let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&worktree_path))?;
+        let policy_value = serde_json::to_value(&resolved_policy).map_err(|err| {
+            NodeError::new(format!("failed to serialize resolved SdlcPolicy: {err}"))
+        })?;
+        put_result(&mut ctx, RESOLVED_POLICY_IDENTITY, policy_value);
+
         Ok(ctx)
     }
 
@@ -586,6 +643,65 @@ mod tests {
             recorded[1][0..2],
             ["worktree".to_string(), "remove".to_string()]
         );
+    }
+
+    // --- policy resolution ---------------------------------------------------
+
+    #[test]
+    fn harness_policy_defaults_override_builtin() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            json!({ "sdlc": { "policy": { "max_attempts": 5 } } }).to_string(),
+        )
+        .unwrap();
+
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved.max_attempts, 5);
+    }
+
+    #[test]
+    fn event_policy_override_beats_harness_default() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            json!({ "sdlc": { "policy": { "max_attempts": 5 } } }).to_string(),
+        )
+        .unwrap();
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "policy": { "max_attempts": 7 },
+        }));
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved.max_attempts, 7);
+    }
+
+    #[test]
+    fn no_harness_json_falls_through_to_builtin_default() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved, super::super::policy::SdlcPolicy::default());
+    }
+
+    #[tokio::test]
+    async fn setup_worktree_node_stamps_resolved_policy_into_ctx() {
+        let node = SetupWorktreeNode::new().with_runner(stub_runner(0));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let policy = out
+            .nodes
+            .get(RESOLVED_POLICY_IDENTITY)
+            .expect("resolved policy present in ctx after setup");
+        assert_eq!(policy["max_attempts"], 3);
+        assert_eq!(policy["review_mode"], "per_task");
     }
 
     // --- GenerateTasksNode --------------------------------------------------

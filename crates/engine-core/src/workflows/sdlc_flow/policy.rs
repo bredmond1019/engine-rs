@@ -160,7 +160,7 @@ impl Default for SdlcPolicy {
 /// Every field left `None` falls through to the next-lower-precedence
 /// layer; `close_out` is deep-merged field-by-field via `PartialCloseOut`
 /// rather than all-or-nothing.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialPolicy {
     pub output_verbosity: Option<OutputVerbosity>,
@@ -177,7 +177,7 @@ pub struct PartialPolicy {
 }
 
 /// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialModelTiers {
     pub implement: Option<ModelTier>,
@@ -188,7 +188,7 @@ pub struct PartialModelTiers {
 }
 
 /// All-optional mirror of [`LocalConfig`].
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialLocalConfig {
     pub endpoint: Option<String>,
@@ -197,7 +197,7 @@ pub struct PartialLocalConfig {
 }
 
 /// All-optional mirror of [`CloseOutReuse`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialCloseOutReuse {
     pub validation: Option<bool>,
@@ -206,7 +206,7 @@ pub struct PartialCloseOutReuse {
 }
 
 /// All-optional mirror of [`CloseOut`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialCloseOut {
     pub reuse: Option<PartialCloseOutReuse>,
