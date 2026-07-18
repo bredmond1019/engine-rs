@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-18T12:34:00Z"
+timestamp: "2026-07-18T17:33:35Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,22 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-18]
+
+### EN.3.B — SDLC-flow docs/wrapup/PR port merged
+- **What:** Closed out EN.3.B-sdlc-flow-docs-wrapup-pr: docs step required no changes (nothing
+  stale after the 8-task implementation + PASS review). Opened PR #5
+  (https://github.com/bredmond1019/engine-rs/pull/5). CI on the PR failed on the fmt/clippy/test/
+  build job, but investigation confirmed this is pre-existing and unrelated to this PR — the Cargo
+  workspace carries a path dependency on `../claude-code-rs` that isn't checked out in CI, and the
+  last 2 CI runs on `main` failed with the identical error before this PR existed. Squash-merged
+  PR #5 into main as commit `c5bddce`, deleted the remote branch, then rebased local `main` onto
+  `origin/main`, resolving a `log.md` conflict by keeping both the new EN.3.B entry and the
+  previously-committed economics-analysis entry (EN.3.B listed first, newer). Local `main` is now
+  clean and in sync with `origin/main`.
+- **Why:** Continuing EN.3.A's SDLC-flow port work; EN.3.B was the last block before EN.3.C
+  (tunable run-policy config + experiment telemetry), which is next per the master-plan.
+- **Refs:** PR #5 (https://github.com/bredmond1019/engine-rs/pull/5), commit `c5bddce`, spec
+  `EN.3.B-sdlc-flow-docs-wrapup-pr`
 
 ### EN.3.B — SDLC-flow docs/wrap-up/PR port + parity acceptance (PASS)
 Ported the bottom half of the SDLC-flow pipeline into `engine-core::workflows::sdlc_flow` across
