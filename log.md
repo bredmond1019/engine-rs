@@ -18,6 +18,39 @@ related: [status, context]
 
 ## [run: 2026-07-18]
 
+### EN.3.B — SDLC-flow docs/wrap-up/PR port + parity acceptance (PASS)
+Ported the bottom half of the SDLC-flow pipeline into `engine-core::workflows::sdlc_flow` across
+8 tasks, all passing first-attempt. Tasks 1-2 hoisted the duplicated `put_result`/`get_result` +
+`CommandOutput`/`CommandRunner`/`ModelTransport`/`default_command_runner` seams into `mod.rs` and
+built `PatchDocsNode` (Sonnet-backed, parses model JSON for stale-docs patches). Tasks 3-4 added the
+deterministic tail nodes `WrapUpNode` (template-rendered PASS/PARTIAL-FAIL report via an injectable
+clock seam, no model call), `PullRequestNode` (git push + `gh pr create` via the runner seam, D25
+no-auto-merge, no-op when `auto_pr` is false), and `EmitStateNode` (`mev emit-state --write` via the
+runner seam). Task 5 fixed the EN.3.A retry-bail known-issue: added `IncrementAttemptNode` as the
+real target of both retry back-edges (`TriageRouterNode` RETRYABLE, `ReviewRouterNode` minor
+FAIL/PARTIAL) and fixed a latent bug where `TriageTaskNode` read a frozen dispatch-time attempt
+count instead of live state, so the bail gate had never actually fired. Task 6 assembled the full
+`SDLC_FLOW` graph in `graph.rs` (17 node identities, declared-acyclic per D42, back-edges runtime-
+only), replacing the old terminal `PatchDocsNode` stub. Task 7 added a hermetic end-to-end
+integration test (`tests/sdlc_flow_e2e.rs`) driving the whole assembled graph — happy path (both
+`auto_pr` values), the never-passing-task retry-bail path, and durable `EventsRow` round-trip
+parity — and surfaced (but did not fix, out of scope) a related finding: `WrapUpNode`'s own
+`latest_state` doesn't consider `IncrementAttemptNode`'s output, so it renders a stale PASS-looking
+report on the MAJOR_BAIL path. Task 8 ran the full validation suite (fmt/clippy/test/build) clean.
+Final verdict: PASS. Both EN.3.A review findings from the prior session (retry-bail, seam
+duplication) are now resolved. Next: EN.3.C — tunable run-policy config + experiment telemetry.
+
+```
+e48bb38 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task7
+b23c8d0 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task6
+55dd7ec feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task5
+0916345 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task4
+1f6315a feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task3
+5ce2060 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task2
+29a9c30 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task1
+f6bab3c docs: log SDLC economics analysis + EN.3.A review findings
+```
+
 ### SDLC token/time economics analysis + EN.3.A review findings; EN.3.B/EN.3.C scoping
 - **What:** Ran a token/cost/time economics analysis of the SDLC pipeline (engine-rs
   deterministic-node port vs. the 100%-agent-led `sdlc-flow.js`), grounded in real telemetry from
