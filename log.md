@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-18T17:33:35Z"
+timestamp: "2026-07-18T23:47:11Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,34 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-18]
+
+### SDLC Flow reference docs + live integration test (bugfixes)
+- **What:** Wrote SDLC Flow reference docs (`docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`)
+  and a live integration test (`crates/engine-core/tests/sdlc_flow_live.rs`) exercising real Claude
+  Code CLI calls through `ImplementTaskNode`, `TriageTaskNode`'s `llm_triage` branch, and
+  `ConsolidatedReviewNode`. Writing that test surfaced and fixed 5 real production bugs:
+  1. `ImplementTaskNode`/`ConsolidatedReviewNode` were missing `Config.cwd` (real calls ran in the
+     wrong directory).
+  2. No headless tool-permission wiring — added `Config.dangerously_skip_permissions` to
+     `claude-code-rs`.
+  3. Real replies wrap JSON in markdown fences — added `strip_json_fence` at all 5 model-output
+     parse sites.
+  4. Case-sensitive verdict routing would silently dead-end a run on a lowercase `"pass"`/`"fail"`
+     reply — normalized to uppercase after parsing.
+
+  (Narrative counts "5 real production bugs" but only 4 are enumerated above — logging the
+  discrepancy as-is rather than inventing a fifth.) All fixes are covered by new hermetic unit
+  tests; the full gated suite is green in both engine-rs and claude-code-rs (155 lib tests, up
+  from 147). Cleared 3 stale `state.json` carryover entries whose conditions had already resolved
+  (`en3a-retry-loop-no-bail`, `sdlc-flow-seam-duplication`, `local-llm-tier-investigation`) and
+  added one new one: `review-retry-no-attempt-cap` — a discovered-but-unfixed gap where the
+  review↔implement retry loop has no attempt cap independent of `TriageTaskNode`'s test-failure
+  path.
+- **Why:** Needed real (non-mocked) CLI-call coverage for the SDLC Flow task loop to validate the
+  policy/routing work landed in EN.3.C actually holds up against a live Claude Code CLI, and to
+  document the workflow + policy surface for future blocks.
+- **Refs:** `docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`,
+  `crates/engine-core/tests/sdlc_flow_live.rs`, `planning/state.json` (carryover updates)
 
 ### EN.3.C — Tunable run-policy config + experiment telemetry (PASS)
 Implemented the three-layer `SdlcPolicy` (event override > `harness.json` `sdlc.policy` defaults >
