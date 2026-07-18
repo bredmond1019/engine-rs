@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-18T04:46:56Z"
+timestamp: "2026-07-18T12:34:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,62 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-18]
+
+### EN.3.B — SDLC-flow docs/wrap-up/PR port + parity acceptance (PASS)
+Ported the bottom half of the SDLC-flow pipeline into `engine-core::workflows::sdlc_flow` across
+8 tasks, all passing first-attempt. Tasks 1-2 hoisted the duplicated `put_result`/`get_result` +
+`CommandOutput`/`CommandRunner`/`ModelTransport`/`default_command_runner` seams into `mod.rs` and
+built `PatchDocsNode` (Sonnet-backed, parses model JSON for stale-docs patches). Tasks 3-4 added the
+deterministic tail nodes `WrapUpNode` (template-rendered PASS/PARTIAL-FAIL report via an injectable
+clock seam, no model call), `PullRequestNode` (git push + `gh pr create` via the runner seam, D25
+no-auto-merge, no-op when `auto_pr` is false), and `EmitStateNode` (`mev emit-state --write` via the
+runner seam). Task 5 fixed the EN.3.A retry-bail known-issue: added `IncrementAttemptNode` as the
+real target of both retry back-edges (`TriageRouterNode` RETRYABLE, `ReviewRouterNode` minor
+FAIL/PARTIAL) and fixed a latent bug where `TriageTaskNode` read a frozen dispatch-time attempt
+count instead of live state, so the bail gate had never actually fired. Task 6 assembled the full
+`SDLC_FLOW` graph in `graph.rs` (17 node identities, declared-acyclic per D42, back-edges runtime-
+only), replacing the old terminal `PatchDocsNode` stub. Task 7 added a hermetic end-to-end
+integration test (`tests/sdlc_flow_e2e.rs`) driving the whole assembled graph — happy path (both
+`auto_pr` values), the never-passing-task retry-bail path, and durable `EventsRow` round-trip
+parity — and surfaced (but did not fix, out of scope) a related finding: `WrapUpNode`'s own
+`latest_state` doesn't consider `IncrementAttemptNode`'s output, so it renders a stale PASS-looking
+report on the MAJOR_BAIL path. Task 8 ran the full validation suite (fmt/clippy/test/build) clean.
+Final verdict: PASS. Both EN.3.A review findings from the prior session (retry-bail, seam
+duplication) are now resolved. Next: EN.3.C — tunable run-policy config + experiment telemetry.
+
+```
+e48bb38 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task7
+b23c8d0 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task6
+55dd7ec feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task5
+0916345 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task4
+1f6315a feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task3
+5ce2060 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task2
+29a9c30 feat: implement EN.3.B-sdlc-flow-docs-wrapup-pr-task1
+f6bab3c docs: log SDLC economics analysis + EN.3.A review findings
+```
+
+### SDLC token/time economics analysis + EN.3.A review findings; EN.3.B/EN.3.C scoping
+- **What:** Ran a token/cost/time economics analysis of the SDLC pipeline (engine-rs
+  deterministic-node port vs. the 100%-agent-led `sdlc-flow.js`), grounded in real telemetry from
+  66 past flow runs — captured in `planning/sdlc-token-time-economics/notes.md`. Ranked improvement
+  levers (#2a coding-output terseness ~$14.6/66runs is the biggest cost+time lever; #1 close-out
+  redundancy dedup ~$10; #3 tier/skip gates; #2b prompt caching secondary). Designed the run-tail
+  structured-output approach (push judgment into loop-node structured output so wrap-up/PR/handoff/
+  emit-state are 0-model-token template renders) and confirmed `claude-code-rs` has no native
+  schema-constrained output (must prompt-and-parse). EN.3.A shipped via `/sdlc-flow` (tasks 1-7 all
+  PASS first-attempt); reviewed the committed code and found two issues: the retry loop has no
+  attempt-based bail (`attempt_count` never increments on the RETRYABLE back-edge), and the
+  `put_result`/runner/transport seams are duplicated across `setup.rs`/`task_loop.rs`. Updated
+  master-plan: added a deterministic `EmitStateNode` to EN.3.B + logged the retry-bail fix there,
+  and added a new EN.3.C block (tunable run-policy config + experiment telemetry — levers #1-#3 as
+  per-run dials). Wrote handoff prompting the next agent to review this work and investigate a
+  local LLM on a 32GB M2 as a model tier vs. dropping to Haiku.
+- **Why:** The user asked how much the deterministic-node port saves and how to push cost/time/
+  limits further; the analysis reframed the endgame (the money+time live in the expensive Sonnet
+  coding path + close-out redundancy, not the cheap Haiku stages the deterministic nodes replace).
+  The review findings and new blocks turn that into actionable roadmap work.
+- **Refs:** `planning/sdlc-token-time-economics/notes.md`, `master-plan.md` EN.3.B/EN.3.C,
+  `planning/handoff.md`
 
 ### Ported the SDLC-flow top half (setup + task loop) into engine-core
 - **What:** Ran EN.3.A-sdlc-flow-setup-task-loop through `/sdlc-flow` (tasks 1-7, all passed on

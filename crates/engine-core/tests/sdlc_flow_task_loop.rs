@@ -19,22 +19,23 @@
 //! `PatchDocsNode`) runs for real against fixture files written to the temp
 //! worktree, exercising the same code path production traffic would use.
 //!
-//! **Telemetry note (documented deviation from the task-decomposition
-//! prose):** `UpdateTaskStatusNode` — ported faithfully from
-//! `orchestrator/app/workflows/sdlc_flow_workflow_nodes/task_queue_router_node.py`
-//! / `triage_task_node.py` — is only reached via `ReviewRouterNode`'s `PASS`
-//! branch (after a task's *final*, passing review), never via
-//! `TriageRouterNode`'s `RETRYABLE` back-edge (which routes straight back to
-//! `ImplementTaskNode`, bypassing `UpdateTaskStatusNode`/`SaveStateNode`
-//! entirely — see `sdlc_flow_workflow.py`'s module docstring graph). So for
-//! a single-task fixture, `SDLCTelemetry.total_attempts` reaches `1` (one
-//! `UpdateTaskStatusNode` call, at the task's eventual PASS), not `2`, no
-//! matter how many retry back-edges fired in between; only `tasks_passed`
-//! and the retry-back-edge count are sensitive to intra-task retries. This
-//! test asserts the two-value pair that is actually reachable
-//! (`total_attempts == 1`, `tasks_passed == 1`) alongside direct proof that
-//! the retry back-edge fired (`ImplementTaskNode` ran twice). See this
-//! spec's Amendment Log.
+//! **Retry-bail fix (EN.3.B task 5):** `TriageRouterNode`'s `RETRYABLE`
+//! back-edge no longer routes straight to `ImplementTaskNode` — it routes
+//! through `IncrementAttemptNode` first, which bumps the durable state's
+//! `attempt_count`/`telemetry.total_attempts` before handing off to
+//! `ImplementTaskNode` for the retry. The wiring lives in the real
+//! `graph::schema()` (EN.3.B task 6) now, so this test uses it unamended.
+//! For this single-task, one-retry fixture, `SDLCTelemetry.total_attempts`
+//! now correctly reaches `2` (one `IncrementAttemptNode` bump for the retry,
+//! one `UpdateTaskStatusNode` bump at the task's eventual PASS) and
+//! `task.attempt_count` reaches `1`.
+//!
+//! **Bottom-half tail (EN.3.B task 6):** the declared graph no longer stops
+//! at `PatchDocsNode` — it continues `PatchDocsNode -> WrapUpNode ->
+//! PullRequestNode -> EmitStateNode`. This test stubs `PatchDocsNode`'s
+//! model transport, drives the fixture event with `auto_pr: false` so
+//! `PullRequestNode` no-ops without touching git/gh, and stubs
+//! `EmitStateNode`'s runner so no real `mev` subprocess spawns.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,14 +45,19 @@ use claude_code_rs::Outcome;
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
-use engine_core::workflows::sdlc_flow::graph::{self, PatchDocsNode};
+use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
+use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
+use engine_core::workflows::sdlc_flow::graph;
+use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
 use engine_core::workflows::sdlc_flow::setup::{
     CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode, SpecExistsRouterNode,
 };
 use engine_core::workflows::sdlc_flow::task_loop::{
-    ConsolidatedReviewNode, ImplementTaskNode, ReviewRouterNode, SaveStateNode,
-    TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode, UpdateTaskStatusNode,
+    ConsolidatedReviewNode, ImplementTaskNode, IncrementAttemptNode, ReviewRouterNode,
+    SaveStateNode, TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode,
+    UpdateTaskStatusNode,
 };
+use engine_core::workflows::sdlc_flow::wrap_up::WrapUpNode;
 use serde_json::json;
 
 /// Replaces the real `SetupWorktreeNode` for this test: writes a controlled
@@ -239,9 +245,24 @@ fn build_workflow(
     registry.register(Box::new(
         SaveStateNode::new().with_runner(noop_git_runner()),
     ));
-    registry.register(Box::new(PatchDocsNode));
+    registry.register(Box::new(PatchDocsNode::new().with_transport(Arc::new(
+        |_config, _prompt| {
+            let outcome = stub_outcome(
+                &json!({ "summary": "no stale docs found", "files_patched": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        },
+    ))));
+    registry.register(Box::new(IncrementAttemptNode));
+    registry.register(Box::new(WrapUpNode::new()));
+    registry.register(Box::new(PullRequestNode::new()));
+    registry.register(Box::new(
+        EmitStateNode::new().with_runner(noop_git_runner()),
+    ));
 
-    Workflow::new_validated(registry, graph::schema())
+    let schema = graph::schema();
+
+    Workflow::new_validated(registry, schema)
         .expect("SDLC_FLOW declared graph must pass WorkflowValidator::validate")
 }
 
@@ -255,7 +276,7 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
 
     let workflow = build_workflow(&worktree, implement_calls.clone(), test_runner);
 
-    let event = json!({ "spec_slug": "fixture-spec" });
+    let event = json!({ "spec_slug": "fixture-spec", "auto_pr": false });
     let snapshots: Arc<Mutex<Vec<TaskContext>>> = Arc::new(Mutex::new(Vec::new()));
     let snapshots_handle = snapshots.clone();
     let on_progress: engine_core::OnProgress<'_> =
@@ -309,18 +330,40 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
     );
     assert_eq!(state.telemetry.tasks_passed, 1);
     assert_eq!(state.telemetry.tasks_failed, 0);
-    // See the module doc's "Telemetry note": UpdateTaskStatusNode only runs
-    // once per task (at its eventual PASS through ReviewRouterNode), never
-    // on the TriageRouterNode RETRYABLE back-edge, so total_attempts reaches
-    // 1 here regardless of how many retries preceded it.
-    assert_eq!(state.telemetry.total_attempts, 1);
+    // Retry-bail fix (EN.3.B task 5): IncrementAttemptNode bumps
+    // attempt_count/total_attempts once for the retry back-edge, then
+    // UpdateTaskStatusNode bumps total_attempts again at the eventual PASS —
+    // see the module doc's "Retry-bail fix" note.
+    assert_eq!(state.tasks[0].attempt_count, 1);
+    assert_eq!(state.telemetry.total_attempts, 2);
 
-    // --- The walk terminated at the PatchDocsNode stub ---------------------
+    // --- The walk reaches the full bottom-half tail -------------------------
     let patch_docs_run = final_ctx
         .node_runs
         .get("PatchDocsNode")
         .expect("PatchDocsNode should be present in node_runs");
     assert_eq!(patch_docs_run.status, NodeRunStatus::Success);
+
+    let wrap_up_result = final_ctx
+        .nodes
+        .get("WrapUpNode")
+        .expect("WrapUpNode should have stamped a result");
+    assert!(wrap_up_result.get("log_entry").is_some());
+    assert!(wrap_up_result.get("report").is_some());
+    assert!(wrap_up_result.get("status_suggestion").is_some());
+
+    let pr_result = final_ctx
+        .nodes
+        .get("PullRequestNode")
+        .expect("PullRequestNode should have stamped a result");
+    assert_eq!(pr_result["skipped"], json!(true));
+    assert_eq!(pr_result["pr_url"], json!(null));
+
+    let emit_state_result = final_ctx
+        .nodes
+        .get("EmitStateNode")
+        .expect("EmitStateNode should have stamped a result");
+    assert_eq!(emit_state_result["emitted"], json!(true));
 
     // --- Parity-shape assertions (contract §6) -----------------------------
     for identity in [
@@ -332,11 +375,15 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "TestTaskNode",
         "TriageTaskNode",
         "TriageRouterNode",
+        "IncrementAttemptNode",
         "ConsolidatedReviewNode",
         "ReviewRouterNode",
         "UpdateTaskStatusNode",
         "SaveStateNode",
         "PatchDocsNode",
+        "WrapUpNode",
+        "PullRequestNode",
+        "EmitStateNode",
     ] {
         let run = final_ctx
             .node_runs
@@ -354,7 +401,11 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
     }
 
     // Model nodes carry usage; deterministic nodes don't.
-    for identity in ["ImplementTaskNode", "ConsolidatedReviewNode"] {
+    for identity in [
+        "ImplementTaskNode",
+        "ConsolidatedReviewNode",
+        "PatchDocsNode",
+    ] {
         let run = final_ctx.node_runs.get(identity).unwrap();
         assert!(
             run.usage.is_some(),
@@ -369,10 +420,13 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "TestTaskNode",
         "TriageTaskNode",
         "TriageRouterNode",
+        "IncrementAttemptNode",
         "ReviewRouterNode",
         "UpdateTaskStatusNode",
         "SaveStateNode",
-        "PatchDocsNode",
+        "WrapUpNode",
+        "PullRequestNode",
+        "EmitStateNode",
     ] {
         let run = final_ctx.node_runs.get(identity).unwrap();
         assert!(
@@ -412,8 +466,9 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
 #[tokio::test]
 async fn workflow_terminal_stub_reachable_when_no_pending_tasks() {
     // A degenerate fixture (task already DONE) exercises the "no pending
-    // task" branch straight through to PatchDocsNode without ever touching
-    // the model nodes.
+    // task" branch straight through PatchDocsNode -> WrapUpNode ->
+    // PullRequestNode -> EmitStateNode without ever touching the task-loop
+    // model nodes.
     let worktree = temp_worktree();
     let spec_dir = worktree.join("planning").join("fixture-spec");
     let state = json!({
@@ -432,7 +487,7 @@ async fn workflow_terminal_stub_reachable_when_no_pending_tasks() {
     let (test_runner, _test_calls) = fail_then_pass_runner();
     let workflow = build_workflow(&worktree, implement_calls.clone(), test_runner);
 
-    let event = json!({ "spec_slug": "fixture-spec" });
+    let event = json!({ "spec_slug": "fixture-spec", "auto_pr": false });
     let final_ctx = workflow
         .run(event, Box::new(|_ctx: &TaskContext| {}))
         .await

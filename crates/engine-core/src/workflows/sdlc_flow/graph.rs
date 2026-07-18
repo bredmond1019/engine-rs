@@ -1,10 +1,11 @@
-//! Assembles the declared `WorkflowSchema` + `NodeRegistry` for the SDLC
-//! Flow top-half workflow (`workflow_type = "SDLC_FLOW"`).
+//! Assembles the declared `WorkflowSchema` + `NodeRegistry` for the full
+//! SDLC Flow workflow (`workflow_type = "SDLC_FLOW"`).
 //!
-//! Scaffolded in EN.3.A task 1; implemented in EN.3.A task 4.
+//! Scaffolded in EN.3.A task 1; top-half implemented in EN.3.A task 4;
+//! bottom-half (`docs` → `wrap_up` → `pr` → `emit_state`) and the
+//! `IncrementAttemptNode` retry-bail wiring assembled in EN.3.B task 6.
 //!
-//! Declared graph shape (matching the `sdlc_flow_workflow.py` docstring for
-//! the top half):
+//! Declared graph shape (matching the `sdlc_flow_workflow.py` docstring):
 //!
 //! ```text
 //! SetupWorktreeNode -> SpecExistsRouterNode -> { GenerateTasksNode -> LoadTaskStateNode
@@ -13,53 +14,46 @@
 //!                                 -> TriageRouterNode -> ConsolidatedReviewNode
 //!                                 -> ReviewRouterNode -> UpdateTaskStatusNode
 //!                                 -> SaveStateNode -> (loop) TaskQueueRouterNode
-//!                             | PatchDocsNode (terminal stub; EN.3.B replaces it) }
+//!                             | PatchDocsNode -> WrapUpNode -> PullRequestNode
+//!                                 -> EmitStateNode }
+//!
+//! TriageRouterNode    -> { ConsolidatedReviewNode | IncrementAttemptNode | WrapUpNode }
+//! ReviewRouterNode    -> { UpdateTaskStatusNode | IncrementAttemptNode | WrapUpNode }
+//! IncrementAttemptNode -> ImplementTaskNode
 //! ```
 //!
 //! Declared `connections` stay acyclic (per [`crate::validate::WorkflowValidator`]):
 //! every router's declared connections are the runtime-consulted `route()`'s
-//! *forward* branches only. The retry back-edges from `TriageRouterNode`
-//! (`RETRYABLE`) and `ReviewRouterNode` (minor-issue `FAIL`/`PARTIAL`) into
-//! `ImplementTaskNode`, and the `MAJOR_BAIL`/structural-issue branches into the
-//! unregistered `WrapUpNode` identity (an EN.3.B stub, deliberately left out
-//! of this graph's registry and declared connections), are runtime-only —
-//! chosen by `Router::route` and never declared here — per D42
-//! (declared-acyclic / runtime-cyclic). `SaveStateNode` is not a router, so
-//! its loop-closing hop back to `TaskQueueRouterNode` *is* a declared
-//! connection; the validator's cycle check does not flag it because
-//! `TaskQueueRouterNode` is itself a router and its own declared out-edges
-//! are skipped by that check, so no cycle is ever walked end-to-end.
+//! branches, but the retry back-edges (`TriageRouterNode`'s `RETRYABLE` and
+//! `ReviewRouterNode`'s minor `FAIL`/`PARTIAL`, both landing on
+//! `IncrementAttemptNode`, which then forwards to `ImplementTaskNode`) and the
+//! `MAJOR_BAIL`/structural-issue branches into `WrapUpNode` are chosen by
+//! `Router::route` at runtime, never walked by the validator's cycle check —
+//! per D42 (declared-acyclic / runtime-cyclic). The validator's cycle check
+//! does not flag any of this because `TriageRouterNode`/`ReviewRouterNode`/
+//! `TaskQueueRouterNode` are routers and their own declared out-edges are
+//! skipped by that check, so no cycle is ever walked end-to-end — including
+//! through `IncrementAttemptNode -> ImplementTaskNode -> ... -> TriageRouterNode`.
+//! `SaveStateNode` is not a router, so its loop-closing hop back to
+//! `TaskQueueRouterNode` *is* a declared connection, but is likewise never
+//! walked into a cycle for the same reason.
 
 use std::collections::HashMap;
 
-use engine_contract::TaskContext;
-
-use crate::node::{Node, NodeError, NodeRegistry};
+use crate::node::NodeRegistry;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
+use super::docs::PatchDocsNode;
+use super::emit_state::EmitStateNode;
+use super::pr::PullRequestNode;
 use super::setup::{GenerateTasksNode, LoadTaskStateNode, SetupWorktreeNode, SpecExistsRouterNode};
 use super::task_loop::{
-    ConsolidatedReviewNode, ImplementTaskNode, ReviewRouterNode, SaveStateNode,
-    TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode, UpdateTaskStatusNode,
+    ConsolidatedReviewNode, ImplementTaskNode, IncrementAttemptNode, ReviewRouterNode,
+    SaveStateNode, TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode,
+    UpdateTaskStatusNode,
 };
-
-/// Terminal stub identity for the "task queue is empty" branch of
-/// `TaskQueueRouterNode`. EN.3.B replaces this with the real `PatchDocsNode`
-/// (the next stage of the pipeline); here it only needs to exist so the
-/// declared graph is fully reachable and the walk has somewhere to land.
-pub struct PatchDocsNode;
-
-#[async_trait::async_trait]
-impl Node for PatchDocsNode {
-    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        Ok(ctx)
-    }
-
-    fn name(&self) -> &str {
-        "PatchDocsNode"
-    }
-}
+use super::wrap_up::WrapUpNode;
 
 /// The `SDLC_FLOW` workflow's declared identity/type name, used both to
 /// register the workflow (engine-serve, Task 5) and as `WorkflowSchema::workflow_type`.
@@ -118,7 +112,11 @@ pub fn schema() -> WorkflowSchema {
         "TriageRouterNode".to_string(),
         NodeConfig::new(
             "TriageRouterNode",
-            vec!["ConsolidatedReviewNode".to_string()],
+            vec![
+                "ConsolidatedReviewNode".to_string(),
+                "IncrementAttemptNode".to_string(),
+                "WrapUpNode".to_string(),
+            ],
         ),
     );
     nodes.insert(
@@ -130,7 +128,14 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "ReviewRouterNode".to_string(),
-        NodeConfig::new("ReviewRouterNode", vec!["UpdateTaskStatusNode".to_string()]),
+        NodeConfig::new(
+            "ReviewRouterNode",
+            vec![
+                "UpdateTaskStatusNode".to_string(),
+                "IncrementAttemptNode".to_string(),
+                "WrapUpNode".to_string(),
+            ],
+        ),
     );
     nodes.insert(
         "UpdateTaskStatusNode".to_string(),
@@ -141,8 +146,27 @@ pub fn schema() -> WorkflowSchema {
         NodeConfig::new("SaveStateNode", vec!["TaskQueueRouterNode".to_string()]),
     );
     nodes.insert(
+        "IncrementAttemptNode".to_string(),
+        NodeConfig::new(
+            "IncrementAttemptNode",
+            vec!["ImplementTaskNode".to_string()],
+        ),
+    );
+    nodes.insert(
         "PatchDocsNode".to_string(),
-        NodeConfig::new("PatchDocsNode", vec![]),
+        NodeConfig::new("PatchDocsNode", vec!["WrapUpNode".to_string()]),
+    );
+    nodes.insert(
+        "WrapUpNode".to_string(),
+        NodeConfig::new("WrapUpNode", vec!["PullRequestNode".to_string()]),
+    );
+    nodes.insert(
+        "PullRequestNode".to_string(),
+        NodeConfig::new("PullRequestNode", vec!["EmitStateNode".to_string()]),
+    );
+    nodes.insert(
+        "EmitStateNode".to_string(),
+        NodeConfig::new("EmitStateNode", vec![]),
     );
 
     WorkflowSchema::new(WORKFLOW_TYPE, "SetupWorktreeNode", nodes)
@@ -168,7 +192,11 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(ReviewRouterNode));
     registry.register(Box::new(UpdateTaskStatusNode));
     registry.register(Box::new(SaveStateNode::new()));
-    registry.register(Box::new(PatchDocsNode));
+    registry.register(Box::new(IncrementAttemptNode));
+    registry.register(Box::new(PatchDocsNode::new()));
+    registry.register(Box::new(WrapUpNode::new()));
+    registry.register(Box::new(PullRequestNode::new()));
+    registry.register(Box::new(EmitStateNode::new()));
     registry
 }
 
@@ -210,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_thirteen_nodes_plus_patch_docs_stub() {
+    fn registry_contains_all_seventeen_nodes_incl_bottom_half() {
         let registry = registry();
 
         let expected = [
@@ -227,7 +255,11 @@ mod tests {
             "ReviewRouterNode",
             "UpdateTaskStatusNode",
             "SaveStateNode",
+            "IncrementAttemptNode",
             "PatchDocsNode",
+            "WrapUpNode",
+            "PullRequestNode",
+            "EmitStateNode",
         ];
 
         for identity in expected {
@@ -237,6 +269,25 @@ mod tests {
             );
         }
         assert_eq!(registry.len(), expected.len());
+    }
+
+    #[test]
+    fn declared_graph_has_no_dangling_or_unregistered_identity() {
+        let schema = schema();
+        let registry = registry();
+
+        for (identity, config) in &schema.nodes {
+            assert!(
+                registry.contains(identity),
+                "declared node '{identity}' is not registered"
+            );
+            for connection in &config.connections {
+                assert!(
+                    schema.nodes.contains_key(connection),
+                    "'{identity}' declares a connection to unregistered/undeclared '{connection}'"
+                );
+            }
+        }
     }
 
     #[test]
