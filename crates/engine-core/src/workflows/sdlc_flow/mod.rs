@@ -35,6 +35,7 @@ use futures::future::BoxFuture;
 pub mod docs;
 pub mod emit_state;
 pub mod graph;
+pub mod policy;
 pub mod pr;
 pub mod schema;
 pub mod setup;
