@@ -7,9 +7,11 @@
 //! written in the Python source, and every `Option`/`Vec`/numeric default
 //! mirrors the corresponding Pydantic `Field(default=...)`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use super::policy::PartialPolicy;
+use super::policy::{PartialPolicy, SdlcPolicy};
 
 /// Lifecycle states for a single SDLC task (`SDLCTaskStatus` in Python).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +194,59 @@ fn default_global_status() -> String {
     SDLCTaskStatus::Pending.as_str().to_string()
 }
 
+/// Snapshot of a completed (or bailed) run's outcome metrics (EN.3.C task
+/// 6), written once at the run tail (`WrapUpNode`) so `(policy -> outcome)`
+/// pairs can be tabulated across runs by a later cross-run aggregator. All
+/// fields default to zero/empty so a run that never reaches the tail (or a
+/// unit test driving a node in isolation) still round-trips cleanly.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunOutcomes {
+    /// Wall-clock seconds from `SetupWorktreeNode`'s `started_at` to the
+    /// moment this snapshot was computed. `0.0` when the start time is
+    /// unavailable (e.g. a unit test that never ran `SetupWorktreeNode`).
+    #[serde(default)]
+    pub wall_clock_secs: f64,
+    /// Total implement -> test attempts made across every task (mirrors
+    /// `SDLCTelemetry::total_attempts`).
+    #[serde(default)]
+    pub total_attempts: u32,
+    /// Sum, across every task, of attempts beyond its first (i.e. total
+    /// retries triggered by `RETRYABLE`/minor-`FAIL` back-edges).
+    #[serde(default)]
+    pub total_retries: u32,
+    /// Number of tasks that reached `DONE` (mirrors
+    /// `SDLCTelemetry::tasks_passed`).
+    #[serde(default)]
+    pub tasks_passed: u32,
+    /// Number of tasks that reached `FAILED` (mirrors
+    /// `SDLCTelemetry::tasks_failed`).
+    #[serde(default)]
+    pub tasks_failed: u32,
+    /// Review/triage verdicts observed by the time this snapshot was taken
+    /// (e.g. `"TriageTaskNode:RETRYABLE"`, `"ConsolidatedReviewNode:PASS"`);
+    /// empty if neither stage has run.
+    #[serde(default)]
+    pub review_verdicts: Vec<String>,
+    /// Total input tokens summed across every model node's last recorded
+    /// usage in `ctx.node_runs`.
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    /// Total output tokens summed across every model node's last recorded
+    /// usage in `ctx.node_runs`.
+    #[serde(default)]
+    pub total_output_tokens: u64,
+    /// Total dollar cost summed across every model node's last recorded
+    /// `cost_usd` in `ctx.nodes`.
+    #[serde(default)]
+    pub total_cost_usd: f64,
+    /// Per-stage model tier actually used this run, keyed by the resolved
+    /// policy's `ModelTiers` field names (`"implement"`, `"triage"`,
+    /// `"review"`, `"implement_simple"`, `"generate"`) — so
+    /// local-vs-cloud quality is measurable across runs.
+    #[serde(default)]
+    pub model_tier_used: BTreeMap<String, String>,
+}
+
 impl SDLCTaskStatus {
     /// The exact string this status serializes to (Python `StrEnum` value).
     pub fn as_str(&self) -> &'static str {
@@ -226,6 +281,15 @@ pub struct SDLCState {
     /// Aggregate telemetry for this run.
     #[serde(default)]
     pub telemetry: SDLCTelemetry,
+    /// The three-layer-resolved `SdlcPolicy` this run executed under
+    /// (EN.3.C task 6). `None` until `WrapUpNode` stamps it at the run
+    /// tail (or for states from before EN.3.C).
+    #[serde(default)]
+    pub policy: Option<SdlcPolicy>,
+    /// The run's outcome-metrics snapshot (EN.3.C task 6). `None` until
+    /// `WrapUpNode` finalizes it at the run tail.
+    #[serde(default)]
+    pub outcomes: Option<RunOutcomes>,
 }
 
 impl SDLCState {
@@ -239,6 +303,8 @@ impl SDLCState {
             global_status: default_global_status(),
             tasks: Vec::new(),
             telemetry: SDLCTelemetry::default(),
+            policy: None,
+            outcomes: None,
         }
     }
 }
@@ -345,6 +411,40 @@ mod tests {
             Some(super::super::policy::OutputVerbosity::Terse)
         );
         assert_eq!(policy.max_attempts, Some(5));
+    }
+
+    #[test]
+    fn sdlc_state_defaults_have_no_policy_or_outcomes() {
+        let state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        assert_eq!(state.policy, None);
+        assert_eq!(state.outcomes, None);
+    }
+
+    #[test]
+    fn sdlc_state_round_trips_with_populated_policy_and_outcomes() {
+        let mut state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
+        state.policy = Some(super::super::policy::SdlcPolicy::default());
+        state.outcomes = Some(RunOutcomes {
+            wall_clock_secs: 12.5,
+            total_attempts: 3,
+            total_retries: 1,
+            tasks_passed: 2,
+            tasks_failed: 0,
+            review_verdicts: vec!["ConsolidatedReviewNode:PASS".to_string()],
+            total_input_tokens: 100,
+            total_output_tokens: 50,
+            total_cost_usd: 0.02,
+            model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
+        });
+
+        let json = serde_json::to_string(&state).expect("serializes");
+        let round_tripped: SDLCState = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(state, round_tripped);
+        assert_eq!(
+            round_tripped.policy.unwrap(),
+            super::super::policy::SdlcPolicy::default()
+        );
+        assert_eq!(round_tripped.outcomes.unwrap().total_cost_usd, 0.02);
     }
 
     #[test]
