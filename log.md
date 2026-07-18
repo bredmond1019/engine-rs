@@ -16,6 +16,48 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-18]
+
+### Ported the SDLC-flow top half (setup + task loop) into engine-core
+- **What:** Ran EN.3.A-sdlc-flow-setup-task-loop through `/sdlc-flow` (tasks 1-7, all passed on
+  first attempt, PASS review). Task 1 ported the SDLC schema types (`SDLCTaskStatus`/
+  `SDLCTriageVerdict`/`SDLCReviewVerdict`/`SDLCTask`/`SDLCFlowEventSchema`/`SDLCTelemetry`/
+  `SDLCState` + `parse_task_range`) into `crates/engine-core/src/workflows/sdlc_flow/schema.rs`
+  and scaffolded the module tree. Task 2 implemented the setup-half nodes (`SetupWorktreeNode`,
+  `SpecExistsRouterNode`, `GenerateTasksNode`, `LoadTaskStateNode`) in `setup.rs`. Task 3
+  implemented the task-loop nodes/routers (`TaskQueueRouterNode`, `ImplementTaskNode`,
+  `TestTaskNode`, `TriageTaskNode`, `TriageRouterNode`, `ConsolidatedReviewNode`,
+  `ReviewRouterNode`, `UpdateTaskStatusNode`, `SaveStateNode`) in `task_loop.rs`, ported from the
+  Python orchestrator with the deterministic-by-default / few-model-calls split (only Implement +
+  Review always call a model; Triage's model branch gates on `event.llm_triage`; Generate is
+  fallback-path only). Task 4 assembled the `SDLC_FLOW` `WorkflowSchema` + `NodeRegistry` in
+  `graph.rs`, wiring all 13 top-half nodes plus a terminal `PatchDocsNode` stub, passing
+  `WorkflowValidator` (declared-acyclic, runtime back-edges supplied by `Router::route`). Task 5
+  registered the schema+workflow under `workflow_type = "SDLC_FLOW"` in engine-serve's dual
+  `Dispatcher` registry. Task 6 added a hermetic integration test
+  (`crates/engine-core/tests/sdlc_flow_task_loop.rs`) driving a fail-then-pass retry back-edge
+  through stubbed transports/runners, with an amendment documenting that
+  `SDLCTelemetry.total_attempts` increments once per completed task (not per retry) — verified
+  against both the Rust and Python node logic. Task 7 confirmed the full validation suite
+  (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release`)
+  green with no further changes needed.
+- **Why:** Continues the Phase 3 SDLC-flow port (EN.3.A) per `master-plan.md`, porting the
+  top half of the 16-node Python `sdlc_flow_workflow` pipeline into the native Rust engine ahead
+  of EN.3.B (docs/wrap-up/PR bottom half + parity acceptance). Next: EN.3.B.
+
+```
+3dcd50f feat: implement EN.3.A-sdlc-flow-setup-task-loop-task6
+0c6cddb feat: implement EN.3.A-sdlc-flow-setup-task-loop-task5
+111118f feat: implement EN.3.A-sdlc-flow-setup-task-loop-task4
+62c578c feat: implement EN.3.A-sdlc-flow-setup-task-loop-task3
+07eb735 feat: implement EN.3.A-sdlc-flow-setup-task-loop-task2
+d5b4fea feat: implement EN.3.A-sdlc-flow-setup-task-loop-task1
+1f18ee3 docs: close-out ticket-engine-store-round-trip-false-green
+472c492 feat: implement ticket-engine-store-round-trip-false-green-task2
+```
+
+---
+
 ## [run: 2026-07-17]
 
 ### Fixed engine-store timestamp decode and killed the false-green Postgres round-trip test
