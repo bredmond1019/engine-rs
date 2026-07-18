@@ -12,11 +12,9 @@
 //! never shell out to a real `git` subprocess.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use claude_code_rs::{Config, Outcome};
+use claude_code_rs::Config;
 use engine_contract::TaskContext;
-use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -25,59 +23,9 @@ use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
+use super::{get_result, put_result};
 
-/// Result of running a single shell command via the injectable
-/// [`CommandRunner`] seam.
-#[derive(Debug, Clone)]
-pub struct CommandOutput {
-    /// Process exit status (`-1` when the platform reports no code).
-    pub status: i32,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// The injectable command-runner signature `SetupWorktreeNode` uses to
-/// invoke `git`. Defaults to the real subprocess via
-/// [`default_command_runner`]; tests substitute a stub so the gated
-/// `cargo test` suite never shells out — mirrors
-/// `ClaudeCodeStep::with_transport` (EN.2.A).
-pub type CommandRunner =
-    Arc<dyn Fn(&str, &[&str], &Path) -> std::io::Result<CommandOutput> + Send + Sync>;
-
-/// The default [`CommandRunner`]: shells out to the real subprocess via
-/// `std::process::Command`.
-#[must_use]
-pub fn default_command_runner() -> CommandRunner {
-    Arc::new(|program, args, cwd| {
-        let output = std::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .output()?;
-        Ok(CommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    })
-}
-
-/// The injectable transport signature for `GenerateTasksNode`'s composed
-/// `ClaudeCodeStep` — identical shape to `ClaudeCodeStep`'s own (private)
-/// transport type. Defaults to the real `claude_code_rs::execute`; tests
-/// substitute a stub via [`GenerateTasksNode::with_transport`].
-pub type ModelTransport = Arc<
-    dyn Fn(Config, String) -> BoxFuture<'static, claude_code_rs::Result<Outcome>> + Send + Sync,
->;
-
-/// Stamp a node's output onto `ctx.nodes` under its own identity.
-fn put_result(ctx: &mut TaskContext, identity: &str, value: serde_json::Value) {
-    ctx.nodes.insert(identity.to_string(), value);
-}
-
-/// Look up a prior node's output from `ctx.nodes` by identity.
-fn get_result<'a>(ctx: &'a TaskContext, identity: &str) -> Option<&'a serde_json::Value> {
-    ctx.nodes.get(identity)
-}
+pub use super::{default_command_runner, CommandOutput, CommandRunner, ModelTransport};
 
 /// Deserialize the inbound `SDLC_FLOW` event from `ctx.event`.
 fn parse_event(ctx: &TaskContext) -> Result<SDLCFlowEventSchema, NodeError> {
@@ -433,9 +381,10 @@ impl Node for GenerateTasksNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claude_code_rs::Outcome;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -26,23 +26,13 @@ use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
 use super::schema::{SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
-use super::setup::{CommandOutput, CommandRunner, ModelTransport};
+use super::{get_result, put_result, CommandOutput, CommandRunner, ModelTransport};
 
 /// A review with more than this many distinct issues is treated as a
 /// structural failure (re-implementation is unlikely to converge) rather
 /// than a minor, fixable one. Mirrors
 /// `review_router_node._STRUCTURAL_ISSUE_THRESHOLD` in Python.
 const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
-
-/// Stamp a node's output onto `ctx.nodes` under its own identity.
-fn put_result(ctx: &mut TaskContext, identity: &str, value: serde_json::Value) {
-    ctx.nodes.insert(identity.to_string(), value);
-}
-
-/// Look up a prior node's output from `ctx.nodes` by identity.
-fn get_result<'a>(ctx: &'a TaskContext, identity: &str) -> Option<&'a serde_json::Value> {
-    ctx.nodes.get(identity)
-}
 
 /// Return the most recently mutated `SDLCState` (`UpdateTaskStatusNode`'s
 /// output if this is not the first pass through the loop, else
@@ -287,7 +277,7 @@ impl TestTaskNode {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            runner: super::setup::default_command_runner(),
+            runner: super::default_command_runner(),
         }
     }
 
@@ -679,7 +669,7 @@ impl ConsolidatedReviewNode {
                 ..Config::default()
             },
             transport: None,
-            runner: super::setup::default_command_runner(),
+            runner: super::default_command_runner(),
         }
     }
 
@@ -892,7 +882,7 @@ impl SaveStateNode {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            runner: super::setup::default_command_runner(),
+            runner: super::default_command_runner(),
         }
     }
 
