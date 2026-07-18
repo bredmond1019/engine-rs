@@ -18,6 +18,43 @@ related: [status, context]
 
 ## [run: 2026-07-18]
 
+### EN.3.C — Tunable run-policy config + experiment telemetry (PASS)
+Implemented the three-layer `SdlcPolicy` (event override > `harness.json` `sdlc.policy` defaults >
+built-in default, precedence-tested) in a new `policy.rs`, and wired its resolution into
+`SetupWorktreeNode` (stamped into ctx as `ResolvedPolicy`). `ImplementTaskNode`, `TriageTaskNode`'s
+llm-triage branch, and `ConsolidatedReviewNode` now consume the resolved policy for per-stage model
+tiers, `output_verbosity` prompt directives, and a `prompt_cache` system-prompt anchor, falling back
+to today's hardcoded defaults when no policy is present. Added deterministic trivial-task
+classification (`git diff --numstat` against `review_skip_max_files`/`review_skip_max_diff_lines`)
+and made `TriageRouterNode` honor `review_mode` (`per_task` | `trivial_skip` | `end_only`) to decide
+whether a passing task still routes to `ConsolidatedReviewNode`. Added `openai_compat_transport` — a
+local (Ollama-style) `ModelTransport` for the `local` tier that POSTs to an OpenAI-compatible
+endpoint, synthesizes a zero-cost `Outcome`, and fails fast + falls back to the cloud transport on
+error — wired via a new `registry_for_policy(&SdlcPolicy)` that rewires triage/review (never
+`ImplementTaskNode`) when their resolved tier is `Local`. Extended `SDLCState` with a resolved-policy
+snapshot + `RunOutcomes` (wall-clock, attempt/retry counts, pass/fail, review verdicts, tokens, cost,
+per-stage tier used), finalized deterministically by `WrapUpNode`. Added `aggregate.rs`, a cross-run
+aggregator grouping state files by policy and tabulating cost/tokens/time/attempts/pass-rate per
+distinct policy. The first review pass caught a real gap: `WrapUpNode` computed the policy/outcomes
+blocks but only stamped them into the transient ctx output — `SaveStateNode`, which runs earlier in
+the graph and never re-runs after `WrapUpNode`, is the only node that persists `SDLCState` to the
+on-disk `sdlc-flow-state.json`, so the durable file never received the new telemetry. This was fixed
+in a review-fix pass; task 8's full gated suite (fmt/clippy/test/release build) is green with no
+further code changes needed. Final verdict: PASS (all 8 tasks passed). EN.3.C's block entry doesn't
+yet exist in `planning/state.json` (only through EN.3.B), so no authored block flip was made there.
+Next: pick the next Phase 3/4 block per `master-plan.md`.
+
+```
+4ce86ac fix: review pass 1 for EN.3.C-tunable-run-policy-telemetry
+e78ae78 feat: implement EN.3.C-tunable-run-policy-telemetry-task7
+da568bb feat: implement EN.3.C-tunable-run-policy-telemetry-task6
+16f512f feat: implement EN.3.C-tunable-run-policy-telemetry-task5
+039dd0d feat: implement EN.3.C-tunable-run-policy-telemetry-task4
+60e41f7 feat: implement EN.3.C-tunable-run-policy-telemetry-task3
+5b88e53 feat: implement EN.3.C-tunable-run-policy-telemetry-task2
+efaa644 feat: implement EN.3.C-tunable-run-policy-telemetry-task1
+```
+
 ### EN.3.B — SDLC-flow docs/wrapup/PR port merged
 - **What:** Closed out EN.3.B-sdlc-flow-docs-wrapup-pr: docs step required no changes (nothing
   stale after the 8-task implementation + PASS review). Opened PR #5
