@@ -39,13 +39,16 @@
 //! walked into a cycle for the same reason.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::node::NodeRegistry;
+use crate::nodes::openai_compat_transport::openai_compat_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
 use super::docs::PatchDocsNode;
 use super::emit_state::EmitStateNode;
+use super::policy::{ModelTier, SdlcPolicy};
 use super::pr::PullRequestNode;
 use super::setup::{GenerateTasksNode, LoadTaskStateNode, SetupWorktreeNode, SpecExistsRouterNode};
 use super::task_loop::{
@@ -54,6 +57,7 @@ use super::task_loop::{
     UpdateTaskStatusNode,
 };
 use super::wrap_up::WrapUpNode;
+use super::ModelTransport;
 
 /// The `SDLC_FLOW` workflow's declared identity/type name, used both to
 /// register the workflow (engine-serve, Task 5) and as `WorkflowSchema::workflow_type`.
@@ -200,6 +204,51 @@ pub fn registry() -> NodeRegistry {
     registry
 }
 
+/// The real `claude_code_rs::execute` transport — the cloud fallback a
+/// `local`-tier judgment stage's `openai_compat_transport` routes to when
+/// its local endpoint is unavailable. `ClaudeCodeStep` deliberately keeps
+/// its own equivalent default private (D4 owns that seam); this is the same
+/// one-line delegation, just visible to this module so `registry_for_policy`
+/// can hand it to `openai_compat_transport_live` as the fallback.
+fn real_cloud_transport() -> ModelTransport {
+    Arc::new(|config, prompt| {
+        Box::pin(async move { claude_code_rs::execute(&config, &prompt).await })
+    })
+}
+
+/// Build a `NodeRegistry` like [`registry`], but with the single-shot
+/// judgment stages the `local` model tier is scoped to — `TriageTaskNode`'s
+/// `llm_triage` model branch and `ConsolidatedReviewNode` — wired to route
+/// through [`openai_compat_transport_live`] whenever `policy`'s resolved
+/// tier for that stage is [`ModelTier::Local`]. **Never** rewires
+/// `ImplementTaskNode`: the local tier is scoped to single-shot judgment
+/// calls, not the agentic `implement` stage (spec Context Pointers,
+/// `planning/local-llm-tier-investigation/notes.md`). Any stage whose tier
+/// is not `Local` keeps [`registry`]'s default (real-`claude`-CLI)
+/// transport untouched.
+///
+/// Any local-endpoint failure at call time falls back to the real `claude`
+/// CLI transport for that call — `openai_compat_transport`'s own fail-fast
+/// + fallback (EN.3.C task 5), not something this function decides.
+#[must_use]
+pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
+    let mut registry = registry();
+
+    if policy.model_tiers.triage == ModelTier::Local {
+        registry.register(Box::new(TriageTaskNode::new().with_transport(
+            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        )));
+    }
+
+    if policy.model_tiers.review == ModelTier::Local {
+        registry.register(Box::new(ConsolidatedReviewNode::new().with_transport(
+            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        )));
+    }
+
+    registry
+}
+
 /// Build the runnable top-half SDLC Flow `Workflow`: [`registry`] paired
 /// with [`schema`], constructed via `Workflow::new_validated` so assembly
 /// fails loudly if the declared graph is not structurally sound.
@@ -269,6 +318,60 @@ mod tests {
             );
         }
         assert_eq!(registry.len(), expected.len());
+    }
+
+    #[test]
+    fn registry_for_policy_with_default_policy_matches_plain_registry() {
+        let default_registry = registry();
+        let policy_registry = registry_for_policy(&SdlcPolicy::default());
+
+        assert_eq!(policy_registry.len(), default_registry.len());
+        assert!(policy_registry.contains("TriageTaskNode"));
+        assert!(policy_registry.contains("ConsolidatedReviewNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_with_local_tiers_keeps_same_node_identities() {
+        let policy = SdlcPolicy {
+            model_tiers: super::super::policy::ModelTiers {
+                triage: ModelTier::Local,
+                review: ModelTier::Local,
+                ..super::super::policy::ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+
+        let registry = registry_for_policy(&policy);
+
+        // Rewiring TriageTaskNode/ConsolidatedReviewNode's transport must not
+        // change the registry's node count or identity set — only the
+        // transport those two nodes' composed `ClaudeCodeStep` uses.
+        assert_eq!(registry.len(), super::registry().len());
+        assert!(registry.contains("TriageTaskNode"));
+        assert!(registry.contains("ConsolidatedReviewNode"));
+        assert!(registry.contains("ImplementTaskNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_never_rewires_implement_task_node() {
+        // ImplementTaskNode has no `model_tiers.implement == Local` branch in
+        // `registry_for_policy` at all — the agentic implement stage is out
+        // of scope for the `local` tier (spec Context Pointers). This test
+        // documents that by construction: a policy with every tier set to
+        // `Local`, including `implement`, still leaves `registry_for_policy`
+        // with only the triage/review branches to rewire.
+        let policy = SdlcPolicy {
+            model_tiers: super::super::policy::ModelTiers {
+                implement: ModelTier::Local,
+                triage: ModelTier::Local,
+                review: ModelTier::Local,
+                ..super::super::policy::ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+
+        let registry = registry_for_policy(&policy);
+        assert!(registry.contains("ImplementTaskNode"));
     }
 
     #[test]
