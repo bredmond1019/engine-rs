@@ -17,6 +17,7 @@ related: [core:engine-rs]
 | [architecture.md](architecture.md) | Overview, module map, core types, data flow |
 | [cli.md](cli.md) | Synopsis, subcommands, global flags, exit codes, examples |
 | [data-contract.md](data-contract.md) | Pinned orchestrator data-contract version, field mappings to `engine_contract` Rust types, HTTP surface parity, re-pin checklist |
+| [sdlc-flow-workflow.md](sdlc-flow-workflow.md) | The `SDLC_FLOW` graph — node roles (model vs. deterministic), triggering from `engine-rs`/bastion, stopping a run, reading outputs, inspecting/resuming state |
 | [sdlc-flow-policy.md](sdlc-flow-policy.md) | SDLC Flow's tunable `SdlcPolicy` (model tiers, review mode, verbosity, local-model tier) — configuration layers, knobs, and `RunOutcomes` telemetry/aggregation |
 
 For project strategy and current focus, see [`planning/`](../planning/index.md).

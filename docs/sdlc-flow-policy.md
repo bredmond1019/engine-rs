@@ -7,7 +7,7 @@ layer: [engine]
 project: engine-rs
 status: active
 keywords: [sdlc-flow, policy, telemetry, model tiers, review mode, local model, aggregate, cost]
-related: [architecture, cli]
+related: [sdlc-flow-workflow, architecture, cli]
 ---
 
 # SDLC Flow — Tunable Run Policy & Telemetry
