@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-18T04:46:56Z"
+timestamp: "2026-07-18T12:34:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,29 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-18]
+
+### SDLC token/time economics analysis + EN.3.A review findings; EN.3.B/EN.3.C scoping
+- **What:** Ran a token/cost/time economics analysis of the SDLC pipeline (engine-rs
+  deterministic-node port vs. the 100%-agent-led `sdlc-flow.js`), grounded in real telemetry from
+  66 past flow runs — captured in `planning/sdlc-token-time-economics/notes.md`. Ranked improvement
+  levers (#2a coding-output terseness ~$14.6/66runs is the biggest cost+time lever; #1 close-out
+  redundancy dedup ~$10; #3 tier/skip gates; #2b prompt caching secondary). Designed the run-tail
+  structured-output approach (push judgment into loop-node structured output so wrap-up/PR/handoff/
+  emit-state are 0-model-token template renders) and confirmed `claude-code-rs` has no native
+  schema-constrained output (must prompt-and-parse). EN.3.A shipped via `/sdlc-flow` (tasks 1-7 all
+  PASS first-attempt); reviewed the committed code and found two issues: the retry loop has no
+  attempt-based bail (`attempt_count` never increments on the RETRYABLE back-edge), and the
+  `put_result`/runner/transport seams are duplicated across `setup.rs`/`task_loop.rs`. Updated
+  master-plan: added a deterministic `EmitStateNode` to EN.3.B + logged the retry-bail fix there,
+  and added a new EN.3.C block (tunable run-policy config + experiment telemetry — levers #1-#3 as
+  per-run dials). Wrote handoff prompting the next agent to review this work and investigate a
+  local LLM on a 32GB M2 as a model tier vs. dropping to Haiku.
+- **Why:** The user asked how much the deterministic-node port saves and how to push cost/time/
+  limits further; the analysis reframed the endgame (the money+time live in the expensive Sonnet
+  coding path + close-out redundancy, not the cheap Haiku stages the deterministic nodes replace).
+  The review findings and new blocks turn that into actionable roadmap work.
+- **Refs:** `planning/sdlc-token-time-economics/notes.md`, `master-plan.md` EN.3.B/EN.3.C,
+  `planning/handoff.md`
 
 ### Ported the SDLC-flow top half (setup + task loop) into engine-core
 - **What:** Ran EN.3.A-sdlc-flow-setup-task-loop through `/sdlc-flow` (tasks 1-7, all passed on
