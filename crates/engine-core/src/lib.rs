@@ -13,6 +13,7 @@ pub mod routing;
 pub mod schema;
 pub mod validate;
 pub mod workflow;
+pub mod workflows;
 
 pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
