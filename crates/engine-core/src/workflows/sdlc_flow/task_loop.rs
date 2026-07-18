@@ -1045,7 +1045,7 @@ mod tests {
 
         let node = TaskQueueRouterNode;
         let out = node.process(ctx).await.expect("process should succeed");
-        assert!(out.nodes.get("TaskQueueRouterNode").is_none());
+        assert!(!out.nodes.contains_key("TaskQueueRouterNode"));
         assert_eq!(node.route(&out), Some("PatchDocsNode".to_string()));
     }
 

@@ -1,0 +1,448 @@
+//! Integration test for the `SDLC_FLOW` top-half workflow (`EN.3.A` task 6):
+//! drives the assembled graph (`engine_core::workflows::sdlc_flow::graph`)
+//! through setup → generate/load tasks → the full implement/test/triage/
+//! review task loop, with **at least one** triggered retry back-edge, and
+//! asserts the resulting `TaskContext`/`NodeRun` shape.
+//!
+//! Hermetic by construction: every seam that would otherwise spawn a real
+//! `claude` process or shell out to a real subprocess is stubbed —
+//! `ImplementTaskNode`/`ConsolidatedReviewNode` via `with_transport`,
+//! `TestTaskNode`/`ConsolidatedReviewNode`'s git-diff/`SaveStateNode` via
+//! `with_runner`. `SetupWorktreeNode` is replaced outright by a tiny
+//! fixture node (rather than stubbing its runner) because its real
+//! implementation hard-codes `worktree_path = "trees/{branch}"` relative to
+//! the process's current directory — not overridable via the injectable
+//! runner alone — and this test needs a controlled temp directory instead.
+//! Every other node identity (`SpecExistsRouterNode`, `LoadTaskStateNode`,
+//! `TaskQueueRouterNode`, `TriageTaskNode` (deterministic branch),
+//! `TriageRouterNode`, `ReviewRouterNode`, `UpdateTaskStatusNode`,
+//! `PatchDocsNode`) runs for real against fixture files written to the temp
+//! worktree, exercising the same code path production traffic would use.
+//!
+//! **Telemetry note (documented deviation from the task-decomposition
+//! prose):** `UpdateTaskStatusNode` — ported faithfully from
+//! `orchestrator/app/workflows/sdlc_flow_workflow_nodes/task_queue_router_node.py`
+//! / `triage_task_node.py` — is only reached via `ReviewRouterNode`'s `PASS`
+//! branch (after a task's *final*, passing review), never via
+//! `TriageRouterNode`'s `RETRYABLE` back-edge (which routes straight back to
+//! `ImplementTaskNode`, bypassing `UpdateTaskStatusNode`/`SaveStateNode`
+//! entirely — see `sdlc_flow_workflow.py`'s module docstring graph). So for
+//! a single-task fixture, `SDLCTelemetry.total_attempts` reaches `1` (one
+//! `UpdateTaskStatusNode` call, at the task's eventual PASS), not `2`, no
+//! matter how many retry back-edges fired in between; only `tasks_passed`
+//! and the retry-back-edge count are sensitive to intra-task retries. This
+//! test asserts the two-value pair that is actually reachable
+//! (`total_attempts == 1`, `tasks_passed == 1`) alongside direct proof that
+//! the retry back-edge fired (`ImplementTaskNode` ran twice). See this
+//! spec's Amendment Log.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use claude_code_rs::Outcome;
+use engine_contract::{NodeRunStatus, TaskContext};
+use engine_core::node::{Node, NodeError, NodeRegistry};
+use engine_core::workflow::Workflow;
+use engine_core::workflows::sdlc_flow::graph::{self, PatchDocsNode};
+use engine_core::workflows::sdlc_flow::setup::{
+    CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode, SpecExistsRouterNode,
+};
+use engine_core::workflows::sdlc_flow::task_loop::{
+    ConsolidatedReviewNode, ImplementTaskNode, ReviewRouterNode, SaveStateNode,
+    TaskQueueRouterNode, TestTaskNode, TriageRouterNode, TriageTaskNode, UpdateTaskStatusNode,
+};
+use serde_json::json;
+
+/// Replaces the real `SetupWorktreeNode` for this test: writes a controlled
+/// temp-dir `worktree_path` (and a fixed `branch_name`) directly, so no real
+/// `git worktree add` runs and downstream nodes (`LoadTaskStateNode`,
+/// `TestTaskNode`, `SaveStateNode`) resolve paths under a directory this
+/// test owns and can inspect.
+struct FixtureSetupNode {
+    worktree_path: String,
+}
+
+#[async_trait::async_trait]
+impl Node for FixtureSetupNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({
+                "worktree_path": self.worktree_path,
+                "branch_name": "sdlc/fixture-spec",
+            }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "SetupWorktreeNode"
+    }
+}
+
+fn stub_outcome(text: &str) -> Outcome {
+    Outcome {
+        cost_usd: 0.01,
+        usage: claude_code_rs::parse::Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+        model_usage: [(
+            "claude-sonnet-4-5".to_string(),
+            claude_code_rs::parse::ModelUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: 0.01,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        text: text.to_string(),
+        is_error: false,
+        api_error_status: None,
+    }
+}
+
+fn temp_worktree() -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "engine-core-sdlc-flow-task-loop-it-{}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("planning").join("fixture-spec")).unwrap();
+    dir
+}
+
+/// Writes the fixture `tasks.json` (one PENDING task, `max_attempts = 2`)
+/// under `<worktree>/planning/fixture-spec/` and a `harness.json` with a
+/// single gating check (its actual command text is irrelevant — the
+/// `TestTaskNode` runner is stubbed).
+fn write_fixture_files(worktree: &Path) {
+    let spec_dir = worktree.join("planning").join("fixture-spec");
+    let tasks = json!([
+        {
+            "task_id": 1,
+            "title": "Implement the thing",
+            "description": "Do the work",
+            "acceptance_criteria": ["it works"],
+            "max_attempts": 2,
+        }
+    ]);
+    std::fs::write(
+        spec_dir.join("tasks.json"),
+        serde_json::to_string_pretty(&tasks).unwrap(),
+    )
+    .unwrap();
+
+    let harness = json!({
+        "validation": {
+            "checks": [
+                { "name": "tests", "kind": "command", "command": "does-not-matter", "gates": true }
+            ]
+        }
+    });
+    std::fs::write(
+        worktree.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Injected `TestTaskNode` runner: FAILs (`status = 1`) on its first
+/// invocation, PASSes (`status = 0`) on every subsequent one — drives the
+/// task's first attempt to fail and its retry to pass.
+fn fail_then_pass_runner() -> (CommandRunner, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = calls.clone();
+    let runner: CommandRunner = Arc::new(move |_program, _args, _cwd| {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(CommandOutput {
+            status: if n == 0 { 1 } else { 0 },
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    });
+    (runner, calls)
+}
+
+/// Injected runner for `git`-shaped calls (`SaveStateNode`'s
+/// add/commit, `ConsolidatedReviewNode`'s diff) that always succeeds with
+/// empty output — no real subprocess spawns.
+fn noop_git_runner() -> CommandRunner {
+    Arc::new(|_program, _args, _cwd| {
+        Ok(CommandOutput {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    })
+}
+
+/// Builds the `SDLC_FLOW` `Workflow` for this test: the declared graph from
+/// [`graph::schema`], paired with a registry where the model/subprocess
+/// nodes are stubbed and every other identity is the real implementation.
+fn build_workflow(
+    worktree: &Path,
+    implement_calls: Arc<AtomicUsize>,
+    test_runner: CommandRunner,
+) -> Workflow {
+    let mut registry = NodeRegistry::new();
+
+    registry.register(Box::new(FixtureSetupNode {
+        worktree_path: worktree.to_string_lossy().to_string(),
+    }));
+    registry.register(Box::new(SpecExistsRouterNode));
+    registry.register(Box::new(GenerateTasksNode::new()));
+    registry.register(Box::new(LoadTaskStateNode));
+    registry.register(Box::new(TaskQueueRouterNode));
+
+    let implement_transport_calls = implement_calls;
+    registry.register(Box::new(ImplementTaskNode::new().with_transport(Arc::new(
+        move |_config, _prompt| {
+            implement_transport_calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = stub_outcome(
+                &json!({
+                    "summary": "implemented",
+                    "modified_files": ["src/lib.rs"],
+                    "tests_added": ["it_works"],
+                })
+                .to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        },
+    ))));
+
+    registry.register(Box::new(TestTaskNode::new().with_runner(test_runner)));
+    registry.register(Box::new(TriageTaskNode::new()));
+    registry.register(Box::new(TriageRouterNode));
+
+    registry.register(Box::new(
+        ConsolidatedReviewNode::new()
+            .with_runner(noop_git_runner())
+            .with_transport(Arc::new(|_config, _prompt| {
+                let outcome = stub_outcome(
+                    &json!({ "verdict": "PASS", "summary": "looks good", "issues": [] })
+                        .to_string(),
+                );
+                Box::pin(async move { Ok(outcome) })
+            })),
+    ));
+
+    registry.register(Box::new(ReviewRouterNode));
+    registry.register(Box::new(UpdateTaskStatusNode));
+    registry.register(Box::new(
+        SaveStateNode::new().with_runner(noop_git_runner()),
+    ));
+    registry.register(Box::new(PatchDocsNode));
+
+    Workflow::new_validated(registry, graph::schema())
+        .expect("SDLC_FLOW declared graph must pass WorkflowValidator::validate")
+}
+
+#[tokio::test]
+async fn full_task_loop_triggers_retry_back_edge_and_completes() {
+    let worktree = temp_worktree();
+    write_fixture_files(&worktree);
+
+    let implement_calls = Arc::new(AtomicUsize::new(0));
+    let (test_runner, test_calls) = fail_then_pass_runner();
+
+    let workflow = build_workflow(&worktree, implement_calls.clone(), test_runner);
+
+    let event = json!({ "spec_slug": "fixture-spec" });
+    let snapshots: Arc<Mutex<Vec<TaskContext>>> = Arc::new(Mutex::new(Vec::new()));
+    let snapshots_handle = snapshots.clone();
+    let on_progress: engine_core::OnProgress<'_> =
+        Box::new(move |ctx: &TaskContext| snapshots_handle.lock().unwrap().push(ctx.clone()));
+
+    let final_ctx = workflow
+        .run(event, on_progress)
+        .await
+        .expect("workflow run should not error");
+
+    // --- The retry back-edge actually fired -------------------------------
+    assert_eq!(
+        implement_calls.load(Ordering::SeqCst),
+        2,
+        "ImplementTaskNode should run once for the failing attempt and once \
+         more for the retry"
+    );
+    assert!(
+        test_calls.load(Ordering::SeqCst) >= 2,
+        "TestTaskNode should run at least twice (fail then pass)"
+    );
+
+    let snapshots = snapshots.lock().unwrap();
+    let implement_running_snapshots = snapshots
+        .iter()
+        .filter(|ctx| {
+            ctx.node_runs
+                .get("ImplementTaskNode")
+                .map(|run| run.status == NodeRunStatus::Running)
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        implement_running_snapshots >= 2,
+        "expected at least two RUNNING snapshots for ImplementTaskNode (the \
+         retry back-edge re-entering it), got {implement_running_snapshots}"
+    );
+
+    // --- Final task + telemetry state --------------------------------------
+    let update_result = final_ctx
+        .nodes
+        .get("UpdateTaskStatusNode")
+        .expect("UpdateTaskStatusNode should have run");
+    let state: engine_core::workflows::sdlc_flow::schema::SDLCState =
+        serde_json::from_value(update_result.clone()).expect("state should deserialize");
+
+    assert_eq!(state.tasks.len(), 1);
+    assert_eq!(
+        state.tasks[0].status,
+        engine_core::workflows::sdlc_flow::schema::SDLCTaskStatus::Done
+    );
+    assert_eq!(state.telemetry.tasks_passed, 1);
+    assert_eq!(state.telemetry.tasks_failed, 0);
+    // See the module doc's "Telemetry note": UpdateTaskStatusNode only runs
+    // once per task (at its eventual PASS through ReviewRouterNode), never
+    // on the TriageRouterNode RETRYABLE back-edge, so total_attempts reaches
+    // 1 here regardless of how many retries preceded it.
+    assert_eq!(state.telemetry.total_attempts, 1);
+
+    // --- The walk terminated at the PatchDocsNode stub ---------------------
+    let patch_docs_run = final_ctx
+        .node_runs
+        .get("PatchDocsNode")
+        .expect("PatchDocsNode should be present in node_runs");
+    assert_eq!(patch_docs_run.status, NodeRunStatus::Success);
+
+    // --- Parity-shape assertions (contract §6) -----------------------------
+    for identity in [
+        "SetupWorktreeNode",
+        "SpecExistsRouterNode",
+        "LoadTaskStateNode",
+        "TaskQueueRouterNode",
+        "ImplementTaskNode",
+        "TestTaskNode",
+        "TriageTaskNode",
+        "TriageRouterNode",
+        "ConsolidatedReviewNode",
+        "ReviewRouterNode",
+        "UpdateTaskStatusNode",
+        "SaveStateNode",
+        "PatchDocsNode",
+    ] {
+        let run = final_ctx
+            .node_runs
+            .get(identity)
+            .unwrap_or_else(|| panic!("expected a NodeRun for '{identity}'"));
+        assert_eq!(
+            run.status,
+            NodeRunStatus::Success,
+            "expected '{identity}' to have run to SUCCESS"
+        );
+        assert!(
+            run.started_at.is_some() && run.completed_at.is_some(),
+            "'{identity}' should have timing stamped"
+        );
+    }
+
+    // Model nodes carry usage; deterministic nodes don't.
+    for identity in ["ImplementTaskNode", "ConsolidatedReviewNode"] {
+        let run = final_ctx.node_runs.get(identity).unwrap();
+        assert!(
+            run.usage.is_some(),
+            "'{identity}' is a model node and should carry usage"
+        );
+    }
+    for identity in [
+        "SetupWorktreeNode",
+        "SpecExistsRouterNode",
+        "LoadTaskStateNode",
+        "TaskQueueRouterNode",
+        "TestTaskNode",
+        "TriageTaskNode",
+        "TriageRouterNode",
+        "ReviewRouterNode",
+        "UpdateTaskStatusNode",
+        "SaveStateNode",
+        "PatchDocsNode",
+    ] {
+        let run = final_ctx.node_runs.get(identity).unwrap();
+        assert!(
+            run.usage.is_none(),
+            "'{identity}' is deterministic and should not carry usage"
+        );
+    }
+
+    // GenerateTasksNode never runs on this fixture (SpecExistsRouterNode
+    // finds tasks.json already present) — still declared/PENDING.
+    let generate_run = final_ctx
+        .node_runs
+        .get("GenerateTasksNode")
+        .expect("GenerateTasksNode is declared and seeded PENDING");
+    assert_eq!(generate_run.status, NodeRunStatus::Pending);
+
+    // Each executed node's own output carries the Python-parity `nodes[id]`
+    // shape used throughout this module (a JSON object, not a bare scalar).
+    for identity in [
+        "TaskQueueRouterNode",
+        "TestTaskNode",
+        "TriageTaskNode",
+        "ConsolidatedReviewNode",
+        "UpdateTaskStatusNode",
+    ] {
+        let output = final_ctx
+            .nodes
+            .get(identity)
+            .unwrap_or_else(|| panic!("expected '{identity}' output in ctx.nodes"));
+        assert!(
+            output.is_object(),
+            "'{identity}' output should be a JSON object"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workflow_terminal_stub_reachable_when_no_pending_tasks() {
+    // A degenerate fixture (task already DONE) exercises the "no pending
+    // task" branch straight through to PatchDocsNode without ever touching
+    // the model nodes.
+    let worktree = temp_worktree();
+    let spec_dir = worktree.join("planning").join("fixture-spec");
+    let state = json!({
+        "spec_slug": "fixture-spec",
+        "tasks": [
+            { "task_id": 1, "title": "Done already", "description": "d", "status": "done" }
+        ]
+    });
+    std::fs::write(
+        spec_dir.join("sdlc-flow-state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    let implement_calls = Arc::new(AtomicUsize::new(0));
+    let (test_runner, _test_calls) = fail_then_pass_runner();
+    let workflow = build_workflow(&worktree, implement_calls.clone(), test_runner);
+
+    let event = json!({ "spec_slug": "fixture-spec" });
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    assert_eq!(implement_calls.load(Ordering::SeqCst), 0);
+    let patch_docs_run = final_ctx.node_runs.get("PatchDocsNode").unwrap();
+    assert_eq!(patch_docs_run.status, NodeRunStatus::Success);
+    let task_queue_run = final_ctx.node_runs.get("TaskQueueRouterNode").unwrap();
+    assert_eq!(task_queue_run.status, NodeRunStatus::Success);
+    // No task dispatched -> TaskQueueRouterNode writes no output.
+    assert!(!final_ctx.nodes.contains_key("TaskQueueRouterNode"));
+}
