@@ -391,11 +391,12 @@ impl Node for GenerateTasksNode {
             .ok_or_else(|| NodeError::new("GenerateTasksNode: model returned no content"))?
             .to_string();
 
-        let generated: GeneratedTasks = serde_json::from_str(&content).map_err(|err| {
-            NodeError::new(format!(
-                "GenerateTasksNode: failed to parse model output as JSON: {err}"
-            ))
-        })?;
+        let generated: GeneratedTasks = serde_json::from_str(super::strip_json_fence(&content))
+            .map_err(|err| {
+                NodeError::new(format!(
+                    "GenerateTasksNode: failed to parse model output as JSON: {err}"
+                ))
+            })?;
 
         std::fs::create_dir_all(&dir)
             .map_err(|err| NodeError::new(format!("failed to create {}: {err}", dir.display())))?;

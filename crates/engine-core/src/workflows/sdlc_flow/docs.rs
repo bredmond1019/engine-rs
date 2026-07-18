@@ -115,11 +115,12 @@ impl Node for PatchDocsNode {
             .ok_or_else(|| NodeError::new("PatchDocsNode: model returned no content"))?
             .to_string();
 
-        let parsed: PatchDocsOutput = serde_json::from_str(&content).map_err(|err| {
-            NodeError::new(format!(
-                "PatchDocsNode: failed to parse model output as JSON: {err}"
-            ))
-        })?;
+        let parsed: PatchDocsOutput = serde_json::from_str(super::strip_json_fence(&content))
+            .map_err(|err| {
+                NodeError::new(format!(
+                    "PatchDocsNode: failed to parse model output as JSON: {err}"
+                ))
+            })?;
 
         super::put_result(
             &mut ctx,
