@@ -1,0 +1,160 @@
+---
+type: Reference
+title: SDLC Flow — Tunable Run Policy & Telemetry
+description: How to configure the SDLC Flow's SdlcPolicy (model tiers, review mode, verbosity, local-model tier) and read/aggregate per-run RunOutcomes telemetry
+doc_id: sdlc-flow-policy
+layer: [engine]
+project: engine-rs
+status: active
+keywords: [sdlc-flow, policy, telemetry, model tiers, review mode, local model, aggregate, cost]
+related: [architecture, cli]
+---
+
+# SDLC Flow — Tunable Run Policy & Telemetry
+
+Added in EN.3.C. Before this, the SDLC Flow's cost/quality levers (which model tier ran which
+stage, how strict review was, how verbose prompts were) were hardcoded. Now every run resolves a
+concrete `SdlcPolicy`, applies it, and records `RunOutcomes` telemetry at the tail — so different
+policies can be compared on real cost/time/quality data instead of guessed at.
+
+Source: `crates/engine-core/src/workflows/sdlc_flow/policy.rs` (the policy + resolution),
+`setup.rs` (`resolve_policy_for_run`, wired into `SetupWorktreeNode`), `graph.rs`
+(`registry_for_policy`, the local-tier rewiring), `schema.rs` (`RunOutcomes`, the event's `policy`
+field), `aggregate.rs` (cross-run aggregation).
+
+## Configuring a run
+
+Three layers, resolved high-to-low precedence — **per-run event override > `harness.json` >
+built-in default**. Every field is independent: an unset field at a higher layer just falls
+through to the next layer down, so you only need to specify the knobs you want to change.
+
+### 1. Built-in default (baseline)
+
+`SdlcPolicy::default()` in `policy.rs`. Guaranteed to reproduce exactly the pre-EN.3.C behavior:
+`normal` verbosity, `per_task` review, all stages on `sonnet`, prompt-cache off, `llm_triage`
+false, `max_attempts` 3, no close-out reuse. You never edit this directly — override it via the
+layers below.
+
+### 2. `planning/harness.json` → `sdlc.policy` (this repo's defaults)
+
+This repo's own `planning/harness.json` already carries a documented no-op example (every value
+matches the built-in default):
+
+```json
+"sdlc": {
+  "policy": {
+    "output_verbosity": "normal",
+    "review_mode": "per_task",
+    "model_tiers": {
+      "implement": "sonnet",
+      "implement_simple": "sonnet",
+      "review": "sonnet",
+      "triage": "sonnet",
+      "generate": "sonnet"
+    },
+    "llm_triage": false,
+    "max_attempts": 3
+  }
+}
+```
+
+Flip a value here to change every future `sdlc-flow`/`sdlc-task` run in this repo. Only include
+the fields you want to change from the built-in default — omitted fields fall through. This
+section is read by `SetupWorktreeNode` on every run (via `resolve_policy_for_run`); if
+`planning/harness.json` has no `sdlc.policy` key at all, this layer is skipped entirely.
+
+### 3. Per-run event override (one-off experiment)
+
+Pass a `policy` object (a `PartialPolicy`, same shape as above) directly in the `SDLC_FLOW` event
+JSON:
+
+```json
+{
+  "spec_slug": "EN.3.C-tunable-run-policy-telemetry",
+  "policy": { "output_verbosity": "terse", "max_attempts": 5 }
+}
+```
+
+This wins over both `harness.json` and the built-in default for the fields it sets, and doesn't
+touch any file — use it to try a variant for a single run without changing this repo's standing
+defaults.
+
+## Available knobs
+
+| Field | Values | What it controls |
+|---|---|---|
+| `output_verbosity` | `terse` \| `normal` \| `verbose` | Verbosity directive added to model-node prompts (`ImplementTaskNode`, triage, review). |
+| `prompt_cache` | `bool` | Whether a stable system-prompt anchor is added for provider-side prompt caching. |
+| `review_mode` | `per_task` \| `trivial_skip` \| `end_only` | `per_task`: every task routes to `ConsolidatedReviewNode` (today's default). `trivial_skip`: a first-pass-green task under the diff-size thresholds below skips per-task review; a non-trivial task still routes to review. `end_only`: per-task review is collapsed into a single end-of-run review. |
+| `review_skip_max_files` / `review_skip_max_diff_lines` | `u32` | Thresholds (`git diff --numstat`) a task's diff must stay under to count as "trivial" for `trivial_skip`. Defaults: 2 files / 40 lines. |
+| `model_tiers.{implement,implement_simple,review,triage,generate}` | `sonnet` \| `haiku` \| `opus` \| `local` | Per-stage model tier. `implement`/`implement_simple` only ever resolve to a concrete cloud model string — `local` is not wired for the agentic implement stage (see below). |
+| `local.{endpoint,model,constrained_json}` | string / string / bool | Config for the `local` tier's OpenAI-compatible transport (endpoint URL, model name, whether to pass a constrained-decoding `response_format`). Only meaningful when some stage's tier is `local`. |
+| `simple_task_max_files` | `u32` | Threshold for classifying a task as "simple" for the `implement_simple` tier. **Not yet consumed** by `ImplementTaskNode`'s tier selection — flagged out-of-scope in EN.3.C task 4, left for a later block. |
+| `llm_triage` | `bool` | Whether `TriageTaskNode` invokes the LLM classifier for a failing-but-under-budget task (`true`) vs. deterministically calling it `RETRYABLE` (`false`, default). |
+| `max_attempts` | `u32` | Retry budget per task before it's marked `FAILED`. |
+| `close_out.reuse.{validation,review,docs}` | `bool` each | Which `close-out` (EN.2.x) stages are allowed to reuse a prior flow record's result rather than re-running. |
+
+## The `local` model tier
+
+Setting `model_tiers.triage` and/or `model_tiers.review` to `local` routes that stage's calls
+through `openai_compat_transport` to an OpenAI-compatible endpoint (e.g. a local Ollama server)
+instead of the Claude CLI — for cheap, zero-cost judgment calls on cheap hardware.
+
+- **Scoped to single-shot judgment stages only** — `TriageTaskNode`'s LLM-triage branch and
+  `ConsolidatedReviewNode`. `ImplementTaskNode` (the agentic implement stage) is **never** rewired
+  to `local`, regardless of what `model_tiers.implement` is set to — the local tier isn't suited to
+  multi-turn agentic work (see `planning/local-llm-tier-investigation/notes.md`).
+- **Automatic fallback**: any failure calling the local endpoint (unreachable, error response)
+  falls back to the real Claude CLI transport for that call — a run degrades gracefully rather than
+  hard-failing because a local server was down.
+- Wired via `registry_for_policy(&SdlcPolicy)` in `graph.rs`, which builds on the default node
+  registry and swaps in the local-routed node only for stages resolved to `local`.
+
+## Telemetry: `RunOutcomes`
+
+`WrapUpNode` stamps a `policy` snapshot (the resolved `SdlcPolicy` for that run) and a
+`RunOutcomes` block into `SDLCState` at the run tail:
+
+- `wall_clock_secs` — from `SetupWorktreeNode`'s start to the snapshot.
+- `total_attempts` / `total_retries` — implement→test attempts across all tasks, and the subset
+  beyond each task's first attempt.
+- `tasks_passed` / `tasks_failed`.
+- `review_verdicts` — e.g. `["TriageTaskNode:RETRYABLE", "ConsolidatedReviewNode:PASS"]`.
+- `total_input_tokens` / `total_output_tokens` / `total_cost_usd`.
+- `model_tier_used` — per-stage tier actually used for that run.
+
+This is persisted to `planning/<spec-slug>/sdlc/sdlc-flow-state.json` (the same file
+`SaveStateNode` writes throughout the run — `WrapUpNode`'s policy/outcomes blocks land in that
+same on-disk snapshot). A state file from a run that never reached `WrapUpNode` (bailed early, or
+predates EN.3.C) simply has `policy`/`outcomes` both `null`.
+
+## Aggregating across runs
+
+`aggregate.rs` groups a set of completed state files by **identical resolved policy** (exact
+field-for-field match) and tabulates cost/time/quality per policy group — the same shape as the
+"Consolidated ranking" table in `planning/sdlc-token-time-economics/notes.md`, but computed from
+real run data instead of hand-estimated:
+
+```rust
+use engine_core::workflows::sdlc_flow::aggregate::aggregate_state_files;
+
+let rows = aggregate_state_files(&[
+    "planning/spec-a/sdlc/sdlc-flow-state.json",
+    "planning/spec-b/sdlc/sdlc-flow-state.json",
+])?;
+// rows: Vec<PolicyAggregate> — one row per distinct policy, with run_count,
+// total/avg cost, total/avg wall-clock, token sums, attempts/retries,
+// pass_rate, and a review_verdict_counts tally.
+```
+
+Runs missing either the `policy` or `outcomes` block are silently skipped (there's no policy to
+key them by). **There is no CLI command wrapping this yet** — it's a library-only API today; call
+it from a Rust test/scratch binary, or wire a `bastion`/CLI subcommand in a later block if this
+needs to be run routinely.
+
+## Gaps / follow-ups (as of EN.3.C)
+
+- `simple_task_max_files`-based tier classification in `ImplementTaskNode` is defined in the
+  policy but not yet consumed.
+- No CLI surface for `aggregate.rs` — Rust-only today.
+- No `bastion`/dashboard visualization of `PolicyAggregate` rows yet.
