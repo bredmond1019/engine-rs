@@ -320,6 +320,36 @@ struct ImplementOutput {
     tests_added: Vec<String>,
 }
 
+/// JSON schema matching [`ImplementOutput`], passed as `Config.json_schema`
+/// so `claude-code-rs` requests (and pre-parses) a schema-constrained reply
+/// via `Outcome.structured_output` instead of relying solely on prompt text.
+fn implement_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "modified_files": { "type": "array", "items": { "type": "string" } },
+            "tests_added": { "type": "array", "items": { "type": "string" } },
+        },
+        "required": ["summary"],
+    })
+}
+
+/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
+/// when present and non-null; otherwise fall back to
+/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
+fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
+    ctx: &TaskContext,
+    node_name: &str,
+    content: &str,
+) -> Result<T, serde_json::Error> {
+    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
+    match structured {
+        Some(value) if !value.is_null() => serde_json::from_value(value),
+        _ => serde_json::from_str(strip_json_fence(content)),
+    }
+}
+
 impl ImplementTaskNode {
     #[must_use]
     pub fn new() -> Self {
@@ -399,6 +429,8 @@ impl Node for ImplementTaskNode {
             config.cwd = Some(std::path::PathBuf::from(worktree));
         }
 
+        config.json_schema = Some(implement_output_schema());
+
         let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
@@ -415,11 +447,13 @@ impl Node for ImplementTaskNode {
             .to_string();
 
         let parsed: ImplementOutput =
-            serde_json::from_str(strip_json_fence(&content)).unwrap_or(ImplementOutput {
-                summary: content.clone(),
-                modified_files: Vec::new(),
-                tests_added: Vec::new(),
-            });
+            parse_structured_or_fenced(&ctx, "ImplementTaskNode", &content).unwrap_or(
+                ImplementOutput {
+                    summary: content.clone(),
+                    modified_files: Vec::new(),
+                    tests_added: Vec::new(),
+                },
+            );
 
         put_result(
             &mut ctx,
@@ -659,6 +693,18 @@ struct TriageOutput {
     reason: String,
 }
 
+/// JSON schema matching [`TriageOutput`].
+fn triage_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict": { "type": "string" },
+            "reason": { "type": "string" },
+        },
+        "required": ["verdict", "reason"],
+    })
+}
+
 impl TriageTaskNode {
     #[must_use]
     pub fn new() -> Self {
@@ -814,7 +860,9 @@ impl Node for TriageTaskNode {
         );
 
         let policy = resolved_policy(&ctx);
-        let (config, prompt) = apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
+        let (mut config, prompt) =
+            apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
+        config.json_schema = Some(triage_output_schema());
 
         let mut step = ClaudeCodeStep::new("TriageTaskNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -830,8 +878,8 @@ impl Node for TriageTaskNode {
             .ok_or_else(|| NodeError::new("TriageTaskNode: model returned no content"))?
             .to_string();
 
-        let parsed: TriageOutput =
-            serde_json::from_str(strip_json_fence(&content)).map_err(|err| {
+        let parsed: TriageOutput = parse_structured_or_fenced(&ctx, "TriageTaskNode", &content)
+            .map_err(|err| {
                 NodeError::new(format!(
                     "TriageTaskNode: failed to parse model output as JSON: {err}"
                 ))
@@ -934,6 +982,19 @@ struct ReviewOutput {
     issues: Vec<String>,
 }
 
+/// JSON schema matching [`ReviewOutput`].
+fn review_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict": { "type": "string" },
+            "summary": { "type": "string" },
+            "issues": { "type": "array", "items": { "type": "string" } },
+        },
+        "required": ["verdict", "summary"],
+    })
+}
+
 impl ConsolidatedReviewNode {
     #[must_use]
     pub fn new() -> Self {
@@ -1008,6 +1069,7 @@ impl Node for ConsolidatedReviewNode {
         // the file it was asked to review as "missing", because it was
         // looking in the wrong directory).
         config.cwd = Some(std::path::PathBuf::from(&worktree));
+        config.json_schema = Some(review_output_schema());
 
         let mut step = ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -1024,11 +1086,13 @@ impl Node for ConsolidatedReviewNode {
             .to_string();
 
         let parsed: ReviewOutput =
-            serde_json::from_str(strip_json_fence(&content)).map_err(|err| {
-                NodeError::new(format!(
-                    "ConsolidatedReviewNode: failed to parse model output as JSON: {err}"
-                ))
-            })?;
+            parse_structured_or_fenced(&ctx, "ConsolidatedReviewNode", &content).map_err(
+                |err| {
+                    NodeError::new(format!(
+                        "ConsolidatedReviewNode: failed to parse model output as JSON: {err}"
+                    ))
+                },
+            )?;
 
         put_result(
             &mut ctx,
@@ -2002,6 +2066,82 @@ mod tests {
             .with_transport(transport);
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
+    /// A schema-tagged reply (`structured_output: Some(..)`) is consumed via
+    /// the `structured` field written by `ClaudeCodeStep`, not the
+    /// fence-strip path — proven by making `text` a value that would fail a
+    /// strict-JSON parse (an unfenced non-JSON string) while `structured`
+    /// carries the real payload.
+    #[tokio::test]
+    async fn review_prefers_structured_output_over_fence_parse() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let mut outcome = canned_outcome("not valid json at all".to_string());
+            outcome.structured_output =
+                Some(json!({ "verdict": "PASS", "summary": "from structured", "issues": [] }));
+            Box::pin(async move { Ok(outcome) })
+        });
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+        assert_eq!(
+            out.nodes["ConsolidatedReviewNode"]["summary"],
+            "from structured"
+        );
+    }
+
+    /// A fence-only reply (`structured_output: None`) still parses via the
+    /// `strip_json_fence` + `serde_json::from_str` fallback.
+    #[tokio::test]
+    async fn review_falls_back_to_fence_parse_when_structured_absent() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let fenced = format!(
+            "```json\n{}\n```",
+            json!({ "verdict": "PASS", "summary": "from fence", "issues": [] })
+        );
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(fenced.clone());
+            Box::pin(async move { Ok(outcome) })
+        });
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["summary"], "from fence");
     }
 
     // --- Policy consumption (EN.3.C task 3) ---------------------------------
