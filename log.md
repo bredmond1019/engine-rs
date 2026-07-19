@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-18T23:47:11Z"
+timestamp: "2026-07-19T00:44:13Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,11 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-18]
+
+### SDLC Flow Policy Research + Test Planning
+- **What:** Reviewed the new SDLC Flow policy and workflow documentation (`docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`). Summarized the available configuration knobs for adjusting cost, time, and quality. Designed four initial test profiles (Baseline, Cheap & Fast, Pragmatist, Batch Reviewer) to determine the ideal configuration. Created a research note at `planning/sdlc-flow-policy-research/notes.md` to hold these test profiles and discussed next steps with the user regarding test execution methods and optimization metrics. Wrote `planning/handoff.md` and committed changes to cleanly hand off for test creation.
+- **Why:** The `SDLC_FLOW` now has a tunable `SdlcPolicy`. We need to empirically test these settings to find the optimal configuration for the agentic loops.
+- **Refs:** `planning/sdlc-flow-policy-research/notes.md`, `planning/handoff.md`
 
 ### SDLC Flow reference docs + live integration test (bugfixes)
 - **What:** Wrote SDLC Flow reference docs (`docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`)
