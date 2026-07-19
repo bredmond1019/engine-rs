@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-19T00:44:13Z"
+timestamp: "2026-07-19T11:40:43Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,35 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ---
+
+## [run: 2026-07-19]
+
+### PR #7 merged — `plan-sdlc-policy-profiles` (Block EN.1-plan.A) closed
+- **What:** Ran the `sdlc-flow` workflow for spec `plan-sdlc-policy-profiles` on branch
+  `plan-sdlc-policy-profiles-flow`. It executed 4 tasks (all implemented and passed fast-tests),
+  a consolidated review (PASS, no findings), and a docs patch (updated `docs/architecture.md`
+  and `docs/sdlc-flow-workflow.md`). This produced PR #7
+  (https://github.com/bredmond1019/engine-rs/pull/7), which has now been merged into `main`
+  (merge commit fast-forwarded locally; `main` is up to date with `origin/main` plus the merge).
+  Changed files in the merge: `crates/engine-core/src/nodes/claude_code_step.rs`,
+  `crates/engine-core/src/nodes/openai_compat_transport.rs`,
+  `crates/engine-core/src/workflows/sdlc_flow/docs.rs`,
+  `crates/engine-core/src/workflows/sdlc_flow/setup.rs`,
+  `crates/engine-core/src/workflows/sdlc_flow/task_loop.rs`, plus new/updated tests in
+  `crates/engine-core/tests/` (`claude_code_step.rs`, `sdlc_flow_e2e.rs`, `sdlc_flow_live.rs`,
+  `sdlc_flow_task_loop.rs`), and `docs/architecture.md`, `docs/sdlc-flow-workflow.md`.
+- **Why:** This closes out Block EN.1-plan.A (structured-output hardening) of the ad-hoc
+  `plan-sdlc-policy-profiles` plan — the implementation/review/docs work was done in the prior
+  session (see the `[run: 2026-07-18]` entry below); this session is the PR merge that finalizes
+  the block.
+- **Status:** Block EN.1-plan.A is closed (`planning/state.json` already had `status: "closed"`
+  for this block). The parent plan `plan-sdlc-policy-profiles` is **not** fully done — Blocks B
+  (named profiles), C/D (deterministic tests + real-CLI experiment harness), and E (docs
+  wrap-up) remain, in that dependency order.
+- **Refs:** PR #7 (https://github.com/bredmond1019/engine-rs/pull/7),
+  `planning/plan-sdlc-policy-profiles/plan.md`, `planning/plan-sdlc-policy-profiles/tasks.md`
+- **Next:** `/generate-tasks` (or `/sdlc-flow`) against Block B — EN.1-plan.B, named profiles +
+  first-class `profile:` field.
 
 ## [run: 2026-07-18]
 
