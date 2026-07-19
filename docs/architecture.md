@@ -216,7 +216,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   itself.
 - `ClaudeCodeStep` (`engine-core::nodes::claude_code_step`, EN.2.A) — a reusable `Node` that spawns
   a Claude Code session via `claude_code_rs::execute` and maps its `Outcome` into the node's
-  `TaskContext::nodes` output (`{content, cost_usd, model}`) and `NodeRun.usage`. Constructed with a
+  `TaskContext::nodes` output (`{content, cost_usd, model, structured}` — `structured` is
+  `outcome.structured_output`, the SDK's parsed JSON when the caller set `config.json_schema` and
+  the model's reply matched it, else `null`) and `NodeRun.usage`. Constructed with a
   fixed prompt (`new`) or a prompt built fresh from the live `TaskContext` on each call
   (`with_prompt_builder`); its subprocess call goes through an injectable `Transport` closure
   (`with_transport`) so the gated test suite stubs it instead of spawning a real `claude` process.
