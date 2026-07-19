@@ -720,6 +720,7 @@ mod tests {
             text: text.to_string(),
             is_error: false,
             api_error_status: None,
+            structured_output: None,
         }
     }
 

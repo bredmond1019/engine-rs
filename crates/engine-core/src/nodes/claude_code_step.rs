@@ -194,6 +194,7 @@ impl Node for ClaudeCodeStep {
             "content": outcome.text,
             "cost_usd": outcome.cost_usd,
             "model": model,
+            "structured": outcome.structured_output,
         });
         ctx.nodes.insert(self.name.clone(), output);
 
@@ -271,6 +272,7 @@ mod tests {
             text: "ok".to_string(),
             is_error: false,
             api_error_status: None,
+            structured_output: None,
         }
     }
 

@@ -1487,6 +1487,7 @@ mod tests {
                 text: json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string(),
                 is_error: false,
                 api_error_status: None,
+                structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
         });
@@ -1909,6 +1910,7 @@ mod tests {
                 text: canned.clone(),
                 is_error: false,
                 api_error_status: None,
+                structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
         });
@@ -2029,6 +2031,7 @@ mod tests {
             text,
             is_error: false,
             api_error_status: None,
+            structured_output: None,
         }
     }
 

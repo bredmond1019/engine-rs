@@ -48,6 +48,7 @@ fn stub_outcome() -> Outcome {
         )]
         .into_iter()
         .collect(),
+        structured_output: None,
         text: "ok".to_string(),
         is_error: false,
         api_error_status: None,

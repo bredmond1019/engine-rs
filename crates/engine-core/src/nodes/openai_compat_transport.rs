@@ -144,6 +144,7 @@ fn outcome_from_chat_completion(model: &str, response: &Value) -> Result<Outcome
         text,
         is_error: false,
         api_error_status: None,
+        structured_output: None,
     })
 }
 
@@ -268,6 +269,7 @@ mod tests {
                     text,
                     is_error: false,
                     api_error_status: None,
+                    structured_output: None,
                 })
             })
         })

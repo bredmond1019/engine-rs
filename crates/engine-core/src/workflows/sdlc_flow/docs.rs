@@ -169,6 +169,7 @@ mod tests {
                 text: reply.to_string(),
                 is_error: false,
                 api_error_status: None,
+                structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
         })
@@ -239,6 +240,7 @@ mod tests {
                 text: "not json".to_string(),
                 is_error: false,
                 api_error_status: None,
+                structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
         }));
