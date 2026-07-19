@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 
-use super::ModelTransport;
+use super::{get_result, ModelTransport};
 
 /// Model output shape `PatchDocsNode` expects (strict JSON reply).
 #[derive(Debug, Deserialize)]
@@ -26,6 +26,35 @@ struct PatchDocsOutput {
     summary: String,
     #[serde(default)]
     files_patched: Vec<String>,
+}
+
+/// JSON schema matching [`PatchDocsOutput`], passed as `Config.json_schema`
+/// so `claude-code-rs` requests (and pre-parses) a schema-constrained reply
+/// via `Outcome.structured_output` instead of relying solely on prompt text.
+fn patch_docs_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "files_patched": { "type": "array", "items": { "type": "string" } },
+        },
+        "required": ["summary"],
+    })
+}
+
+/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
+/// when present and non-null; otherwise fall back to
+/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
+fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
+    ctx: &TaskContext,
+    node_name: &str,
+    content: &str,
+) -> Result<T, serde_json::Error> {
+    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
+    match structured {
+        Some(value) if !value.is_null() => serde_json::from_value(value),
+        _ => serde_json::from_str(super::strip_json_fence(content)),
+    }
 }
 
 /// Model node (Sonnet): patches documentation referencing the task's
@@ -87,10 +116,11 @@ impl Default for PatchDocsNode {
 #[async_trait::async_trait]
 impl Node for PatchDocsNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        let mut step = ClaudeCodeStep::with_prompt_builder(
-            "PatchDocsNode",
-            self.config.clone(),
-            |ctx: &TaskContext| {
+        let mut config = self.config.clone();
+        config.json_schema = Some(patch_docs_output_schema());
+
+        let mut step =
+            ClaudeCodeStep::with_prompt_builder("PatchDocsNode", config, |ctx: &TaskContext| {
                 let modified_files = Self::collect_modified_files(ctx);
                 format!(
                     "Search docs/ for stale references to the following \
@@ -99,8 +129,7 @@ impl Node for PatchDocsNode {
                      \"files_patched\": [str]}}.\n\nModified files: {}",
                     json!(modified_files)
                 )
-            },
-        );
+            });
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -115,12 +144,12 @@ impl Node for PatchDocsNode {
             .ok_or_else(|| NodeError::new("PatchDocsNode: model returned no content"))?
             .to_string();
 
-        let parsed: PatchDocsOutput = serde_json::from_str(super::strip_json_fence(&content))
+        let parsed: PatchDocsOutput = parse_structured_or_fenced(&ctx, "PatchDocsNode", &content)
             .map_err(|err| {
-                NodeError::new(format!(
-                    "PatchDocsNode: failed to parse model output as JSON: {err}"
-                ))
-            })?;
+            NodeError::new(format!(
+                "PatchDocsNode: failed to parse model output as JSON: {err}"
+            ))
+        })?;
 
         super::put_result(
             &mut ctx,
@@ -175,6 +204,29 @@ mod tests {
         })
     }
 
+    /// Like `stub_transport` but returns non-JSON `text` alongside a
+    /// pre-parsed `structured_output`, so a passing test proves the
+    /// `structured` field was consumed rather than the fence-strip path.
+    fn stub_transport_structured(structured: serde_json::Value) -> ModelTransport {
+        Arc::new(move |_config, _prompt| {
+            let outcome = Outcome {
+                cost_usd: 0.0,
+                usage: claude_code_rs::parse::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: "not fence-parseable json".to_string(),
+                is_error: false,
+                api_error_status: None,
+                structured_output: Some(structured.clone()),
+            };
+            Box::pin(async move { Ok(outcome) })
+        })
+    }
+
     #[tokio::test]
     async fn stamps_summary_and_files_patched_from_stub_transport() {
         let mut ctx = empty_context(json!({}));
@@ -195,6 +247,29 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         let result = out.nodes.get("PatchDocsNode").expect("output present");
         assert_eq!(result["summary"], "patched stale references");
+        assert_eq!(result["files_patched"], json!(["docs/foo.md"]));
+    }
+
+    #[tokio::test]
+    async fn stamps_summary_and_files_patched_from_structured_output() {
+        let mut ctx = empty_context(json!({}));
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": ["src/foo.rs"],
+                "tests_added": [],
+            }),
+        );
+
+        let node = PatchDocsNode::new().with_transport(stub_transport_structured(json!({
+            "summary": "patched via structured output",
+            "files_patched": ["docs/foo.md"],
+        })));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = out.nodes.get("PatchDocsNode").expect("output present");
+        assert_eq!(result["summary"], "patched via structured output");
         assert_eq!(result["files_patched"], json!(["docs/foo.md"]));
     }
 
