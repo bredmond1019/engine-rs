@@ -28,7 +28,9 @@ use crate::routing::Router;
 use super::policy::{ModelTier, OutputVerbosity, ReviewMode, SdlcPolicy};
 use super::schema::{SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
 use super::setup::RESOLVED_POLICY_IDENTITY;
-use super::{get_result, put_result, CommandOutput, CommandRunner, ModelTransport};
+use super::{
+    get_result, put_result, strip_json_fence, CommandOutput, CommandRunner, ModelTransport,
+};
 
 /// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
 /// anchor when `policy.prompt_cache` is true (lever #2b). `claude-code-rs`'s
@@ -318,6 +320,36 @@ struct ImplementOutput {
     tests_added: Vec<String>,
 }
 
+/// JSON schema matching [`ImplementOutput`], passed as `Config.json_schema`
+/// so `claude-code-rs` requests (and pre-parses) a schema-constrained reply
+/// via `Outcome.structured_output` instead of relying solely on prompt text.
+fn implement_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "modified_files": { "type": "array", "items": { "type": "string" } },
+            "tests_added": { "type": "array", "items": { "type": "string" } },
+        },
+        "required": ["summary"],
+    })
+}
+
+/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
+/// when present and non-null; otherwise fall back to
+/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
+fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
+    ctx: &TaskContext,
+    node_name: &str,
+    content: &str,
+) -> Result<T, serde_json::Error> {
+    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
+    match structured {
+        Some(value) if !value.is_null() => serde_json::from_value(value),
+        _ => serde_json::from_str(strip_json_fence(content)),
+    }
+}
+
 impl ImplementTaskNode {
     #[must_use]
     pub fn new() -> Self {
@@ -336,6 +368,19 @@ impl ImplementTaskNode {
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Override the base `Config` entirely (model/tool-permission/etc.
+    /// fields) — `process` still overwrites `model` per the resolved
+    /// policy and `cwd` per `SetupWorktreeNode`'s worktree path, but every
+    /// other field (e.g. `disallowed_tools`, `dangerously_skip_permissions`)
+    /// passes through untouched. Live/manual tests use this to grant real
+    /// tool-use permission for a genuine agentic session without changing
+    /// this node's own safe-by-default `new()` construction.
+    #[must_use]
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
         self
     }
 }
@@ -373,7 +418,18 @@ impl Node for ImplementTaskNode {
         );
 
         let policy = resolved_policy(&ctx);
-        let (config, prompt) = apply_policy(self.config.clone(), prompt, &policy, Stage::Implement);
+        let (mut config, prompt) =
+            apply_policy(self.config.clone(), prompt, &policy, Stage::Implement);
+        // Scope the model's session to the actual worktree so it edits the
+        // right checkout rather than inheriting the host process's ambient
+        // cwd. Best-effort: a ctx driven directly (no `SetupWorktreeNode`
+        // run, e.g. a unit test) falls back to today's behavior (no `cwd`
+        // override) instead of failing the node.
+        if let Ok(worktree) = worktree_path(&ctx) {
+            config.cwd = Some(std::path::PathBuf::from(worktree));
+        }
+
+        config.json_schema = Some(implement_output_schema());
 
         let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -390,11 +446,14 @@ impl Node for ImplementTaskNode {
             .unwrap_or_default()
             .to_string();
 
-        let parsed: ImplementOutput = serde_json::from_str(&content).unwrap_or(ImplementOutput {
-            summary: content.clone(),
-            modified_files: Vec::new(),
-            tests_added: Vec::new(),
-        });
+        let parsed: ImplementOutput =
+            parse_structured_or_fenced(&ctx, "ImplementTaskNode", &content).unwrap_or(
+                ImplementOutput {
+                    summary: content.clone(),
+                    modified_files: Vec::new(),
+                    tests_added: Vec::new(),
+                },
+            );
 
         put_result(
             &mut ctx,
@@ -634,6 +693,18 @@ struct TriageOutput {
     reason: String,
 }
 
+/// JSON schema matching [`TriageOutput`].
+fn triage_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict": { "type": "string" },
+            "reason": { "type": "string" },
+        },
+        "required": ["verdict", "reason"],
+    })
+}
+
 impl TriageTaskNode {
     #[must_use]
     pub fn new() -> Self {
@@ -662,6 +733,15 @@ impl TriageTaskNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the base `Config` entirely. Live/manual tests use this to
+    /// set `isolated: true` when driving a real `claude` call from inside
+    /// another interactive session (see `Config::isolated`'s doc comment).
+    #[must_use]
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
         self
     }
 }
@@ -780,7 +860,9 @@ impl Node for TriageTaskNode {
         );
 
         let policy = resolved_policy(&ctx);
-        let (config, prompt) = apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
+        let (mut config, prompt) =
+            apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
+        config.json_schema = Some(triage_output_schema());
 
         let mut step = ClaudeCodeStep::new("TriageTaskNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -796,16 +878,19 @@ impl Node for TriageTaskNode {
             .ok_or_else(|| NodeError::new("TriageTaskNode: model returned no content"))?
             .to_string();
 
-        let parsed: TriageOutput = serde_json::from_str(&content).map_err(|err| {
-            NodeError::new(format!(
-                "TriageTaskNode: failed to parse model output as JSON: {err}"
-            ))
-        })?;
+        let parsed: TriageOutput = parse_structured_or_fenced(&ctx, "TriageTaskNode", &content)
+            .map_err(|err| {
+                NodeError::new(format!(
+                    "TriageTaskNode: failed to parse model output as JSON: {err}"
+                ))
+            })?;
 
         put_result(
             &mut ctx,
             "TriageTaskNode",
-            json!({ "verdict": parsed.verdict, "reason": parsed.reason }),
+            // Same normalization as `ConsolidatedReviewNode`'s, and for the
+            // same reason — `TriageRouterNode` exact-matches this string.
+            json!({ "verdict": parsed.verdict.trim().to_uppercase(), "reason": parsed.reason }),
         );
 
         Ok(ctx)
@@ -897,6 +982,19 @@ struct ReviewOutput {
     issues: Vec<String>,
 }
 
+/// JSON schema matching [`ReviewOutput`].
+fn review_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict": { "type": "string" },
+            "summary": { "type": "string" },
+            "issues": { "type": "array", "items": { "type": "string" } },
+        },
+        "required": ["verdict", "summary"],
+    })
+}
+
 impl ConsolidatedReviewNode {
     #[must_use]
     pub fn new() -> Self {
@@ -921,6 +1019,15 @@ impl ConsolidatedReviewNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the base `Config` entirely. Live/manual tests use this to
+    /// set `isolated: true` when driving a real `claude` call from inside
+    /// another interactive session (see `Config::isolated`'s doc comment).
+    #[must_use]
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
         self
     }
 }
@@ -953,7 +1060,16 @@ impl Node for ConsolidatedReviewNode {
         );
 
         let policy = resolved_policy(&ctx);
-        let (config, prompt) = apply_policy(self.config.clone(), prompt, &policy, Stage::Review);
+        let (mut config, prompt) =
+            apply_policy(self.config.clone(), prompt, &policy, Stage::Review);
+        // Scope the model's session to the actual worktree, matching
+        // `ImplementTaskNode`'s fix — without this, a real call that reads
+        // the filesystem checks the host process's ambient cwd instead of
+        // the task's worktree (observed live: the model correctly reported
+        // the file it was asked to review as "missing", because it was
+        // looking in the wrong directory).
+        config.cwd = Some(std::path::PathBuf::from(&worktree));
+        config.json_schema = Some(review_output_schema());
 
         let mut step = ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -969,17 +1085,26 @@ impl Node for ConsolidatedReviewNode {
             .ok_or_else(|| NodeError::new("ConsolidatedReviewNode: model returned no content"))?
             .to_string();
 
-        let parsed: ReviewOutput = serde_json::from_str(&content).map_err(|err| {
-            NodeError::new(format!(
-                "ConsolidatedReviewNode: failed to parse model output as JSON: {err}"
-            ))
-        })?;
+        let parsed: ReviewOutput =
+            parse_structured_or_fenced(&ctx, "ConsolidatedReviewNode", &content).map_err(
+                |err| {
+                    NodeError::new(format!(
+                        "ConsolidatedReviewNode: failed to parse model output as JSON: {err}"
+                    ))
+                },
+            )?;
 
         put_result(
             &mut ctx,
             "ConsolidatedReviewNode",
             json!({
-                "verdict": parsed.verdict,
+                // Normalized to the canonical uppercase form `ReviewRouterNode`
+                // matches on — a real model reply doesn't reliably preserve
+                // the exact casing asked for (observed live: a real Sonnet
+                // reply returned "pass"), and an un-normalized mismatch here
+                // makes the router's exact match fail closed to `None`,
+                // silently halting the whole run at this node.
+                "verdict": parsed.verdict.trim().to_uppercase(),
                 "summary": parsed.summary,
                 "issues": parsed.issues,
             }),
@@ -1426,6 +1551,7 @@ mod tests {
                 text: json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string(),
                 is_error: false,
                 api_error_status: None,
+                structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
         });
@@ -1437,6 +1563,31 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(*called.lock().unwrap());
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+    }
+
+    /// A real model reply's casing isn't guaranteed to match the prompt's
+    /// literal request — a lowercase (or mixed-case) verdict is normalized
+    /// to uppercase so `TriageRouterNode`'s exact match still routes
+    /// correctly instead of silently falling through to `None`.
+    #[tokio::test]
+    async fn triage_llm_branch_normalizes_lowercase_verdict() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({ "verdict": "retryable", "reason": "try again" }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = TriageTaskNode::new().with_transport(transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
     }
 
     // --- TriageRouterNode ------------------------------------------------
@@ -1823,6 +1974,7 @@ mod tests {
                 text: canned.clone(),
                 is_error: false,
                 api_error_status: None,
+                structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
         });
@@ -1833,6 +1985,163 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(*diff_called.lock().unwrap());
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
+    /// The model's `Config.cwd` is scoped to the run's worktree — without
+    /// this, a real review call that reads the filesystem checks the host
+    /// process's ambient cwd instead of the task's actual worktree.
+    #[tokio::test]
+    async fn review_node_scopes_config_cwd_to_worktree() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "/tmp/some-worktree" }),
+        );
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(
+                json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(
+            config.cwd,
+            Some(std::path::PathBuf::from("/tmp/some-worktree"))
+        );
+    }
+
+    /// Same normalization as `TriageTaskNode`'s llm branch, and for the same
+    /// reason: a real model reply's casing isn't guaranteed, and an
+    /// un-normalized mismatch makes `ReviewRouterNode`'s exact match fail
+    /// closed to `None` (observed live: a real reply returned "pass").
+    #[tokio::test]
+    async fn review_node_normalizes_lowercase_verdict() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({ "verdict": "pass", "summary": "ok", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
+    /// A schema-tagged reply (`structured_output: Some(..)`) is consumed via
+    /// the `structured` field written by `ClaudeCodeStep`, not the
+    /// fence-strip path — proven by making `text` a value that would fail a
+    /// strict-JSON parse (an unfenced non-JSON string) while `structured`
+    /// carries the real payload.
+    #[tokio::test]
+    async fn review_prefers_structured_output_over_fence_parse() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let mut outcome = canned_outcome("not valid json at all".to_string());
+            outcome.structured_output =
+                Some(json!({ "verdict": "PASS", "summary": "from structured", "issues": [] }));
+            Box::pin(async move { Ok(outcome) })
+        });
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+        assert_eq!(
+            out.nodes["ConsolidatedReviewNode"]["summary"],
+            "from structured"
+        );
+    }
+
+    /// A fence-only reply (`structured_output: None`) still parses via the
+    /// `strip_json_fence` + `serde_json::from_str` fallback.
+    #[tokio::test]
+    async fn review_falls_back_to_fence_parse_when_structured_absent() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let fenced = format!(
+            "```json\n{}\n```",
+            json!({ "verdict": "PASS", "summary": "from fence", "issues": [] })
+        );
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(fenced.clone());
+            Box::pin(async move { Ok(outcome) })
+        });
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["summary"], "from fence");
     }
 
     // --- Policy consumption (EN.3.C task 3) ---------------------------------
@@ -1862,6 +2171,7 @@ mod tests {
             text,
             is_error: false,
             api_error_status: None,
+            structured_output: None,
         }
     }
 
@@ -1932,6 +2242,71 @@ mod tests {
             .clone()
             .expect("transport should have been called");
         assert!(prompt.contains("Be terse"));
+    }
+
+    /// When `SetupWorktreeNode` has stamped a `worktree_path`, the model's
+    /// `Config.cwd` is scoped to it — so a real session edits the actual
+    /// checkout rather than the host process's ambient cwd.
+    #[tokio::test]
+    async fn implement_node_scopes_config_cwd_to_worktree() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+        let mut ctx = ctx;
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "/tmp/some-worktree" }),
+        );
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(
+            config.cwd,
+            Some(std::path::PathBuf::from("/tmp/some-worktree"))
+        );
+    }
+
+    /// Without a `SetupWorktreeNode` result (e.g. a unit test driving the
+    /// node directly), `Config.cwd` falls back to `None` rather than
+    /// failing the node — today's pre-fix behavior is preserved when no
+    /// worktree is known.
+    #[tokio::test]
+    async fn implement_node_leaves_cwd_none_without_worktree() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let seen_config: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let seen_config_clone = seen_config.clone();
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *seen_config_clone.lock().unwrap() = Some(config);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = seen_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert_eq!(config.cwd, None);
     }
 
     /// The `normal` (default) verbosity injects no directive, reproducing

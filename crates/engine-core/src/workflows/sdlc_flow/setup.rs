@@ -290,6 +290,35 @@ struct GeneratedTasks {
     tasks_markdown: String,
 }
 
+/// JSON schema matching [`GeneratedTasks`], passed as `Config.json_schema` so
+/// `claude-code-rs` requests (and pre-parses) a schema-constrained reply via
+/// `Outcome.structured_output` instead of relying solely on prompt text.
+fn generated_tasks_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tasks": { "type": "array" },
+            "tasks_markdown": { "type": "string" },
+        },
+        "required": ["tasks", "tasks_markdown"],
+    })
+}
+
+/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
+/// when present and non-null; otherwise fall back to
+/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
+fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
+    ctx: &TaskContext,
+    node_name: &str,
+    content: &str,
+) -> Result<T, serde_json::Error> {
+    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
+    match structured {
+        Some(value) if !value.is_null() => serde_json::from_value(value),
+        _ => serde_json::from_str(super::strip_json_fence(content)),
+    }
+}
+
 /// Gather every `*.md` file directly under `dir` except the ones the task
 /// loop itself owns (`tasks.md`, generated `tasks.json`,
 /// `sdlc-flow-state.json`), concatenated with a `## <filename>` header each.
@@ -376,7 +405,10 @@ impl Node for GenerateTasksNode {
             event.spec_slug
         );
 
-        let mut step = ClaudeCodeStep::new("GenerateTasksNode", self.config.clone(), prompt);
+        let mut config = self.config.clone();
+        config.json_schema = Some(generated_tasks_schema());
+
+        let mut step = ClaudeCodeStep::new("GenerateTasksNode", config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -391,11 +423,12 @@ impl Node for GenerateTasksNode {
             .ok_or_else(|| NodeError::new("GenerateTasksNode: model returned no content"))?
             .to_string();
 
-        let generated: GeneratedTasks = serde_json::from_str(&content).map_err(|err| {
-            NodeError::new(format!(
-                "GenerateTasksNode: failed to parse model output as JSON: {err}"
-            ))
-        })?;
+        let generated: GeneratedTasks =
+            parse_structured_or_fenced(&ctx, "GenerateTasksNode", &content).map_err(|err| {
+                NodeError::new(format!(
+                    "GenerateTasksNode: failed to parse model output as JSON: {err}"
+                ))
+            })?;
 
         std::fs::create_dir_all(&dir)
             .map_err(|err| NodeError::new(format!("failed to create {}: {err}", dir.display())))?;
@@ -719,6 +752,14 @@ mod tests {
             text: text.to_string(),
             is_error: false,
             api_error_status: None,
+            structured_output: None,
+        }
+    }
+
+    fn stub_outcome_with_structured(text: &str, structured: serde_json::Value) -> Outcome {
+        Outcome {
+            structured_output: Some(structured),
+            ..stub_outcome_with_text(text)
         }
     }
 
@@ -750,6 +791,61 @@ mod tests {
         assert!(dir.join("tasks.md").exists());
         let md = std::fs::read_to_string(dir.join("tasks.md")).unwrap();
         assert!(md.contains("Do it"));
+    }
+
+    #[tokio::test]
+    async fn generate_prefers_structured_output_over_fence_parse() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        // Text is deliberately not valid JSON for GeneratedTasks so the test
+        // only passes if the structured path is used, not the fence path.
+        let structured = json!({
+            "tasks": [{ "task_id": 1, "title": "Structured task", "description": "desc" }],
+            "tasks_markdown": "# Tasks\n\n1. Structured task",
+        });
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome =
+                stub_outcome_with_structured("not fence-parseable json", structured.clone());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+
+        let out = node.process(ctx).await.expect("generate should succeed");
+        let result = out.nodes.get("GenerateTasksNode").expect("output present");
+        assert_eq!(result["task_count"], 1);
+
+        let dir = worktree.join("planning").join("my-spec");
+        let md = std::fs::read_to_string(dir.join("tasks.md")).unwrap();
+        assert!(md.contains("Structured task"));
+    }
+
+    #[tokio::test]
+    async fn generate_falls_back_to_fence_parse_when_structured_absent() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let canned = json!({
+            "tasks": [{ "task_id": 1, "title": "Fence task", "description": "desc" }],
+            "tasks_markdown": "# Tasks\n\n1. Fence task",
+        })
+        .to_string();
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text(&canned);
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+
+        let _out = node.process(ctx).await.expect("generate should succeed");
+        let dir = worktree.join("planning").join("my-spec");
+        let md = std::fs::read_to_string(dir.join("tasks.md")).unwrap();
+        assert!(md.contains("Fence task"));
     }
 
     #[tokio::test]

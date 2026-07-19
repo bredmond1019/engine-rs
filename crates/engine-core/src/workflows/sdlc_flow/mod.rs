@@ -101,3 +101,61 @@ pub(crate) fn get_result<'a>(
 ) -> Option<&'a serde_json::Value> {
     ctx.nodes.get(identity)
 }
+
+/// Strip a Markdown code fence (` ```json ... ``` ` or plain ` ``` ... ``` `)
+/// wrapping a model's reply, if present, so a strict `serde_json::from_str`
+/// parse still succeeds. Every model node here prompts for "strict JSON",
+/// but a real `claude` response commonly wraps it in a fence anyway
+/// (observed live, `EN.3.C`+ manual verification) — this is the one
+/// normalization applied before every model-output JSON parse in this
+/// module. Returns the input unchanged (just trimmed) when no fence is
+/// present, so a genuinely bare JSON reply round-trips exactly as before.
+pub(crate) fn strip_json_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    // Drop an optional language tag (e.g. `json`) up to the first newline.
+    let after_lang = match after_open.find('\n') {
+        Some(idx) => &after_open[idx + 1..],
+        None => after_open,
+    };
+    match after_lang.rfind("```") {
+        Some(idx) => after_lang[..idx].trim(),
+        None => trimmed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_json_fence;
+
+    #[test]
+    fn bare_json_passes_through_unchanged_but_trimmed() {
+        assert_eq!(strip_json_fence("  {\"a\": 1}  "), "{\"a\": 1}");
+    }
+
+    #[test]
+    fn strips_fence_with_json_language_tag() {
+        let text = "```json\n{\"a\": 1}\n```";
+        assert_eq!(strip_json_fence(text), "{\"a\": 1}");
+    }
+
+    #[test]
+    fn strips_bare_fence_with_no_language_tag() {
+        let text = "```\n{\"a\": 1}\n```";
+        assert_eq!(strip_json_fence(text), "{\"a\": 1}");
+    }
+
+    #[test]
+    fn discards_trailing_prose_after_the_closing_fence() {
+        let text = "```json\n{\"a\": 1}\n```\nDone!";
+        assert_eq!(strip_json_fence(text), "{\"a\": 1}");
+    }
+
+    #[test]
+    fn unclosed_fence_falls_back_to_the_whole_trimmed_text() {
+        let text = "```json\n{\"a\": 1}";
+        assert_eq!(strip_json_fence(text), text);
+    }
+}

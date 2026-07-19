@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-18T17:33:35Z"
+timestamp: "2026-07-19T00:44:13Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,78 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-18]
+
+### EN.1-plan.A — Structured-output hardening (`/sdlc-flow plan-sdlc-policy-profiles`)
+- **What:** Surfaced `claude-code-rs`'s new `Outcome.structured_output` through the shared
+  `ClaudeCodeStep` seam (`crates/engine-core/src/nodes/claude_code_step.rs`), writing it into
+  `ctx.nodes[name]["structured"]` alongside `content`/`cost_usd`/`model`, and fixed every
+  `Outcome { .. }` literal crate-wide (9 files) that would otherwise fail to compile against the
+  new struct field. All five model-JSON parse sites in `sdlc_flow` — `ImplementTaskNode`,
+  `TriageTaskNode`'s llm branch, `ConsolidatedReviewNode` (`task_loop.rs`), `GenerateTasksNode`
+  (`setup.rs`), and `PatchDocsNode` (`docs.rs`) — now set `config.json_schema` matching their
+  output struct and prefer the pre-parsed `structured` value, falling back to the existing
+  `strip_json_fence` + `serde_json::from_str` path when structured output is absent or null.
+  Verdict routing's `.trim().to_uppercase()` normalization was retained unchanged. Ran the full
+  gated validation suite (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`,
+  `cargo build --release`) clean. All 4 tasks passed on first attempt; end-of-flow review verdict
+  PASS with no findings; docs stage patched `docs/architecture.md` and `docs/sdlc-flow-workflow.md`.
+- **Why:** This is Block A of the `plan-sdlc-policy-profiles` ad-hoc plan
+  (`planning/plan-sdlc-policy-profiles/plan.md`) — two of the real production bugs already fixed
+  in the SDLC-flow port (JSON-fence wrapping, lowercase `"pass"` verdicts) are exactly what
+  schema-constrained output prevents at the source, so this had to land before the Phase 2
+  experiments (Blocks C/D) measure *policy* effects rather than parse flakiness.
+- **Decisions:** A shared `parse_structured_or_fenced<T>` helper was added per-file (duplicated
+  into `task_loop.rs`, `setup.rs`, and `docs.rs` rather than promoted to `mod.rs`) to keep each
+  task's file-touch scope narrow. Task 1 also fixed 5 `Outcome{..}` literals beyond the 4 files
+  named in the spec's file list, since the acceptance criteria required crate-wide compilation.
+- **Status:** Block A (EN.1-plan.A) is Done. The parent plan `plan-sdlc-policy-profiles` is
+  **not** fully done — Blocks B (named profiles), C/D (deterministic tests + real-CLI experiment
+  harness), and E (docs wrap-up) remain, in that dependency order.
+- **Refs:** `planning/plan-sdlc-policy-profiles/plan.md`, `planning/plan-sdlc-policy-profiles/tasks.md`,
+  `planning/plan-sdlc-policy-profiles/sdlc/sdlc-flow-state.json`
+- **Next:** `/generate-tasks` (or `/sdlc-flow`) against Block B — EN.1-plan.B, named profiles +
+  first-class `profile:` field.
+
+```
+6151b37 docs: update docs for plan-sdlc-policy-profiles
+d48ffc4 feat: implement plan-sdlc-policy-profiles-task4
+272cf10 feat: implement plan-sdlc-policy-profiles-task3
+1b6a8c8 feat: implement plan-sdlc-policy-profiles-task2
+bc386ab feat: implement plan-sdlc-policy-profiles-task1
+```
+
+### SDLC Flow Policy Research + Test Planning
+- **What:** Reviewed the new SDLC Flow policy and workflow documentation (`docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`). Summarized the available configuration knobs for adjusting cost, time, and quality. Designed four initial test profiles (Baseline, Cheap & Fast, Pragmatist, Batch Reviewer) to determine the ideal configuration. Created a research note at `planning/sdlc-flow-policy-research/notes.md` to hold these test profiles and discussed next steps with the user regarding test execution methods and optimization metrics. Wrote `planning/handoff.md` and committed changes to cleanly hand off for test creation.
+- **Why:** The `SDLC_FLOW` now has a tunable `SdlcPolicy`. We need to empirically test these settings to find the optimal configuration for the agentic loops.
+- **Refs:** `planning/sdlc-flow-policy-research/notes.md`, `planning/handoff.md`
+
+### SDLC Flow reference docs + live integration test (bugfixes)
+- **What:** Wrote SDLC Flow reference docs (`docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`)
+  and a live integration test (`crates/engine-core/tests/sdlc_flow_live.rs`) exercising real Claude
+  Code CLI calls through `ImplementTaskNode`, `TriageTaskNode`'s `llm_triage` branch, and
+  `ConsolidatedReviewNode`. Writing that test surfaced and fixed 5 real production bugs:
+  1. `ImplementTaskNode`/`ConsolidatedReviewNode` were missing `Config.cwd` (real calls ran in the
+     wrong directory).
+  2. No headless tool-permission wiring — added `Config.dangerously_skip_permissions` to
+     `claude-code-rs`.
+  3. Real replies wrap JSON in markdown fences — added `strip_json_fence` at all 5 model-output
+     parse sites.
+  4. Case-sensitive verdict routing would silently dead-end a run on a lowercase `"pass"`/`"fail"`
+     reply — normalized to uppercase after parsing.
+
+  (Narrative counts "5 real production bugs" but only 4 are enumerated above — logging the
+  discrepancy as-is rather than inventing a fifth.) All fixes are covered by new hermetic unit
+  tests; the full gated suite is green in both engine-rs and claude-code-rs (155 lib tests, up
+  from 147). Cleared 3 stale `state.json` carryover entries whose conditions had already resolved
+  (`en3a-retry-loop-no-bail`, `sdlc-flow-seam-duplication`, `local-llm-tier-investigation`) and
+  added one new one: `review-retry-no-attempt-cap` — a discovered-but-unfixed gap where the
+  review↔implement retry loop has no attempt cap independent of `TriageTaskNode`'s test-failure
+  path.
+- **Why:** Needed real (non-mocked) CLI-call coverage for the SDLC Flow task loop to validate the
+  policy/routing work landed in EN.3.C actually holds up against a live Claude Code CLI, and to
+  document the workflow + policy surface for future blocks.
+- **Refs:** `docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`,
+  `crates/engine-core/tests/sdlc_flow_live.rs`, `planning/state.json` (carryover updates)
 
 ### EN.3.C — Tunable run-policy config + experiment telemetry (PASS)
 Implemented the three-layer `SdlcPolicy` (event override > `harness.json` `sdlc.policy` defaults >
