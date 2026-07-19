@@ -842,7 +842,7 @@ mod tests {
         let node = GenerateTasksNode::new().with_transport(transport);
         let ctx = ctx_with_worktree("my-spec", &worktree);
 
-        let out = node.process(ctx).await.expect("generate should succeed");
+        let _out = node.process(ctx).await.expect("generate should succeed");
         let dir = worktree.join("planning").join("my-spec");
         let md = std::fs::read_to_string(dir.join("tasks.md")).unwrap();
         assert!(md.contains("Fence task"));
