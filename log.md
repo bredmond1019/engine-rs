@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-20T03:26:11Z"
+timestamp: "2026-07-20T11:44:06Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,24 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-20]
+
+### PR #10 merged — `plan-sdlc-policy-profiles-D` (Block EN.2-plan.D) closed
+- **What:** Merged PR #10 (https://github.com/bredmond1019/engine-rs/pull/10), branch
+  `plan-sdlc-policy-profiles-D-flow`, into `main`. The PR carried the `sdlc-flow` run for spec
+  `plan-sdlc-policy-profiles-D`: 3 tasks (all passed, attempt 1 each), a consolidated end-of-flow
+  review (PASS, no findings on first attempt), and a docs update (`docs/sdlc-flow-policy.md`).
+  Changed files: new `crates/engine-core/tests/sdlc_flow_experiment.rs` (505 lines) — the real-CLI
+  experiment harness described in the session entry directly below — plus
+  `docs/sdlc-flow-policy.md`.
+- **Why:** Finalizes Block EN.2-plan.D (Real-CLI experiment harness, Part B) of the ad-hoc
+  `plan-sdlc-policy-profiles` plan — the implementation/review work was done in this same session
+  (see the sub-entry directly below); this entry is the PR merge that closes the block out,
+  unblocking EN.3-plan.E (docs, index, and research-note wrap-up, the plan's last remaining block).
+- **Status:** Block EN.2-plan.D is closed (`planning/state.json` already had `status: "closed"`
+  for this block). The parent plan `plan-sdlc-policy-profiles` is *not* fully done — Block E
+  remains.
+- **Refs:** PR #10 (https://github.com/bredmond1019/engine-rs/pull/10),
+  `planning/plan-sdlc-policy-profiles-D/tasks.md`
 
 ### `plan-sdlc-policy-profiles-D` (Block EN.2-plan.D) done — real-CLI experiment harness (Part B)
 - **What:** Ran `/sdlc-flow` for spec `plan-sdlc-policy-profiles-D` on branch
