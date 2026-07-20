@@ -18,6 +18,42 @@ related: [status, context]
 
 ## [run: 2026-07-19]
 
+### `plan-sdlc-policy-profiles-C` (Block EN.2-plan.C) — deterministic plumbing tests, all 4 tasks PASS
+- **What:** Ran `/sdlc-flow plan-sdlc-policy-profiles-C` on branch `plan-sdlc-policy-profiles-C-flow`.
+  Added `crates/engine-core/tests/sdlc_flow_profiles.rs`, a hermetic, in-suite test file proving:
+  each of the four named profiles (`baseline`, `cheap-fast`, `pragmatist`, `batch-reviewer`)
+  resolves to its documented `SdlcPolicy` (Task 1); inline-`policy` precedence over `profile` holds
+  and an unknown profile name errors out of `resolve_policy_for_run` (Task 2); and the assembled
+  `SDLC_FLOW` graph actually routes on policy — `cheap-fast`'s `TrivialSkip` mode skips
+  `ConsolidatedReviewNode` on a trivial diff (contrasted with `baseline` still reaching it), and a
+  `local`-tier review policy gets its transport genuinely rewired to a loopback HTTP stub, observed
+  via a request-count spy and the `local/<model>` usage marker (Task 3). Task 4 ran the full gated
+  validation suite (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`,
+  `cargo build --release`) confirming all pass, including the 11 new tests.
+- **Why:** Closes Block EN.2-plan.C (Deterministic plumbing tests, Part A) of the ad-hoc
+  `plan-sdlc-policy-profiles` plan, unblocking EN.2-plan.D (real-CLI experiment harness, Part B).
+- **Verdict:** PASS (consolidated end-of-flow review, no findings).
+- **Notable decisions:** built a minimal in-process HTTP/1.1 stub server on `127.0.0.1:0` (tokio
+  `TcpListener`, hand-rolled response) to exercise the real reqwest-based local transport
+  hermetically rather than reimplementing it; reached the run-level unknown-profile error path via
+  the public `engine_core::workflows::sdlc_flow::setup::resolve_policy_for_run` rather than only
+  re-asserting `profile_by_name(...) == None`; introduced a `NamedProfileCtor` type alias to satisfy
+  `clippy::type_complexity` in the profile round-trip test's case table.
+- **Refs:** `planning/plan-sdlc-policy-profiles-C/tasks.md`,
+  `planning/plan-sdlc-policy-profiles-C/sdlc/sdlc-flow-state.json`,
+  `crates/engine-core/tests/sdlc_flow_profiles.rs`.
+- **Next:** EN.2-plan.D — real-CLI experiment harness (Part B).
+
+```
+eb20351 feat: implement plan-sdlc-policy-profiles-C-task3
+831da39 feat: implement plan-sdlc-policy-profiles-C-task2
+6c5b615 feat: implement plan-sdlc-policy-profiles-C-task1
+```
+
+---
+
+## [run: 2026-07-19]
+
 ### PR #8 merged — `plan-sdlc-policy-profiles-B` (Block EN.1-plan.B) closed
 - **What:** Merged PR #8 (https://github.com/bredmond1019/engine-rs/pull/8), branch
   `plan-sdlc-policy-profiles-B-flow`, into `main`. The PR carried the `sdlc-flow` run for spec
