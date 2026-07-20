@@ -9,10 +9,13 @@
 //! tasks in this block extend this file with precedence, unknown-profile
 //! error, and routing assertions (see `planning/plan-sdlc-policy-profiles-C/`).
 
+use std::collections::HashMap;
+
+use engine_contract::TaskContext;
 use engine_core::workflows::sdlc_flow::policy::{
     ModelTier, ModelTiers, OutputVerbosity, PartialPolicy, ReviewMode, SdlcPolicy,
 };
-use engine_core::workflows::sdlc_flow::{policy, profiles};
+use engine_core::workflows::sdlc_flow::{policy, profiles, setup};
 
 /// A profile's kebab-case name paired with its direct constructor, used to
 /// prove `profile_by_name` round-trips to the same resolution.
@@ -125,4 +128,76 @@ fn profile_by_name_matches_direct_constructor_resolution() {
 #[test]
 fn profile_by_name_returns_none_for_unknown_name() {
     assert_eq!(profiles::profile_by_name("does-not-exist"), None);
+}
+
+/// A bare `TaskContext` carrying only an `event` — mirrors `setup.rs`'s
+/// private `empty_context` test helper, reconstructed here since it isn't
+/// exported across the crate boundary.
+fn empty_context(event: serde_json::Value) -> TaskContext {
+    TaskContext {
+        event,
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    }
+}
+
+/// Event-inline `policy` overrides beat the `profile` layer field-by-field:
+/// the overridden field (`max_attempts`) takes the inline value, while every
+/// other field still falls through to the profile's bundle. Exercised
+/// through the same `resolve` call shape `setup::resolve_policy_for_run`
+/// uses (profile arg = `Some(cheap_fast)`, event_override = `Some(inline)`).
+#[test]
+fn event_inline_policy_overrides_profile_field_but_keeps_profile_tiers() {
+    let inline_override = PartialPolicy {
+        max_attempts: Some(9),
+        ..Default::default()
+    };
+
+    let resolved = policy::resolve(
+        SdlcPolicy::default(),
+        None,
+        Some(&profiles::cheap_fast()),
+        Some(&inline_override),
+    );
+
+    // The inline-overridden field wins...
+    assert_eq!(resolved.max_attempts, 9);
+    // ...but every other cheap-fast knob still comes through from the
+    // profile layer, since the inline override left those fields `None`.
+    assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
+    assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
+    assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+    assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
+    assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
+}
+
+/// The full run-level resolution path (`setup::resolve_policy_for_run`,
+/// reachable here since `setup` is a `pub mod` and the function itself is
+/// `pub`) errors on an unknown profile name rather than silently no-op'ing.
+/// `setup.rs`'s own unit test (`unknown_profile_name_returns_node_error`)
+/// covers the same path from inside the crate; this integration-level copy
+/// proves the behavior holds through the public API surface too.
+#[test]
+fn resolve_policy_for_run_errors_on_unknown_profile_name() {
+    let worktree = std::env::temp_dir().join(format!(
+        "sdlc_flow_profiles_unknown_profile_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&worktree).expect("temp worktree dir should create");
+
+    let ctx = empty_context(serde_json::json!({
+        "spec_slug": "my-spec",
+        "profile": "does-not-exist",
+    }));
+
+    let err = setup::resolve_policy_for_run(&ctx, &worktree)
+        .expect_err("an unknown profile name must not resolve");
+    assert!(
+        err.message.contains("unknown profile"),
+        "expected an 'unknown profile' error message, got: {}",
+        err.message
+    );
+
+    let _ = std::fs::remove_dir_all(&worktree);
 }
