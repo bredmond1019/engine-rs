@@ -193,6 +193,15 @@ key them by). **There is no CLI command wrapping this yet** — it's a library-o
 it from a Rust test/scratch binary, or wire a `bastion`/CLI subcommand in a later block if this
 needs to be run routinely.
 
+A worked example lives at `crates/engine-core/tests/sdlc_flow_experiment.rs`: a `#[ignore]`-gated
+real-CLI test (`experiment_four_profiles_real_cli_ranked_by_cost`) that drives the four named
+profiles (`baseline`, `cheap-fast`, `pragmatist`, `batch-reviewer`) through the full `SDLC_FLOW`
+graph against a synthetic multi-task fixture, then calls `aggregate_state_files` on the resulting
+state files and prints a table ranked by ascending `avg_cost_usd`. It also asserts that more than
+one distinct resolved-policy row shows up, as an end-to-end proof that policy stamping actually
+changes run behavior. Run it explicitly with
+`cargo test -p engine-core --test sdlc_flow_experiment -- --ignored`.
+
 ## Gaps / follow-ups (as of EN.3.C)
 
 - `simple_task_max_files`-based tier classification in `ImplementTaskNode` is defined in the
