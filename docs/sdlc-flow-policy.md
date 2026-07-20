@@ -135,6 +135,31 @@ then the inline `policy` fields override individual knobs on top of it.
 | `max_attempts` | `u32` | Retry budget per task before it's marked `FAILED`. |
 | `close_out.reuse.{validation,review,docs}` | `bool` each | Which `close-out` (EN.2.x) stages are allowed to reuse a prior flow record's result rather than re-running. |
 
+## Structured-output adoption
+
+Every cloud-side model node that expects a specific JSON reply shape sets `Config.json_schema`
+on its `claude_code_rs::Config` before calling `ClaudeCodeStep`/`execute()` — `GenerateTasksNode`
+(`setup.rs`, `generated_tasks_schema()`), `ImplementTaskNode`, `TriageTaskNode`, and
+`ConsolidatedReviewNode`'s review call (`task_loop.rs`, `implement_output_schema()` /
+`triage_output_schema()` / `review_output_schema()`), and `PatchDocsNode` (`docs.rs`,
+`patch_docs_output_schema()`). This asks the Claude CLI to constrain its reply to the given
+schema and hands back a pre-parsed `Outcome.structured_output` alongside the raw text; each node
+prefers the pre-parsed value over its own fence/regex parse of the prompt text, falling back to
+that parse only when `structured_output` is `None` (e.g. an older CLI, or a schema-less reply).
+This is unconditional — it isn't gated by any `SdlcPolicy` field and applies regardless of which
+`model_tiers` value a stage resolves to, as long as the stage runs through the Claude CLI
+transport.
+
+This is a distinct mechanism from `local.constrained_json` (see [Available knobs](#available-knobs)
+above): `local.constrained_json` is the equivalent guarantee for the **`local` model tier's**
+OpenAI-compatible transport (`openai_compat_transport.rs`) — when set, it adds a
+`response_format: {"type": "json_object"}` hint to the `/v1/chat/completions` request body sent
+to the local endpoint, and the caller is expected to skip its own JSON-repair retry for that
+stage. Both mechanisms serve the same goal (a schema-honest reply the node can trust without a
+repair pass) over the two different transports the policy can route a stage through — the
+Claude CLI (schema requested via `Config.json_schema`, always on) and the local OpenAI-compatible
+endpoint (schema-shaped hint gated by `local.constrained_json`, off by default).
+
 ## The `local` model tier
 
 Setting `model_tiers.triage` and/or `model_tiers.review` to `local` routes that stage's calls
