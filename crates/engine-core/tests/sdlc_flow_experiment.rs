@@ -44,6 +44,7 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
+use engine_core::workflows::sdlc_flow::aggregate;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
 use engine_core::workflows::sdlc_flow::graph;
@@ -362,4 +363,143 @@ fn experiment_scaffolding_builds_workflow_and_fixtures() {
     let _workflow = build_experiment_workflow(&worktree);
 
     std::fs::remove_dir_all(&worktree).ok();
+}
+
+/// The four named policy profiles this experiment runs, in the exact order
+/// the Acceptance Criteria list them.
+const PROFILES: [&str; 4] = ["baseline", "cheap-fast", "pragmatist", "batch-reviewer"];
+
+/// Prints a ranked cost/time/tokens/attempts/pass-rate table — one row per
+/// distinct resolved policy — sorted by ascending `avg_cost_usd` (cheapest
+/// first). Intentionally plain `println!` (no external table-formatting
+/// dependency): this test is a manually-run experiment harness, not a
+/// machine-parsed report.
+fn print_ranked_table(mut rows: Vec<aggregate::PolicyAggregate>) {
+    rows.sort_by(|a, b| {
+        a.avg_cost_usd
+            .partial_cmp(&b.avg_cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    println!(
+        "\n{:<8} {:>10} {:>12} {:>14} {:>14} {:>16} {:>16} {:>10}",
+        "runs",
+        "avg_cost",
+        "avg_wall_s",
+        "total_in_tok",
+        "total_out_tok",
+        "attempts/retries",
+        "pass_rate",
+        "policy"
+    );
+    for row in &rows {
+        println!(
+            "{:<8} {:>10.4} {:>12.2} {:>14} {:>14} {:>7}/{:<8} {:>9.2}% {}",
+            row.run_count,
+            row.avg_cost_usd,
+            row.avg_wall_clock_secs,
+            row.total_input_tokens,
+            row.total_output_tokens,
+            row.total_attempts,
+            row.total_retries,
+            row.pass_rate * 100.0,
+            serde_json::to_string(&row.policy).unwrap_or_default(),
+        );
+    }
+    println!();
+}
+
+/// The real-CLI experiment: runs the four named profiles through the full
+/// `SDLC_FLOW` graph (with [`ExperimentSetupNode`] stamping the resolved
+/// policy so profiles actually take effect), aggregates each run's
+/// `sdlc-flow-state.json` via
+/// [`engine_core::workflows::sdlc_flow::aggregate::aggregate_state_files`],
+/// and prints a ranked table.
+///
+/// **Ignored by default** — spawns four real `claude` CLI sessions per run
+/// (`ImplementTaskNode`, `TriageTaskNode`'s `llm_triage` branch when
+/// engaged, `ConsolidatedReviewNode`) and spends real tokens. Run manually:
+///
+/// ```sh
+/// cargo test -p engine-core --test sdlc_flow_experiment -- --ignored --test-threads=1
+/// ```
+///
+/// Every profile in [`PROFILES`] here resolves via
+/// [`engine_core::workflows::sdlc_flow::profiles::profile_by_name`] against
+/// the built-in `claude-sonnet-4-5`-family models, so no `local`-tier
+/// Ollama endpoint is required for this particular set; a profile that
+/// *does* resolve to a `local`-tier model would need a reachable Ollama
+/// endpoint (or the documented cloud fallback — see
+/// `planning/decisions/` for the policy-tier fallback rule) before it could
+/// run for real.
+#[tokio::test]
+#[ignore]
+async fn experiment_four_profiles_real_cli_ranked_by_cost() {
+    let mut state_paths: Vec<PathBuf> = Vec::new();
+    let mut worktrees: Vec<PathBuf> = Vec::new();
+
+    for profile in PROFILES {
+        let worktree = temp_worktree(profile);
+        // Two attempts of headroom: the retry-marker task is deliberately
+        // framed to be easy to get subtly wrong on a first pass, so it
+        // needs the real triage/retry loop to demonstrate a second real
+        // attempt rather than immediately MAJOR_BAIL-ing.
+        write_fixture_files(&worktree, 2);
+
+        let workflow = build_experiment_workflow(&worktree);
+        let event = json!({
+            "spec_slug": "experiment-spec",
+            "auto_pr": false,
+            "profile": profile,
+        });
+
+        let final_ctx = workflow
+            .run(event, Box::new(|_ctx: &TaskContext| {}))
+            .await
+            .unwrap_or_else(|err| panic!("profile {profile:?} run should not error: {err}"));
+
+        // The resolved policy actually took effect for this run (the bug
+        // ExperimentSetupNode fixes over sdlc_flow_live.rs's FixtureSetupNode).
+        assert!(
+            final_ctx
+                .nodes
+                .contains_key(setup::RESOLVED_POLICY_IDENTITY),
+            "profile {profile:?}: resolved policy should have been stamped into ctx.nodes"
+        );
+
+        let state_path = worktree
+            .join("planning")
+            .join("experiment-spec")
+            .join("sdlc-flow-state.json");
+        assert!(
+            state_path.exists(),
+            "profile {profile:?}: expected WrapUpNode to persist {}",
+            state_path.display()
+        );
+        state_paths.push(state_path);
+        worktrees.push(worktree);
+    }
+
+    assert_eq!(
+        state_paths.len(),
+        PROFILES.len(),
+        "expected one sdlc-flow-state.json per profile"
+    );
+
+    let rows = aggregate::aggregate_state_files(&state_paths)
+        .expect("all four sdlc-flow-state.json files should parse");
+
+    print_ranked_table(rows.clone());
+
+    assert!(
+        rows.len() > 1,
+        "expected more than one distinct resolved-policy row across the four \
+         profiles (got {}) — a non-default profile should demonstrably change \
+         the resolved policy recorded in its run's state file",
+        rows.len()
+    );
+
+    for worktree in &worktrees {
+        std::fs::remove_dir_all(worktree).ok();
+    }
 }
