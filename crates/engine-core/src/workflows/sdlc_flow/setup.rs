@@ -85,8 +85,17 @@ fn read_harness_profiles(
         return Ok(None);
     };
 
+    // `sdlc.profiles` is documented with a sibling `_comment` string entry
+    // (see planning/harness.examples.md); strip any `_comment*`-keyed entry
+    // before deserializing so it isn't mistaken for a named `PartialPolicy`
+    // bundle.
+    let mut profiles_value = profiles_value.clone();
+    if let Some(map) = profiles_value.as_object_mut() {
+        map.retain(|key, _| !key.starts_with("_comment"));
+    }
+
     let parsed: std::collections::HashMap<String, PartialPolicy> =
-        serde_json::from_value(profiles_value.clone()).map_err(|err| {
+        serde_json::from_value(profiles_value).map_err(|err| {
             NodeError::new(format!(
                 "failed to parse {} sdlc.profiles: {err}",
                 harness_path.display()
@@ -878,6 +887,55 @@ mod tests {
         assert_eq!(
             resolved.model_tiers.implement,
             super::super::policy::ModelTier::Sonnet
+        );
+    }
+
+    #[test]
+    fn harness_profiles_with_comment_sibling_key_still_resolves() {
+        // Regression: `sdlc.profiles` documented with a sibling `_comment`
+        // string entry (see planning/harness.examples.md) must not break
+        // deserialization of the map<String, PartialPolicy> as a whole.
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            json!({
+                "sdlc": {
+                    "profiles": {
+                        "_comment": "explanatory text, not a PartialPolicy",
+                        "cheap-fast": { "max_attempts": 42 }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "profile": "cheap-fast",
+        }));
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved.max_attempts, 42);
+    }
+
+    #[test]
+    fn resolve_policy_for_run_succeeds_against_repo_harness_json() {
+        // Regression: exercise the real committed planning/harness.json
+        // (which carries a `_comment` sibling key under `sdlc.profiles`) to
+        // guard against reintroducing a deserialization break that only
+        // synthetic in-test fixtures would miss.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../")
+            .canonicalize()
+            .expect("repo root should resolve");
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "profile": "cheap-fast",
+        }));
+        resolve_policy_for_run(&ctx, &repo_root).expect(
+            "resolving a built-in profile name against the repo's harness.json should succeed",
         );
     }
 
