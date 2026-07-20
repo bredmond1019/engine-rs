@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-19T11:40:43Z"
+timestamp: "2026-07-20T02:18:05Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,27 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-19]
+
+### PR #8 merged — `plan-sdlc-policy-profiles-B` (Block EN.1-plan.B) closed
+- **What:** Merged PR #8 (https://github.com/bredmond1019/engine-rs/pull/8), branch
+  `plan-sdlc-policy-profiles-B-flow`, into `main`. The PR carried the `sdlc-flow` run for spec
+  `plan-sdlc-policy-profiles-B`: 6 tasks (all passed, attempt 1 each), a consolidated end-of-flow
+  review (PASS, no findings after one review-fix pass), and a docs patch
+  (`docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`). Changed files: new
+  `crates/engine-core/src/workflows/sdlc_flow/profiles.rs` (the four named `PartialPolicy`
+  profiles + `profile_by_name` lookup), plus `mod.rs`, `policy.rs`, `schema.rs`, `setup.rs`.
+- **Why:** Finalizes Block EN.1-plan.B (named profiles + first-class `profile:` field) of the
+  ad-hoc `plan-sdlc-policy-profiles` plan — the implementation/review/docs work was done in this
+  same session (see the sub-entry directly below); this entry is the PR merge that closes the
+  block out, unblocking EN.2-plan.C (deterministic plumbing tests) and EN.2-plan.D (real-CLI
+  experiment harness).
+- **Status:** Block EN.1-plan.B is closed (`planning/state.json` already had `status: "closed"`
+  for this block). The parent plan `plan-sdlc-policy-profiles` is *not* fully done — Blocks C/D/E
+  remain, in that dependency order.
+- **Refs:** PR #8 (https://github.com/bredmond1019/engine-rs/pull/8),
+  `planning/plan-sdlc-policy-profiles-B/tasks.md`, `planning/plan-sdlc-policy-profiles-B/tasks.json`
+- **Next:** `/generate-tasks` (or `/sdlc-flow`) against EN.2-plan.C / EN.2-plan.D — deterministic
+  plumbing tests + real-CLI experiment harness (both now unblocked).
 
 ### `plan-sdlc-policy-profiles-B` (Block EN.1-plan.B) — Named profiles + first-class `profile:` field
 - **What:** Ran the `sdlc-flow` workflow for spec `plan-sdlc-policy-profiles-B` on branch
