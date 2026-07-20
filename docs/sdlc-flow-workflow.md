@@ -49,7 +49,7 @@ are runtime-only — declared but not walked by the graph's acyclic-shape valida
 
 | Node | Kind | What it does |
 |---|---|---|
-| `SetupWorktreeNode` | Deterministic | Creates/reattaches the spec's git worktree (`git worktree add`, or reattach if `resume` and it already exists on disk). Resolves the 3-layer `SdlcPolicy` and stamps it into ctx as `ResolvedPolicy` — see [sdlc-flow-policy.md](sdlc-flow-policy.md). |
+| `SetupWorktreeNode` | Deterministic | Creates/reattaches the spec's git worktree (`git worktree add`, or reattach if `resume` and it already exists on disk). Resolves the 4-layer `SdlcPolicy` (event `policy` > event `profile` > `harness.json` > built-in default) and stamps it into ctx as `ResolvedPolicy` — see [sdlc-flow-policy.md](sdlc-flow-policy.md). |
 | `SpecExistsRouterNode` | Deterministic router | Routes to `LoadTaskStateNode` if `sdlc-flow-state.json` or `tasks.json` already exists under `planning/<slug>/`, else to `GenerateTasksNode`. |
 | `GenerateTasksNode` | **Model** (Opus) | Planning-fallback path only — gathers `planning/<slug>/*.md` context and prompts for a task list, writing `tasks.json` + `tasks.md`. Sets `config.json_schema` and prefers the model's structured output (`ctx.nodes["GenerateTasksNode"]["structured"]`) over fence-stripped text parsing, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Hardcoded to Opus; does not read policy. |
 | `LoadTaskStateNode` | Deterministic | Loads `sdlc-flow-state.json` if present (always preferred over `tasks.json`), else bootstraps a fresh `SDLCState` from `tasks.json`. Applies the event's `task_range` filter. |
@@ -195,7 +195,8 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
 - **Event fields** (`SDLCFlowEventSchema`): `spec_slug` (required), `task_range` (e.g. `"1-3,5"`,
   1-indexed inclusive, rejects `end < start`), `resume` (default `false`), `auto_pr` (default
   **`true`**), `branch_name` (defaults to `sdlc/<spec_slug>`), `llm_triage` (default `false`),
-  `policy` (optional per-run override — see [sdlc-flow-policy.md](sdlc-flow-policy.md)).
+  `policy` (optional per-run override), `profile` (optional named policy-profile bundle — see
+  [sdlc-flow-policy.md](sdlc-flow-policy.md)).
 - **Worktree/branch naming**: branch defaults to `sdlc/<spec_slug>`; worktree path is
   `trees/<branch>`. A fresh (non-resume) run does `git worktree add trees/<branch> -b <branch>
   origin/main`.

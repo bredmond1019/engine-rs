@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-19T00:44:13Z"
+timestamp: "2026-07-19T11:40:43Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,80 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ---
+
+## [run: 2026-07-19]
+
+### `plan-sdlc-policy-profiles-B` (Block EN.1-plan.B) — Named profiles + first-class `profile:` field
+- **What:** Ran the `sdlc-flow` workflow for spec `plan-sdlc-policy-profiles-B` on branch
+  `plan-sdlc-policy-profiles-B-flow`, executing all 6 tasks (all passed, attempt 1 each) plus a
+  consolidated review (PASS, no findings after one review-fix pass) and a docs patch
+  (`docs/sdlc-flow-policy.md`, `docs/sdlc-flow-workflow.md`). Task 1 added
+  `crates/engine-core/src/workflows/sdlc_flow/profiles.rs` with `baseline`/`cheap-fast`/`pragmatist`/
+  `batch-reviewer` `PartialPolicy` constructors and a `profile_by_name` lookup. Task 2 added an
+  additive `#[serde(default)] profile: Option<String>` field to `SDLCFlowEventSchema`. Task 3 gave
+  `policy::resolve` a fourth profile layer between harness defaults and the event override
+  (builtin → harness_defaults → profile → event_override). Task 4 wired
+  `resolve_policy_for_run` to resolve `event.profile` via `harness.json`'s `sdlc.profiles` map first,
+  then the built-in `profiles::profile_by_name`, erroring on unknown names. Task 5 added the
+  `sdlc.profiles` map (all four named profiles) to `planning/harness.json` alongside the existing
+  `sdlc.policy` no-op block, plus a documented example in `planning/harness.examples.md`. Task 6
+  confirmed all four gated validation commands (`cargo fmt --check`, `cargo clippy -D warnings`,
+  `cargo test`, `cargo build --release`) pass.
+- **Why:** Closes out Block EN.1-plan.B of the ad-hoc `plan-sdlc-policy-profiles` plan, unblocking
+  EN.2-plan.C (deterministic plumbing tests) and EN.2-plan.D (real-CLI experiment harness), both of
+  which depended on the named-profile plumbing landing first.
+- **Notable decisions:** `baseline()` spells out all model tiers + `review_mode: per_task` +
+  `llm_triage: false` explicitly (rather than an all-`None` `PartialPolicy`) so selecting
+  `profile: "baseline"` is a legible, self-documenting no-op; `resolve_profile` in `setup.rs` keeps
+  the harness-profiles-then-builtin lookup and unknown-name error logic in one place;
+  `planning/harness.json`/`harness.examples.md` edits landed via the company-brain symlink (not
+  tracked by this repo's git, per the Symlink warning standing rule).
+- **Status:** Block EN.1-plan.B is closed (`planning/state.json` flipped to `status: "closed"`).
+  The parent plan `plan-sdlc-policy-profiles` is *not* fully done — Blocks C/D/E remain.
+
+Next: EN.2-plan.C / EN.2-plan.D — deterministic plumbing tests + real-CLI experiment harness.
+
+```
+8858b34 docs: update docs for plan-sdlc-policy-profiles-B
+56578bb fix: review pass 1 for plan-sdlc-policy-profiles-B
+6a36828 feat: implement plan-sdlc-policy-profiles-B-task4
+c944ce3 feat: implement plan-sdlc-policy-profiles-B-task3
+d2cbcfc feat: implement plan-sdlc-policy-profiles-B-task2
+7cb3e0b feat: implement plan-sdlc-policy-profiles-B-task1
+b13ad69 docs: log-work for plan-sdlc-policy-profiles PR #7 merge
+e93c13a Merge pull request #7 from bredmond1019/plan-sdlc-policy-profiles-flow
+```
+
+---
+
+## [run: 2026-07-19]
+
+### PR #7 merged — `plan-sdlc-policy-profiles` (Block EN.1-plan.A) closed
+- **What:** Ran the `sdlc-flow` workflow for spec `plan-sdlc-policy-profiles` on branch
+  `plan-sdlc-policy-profiles-flow`. It executed 4 tasks (all implemented and passed fast-tests),
+  a consolidated review (PASS, no findings), and a docs patch (updated `docs/architecture.md`
+  and `docs/sdlc-flow-workflow.md`). This produced PR #7
+  (https://github.com/bredmond1019/engine-rs/pull/7), which has now been merged into `main`
+  (merge commit fast-forwarded locally; `main` is up to date with `origin/main` plus the merge).
+  Changed files in the merge: `crates/engine-core/src/nodes/claude_code_step.rs`,
+  `crates/engine-core/src/nodes/openai_compat_transport.rs`,
+  `crates/engine-core/src/workflows/sdlc_flow/docs.rs`,
+  `crates/engine-core/src/workflows/sdlc_flow/setup.rs`,
+  `crates/engine-core/src/workflows/sdlc_flow/task_loop.rs`, plus new/updated tests in
+  `crates/engine-core/tests/` (`claude_code_step.rs`, `sdlc_flow_e2e.rs`, `sdlc_flow_live.rs`,
+  `sdlc_flow_task_loop.rs`), and `docs/architecture.md`, `docs/sdlc-flow-workflow.md`.
+- **Why:** This closes out Block EN.1-plan.A (structured-output hardening) of the ad-hoc
+  `plan-sdlc-policy-profiles` plan — the implementation/review/docs work was done in the prior
+  session (see the `[run: 2026-07-18]` entry below); this session is the PR merge that finalizes
+  the block.
+- **Status:** Block EN.1-plan.A is closed (`planning/state.json` already had `status: "closed"`
+  for this block). The parent plan `plan-sdlc-policy-profiles` is **not** fully done — Blocks B
+  (named profiles), C/D (deterministic tests + real-CLI experiment harness), and E (docs
+  wrap-up) remain, in that dependency order.
+- **Refs:** PR #7 (https://github.com/bredmond1019/engine-rs/pull/7),
+  `planning/plan-sdlc-policy-profiles/plan.md`, `planning/plan-sdlc-policy-profiles/tasks.md`
+- **Next:** `/generate-tasks` (or `/sdlc-flow`) against Block B — EN.1-plan.B, named profiles +
+  first-class `profile:` field.
 
 ## [run: 2026-07-18]
 

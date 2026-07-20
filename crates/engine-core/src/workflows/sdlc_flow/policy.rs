@@ -4,11 +4,12 @@
 //! mirror used by the two override layers and a `resolve` function that
 //! merges all three layers into one concrete policy.
 //!
-//! **Resolution — three layers, high-to-low precedence:** per-run
-//! `SdlcFlowEvent` override, then `planning/harness.json` `sdlc.policy`
-//! defaults, then built-in defaults. The built-in [`SdlcPolicy::default`]
-//! MUST reproduce today's (pre-EN.3.C) behavior exactly — turning any knob
-//! away from that baseline is opt-in.
+//! **Resolution — four layers, high-to-low precedence:** per-run
+//! `SdlcFlowEvent` override, then a named `profile:` bundle, then
+//! `planning/harness.json` `sdlc.policy` defaults, then built-in defaults.
+//! The built-in [`SdlcPolicy::default`] MUST reproduce today's
+//! (pre-EN.3.C) behavior exactly — turning any knob away from that
+//! baseline is opt-in.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -298,21 +299,27 @@ fn apply_override(base: SdlcPolicy, over: &PartialPolicy) -> SdlcPolicy {
     }
 }
 
-/// Resolve the three policy layers into one concrete [`SdlcPolicy`],
-/// high->low precedence: `event_override` > `harness_defaults` >
-/// `builtin`.
+/// Resolve the four policy layers into one concrete [`SdlcPolicy`],
+/// high->low precedence: `event_override` > `profile` > `harness_defaults`
+/// > `builtin`.
 ///
 /// `builtin` is normally `SdlcPolicy::default()`, taken as a parameter so
-/// callers/tests can exercise the merge against any base.
+/// callers/tests can exercise the merge against any base. `profile` is a
+/// named bundle (see `profiles::profile_by_name` and `harness.json`'s
+/// `sdlc.profiles`) resolved by the caller before this function runs.
 #[must_use]
 pub fn resolve(
     builtin: SdlcPolicy,
     harness_defaults: Option<&PartialPolicy>,
+    profile: Option<&PartialPolicy>,
     event_override: Option<&PartialPolicy>,
 ) -> SdlcPolicy {
     let mut resolved = builtin;
     if let Some(harness) = harness_defaults {
         resolved = apply_override(resolved, harness);
+    }
+    if let Some(profile) = profile {
+        resolved = apply_override(resolved, profile);
     }
     if let Some(event) = event_override {
         resolved = apply_override(resolved, event);
@@ -337,6 +344,7 @@ pub fn model_tiers_by_stage(tiers: &ModelTiers) -> BTreeMap<&'static str, ModelT
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflows::sdlc_flow::profiles;
 
     #[test]
     fn builtin_default_matches_pre_en_3_c_baseline() {
@@ -358,7 +366,7 @@ mod tests {
 
     #[test]
     fn resolve_with_no_overrides_returns_builtin() {
-        let resolved = resolve(SdlcPolicy::default(), None, None);
+        let resolved = resolve(SdlcPolicy::default(), None, None, None);
         assert_eq!(resolved, SdlcPolicy::default());
     }
 
@@ -368,7 +376,7 @@ mod tests {
             output_verbosity: Some(OutputVerbosity::Terse),
             ..Default::default()
         };
-        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None);
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, None);
         assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
         // Untouched knobs still fall through to builtin.
         assert_eq!(resolved.review_mode, ReviewMode::PerTask);
@@ -384,7 +392,7 @@ mod tests {
             review_mode: Some(ReviewMode::EndOnly),
             ..Default::default()
         };
-        let resolved = resolve(SdlcPolicy::default(), Some(&harness), Some(&event));
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, Some(&event));
         assert_eq!(resolved.review_mode, ReviewMode::EndOnly);
     }
 
@@ -404,7 +412,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let resolved = resolve(SdlcPolicy::default(), Some(&harness), Some(&event));
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, Some(&event));
         assert_eq!(resolved.model_tiers.implement, ModelTier::Opus);
         // Other stages untouched by either override fall through to builtin.
         assert_eq!(resolved.model_tiers.review, ModelTier::Sonnet);
@@ -416,7 +424,7 @@ mod tests {
             max_attempts: Some(5),
             ..Default::default()
         };
-        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None);
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, None);
         assert_eq!(resolved.max_attempts, 5);
     }
 
@@ -440,7 +448,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let resolved = resolve(SdlcPolicy::default(), Some(&harness), Some(&event));
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, Some(&event));
         // Deep-merge: harness's `validation: true` survives the event layer,
         // event's `review: true` layers on top, `docs` still falls to builtin.
         assert!(resolved.close_out.reuse.validation);
@@ -471,5 +479,54 @@ mod tests {
         );
         // Not present in the JSON -> None, falls through on merge.
         assert_eq!(partial.model_tiers.as_ref().unwrap().review, None);
+    }
+
+    #[test]
+    fn resolve_with_only_profile_matches_documented_cheap_fast_policy() {
+        let cheap_fast = profiles::cheap_fast();
+        let resolved = resolve(SdlcPolicy::default(), None, Some(&cheap_fast), None);
+        assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
+        assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+        assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
+        assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
+        // Untouched knobs still fall through to builtin.
+        assert_eq!(resolved.model_tiers.generate, ModelTier::Sonnet);
+        assert!(!resolved.prompt_cache);
+    }
+
+    #[test]
+    fn event_override_beats_profile_for_one_field_while_profile_supplies_the_rest() {
+        let cheap_fast = profiles::cheap_fast();
+        let event = PartialPolicy {
+            max_attempts: Some(9),
+            ..Default::default()
+        };
+        let resolved = resolve(SdlcPolicy::default(), None, Some(&cheap_fast), Some(&event));
+        // Event-inline field wins.
+        assert_eq!(resolved.max_attempts, 9);
+        // Profile still supplies everything the event didn't touch.
+        assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
+        assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+        assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
+        assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
+    }
+
+    #[test]
+    fn profile_beats_harness_defaults_for_overlapping_fields() {
+        let harness = PartialPolicy {
+            review_mode: Some(ReviewMode::EndOnly),
+            ..Default::default()
+        };
+        let cheap_fast = profiles::cheap_fast();
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&cheap_fast),
+            None,
+        );
+        // profile's review_mode wins over harness_defaults'.
+        assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
     }
 }

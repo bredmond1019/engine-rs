@@ -18,15 +18,17 @@ concrete `SdlcPolicy`, applies it, and records `RunOutcomes` telemetry at the ta
 policies can be compared on real cost/time/quality data instead of guessed at.
 
 Source: `crates/engine-core/src/workflows/sdlc_flow/policy.rs` (the policy + resolution),
-`setup.rs` (`resolve_policy_for_run`, wired into `SetupWorktreeNode`), `graph.rs`
-(`registry_for_policy`, the local-tier rewiring), `schema.rs` (`RunOutcomes`, the event's `policy`
-field), `aggregate.rs` (cross-run aggregation).
+`profiles.rs` (the four named `PartialPolicy` bundles), `setup.rs` (`resolve_policy_for_run`,
+`resolve_profile`, wired into `SetupWorktreeNode`), `graph.rs` (`registry_for_policy`, the
+local-tier rewiring), `schema.rs` (`RunOutcomes`, the event's `policy` and `profile` fields),
+`aggregate.rs` (cross-run aggregation).
 
 ## Configuring a run
 
-Three layers, resolved high-to-low precedence — **per-run event override > `harness.json` >
-built-in default**. Every field is independent: an unset field at a higher layer just falls
-through to the next layer down, so you only need to specify the knobs you want to change.
+Four layers, resolved high-to-low precedence — **per-run event `policy` override > per-run event
+`profile` > `harness.json` `sdlc.policy` > built-in default**. Every field is independent: an
+unset field at a higher layer just falls through to the next layer down, so you only need to
+specify the knobs you want to change.
 
 ### 1. Built-in default (baseline)
 
@@ -63,7 +65,45 @@ the fields you want to change from the built-in default — omitted fields fall 
 section is read by `SetupWorktreeNode` on every run (via `resolve_policy_for_run`); if
 `planning/harness.json` has no `sdlc.policy` key at all, this layer is skipped entirely.
 
-### 3. Per-run event override (one-off experiment)
+### 3. Named policy profile (`profile:` — reusable bundle)
+
+Pass a `profile` name (a string) in the `SDLC_FLOW` event JSON instead of (or alongside) an
+inline `policy` object:
+
+```json
+{
+  "spec_slug": "EN.3.C-tunable-run-policy-telemetry",
+  "profile": "cheap-fast"
+}
+```
+
+`resolve_profile` (in `setup.rs`) looks the name up in two places, in order:
+
+1. `planning/harness.json` → `sdlc.profiles[name]` — a repo-local `PartialPolicy` bundle that
+   overrides (or adds to) the built-in set.
+2. The built-in bundles in `profiles.rs` (`profiles::profile_by_name`) — four canonical
+   cost/time/quality tradeoffs:
+
+   | Name | Tradeoff |
+   |---|---|
+   | `baseline` | Explicit no-op control: Sonnet on every tier, `per_task` review, `llm_triage` off — matches the built-in default, spelled out for clarity. |
+   | `cheap-fast` | `haiku` implement, `local` triage + review, `terse` output, `trivial_skip` review. |
+   | `pragmatist` | `sonnet` implement, `local` review, prompt caching on, `trivial_skip` review, `llm_triage` on. |
+   | `batch-reviewer` | `sonnet` implement, per-task review collapsed into a single end-of-run review (`end_only`). |
+
+   An `event.profile` name found in neither place is an error (`resolve_profile` returns `Err`,
+   failing the run) rather than a silent no-op.
+
+A resolved profile bundle sits between `harness.json`'s `sdlc.policy` defaults and the event's
+inline `policy` override in the precedence chain — same as any other layer, unset fields fall
+through.
+
+> `planning/harness.json`'s `sdlc.profiles` map documents itself with a sibling `_comment` string
+> key (see the example below). `read_harness_profiles` strips any `_comment*`-prefixed key before
+> deserializing the map, so the comment doesn't get parsed as a (broken) named `PartialPolicy`
+> entry — add new profiles as sibling keys of `_comment`, not inside it.
+
+### 4. Per-run event `policy` override (one-off experiment)
 
 Pass a `policy` object (a `PartialPolicy`, same shape as above) directly in the `SDLC_FLOW` event
 JSON:
@@ -75,9 +115,10 @@ JSON:
 }
 ```
 
-This wins over both `harness.json` and the built-in default for the fields it sets, and doesn't
-touch any file — use it to try a variant for a single run without changing this repo's standing
-defaults.
+This wins over `profile`, `harness.json`, and the built-in default for the fields it sets, and
+doesn't touch any file — use it to try a variant for a single run without changing this repo's
+standing defaults. `policy` and `profile` can be combined: the profile's bundle resolves first,
+then the inline `policy` fields override individual knobs on top of it.
 
 ## Available knobs
 

@@ -41,6 +41,7 @@ pub mod emit_state;
 pub mod graph;
 pub mod policy;
 pub mod pr;
+pub mod profiles;
 pub mod schema;
 pub mod setup;
 pub mod task_loop;
