@@ -68,9 +68,13 @@ fn read_harness_policy_defaults(worktree: &Path) -> Result<Option<PartialPolicy>
 pub fn resolve_policy_for_run(ctx: &TaskContext, worktree: &Path) -> Result<SdlcPolicy, NodeError> {
     let event = parse_event(ctx)?;
     let harness_defaults = read_harness_policy_defaults(worktree)?;
+    // TODO(task 4): resolve `event.profile` to a `PartialPolicy` (via
+    // `harness.json` `sdlc.profiles` then the built-in `profiles::profile_by_name`)
+    // and pass it as the third layer here.
     Ok(policy::resolve(
         SdlcPolicy::default(),
         harness_defaults.as_ref(),
+        None,
         event.policy.as_ref(),
     ))
 }
