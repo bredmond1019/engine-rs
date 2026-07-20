@@ -132,6 +132,16 @@ pub struct SDLCFlowEventSchema {
     /// means "no per-run override", falling through to the next layer down.
     #[serde(default)]
     pub policy: Option<PartialPolicy>,
+    /// Optional name of a built-in or `harness.json`-defined policy profile
+    /// bundle (e.g. `"cheap-fast"`) to apply for this run. Resolved between
+    /// the `harness.json` `sdlc.policy` defaults layer and the event-inline
+    /// `policy` override layer: `policy` (this event) > `profile` (this
+    /// event) > `sdlc.policy` (harness defaults) > built-in default.
+    /// Additive: every existing field above is untouched byte-for-byte.
+    /// `None`/absent means "no named profile", falling through to the next
+    /// layer down.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Parse a task-range string like `"1-3,5"` into a sorted, deduplicated list
@@ -395,6 +405,26 @@ mod tests {
         assert_eq!(event.branch_name, None);
         assert!(!event.llm_triage);
         assert_eq!(event.policy, None);
+        assert_eq!(event.profile, None);
+    }
+
+    #[test]
+    fn sdlc_flow_event_schema_deserializes_profile_name() {
+        let json = serde_json::json!({
+            "spec_slug": "x",
+            "profile": "cheap-fast",
+        });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes with profile name");
+        assert_eq!(event.profile, Some("cheap-fast".to_string()));
+    }
+
+    #[test]
+    fn sdlc_flow_event_schema_profile_absent_is_none() {
+        let json = serde_json::json!({ "spec_slug": "x" });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes without profile");
+        assert_eq!(event.profile, None);
     }
 
     #[test]
