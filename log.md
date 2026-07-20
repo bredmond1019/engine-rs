@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-20T11:44:06Z"
+timestamp: "2026-07-20T13:14:48Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,32 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-20]
+
+### `plan-sdlc-policy-profiles-E` (Block EN.3-plan.E) done — docs, index, and research-note wrap-up; plan complete
+- **What:** Ran `/sdlc-task plan-sdlc-policy-profiles-E` (lean single-unit engine — implement →
+  fast-test → fix, committed directly to `main`; no branch/PR/review, since `sdlc-task` doesn't do
+  those). All 5 tasks passed: (1) hardened `docs/sdlc-flow-policy.md` against the shipped profile
+  surface — the `profile` event field, the four named profiles, the 4-layer precedence, and
+  structured-output/`constrained_json` — commit `9323257`; (2) added `profile` to the workflow
+  event-field docs in `docs/sdlc-flow-workflow.md` — commit `e4eabe3`; (3) refreshed index rows in
+  `docs/index.md`/`planning/index.md` for the files delivered across Blocks A–D (standing rule 2) —
+  commit `f343bdf`; (4) flipped `planning/sdlc-flow-policy-research/notes.md` from `draft` to
+  `active` and cross-linked the delivered tests/harness deliverables — touched only the gitignored,
+  brain-vaulted `planning/` tree, so produced no repo commit (expected); (5) validation — ran the
+  full check suite (fmt/clippy/test/build), confirmed all green on a doc-only block — also
+  planning-only, no repo commit.
+- **Why:** Closes Block EN.3-plan.E, the last remaining block of the ad-hoc
+  `plan-sdlc-policy-profiles` plan (see D34) — depended on Blocks A–D (structured-output hardening,
+  named profiles, deterministic plumbing tests, and the real-CLI experiment harness merged via PR
+  #10) all being closed first, per `planning/plan-sdlc-policy-profiles/plan.md`. With EN.3-plan.E
+  closed, all five blocks (A–E) of the plan are now `closed` in `planning/state.json`, so
+  `plan-sdlc-policy-profiles` is fully complete.
+- **Status:** Block EN.3-plan.E closed (`planning/state.json` id `EN.3-plan.E` set to `"closed"`).
+  Parent plan `plan-sdlc-policy-profiles` complete — no blocks remain open. `master-plan.md`'s own
+  sequence (Phases 0–3) was already fully `Done` before this ad-hoc plan started; nothing else is
+  queued there, so the next overall focus is open — to be planned.
+- **Refs:** `planning/plan-sdlc-policy-profiles/plan.md`, `planning/plan-sdlc-policy-profiles-E/tasks.json`,
+  commits `9323257`, `e4eabe3`, `f343bdf`
 
 ### PR #10 merged — `plan-sdlc-policy-profiles-D` (Block EN.2-plan.D) closed
 - **What:** Merged PR #10 (https://github.com/bredmond1019/engine-rs/pull/10), branch
