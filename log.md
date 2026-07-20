@@ -16,6 +16,49 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-20]
+
+### `plan-sdlc-policy-profiles-D` (Block EN.2-plan.D) done — real-CLI experiment harness (Part B)
+- **What:** Ran `/sdlc-flow` for spec `plan-sdlc-policy-profiles-D` on branch
+  `plan-sdlc-policy-profiles-D-flow`, 3 tasks, all passed on attempt 1, consolidated review PASS
+  with no findings. Added `crates/engine-core/tests/sdlc_flow_experiment.rs`: an
+  `ExperimentSetupNode` that fixes `sdlc_flow_live.rs`'s policy-stamping shortcut (the fixture
+  setup node there inserts the `SetupWorktreeNode` result directly, skipping
+  `resolve_policy_for_run`, so no policy gets stamped) by calling `resolve_policy_for_run` and
+  inserting `RESOLVED_POLICY_IDENTITY` into `ctx.nodes` directly (since `put_result` is
+  `pub(crate)` and unreachable from an external `tests/` file). A synthetic 3-task fixture
+  (happy path / first-fail-then-pass retry / trivial one-liner) drives a `#[ignore]`-gated test
+  that runs all four named profiles (`baseline`, `cheap-fast`, `pragmatist`, `batch-reviewer`)
+  through the full `SDLC_FLOW` graph, aggregates their `sdlc-flow-state.json` files via
+  `aggregate::aggregate_state_files`, and prints a ranked table (sorted by ascending
+  `avg_cost_usd`) covering cost/time/tokens/attempts/pass-rate, asserting more than one distinct
+  resolved-policy row appears. Task 1 also added a non-`#[ignore]` scaffolding unit test
+  (`experiment_scaffolding_builds_workflow_and_fixtures`) so the harness's construction is itself
+  verified in the default gated suite. Task 3 was validation-only (fmt/clippy/test/build all
+  green, `--test sdlc_flow_experiment -- --list` confirms both tests are present with the real-CLI
+  one `#[ignore]`-gated) — no code changes, no commit.
+- **Why:** Closes Block EN.2-plan.D of the ad-hoc `plan-sdlc-policy-profiles` plan (see D34),
+  unblocking EN.3-plan.E (docs/index/research-note wrap-up), the plan's last remaining block.
+- **Status:** Block EN.2-plan.D closed (`planning/state.json` id `EN.2-plan.D` flipped to
+  `"closed"`). The parent plan `plan-sdlc-policy-profiles` is *not* fully done — Block E remains.
+- **Refs:** `planning/plan-sdlc-policy-profiles-D/tasks.md`,
+  `crates/engine-core/tests/sdlc_flow_experiment.rs`
+- **Next:** `/generate-tasks` (or `/sdlc-flow`) against EN.3-plan.E — docs, index, and
+  research-note wrap-up
+
+```
+414923c docs: update docs for plan-sdlc-policy-profiles-D
+cbd3dda feat: implement plan-sdlc-policy-profiles-D-task2
+2626b22 feat: implement plan-sdlc-policy-profiles-D-task1
+d8544a9 docs: log-work for plan-sdlc-policy-profiles-C PR #9 merge
+4b70a7e Merge pull request #9 from bredmond1019/plan-sdlc-policy-profiles-C-flow
+75c4ff8 chore: wrap up plan-sdlc-policy-profiles-C
+eb20351 feat: implement plan-sdlc-policy-profiles-C-task3
+831da39 feat: implement plan-sdlc-policy-profiles-C-task2
+```
+
+---
+
 ## [run: 2026-07-19]
 
 ### PR #9 merged — `plan-sdlc-policy-profiles-C` (Block EN.2-plan.C) closed
