@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-20T02:18:05Z"
+timestamp: "2026-07-20T03:26:11Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,28 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-19]
+
+### PR #9 merged — `plan-sdlc-policy-profiles-C` (Block EN.2-plan.C) closed
+- **What:** Merged PR #9 (https://github.com/bredmond1019/engine-rs/pull/9), branch
+  `plan-sdlc-policy-profiles-C-flow`, into `main`. The PR carried the `sdlc-flow` run for spec
+  `plan-sdlc-policy-profiles-C`: 4 tasks (all passed, attempt 1 each), a consolidated end-of-flow
+  review (PASS, no findings on first attempt), and no docs changes needed. Changed files: new
+  `crates/engine-core/tests/sdlc_flow_profiles.rs` (680 lines) — hermetic, deterministic plumbing
+  tests proving profile resolution, inline-`policy`-over-`profile` precedence, unknown-profile
+  errors, and policy-driven graph routing (trivial-skip review bypass, local-tier transport
+  rewiring).
+- **Why:** Finalizes Block EN.2-plan.C (Deterministic plumbing tests, Part A) of the ad-hoc
+  `plan-sdlc-policy-profiles` plan — the implementation/review work was done in this same session
+  (see the sub-entry directly below); this entry is the PR merge that closes the block out,
+  unblocking EN.2-plan.D (real-CLI experiment harness, Part B).
+- **Status:** Block EN.2-plan.C is closed (`planning/state.json` already had `status: "closed"`
+  for this block). The parent plan `plan-sdlc-policy-profiles` is *not* fully done — Blocks D/E
+  remain, in that dependency order.
+- **Refs:** PR #9 (https://github.com/bredmond1019/engine-rs/pull/9),
+  `planning/plan-sdlc-policy-profiles-C/tasks.md`,
+  `crates/engine-core/tests/sdlc_flow_profiles.rs`
+- **Next:** `/generate-tasks` (or `/sdlc-flow`) against EN.2-plan.D — real-CLI experiment harness
+  (Part B).
 
 ### `plan-sdlc-policy-profiles-C` (Block EN.2-plan.C) — deterministic plumbing tests, all 4 tasks PASS
 - **What:** Ran `/sdlc-flow plan-sdlc-policy-profiles-C` on branch `plan-sdlc-policy-profiles-C-flow`.
