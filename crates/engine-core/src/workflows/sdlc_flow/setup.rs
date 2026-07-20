@@ -23,6 +23,7 @@ use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
 use super::policy::{self, PartialPolicy, SdlcPolicy};
+use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
 use super::{get_result, put_result};
 
@@ -61,20 +62,79 @@ fn read_harness_policy_defaults(worktree: &Path) -> Result<Option<PartialPolicy>
     Ok(Some(partial))
 }
 
-/// Resolve the three-layer [`SdlcPolicy`] for this run: the inbound event's
-/// `policy` override, the worktree's `planning/harness.json` `sdlc.policy`
-/// defaults, and the built-in default, high->low precedence via
-/// [`policy::resolve`].
+/// Read `planning/harness.json`'s `sdlc.profiles` section (a
+/// `map<String, PartialPolicy>`) out of a worktree, if the file and section
+/// exist. Mirrors [`read_harness_policy_defaults`] but for the named-profile
+/// map rather than the single defaults bundle.
+fn read_harness_profiles(
+    worktree: &Path,
+) -> Result<Option<std::collections::HashMap<String, PartialPolicy>>, NodeError> {
+    let harness_path = worktree.join("planning").join("harness.json");
+    if !harness_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
+        NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
+    })?;
+    let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
+    })?;
+
+    let Some(profiles_value) = harness.get("sdlc").and_then(|v| v.get("profiles")) else {
+        return Ok(None);
+    };
+
+    let parsed: std::collections::HashMap<String, PartialPolicy> =
+        serde_json::from_value(profiles_value.clone()).map_err(|err| {
+            NodeError::new(format!(
+                "failed to parse {} sdlc.profiles: {err}",
+                harness_path.display()
+            ))
+        })?;
+    Ok(Some(parsed))
+}
+
+/// Resolve `event.profile` (a named profile) to a [`PartialPolicy`] bundle,
+/// preferring a `harness.json` `sdlc.profiles[name]` entry over the built-in
+/// [`profiles::profile_by_name`]. Returns `Ok(None)` when the event carries
+/// no `profile` field, and `Err` when a `profile` name is given but resolves
+/// to neither source (no silent no-op).
+fn resolve_profile(
+    profile_name: Option<&str>,
+    worktree: &Path,
+) -> Result<Option<PartialPolicy>, NodeError> {
+    let Some(name) = profile_name else {
+        return Ok(None);
+    };
+
+    if let Some(harness_profiles) = read_harness_profiles(worktree)? {
+        if let Some(partial) = harness_profiles.get(name) {
+            return Ok(Some(partial.clone()));
+        }
+    }
+
+    if let Some(partial) = profiles::profile_by_name(name) {
+        return Ok(Some(partial));
+    }
+
+    Err(NodeError::new(format!(
+        "unknown profile {name:?}: not found in harness.json sdlc.profiles or built-in profiles"
+    )))
+}
+
+/// Resolve the four-layer [`SdlcPolicy`] for this run: the inbound event's
+/// `policy` override, the resolved `profile` bundle, the worktree's
+/// `planning/harness.json` `sdlc.policy` defaults, and the built-in default,
+/// high->low precedence via [`policy::resolve`].
 pub fn resolve_policy_for_run(ctx: &TaskContext, worktree: &Path) -> Result<SdlcPolicy, NodeError> {
     let event = parse_event(ctx)?;
     let harness_defaults = read_harness_policy_defaults(worktree)?;
-    // TODO(task 4): resolve `event.profile` to a `PartialPolicy` (via
-    // `harness.json` `sdlc.profiles` then the built-in `profiles::profile_by_name`)
-    // and pass it as the third layer here.
+    let profile = resolve_profile(event.profile.as_deref(), worktree)?;
     Ok(policy::resolve(
         SdlcPolicy::default(),
         harness_defaults.as_ref(),
-        None,
+        profile.as_ref(),
         event.policy.as_ref(),
     ))
 }
@@ -725,6 +785,100 @@ mod tests {
         let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
         let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
         assert_eq!(resolved, super::super::policy::SdlcPolicy::default());
+    }
+
+    #[test]
+    fn event_profile_with_no_harness_profiles_resolves_to_builtin_cheap_fast() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "profile": "cheap-fast",
+        }));
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(
+            resolved.model_tiers.implement,
+            super::super::policy::ModelTier::Haiku
+        );
+        assert_eq!(
+            resolved.model_tiers.triage,
+            super::super::policy::ModelTier::Local
+        );
+        assert_eq!(
+            resolved.model_tiers.review,
+            super::super::policy::ModelTier::Local
+        );
+        assert_eq!(
+            resolved.output_verbosity,
+            super::super::policy::OutputVerbosity::Terse
+        );
+        assert_eq!(
+            resolved.review_mode,
+            super::super::policy::ReviewMode::TrivialSkip
+        );
+    }
+
+    #[test]
+    fn event_inline_policy_overrides_profile_but_keeps_profile_tiers() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "profile": "cheap-fast",
+            "policy": { "max_attempts": 9 },
+        }));
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(
+            resolved.model_tiers.implement,
+            super::super::policy::ModelTier::Haiku
+        );
+        assert_eq!(resolved.max_attempts, 9);
+    }
+
+    #[test]
+    fn unknown_profile_name_returns_node_error() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "profile": "nonexistent",
+        }));
+        let err = resolve_policy_for_run(&ctx, &worktree).expect_err("should fail");
+        assert!(err.message.contains("unknown profile"));
+    }
+
+    #[test]
+    fn harness_profiles_take_precedence_over_builtin_profiles() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            json!({
+                "sdlc": {
+                    "profiles": {
+                        "cheap-fast": { "max_attempts": 42 }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "profile": "cheap-fast",
+        }));
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        // The harness.json override for "cheap-fast" only sets max_attempts,
+        // so it should win over the built-in bundle rather than merge with it.
+        assert_eq!(resolved.max_attempts, 42);
+        assert_eq!(
+            resolved.model_tiers.implement,
+            super::super::policy::ModelTier::Sonnet
+        );
     }
 
     #[tokio::test]
