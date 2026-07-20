@@ -94,10 +94,15 @@ Content-Type: application/json
     "auto_pr": true,
     "task_range": "1-3",
     "llm_triage": false,
-    "policy": { "output_verbosity": "terse" }
+    "profile": "cheap-fast"
   }
 }
 ```
+
+`profile` names a built-in or `harness.json`-defined policy-profile bundle (see
+[sdlc-flow-policy.md](sdlc-flow-policy.md)); it's mutually layered with the inline `policy`
+override shown above — an event can carry either, both, or neither. See the 4-layer precedence
+in the event-fields list below.
 
 - 401 without a valid `X-API-Key`; 422 if `workflow_type` isn't registered.
 - On success, mints a `run_id` (UUID) and starts the workflow; that `run_id` is what you abort
