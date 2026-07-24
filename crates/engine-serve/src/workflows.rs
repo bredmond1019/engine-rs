@@ -21,11 +21,23 @@ pub fn register_sdlc_flow(dispatcher: &mut Dispatcher) {
     );
 }
 
-/// Register every builtin workflow known to this crate. Currently just
-/// `SDLC_FLOW`; future builtins (e.g. the bottom-half PatchDocs/WrapUp/PR
-/// pipeline from EN.3.B) register here too.
+/// Register the `RESEARCH_AGENT` workflow (`engine_core::workflows::research_agent`)
+/// with `dispatcher`, populating both the `workflow_registry` (via
+/// `research_agent::graph::workflow`) and the `schema_registry` (via
+/// `research_agent::graph::schema`). See
+/// `planning/EN.4.A-research-agent/tasks.md`, Task 7.
+pub fn register_research_agent(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::research_agent::graph::schema(),
+        Box::new(engine_core::workflows::research_agent::graph::workflow),
+    );
+}
+
+/// Register every builtin workflow known to this crate: `SDLC_FLOW` and
+/// `RESEARCH_AGENT`; future builtins register here too.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_sdlc_flow(dispatcher);
+    register_research_agent(dispatcher);
 }
 
 #[cfg(test)]
@@ -76,5 +88,35 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("SDLC_FLOW"));
+    }
+
+    #[test]
+    fn register_research_agent_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_research_agent(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("RESEARCH_AGENT"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_research_mode_router_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_research_agent(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("RESEARCH_AGENT")
+            .expect("RESEARCH_AGENT schema should resolve");
+
+        assert_eq!(schema.start_node, "ResearchModeRouterNode");
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_research_agent() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("RESEARCH_AGENT"));
     }
 }
