@@ -10,19 +10,17 @@
 //! The built-in [`SdlcPolicy::default`] MUST reproduce today's
 //! (pre-EN.3.C) behavior exactly — turning any knob away from that
 //! baseline is opt-in.
+//!
+//! **EN.4.0:** `SdlcPolicy` now implements the generic `crate::policy::Policy`
+//! trait, and this module's `resolve` delegates to the generic
+//! `crate::policy::resolve::resolve`. `OutputVerbosity`/`ModelTier`/
+//! `LocalConfig` are re-exported from `crate::policy::tier` (byte-identical
+//! serde reprs to the pre-hoist types) rather than redefined here.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// How verbose model-node prompts should ask the model to be (lever #2a).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutputVerbosity {
-    Terse,
-    #[default]
-    Normal,
-    Verbose,
-}
+pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity};
 
 /// How the review gate is applied across a run's tasks (lever #3a).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,19 +34,6 @@ pub enum ReviewMode {
     TrivialSkip,
     /// Per-task review is collapsed into a single end-of-run review.
     EndOnly,
-}
-
-/// A model tier a stage can be resolved to (lever #3b). `Local` routes
-/// through the `openai_compat_transport` (EN.3.C task 5); every other
-/// variant maps to a concrete cloud model string in the consuming node.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelTier {
-    #[default]
-    Sonnet,
-    Haiku,
-    Opus,
-    Local,
 }
 
 /// Per-stage model tier assignment. Field names match the stage identities
@@ -71,31 +56,6 @@ impl Default for ModelTiers {
             review: ModelTier::Sonnet,
             triage: ModelTier::Sonnet,
             generate: ModelTier::Sonnet,
-        }
-    }
-}
-
-/// Configuration for the `local` model tier's OpenAI-compatible transport
-/// (EN.3.C task 5). Not present in the built-in default (no stage defaults
-/// to `local`), but shaped here so `harness.json`/event overrides can supply
-/// it once any stage opts into `local`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalConfig {
-    /// Base URL of the OpenAI-compatible endpoint, e.g. `http://localhost:11434`.
-    pub endpoint: String,
-    /// Model name to request, e.g. `qwen2.5-coder:7b`.
-    pub model: String,
-    /// Whether to pass the stage's JSON schema as a constrained-decoding
-    /// `response_format` and skip the JSON-repair retry for that stage.
-    pub constrained_json: bool,
-}
-
-impl Default for LocalConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
-            constrained_json: false,
         }
     }
 }
@@ -269,6 +229,17 @@ fn merge_close_out(mut base: CloseOut, over: &PartialCloseOut) -> CloseOut {
     base
 }
 
+impl crate::policy::Policy for SdlcPolicy {
+    type Partial = PartialPolicy;
+
+    /// Apply one override layer on top of `self`, field-by-field (`Some` in
+    /// `over` wins, `None` falls through to `self`) — the existing
+    /// `apply_override` body, unchanged.
+    fn apply(self, over: &PartialPolicy) -> Self {
+        apply_override(self, over)
+    }
+}
+
 /// Apply one override layer on top of a `base` policy, field-by-field
 /// (`Some` in `over` wins, `None` falls through to `base`).
 fn apply_override(base: SdlcPolicy, over: &PartialPolicy) -> SdlcPolicy {
@@ -300,8 +271,10 @@ fn apply_override(base: SdlcPolicy, over: &PartialPolicy) -> SdlcPolicy {
 }
 
 /// Resolve the four policy layers into one concrete [`SdlcPolicy`],
-/// high->low precedence: `event_override` > `profile` > `harness_defaults`
-/// > `builtin`.
+/// high->low precedence: `event_override` beats `profile` beats
+/// `harness_defaults` beats `builtin`. Delegates to the generic
+/// `crate::policy::resolve::resolve` now that `SdlcPolicy` implements
+/// `crate::policy::Policy` (EN.4.0).
 ///
 /// `builtin` is normally `SdlcPolicy::default()`, taken as a parameter so
 /// callers/tests can exercise the merge against any base. `profile` is a
@@ -314,17 +287,7 @@ pub fn resolve(
     profile: Option<&PartialPolicy>,
     event_override: Option<&PartialPolicy>,
 ) -> SdlcPolicy {
-    let mut resolved = builtin;
-    if let Some(harness) = harness_defaults {
-        resolved = apply_override(resolved, harness);
-    }
-    if let Some(profile) = profile {
-        resolved = apply_override(resolved, profile);
-    }
-    if let Some(event) = event_override {
-        resolved = apply_override(resolved, event);
-    }
-    resolved
+    crate::policy::resolve::resolve(builtin, harness_defaults, profile, event_override)
 }
 
 /// Convenience: a `BTreeMap` view of the resolved per-stage tiers, keyed by
@@ -528,5 +491,34 @@ mod tests {
         );
         // profile's review_mode wins over harness_defaults'.
         assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
+    }
+
+    /// EN.4.0 task 5 step 5.7: pin a fixed non-trivial `(builtin, harness,
+    /// profile, event)` input set's resolved-JSON output so a future change
+    /// to the delegation onto `crate::policy::resolve` can't silently alter
+    /// `SdlcPolicy` resolution — the concrete guard that the refactor
+    /// changed nothing observable.
+    #[test]
+    fn resolve_output_is_byte_identical_to_pre_hoist_baseline() {
+        let harness = PartialPolicy {
+            max_attempts: Some(4),
+            ..Default::default()
+        };
+        let cheap_fast = profiles::cheap_fast();
+        let event = PartialPolicy {
+            llm_triage: Some(true),
+            ..Default::default()
+        };
+
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&cheap_fast),
+            Some(&event),
+        );
+
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}}}";
+
+        assert_eq!(serde_json::to_string(&resolved).unwrap(), expected);
     }
 }
