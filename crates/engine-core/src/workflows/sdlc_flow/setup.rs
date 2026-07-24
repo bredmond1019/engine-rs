@@ -25,7 +25,7 @@ use crate::routing::Router;
 use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
-use super::{get_result, put_result};
+use super::{get_result, parse_structured_or_fenced, put_result};
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
 /// downstream node reads one resolved value rather than re-deriving it.
@@ -419,21 +419,6 @@ fn generated_tasks_schema() -> serde_json::Value {
         },
         "required": ["tasks", "tasks_markdown"],
     })
-}
-
-/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
-/// when present and non-null; otherwise fall back to
-/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
-fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
-    ctx: &TaskContext,
-    node_name: &str,
-    content: &str,
-) -> Result<T, serde_json::Error> {
-    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
-    match structured {
-        Some(value) if !value.is_null() => serde_json::from_value(value),
-        _ => serde_json::from_str(super::strip_json_fence(content)),
-    }
 }
 
 /// Gather every `*.md` file directly under `dir` except the ones the task

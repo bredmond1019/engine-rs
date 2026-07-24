@@ -22,18 +22,25 @@
 //!   snapshots and tabulates one row per distinct resolved policy.
 //!
 //! The node-plumbing seams shared by every submodule — `CommandOutput` /
-//! `CommandRunner` / `ModelTransport` / `default_command_runner` and the
-//! `put_result` / `get_result` context helpers — are owned here (hoisted in
-//! EN.3.B task 1 out of `setup.rs`/`task_loop.rs`, which had byte-identical
-//! private copies) so every leaf module imports a single definition via
-//! `super::...`.
+//! `CommandRunner` / `default_command_runner` — are owned here so every leaf
+//! module imports a single definition via `super::...` (hoisted in EN.3.B
+//! task 1 out of `setup.rs`/`task_loop.rs`, which had byte-identical private
+//! copies). `ModelTransport`, the `put_result`/`get_result` context helpers,
+//! `strip_json_fence`, and `parse_structured_or_fenced` were hoisted one
+//! level further, up to `workflows::mod` (EN.4.0 task 4), since they are not
+//! SDLC-specific; this module re-exports them so every existing
+//! `super::`/`sdlc_flow::` import site keeps resolving unchanged.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use claude_code_rs::{Config, Outcome};
-use engine_contract::TaskContext;
-use futures::future::BoxFuture;
+// `strip_json_fence` has no direct callers left in this module now that
+// `parse_structured_or_fenced` (also re-exported here) is the sole caller,
+// but it stays re-exported for back-compat — any `super::strip_json_fence`
+// import site elsewhere in the crate must keep resolving unchanged.
+pub use super::ModelTransport;
+#[allow(unused_imports)]
+pub(crate) use super::{get_result, parse_structured_or_fenced, put_result, strip_json_fence};
 
 pub mod aggregate;
 pub mod docs;
@@ -80,83 +87,4 @@ pub fn default_command_runner() -> CommandRunner {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     })
-}
-
-/// The injectable transport signature for model-calling nodes' composed
-/// `ClaudeCodeStep`s — identical shape to `ClaudeCodeStep`'s own (private)
-/// transport type. Defaults to the real `claude_code_rs::execute`; tests
-/// substitute a stub via each node's `with_transport`.
-pub type ModelTransport = Arc<
-    dyn Fn(Config, String) -> BoxFuture<'static, claude_code_rs::Result<Outcome>> + Send + Sync,
->;
-
-/// Stamp a node's output onto `ctx.nodes` under its own identity.
-pub(crate) fn put_result(ctx: &mut TaskContext, identity: &str, value: serde_json::Value) {
-    ctx.nodes.insert(identity.to_string(), value);
-}
-
-/// Look up a prior node's output from `ctx.nodes` by identity.
-pub(crate) fn get_result<'a>(
-    ctx: &'a TaskContext,
-    identity: &str,
-) -> Option<&'a serde_json::Value> {
-    ctx.nodes.get(identity)
-}
-
-/// Strip a Markdown code fence (` ```json ... ``` ` or plain ` ``` ... ``` `)
-/// wrapping a model's reply, if present, so a strict `serde_json::from_str`
-/// parse still succeeds. Every model node here prompts for "strict JSON",
-/// but a real `claude` response commonly wraps it in a fence anyway
-/// (observed live, `EN.3.C`+ manual verification) — this is the one
-/// normalization applied before every model-output JSON parse in this
-/// module. Returns the input unchanged (just trimmed) when no fence is
-/// present, so a genuinely bare JSON reply round-trips exactly as before.
-pub(crate) fn strip_json_fence(text: &str) -> &str {
-    let trimmed = text.trim();
-    let Some(after_open) = trimmed.strip_prefix("```") else {
-        return trimmed;
-    };
-    // Drop an optional language tag (e.g. `json`) up to the first newline.
-    let after_lang = match after_open.find('\n') {
-        Some(idx) => &after_open[idx + 1..],
-        None => after_open,
-    };
-    match after_lang.rfind("```") {
-        Some(idx) => after_lang[..idx].trim(),
-        None => trimmed,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::strip_json_fence;
-
-    #[test]
-    fn bare_json_passes_through_unchanged_but_trimmed() {
-        assert_eq!(strip_json_fence("  {\"a\": 1}  "), "{\"a\": 1}");
-    }
-
-    #[test]
-    fn strips_fence_with_json_language_tag() {
-        let text = "```json\n{\"a\": 1}\n```";
-        assert_eq!(strip_json_fence(text), "{\"a\": 1}");
-    }
-
-    #[test]
-    fn strips_bare_fence_with_no_language_tag() {
-        let text = "```\n{\"a\": 1}\n```";
-        assert_eq!(strip_json_fence(text), "{\"a\": 1}");
-    }
-
-    #[test]
-    fn discards_trailing_prose_after_the_closing_fence() {
-        let text = "```json\n{\"a\": 1}\n```\nDone!";
-        assert_eq!(strip_json_fence(text), "{\"a\": 1}");
-    }
-
-    #[test]
-    fn unclosed_fence_falls_back_to_the_whole_trimmed_text() {
-        let text = "```json\n{\"a\": 1}";
-        assert_eq!(strip_json_fence(text), text);
-    }
 }

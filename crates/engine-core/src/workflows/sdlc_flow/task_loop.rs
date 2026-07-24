@@ -29,7 +29,8 @@ use super::policy::{ModelTier, OutputVerbosity, ReviewMode, SdlcPolicy};
 use super::schema::{SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
 use super::setup::RESOLVED_POLICY_IDENTITY;
 use super::{
-    get_result, put_result, strip_json_fence, CommandOutput, CommandRunner, ModelTransport,
+    get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
+    ModelTransport,
 };
 
 /// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
@@ -333,21 +334,6 @@ fn implement_output_schema() -> serde_json::Value {
         },
         "required": ["summary"],
     })
-}
-
-/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
-/// when present and non-null; otherwise fall back to
-/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
-fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
-    ctx: &TaskContext,
-    node_name: &str,
-    content: &str,
-) -> Result<T, serde_json::Error> {
-    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
-    match structured {
-        Some(value) if !value.is_null() => serde_json::from_value(value),
-        _ => serde_json::from_str(strip_json_fence(content)),
-    }
 }
 
 impl ImplementTaskNode {
