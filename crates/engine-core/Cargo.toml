@@ -20,3 +20,4 @@ engine-contract = { path = "../engine-contract" }
 [dev-dependencies]
 tokio = { workspace = true }
 uuid = { workspace = true }
+engine-serve = { path = "../engine-serve" }
