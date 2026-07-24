@@ -16,6 +16,28 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-24]
+
+### `EN.4.0-shared-policy-framework` done — shared run-policy/observability framework + model-node seam hoist + SDLC refactor
+- **What:** Ran `/sdlc-flow EN.4.0-shared-policy-framework` (branch `EN.4.0-shared-policy-framework-flow`); all 8 tasks passed. Task 1 added the new generic `crates/engine-core/src/policy/` module family (`ModelTier`/`LocalConfig`/`OutputVerbosity`, tier→model-string mapping, and the shaping fns `apply_model_tier`/`apply_prompt_cache`/`apply_verbosity_directive`, factored out of the old monolithic `apply_policy`). Task 2 added generic telemetry, aggregation, `EmitStateNode`, and resolved-policy plumbing + profile lookup to the framework. Task 3 added `crates/engine-core/tests/policy_framework.rs`, proving the framework is reusable via a standalone `SamplePolicy` outside `SdlcPolicy`. Task 4 hoisted the model-node seams (`ModelTransport`, `put_result`/`get_result`, `strip_json_fence`, and a newly-factored `parse_structured_or_fenced`) from `sdlc_flow/mod.rs` up to `workflows/mod.rs`, with `sdlc_flow` re-exporting them for back-compat (`CommandRunner`/`default_command_runner` stayed in `sdlc_flow` as specified). Task 5 refactored SDLC-flow's policy/telemetry/aggregation/emit-state/profile-lookup machinery to delegate onto the generic framework (`SdlcPolicy` implements the `Policy` trait) while keeping every serialized shape and the pre-existing SDLC test suite byte-identical. Task 6 wired `cost_usd` (read generically from each node's own `ctx.nodes[identity]["cost_usd"]`) into `Workflow::run_with`'s `BudgetLedger`, so `Budget.max_cost_usd` actually gates a run. Task 7 added decision doc `planning/decisions/D7-shared-policy-framework.md` + its index row. Task 8 validated the full block (fmt/clippy/test/release-build all green, `SdlcPolicy` behavior-preservation confirmed).
+- **Why:** Closes Block EN.4.0 of `master-plan.md` Phase 4 — the shared policy/telemetry framework that Blocks EN.4.A–D (RESEARCH_AGENT, DIAGNOSTIC_INTAKE, PROPOSAL_GENERATOR, DELIVERABLE_RENDER) and EN.5.B1/B2 (eval slice runner, regression-history gate) all depend on, per the block→project-doc crosswalk in `master-plan.md`.
+- **Verdict:** PASS (review found no findings). Docs patched: `docs/sdlc-flow-policy.md`, `docs/architecture.md`.
+- **Status:** `planning/state.json` block `EN.4.0` set to `"closed"`; `planning/status.md` Progress Table flipped to Done with a new Phase 4 sub-table.
+- **Next:** Plan and pick up one of the newly-unblocked EN.4.A–D / EN.5.B1 blocks.
+
+```
+38cb87d docs: update docs for EN.4.0-shared-policy-framework
+c268b5a feat: implement EN.4.0-shared-policy-framework-task6
+eb0a5b7 feat: implement EN.4.0-shared-policy-framework-task5
+25eb516 feat: implement EN.4.0-shared-policy-framework-task4
+6e445e0 feat: implement EN.4.0-shared-policy-framework-task3
+c3d58a7 feat: implement EN.4.0-shared-policy-framework-task2
+32e225c fix: fix pass 1 for EN.4.0-shared-policy-framework-task1
+33ec137 feat: implement EN.4.0-shared-policy-framework-task1
+```
+
+---
+
 ## [run: 2026-07-20]
 
 ### `plan-sdlc-policy-profiles-E` (Block EN.3-plan.E) done — docs, index, and research-note wrap-up; plan complete
