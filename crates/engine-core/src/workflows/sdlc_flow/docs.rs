@@ -71,6 +71,18 @@ impl PatchDocsNode {
         self
     }
 
+    /// Override the base `Config` entirely (model/tool-permission/etc.
+    /// fields) — `process` still applies `json_schema` on top, but every
+    /// other field (e.g. `disallowed_tools`, `dangerously_skip_permissions`)
+    /// passes through untouched. Mirrors `ImplementTaskNode::with_config`;
+    /// lets `graph.rs::registry()` grant this node real headless write
+    /// permission without changing its safe-by-default `new()` construction.
+    #[must_use]
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Return the `modified_files` reported by the most recent
     /// `ImplementTaskNode` pass, or an empty list if it hasn't run.
     /// `TaskContext.nodes` stores one entry per node *name*, so across a
@@ -282,6 +294,58 @@ mod tests {
             PatchDocsNode::collect_modified_files(&ctx),
             Vec::<String>::new()
         );
+    }
+
+    #[tokio::test]
+    async fn with_config_overrides_the_config_passed_to_the_transport() {
+        let captured_config: Arc<std::sync::Mutex<Option<Config>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_config_clone = captured_config.clone();
+        let reply = json!({
+            "summary": "patched stale references",
+            "files_patched": ["docs/foo.md"],
+        });
+        let transport: ModelTransport = Arc::new(move |config, _prompt| {
+            *captured_config_clone.lock().unwrap() = Some(config.clone());
+            let outcome = Outcome {
+                cost_usd: 0.0,
+                usage: claude_code_rs::parse::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: reply.to_string(),
+                is_error: false,
+                api_error_status: None,
+                structured_output: None,
+            };
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = PatchDocsNode::new()
+            .with_config(Config {
+                model: Some("claude-opus-4-1".to_string()),
+                dangerously_skip_permissions: true,
+                disallowed_tools: vec!["Bash".to_string()],
+                isolated: true,
+                ..Config::default()
+            })
+            .with_transport(transport);
+
+        let ctx = empty_context(json!({}));
+        node.process(ctx).await.expect("process should succeed");
+
+        let config = captured_config
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called with a config");
+        assert_eq!(config.model.as_deref(), Some("claude-opus-4-1"));
+        assert!(config.dangerously_skip_permissions);
+        assert_eq!(config.disallowed_tools, vec!["Bash".to_string()]);
+        assert!(config.isolated);
     }
 
     #[tokio::test]
