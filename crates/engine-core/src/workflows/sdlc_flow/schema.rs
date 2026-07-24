@@ -125,6 +125,10 @@ pub struct SDLCFlowEventSchema {
     /// `RETRYABLE` vs `MAJOR_BAIL` (early-bail heuristic).
     #[serde(default)]
     pub llm_triage: bool,
+    /// Whether to use a git worktree (in `trees/{branch}`) or just checkout
+    /// the branch in the current directory.
+    #[serde(default)]
+    pub use_worktree: bool,
     /// Optional per-run policy override (EN.3.C) — the highest-precedence of
     /// the three `SdlcPolicy` resolution layers (event override >
     /// `harness.json` `sdlc.policy` defaults > built-in default). Additive:
@@ -404,6 +408,7 @@ mod tests {
         assert!(event.auto_pr);
         assert_eq!(event.branch_name, None);
         assert!(!event.llm_triage);
+        assert!(!event.use_worktree);
         assert_eq!(event.policy, None);
         assert_eq!(event.profile, None);
     }

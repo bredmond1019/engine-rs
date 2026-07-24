@@ -215,36 +215,81 @@ impl Node for SetupWorktreeNode {
             .branch_name
             .clone()
             .unwrap_or_else(|| format!("sdlc/{}", event.spec_slug));
-        let worktree_path = format!("trees/{branch}");
+        let worktree_path = if event.use_worktree {
+            format!("trees/{branch}")
+        } else {
+            ".".to_string()
+        };
 
-        let reattaching = event.resume && Path::new(&worktree_path).exists();
-        if !reattaching {
-            let output = (self.runner)(
-                "git",
-                &[
-                    "worktree",
-                    "add",
-                    &worktree_path,
-                    "-b",
-                    &branch,
-                    "origin/main",
-                ],
-                Path::new("."),
-            )
-            .map_err(|err| NodeError::new(format!("failed to spawn git worktree add: {err}")))?;
-
-            if output.status != 0 {
-                // Best-effort cleanup; its own outcome doesn't change the
-                // failure we're about to report.
-                let _ = (self.runner)(
+        if event.use_worktree {
+            let reattaching = event.resume && Path::new(&worktree_path).exists();
+            if !reattaching {
+                let output = (self.runner)(
                     "git",
-                    &["worktree", "remove", "--force", &worktree_path],
+                    &[
+                        "worktree",
+                        "add",
+                        &worktree_path,
+                        "-b",
+                        &branch,
+                        "origin/main",
+                    ],
                     Path::new("."),
-                );
-                return Err(NodeError::new(format!(
-                    "git worktree add failed (status {}): {}",
-                    output.status, output.stderr
-                )));
+                )
+                .map_err(|err| NodeError::new(format!("failed to spawn git worktree add: {err}")))?;
+
+                if output.status != 0 {
+                    // Best-effort cleanup; its own outcome doesn't change the
+                    // failure we're about to report.
+                    let _ = (self.runner)(
+                        "git",
+                        &["worktree", "remove", "--force", &worktree_path],
+                        Path::new("."),
+                    );
+                    return Err(NodeError::new(format!(
+                        "git worktree add failed (status {}): {}",
+                        output.status, output.stderr
+                    )));
+                }
+            }
+
+            // Ensure the planning symlink exists in the worktree
+            let worktree_planning = Path::new(&worktree_path).join("planning");
+            if !worktree_planning.exists() {
+                if let Ok(canonical_planning) = std::fs::canonicalize("planning") {
+                    #[cfg(unix)]
+                    let _ = std::os::unix::fs::symlink(canonical_planning, worktree_planning);
+                }
+            }
+        } else {
+            if !event.resume {
+                let output = (self.runner)(
+                    "git",
+                    &["checkout", "-B", &branch, "origin/main"],
+                    Path::new("."),
+                )
+                .map_err(|err| NodeError::new(format!("failed to spawn git checkout: {err}")))?;
+
+                if output.status != 0 {
+                    return Err(NodeError::new(format!(
+                        "git checkout failed (status {}): {}",
+                        output.status, output.stderr
+                    )));
+                }
+            } else {
+                let output = (self.runner)(
+                    "git",
+                    &["checkout", &branch],
+                    Path::new("."),
+                )
+                .map_err(|err| NodeError::new(format!("failed to spawn git checkout: {err}")))?;
+
+                if output.status != 0 {
+                    return Err(NodeError::new(format!(
+                        "git checkout failed (status {}): {}",
+                        output.status, output.stderr
+                    )));
+                }
             }
         }
 
@@ -705,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn setup_writes_worktree_result_via_stub_runner() {
         let node = SetupWorktreeNode::new().with_runner(stub_runner(0));
-        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
 
         let out = node.process(ctx).await.expect("setup should succeed");
         let result = out.nodes.get("SetupWorktreeNode").expect("output present");
@@ -716,7 +761,7 @@ mod tests {
     #[tokio::test]
     async fn setup_surfaces_git_failure() {
         let node = SetupWorktreeNode::new().with_runner(stub_runner(1));
-        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("git worktree add failed"));
@@ -740,7 +785,7 @@ mod tests {
         });
 
         let node = SetupWorktreeNode::new().with_runner(runner);
-        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
         let _ = node.process(ctx).await;
 
         let recorded = calls.lock().unwrap();
