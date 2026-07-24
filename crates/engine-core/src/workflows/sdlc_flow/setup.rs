@@ -226,11 +226,25 @@ impl Node for SetupWorktreeNode {
             }
         }
 
-        put_result(
-            &mut ctx,
-            "SetupWorktreeNode",
-            json!({ "worktree_path": worktree_path.clone(), "branch_name": branch }),
-        );
+        // Best-effort: capture the base commit SHA so downstream diff/review
+        // steps can pin their diff base to "what existed when this worktree
+        // was set up" rather than a hardcoded `main` that may move mid-run.
+        // A failed `git rev-parse` (or a no-op stub runner in unit tests)
+        // simply omits `base_sha` — downstream readers fall back to
+        // `main..HEAD`.
+        let base_sha = (self.runner)("git", &["rev-parse", "HEAD"], Path::new(&worktree_path))
+            .ok()
+            .filter(|output| output.status == 0)
+            .map(|output| output.stdout.trim().to_string())
+            .filter(|sha| !sha.is_empty());
+
+        let mut setup_result =
+            json!({ "worktree_path": worktree_path.clone(), "branch_name": branch });
+        if let Some(sha) = base_sha {
+            setup_result["base_sha"] = json!(sha);
+        }
+
+        put_result(&mut ctx, "SetupWorktreeNode", setup_result);
 
         let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&worktree_path))?;
         crate::policy::stamp_resolved_policy(&mut ctx, &resolved_policy)?;
@@ -708,6 +722,46 @@ mod tests {
         assert_eq!(
             recorded[1][0..2],
             ["worktree".to_string(), "remove".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_stamps_base_sha_from_rev_parse() {
+        const FIXED_SHA: &str = "abc1234def5678900000000000000000000000";
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            if args.first() == Some(&"rev-parse") {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: format!("{FIXED_SHA}\n"),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        });
+
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["base_sha"], FIXED_SHA);
+    }
+
+    #[tokio::test]
+    async fn setup_omits_base_sha_when_rev_parse_fails() {
+        let node = SetupWorktreeNode::new().with_runner(stub_runner(0));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert!(
+            result.get("base_sha").is_none(),
+            "base_sha should be absent when rev-parse yields no usable SHA"
         );
     }
 
