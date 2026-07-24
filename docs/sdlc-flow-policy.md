@@ -17,11 +17,27 @@ stage, how strict review was, how verbose prompts were) were hardcoded. Now ever
 concrete `SdlcPolicy`, applies it, and records `RunOutcomes` telemetry at the tail — so different
 policies can be compared on real cost/time/quality data instead of guessed at.
 
-Source: `crates/engine-core/src/workflows/sdlc_flow/policy.rs` (the policy + resolution),
-`profiles.rs` (the four named `PartialPolicy` bundles), `setup.rs` (`resolve_policy_for_run`,
-`resolve_profile`, wired into `SetupWorktreeNode`), `graph.rs` (`registry_for_policy`, the
-local-tier rewiring), `schema.rs` (`RunOutcomes`, the event's `policy` and `profile` fields),
-`aggregate.rs` (cross-run aggregation).
+**EN.4.0:** the underlying mechanism — tier types, the four-layer `resolve<P>` precedence, the
+model-node shaping helpers, telemetry harvest, and aggregation — was generalized out of
+`sdlc_flow` into a workflow-agnostic `engine-core::policy` framework (`crates/engine-core/src/policy/`),
+so any workflow can reuse it, not just `sdlc_flow`. `SdlcPolicy` now implements `crate::policy::Policy`
+and every SDLC-flow-facing type below (`PolicyAggregate`, `RunOutcomes`/`RunTelemetry`,
+`EmitStateNode`) delegates to the generic framework internally; the serialized shapes, CLI-facing
+behavior, and everything documented below are unchanged. `sdlc_flow` keeps its own
+`CommandRunner`/`default_command_runner` (subprocess execution) and its four concrete named
+profiles — those did not move.
+
+Source: `crates/engine-core/src/policy/` (the generic framework: `resolve.rs`, `tier.rs`,
+`shaping.rs`, `telemetry.rs`, `aggregate.rs`, `emit_state.rs`, `profiles.rs`) plus
+`crates/engine-core/src/workflows/sdlc_flow/policy.rs` (`SdlcPolicy`, its `Policy` impl, and
+resolution wired to the generic framework), `profiles.rs` (the four named `PartialPolicy`
+bundles), `setup.rs` (`resolve_policy_for_run`, `resolve_profile`, wired into
+`SetupWorktreeNode` — both now thin wrappers over `crate::policy::resolve_profile` /
+`crate::policy::read_harness_policy_defaults`), `graph.rs` (`registry_for_policy`, the
+local-tier rewiring), `schema.rs` (`RunOutcomes`, with `From`/`Into` conversions to/from the
+generic `crate::policy::RunTelemetry`; the event's `policy` and `profile` fields), `aggregate.rs`
+(cross-run aggregation — `PolicyAggregate` is now a type alias for the generic
+`crate::policy::PolicyAggregate<SdlcPolicy>`).
 
 ## Configuring a run
 
