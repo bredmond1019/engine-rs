@@ -93,22 +93,22 @@ fn apply_policy(
 /// Deterministically classify the current task's diff as "trivial" against
 /// the resolved policy's `review_skip_max_files`/`review_skip_max_diff_lines`
 /// thresholds (lever #3a, `trivial_skip` mode) — zero model tokens spent.
-/// Reads `git diff --numstat main..HEAD` via the injectable [`CommandRunner`]
-/// seam: one line per changed file, `<added>\t<deleted>\t<path>`. Any
-/// unparsable line (e.g. a binary file's `-\t-\tpath`) is treated
-/// conservatively as non-trivial. Falls back to non-trivial (`false`) when
-/// the worktree path or the `git diff` invocation is unavailable, so this
-/// never turns a `process` failure into an error path — trivial-skip is an
-/// optimization, not a correctness requirement.
+/// Reads `git diff --numstat <base_sha>..HEAD` via the injectable
+/// [`CommandRunner`] seam: one line per changed file,
+/// `<added>\t<deleted>\t<path>`. The diff base is the SHA `SetupWorktreeNode`
+/// captured at worktree-setup time (see [`base_sha`]), falling back to
+/// `main..HEAD` when absent (e.g. unit tests with no `SetupWorktreeNode`
+/// output). Any unparsable line (e.g. a binary file's `-\t-\tpath`) is
+/// treated conservatively as non-trivial. Falls back to non-trivial
+/// (`false`) when the worktree path or the `git diff` invocation is
+/// unavailable, so this never turns a `process` failure into an error path
+/// — trivial-skip is an optimization, not a correctness requirement.
 fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPolicy) -> bool {
     let Ok(worktree) = worktree_path(ctx) else {
         return false;
     };
-    let Ok(output) = runner(
-        "git",
-        &["diff", "--numstat", "main..HEAD"],
-        Path::new(&worktree),
-    ) else {
+    let range = diff_range(ctx);
+    let Ok(output) = runner("git", &["diff", "--numstat", &range], Path::new(&worktree)) else {
         return false;
     };
 
@@ -191,6 +191,28 @@ fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .ok_or_else(|| NodeError::new("SetupWorktreeNode output missing worktree_path"))
+}
+
+/// Read the base commit SHA captured by `SetupWorktreeNode` at worktree-setup
+/// time, if present. Mirrors [`worktree_path`] but returns `None` rather than
+/// an error when absent (best-effort: `SetupWorktreeNode` omits `base_sha`
+/// when `git rev-parse HEAD` failed or the runner is a no-op stub, and
+/// callers here fall back to `main..HEAD` in that case).
+fn base_sha(ctx: &TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")
+        .and_then(|value| value.get("base_sha"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// Build the `git diff` range argument (`<base_sha>..HEAD` when a base SHA
+/// was captured at worktree-setup time, `main..HEAD` otherwise) shared by
+/// [`classify_trivial`] and `ConsolidatedReviewNode`.
+fn diff_range(ctx: &TaskContext) -> String {
+    match base_sha(ctx) {
+        Some(sha) => format!("{sha}..HEAD"),
+        None => "main..HEAD".to_string(),
+    }
 }
 
 fn current_task_fields(ctx: &TaskContext) -> Result<&serde_json::Value, NodeError> {
@@ -1135,7 +1157,8 @@ impl Router for TriageRouterNode {
 
 // --- ConsolidatedReviewNode ----------------------------------------------------
 
-/// Model node (Sonnet): reviews the task's `git diff main..HEAD` against its
+/// Model node (Sonnet): reviews the task's `git diff <base_sha>..HEAD`
+/// (falling back to `main..HEAD` when no `base_sha` was captured) against its
 /// acceptance criteria via a composed `ClaudeCodeStep`.
 pub struct ConsolidatedReviewNode {
     config: Config,
@@ -1217,7 +1240,8 @@ impl Node for ConsolidatedReviewNode {
             .cloned()
             .unwrap_or_else(|| json!([]));
 
-        let diff = (self.runner)("git", &["diff", "main..HEAD"], Path::new(&worktree))
+        let range = diff_range(&ctx);
+        let diff = (self.runner)("git", &["diff", &range], Path::new(&worktree))
             .map(|output| output.stdout)
             .unwrap_or_default();
 
@@ -2379,6 +2403,47 @@ mod tests {
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
     }
 
+    /// When `SetupWorktreeNode` stamped a `base_sha` (the SHA captured at
+    /// worktree-setup time), the review diff pins to `<base_sha>..HEAD`
+    /// instead of `main..HEAD` — so a `main` that advances mid-run doesn't
+    /// misreport unrelated commits as reversions.
+    #[tokio::test]
+    async fn review_uses_base_sha_diff_range_when_present() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": ".", "base_sha": "abc1234" }),
+        );
+
+        let diff_called = Arc::new(Mutex::new(false));
+        let diff_called_clone = diff_called.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            *diff_called_clone.lock().unwrap() = true;
+            assert_eq!(args, ["diff", "abc1234..HEAD"]);
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let canned =
+            json!({ "verdict": "PASS", "summary": "looks good", "issues": [] }).to_string();
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(canned.clone());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert!(*diff_called.lock().unwrap());
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
     /// The model's `Config.cwd` is scoped to the run's worktree — without
     /// this, a real review call that reads the filesystem checks the host
     /// process's ambient cwd instead of the task's actual worktree.
@@ -2911,6 +2976,14 @@ mod tests {
         ctx
     }
 
+    fn ctx_with_worktree_and_base_sha(mut ctx: TaskContext, base_sha: &str) -> TaskContext {
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": ".", "base_sha": base_sha }),
+        );
+        ctx
+    }
+
     /// A trivial green task (small diff, under the default thresholds)
     /// classifies `trivial: true` and, under `TrivialSkip`, the router
     /// skips `ConsolidatedReviewNode` and goes straight to
@@ -2938,6 +3011,38 @@ mod tests {
 
         let router = TriageRouterNode;
         assert_eq!(router.route(&out), Some("UpdateTaskStatusNode".to_string()));
+    }
+
+    /// When `SetupWorktreeNode` stamped a `base_sha`, `classify_trivial`
+    /// diffs `<base_sha>..HEAD` instead of `main..HEAD`.
+    #[tokio::test]
+    async fn trivial_classification_uses_base_sha_diff_range_when_present() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let policy = SdlcPolicy {
+            review_mode: ReviewMode::TrivialSkip,
+            ..SdlcPolicy::default()
+        };
+
+        let ctx = ctx_with_worktree_and_base_sha(ctx_with_test_result(true, &task), "deadbee");
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            assert_eq!(args, ["diff", "--numstat", "deadbee..HEAD"]);
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "1\t1\tsrc/lib.rs\n".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = TriageTaskNode::new()
+            .with_transport(panicking_transport())
+            .with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["trivial"], true);
     }
 
     /// A non-trivial green task (diff over the thresholds) classifies
