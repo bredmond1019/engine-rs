@@ -11,113 +11,41 @@
 //!
 //! States missing either block (no run ever reached `WrapUpNode`, or a
 //! pre-EN.3.C state file) are skipped — there is no policy to key them by.
+//!
+//! **EN.4.0:** delegates to the generic `crate::policy::aggregate` — this
+//! module now only converts `(SdlcPolicy, RunOutcomes)` pairs into
+//! `(SdlcPolicy, RunTelemetry)` pairs (via `RunOutcomes`'s `Into` impl,
+//! `schema.rs`) and hands them to the generic `aggregate`/
+//! `aggregate_state_files`. `PolicyAggregate` is a type alias for the
+//! generic `crate::policy::PolicyAggregate<SdlcPolicy>`, so its field shape
+//! is unchanged.
 
-use std::collections::BTreeMap;
 use std::path::Path;
+
+#[cfg(test)]
+use std::collections::BTreeMap;
 
 use super::policy::SdlcPolicy;
 use super::schema::{RunOutcomes, SDLCState};
 
 /// One row of the cross-run aggregation table: a distinct resolved
 /// [`SdlcPolicy`] plus the summed/averaged outcome metrics across every run
-/// that resolved to it.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct PolicyAggregate {
-    /// The resolved policy this row summarizes.
-    pub policy: SdlcPolicy,
-    /// Number of runs that resolved to this exact policy.
-    pub run_count: usize,
-    /// Sum of `RunOutcomes::total_cost_usd` across every run in this group.
-    pub total_cost_usd: f64,
-    /// `total_cost_usd / run_count`.
-    pub avg_cost_usd: f64,
-    /// Sum of `RunOutcomes::wall_clock_secs` across every run in this group.
-    pub total_wall_clock_secs: f64,
-    /// `total_wall_clock_secs / run_count`.
-    pub avg_wall_clock_secs: f64,
-    /// Sum of `RunOutcomes::total_input_tokens`.
-    pub total_input_tokens: u64,
-    /// Sum of `RunOutcomes::total_output_tokens`.
-    pub total_output_tokens: u64,
-    /// Sum of `RunOutcomes::total_attempts`.
-    pub total_attempts: u32,
-    /// Sum of `RunOutcomes::total_retries`.
-    pub total_retries: u32,
-    /// Sum of `RunOutcomes::tasks_passed` (quality numerator).
-    pub total_tasks_passed: u32,
-    /// Sum of `RunOutcomes::tasks_failed` (quality denominator, with
-    /// `total_tasks_passed`).
-    pub total_tasks_failed: u32,
-    /// `total_tasks_passed / (total_tasks_passed + total_tasks_failed)`, or
-    /// `0.0` if no tasks were recorded in this group.
-    pub pass_rate: f64,
-    /// Tally of every `review_verdicts` entry observed across the group's
-    /// runs (e.g. `"ConsolidatedReviewNode:PASS" -> 4`).
-    pub review_verdict_counts: BTreeMap<String, u32>,
-}
-
-/// Canonical grouping key for a resolved policy: its serde-serialized JSON,
-/// so two policies are "the same" for aggregation purposes iff they'd
-/// serialize identically (matches `SdlcPolicy`'s `PartialEq` semantics
-/// without requiring `Eq`/`Hash`/`Ord` derives on the type itself).
-fn policy_key(policy: &SdlcPolicy) -> String {
-    serde_json::to_string(policy).expect("SdlcPolicy always serializes")
-}
+/// that resolved to it. A type alias for the generic
+/// `crate::policy::PolicyAggregate<SdlcPolicy>` (EN.4.0) — same fields,
+/// same shape, as the pre-hoist concrete struct.
+pub type PolicyAggregate = crate::policy::PolicyAggregate<SdlcPolicy>;
 
 /// Group `(policy, outcomes)` pairs by resolved policy and tabulate one
 /// [`PolicyAggregate`] row per distinct policy. Rows are returned sorted by
-/// their policy's canonical JSON key, for deterministic output.
+/// their policy's canonical JSON key, for deterministic output. Delegates
+/// to the generic `crate::policy::aggregate::aggregate` (EN.4.0).
 #[must_use]
 pub fn aggregate_outcomes(runs: &[(SdlcPolicy, RunOutcomes)]) -> Vec<PolicyAggregate> {
-    let mut groups: BTreeMap<String, PolicyAggregate> = BTreeMap::new();
-
-    for (policy, outcomes) in runs {
-        let key = policy_key(policy);
-        let row = groups.entry(key).or_insert_with(|| PolicyAggregate {
-            policy: policy.clone(),
-            run_count: 0,
-            total_cost_usd: 0.0,
-            avg_cost_usd: 0.0,
-            total_wall_clock_secs: 0.0,
-            avg_wall_clock_secs: 0.0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_attempts: 0,
-            total_retries: 0,
-            total_tasks_passed: 0,
-            total_tasks_failed: 0,
-            pass_rate: 0.0,
-            review_verdict_counts: BTreeMap::new(),
-        });
-
-        row.run_count += 1;
-        row.total_cost_usd += outcomes.total_cost_usd;
-        row.total_wall_clock_secs += outcomes.wall_clock_secs;
-        row.total_input_tokens += outcomes.total_input_tokens;
-        row.total_output_tokens += outcomes.total_output_tokens;
-        row.total_attempts += outcomes.total_attempts;
-        row.total_retries += outcomes.total_retries;
-        row.total_tasks_passed += outcomes.tasks_passed;
-        row.total_tasks_failed += outcomes.tasks_failed;
-        for verdict in &outcomes.review_verdicts {
-            *row.review_verdict_counts
-                .entry(verdict.clone())
-                .or_insert(0) += 1;
-        }
-    }
-
-    let mut rows: Vec<PolicyAggregate> = groups.into_values().collect();
-    for row in &mut rows {
-        row.avg_cost_usd = row.total_cost_usd / row.run_count as f64;
-        row.avg_wall_clock_secs = row.total_wall_clock_secs / row.run_count as f64;
-        let total_tasks = row.total_tasks_passed + row.total_tasks_failed;
-        row.pass_rate = if total_tasks > 0 {
-            f64::from(row.total_tasks_passed) / f64::from(total_tasks)
-        } else {
-            0.0
-        };
-    }
-    rows
+    let converted: Vec<(SdlcPolicy, crate::policy::RunTelemetry)> = runs
+        .iter()
+        .map(|(policy, outcomes)| (policy.clone(), outcomes.clone().into()))
+        .collect();
+    crate::policy::aggregate::aggregate(&converted)
 }
 
 /// Extract `(policy, outcomes)` pairs from a set of completed
@@ -136,21 +64,16 @@ pub fn aggregate_states(states: &[SDLCState]) -> Vec<PolicyAggregate> {
 }
 
 /// Read a set of `sdlc-flow-state.json` files from disk and aggregate them
-/// via [`aggregate_states`]. Returns an `io::Error` if any file can't be
-/// read or fails to parse as [`SDLCState`] JSON.
+/// via the generic `crate::policy::aggregate::aggregate_state_files`
+/// (EN.4.0), extracting `(policy, outcomes)` from each state's `policy`/
+/// `outcomes` fields. Returns an `io::Error` if any file can't be read or
+/// fails to parse as [`SDLCState`] JSON.
 pub fn aggregate_state_files<P: AsRef<Path>>(paths: &[P]) -> std::io::Result<Vec<PolicyAggregate>> {
-    let mut states = Vec::with_capacity(paths.len());
-    for path in paths {
-        let content = std::fs::read_to_string(path.as_ref())?;
-        let state: SDLCState = serde_json::from_str(&content).map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{}: {err}", path.as_ref().display()),
-            )
-        })?;
-        states.push(state);
-    }
-    Ok(aggregate_states(&states))
+    crate::policy::aggregate::aggregate_state_files(paths, |value| {
+        crate::policy::aggregate::extract_policy_telemetry::<SdlcPolicy>(
+            value, "policy", "outcomes",
+        )
+    })
 }
 
 #[cfg(test)]

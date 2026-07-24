@@ -125,6 +125,10 @@ pub struct SDLCFlowEventSchema {
     /// `RETRYABLE` vs `MAJOR_BAIL` (early-bail heuristic).
     #[serde(default)]
     pub llm_triage: bool,
+    /// Whether to use a git worktree (in `trees/{branch}`) or just checkout
+    /// the branch in the current directory.
+    #[serde(default)]
+    pub use_worktree: bool,
     /// Optional per-run policy override (EN.3.C) — the highest-precedence of
     /// the three `SdlcPolicy` resolution layers (event override >
     /// `harness.json` `sdlc.policy` defaults > built-in default). Additive:
@@ -209,6 +213,14 @@ fn default_global_status() -> String {
 /// pairs can be tabulated across runs by a later cross-run aggregator. All
 /// fields default to zero/empty so a run that never reaches the tail (or a
 /// unit test driving a node in isolation) still round-trips cleanly.
+///
+/// **EN.4.0:** this shape is field-for-field identical to the generic
+/// `crate::policy::RunTelemetry` (see the `From` impls below), which
+/// `wrap_up::finalize_outcomes` now uses to compute the ctx-derived fields
+/// via `crate::policy::telemetry::harvest` rather than re-deriving them
+/// locally. The struct itself is kept flat (not `#[serde(flatten)]`-wrapped)
+/// so its JSON shape — and every existing direct field access across this
+/// crate's tests — stays byte-identical to pre-EN.4.0.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunOutcomes {
     /// Wall-clock seconds from `SetupWorktreeNode`'s `started_at` to the
@@ -255,6 +267,40 @@ pub struct RunOutcomes {
     /// local-vs-cloud quality is measurable across runs.
     #[serde(default)]
     pub model_tier_used: BTreeMap<String, String>,
+}
+
+impl From<crate::policy::RunTelemetry> for RunOutcomes {
+    fn from(telemetry: crate::policy::RunTelemetry) -> Self {
+        Self {
+            wall_clock_secs: telemetry.wall_clock_secs,
+            total_attempts: telemetry.total_attempts,
+            total_retries: telemetry.total_retries,
+            tasks_passed: telemetry.tasks_passed,
+            tasks_failed: telemetry.tasks_failed,
+            review_verdicts: telemetry.review_verdicts,
+            total_input_tokens: telemetry.total_input_tokens,
+            total_output_tokens: telemetry.total_output_tokens,
+            total_cost_usd: telemetry.total_cost_usd,
+            model_tier_used: telemetry.model_tier_used,
+        }
+    }
+}
+
+impl From<RunOutcomes> for crate::policy::RunTelemetry {
+    fn from(outcomes: RunOutcomes) -> Self {
+        Self {
+            wall_clock_secs: outcomes.wall_clock_secs,
+            total_attempts: outcomes.total_attempts,
+            total_retries: outcomes.total_retries,
+            tasks_passed: outcomes.tasks_passed,
+            tasks_failed: outcomes.tasks_failed,
+            review_verdicts: outcomes.review_verdicts,
+            total_input_tokens: outcomes.total_input_tokens,
+            total_output_tokens: outcomes.total_output_tokens,
+            total_cost_usd: outcomes.total_cost_usd,
+            model_tier_used: outcomes.model_tier_used,
+        }
+    }
 }
 
 impl SDLCTaskStatus {
@@ -404,6 +450,7 @@ mod tests {
         assert!(event.auto_pr);
         assert_eq!(event.branch_name, None);
         assert!(!event.llm_triage);
+        assert!(!event.use_worktree);
         assert_eq!(event.policy, None);
         assert_eq!(event.profile, None);
     }
@@ -513,5 +560,36 @@ mod tests {
     fn parse_task_range_rejects_end_before_start() {
         let err = parse_task_range(Some("5-3")).unwrap_err();
         assert!(err.contains("end < start"));
+    }
+
+    /// EN.4.0 task 5 step 5.2 guard: converting a populated `RunOutcomes`
+    /// into the generic `RunTelemetry` and back must round-trip exactly, and
+    /// the two types must serialize to byte-identical JSON (same field
+    /// names, same shape) — the proof that `RunOutcomes` staying flat
+    /// (rather than `#[serde(flatten)]`-wrapped) doesn't diverge from the
+    /// generic shape it's "expressed via".
+    #[test]
+    fn run_outcomes_round_trips_through_run_telemetry_byte_identically() {
+        let outcomes = RunOutcomes {
+            wall_clock_secs: 12.5,
+            total_attempts: 3,
+            total_retries: 1,
+            tasks_passed: 2,
+            tasks_failed: 0,
+            review_verdicts: vec!["ConsolidatedReviewNode:PASS".to_string()],
+            total_input_tokens: 100,
+            total_output_tokens: 50,
+            total_cost_usd: 0.02,
+            model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
+        };
+
+        let telemetry: crate::policy::RunTelemetry = outcomes.clone().into();
+        let round_tripped: RunOutcomes = telemetry.clone().into();
+        assert_eq!(outcomes, round_tripped);
+
+        assert_eq!(
+            serde_json::to_string(&outcomes).unwrap(),
+            serde_json::to_string(&telemetry).unwrap()
+        );
     }
 }

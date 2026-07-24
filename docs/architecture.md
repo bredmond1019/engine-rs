@@ -162,9 +162,14 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `planning/decisions/D6-cancellation-and-budget-semantics.md`.
 - `Budget` / `BudgetLedger` (`engine-core::budget`, EN.2.B) — `Budget` is a config struct (token
   and/or cost caps); `BudgetLedger` accumulates spend from each completed node's `NodeRun.usage`
-  (tokens) plus an optional per-call `cost_usd` (folded in separately, since
-  `engine_contract::Usage` carries no cost field per the data contract — a later caller with an
-  actual cost figure, e.g. `ClaudeCodeStep`'s SDK `Outcome::cost_usd`, supplies it).
+  (tokens) plus an optional per-call `cost_usd`, folded in separately since `engine_contract::Usage`
+  carries no cost field per the data contract. **EN.4.0:** `Workflow::run_with` now supplies that
+  `cost_usd` itself — after each node completes, `node_cost_usd(&ctx, &identity)` (`workflow.rs`)
+  reads the node's own `ctx.nodes[identity]["cost_usd"]` (the same field shape `ClaudeCodeStep`
+  writes, and that `policy::telemetry::total_cost_usd` reads for SDLC's cost-bearing stages) and
+  folds it into `ledger.record(...)` alongside token usage, so `Budget::max_cost_usd` actually
+  gates a run the same way `max_total_tokens` already did. A node with no `cost_usd` in its output
+  contributes `None` (token-only accounting), so behavior is unchanged when no cost cap is set.
   `check()` is the pre-dispatch gate `Workflow::run_with` calls before each node: returns
   `Allow` or `Halt(BudgetHaltReason)` when accumulated spend is *reached* (`>=`) the configured
   cap — a cap hit exactly by the last completed node stops the walk before the node that would

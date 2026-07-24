@@ -24,10 +24,12 @@ use engine_contract::TaskContext;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
+use crate::policy::telemetry::RunTelemetryInputs;
+#[cfg(test)]
+use crate::policy::RESOLVED_POLICY_IDENTITY;
 
 use super::policy::SdlcPolicy;
 use super::schema::{RunOutcomes, SDLCState};
-use super::setup::RESOLVED_POLICY_IDENTITY;
 use super::{get_result, put_result};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
@@ -120,22 +122,10 @@ fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
 /// Read the resolved `SdlcPolicy` stamped by `SetupWorktreeNode`
 /// (`setup::RESOLVED_POLICY_IDENTITY`). Falls back to the built-in default
 /// when absent or unparsable — the same defensive fallback `task_loop.rs`
-/// uses (kept as a local copy per this module's no-`mod.rs`-touch rule).
+/// uses. Delegates to the generic `crate::policy::resolved_policy::<SdlcPolicy>`
+/// (EN.4.0).
 fn resolved_policy(ctx: &TaskContext) -> SdlcPolicy {
-    get_result(ctx, RESOLVED_POLICY_IDENTITY)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
-        .unwrap_or_default()
-}
-
-/// Wall-clock seconds from `SetupWorktreeNode`'s framework-stamped
-/// `started_at` (contract §6) to `now`. `0.0` if the run never went through
-/// `SetupWorktreeNode` (e.g. a unit test driving `WrapUpNode` directly).
-fn wall_clock_secs(ctx: &TaskContext, now: chrono::DateTime<Utc>) -> f64 {
-    ctx.node_runs
-        .get("SetupWorktreeNode")
-        .and_then(|run| run.started_at)
-        .map(|started| (now - started).num_milliseconds().max(0) as f64 / 1000.0)
-        .unwrap_or(0.0)
+    crate::policy::resolved_policy::<SdlcPolicy>(ctx)
 }
 
 /// Sum of every task's attempts beyond its first — total retries triggered
@@ -149,54 +139,21 @@ fn total_retries(state: &SDLCState) -> u32 {
 }
 
 /// The verdict-bearing model-judgment stages this snapshot inspects, in
-/// declared run order.
+/// declared run order. Passed to the generic
+/// `crate::policy::telemetry::harvest` as `RunTelemetryInputs::verdict_stages`
+/// (EN.4.0).
 const VERDICT_STAGES: [&str; 2] = ["TriageTaskNode", "ConsolidatedReviewNode"];
 
-/// Collect `"<stage>:<verdict>"` entries for every verdict-bearing stage
-/// that has run by the time this snapshot is taken.
-fn review_verdicts(ctx: &TaskContext) -> Vec<String> {
-    VERDICT_STAGES
-        .iter()
-        .filter_map(|stage| {
-            get_result(ctx, stage)
-                .and_then(|value| value.get("verdict").and_then(|v| v.as_str()))
-                .map(|verdict| format!("{stage}:{verdict}"))
-        })
-        .collect()
-}
-
-/// Sum the input/output tokens last recorded in `ctx.node_runs` (contract
-/// §6 `Usage`) across every node that ran a model this run.
-fn total_tokens(ctx: &TaskContext) -> (u64, u64) {
-    ctx.node_runs
-        .values()
-        .fold((0u64, 0u64), |(inp, out), run| match &run.usage {
-            Some(usage) => (
-                inp + usage.input_tokens.unwrap_or(0),
-                out + usage.output_tokens.unwrap_or(0),
-            ),
-            None => (inp, out),
-        })
-}
-
 /// The model-node identities whose `ctx.nodes` output may carry a
-/// `"cost_usd"` field (`ClaudeCodeStep`'s output shape).
+/// `"cost_usd"` field (`ClaudeCodeStep`'s output shape). Passed to the
+/// generic `crate::policy::telemetry::harvest` as
+/// `RunTelemetryInputs::cost_bearing_stages` (EN.4.0).
 const COST_BEARING_STAGES: [&str; 4] = [
     "ImplementTaskNode",
     "TriageTaskNode",
     "ConsolidatedReviewNode",
     "GenerateTasksNode",
 ];
-
-/// Sum every model-bearing stage's last recorded `cost_usd`.
-fn total_cost_usd(ctx: &TaskContext) -> f64 {
-    COST_BEARING_STAGES
-        .iter()
-        .filter_map(|stage| {
-            get_result(ctx, stage).and_then(|value| value.get("cost_usd")?.as_f64())
-        })
-        .sum()
-}
 
 /// The resolved policy's per-stage tier, keyed by `ModelTiers` field name —
 /// "actually used" for this run (`registry_for_policy` wires the stage's
@@ -226,26 +183,28 @@ fn model_tier_used(policy: &SdlcPolicy) -> BTreeMap<String, String> {
 /// completed (or bailed) run (EN.3.C task 6): deterministic — reads only
 /// `ctx`'s already-accumulated `SDLCState`/`node_runs`/`nodes`, spends no
 /// model tokens, and stays a pure function of `ctx` + `now` so tests can
-/// pin the clock.
+/// pin the clock. Delegates the ctx-derived fields (wall-clock, tokens,
+/// cost, verdicts) to the generic `crate::policy::telemetry::harvest`
+/// (EN.4.0), supplying the SDLC-specific `total_attempts`/`total_retries`/
+/// `tasks_passed`/`tasks_failed` (state-derived) and `model_tier_used`
+/// (policy-derived) via `RunTelemetryInputs`.
 fn finalize_outcomes(
     ctx: &TaskContext,
     state: &SDLCState,
     policy: &SdlcPolicy,
     now: chrono::DateTime<Utc>,
 ) -> RunOutcomes {
-    let (total_input_tokens, total_output_tokens) = total_tokens(ctx);
-    RunOutcomes {
-        wall_clock_secs: wall_clock_secs(ctx, now),
+    let inputs = RunTelemetryInputs {
+        start_node_identity: "SetupWorktreeNode",
+        verdict_stages: &VERDICT_STAGES,
+        cost_bearing_stages: &COST_BEARING_STAGES,
         total_attempts: state.telemetry.total_attempts,
         total_retries: total_retries(state),
         tasks_passed: state.telemetry.tasks_passed,
         tasks_failed: state.telemetry.tasks_failed,
-        review_verdicts: review_verdicts(ctx),
-        total_input_tokens,
-        total_output_tokens,
-        total_cost_usd: total_cost_usd(ctx),
         model_tier_used: model_tier_used(policy),
-    }
+    };
+    crate::policy::harvest_telemetry(ctx, now, inputs).into()
 }
 
 /// Deterministic node: renders the wrap-up artifacts for a completed (or

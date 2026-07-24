@@ -6,24 +6,36 @@
 //! `state.json` itself, matching `/log-work` semantics and removing the
 //! downstream `/close-out` dependency (economics lever #1 prerequisite).
 //! Deterministic — no model call.
-
-use std::path::Path;
+//!
+//! **EN.4.0:** the node body now delegates to the generic
+//! `crate::policy::emit_state::EmitStateNode`, adapting `CommandOutput` to
+//! its `CommandOutputLike` trait. The public API here (`EmitStateNode::new`/
+//! `with_runner`, taking `sdlc_flow`'s `CommandRunner`) is unchanged so
+//! `graph.rs`'s `EmitStateNode::new()` call site keeps compiling — the
+//! generic node has no parameterless constructor of its own (it has no
+//! built-in subprocess runner to default to), so this wrapper is the seam
+//! that supplies one.
 
 use engine_contract::TaskContext;
-use serde_json::json;
 
 use crate::node::{Node, NodeError};
+use crate::policy::emit_state::{CommandOutputLike, EmitStateNode as GenericEmitStateNode};
 
-use super::{default_command_runner, get_result, put_result, CommandRunner};
+use super::{default_command_runner, CommandOutput, CommandRunner};
 
-/// Resolve the worktree path to run `mev` in: `SetupWorktreeNode`'s output
-/// if present, else `.` (e.g. a unit test driving this node in isolation).
-fn worktree_path(ctx: &TaskContext) -> String {
-    get_result(ctx, "SetupWorktreeNode")
-        .and_then(|value| value.get("worktree_path"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(".")
-        .to_string()
+#[cfg(test)]
+use serde_json::json;
+
+impl CommandOutputLike for CommandOutput {
+    fn status(&self) -> i32 {
+        self.status
+    }
+    fn stdout(&self) -> &str {
+        &self.stdout
+    }
+    fn stderr(&self) -> &str {
+        &self.stderr
+    }
 }
 
 /// Deterministic node: runs `mev emit-state --write` in the worktree.
@@ -56,48 +68,13 @@ impl Default for EmitStateNode {
 
 #[async_trait::async_trait]
 impl Node for EmitStateNode {
-    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        let cwd_string = worktree_path(&ctx);
-        let cwd = Path::new(&cwd_string);
-
-        let output = (self.runner)("mev", &["emit-state", "--write"], cwd)
-            .map_err(|err| NodeError::new(format!("mev emit-state failed to spawn: {err}")))?;
-
-        let emitted = output.status == 0;
-        let stdout_tail: String = output
-            .stdout
-            .lines()
-            .rev()
-            .take(5)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if !emitted {
-            put_result(
-                &mut ctx,
-                "EmitStateNode",
-                json!({
-                    "emitted": false,
-                    "stdout_tail": stdout_tail,
-                    "stderr": output.stderr,
-                }),
-            );
-            return Ok(ctx);
-        }
-
-        put_result(
-            &mut ctx,
-            "EmitStateNode",
-            json!({
-                "emitted": true,
-                "stdout_tail": stdout_tail,
-            }),
-        );
-
-        Ok(ctx)
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        // `CommandRunner` (`sdlc_flow`) and `crate::policy::emit_state::Runner<CommandOutput>`
+        // (the generic seam) are the same underlying `Arc<dyn Fn(...) -> io::Result<CommandOutput>>`
+        // type, so `self.runner` is directly usable here.
+        GenericEmitStateNode::new(self.runner.clone())
+            .process(ctx)
+            .await
     }
 
     fn name(&self) -> &str {

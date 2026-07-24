@@ -25,111 +25,45 @@ use crate::routing::Router;
 use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
-use super::{get_result, put_result};
+use super::{get_result, parse_structured_or_fenced, put_result};
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
 /// downstream node reads one resolved value rather than re-deriving it.
-pub const RESOLVED_POLICY_IDENTITY: &str = "ResolvedPolicy";
+/// Re-exported from the generic `crate::policy::profiles` plumbing (EN.4.0)
+/// so existing `setup::RESOLVED_POLICY_IDENTITY` import sites keep
+/// resolving unchanged.
+pub use crate::policy::RESOLVED_POLICY_IDENTITY;
+
+/// The `harness.json` section key this workflow's policy/profiles live
+/// under (`sdlc.policy` / `sdlc.profiles`), passed to the generic
+/// `crate::policy::profiles` plumbing.
+const WORKFLOW_KEY: &str = "sdlc";
 
 /// Read `planning/harness.json`'s `sdlc.policy` section (a [`PartialPolicy`])
-/// out of a worktree, if the file and section exist. Reuses the same
-/// `worktree/planning/harness.json` path `TestTaskNode` reads
-/// (`task_loop.rs`) rather than duplicating its check-running logic — this
-/// helper only cares about the `sdlc.policy` subsection.
+/// out of a worktree, if the file and section exist. Delegates to the
+/// generic `crate::policy::read_harness_policy_defaults` (EN.4.0),
+/// parameterized by [`WORKFLOW_KEY`].
 fn read_harness_policy_defaults(worktree: &Path) -> Result<Option<PartialPolicy>, NodeError> {
-    let harness_path = worktree.join("planning").join("harness.json");
-    if !harness_path.exists() {
-        return Ok(None);
-    }
-
-    let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
-        NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
-    })?;
-    let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
-        NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
-    })?;
-
-    let Some(policy_value) = harness.get("sdlc").and_then(|v| v.get("policy")) else {
-        return Ok(None);
-    };
-
-    let partial: PartialPolicy = serde_json::from_value(policy_value.clone()).map_err(|err| {
-        NodeError::new(format!(
-            "failed to parse {} sdlc.policy: {err}",
-            harness_path.display()
-        ))
-    })?;
-    Ok(Some(partial))
-}
-
-/// Read `planning/harness.json`'s `sdlc.profiles` section (a
-/// `map<String, PartialPolicy>`) out of a worktree, if the file and section
-/// exist. Mirrors [`read_harness_policy_defaults`] but for the named-profile
-/// map rather than the single defaults bundle.
-fn read_harness_profiles(
-    worktree: &Path,
-) -> Result<Option<std::collections::HashMap<String, PartialPolicy>>, NodeError> {
-    let harness_path = worktree.join("planning").join("harness.json");
-    if !harness_path.exists() {
-        return Ok(None);
-    }
-
-    let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
-        NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
-    })?;
-    let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
-        NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
-    })?;
-
-    let Some(profiles_value) = harness.get("sdlc").and_then(|v| v.get("profiles")) else {
-        return Ok(None);
-    };
-
-    // `sdlc.profiles` is documented with a sibling `_comment` string entry
-    // (see planning/harness.examples.md); strip any `_comment*`-keyed entry
-    // before deserializing so it isn't mistaken for a named `PartialPolicy`
-    // bundle.
-    let mut profiles_value = profiles_value.clone();
-    if let Some(map) = profiles_value.as_object_mut() {
-        map.retain(|key, _| !key.starts_with("_comment"));
-    }
-
-    let parsed: std::collections::HashMap<String, PartialPolicy> =
-        serde_json::from_value(profiles_value).map_err(|err| {
-            NodeError::new(format!(
-                "failed to parse {} sdlc.profiles: {err}",
-                harness_path.display()
-            ))
-        })?;
-    Ok(Some(parsed))
+    crate::policy::read_harness_policy_defaults(worktree, WORKFLOW_KEY)
 }
 
 /// Resolve `event.profile` (a named profile) to a [`PartialPolicy`] bundle,
 /// preferring a `harness.json` `sdlc.profiles[name]` entry over the built-in
 /// [`profiles::profile_by_name`]. Returns `Ok(None)` when the event carries
 /// no `profile` field, and `Err` when a `profile` name is given but resolves
-/// to neither source (no silent no-op).
+/// to neither source (no silent no-op). Delegates to the generic
+/// `crate::policy::resolve_profile` (EN.4.0), parameterized by
+/// [`WORKFLOW_KEY`] and `profiles::profile_by_name`.
 fn resolve_profile(
     profile_name: Option<&str>,
     worktree: &Path,
 ) -> Result<Option<PartialPolicy>, NodeError> {
-    let Some(name) = profile_name else {
-        return Ok(None);
-    };
-
-    if let Some(harness_profiles) = read_harness_profiles(worktree)? {
-        if let Some(partial) = harness_profiles.get(name) {
-            return Ok(Some(partial.clone()));
-        }
-    }
-
-    if let Some(partial) = profiles::profile_by_name(name) {
-        return Ok(Some(partial));
-    }
-
-    Err(NodeError::new(format!(
-        "unknown profile {name:?}: not found in harness.json sdlc.profiles or built-in profiles"
-    )))
+    crate::policy::resolve_profile(
+        profile_name,
+        worktree,
+        WORKFLOW_KEY,
+        profiles::profile_by_name,
+    )
 }
 
 /// Resolve the four-layer [`SdlcPolicy`] for this run: the inbound event's
@@ -215,36 +149,80 @@ impl Node for SetupWorktreeNode {
             .branch_name
             .clone()
             .unwrap_or_else(|| format!("sdlc/{}", event.spec_slug));
-        let worktree_path = format!("trees/{branch}");
+        let worktree_path = if event.use_worktree {
+            format!("trees/{branch}")
+        } else {
+            ".".to_string()
+        };
 
-        let reattaching = event.resume && Path::new(&worktree_path).exists();
-        if !reattaching {
-            let output = (self.runner)(
-                "git",
-                &[
-                    "worktree",
-                    "add",
-                    &worktree_path,
-                    "-b",
-                    &branch,
-                    "origin/main",
-                ],
-                Path::new("."),
-            )
-            .map_err(|err| NodeError::new(format!("failed to spawn git worktree add: {err}")))?;
-
-            if output.status != 0 {
-                // Best-effort cleanup; its own outcome doesn't change the
-                // failure we're about to report.
-                let _ = (self.runner)(
+        if event.use_worktree {
+            let reattaching = event.resume && Path::new(&worktree_path).exists();
+            if !reattaching {
+                let output = (self.runner)(
                     "git",
-                    &["worktree", "remove", "--force", &worktree_path],
+                    &[
+                        "worktree",
+                        "add",
+                        &worktree_path,
+                        "-b",
+                        &branch,
+                        "origin/main",
+                    ],
                     Path::new("."),
-                );
-                return Err(NodeError::new(format!(
-                    "git worktree add failed (status {}): {}",
-                    output.status, output.stderr
-                )));
+                )
+                .map_err(|err| {
+                    NodeError::new(format!("failed to spawn git worktree add: {err}"))
+                })?;
+
+                if output.status != 0 {
+                    // Best-effort cleanup; its own outcome doesn't change the
+                    // failure we're about to report.
+                    let _ = (self.runner)(
+                        "git",
+                        &["worktree", "remove", "--force", &worktree_path],
+                        Path::new("."),
+                    );
+                    return Err(NodeError::new(format!(
+                        "git worktree add failed (status {}): {}",
+                        output.status, output.stderr
+                    )));
+                }
+            }
+
+            // Ensure the planning symlink exists in the worktree
+            let worktree_planning = Path::new(&worktree_path).join("planning");
+            if !worktree_planning.exists() {
+                if let Ok(canonical_planning) = std::fs::canonicalize("planning") {
+                    #[cfg(unix)]
+                    let _ = std::os::unix::fs::symlink(canonical_planning, worktree_planning);
+                }
+            }
+        } else {
+            if !event.resume {
+                let output = (self.runner)(
+                    "git",
+                    &["checkout", "-B", &branch, "origin/main"],
+                    Path::new("."),
+                )
+                .map_err(|err| NodeError::new(format!("failed to spawn git checkout: {err}")))?;
+
+                if output.status != 0 {
+                    return Err(NodeError::new(format!(
+                        "git checkout failed (status {}): {}",
+                        output.status, output.stderr
+                    )));
+                }
+            } else {
+                let output = (self.runner)("git", &["checkout", &branch], Path::new(".")).map_err(
+                    |err| NodeError::new(format!("failed to spawn git checkout: {err}")),
+                )?;
+
+                if output.status != 0 {
+                    return Err(NodeError::new(format!(
+                        "git checkout failed (status {}): {}",
+                        output.status, output.stderr
+                    )));
+                }
             }
         }
 
@@ -255,10 +233,7 @@ impl Node for SetupWorktreeNode {
         );
 
         let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&worktree_path))?;
-        let policy_value = serde_json::to_value(&resolved_policy).map_err(|err| {
-            NodeError::new(format!("failed to serialize resolved SdlcPolicy: {err}"))
-        })?;
-        put_result(&mut ctx, RESOLVED_POLICY_IDENTITY, policy_value);
+        crate::policy::stamp_resolved_policy(&mut ctx, &resolved_policy)?;
 
         Ok(ctx)
     }
@@ -375,21 +350,6 @@ fn generated_tasks_schema() -> serde_json::Value {
         },
         "required": ["tasks", "tasks_markdown"],
     })
-}
-
-/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
-/// when present and non-null; otherwise fall back to
-/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
-fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
-    ctx: &TaskContext,
-    node_name: &str,
-    content: &str,
-) -> Result<T, serde_json::Error> {
-    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
-    match structured {
-        Some(value) if !value.is_null() => serde_json::from_value(value),
-        _ => serde_json::from_str(super::strip_json_fence(content)),
-    }
 }
 
 /// Gather every `*.md` file directly under `dir` except the ones the task
@@ -705,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn setup_writes_worktree_result_via_stub_runner() {
         let node = SetupWorktreeNode::new().with_runner(stub_runner(0));
-        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
 
         let out = node.process(ctx).await.expect("setup should succeed");
         let result = out.nodes.get("SetupWorktreeNode").expect("output present");
@@ -716,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn setup_surfaces_git_failure() {
         let node = SetupWorktreeNode::new().with_runner(stub_runner(1));
-        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("git worktree add failed"));
@@ -740,7 +700,7 @@ mod tests {
         });
 
         let node = SetupWorktreeNode::new().with_runner(runner);
-        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
         let _ = node.process(ctx).await;
 
         let recorded = calls.lock().unwrap();

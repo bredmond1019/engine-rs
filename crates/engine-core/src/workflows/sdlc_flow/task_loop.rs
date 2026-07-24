@@ -25,12 +25,16 @@ use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
-use super::policy::{ModelTier, OutputVerbosity, ReviewMode, SdlcPolicy};
+#[cfg(test)]
+use super::policy::{ModelTier, OutputVerbosity};
+use super::policy::{ReviewMode, SdlcPolicy};
 use super::schema::{SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
-use super::setup::RESOLVED_POLICY_IDENTITY;
 use super::{
-    get_result, put_result, strip_json_fence, CommandOutput, CommandRunner, ModelTransport,
+    get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
+    ModelTransport,
 };
+#[cfg(test)]
+use crate::policy::RESOLVED_POLICY_IDENTITY;
 
 /// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
 /// anchor when `policy.prompt_cache` is true (lever #2b). `claude-code-rs`'s
@@ -56,51 +60,19 @@ enum Stage {
 /// (`setup::RESOLVED_POLICY_IDENTITY`). Falls back to the built-in default
 /// (today's hardcoded behavior) when absent or unparsable — defensive, so a
 /// ctx driven directly in a unit test (no `SetupWorktreeNode` run) still
-/// gets sane behavior rather than an error.
+/// gets sane behavior rather than an error. Delegates to the generic
+/// `crate::policy::resolved_policy::<SdlcPolicy>` (EN.4.0).
 fn resolved_policy(ctx: &TaskContext) -> SdlcPolicy {
-    get_result(ctx, RESOLVED_POLICY_IDENTITY)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
-        .unwrap_or_default()
-}
-
-/// Map a stage's resolved [`ModelTier`] to a concrete `claude` CLI model
-/// string. `Local` resolves to the policy's configured local model name for
-/// display/bookkeeping purposes only — routing a `local`-tier stage through
-/// `openai_compat_transport` instead of the real `claude` CLI is EN.3.C
-/// task 5's `with_transport` injection in `graph.rs`; this function only
-/// picks the tier, never the transport.
-fn model_tier_to_model_string(tier: ModelTier, policy: &SdlcPolicy) -> String {
-    match tier {
-        ModelTier::Sonnet => "claude-sonnet-4-5".to_string(),
-        ModelTier::Haiku => "claude-haiku-4-5".to_string(),
-        ModelTier::Opus => "claude-opus-4-8".to_string(),
-        ModelTier::Local => policy.local.model.clone(),
-    }
-}
-
-/// Prompt directive injected when `output_verbosity` deviates from the
-/// baseline `Normal` (lever #2a). `Normal` intentionally injects nothing so
-/// the built-in-default prompt text is byte-identical to pre-EN.3.C.
-fn output_verbosity_directive(verbosity: OutputVerbosity) -> Option<&'static str> {
-    match verbosity {
-        OutputVerbosity::Normal => None,
-        OutputVerbosity::Terse => Some(
-            "\n\nBe terse: keep your response as short as possible while still \
-             satisfying the request. Target well under 200 output tokens where \
-             the task allows it.",
-        ),
-        OutputVerbosity::Verbose => Some(
-            "\n\nBe thorough: explain your reasoning and any trade-offs in \
-             detail before giving the final answer.",
-        ),
-    }
+    crate::policy::resolved_policy::<SdlcPolicy>(ctx)
 }
 
 /// Apply the resolved policy's model-tier + prompt-cache knobs to a stage's
 /// `Config`, then append the `output_verbosity` directive to `prompt`.
-/// Returns `(config, prompt)`.
+/// Returns `(config, prompt)`. Delegates to the generic
+/// `crate::policy::shaping::{apply_model_tier, apply_prompt_cache,
+/// apply_verbosity_directive}` (EN.4.0).
 fn apply_policy(
-    mut config: Config,
+    config: Config,
     prompt: String,
     policy: &SdlcPolicy,
     stage: Stage,
@@ -110,16 +82,10 @@ fn apply_policy(
         Stage::Triage => policy.model_tiers.triage,
         Stage::Review => policy.model_tiers.review,
     };
-    config.model = Some(model_tier_to_model_string(tier, policy));
-
-    if policy.prompt_cache {
-        config.system_prompt = Some(STABLE_SYSTEM_PROMPT.to_string());
-    }
-
-    let prompt = match output_verbosity_directive(policy.output_verbosity) {
-        Some(directive) => format!("{prompt}{directive}"),
-        None => prompt,
-    };
+    let config = crate::policy::apply_model_tier(config, tier, &policy.local.model);
+    let config =
+        crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
+    let prompt = crate::policy::apply_verbosity_directive(prompt, policy.output_verbosity);
 
     (config, prompt)
 }
@@ -333,21 +299,6 @@ fn implement_output_schema() -> serde_json::Value {
         },
         "required": ["summary"],
     })
-}
-
-/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
-/// when present and non-null; otherwise fall back to
-/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
-fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
-    ctx: &TaskContext,
-    node_name: &str,
-    content: &str,
-) -> Result<T, serde_json::Error> {
-    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
-    match structured {
-        Some(value) if !value.is_null() => serde_json::from_value(value),
-        _ => serde_json::from_str(strip_json_fence(content)),
-    }
 }
 
 impl ImplementTaskNode {

@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 
-use super::{get_result, ModelTransport};
+use super::{parse_structured_or_fenced, ModelTransport};
 
 /// Model output shape `PatchDocsNode` expects (strict JSON reply).
 #[derive(Debug, Deserialize)]
@@ -40,21 +40,6 @@ fn patch_docs_output_schema() -> serde_json::Value {
         },
         "required": ["summary"],
     })
-}
-
-/// Prefer the pre-parsed `structured` value written by [`ClaudeCodeStep`]
-/// when present and non-null; otherwise fall back to
-/// `strip_json_fence` + `serde_json::from_str` on the raw text `content`.
-fn parse_structured_or_fenced<T: serde::de::DeserializeOwned>(
-    ctx: &TaskContext,
-    node_name: &str,
-    content: &str,
-) -> Result<T, serde_json::Error> {
-    let structured = get_result(ctx, node_name).and_then(|value| value.get("structured").cloned());
-    match structured {
-        Some(value) if !value.is_null() => serde_json::from_value(value),
-        _ => serde_json::from_str(super::strip_json_fence(content)),
-    }
 }
 
 /// Model node (Sonnet): patches documentation referencing the task's

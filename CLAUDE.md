@@ -1,6 +1,41 @@
 # CLAUDE.md — engine-rs
 
-Bastion's native Rust execution engine — a graph-validated workflow runtime that embeds in `bastion serve`, holds live run state in-memory, and writes the orchestrator data contract to Postgres as a durable record.
+Bastion's native Rust execution engine — a graph-validated workflow runtime that embeds in `bastion serve`, holds live run state in-memory, and writes the data contract to Postgres as a durable record.
+
+**This repo is the orchestrator.** Per brain **D50/D51** the Python repo (renamed **Synapse**, D52)
+divested every execution workflow: all business workflows, artifact generation, eval, and the SDLC
+harness are engine-rs's. Synapse keeps knowledge only — corpus, embeddings, structural graph, memory,
+retrieval.
+
+## THE BOUNDARY TEST — read this before scoping any new work
+
+Brain (Synapse) or Engine (engine-rs)? Ask in order. Governed by brain **D51**; this block is
+byte-identical in `core/orchestrator/CLAUDE.md`.
+
+```
+THE BOUNDARY TEST — Brain (Synapse) or Engine (engine-rs)?  Ask in order.
+
+1. Does it need IN-PROCESS access to embeddings, pgvector, brain_edges,
+   or the memory tables?                                    YES -> Synapse
+2. Does it produce a client- or repo-facing artifact
+   (brief, proposal, PDF, PR, code)?                        YES -> engine-rs
+3. Is it maintaining the corpus itself (freshness, validation,
+   distillation, retrieval quality, scheduled chores)?      YES -> Synapse
+
+TIEBREAKER — if 1 and 2 are both YES, the work is a hybrid.
+   SPLIT it at the ingest seam. Never let one repo own both halves.
+       engine-rs workflow  --POST /ingest/*-->  Synapse
+   engine-rs acquires and reasons; Synapse owns everything behind the endpoint
+   (embedding, storage, retrieval, memory, decay).
+```
+
+**The practical consequence for this repo: no embedding, no pgvector, no corpus writes — ever.** A
+workflow that produces something the Brain should remember uses a `PersistToBrainNode` over the
+injectable `HttpPost` seam (`EN.4.C`) and POSTs to Synapse's ingest endpoint (Synapse block `OR.Q`).
+If you find yourself reaching for an embedding model here, you are on the wrong side of the boundary.
+
+**Cadence:** engine-rs and `bastion` schedule business runs; Synapse schedules only its own corpus
+housekeeping. There is no global scheduler.
 
 ## Before you start
 

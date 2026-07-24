@@ -142,7 +142,10 @@ impl Workflow {
     /// halt the walk stops, the reason is stamped into `ctx.metadata`, a
     /// final `on_progress` snapshot is emitted, and this returns `Ok(ctx)` —
     /// nodes not yet reached stay `Pending`. After each node completes
-    /// successfully, its `NodeRun.usage` is folded into the budget ledger.
+    /// successfully, its `NodeRun.usage` is folded into the budget ledger
+    /// alongside any `"cost_usd"` the node wrote to its own `ctx.nodes`
+    /// output (EN.4.0 task 6), so `Budget::max_cost_usd` gates a run the
+    /// same way `Budget::max_total_tokens` already does.
     pub async fn run_with(
         &self,
         event: serde_json::Value,
@@ -211,7 +214,8 @@ impl Workflow {
             }
 
             if let Some(run) = ctx.node_runs.get(&identity) {
-                ledger.record(run.usage.as_ref(), None);
+                let cost_usd = node_cost_usd(&ctx, &identity);
+                ledger.record(run.usage.as_ref(), cost_usd);
             }
 
             current = match router_next {
@@ -222,6 +226,17 @@ impl Workflow {
 
         Ok(ctx)
     }
+}
+
+/// Reads a completed node's dollar cost out of its own `ctx.nodes[identity]`
+/// output, the same `"cost_usd"` field shape `ClaudeCodeStep` writes (and
+/// `policy::telemetry::total_cost_usd` reads for SDLC's cost-bearing
+/// stages). `None` when the node's output has no such field (non-LLM nodes,
+/// or an LLM node whose SDK call reported no cost) — folded into the
+/// [`BudgetLedger`] alongside token usage so `Budget::max_cost_usd` gates a
+/// run the same way `Budget::max_total_tokens` already does.
+fn node_cost_usd(ctx: &TaskContext, identity: &str) -> Option<f64> {
+    ctx.nodes.get(identity)?.get("cost_usd")?.as_f64()
 }
 
 /// The framework-owned envelope around a single node's `process` call: stamps
