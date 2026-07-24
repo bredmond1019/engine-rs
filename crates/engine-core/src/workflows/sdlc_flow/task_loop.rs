@@ -805,17 +805,32 @@ impl TestTaskNode {
             .collect()
     }
 
-    /// Write-verification guard: reads `ImplementTaskNode`'s claimed
-    /// `modified_files` from ctx and checks each against
-    /// [`Self::changed_files`]'s report of what actually changed in the
-    /// worktree. An empty claim never trips the guard (a genuinely no-op
-    /// task is legitimate). A non-empty claim where at least one claimed
-    /// path shows up as changed also passes — this is a coarse "did the
-    /// model touch the filesystem at all" check, not a per-file audit.
-    /// Only when the claim is non-empty AND none of the claimed paths
-    /// appear in the worktree's change set does this synthesize a failed
-    /// [`CheckResult`] so the mismatch flows through the existing
-    /// triage/retry machinery exactly like a harness-check failure.
+    /// Write-verification guard: checks [`Self::changed_files`]'s report of
+    /// what actually changed in the worktree against `ImplementTaskNode`'s
+    /// claimed `modified_files` from ctx.
+    ///
+    /// The pass condition is deliberately "the worktree shows ANY change at
+    /// all", not "the specific claimed paths changed": a real (non-stubbed)
+    /// `claude` call was observed live to leave `modified_files` empty even
+    /// on a genuinely successful write (the model's own JSON self-report is
+    /// not a reliable enumeration of what it touched — see
+    /// `sdlc_flow_live.rs`'s `live_full_workflow_real_implement_and_review`).
+    /// Gating on exact claim-vs-disk matching would false-fail a real,
+    /// useful write whose self-reported paths are incomplete or off by a
+    /// prefix/suffix quirk; gating on "did anything change" is robust to
+    /// that unreliability while still catching the guard's actual target —
+    /// the original bug this exists for (`planning/decisions/
+    /// D8-autonomous-node-write-permission.md`): a claimed, narrated write
+    /// that never touched disk at all.
+    ///
+    /// Only trips (a failed [`CheckResult`], routed through the normal
+    /// triage/retry machinery exactly like a harness-check failure) when
+    /// the worktree shows ZERO changes AND the claim was non-empty — the
+    /// model asserted specific writes but nothing happened anywhere. A
+    /// claim-empty-and-nothing-changed pair passes: a genuinely no-op task
+    /// (e.g. investigation-only) is legitimate and indistinguishable from
+    /// this state without a task-level "expected to write" signal this
+    /// node doesn't have.
     fn verify_claimed_writes(&self, ctx: &TaskContext, worktree: &Path) -> Option<CheckResult> {
         let modified_files: Vec<String> = get_result(ctx, "ImplementTaskNode")
             .and_then(|value| value.get("modified_files"))
@@ -828,20 +843,19 @@ impl TestTaskNode {
             })
             .unwrap_or_default();
 
+        // Short-circuit BEFORE invoking `changed_files` (which calls the
+        // injected runner): an empty claim never trips the guard, so there
+        // is no need to spend a `git status` call on it. This also keeps
+        // this guard's runner-call count at zero for empty claims, matching
+        // callers (tests and otherwise) that assume `TestTaskNode`'s runner
+        // is only invoked for actual harness-check commands when
+        // `ImplementTaskNode` made no write claim.
         if modified_files.is_empty() {
             return None;
         }
 
         let changed = self.changed_files(worktree);
-        let any_claim_matches = modified_files.iter().any(|claimed| {
-            changed.iter().any(|actual| {
-                actual == claimed
-                    || actual.ends_with(claimed.as_str())
-                    || claimed.ends_with(actual.as_str())
-            })
-        });
-
-        if any_claim_matches {
+        if !changed.is_empty() {
             return None;
         }
 
@@ -851,9 +865,8 @@ impl TestTaskNode {
             passed: false,
             output: changed.join("\n"),
             message: format!(
-                "ImplementTaskNode claimed modified_files {modified_files:?} but none of \
-                 those paths show as changed in the worktree (git status --porcelain: \
-                 {changed:?})"
+                "ImplementTaskNode claimed modified_files {modified_files:?} but the worktree \
+                 shows no changes at all (git status --porcelain: {changed:?})"
             ),
         })
     }
