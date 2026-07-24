@@ -442,12 +442,12 @@ struct CheckResult {
 /// validation suite via the injectable [`CommandRunner`] seam so tests can
 /// drive fail-then-pass across attempts without a real subprocess.
 ///
-/// Only the `command` check kind (the default) is fully ported; the richer
-/// kinds (`forbidden-pattern-scan`, `baseline-diff`, `count-delta`,
-/// `warning-scan`) are left as a documented reduced-scope TODO for EN.3.B+
-/// (see this spec's Amendment Log) — an unsupported kind fails closed with a
-/// message noting the gap, so a harness.json using them doesn't silently
-/// pass.
+/// Every check `kind` from the Python port
+/// (`orchestrator/app/workflows/sdlc_flow_workflow_nodes/test_task_node.py`)
+/// is supported: `command` (the default), `forbidden-pattern-scan`,
+/// `baseline-diff`, `count-delta`, `warning-scan`. Any *other* kind still
+/// fails closed via [`Self::run_unsupported_kind`], so a harness.json typo
+/// or a genuinely new kind never silently passes.
 pub struct TestTaskNode {
     runner: CommandRunner,
 }
@@ -511,6 +511,221 @@ impl TestTaskNode {
         }
     }
 
+    /// Runs `command` (`sh -c <command>`) via the injectable runner,
+    /// returning stdout+stderr — the shared shell-out primitive every check
+    /// kind below builds on.
+    fn shell_out(&self, command: &str, worktree: &Path) -> CommandOutput {
+        (self.runner)("sh", &["-c", command], worktree).unwrap_or(CommandOutput {
+            status: -1,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    /// `forbidden-pattern-scan`: grep for each rule's pattern under its
+    /// paths, drop matches covered by that rule's `allowlistPattern`, fail
+    /// on any match left.
+    fn run_forbidden_pattern_scan(
+        &self,
+        check: &serde_json::Value,
+        worktree: &Path,
+    ) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+
+        let mut violations: Vec<String> = Vec::new();
+        let mut output_parts: Vec<String> = Vec::new();
+        for rule in check
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let pattern = rule.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let paths = rule.get("paths").and_then(|v| v.as_str()).unwrap_or("");
+            let grep_command = format!("grep -rnE '{pattern}' {paths}");
+            let stdout = self.shell_out(&grep_command, worktree).stdout;
+
+            let mut matches: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+            if let Some(allowlist) = rule.get("allowlistPattern").and_then(|v| v.as_str()) {
+                if let Ok(re) = regex::Regex::new(allowlist) {
+                    matches.retain(|line| !re.is_match(line));
+                }
+            }
+            violations.extend(matches.into_iter().map(str::to_string));
+            output_parts.push(stdout);
+        }
+
+        let passed = violations.is_empty();
+        let message = if passed {
+            String::new()
+        } else {
+            format!("{} forbidden-pattern match(es)", violations.len())
+        };
+        CheckResult {
+            name,
+            kind: "forbidden-pattern-scan".to_string(),
+            passed,
+            output: output_parts.join("\n"),
+            message,
+        }
+    }
+
+    /// `baseline-diff`: run `baselineCommand` and `command`, both expected
+    /// to emit a JSON array; fail on any `command` entry whose `compareKeys`
+    /// projection isn't present in the baseline's.
+    fn run_baseline_diff(&self, check: &serde_json::Value, worktree: &Path) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        let compare_keys: Vec<String> = check
+            .get("compareKeys")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+
+        let baseline_command = check
+            .get("baselineCommand")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let command = check.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let baseline_stdout = self.shell_out(baseline_command, worktree).stdout;
+        let current_stdout = self.shell_out(command, worktree).stdout;
+
+        let baseline_entries: Vec<serde_json::Value> =
+            serde_json::from_str(&baseline_stdout).unwrap_or_default();
+        let current_entries: Vec<serde_json::Value> =
+            serde_json::from_str(&current_stdout).unwrap_or_default();
+
+        let key = |entry: &serde_json::Value| -> Vec<Option<String>> {
+            compare_keys
+                .iter()
+                .map(|k| entry.get(k).map(|v| v.to_string()))
+                .collect()
+        };
+        let baseline_keys: std::collections::HashSet<Vec<Option<String>>> =
+            baseline_entries.iter().map(key).collect();
+        let new_entries: usize = current_entries
+            .iter()
+            .filter(|entry| !baseline_keys.contains(&key(entry)))
+            .count();
+
+        let passed = new_entries == 0;
+        let message = if passed {
+            String::new()
+        } else {
+            format!("{new_entries} net-new violation(s)")
+        };
+        CheckResult {
+            name,
+            kind: "baseline-diff".to_string(),
+            passed,
+            output: current_stdout,
+            message,
+        }
+    }
+
+    /// `count-delta`: extract a count from `command`'s stdout via
+    /// `countPattern`, comparing it to `baseline` in the `failOn` direction
+    /// (`"decrease"` fails when the count dropped; anything else fails when
+    /// it rose).
+    fn run_count_delta(&self, check: &serde_json::Value, worktree: &Path) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        let baseline_count = check.get("baseline").and_then(|v| v.as_i64()).unwrap_or(0);
+        let command = check.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let count_pattern = check
+            .get("countPattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let stdout = self.shell_out(command, worktree).stdout;
+        let current_count = regex::Regex::new(count_pattern)
+            .ok()
+            .and_then(|re| re.find(&stdout))
+            .and_then(|m| m.as_str().split_whitespace().next())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let fail_on = check
+            .get("failOn")
+            .and_then(|v| v.as_str())
+            .unwrap_or("decrease");
+        let passed = if fail_on == "decrease" {
+            current_count >= baseline_count
+        } else {
+            current_count <= baseline_count
+        };
+        let message = if passed {
+            String::new()
+        } else {
+            format!("count {current_count} vs baseline {baseline_count} ({fail_on})")
+        };
+        CheckResult {
+            name,
+            kind: "count-delta".to_string(),
+            passed,
+            output: stdout,
+            message,
+        }
+    }
+
+    /// `warning-scan`: run `command`, scan combined stdout+stderr for every
+    /// `warningPatterns` entry. Only fails the check itself when `gates` is
+    /// true (default `false` for this kind — matches the Python port).
+    fn run_warning_scan(&self, check: &serde_json::Value, worktree: &Path) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        let command = check.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let outcome = self.shell_out(command, worktree);
+        let combined = format!("{}{}", outcome.stdout, outcome.stderr);
+
+        let found: Vec<String> = check
+            .get("warningPatterns")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .filter(|pattern| {
+                regex::Regex::new(pattern)
+                    .map(|re| re.is_match(&combined))
+                    .unwrap_or(false)
+            })
+            .map(str::to_string)
+            .collect();
+
+        let gates = check
+            .get("gates")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let passed = !gates || found.is_empty();
+        let message = if found.is_empty() {
+            String::new()
+        } else {
+            format!("warning pattern(s) matched: {found:?}")
+        };
+        CheckResult {
+            name,
+            kind: "warning-scan".to_string(),
+            passed,
+            output: combined,
+            message,
+        }
+    }
+
     fn run_unsupported_kind(&self, check: &serde_json::Value, kind: &str) -> CheckResult {
         let name = check
             .get("name")
@@ -547,10 +762,13 @@ impl TestTaskNode {
                 .and_then(|v| v.as_str())
                 .unwrap_or("command")
                 .to_string();
-            let result = if kind == "command" {
-                self.run_command_check(check, worktree)
-            } else {
-                self.run_unsupported_kind(check, &kind)
+            let result = match kind.as_str() {
+                "command" => self.run_command_check(check, worktree),
+                "forbidden-pattern-scan" => self.run_forbidden_pattern_scan(check, worktree),
+                "baseline-diff" => self.run_baseline_diff(check, worktree),
+                "count-delta" => self.run_count_delta(check, worktree),
+                "warning-scan" => self.run_warning_scan(check, worktree),
+                _ => self.run_unsupported_kind(check, &kind),
             };
 
             let gates = check.get("gates").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -1884,6 +2102,229 @@ mod tests {
         let node = TestTaskNode::new().with_runner(runner);
         let out = node.process(ctx).await.unwrap();
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    fn ctx_for_worktree(worktree: &Path) -> TaskContext {
+        let mut ctx = empty_context(json!({}));
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn forbidden_pattern_scan_fails_on_unallowlisted_match() {
+        let worktree = temp_worktree();
+        std::fs::create_dir_all(worktree.join("app")).unwrap();
+        std::fs::write(worktree.join("app").join("bad.py"), "open(\"x\")\n").unwrap();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "forbidden-pattern-scan",
+                "name": "open-without-encoding",
+                "gates": true,
+                "rules": [{ "id": "r1", "pattern": "open\\(", "paths": "--include='*.py' app/" }],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "forbidden-pattern-scan");
+        assert_eq!(results[0]["passed"], false);
+    }
+
+    #[tokio::test]
+    async fn forbidden_pattern_scan_passes_when_match_is_allowlisted() {
+        let worktree = temp_worktree();
+        std::fs::create_dir_all(worktree.join("app")).unwrap();
+        std::fs::write(
+            worktree.join("app").join("ok.py"),
+            "open(\"x\", encoding=\"utf-8\")\n",
+        )
+        .unwrap();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "forbidden-pattern-scan",
+                "name": "open-without-encoding",
+                "gates": true,
+                "rules": [{
+                    "id": "r1",
+                    "pattern": "open\\(",
+                    "paths": "--include='*.py' app/",
+                    "allowlistPattern": "encoding=",
+                }],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn baseline_diff_fails_on_net_new_entry() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "baseline-diff",
+                "name": "net-new-lint",
+                "gates": true,
+                "compareKeys": ["file", "code"],
+                "baselineCommand": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+                "command": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"},{\"file\":\"b.py\",\"code\":\"E2\"}]'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["message"], "1 net-new violation(s)");
+    }
+
+    #[tokio::test]
+    async fn baseline_diff_passes_when_no_net_new_entries() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "baseline-diff",
+                "name": "net-new-lint",
+                "gates": true,
+                "compareKeys": ["file", "code"],
+                "baselineCommand": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+                "command": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn count_delta_fails_when_count_decreases() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "count-delta",
+                "name": "pytest-count",
+                "gates": true,
+                "baseline": 100,
+                "countPattern": "\\d+ passed",
+                "failOn": "decrease",
+                "command": "echo '90 passed'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["message"], "count 90 vs baseline 100 (decrease)");
+    }
+
+    #[tokio::test]
+    async fn count_delta_passes_when_count_holds_or_grows() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "count-delta",
+                "name": "pytest-count",
+                "gates": true,
+                "baseline": 100,
+                "countPattern": "\\d+ passed",
+                "failOn": "decrease",
+                "command": "echo '101 passed'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn warning_scan_does_not_gate_by_default() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "warning-scan",
+                "name": "app-import",
+                "gates": false,
+                "command": "echo 'UserWarning: field shadows an attribute'",
+                "warningPatterns": ["UserWarning"],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["passed"], true);
+        assert!(results[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("warning pattern(s) matched"));
+    }
+
+    #[tokio::test]
+    async fn warning_scan_gates_when_check_opts_in() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "warning-scan",
+                "name": "app-import",
+                "gates": true,
+                "command": "echo 'UserWarning: field shadows an attribute'",
+                "warningPatterns": ["UserWarning"],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
     }
 
     // --- ConsolidatedReviewNode ------------------------------------------
