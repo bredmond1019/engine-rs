@@ -766,6 +766,98 @@ impl TestTaskNode {
         }
     }
 
+    /// List every path `git status --porcelain` reports as changed
+    /// (modified, added, deleted, renamed, or untracked) in `worktree`, via
+    /// the injectable [`CommandRunner`] seam. Each porcelain line is either
+    /// `XY path` or, for a rename, `XY orig -> new` — this returns the
+    /// right-hand path in the rename case (the file's current location) and
+    /// the single path otherwise. Returns an empty list (never errors) when
+    /// the runner invocation itself fails, so a spawn failure here degrades
+    /// to "nothing looks changed" rather than aborting the node.
+    fn changed_files(&self, worktree: &Path) -> Vec<String> {
+        let output =
+            (self.runner)("git", &["status", "--porcelain"], worktree).unwrap_or(CommandOutput {
+                status: -1,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                if line.len() <= 3 {
+                    return None;
+                }
+                let rest = line[3..].trim();
+                if rest.is_empty() {
+                    return None;
+                }
+                // Rename/copy lines look like `orig -> new`; keep the
+                // destination path.
+                let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(path.trim_matches('"').to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// Write-verification guard: reads `ImplementTaskNode`'s claimed
+    /// `modified_files` from ctx and checks each against
+    /// [`Self::changed_files`]'s report of what actually changed in the
+    /// worktree. An empty claim never trips the guard (a genuinely no-op
+    /// task is legitimate). A non-empty claim where at least one claimed
+    /// path shows up as changed also passes — this is a coarse "did the
+    /// model touch the filesystem at all" check, not a per-file audit.
+    /// Only when the claim is non-empty AND none of the claimed paths
+    /// appear in the worktree's change set does this synthesize a failed
+    /// [`CheckResult`] so the mismatch flows through the existing
+    /// triage/retry machinery exactly like a harness-check failure.
+    fn verify_claimed_writes(&self, ctx: &TaskContext, worktree: &Path) -> Option<CheckResult> {
+        let modified_files: Vec<String> = get_result(ctx, "ImplementTaskNode")
+            .and_then(|value| value.get("modified_files"))
+            .and_then(|value| value.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if modified_files.is_empty() {
+            return None;
+        }
+
+        let changed = self.changed_files(worktree);
+        let any_claim_matches = modified_files.iter().any(|claimed| {
+            changed.iter().any(|actual| {
+                actual == claimed
+                    || actual.ends_with(claimed.as_str())
+                    || claimed.ends_with(actual.as_str())
+            })
+        });
+
+        if any_claim_matches {
+            return None;
+        }
+
+        Some(CheckResult {
+            name: "write-verification".to_string(),
+            kind: "write-verification".to_string(),
+            passed: false,
+            output: changed.join("\n"),
+            message: format!(
+                "ImplementTaskNode claimed modified_files {modified_files:?} but none of \
+                 those paths show as changed in the worktree (git status --porcelain: \
+                 {changed:?})"
+            ),
+        })
+    }
+
     fn run_checks(
         &self,
         checks: &[serde_json::Value],
@@ -815,31 +907,37 @@ impl Node for TestTaskNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let worktree = worktree_path(&ctx)?;
         let worktree = Path::new(&worktree);
-        let harness_path = worktree.join("planning").join("harness.json");
 
-        if !harness_path.exists() {
-            put_result(
-                &mut ctx,
-                "TestTaskNode",
-                json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
-            );
-            return Ok(ctx);
+        // Write-verification guard runs before the harness suite so a
+        // claimed-but-empty implement never gets a free pass through checks
+        // that happen to already be green (e.g. no `harness.json`).
+        let write_verification = self.verify_claimed_writes(&ctx, worktree);
+
+        let harness_path = worktree.join("planning").join("harness.json");
+        let (mut check_results, mut failed_names) = if harness_path.exists() {
+            let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
+                NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
+            })?;
+            let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+                NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
+            })?;
+            let checks: Vec<serde_json::Value> = harness
+                .get("validation")
+                .and_then(|v| v.get("checks"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            self.run_checks(&checks, worktree)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        if let Some(guard_result) = write_verification {
+            failed_names.insert(0, guard_result.name.clone());
+            check_results.insert(0, guard_result);
         }
 
-        let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
-            NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
-        })?;
-        let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
-            NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
-        })?;
-        let checks: Vec<serde_json::Value> = harness
-            .get("validation")
-            .and_then(|v| v.get("checks"))
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let (check_results, failed_names) = self.run_checks(&checks, worktree);
         let all_passed = failed_names.is_empty();
         let failure_summary = if all_passed {
             String::new()
@@ -2135,6 +2233,148 @@ mod tests {
             json!({ "worktree_path": worktree.to_string_lossy() }),
         );
         ctx
+    }
+
+    fn ctx_with_implement_claim(worktree: &Path, modified_files: &[&str]) -> TaskContext {
+        let mut ctx = ctx_for_worktree(worktree);
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": modified_files,
+                "tests_added": [],
+            }),
+        );
+        ctx
+    }
+
+    fn porcelain_runner(status_lines: &'static str) -> CommandRunner {
+        Arc::new(move |program, args, _cwd| {
+            if program == "git" && args.first() == Some(&"status") {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: status_lines.to_string(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        })
+    }
+
+    /// A non-empty `modified_files` claim with none of the claimed paths
+    /// showing up in `git status --porcelain` fails the write-verification
+    /// guard, even when no `harness.json` exists, and the failure routes
+    /// through the normal `all_passed`/`check_results` shape (i.e. through
+    /// the same triage/retry path a harness failure would).
+    #[tokio::test]
+    async fn write_verification_fails_when_no_claimed_file_changed() {
+        let worktree = temp_worktree();
+        let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert_eq!(results[0]["passed"], false);
+        assert!(out.nodes["TestTaskNode"]["failure_summary"]
+            .as_str()
+            .unwrap()
+            .contains("write-verification"));
+    }
+
+    /// A claimed file that DOES show up in `git status --porcelain` passes
+    /// the guard, and (with no `harness.json`) the task overall passes.
+    #[tokio::test]
+    async fn write_verification_passes_when_claimed_file_changed() {
+        let worktree = temp_worktree();
+        let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" M src/lib.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// An empty `modified_files` claim (a genuinely no-op task) never trips
+    /// the guard, even when the worktree is completely clean.
+    #[tokio::test]
+    async fn write_verification_does_not_trip_on_empty_claim() {
+        let worktree = temp_worktree();
+        let ctx = ctx_with_implement_claim(&worktree, &[]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// No `ImplementTaskNode` output at all (e.g. a ctx driven directly in a
+    /// unit test) behaves like an empty claim — the guard never trips.
+    #[tokio::test]
+    async fn write_verification_does_not_trip_when_implement_never_ran() {
+        let worktree = temp_worktree();
+        let ctx = ctx_for_worktree(&worktree);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// A guard failure and a harness-check failure both surface in
+    /// `check_results`/`failure_summary` together when both are present.
+    #[tokio::test]
+    async fn write_verification_and_harness_failures_both_reported() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{ "name": "always_fail", "command": "exit 1", "gates": true }]),
+        );
+        let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
+
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            if program == "git" && args.first() == Some(&"status") {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        });
+
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert_eq!(results[1]["name"], "always_fail");
     }
 
     #[tokio::test]
