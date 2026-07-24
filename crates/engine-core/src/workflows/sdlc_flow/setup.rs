@@ -236,7 +236,9 @@ impl Node for SetupWorktreeNode {
                     ],
                     Path::new("."),
                 )
-                .map_err(|err| NodeError::new(format!("failed to spawn git worktree add: {err}")))?;
+                .map_err(|err| {
+                    NodeError::new(format!("failed to spawn git worktree add: {err}"))
+                })?;
 
                 if output.status != 0 {
                     // Best-effort cleanup; its own outcome doesn't change the
@@ -277,12 +279,9 @@ impl Node for SetupWorktreeNode {
                     )));
                 }
             } else {
-                let output = (self.runner)(
-                    "git",
-                    &["checkout", &branch],
-                    Path::new("."),
-                )
-                .map_err(|err| NodeError::new(format!("failed to spawn git checkout: {err}")))?;
+                let output = (self.runner)("git", &["checkout", &branch], Path::new(".")).map_err(
+                    |err| NodeError::new(format!("failed to spawn git checkout: {err}")),
+                )?;
 
                 if output.status != 0 {
                     return Err(NodeError::new(format!(
