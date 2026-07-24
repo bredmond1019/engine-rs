@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-20T13:14:48Z"
+timestamp: "2026-07-24T19:30:32Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,15 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [2026-07-24]
+
+### TestTaskNode harness check-kind parity + live-tested critical write-permission gap in ImplementTaskNode/ConsolidatedReviewNode
+- **What:** Ported the four missing harness check kinds (`forbidden-pattern-scan`, `baseline-diff`, `count-delta`, `warning-scan`) into `TestTaskNode` from the Python reference, with 10 new unit tests — fixes the gate that made real per-project harnesses (e.g. orchestrator's) unpassable through `/sdlc-flow` regardless of code correctness. Also root-caused a deeper, more serious gap while live-testing against orchestrator's `or-y-event-read-api` spec through `bastion serve`: `ImplementTaskNode`/`ConsolidatedReviewNode` build their `claude-code-rs` `Config` from `Config::default()` (`dangerously_skip_permissions: false`, no `allowed_tools` grant), and `graph.rs` registers them plain with no `.with_config()` override — the exact wiring `bastion serve`'s engine mount uses. Confirmed live: two full `SDLC_FLOW` triggers both reported `ImplementTaskNode` success with a plausible written-files summary, but orchestrator's working tree stayed completely clean — no files were ever actually written. Every `/sdlc-flow` run through `bastion serve` today is a no-op on the real codebase despite reporting success.
+- **Why:** The four missing check kinds were blocking real per-project harnesses from ever passing through `/sdlc-flow`, independent of code correctness — needed fixing to unblock genuine SDLC validation. The deeper write-permission gap surfaced only because of live end-to-end testing against a real orchestrator spec through `bastion serve`, and is a materially more serious finding: it means the engine has been silently no-op'ing on real codebases while reporting success.
+- **Status:** Did not fix the write-permission gap — captured as carryover `sdlc-flow-implement-node-no-write-permission` (already recorded in `planning/state.json` `carryover[]`; also notes the secondary branch-staleness issue where a long-running flow's end-review diffs against a moving `main`). It needs a human call on the safety tradeoff of granting an autonomous, network-triggered node blanket write/skip-permissions.
 
 ---
 
