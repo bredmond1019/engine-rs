@@ -1,13 +1,48 @@
 # GEMINI.md — engine-rs
 
-Bastion's native Rust execution engine — a graph-validated workflow runtime that embeds in `bastion serve`, holds live run state in-memory, and writes the orchestrator data contract to Postgres as a durable record.
+Bastion's native Rust execution engine — a graph-validated workflow runtime that embeds in `bastion serve`, holds live run state in-memory, and writes the data contract to Postgres as a durable record.
+
+**This repo is the orchestrator.** Per brain **D50/D51** the Python repo (renamed **Synapse**, D52)
+divested every execution workflow: all business workflows, artifact generation, eval, and the SDLC
+harness are engine-rs's. Synapse keeps knowledge only — corpus, embeddings, structural graph, memory,
+retrieval.
+
+## THE BOUNDARY TEST — read this before scoping any new work
+
+Brain (Synapse) or Engine (engine-rs)? Ask in order. Governed by brain **D51**; this block is
+byte-identical in `core/orchestrator/CLAUDE.md`.
+
+```
+THE BOUNDARY TEST — Brain (Synapse) or Engine (engine-rs)?  Ask in order.
+
+1. Does it need IN-PROCESS access to embeddings, pgvector, brain_edges,
+   or the memory tables?                                    YES -> Synapse
+2. Does it produce a client- or repo-facing artifact
+   (brief, proposal, PDF, PR, code)?                        YES -> engine-rs
+3. Is it maintaining the corpus itself (freshness, validation,
+   distillation, retrieval quality, scheduled chores)?      YES -> Synapse
+
+TIEBREAKER — if 1 and 2 are both YES, the work is a hybrid.
+   SPLIT it at the ingest seam. Never let one repo own both halves.
+       engine-rs workflow  --POST /ingest/*-->  Synapse
+   engine-rs acquires and reasons; Synapse owns everything behind the endpoint
+   (embedding, storage, retrieval, memory, decay).
+```
+
+**The practical consequence for this repo: no embedding, no pgvector, no corpus writes — ever.** A
+workflow that produces something the Brain should remember uses a `PersistToBrainNode` over the
+injectable `HttpPost` seam (`EN.4.C`) and POSTs to Synapse's ingest endpoint (Synapse block `OR.Q`).
+If you find yourself reaching for an embedding model here, you are on the wrong side of the boundary.
+
+**Cadence:** engine-rs and `bastion` schedule business runs; Synapse schedules only its own corpus
+housekeeping. There is no global scheduler.
 
 ## Before you start
 
 - **Strategic context:** `planning/context.md` (read first) → `planning/status.md` (current state)
 - **Symlink warning:** the `planning/` directory is actually a local symlink pointing to the company brain repo's `_planning/` vault (e.g. `core/_planning/engine-rs/`). The brain repo is responsible for tracking all planning files under Git. Do not track `planning/` in this project's public Git repository (it is gitignored).
 - **Plan:** `planning/master-plan.md` — the phase/block sequence
-- **Pipeline config:** `planning/harness.json` — the validation skills + UI-test config the
+- **Pipeline config:** `planning/harness.json` — the validation commands + UI-test config the
   SDLC engines run (see `planning/harness.examples.md` for ready-made stack profiles)
 - **Decisions log:** `planning/decisions/` (start at `planning/decisions/index.md`) — check
   before relitigating any settled choice
@@ -50,14 +85,14 @@ None known at initialization.
 ```
 
 > The SDLC pipeline reads its validation suite from `planning/harness.json` (not from this
-> block). Keep the `<test>`/`<build>` skills here in sync with that file's
+> block). Keep the `<test>`/`<build>` commands here in sync with that file's
 > `validation.checks[]` so humans and the pipeline run the same thing.
 
 ## Directory map
 
 ```
 engine-rs/
-├── .claude/        ← Gemini skills + SDLC workflow engines
+├── .claude/        ← Claude Code commands + SDLC workflow engines
 ├── planning/       ← context, status (+Momentum/Metrics), master-plan, knowledge, memory,
 │                     artifacts/, harness.json, decisions/, <concept>/
 └── <source dirs>   ← add as the project grows
@@ -69,15 +104,15 @@ engine-rs/
 
 ---
 
-## Available Skills
+## Available Commands
 
-All harness skills are installed globally in `~/.agents/skills/` via `/sync-global-commands`
-(run from base-template). Invoke them with `/<name>` directly. Project-specific skills (if any)
-live in `.agents/skills/` and take precedence over global skills on name conflict.
+All harness commands are installed globally in `~/.claude/commands/` via `/sync-global-commands`
+(run from base-template). Invoke them with `/<name>` directly. Project-specific commands (if any)
+live in `.claude/commands/` and take precedence over global commands on name conflict.
 
 ### Session
 
-| Skill/Command | What it does |
+| Command | What it does |
 |---|---|
 | `/prime` (global) | Deep session start — reads key docs and summarizes state |
 | `/session-recap` (global) | Start-of-session briefing: recent log, current focus, next action |
@@ -90,7 +125,7 @@ live in `.agents/skills/` and take precedence over global skills on name conflic
 
 ### Planning
 
-| Skill/Command | What it does |
+| Command | What it does |
 |---|---|
 | `/plan` (global) | Author a mini-roadmap (phases/blocks) into planning/plan-<slug>/plan.md |
 | `/ticket` (global) | Single-block behavior-change spec with observable AC + testing strategy |
@@ -101,7 +136,7 @@ live in `.agents/skills/` and take precedence over global skills on name conflic
 
 ### SDLC
 
-| Skill/Command | What it does |
+| Command | What it does |
 |---|---|
 | `/implement` (global) | Execute a plan file against the codebase |
 | `/test` (global) | Application validation test suite |
@@ -119,7 +154,7 @@ live in `.agents/skills/` and take precedence over global skills on name conflic
 
 ### Git
 
-| Skill/Command | What it does |
+| Command | What it does |
 |---|---|
 | `/commit` (global) | Stage and commit changes with a conventional message |
 | `/init-worktree` (global) | Initialize a new git worktree for isolated work |
@@ -129,7 +164,7 @@ live in `.agents/skills/` and take precedence over global skills on name conflic
 
 ### E2E
 
-| Skill/Command | What it does |
+| Command | What it does |
 |---|---|
 | `/test_auth_gate` (global) | E2E test template: authentication gate |
 | `/test_crud_api` (global) | E2E test template: CRUD API |
@@ -137,7 +172,7 @@ live in `.agents/skills/` and take precedence over global skills on name conflic
 | `/test_ui_form` (global) | E2E test template: UI form |
 
 > `/sync-global-commands` (global) is available in base-template only — it syncs
-> these commands to `~/.agents/skills/` and aborts if run outside the base-template root.
+> these commands to `~/.claude/commands/` and aborts if run outside the base-template root.
 
 ## SDLC pipeline
 
@@ -146,6 +181,6 @@ structured work through:
 `/generate-tasks → /implement → /test → /review-task → /document → /log-work`.
 
 > **Stack note:** the SDLC engines carry no stack defaults. Point them at this project's stack
-> by filling `planning/harness.json` (validation skills + optional UI-test config). Copy a
+> by filling `planning/harness.json` (validation commands + optional UI-test config). Copy a
 > ready-made profile from `planning/harness.examples.md` (Rust / Python / Next.js). Do **not**
 > edit the `workflows/*.js` engines for stack reasons — that's what `harness.json` is for.
