@@ -10,6 +10,7 @@
 
 pub mod aggregate;
 pub mod emit_state;
+pub mod overlay;
 pub mod profiles;
 pub mod resolve;
 pub mod shaping;
@@ -18,6 +19,7 @@ pub mod tier;
 
 pub use aggregate::{aggregate, aggregate_state_files, extract_policy_telemetry, PolicyAggregate};
 pub use emit_state::{CommandOutputLike, EmitStateNode, Runner as EmitStateRunner};
+pub use overlay::{merge_local, Overlay, PartialLocalConfig};
 pub use profiles::{
     read_harness_policy_defaults, read_harness_profiles, resolve_profile, resolved_policy,
     stamp_resolved_policy, RESOLVED_POLICY_IDENTITY,
