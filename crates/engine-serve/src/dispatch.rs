@@ -7,6 +7,17 @@
 //! Resolving an unregistered `workflow_type` returns a typed
 //! `DispatchError::UnknownWorkflowType`, which the HTTP layer (EN.1.C task 4)
 //! maps to a 422 response.
+//!
+//! `WorkflowFactory` (EN.5.D task 5) receives the triggering event payload so
+//! a registration can resolve its own policy (the four-layer
+//! `builtin < harness < profile < event` precedence) and assemble the
+//! policy-dependent `registry_for_policy` before the `Workflow` is built —
+//! something the old zero-argument factory could not do. A factory that
+//! fails to resolve policy (an unknown profile name, a malformed `policy`
+//! override in the event payload) returns `Err(String)`, surfaced through
+//! `dispatch_with_event` as `DispatchError::PolicyResolutionFailed`, distinct
+//! from `UnknownWorkflowType` so the HTTP layer (EN.5.D task 7) can map the
+//! two to different status codes.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -14,15 +25,24 @@ use std::fmt;
 use engine_core::{Workflow, WorkflowSchema};
 
 /// A factory that produces a fresh, runnable `Workflow` for a given
-/// registration. Boxed so the `Dispatcher` can hold heterogeneous
-/// construction logic per `workflow_type`.
-pub type WorkflowFactory = Box<dyn Fn() -> Workflow + Send + Sync>;
+/// registration, given the triggering event payload (`data` from
+/// `POST /events/`). Boxed so the `Dispatcher` can hold heterogeneous
+/// construction logic per `workflow_type`. Returns `Err(String)` when the
+/// registration's own policy resolution fails against `event` (e.g. an
+/// unknown profile name).
+pub type WorkflowFactory =
+    Box<dyn Fn(&serde_json::Value) -> Result<Workflow, String> + Send + Sync>;
 
-/// Error returned when resolving a `workflow_type` that has not been
-/// registered in both registries.
+/// Error returned when resolving a `workflow_type`, either because it has
+/// not been registered in both registries, or because its factory failed to
+/// resolve policy against the triggering event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchError {
     UnknownWorkflowType(String),
+    /// A registered `workflow_type`'s factory failed to resolve policy
+    /// against the triggering event (e.g. an unknown profile name, a
+    /// malformed `policy` override) — carries the factory's message.
+    PolicyResolutionFailed(String),
 }
 
 impl fmt::Display for DispatchError {
@@ -30,6 +50,9 @@ impl fmt::Display for DispatchError {
         match self {
             DispatchError::UnknownWorkflowType(workflow_type) => {
                 write!(f, "unknown workflow_type '{workflow_type}'")
+            }
+            DispatchError::PolicyResolutionFailed(message) => {
+                write!(f, "policy resolution failed: {message}")
             }
         }
     }
@@ -66,13 +89,33 @@ impl Dispatcher {
     }
 
     /// Resolve a `workflow_type` to a freshly constructed, runnable
-    /// `Workflow`. Returns `DispatchError::UnknownWorkflowType` if it is not
-    /// registered.
+    /// `Workflow`, using an empty event payload (`{}`) for the factory's
+    /// policy resolution. Returns `DispatchError::UnknownWorkflowType` if it
+    /// is not registered, or `DispatchError::PolicyResolutionFailed` if the
+    /// factory cannot resolve policy against the empty payload. Prefer
+    /// [`Dispatcher::dispatch_with_event`] whenever an actual triggering
+    /// event payload is available.
     pub fn dispatch(&self, workflow_type: &str) -> Result<Workflow, DispatchError> {
-        self.workflow_registry
+        self.dispatch_with_event(workflow_type, &serde_json::Value::Null)
+    }
+
+    /// Resolve a `workflow_type` to a freshly constructed, runnable
+    /// `Workflow`, feeding the triggering `event` payload (`POST /events/`'s
+    /// `data`) to the registration's factory so it can resolve its own
+    /// policy. Returns `DispatchError::UnknownWorkflowType` if `workflow_type`
+    /// is not registered, or `DispatchError::PolicyResolutionFailed` if the
+    /// factory's policy resolution fails against `event` (carrying the
+    /// factory's message, e.g. naming an unknown profile).
+    pub fn dispatch_with_event(
+        &self,
+        workflow_type: &str,
+        event: &serde_json::Value,
+    ) -> Result<Workflow, DispatchError> {
+        let factory = self
+            .workflow_registry
             .get(workflow_type)
-            .map(|factory| factory())
-            .ok_or_else(|| DispatchError::UnknownWorkflowType(workflow_type.to_string()))
+            .ok_or_else(|| DispatchError::UnknownWorkflowType(workflow_type.to_string()))?;
+        factory(event).map_err(DispatchError::PolicyResolutionFailed)
     }
 
     /// Resolve a `workflow_type` to its declared `WorkflowSchema` (the graph
@@ -129,11 +172,17 @@ mod tests {
     }
 
     fn fixture_factory() -> WorkflowFactory {
-        Box::new(|| {
+        Box::new(|_event: &serde_json::Value| {
             let mut registry = NodeRegistry::new();
             registry.register(Box::new(MarkerNode));
-            Workflow::new(registry, fixture_schema("fixture"))
+            Ok(Workflow::new(registry, fixture_schema("fixture")))
         })
+    }
+
+    /// A factory whose "policy resolution" always fails, to exercise
+    /// `DispatchError::PolicyResolutionFailed`.
+    fn failing_factory(message: &'static str) -> WorkflowFactory {
+        Box::new(move |_event: &serde_json::Value| Err(message.to_string()))
     }
 
     #[test]
@@ -181,5 +230,82 @@ mod tests {
             ))
         );
         assert!(!dispatcher.is_registered("does-not-exist"));
+    }
+
+    #[test]
+    fn dispatch_with_event_passes_the_event_payload_to_the_factory() {
+        let mut dispatcher = Dispatcher::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_in_factory = seen.clone();
+        let factory: WorkflowFactory = Box::new(move |event: &serde_json::Value| {
+            *seen_in_factory.lock().unwrap() = Some(event.clone());
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(MarkerNode));
+            Ok(Workflow::new(registry, fixture_schema("fixture")))
+        });
+        dispatcher.register(fixture_schema("fixture"), factory);
+
+        let event = serde_json::json!({ "profile": "local-judgment" });
+        let result = dispatcher.dispatch_with_event("fixture", &event);
+
+        assert!(result.is_ok());
+        assert_eq!(*seen.lock().unwrap(), Some(event));
+    }
+
+    #[test]
+    fn dispatch_with_event_unknown_type_returns_unknown_workflow_type() {
+        let dispatcher = Dispatcher::new();
+
+        let result = dispatcher.dispatch_with_event("does-not-exist", &serde_json::json!({}));
+
+        assert!(matches!(
+            result,
+            Err(DispatchError::UnknownWorkflowType(ref t)) if t == "does-not-exist"
+        ));
+    }
+
+    #[test]
+    fn dispatch_with_event_surfaces_policy_resolution_failure() {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            fixture_schema("fixture"),
+            failing_factory("unknown profile 'not-a-real-profile'"),
+        );
+
+        let result = dispatcher.dispatch_with_event(
+            "fixture",
+            &serde_json::json!({ "profile": "not-a-real-profile" }),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DispatchError::PolicyResolutionFailed(ref m))
+                if m == "unknown profile 'not-a-real-profile'"
+        ));
+    }
+
+    #[test]
+    fn dispatch_surfaces_policy_resolution_failure_via_default_dispatch() {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(fixture_schema("fixture"), failing_factory("bad policy"));
+
+        let result = dispatcher.dispatch("fixture");
+
+        assert!(matches!(
+            result,
+            Err(DispatchError::PolicyResolutionFailed(ref m)) if m == "bad policy"
+        ));
+    }
+
+    #[test]
+    fn dispatch_error_display_distinguishes_the_two_variants() {
+        let unknown = DispatchError::UnknownWorkflowType("foo".to_string());
+        let policy_failed = DispatchError::PolicyResolutionFailed("bad profile".to_string());
+
+        assert!(unknown.to_string().contains("unknown workflow_type"));
+        assert!(policy_failed
+            .to_string()
+            .contains("policy resolution failed"));
+        assert_ne!(unknown, policy_failed);
     }
 }

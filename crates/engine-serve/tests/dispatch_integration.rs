@@ -80,7 +80,10 @@ fn fixture_workflow() -> Workflow {
 
 fn test_app_state() -> AppState {
     let mut dispatcher = Dispatcher::new();
-    dispatcher.register(fixture_schema(), Box::new(fixture_workflow));
+    dispatcher.register(
+        fixture_schema(),
+        Box::new(|_event: &serde_json::Value| Ok(fixture_workflow())),
+    );
 
     AppState {
         dispatcher: Arc::new(dispatcher),

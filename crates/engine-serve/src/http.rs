@@ -75,6 +75,11 @@ async fn workflow_graph(path: web::Path<String>, state: web::Data<AppState>) -> 
         Err(DispatchError::UnknownWorkflowType(_)) => {
             HttpResponse::NotFound().json(serde_json::json!({ "error": "unknown workflow_type" }))
         }
+        // `resolve_schema` only ever consults the `schema_registry`, never a
+        // factory, so it structurally cannot produce this variant.
+        Err(DispatchError::PolicyResolutionFailed(_)) => unreachable!(
+            "resolve_schema never invokes a WorkflowFactory, so it cannot fail policy resolution"
+        ),
     }
 }
 
@@ -122,6 +127,17 @@ async fn post_events(
             return HttpResponse::UnprocessableEntity().json(serde_json::json!({
                 "error": "unknown workflow_type",
                 "workflow_type": workflow_type,
+            }));
+        }
+        // No builtin registration resolves policy against the event yet
+        // (EN.5.D task 7 wires `dispatch_with_event`+`body.data` through
+        // here and maps this to a dedicated 4xx naming the offending
+        // profile); kept as a real arm rather than `unreachable!()` since
+        // `dispatch`'s empty-payload factory call can still fail today.
+        Err(DispatchError::PolicyResolutionFailed(message)) => {
+            return HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                "error": "policy resolution failed",
+                "message": message,
             }));
         }
     };
@@ -199,10 +215,10 @@ mod tests {
         let mut dispatcher = Dispatcher::new();
         dispatcher.register(
             fixture_schema("fixture"),
-            Box::new(|| {
+            Box::new(|_event: &serde_json::Value| {
                 let mut registry = NodeRegistry::new();
                 registry.register(Box::new(MarkerNode));
-                Workflow::new(registry, fixture_schema("fixture"))
+                Ok(Workflow::new(registry, fixture_schema("fixture")))
             }),
         );
 

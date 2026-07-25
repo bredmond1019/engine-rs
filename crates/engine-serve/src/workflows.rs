@@ -7,6 +7,12 @@
 //! assembled `WorkflowSchema` + `WorkflowFactory`-shaped builder with the
 //! `Dispatcher::register` call. See `planning/EN.3.A-sdlc-flow-setup-task-loop/tasks.md`,
 //! Task 5, and its Notes section for the cross-crate rationale.
+//!
+//! Each registration below still ignores the triggering event payload and
+//! builds its workflow with the zero-argument, default-policy
+//! `graph::workflow` builder — `WorkflowFactory` (EN.5.D task 5) now *can*
+//! read the event to resolve policy and assemble `graph::registry_for_policy`,
+//! but wiring each registration to actually do so is EN.5.D task 7.
 
 use crate::dispatch::Dispatcher;
 
@@ -17,7 +23,9 @@ use crate::dispatch::Dispatcher;
 pub fn register_sdlc_flow(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::sdlc_flow::graph::schema(),
-        Box::new(engine_core::workflows::sdlc_flow::graph::workflow),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(engine_core::workflows::sdlc_flow::graph::workflow())
+        }),
     );
 }
 
@@ -29,7 +37,9 @@ pub fn register_sdlc_flow(dispatcher: &mut Dispatcher) {
 pub fn register_research_agent(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::research_agent::graph::schema(),
-        Box::new(engine_core::workflows::research_agent::graph::workflow),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(engine_core::workflows::research_agent::graph::workflow())
+        }),
     );
 }
 
@@ -42,7 +52,9 @@ pub fn register_research_agent(dispatcher: &mut Dispatcher) {
 pub fn register_diagnostic_intake(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::diagnostic_intake::graph::schema(),
-        Box::new(engine_core::workflows::diagnostic_intake::graph::workflow),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(engine_core::workflows::diagnostic_intake::graph::workflow())
+        }),
     );
 }
 
@@ -55,7 +67,9 @@ pub fn register_diagnostic_intake(dispatcher: &mut Dispatcher) {
 pub fn register_proposal_generator(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::proposal_generator::graph::schema(),
-        Box::new(engine_core::workflows::proposal_generator::graph::workflow),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(engine_core::workflows::proposal_generator::graph::workflow())
+        }),
     );
 }
 

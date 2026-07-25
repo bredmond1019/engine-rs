@@ -78,13 +78,13 @@ fn test_app_state(release: Arc<Notify>) -> AppState {
     let mut dispatcher = Dispatcher::new();
     dispatcher.register(
         fixture_schema(),
-        Box::new(move || {
+        Box::new(move |_event: &serde_json::Value| {
             let mut registry = NodeRegistry::new();
             registry.register(Box::new(WaitNode {
                 release: release.clone(),
             }));
             registry.register(Box::new(SuccessNode));
-            Workflow::new(registry, fixture_schema())
+            Ok(Workflow::new(registry, fixture_schema()))
         }),
     );
 
