@@ -11,7 +11,7 @@
 //! just `"sdlc"`) can share this code.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use engine_contract::TaskContext;
 use serde::de::DeserializeOwned;
@@ -22,6 +22,35 @@ use crate::node::NodeError;
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
 /// downstream node reads one resolved value rather than re-deriving it.
 pub const RESOLVED_POLICY_IDENTITY: &str = "ResolvedPolicy";
+
+/// Where to look up `harness.json`-sourced policy defaults/profiles for a
+/// workflow run, decoupled from a worktree path. Channel- and API-triggered
+/// workflows have no repo checkout to read from — [`PolicyConfigSource::Builtin`]
+/// lets those resolve successfully (builtin + profile + event layers only)
+/// instead of erroring or silently reading `std::env::current_dir()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyConfigSource {
+    /// Read `<worktree>/planning/harness.json` — today's on-disk convention.
+    Worktree(PathBuf),
+    /// Read a specific `harness.json`-shaped file, wherever it lives.
+    HarnessFile(PathBuf),
+    /// No config file. Resolution falls through to builtin + profile + event
+    /// layers only.
+    Builtin,
+}
+
+impl PolicyConfigSource {
+    /// The concrete file path to read, or `None` for [`PolicyConfigSource::Builtin`].
+    fn harness_path(&self) -> Option<PathBuf> {
+        match self {
+            PolicyConfigSource::Worktree(worktree) => {
+                Some(worktree.join("planning").join("harness.json"))
+            }
+            PolicyConfigSource::HarnessFile(path) => Some(path.clone()),
+            PolicyConfigSource::Builtin => None,
+        }
+    }
+}
 
 /// Serialize `policy` and stamp it into `ctx.nodes[RESOLVED_POLICY_IDENTITY]`.
 pub fn stamp_resolved_policy<P: Serialize>(
@@ -46,13 +75,35 @@ pub fn resolved_policy<P: DeserializeOwned + Default>(ctx: &TaskContext) -> P {
         .unwrap_or_default()
 }
 
-/// Read `planning/harness.json`'s `<workflow_key>.policy` section (a `P`)
-/// out of a worktree, if the file and section exist.
-pub fn read_harness_policy_defaults<P: DeserializeOwned>(
-    worktree: &Path,
+/// Read the resolved policy stamped by [`stamp_resolved_policy`], failing
+/// loudly instead of silently defaulting: `Err` when the stamp is absent
+/// from `ctx.nodes`, or when it is present but fails to deserialize into
+/// `P`. Task 8 migrates node callers off [`resolved_policy`]'s lenient
+/// `Default` fallback onto this strict read and removes the lenient one.
+pub fn resolved_policy_strict<P: DeserializeOwned>(ctx: &TaskContext) -> Result<P, NodeError> {
+    let value = ctx.nodes.get(RESOLVED_POLICY_IDENTITY).ok_or_else(|| {
+        NodeError::new(format!(
+            "no resolved policy stamped under ctx.nodes[{RESOLVED_POLICY_IDENTITY:?}]"
+        ))
+    })?;
+    serde_json::from_value(value.clone()).map_err(|err| {
+        NodeError::new(format!(
+            "failed to parse resolved policy stamped under {RESOLVED_POLICY_IDENTITY:?}: {err}"
+        ))
+    })
+}
+
+/// Read `<workflow_key>.policy` (a `P`) out of the file addressed by
+/// `source`, if the source has a file and the section exists.
+/// [`PolicyConfigSource::Builtin`] always yields `Ok(None)` — no filesystem
+/// access at all.
+pub fn read_harness_policy_defaults_from<P: DeserializeOwned>(
+    source: &PolicyConfigSource,
     workflow_key: &str,
 ) -> Result<Option<P>, NodeError> {
-    let harness_path = worktree.join("planning").join("harness.json");
+    let Some(harness_path) = source.harness_path() else {
+        return Ok(None);
+    };
     if !harness_path.exists() {
         return Ok(None);
     }
@@ -77,16 +128,32 @@ pub fn read_harness_policy_defaults<P: DeserializeOwned>(
     Ok(Some(partial))
 }
 
-/// Read `planning/harness.json`'s `<workflow_key>.profiles` section (a
-/// `map<String, P>`) out of a worktree, if the file and section exist.
-/// Strips any `_comment*`-keyed sibling entry before deserializing so a
-/// documentation comment isn't mistaken for a named profile bundle (see
-/// `planning/harness.examples.md`).
-pub fn read_harness_profiles<P: DeserializeOwned>(
+/// Read `planning/harness.json`'s `<workflow_key>.policy` section (a `P`)
+/// out of a worktree, if the file and section exist. Thin wrapper over
+/// [`read_harness_policy_defaults_from`] with [`PolicyConfigSource::Worktree`].
+pub fn read_harness_policy_defaults<P: DeserializeOwned>(
     worktree: &Path,
     workflow_key: &str,
+) -> Result<Option<P>, NodeError> {
+    read_harness_policy_defaults_from(
+        &PolicyConfigSource::Worktree(worktree.to_path_buf()),
+        workflow_key,
+    )
+}
+
+/// Read `<workflow_key>.profiles` (a `map<String, P>`) out of the file
+/// addressed by `source`, if the source has a file and the section exists.
+/// Strips any `_comment*`-keyed sibling entry before deserializing so a
+/// documentation comment isn't mistaken for a named profile bundle (see
+/// `planning/harness.examples.md`). [`PolicyConfigSource::Builtin`] always
+/// yields `Ok(None)`.
+pub fn read_harness_profiles_from<P: DeserializeOwned>(
+    source: &PolicyConfigSource,
+    workflow_key: &str,
 ) -> Result<Option<HashMap<String, P>>, NodeError> {
-    let harness_path = worktree.join("planning").join("harness.json");
+    let Some(harness_path) = source.harness_path() else {
+        return Ok(None);
+    };
     if !harness_path.exists() {
         return Ok(None);
     }
@@ -116,13 +183,27 @@ pub fn read_harness_profiles<P: DeserializeOwned>(
     Ok(Some(parsed))
 }
 
-/// Resolve `profile_name` to a `P` bundle, preferring a `harness.json`
-/// `<workflow_key>.profiles[name]` entry over `builtin_profile_by_name`.
-/// Returns `Ok(None)` when `profile_name` is `None`, and `Err` when a name
-/// is given but resolves to neither source (no silent no-op).
-pub fn resolve_profile<P: DeserializeOwned>(
-    profile_name: Option<&str>,
+/// Read `planning/harness.json`'s `<workflow_key>.profiles` section (a
+/// `map<String, P>`) out of a worktree, if the file and section exist. Thin
+/// wrapper over [`read_harness_profiles_from`] with [`PolicyConfigSource::Worktree`].
+pub fn read_harness_profiles<P: DeserializeOwned>(
     worktree: &Path,
+    workflow_key: &str,
+) -> Result<Option<HashMap<String, P>>, NodeError> {
+    read_harness_profiles_from(
+        &PolicyConfigSource::Worktree(worktree.to_path_buf()),
+        workflow_key,
+    )
+}
+
+/// Resolve `profile_name` to a `P` bundle, preferring a `harness.json`
+/// `<workflow_key>.profiles[name]` entry (read via `source`) over
+/// `builtin_profile_by_name`. Returns `Ok(None)` when `profile_name` is
+/// `None`, and `Err` when a name is given but resolves to neither source (no
+/// silent no-op).
+pub fn resolve_profile_from<P: DeserializeOwned>(
+    profile_name: Option<&str>,
+    source: &PolicyConfigSource,
     workflow_key: &str,
     builtin_profile_by_name: impl Fn(&str) -> Option<P>,
 ) -> Result<Option<P>, NodeError> {
@@ -130,7 +211,7 @@ pub fn resolve_profile<P: DeserializeOwned>(
         return Ok(None);
     };
 
-    if let Some(harness_profiles) = read_harness_profiles::<P>(worktree, workflow_key)? {
+    if let Some(harness_profiles) = read_harness_profiles_from::<P>(source, workflow_key)? {
         if let Some(partial) = harness_profiles.into_iter().find(|(key, _)| key == name) {
             return Ok(Some(partial.1));
         }
@@ -143,6 +224,25 @@ pub fn resolve_profile<P: DeserializeOwned>(
     Err(NodeError::new(format!(
         "unknown profile {name:?}: not found in harness.json {workflow_key}.profiles or built-in profiles"
     )))
+}
+
+/// Resolve `profile_name` to a `P` bundle, preferring a `harness.json`
+/// `<workflow_key>.profiles[name]` entry over `builtin_profile_by_name`.
+/// Returns `Ok(None)` when `profile_name` is `None`, and `Err` when a name
+/// is given but resolves to neither source (no silent no-op). Thin wrapper
+/// over [`resolve_profile_from`] with [`PolicyConfigSource::Worktree`].
+pub fn resolve_profile<P: DeserializeOwned>(
+    profile_name: Option<&str>,
+    worktree: &Path,
+    workflow_key: &str,
+    builtin_profile_by_name: impl Fn(&str) -> Option<P>,
+) -> Result<Option<P>, NodeError> {
+    resolve_profile_from(
+        profile_name,
+        &PolicyConfigSource::Worktree(worktree.to_path_buf()),
+        workflow_key,
+        builtin_profile_by_name,
+    )
 }
 
 #[cfg(test)]
@@ -300,5 +400,170 @@ mod tests {
         let err = resolve_profile(Some("nonexistent"), &worktree, "sdlc", builtin)
             .expect_err("should fail");
         assert!(err.message.contains("unknown profile"));
+    }
+
+    #[test]
+    fn builtin_source_resolves_with_no_filesystem_access() {
+        // A `Builtin` source has no `harness_path()` at all, so the reads
+        // below can't touch disk regardless of `workflow_key` or cwd.
+        let policy: Option<TestPartial> =
+            read_harness_policy_defaults_from(&PolicyConfigSource::Builtin, "sdlc")
+                .expect("should succeed");
+        assert!(policy.is_none());
+
+        let profiles: Option<HashMap<String, TestPartial>> =
+            read_harness_profiles_from(&PolicyConfigSource::Builtin, "sdlc")
+                .expect("should succeed");
+        assert!(profiles.is_none());
+
+        let resolved = resolve_profile_from(
+            Some("cheap-fast"),
+            &PolicyConfigSource::Builtin,
+            "sdlc",
+            builtin,
+        )
+        .expect("should succeed")
+        .expect("builtin profile resolved");
+        assert_eq!(resolved.max_attempts, Some(1));
+
+        let unknown = resolve_profile_from(
+            Some("nonexistent"),
+            &PolicyConfigSource::Builtin,
+            "sdlc",
+            builtin,
+        )
+        .expect_err("should fail");
+        assert!(unknown.message.contains("unknown profile"));
+    }
+
+    #[test]
+    fn harness_file_source_reads_a_file_outside_any_worktree_layout() {
+        let dir = temp_dir();
+        // Deliberately not `<dir>/planning/harness.json` — some arbitrary
+        // file path with no `planning/` layout at all.
+        let harness_file = dir.join("standalone-harness.json");
+        std::fs::write(
+            &harness_file,
+            serde_json::json!({
+                "sdlc": {
+                    "policy": { "max_attempts": 7 },
+                    "profiles": { "cheap-fast": { "max_attempts": 42 } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let source = PolicyConfigSource::HarnessFile(harness_file);
+
+        let policy: TestPartial = read_harness_policy_defaults_from(&source, "sdlc")
+            .expect("should succeed")
+            .expect("policy present");
+        assert_eq!(policy.max_attempts, Some(7));
+
+        let profiles: HashMap<String, TestPartial> = read_harness_profiles_from(&source, "sdlc")
+            .expect("should succeed")
+            .expect("profiles present");
+        assert_eq!(profiles["cheap-fast"].max_attempts, Some(42));
+
+        let resolved = resolve_profile_from(Some("cheap-fast"), &source, "sdlc", builtin)
+            .expect("should succeed")
+            .expect("profile resolved");
+        assert_eq!(resolved.max_attempts, Some(42));
+    }
+
+    #[test]
+    fn worktree_source_behaves_identically_to_today() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            serde_json::json!({ "sdlc": { "policy": { "max_attempts": 5 } } }).to_string(),
+        )
+        .unwrap();
+
+        let source = PolicyConfigSource::Worktree(worktree.clone());
+        let via_from: Option<TestPartial> =
+            read_harness_policy_defaults_from(&source, "sdlc").expect("should succeed");
+        let via_wrapper: Option<TestPartial> =
+            read_harness_policy_defaults(&worktree, "sdlc").expect("should succeed");
+        assert_eq!(via_from, via_wrapper);
+        assert_eq!(
+            via_from,
+            Some(TestPartial {
+                max_attempts: Some(5)
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_policy_strict_errors_on_absent_stamp() {
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+        let err = resolved_policy_strict::<TestPartial>(&ctx).expect_err("should fail");
+        assert!(err.message.contains("no resolved policy stamped"));
+    }
+
+    #[test]
+    fn resolved_policy_strict_errors_on_unparsable_stamp() {
+        let mut ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+        // `max_attempts` expects a number; stamp a string so deserialization fails.
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::json!({ "max_attempts": "not-a-number" }),
+        );
+        let err = resolved_policy_strict::<TestPartial>(&ctx).expect_err("should fail");
+        assert!(err.message.contains("failed to parse resolved policy"));
+    }
+
+    #[test]
+    fn resolved_policy_strict_succeeds_on_valid_stamp() {
+        let mut ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+        let policy = TestPartial {
+            max_attempts: Some(9),
+        };
+        stamp_resolved_policy(&mut ctx, &policy).expect("stamp should succeed");
+        let read: TestPartial = resolved_policy_strict(&ctx).expect("should succeed");
+        assert_eq!(read, policy);
+    }
+
+    #[test]
+    fn read_harness_profiles_from_strips_comment_sibling_key() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            serde_json::json!({
+                "sdlc": {
+                    "profiles": {
+                        "_comment": "explanatory text, not a bundle",
+                        "cheap-fast": { "max_attempts": 42 }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let profiles: HashMap<String, TestPartial> =
+            read_harness_profiles_from(&PolicyConfigSource::Worktree(worktree), "sdlc")
+                .expect("should succeed")
+                .expect("profiles present");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles["cheap-fast"].max_attempts, Some(42));
     }
 }

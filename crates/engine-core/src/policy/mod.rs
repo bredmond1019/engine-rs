@@ -21,8 +21,9 @@ pub use aggregate::{aggregate, aggregate_state_files, extract_policy_telemetry, 
 pub use emit_state::{CommandOutputLike, EmitStateNode, Runner as EmitStateRunner};
 pub use overlay::{merge_local, Overlay, PartialLocalConfig};
 pub use profiles::{
-    read_harness_policy_defaults, read_harness_profiles, resolve_profile, resolved_policy,
-    stamp_resolved_policy, RESOLVED_POLICY_IDENTITY,
+    read_harness_policy_defaults, read_harness_policy_defaults_from, read_harness_profiles,
+    read_harness_profiles_from, resolve_profile, resolve_profile_from, resolved_policy,
+    resolved_policy_strict, stamp_resolved_policy, PolicyConfigSource, RESOLVED_POLICY_IDENTITY,
 };
 pub use resolve::{merge_opt, resolve, Policy};
 pub use shaping::{apply_model_tier, apply_prompt_cache, apply_verbosity_directive};
