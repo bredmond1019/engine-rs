@@ -96,6 +96,18 @@ fn set_worktree(ctx: &mut TaskContext, worktree: &Path) {
     );
 }
 
+/// Resolve `ctx.event`'s policy (built-in + `harness.json` + named
+/// `profile:` + inline `policy` override, high->low precedence) and stamp it
+/// under `RESOLVED_POLICY_IDENTITY` — the same seeding `engine-serve`'s
+/// dispatch factory performs before a real node ever sees the `ctx` (EN.5.D
+/// task 8: nodes no longer re-resolve inside `process()`, so this hermetic
+/// harness must replicate dispatch's resolve-once step itself).
+fn stamp_resolved_policy(ctx: &mut TaskContext, worktree: &Path) {
+    let resolved = profiles::resolve_policy_for_run(ctx, worktree)
+        .expect("PROPOSAL_GENERATOR policy should resolve for this event");
+    policy::stamp_resolved_policy(ctx, &resolved).expect("policy should stamp");
+}
+
 fn stub_outcome(structured: Value, input_tokens: u64, output_tokens: u64) -> Outcome {
     Outcome {
         cost_usd: 0.01,
@@ -363,6 +375,7 @@ async fn drive(event: Value, worktree: &Path, registry: &NodeRegistry) -> (Strin
         node_runs: HashMap::new(),
     };
     set_worktree(&mut ctx, worktree);
+    stamp_resolved_policy(&mut ctx, worktree);
 
     for identity in [
         "ProposalCompanyResearchNode",

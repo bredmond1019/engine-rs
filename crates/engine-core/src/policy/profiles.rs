@@ -64,22 +64,13 @@ pub fn stamp_resolved_policy<P: Serialize>(
     Ok(())
 }
 
-/// Read the resolved policy stamped by [`stamp_resolved_policy`]. Falls back
-/// to `P::default()` when absent or unparsable — the same defensive
-/// fallback `sdlc_flow::wrap_up::resolved_policy` uses.
-#[must_use]
-pub fn resolved_policy<P: DeserializeOwned + Default>(ctx: &TaskContext) -> P {
-    ctx.nodes
-        .get(RESOLVED_POLICY_IDENTITY)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
-        .unwrap_or_default()
-}
-
 /// Read the resolved policy stamped by [`stamp_resolved_policy`], failing
 /// loudly instead of silently defaulting: `Err` when the stamp is absent
 /// from `ctx.nodes`, or when it is present but fails to deserialize into
-/// `P`. Task 8 migrates node callers off [`resolved_policy`]'s lenient
-/// `Default` fallback onto this strict read and removes the lenient one.
+/// `P`. The lenient `Default`-falling-back predecessor (`resolved_policy`)
+/// was deleted in task 8 — every node caller now goes through this strict
+/// read, so a missing/unparsable stamp surfaces as a `NodeError` instead of
+/// a silent all-Sonnet resolution.
 pub fn resolved_policy_strict<P: DeserializeOwned>(ctx: &TaskContext) -> Result<P, NodeError> {
     let value = ctx.nodes.get(RESOLVED_POLICY_IDENTITY).ok_or_else(|| {
         NodeError::new(format!(
@@ -275,34 +266,6 @@ mod tests {
             }),
             _ => None,
         }
-    }
-
-    #[test]
-    fn resolved_policy_round_trips_via_stamp() {
-        let mut ctx = TaskContext {
-            event: serde_json::json!({}),
-            nodes: HashMap::new(),
-            metadata: serde_json::json!({}),
-            node_runs: HashMap::new(),
-        };
-        let policy = TestPartial {
-            max_attempts: Some(5),
-        };
-        stamp_resolved_policy(&mut ctx, &policy).expect("stamp should succeed");
-        let read: TestPartial = resolved_policy(&ctx);
-        assert_eq!(read, policy);
-    }
-
-    #[test]
-    fn resolved_policy_falls_back_to_default_when_absent() {
-        let ctx = TaskContext {
-            event: serde_json::json!({}),
-            nodes: HashMap::new(),
-            metadata: serde_json::json!({}),
-            node_runs: HashMap::new(),
-        };
-        let read: TestPartial = resolved_policy(&ctx);
-        assert_eq!(read, TestPartial::default());
     }
 
     #[test]

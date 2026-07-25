@@ -563,6 +563,17 @@ async fn live_triage_task_node_llm_branch_real_call() {
                     "failure_summary": "Failed checks: config-validator (exit code 1)",
                 }),
             ),
+            (
+                // Required since task 8's strict `resolved_policy_strict`
+                // read (no more per-node re-resolution or silent `Default`
+                // fallback) — mirrors what a real run's dispatch/
+                // `SetupWorktreeNode` stamp would have seeded.
+                engine_core::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+                serde_json::to_value(
+                    engine_core::workflows::sdlc_flow::policy::SdlcPolicy::default(),
+                )
+                .expect("SdlcPolicy serializes"),
+            ),
         ]),
         metadata: json!({}),
         node_runs: HashMap::new(),

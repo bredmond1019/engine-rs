@@ -4,8 +4,9 @@
 //!
 //! A non-terminal, Local-eligible model node wrapping
 //! `crate::nodes::claude_code_step::ClaudeCodeStep`. On `process`:
-//! 1. resolve the run's [`super::policy::ProposalGeneratorPolicy`] via
-//!    [`super::profiles::resolve_policy_for_run`];
+//! 1. read the run's [`super::policy::ProposalGeneratorPolicy`] stamped once
+//!    at dispatch (`crate::policy::resolved_policy_strict`, EN.5.D task 8)
+//!    — no per-node re-resolution;
 //! 2. when `policy.review_mode` is [`super::policy::ReviewMode::Skip`],
 //!    short-circuit straight to a `pass` verdict with no model call;
 //! 3. otherwise compose a review prompt from the upstream
@@ -16,8 +17,6 @@
 //!    `ctx.nodes["ProposalReviewNode"]` for `ProposalReviewRouterNode` to
 //!    read.
 
-use std::path::PathBuf;
-
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
 use serde::Deserialize;
@@ -27,8 +26,7 @@ use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
-use super::policy::ReviewMode;
-use super::profiles::resolve_policy_for_run;
+use super::policy::{ProposalGeneratorPolicy, ReviewMode};
 use super::schema::ProposalGeneratorEventSchema;
 
 /// The `Node::name()` identity `ProposalReviewNode` runs its composed
@@ -164,14 +162,7 @@ impl Default for ProposalReviewNode {
 impl Node for ProposalReviewNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let event = parse_event(&ctx)?;
-        let worktree = get_result(&ctx, "SetupWorktreeNode")
-            .and_then(|value| value.get("worktree_path"))
-            .and_then(|value| value.as_str())
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        let policy = resolve_policy_for_run(&ctx, &worktree)?;
+        let policy: ProposalGeneratorPolicy = crate::policy::resolved_policy_strict(&ctx)?;
 
         // `review_mode = Skip` short-circuits straight to `pass` — no
         // model call, no revise branch ever taken.
@@ -248,18 +239,41 @@ mod tests {
     use futures::FutureExt;
     use serde_json::json;
 
-    use super::super::policy::{
-        ModelTier, PartialModelTiers, PartialProposalGeneratorPolicy, ReviewMode,
-    };
+    use super::super::policy::{LocalConfig, ModelTier, ReviewMode};
     use super::*;
 
+    /// Builds a `ctx` and stamps a default [`ProposalGeneratorPolicy`] under
+    /// `RESOLVED_POLICY_IDENTITY` — required since task 8's strict
+    /// `resolved_policy_strict` read (no more per-node re-resolution or a
+    /// silent `Default` fallback).
     fn empty_ctx(event: ProposalGeneratorEventSchema) -> TaskContext {
-        TaskContext {
+        let mut ctx = TaskContext {
             event: serde_json::to_value(event).unwrap(),
             nodes: HashMap::new(),
             metadata: serde_json::json!({}),
             node_runs: HashMap::new(),
-        }
+        };
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(ProposalGeneratorPolicy::default()).expect("policy serializes"),
+        );
+        ctx
+    }
+
+    /// Like [`empty_ctx`] but stamps `policy` instead of the built-in
+    /// default — for tests exercising a non-default resolved policy (task 8:
+    /// the node no longer re-merges `event.policy` itself, so a test wanting
+    /// a specific resolved policy must stamp the already-merged result).
+    fn ctx_with_policy(
+        event: ProposalGeneratorEventSchema,
+        policy: &ProposalGeneratorPolicy,
+    ) -> TaskContext {
+        let mut ctx = empty_ctx(event);
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(policy).expect("policy serializes"),
+        );
+        ctx
     }
 
     fn base_event() -> ProposalGeneratorEventSchema {
@@ -337,14 +351,14 @@ mod tests {
 
     #[tokio::test]
     async fn process_short_circuits_to_pass_under_review_mode_skip_with_no_transport_call() {
-        let mut event = base_event();
-        event.policy = Some(PartialProposalGeneratorPolicy {
-            review_mode: Some(ReviewMode::Skip),
-            ..Default::default()
-        });
+        let event = base_event();
+        let policy = ProposalGeneratorPolicy {
+            review_mode: ReviewMode::Skip,
+            ..ProposalGeneratorPolicy::default()
+        };
 
         let node = ProposalReviewNode::new().with_transport(panics_if_called_transport());
-        let ctx = empty_ctx(event);
+        let ctx = ctx_with_policy(event, &policy);
 
         let ctx = node.process(ctx).await.expect("process should succeed");
 
@@ -354,21 +368,24 @@ mod tests {
 
     #[tokio::test]
     async fn process_applies_tier_cache_and_verbosity_shaping() {
-        let mut event = base_event();
-        event.policy = Some(PartialProposalGeneratorPolicy {
-            output_verbosity: Some(super::super::policy::OutputVerbosity::Terse),
-            prompt_cache: Some(true),
-            model_tiers: Some(PartialModelTiers {
-                review: Some(ModelTier::Local),
-                ..Default::default()
-            }),
-            local: Some(super::super::policy::PartialLocalConfig {
-                endpoint: None,
-                model: Some("qwen2.5-coder:7b".to_string()),
-                constrained_json: None,
-            }),
-            ..Default::default()
-        });
+        // Task 8: the node reads a policy already resolved (event override
+        // merged in) and stamped at dispatch — it no longer re-merges
+        // `event.policy` itself, so this test stamps the *already-merged*
+        // final policy directly rather than an `event.policy` override.
+        let event = base_event();
+        let policy = ProposalGeneratorPolicy {
+            output_verbosity: super::super::policy::OutputVerbosity::Terse,
+            prompt_cache: true,
+            model_tiers: super::super::policy::ModelTiers {
+                review: ModelTier::Local,
+                ..ProposalGeneratorPolicy::default().model_tiers
+            },
+            local: LocalConfig {
+                model: "qwen2.5-coder:7b".to_string(),
+                ..LocalConfig::default()
+            },
+            ..ProposalGeneratorPolicy::default()
+        };
 
         let captured: std::sync::Arc<std::sync::Mutex<Option<(Config, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -396,7 +413,7 @@ mod tests {
         });
 
         let node = ProposalReviewNode::new().with_transport(transport);
-        let ctx = empty_ctx(event);
+        let ctx = ctx_with_policy(event, &policy);
         node.process(ctx).await.expect("process should succeed");
 
         let (config, prompt) = captured.lock().unwrap().take().expect("transport called");

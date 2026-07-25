@@ -65,6 +65,14 @@ fn ctx_with_task(worktree: &std::path::Path, base_sha: Option<&str>) -> TaskCont
         setup["base_sha"] = json!(sha);
     }
     ctx.nodes.insert("SetupWorktreeNode".to_string(), setup);
+    // Required since task 8's strict `resolved_policy_strict` read (no more
+    // per-node re-resolution or silent `Default` fallback) — mirrors what a
+    // real run's dispatch/`SetupWorktreeNode` stamp would have seeded.
+    ctx.nodes.insert(
+        engine_core::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+        serde_json::to_value(engine_core::workflows::sdlc_flow::policy::SdlcPolicy::default())
+            .expect("SdlcPolicy serializes"),
+    );
 
     let mut state = SDLCState::new("write-permission-fixture");
     state

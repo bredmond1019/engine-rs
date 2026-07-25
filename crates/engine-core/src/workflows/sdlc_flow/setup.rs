@@ -265,8 +265,22 @@ impl Node for SetupWorktreeNode {
 
         put_result(&mut ctx, "SetupWorktreeNode", setup_result);
 
-        let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&worktree_path))?;
-        crate::policy::stamp_resolved_policy(&mut ctx, &resolved_policy)?;
+        // Idempotent: a served run's dispatch factory (`engine-serve`'s
+        // `seed_resolved_policy`, EN.5.D task 7) already resolved and seeded
+        // `RESOLVED_POLICY_IDENTITY` into `ctx.nodes` before this node ran —
+        // re-resolving here (against this process's cwd, not necessarily the
+        // run's eventual worktree) would clobber that dispatch-time
+        // resolution with a different `PolicyConfigSource`. Only resolve +
+        // stamp when the run reached this node with no policy seeded at all
+        // (in-tree/CLI-driven runs, and unit tests driving this node
+        // directly).
+        if !ctx
+            .nodes
+            .contains_key(crate::policy::RESOLVED_POLICY_IDENTITY)
+        {
+            let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&worktree_path))?;
+            crate::policy::stamp_resolved_policy(&mut ctx, &resolved_policy)?;
+        }
 
         Ok(ctx)
     }
@@ -1110,6 +1124,32 @@ mod tests {
             .expect("resolved policy present in ctx after setup");
         assert_eq!(policy["max_attempts"], 3);
         assert_eq!(policy["review_mode"], "per_task");
+    }
+
+    /// A policy already seeded at dispatch time (`engine-serve`'s
+    /// `seed_resolved_policy`, EN.5.D task 7) is not clobbered by
+    /// `SetupWorktreeNode`'s own resolution: the stamp is idempotent. Proven
+    /// by seeding a `max_attempts` value the built-in default (3) would
+    /// never produce and asserting it survives `process` untouched.
+    #[tokio::test]
+    async fn setup_worktree_node_does_not_clobber_a_policy_seeded_at_dispatch() {
+        let node = SetupWorktreeNode::new().with_runner(stub_runner(0));
+        let mut ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let seeded_policy = SdlcPolicy {
+            max_attempts: 99,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&seeded_policy).expect("SdlcPolicy serializes"),
+        );
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let policy = out
+            .nodes
+            .get(RESOLVED_POLICY_IDENTITY)
+            .expect("resolved policy present in ctx after setup");
+        assert_eq!(policy["max_attempts"], 99);
     }
 
     // --- GenerateTasksNode --------------------------------------------------

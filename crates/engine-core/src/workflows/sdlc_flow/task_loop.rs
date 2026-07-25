@@ -56,14 +56,16 @@ enum Stage {
     Review,
 }
 
-/// Read the resolved [`SdlcPolicy`] stamped by `SetupWorktreeNode`
-/// (`setup::RESOLVED_POLICY_IDENTITY`). Falls back to the built-in default
-/// (today's hardcoded behavior) when absent or unparsable — defensive, so a
-/// ctx driven directly in a unit test (no `SetupWorktreeNode` run) still
-/// gets sane behavior rather than an error. Delegates to the generic
-/// `crate::policy::resolved_policy::<SdlcPolicy>` (EN.4.0).
-fn resolved_policy(ctx: &TaskContext) -> SdlcPolicy {
-    crate::policy::resolved_policy::<SdlcPolicy>(ctx)
+/// Read the resolved [`SdlcPolicy`] stamped by dispatch (`engine-serve`'s
+/// `seed_resolved_policy`) or by `SetupWorktreeNode`
+/// (`setup::RESOLVED_POLICY_IDENTITY`). Fails loudly — `Err` — when the
+/// stamp is absent or unparsable, rather than silently falling back to a
+/// built-in default (task 8): a ctx driven directly in a unit test must now
+/// seed a policy explicitly (`ctx_with_policy`/`ctx_with_current_task`).
+/// Delegates to the generic `crate::policy::resolved_policy_strict::<SdlcPolicy>`
+/// (EN.4.0/EN.5.D).
+fn resolved_policy(ctx: &TaskContext) -> Result<SdlcPolicy, NodeError> {
+    crate::policy::resolved_policy_strict::<SdlcPolicy>(ctx)
 }
 
 /// Apply the resolved policy's model-tier + prompt-cache knobs to a stage's
@@ -396,7 +398,7 @@ impl Node for ImplementTaskNode {
              {description}\nAcceptance criteria: {acceptance_criteria}"
         );
 
-        let policy = resolved_policy(&ctx);
+        let policy = resolved_policy(&ctx)?;
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Implement);
         // Scope the model's session to the actual worktree so it edits the
@@ -1099,7 +1101,7 @@ impl Node for TriageTaskNode {
             .unwrap_or(false);
 
         if all_passed {
-            let policy = resolved_policy(&ctx);
+            let policy = resolved_policy(&ctx)?;
             let trivial = classify_trivial(&ctx, &self.runner, &policy);
             put_result(
                 &mut ctx,
@@ -1167,7 +1169,7 @@ impl Node for TriageTaskNode {
             attempt_count + 1
         );
 
-        let policy = resolved_policy(&ctx);
+        let policy = resolved_policy(&ctx)?;
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
         config.json_schema = Some(triage_output_schema());
@@ -1244,7 +1246,7 @@ impl Router for TriageRouterNode {
             //     `review_skip_max_diff_lines`) skips review; a non-trivial
             //     `PASS` still routes to `ConsolidatedReviewNode`.
             "PASS" => {
-                let policy = resolved_policy(ctx);
+                let policy = resolved_policy(ctx).ok()?;
                 match policy.review_mode {
                     ReviewMode::PerTask => Some("ConsolidatedReviewNode".to_string()),
                     ReviewMode::EndOnly => Some("UpdateTaskStatusNode".to_string()),
@@ -1369,7 +1371,7 @@ impl Node for ConsolidatedReviewNode {
              {acceptance_criteria}\n\nDiff:\n{diff}"
         );
 
-        let policy = resolved_policy(&ctx);
+        let policy = resolved_policy(&ctx)?;
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Review);
         // Scope the model's session to the actual worktree, matching
@@ -1798,6 +1800,11 @@ mod tests {
         ctx
     }
 
+    /// Builds a task-loop-ready `ctx` and stamps a default [`SdlcPolicy`]
+    /// under [`RESOLVED_POLICY_IDENTITY`] — required since task 8's strict
+    /// `resolved_policy_strict` read (no more silent `Default` fallback for
+    /// an unstamped ctx). Tests wanting a non-default policy call
+    /// `ctx_with_policy(ctx, &policy)` afterwards to overwrite this stamp.
     fn ctx_with_current_task(state: &SDLCState, task: &SDLCTask) -> TaskContext {
         let mut ctx = ctx_with_state(state);
         ctx.nodes.insert(
@@ -1810,6 +1817,10 @@ mod tests {
                 "attempt_count": task.attempt_count,
                 "max_attempts": task.max_attempts,
             }),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
         );
         ctx
     }
@@ -1980,6 +1991,14 @@ mod tests {
             ctx.nodes.insert(
                 "TriageTaskNode".to_string(),
                 json!({ "verdict": verdict, "reason": "r" }),
+            );
+            // The `PASS` branch reads the resolved policy's `review_mode`
+            // (task 8's `resolved_policy_strict` — no more silent `Default`
+            // fallback), so this ctx must carry a stamp even though the
+            // other two verdicts never touch it.
+            ctx.nodes.insert(
+                RESOLVED_POLICY_IDENTITY.to_string(),
+                serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
             );
             assert_eq!(router.route(&ctx), Some(expected.to_string()));
         }

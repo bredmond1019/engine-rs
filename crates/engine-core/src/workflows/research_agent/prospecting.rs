@@ -5,8 +5,9 @@
 //! `crate::nodes::claude_code_step::ClaudeCodeStep`, ported from
 //! `orchestrator`'s reddit-prospecting-inspired research flow and broadened
 //! onto the EN.4.0 policy framework. On `process`:
-//! 1. resolve the run's [`super::policy::ResearchAgentPolicy`] via
-//!    [`super::profiles::resolve_policy_for_run`];
+//! 1. read the run's [`super::policy::ResearchAgentPolicy`] stamped once at
+//!    dispatch (`crate::policy::resolved_policy_strict`, EN.5.D task 8) —
+//!    no per-node re-resolution;
 //! 2. apply `prospect`-stage shaping (model tier, prompt cache, verbosity
 //!    directive) to the composed `Config`;
 //! 3. await the (injectable) transport and parse its reply into a
@@ -28,7 +29,6 @@ use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
 use super::policy::{ModelTier, ResearchAgentPolicy};
-use super::profiles::resolve_policy_for_run;
 use super::schema::{prospecting_result_json_schema, ProspectingResult, ResearchAgentEventSchema};
 
 /// The `Node::name()` identity `ProspectingResearchNode` runs its composed
@@ -97,12 +97,13 @@ fn build_prompt(event: &ResearchAgentEventSchema) -> String {
 }
 
 /// Read the worktree path stamped by an upstream setup node, if this run
-/// went through one. `RESEARCH_AGENT` has no dedicated setup node (per the
-/// spec's Context Pointers — the two terminal nodes resolve their own
-/// policy), so this is best-effort: absent, [`persist_state`] falls back to
-/// the process's current working directory, and a ctx driven directly in a
-/// unit test (no upstream node at all) still resolves *some* path rather
-/// than failing `process`.
+/// went through one. `RESEARCH_AGENT` has no dedicated setup node, so this
+/// is best-effort — used only by [`persist_state`] to locate
+/// `planning/research-agent-state.json`, not for policy resolution (task
+/// 8's stamped-policy read needs no path at all): absent, [`persist_state`]
+/// falls back to the process's current working directory, and a ctx driven
+/// directly in a unit test (no upstream node at all) still resolves *some*
+/// path rather than failing `process`.
 fn worktree_path(ctx: &TaskContext) -> PathBuf {
     get_result(ctx, "SetupWorktreeNode")
         .and_then(|value| value.get("worktree_path"))
@@ -184,7 +185,7 @@ impl Node for ProspectingResearchNode {
         let event = parse_event(&ctx)?;
         let worktree = worktree_path(&ctx);
 
-        let policy = resolve_policy_for_run(&ctx, &worktree)?;
+        let policy: ResearchAgentPolicy = crate::policy::resolved_policy_strict(&ctx)?;
 
         let mut config = self.config.clone();
         config = crate::policy::apply_model_tier(
@@ -270,13 +271,22 @@ mod tests {
     use super::super::schema::ResearchMode;
     use super::*;
 
+    /// Builds a `ctx` and stamps a default [`ResearchAgentPolicy`] under
+    /// `RESOLVED_POLICY_IDENTITY` — required since task 8's strict
+    /// `resolved_policy_strict` read (no more per-node re-resolution or a
+    /// silent `Default` fallback).
     fn empty_ctx(event: ResearchAgentEventSchema) -> TaskContext {
-        TaskContext {
+        let mut ctx = TaskContext {
             event: serde_json::to_value(event).unwrap(),
             nodes: HashMap::new(),
             metadata: serde_json::json!({}),
             node_runs: HashMap::new(),
-        }
+        };
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(ResearchAgentPolicy::default()).expect("policy serializes"),
+        );
+        ctx
     }
 
     fn prospecting_event() -> ResearchAgentEventSchema {
@@ -390,16 +400,20 @@ mod tests {
 
     #[tokio::test]
     async fn process_applies_tier_cache_and_verbosity_shaping() {
-        let mut event = prospecting_event();
-        event.policy = Some(super::super::policy::PartialResearchAgentPolicy {
-            output_verbosity: Some(super::super::policy::OutputVerbosity::Terse),
-            prompt_cache: Some(true),
-            model_tiers: Some(super::super::policy::PartialModelTiers {
-                prospect: Some(ModelTier::Opus),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
+        // Task 8: the node reads a policy already resolved (event override
+        // merged in) and stamped at dispatch — it no longer re-merges
+        // `event.policy` itself, so this test stamps the *already-merged*
+        // final policy directly rather than an `event.policy` override.
+        let event = prospecting_event();
+        let policy = ResearchAgentPolicy {
+            output_verbosity: super::super::policy::OutputVerbosity::Terse,
+            prompt_cache: true,
+            model_tiers: super::super::policy::ModelTiers {
+                prospect: ModelTier::Opus,
+                ..ResearchAgentPolicy::default().model_tiers
+            },
+            ..ResearchAgentPolicy::default()
+        };
 
         let captured: std::sync::Arc<std::sync::Mutex<Option<(Config, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -430,6 +444,10 @@ mod tests {
         ctx.nodes.insert(
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
         );
         node.process(ctx).await.expect("process should succeed");
 

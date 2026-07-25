@@ -4,8 +4,9 @@
 //!
 //! A non-terminal model node wrapping `crate::nodes::claude_code_step::ClaudeCodeStep`.
 //! On `process`:
-//! 1. resolve the run's [`super::policy::ProposalGeneratorPolicy`] via
-//!    [`super::profiles::resolve_policy_for_run`];
+//! 1. read the run's [`super::policy::ProposalGeneratorPolicy`] stamped once
+//!    at dispatch (`crate::policy::resolved_policy_strict`, EN.5.D task 8)
+//!    — no per-node re-resolution;
 //! 2. apply `research`-stage shaping (model tier, prompt cache, verbosity
 //!    directive) to the composed `Config` — WebSearch/WebFetch stay granted
 //!    regardless of tier (this stage never resolves to `ModelTier::Local`,
@@ -18,17 +19,15 @@
 //! 4. stamp the parsed brief + usage onto `ctx` and forward to
 //!    `OpportunityIdentifierNode`.
 
-use std::path::PathBuf;
-
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
 
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::workflows::research_agent::schema::{company_brief_json_schema, CompanyBrief};
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{parse_structured_or_fenced, put_result, ModelTransport};
 
-use super::profiles::resolve_policy_for_run;
+use super::policy::ProposalGeneratorPolicy;
 use super::schema::ProposalGeneratorEventSchema;
 
 /// The `Node::name()` identity `ProposalCompanyResearchNode` runs its
@@ -80,20 +79,6 @@ fn build_prompt(event: &ProposalGeneratorEventSchema) -> String {
     )
 }
 
-/// Read the worktree path stamped by an upstream setup node, if this run
-/// went through one. `PROPOSAL_GENERATOR` has no dedicated setup node — this
-/// is best-effort: absent, `resolve_policy_for_run` falls back to the
-/// process's current working directory (mirrors
-/// `research_agent::company_research::worktree_path`).
-fn worktree_path(ctx: &TaskContext) -> PathBuf {
-    get_result(ctx, "SetupWorktreeNode")
-        .and_then(|value| value.get("worktree_path"))
-        .and_then(|value| value.as_str())
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 /// The WebSearch-backed `research`-stage entry node of the
 /// `PROPOSAL_GENERATOR` pipeline. Forwards to `OpportunityIdentifierNode`.
 pub struct ProposalCompanyResearchNode {
@@ -137,9 +122,7 @@ impl Default for ProposalCompanyResearchNode {
 impl Node for ProposalCompanyResearchNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let event = parse_event(&ctx)?;
-        let worktree = worktree_path(&ctx);
-
-        let policy = resolve_policy_for_run(&ctx, &worktree)?;
+        let policy: ProposalGeneratorPolicy = crate::policy::resolved_policy_strict(&ctx)?;
 
         let mut config = self.config.clone();
         config = crate::policy::apply_model_tier(
@@ -199,16 +182,25 @@ mod tests {
     use futures::FutureExt;
     use serde_json::json;
 
-    use super::super::policy::{ModelTier, PartialModelTiers, PartialProposalGeneratorPolicy};
+    use super::super::policy::ModelTier;
     use super::*;
 
+    /// Builds a `ctx` and stamps a default [`ProposalGeneratorPolicy`] under
+    /// `RESOLVED_POLICY_IDENTITY` — required since task 8's strict
+    /// `resolved_policy_strict` read (no more per-node re-resolution or a
+    /// silent `Default` fallback).
     fn empty_ctx(event: ProposalGeneratorEventSchema) -> TaskContext {
-        TaskContext {
+        let mut ctx = TaskContext {
             event: serde_json::to_value(event).unwrap(),
             nodes: HashMap::new(),
             metadata: serde_json::json!({}),
             node_runs: HashMap::new(),
-        }
+        };
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(ProposalGeneratorPolicy::default()).expect("policy serializes"),
+        );
+        ctx
     }
 
     fn company_event() -> ProposalGeneratorEventSchema {
@@ -297,16 +289,20 @@ mod tests {
 
     #[tokio::test]
     async fn process_applies_tier_cache_and_verbosity_shaping() {
-        let mut event = company_event();
-        event.policy = Some(PartialProposalGeneratorPolicy {
-            output_verbosity: Some(super::super::policy::OutputVerbosity::Terse),
-            prompt_cache: Some(true),
-            model_tiers: Some(PartialModelTiers {
-                research: Some(ModelTier::Opus),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
+        // Task 8: the node reads a policy already resolved (event override
+        // merged in) and stamped at dispatch — it no longer re-merges
+        // `event.policy` itself, so this test stamps the *already-merged*
+        // final policy directly rather than an `event.policy` override.
+        let event = company_event();
+        let policy = ProposalGeneratorPolicy {
+            output_verbosity: super::super::policy::OutputVerbosity::Terse,
+            prompt_cache: true,
+            model_tiers: super::super::policy::ModelTiers {
+                research: ModelTier::Opus,
+                ..ProposalGeneratorPolicy::default().model_tiers
+            },
+            ..ProposalGeneratorPolicy::default()
+        };
 
         let captured: std::sync::Arc<std::sync::Mutex<Option<(Config, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -333,7 +329,11 @@ mod tests {
         });
 
         let node = ProposalCompanyResearchNode::new().with_transport(transport);
-        let ctx = empty_ctx(event);
+        let mut ctx = empty_ctx(event);
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
         node.process(ctx).await.expect("process should succeed");
 
         let (config, prompt) = captured.lock().unwrap().take().expect("transport called");

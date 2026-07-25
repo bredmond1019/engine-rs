@@ -292,13 +292,14 @@ fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
         .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))
 }
 
-/// Read the resolved `SdlcPolicy` stamped by `SetupWorktreeNode`
-/// (`setup::RESOLVED_POLICY_IDENTITY`). Falls back to the built-in default
-/// when absent or unparsable — the same defensive fallback `task_loop.rs`
-/// uses. Delegates to the generic `crate::policy::resolved_policy::<SdlcPolicy>`
-/// (EN.4.0).
-fn resolved_policy(ctx: &TaskContext) -> SdlcPolicy {
-    crate::policy::resolved_policy::<SdlcPolicy>(ctx)
+/// Read the resolved `SdlcPolicy` stamped by dispatch or by
+/// `SetupWorktreeNode` (`setup::RESOLVED_POLICY_IDENTITY`). Fails loudly —
+/// `Err` — when the stamp is absent or unparsable, rather than silently
+/// falling back to a built-in default (task 8): a ctx driven directly in a
+/// unit test must now seed a policy explicitly. Delegates to the generic
+/// `crate::policy::resolved_policy_strict::<SdlcPolicy>` (EN.4.0/EN.5.D).
+fn resolved_policy(ctx: &TaskContext) -> Result<SdlcPolicy, NodeError> {
+    crate::policy::resolved_policy_strict::<SdlcPolicy>(ctx)
 }
 
 /// Sum of every task's attempts beyond its first — total retries triggered
@@ -415,7 +416,7 @@ impl Node for WrapUpNode {
         let mut state = latest_state(&ctx)?;
         let date = (self.clock)();
 
-        let policy = resolved_policy(&ctx);
+        let policy = resolved_policy(&ctx)?;
         let outcomes = finalize_outcomes(&ctx, &state, &policy, Utc::now());
         state.policy = Some(policy);
         state.outcomes = Some(outcomes);
@@ -522,6 +523,12 @@ mod tests {
         Arc::new(move || date.to_string())
     }
 
+    /// Builds a `WrapUpNode`-ready `ctx` and stamps a default [`SdlcPolicy`]
+    /// under [`RESOLVED_POLICY_IDENTITY`] — required since task 8's strict
+    /// `resolved_policy_strict` read (no more silent `Default` fallback for
+    /// an unstamped ctx). Tests wanting a non-default policy insert their
+    /// own `RESOLVED_POLICY_IDENTITY` entry afterwards, overwriting this
+    /// stamp.
     fn ctx_with_state(state: &SDLCState) -> TaskContext {
         let mut ctx = TaskContext {
             event: json!({ "spec_slug": state.spec_slug }),
@@ -532,6 +539,10 @@ mod tests {
         ctx.nodes.insert(
             "UpdateTaskStatusNode".to_string(),
             serde_json::to_value(state).unwrap(),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
         );
         ctx
     }
@@ -613,6 +624,11 @@ mod tests {
             "LoadTaskStateNode".to_string(),
             serde_json::to_value(&state).unwrap(),
         );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(crate::workflows::sdlc_flow::policy::SdlcPolicy::default())
+                .expect("SdlcPolicy serializes"),
+        );
 
         let node = WrapUpNode::new().with_clock(fixed_clock("2026-01-01"));
         let out = node.process(ctx).await.expect("process should succeed");
@@ -673,8 +689,13 @@ mod tests {
         assert_eq!(outcomes.model_tier_used["implement"], "sonnet");
     }
 
+    /// Task 8 deleted the lenient `Default`-fallback read — every `ctx`
+    /// (including `ctx_with_state`'s own fixture stamp) now carries an
+    /// explicit policy. This still exercises the built-in-default *values*
+    /// end to end, just via an explicit stamp rather than a silent
+    /// fallback.
     #[tokio::test]
-    async fn wrap_up_falls_back_to_default_policy_when_none_stamped() {
+    async fn wrap_up_uses_explicitly_stamped_default_policy() {
         let state = SDLCState::new("EN.3.C-tunable-run-policy-telemetry");
         let ctx = ctx_with_state(&state);
 

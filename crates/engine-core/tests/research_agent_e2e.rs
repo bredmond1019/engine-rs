@@ -153,6 +153,18 @@ fn set_worktree(ctx: &mut TaskContext, worktree: &Path) {
     );
 }
 
+/// Resolve `ctx.event`'s policy (built-in + `harness.json` + named
+/// `profile:` + inline `policy` override, high->low precedence) and stamp it
+/// under `RESOLVED_POLICY_IDENTITY` — the same seeding `engine-serve`'s
+/// dispatch factory performs before a real node ever sees the `ctx` (EN.5.D
+/// task 8: nodes no longer re-resolve inside `process()`, so this hermetic
+/// harness must replicate dispatch's resolve-once step itself).
+fn stamp_resolved_policy(ctx: &mut TaskContext, worktree: &Path) {
+    let resolved = profiles::resolve_policy_for_run(ctx, worktree)
+        .expect("RESEARCH_AGENT policy should resolve for this event");
+    policy::stamp_resolved_policy(ctx, &resolved).expect("policy should stamp");
+}
+
 /// Drives the full logical `RESEARCH_AGENT` walk against the exact node
 /// instances a real `Workflow` built from [`build_registry`] would use:
 /// `ResearchModeRouterNode::route` picks the terminal identity from
@@ -169,6 +181,7 @@ async fn drive(event: serde_json::Value, worktree: &Path) -> (String, TaskContex
         node_runs: HashMap::new(),
     };
     set_worktree(&mut ctx, worktree);
+    stamp_resolved_policy(&mut ctx, worktree);
 
     let router = registry
         .get("ResearchModeRouterNode")

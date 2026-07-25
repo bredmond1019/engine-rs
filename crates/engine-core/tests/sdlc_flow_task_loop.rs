@@ -50,7 +50,8 @@ use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
 use engine_core::workflows::sdlc_flow::graph;
 use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
 use engine_core::workflows::sdlc_flow::setup::{
-    CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode, SpecExistsRouterNode,
+    resolve_policy_for_run, CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode,
+    SpecExistsRouterNode,
 };
 use engine_core::workflows::sdlc_flow::task_loop::{
     ConsolidatedReviewNode, ImplementTaskNode, IncrementAttemptNode, ReviewRouterNode,
@@ -64,7 +65,11 @@ use serde_json::json;
 /// temp-dir `worktree_path` (and a fixed `branch_name`) directly, so no real
 /// `git worktree add` runs and downstream nodes (`LoadTaskStateNode`,
 /// `TestTaskNode`, `SaveStateNode`) resolve paths under a directory this
-/// test owns and can inspect.
+/// test owns and can inspect. Still resolves + stamps
+/// `RESOLVED_POLICY_IDENTITY` (EN.5.D task 8: downstream task-loop/wrap-up
+/// nodes now read the stamp strictly, no per-node re-resolution or silent
+/// `Default` fallback), the same as the real `SetupWorktreeNode::process`
+/// does.
 struct FixtureSetupNode {
     worktree_path: String,
 }
@@ -79,6 +84,10 @@ impl Node for FixtureSetupNode {
                 "branch_name": "sdlc/fixture-spec",
             }),
         );
+
+        let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&self.worktree_path))?;
+        engine_core::policy::stamp_resolved_policy(&mut ctx, &resolved_policy)?;
+
         Ok(ctx)
     }
 
