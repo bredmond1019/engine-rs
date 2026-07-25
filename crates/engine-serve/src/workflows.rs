@@ -33,11 +33,26 @@ pub fn register_research_agent(dispatcher: &mut Dispatcher) {
     );
 }
 
-/// Register every builtin workflow known to this crate: `SDLC_FLOW` and
-/// `RESEARCH_AGENT`; future builtins register here too.
+/// Register the `DIAGNOSTIC_INTAKE` workflow
+/// (`engine_core::workflows::diagnostic_intake`) with `dispatcher`,
+/// populating both the `workflow_registry` (via
+/// `diagnostic_intake::graph::workflow`) and the `schema_registry` (via
+/// `diagnostic_intake::graph::schema`). See
+/// `planning/EN.4.B-diagnostic-intake/tasks.md`, Task 6.
+pub fn register_diagnostic_intake(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::diagnostic_intake::graph::schema(),
+        Box::new(engine_core::workflows::diagnostic_intake::graph::workflow),
+    );
+}
+
+/// Register every builtin workflow known to this crate: `SDLC_FLOW`,
+/// `RESEARCH_AGENT`, and `DIAGNOSTIC_INTAKE`; future builtins register here
+/// too.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_sdlc_flow(dispatcher);
     register_research_agent(dispatcher);
+    register_diagnostic_intake(dispatcher);
 }
 
 #[cfg(test)]
@@ -118,5 +133,35 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("RESEARCH_AGENT"));
+    }
+
+    #[test]
+    fn register_diagnostic_intake_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_diagnostic_intake(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("DIAGNOSTIC_INTAKE"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_intake_extract_node_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_diagnostic_intake(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("DIAGNOSTIC_INTAKE")
+            .expect("DIAGNOSTIC_INTAKE schema should resolve");
+
+        assert_eq!(schema.start_node, "IntakeExtractNode");
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_diagnostic_intake() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("DIAGNOSTIC_INTAKE"));
     }
 }
