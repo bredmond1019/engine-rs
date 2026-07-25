@@ -16,11 +16,19 @@
 //! `crate::policy::resolve::resolve`. `OutputVerbosity`/`ModelTier`/
 //! `LocalConfig` are re-exported from `crate::policy::tier` (byte-identical
 //! serde reprs to the pre-hoist types) rather than redefined here.
+//!
+//! **EN.5.D task 2:** the hand-written `merge_opt`/`merge_local`/
+//! `apply_override` trio is gone — `local: LocalConfig` merges via the
+//! shared `crate::policy::Overlay` surface (`policy::overlay`), and the
+//! top-level field merge is inlined directly into `Policy::apply` rather
+//! than a private free function.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity};
+pub use crate::policy::PartialLocalConfig;
+use crate::policy::{merge_opt, Overlay};
 
 /// How the review gate is applied across a run's tasks (lever #3a).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,15 +156,6 @@ pub struct PartialModelTiers {
     pub generate: Option<ModelTier>,
 }
 
-/// All-optional mirror of [`LocalConfig`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PartialLocalConfig {
-    pub endpoint: Option<String>,
-    pub model: Option<String>,
-    pub constrained_json: Option<bool>,
-}
-
 /// All-optional mirror of [`CloseOutReuse`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -171,10 +170,6 @@ pub struct PartialCloseOutReuse {
 #[serde(default)]
 pub struct PartialCloseOut {
     pub reuse: Option<PartialCloseOutReuse>,
-}
-
-fn merge_opt<T>(lower: T, higher: Option<T>) -> T {
-    higher.unwrap_or(lower)
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -192,19 +187,6 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
     }
     if let Some(v) = over.generate {
         base.generate = v;
-    }
-    base
-}
-
-fn merge_local(mut base: LocalConfig, over: &PartialLocalConfig) -> LocalConfig {
-    if let Some(v) = &over.endpoint {
-        base.endpoint = v.clone();
-    }
-    if let Some(v) = &over.model {
-        base.model = v.clone();
-    }
-    if let Some(v) = over.constrained_json {
-        base.constrained_json = v;
     }
     base
 }
@@ -233,40 +215,40 @@ impl crate::policy::Policy for SdlcPolicy {
     type Partial = PartialPolicy;
 
     /// Apply one override layer on top of `self`, field-by-field (`Some` in
-    /// `over` wins, `None` falls through to `self`) — the existing
-    /// `apply_override` body, unchanged.
+    /// `over` wins, `None` falls through to `self`).
     fn apply(self, over: &PartialPolicy) -> Self {
-        apply_override(self, over)
-    }
-}
-
-/// Apply one override layer on top of a `base` policy, field-by-field
-/// (`Some` in `over` wins, `None` falls through to `base`).
-fn apply_override(base: SdlcPolicy, over: &PartialPolicy) -> SdlcPolicy {
-    SdlcPolicy {
-        output_verbosity: merge_opt(base.output_verbosity, over.output_verbosity),
-        prompt_cache: merge_opt(base.prompt_cache, over.prompt_cache),
-        review_mode: merge_opt(base.review_mode, over.review_mode),
-        review_skip_max_files: merge_opt(base.review_skip_max_files, over.review_skip_max_files),
-        review_skip_max_diff_lines: merge_opt(
-            base.review_skip_max_diff_lines,
-            over.review_skip_max_diff_lines,
-        ),
-        model_tiers: match &over.model_tiers {
-            Some(mt) => merge_model_tiers(base.model_tiers, mt),
-            None => base.model_tiers,
-        },
-        local: match &over.local {
-            Some(l) => merge_local(base.local, l),
-            None => base.local,
-        },
-        simple_task_max_files: merge_opt(base.simple_task_max_files, over.simple_task_max_files),
-        llm_triage: merge_opt(base.llm_triage, over.llm_triage),
-        max_attempts: merge_opt(base.max_attempts, over.max_attempts),
-        close_out: match &over.close_out {
-            Some(co) => merge_close_out(base.close_out, co),
-            None => base.close_out,
-        },
+        let base = self;
+        SdlcPolicy {
+            output_verbosity: merge_opt(base.output_verbosity, over.output_verbosity),
+            prompt_cache: merge_opt(base.prompt_cache, over.prompt_cache),
+            review_mode: merge_opt(base.review_mode, over.review_mode),
+            review_skip_max_files: merge_opt(
+                base.review_skip_max_files,
+                over.review_skip_max_files,
+            ),
+            review_skip_max_diff_lines: merge_opt(
+                base.review_skip_max_diff_lines,
+                over.review_skip_max_diff_lines,
+            ),
+            model_tiers: match &over.model_tiers {
+                Some(mt) => merge_model_tiers(base.model_tiers, mt),
+                None => base.model_tiers,
+            },
+            local: match &over.local {
+                Some(l) => base.local.overlay(l),
+                None => base.local,
+            },
+            simple_task_max_files: merge_opt(
+                base.simple_task_max_files,
+                over.simple_task_max_files,
+            ),
+            llm_triage: merge_opt(base.llm_triage, over.llm_triage),
+            max_attempts: merge_opt(base.max_attempts, over.max_attempts),
+            close_out: match &over.close_out {
+                Some(co) => merge_close_out(base.close_out, co),
+                None => base.close_out,
+            },
+        }
     }
 }
 

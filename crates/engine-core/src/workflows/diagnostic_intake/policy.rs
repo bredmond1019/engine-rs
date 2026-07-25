@@ -17,6 +17,8 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity};
+pub use crate::policy::PartialLocalConfig;
+use crate::policy::{merge_opt, Overlay};
 
 /// Per-stage model tier assignment. `DIAGNOSTIC_INTAKE` has exactly one
 /// stage: the terminal `IntakeExtractNode`.
@@ -70,15 +72,6 @@ pub struct PartialModelTiers {
     pub extract: Option<ModelTier>,
 }
 
-/// All-optional mirror of [`LocalConfig`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PartialLocalConfig {
-    pub endpoint: Option<String>,
-    pub model: Option<String>,
-    pub constrained_json: Option<bool>,
-}
-
 /// All-optional mirror of [`DiagnosticIntakePolicy`] used by the override
 /// layers (`harness.json`'s `diagnostic_intake.policy`, a named `profile`,
 /// and a per-run event's `policy` field). Every field left `None` falls
@@ -92,26 +85,9 @@ pub struct PartialDiagnosticIntakePolicy {
     pub local: Option<PartialLocalConfig>,
 }
 
-fn merge_opt<T>(lower: T, higher: Option<T>) -> T {
-    higher.unwrap_or(lower)
-}
-
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
     if let Some(v) = over.extract {
         base.extract = v;
-    }
-    base
-}
-
-fn merge_local(mut base: LocalConfig, over: &PartialLocalConfig) -> LocalConfig {
-    if let Some(v) = &over.endpoint {
-        base.endpoint = v.clone();
-    }
-    if let Some(v) = &over.model {
-        base.model = v.clone();
-    }
-    if let Some(v) = over.constrained_json {
-        base.constrained_json = v;
     }
     base
 }
@@ -122,27 +98,19 @@ impl crate::policy::Policy for DiagnosticIntakePolicy {
     /// Apply one override layer on top of `self`, field-by-field (`Some` in
     /// `over` wins, `None` falls through to `self`).
     fn apply(self, over: &PartialDiagnosticIntakePolicy) -> Self {
-        apply_override(self, over)
-    }
-}
-
-/// Apply one override layer on top of a `base` policy, field-by-field
-/// (`Some` in `over` wins, `None` falls through to `base`).
-fn apply_override(
-    base: DiagnosticIntakePolicy,
-    over: &PartialDiagnosticIntakePolicy,
-) -> DiagnosticIntakePolicy {
-    DiagnosticIntakePolicy {
-        output_verbosity: merge_opt(base.output_verbosity, over.output_verbosity),
-        prompt_cache: merge_opt(base.prompt_cache, over.prompt_cache),
-        model_tiers: match &over.model_tiers {
-            Some(mt) => merge_model_tiers(base.model_tiers, mt),
-            None => base.model_tiers,
-        },
-        local: match &over.local {
-            Some(l) => merge_local(base.local, l),
-            None => base.local,
-        },
+        let base = self;
+        DiagnosticIntakePolicy {
+            output_verbosity: merge_opt(base.output_verbosity, over.output_verbosity),
+            prompt_cache: merge_opt(base.prompt_cache, over.prompt_cache),
+            model_tiers: match &over.model_tiers {
+                Some(mt) => merge_model_tiers(base.model_tiers, mt),
+                None => base.model_tiers,
+            },
+            local: match &over.local {
+                Some(l) => base.local.overlay(l),
+                None => base.local,
+            },
+        }
     }
 }
 
