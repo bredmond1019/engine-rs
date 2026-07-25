@@ -16,6 +16,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout claude-code-rs
+        uses: actions/checkout@v4
+        with:
+          repository: bredmond1019/claude-code-rs
+          path: ../claude-code-rs
+
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
