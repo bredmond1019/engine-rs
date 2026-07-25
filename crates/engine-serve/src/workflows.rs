@@ -46,13 +46,27 @@ pub fn register_diagnostic_intake(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `PROPOSAL_GENERATOR` workflow
+/// (`engine_core::workflows::proposal_generator`) with `dispatcher`,
+/// populating both the `workflow_registry` (via
+/// `proposal_generator::graph::workflow`) and the `schema_registry` (via
+/// `proposal_generator::graph::schema`). See
+/// `planning/EN.4.C-proposal-generator/tasks.md`, Task 10.
+pub fn register_proposal_generator(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::proposal_generator::graph::schema(),
+        Box::new(engine_core::workflows::proposal_generator::graph::workflow),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
-/// `RESEARCH_AGENT`, and `DIAGNOSTIC_INTAKE`; future builtins register here
-/// too.
+/// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, and `PROPOSAL_GENERATOR`; future
+/// builtins register here too.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_sdlc_flow(dispatcher);
     register_research_agent(dispatcher);
     register_diagnostic_intake(dispatcher);
+    register_proposal_generator(dispatcher);
 }
 
 #[cfg(test)]
@@ -163,5 +177,35 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("DIAGNOSTIC_INTAKE"));
+    }
+
+    #[test]
+    fn register_proposal_generator_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_proposal_generator(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("PROPOSAL_GENERATOR"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_company_research_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_proposal_generator(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("PROPOSAL_GENERATOR")
+            .expect("PROPOSAL_GENERATOR schema should resolve");
+
+        assert_eq!(schema.start_node, "ProposalCompanyResearchNode");
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_proposal_generator() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("PROPOSAL_GENERATOR"));
     }
 }

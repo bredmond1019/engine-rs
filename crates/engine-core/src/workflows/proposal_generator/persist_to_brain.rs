@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(body["section"], json!("full"));
         assert_eq!(body["roadmap"], sample_roadmap_json());
         assert!(body["content"].as_str().unwrap().contains("Loja da Ana"));
-        assert!(body["artifact_id"].as_str().unwrap().len() > 0);
+        assert!(!body["artifact_id"].as_str().unwrap().is_empty());
 
         let result = &ctx.nodes[NODE_NAME];
         assert_eq!(result["posted"], json!(true));
