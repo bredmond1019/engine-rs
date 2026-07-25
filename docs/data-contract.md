@@ -181,12 +181,13 @@ The canonical contract's v1.3.0 adds two more routes, `POST /ingest/proposal` an
 (`app/api/` — mounted beside `/events`, `/health`, `/workflows`) — **not** in `engine-serve`, and
 not planned to be: these are ingest-direction routes engine-rs *calls*, not routes it needs to
 serve for runtime interchangeability. `/ingest/proposal` is pinned exactly to the payload
-`EN.4.C`'s `PersistToBrainNode` (see `planning/master-plan.md` § EN.4.C; not yet built) already
-asserts against a stub — `{ artifact_id, company_name, doc_type, section, content, roadmap }` —
+`EN.4.C`'s `PersistToBrainNode` (`crates/engine-core/src/workflows/proposal_generator/persist_to_brain.rs`,
+built) asserts against a stub — `{ artifact_id, company_name, doc_type, section, content, roadmap }` —
 returning `200 { artifact_id, chunks_written }`; both routes reuse the same `X-API-Key` gate as
 `POST /events/` and reject a malformed body with a typed `422` (never `500`). `PersistToBrainNode`
-now has a live target to POST to instead of its `HttpPost` stub; wiring it up is `EN.4.C`'s own
-follow-on work, not this re-pin.
+now has a live target to POST to instead of its `HttpPost` stub, but still POSTs to a hardcoded
+placeholder `BRAIN_INGEST_URL` constant rather than this route — pointing it at the real Synapse
+`/ingest/proposal` endpoint is unfinished follow-on work (see `planning/decisions/D9-engine-brain-boundary.md`).
 
 ---
 
@@ -211,4 +212,4 @@ follow-on work, not this re-pin.
 | 1.0.1 | 2026-07-02 | Retroactive: `engine-contract`'s types (`EventsRow`, `TaskContext`, `NodeRun`, `NodeRunStatus`, `Usage`) were built matching canonical 1.0.1 during EN.0.B, but this consumer doc did not exist yet (Gap 2, `core/_planning/engine-rs/orchestrator-contract-conformance/notes.md`). Backfilled here rather than left undocumented. |
 | 1.1.0 | 2026-07-16 | Re-pin to 1.1.0. Registers the canonical's v1.1.0 additions, both introduced by engine-rs's own EN.2.B: `POST /events/{run_id}/abort` (§ HTTP surface parity above) and the `metadata.cancellation` / `metadata.budget` run-level annotations (§ above). No `engine_contract` Rust type changed shape — both additions live in the existing `TaskContext::metadata: serde_json::Value` free-form field, per D6. |
 | 1.2.0 | 2026-07-24 | Re-pin from 1.1.0 to 1.2.0 (`OR.Y`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.2.0 additions, none yet ported to `engine-serve`: the orchestrator's own `GET /events/{event_id}` read route and the `event_id` field on `POST /events/`'s 202 body (§ HTTP surface parity above), and the `metadata.failure` run-level annotation (§ Run-level `metadata` annotations above). No `engine_contract` Rust type changed shape — `metadata.failure` lives in the existing free-form `metadata` field, per D6. Porting the read route and `event_id` field to `engine-serve` for HTTP-surface parity is future work. |
-| 1.3.0 | 2026-07-24 | Re-pin from 1.2.0 to 1.3.0 (`OR.Q`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.3.0 additions, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact`, both `X-API-Key` gated with a typed `422` on malformed bodies. `/ingest/proposal` gives `EN.4.C`'s (not yet built) `PersistToBrainNode` a live endpoint matching the payload it already stubs — `{artifact_id, company_name, doc_type, section, content, roadmap}` → `200 {artifact_id, chunks_written}`. No `engine_contract` Rust type changed shape; these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. Wiring `PersistToBrainNode` to POST here for real is `EN.4.C`'s own follow-on work. |
+| 1.3.0 | 2026-07-24 | Re-pin from 1.2.0 to 1.3.0 (`OR.Q`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.3.0 additions, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact`, both `X-API-Key` gated with a typed `422` on malformed bodies. `/ingest/proposal` gives `EN.4.C`'s `PersistToBrainNode` a live endpoint matching the payload it already stubs — `{artifact_id, company_name, doc_type, section, content, roadmap}` → `200 {artifact_id, chunks_written}`. No `engine_contract` Rust type changed shape; these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. `EN.4.C` (built, see [proposal-generator-workflow.md](proposal-generator-workflow.md)) still POSTs to a hardcoded placeholder URL rather than this route; wiring `PersistToBrainNode` to POST here for real remains open follow-on work. |

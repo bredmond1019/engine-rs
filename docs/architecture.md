@@ -42,7 +42,10 @@ engine-rs/
 │   │                         + pre-dispatch check() gate, EN.2.B), nodes/ (claude_code_step.rs —
 │   │                         ClaudeCodeStep, a reusable Node wrapping core/claude-code-rs's
 │   │                         execute(), EN.2.A; now cancellation-aware via
-│   │                         with_cancellation_token(), EN.2.B)
+│   │                         with_cancellation_token(), EN.2.B; http_post.rs — the injectable
+                         `HttpPost` trait seam + `reqwest`-backed live impl + `StubHttpPost` test
+                         double, EN.4.C, used by `proposal_generator::PersistToBrainNode` to POST
+                         a finished artifact to Synapse's brain-ingest endpoint)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
