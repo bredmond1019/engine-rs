@@ -16,6 +16,28 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-25]
+
+### `EN.4.C-proposal-generator` done — PROPOSAL_GENERATOR (policy-aware, PersistToBrainNode HTTP push)
+- **What:** Ran `/sdlc-flow EN.4.C-proposal-generator` (branch `EN.4.C-proposal-generator-flow`); all 12 tasks passed. Task 1 fixed pre-existing `cargo fmt` violations in an examples file and scaffolded the `proposal_generator` workflow module (mod.rs + eight sibling files, `WORKFLOW_TYPE = "PROPOSAL_GENERATOR"`). Task 2 added a new injectable `HttpPost` seam (trait + reqwest-backed live impl + `StubHttpPost`) in `nodes/http_post.rs` for the engine→brain boundary. Task 3 added `ProposalGeneratorPolicy`/`PartialProposalGeneratorPolicy` on the EN.4.0 `Policy` trait across five stages (research/opportunity/writer/review/revise) with a domain-specific `ReviewMode` (`Full`/`Skip`) knob. Task 4 filled `schema.rs` with the four-section `AutomationRoadmap` deliverable, composite/sort/≤3-profile validators, and `automation_roadmap_json_schema()`. Task 5 added three named policy profiles (`baseline`/`local-judgment`/`skip-review`), `resolve_policy_for_run`, and a `proposal_generator.{policy,profiles}` `harness.json` section. Task 6 built `ProposalCompanyResearchNode` (WebSearch-backed) and `ProposalWriterNode`. Task 7 built `OpportunityIdentifierNode`, scoring from `diagnostic_intake`'s `*_evidence` fields when present with a web-brief fallback, recomputing composite/tier deterministically rather than trusting model arithmetic. Task 8 built the review loop — `ProposalReviewNode` (with a `Skip`-mode short-circuit), `ProposalReviewRouterNode` (`Node`+`Router`, pass/revise branches), and `ProposalReviseNode`. Task 9 built `PersistToBrainNode`, POSTing the finished roadmap (preferring the revise-branch draft) over the `HttpPost` seam to a placeholder `BRAIN_INGEST_URL`. Task 10 assembled the declared `PROPOSAL_GENERATOR` `WorkflowSchema`/`NodeRegistry`/`Workflow` with a Local-tier rewire for opportunity/review/revise (never research/writer), registered in engine-serve. Task 11 added a hermetic e2e integration test driving the full seven-node chain through both router branches, plus decision `D9-engine-brain-boundary.md` recording the engine↔brain HTTP-POST boundary. Task 12 validated the full block (fmt/clippy/test/release-build all green) with no code changes needed.
+- **Why:** Closes Block EN.4.C of `master-plan.md` Phase 4 — the largest workflow in the phase, reusing EN.4.A's `CompanyResearchNode` pattern and EN.4.B's `DiagnosticIntake` evidence contract, and the first workflow to POST a finished deliverable across the engine↔brain boundary via the new `HttpPost` seam rather than writing to Postgres/pgvector directly (THE BOUNDARY TEST). `AutomationRoadmap` is exported for reuse by EN.4.D (`DELIVERABLE_RENDER`).
+- **Verdict:** PASS (review found no findings). Docs: `docs/proposal-generator-workflow.md` created; `docs/index.md`, `docs/architecture.md`, `docs/research-agent-workflow.md`, `docs/diagnostic-intake-workflow.md`, `docs/data-contract.md` updated.
+- **Status:** `planning/state.json` block `EN.4.C` set to `"closed"`; `planning/status.md` Progress Table row added under Phase 4 and flipped to Done.
+- **Next:** EN.4.D — DELIVERABLE_RENDER (net-new, roadmap → PDF).
+
+```
+954f035 docs: update docs for EN.4.C-proposal-generator
+51546f3 feat: implement EN.4.C-proposal-generator-task11
+88b6f26 feat: implement EN.4.C-proposal-generator-task10
+c8fe13d feat: implement EN.4.C-proposal-generator-task9
+17bd333 feat: implement EN.4.C-proposal-generator-task8
+f2fa74b feat: implement EN.4.C-proposal-generator-task7
+c4508bb feat: implement EN.4.C-proposal-generator-task6
+b6e3f64 feat: implement EN.4.C-proposal-generator-task5
+```
+
+---
+
 ## [run: 2026-07-24]
 
 ### `EN.4.B-diagnostic-intake` done — DIAGNOSTIC_INTAKE extractor (net-new, policy-aware)

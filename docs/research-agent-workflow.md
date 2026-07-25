@@ -170,9 +170,9 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   `ProspectingResearchNode`. There is no setup/worktree node; each terminal node resolves its
   own worktree path from an upstream `SetupWorktreeNode` result if present in `ctx.nodes`,
   falling back to `std::env::current_dir()` otherwise.
-- **Out of scope for this block** (owned by later Phase 4 blocks): intake extraction (EN.4.B),
-  proposal generation (EN.4.C — which reuses `CompanyResearchNode`, re-exported from
-  `workflows::research_agent`), PDF render (EN.4.D).
+- **Out of scope for this block**: intake extraction (EN.4.B), PDF render (EN.4.D — not yet
+  built). Proposal generation (EN.4.C, built) reuses `CompanyResearchNode`, re-exported from
+  `workflows::research_agent` — see [proposal-generator-workflow.md](proposal-generator-workflow.md).
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
   only acquires and reasons; a downstream `PersistToBrainNode` (not part of this block) would own
   handing a brief off to Synapse's ingest endpoint.

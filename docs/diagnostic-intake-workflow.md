@@ -62,7 +62,8 @@ buildability_notes, knowledge_holder, failure_mode }`. Only `company_name`, `com
 requires `name`+`description`, since real transcripts may genuinely leave a rubric axis
 unaddressed — evidence discipline means flagging a gap (empty string), never inventing content.
 
-This type is **load-bearing**: EN.4.C imports `DiagnosticIntake` by name (re-exported from
+This type is **load-bearing**: EN.4.C (`proposal_generator`, built — see
+[proposal-generator-workflow.md](proposal-generator-workflow.md)) imports `DiagnosticIntake` by name (re-exported from
 `workflows::diagnostic_intake` in `mod.rs`).
 
 `IntakeExtractNode` sets `Config.json_schema` on the underlying `claude_code_rs::Config` (via
@@ -165,9 +166,9 @@ Content-Type: application/json
 - **Node count is fixed at one** — `IntakeExtractNode`, both start and terminal, no router, no
   dedicated setup node. It resolves its own worktree path from an upstream `SetupWorktreeNode`
   result if present in `ctx.nodes`, falling back to `std::env::current_dir()` otherwise.
-- **Out of scope for this block** (owned by later Phase 4 blocks): company/prospecting research
-  (EN.4.A, `research_agent`), proposal generation and scoring (EN.4.C, which imports
-  `DiagnosticIntake` by name), PDF render (EN.4.D).
+- **Out of scope for this block**: company/prospecting research (EN.4.A, `research_agent`), PDF
+  render (EN.4.D — not yet built). Proposal generation and scoring (EN.4.C, built) imports
+  `DiagnosticIntake` by name — see [proposal-generator-workflow.md](proposal-generator-workflow.md).
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
   only acquires and reasons; a downstream `PersistToBrainNode` (not part of this block) would own
   handing extracted intake off to Synapse's ingest endpoint.
