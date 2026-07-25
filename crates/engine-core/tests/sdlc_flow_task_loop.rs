@@ -291,8 +291,38 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
     let event = json!({ "spec_slug": "fixture-spec", "auto_pr": false });
     let snapshots: Arc<Mutex<Vec<TaskContext>>> = Arc::new(Mutex::new(Vec::new()));
     let snapshots_handle = snapshots.clone();
-    let on_progress: engine_core::OnProgress<'_> =
-        Box::new(move |ctx: &TaskContext| snapshots_handle.lock().unwrap().push(ctx.clone()));
+    // `SaveStateNode` and `WrapUpNode` write to the *same* on-disk path
+    // (D31-committed `sdlc/sdlc-flow-state.json`), and `WrapUpNode` runs
+    // after `SaveStateNode` in every full run — so reading the file only
+    // once, after `workflow.run` returns, would observe `WrapUpNode`'s
+    // final (review/docs-populated) write, not `SaveStateNode`'s own
+    // partial-write shape. Capture the file's content the first time
+    // `SaveStateNode` reports SUCCESS instead, mid-run, before anything
+    // downstream can overwrite it.
+    let save_state_snapshot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let save_state_snapshot_handle = save_state_snapshot.clone();
+    let on_progress: engine_core::OnProgress<'_> = Box::new(move |ctx: &TaskContext| {
+        snapshots_handle.lock().unwrap().push(ctx.clone());
+        let mut captured = save_state_snapshot_handle.lock().unwrap();
+        if captured.is_none() {
+            let is_success = ctx
+                .node_runs
+                .get("SaveStateNode")
+                .map(|run| run.status == NodeRunStatus::Success)
+                .unwrap_or(false);
+            if is_success {
+                if let Some(saved_to) = ctx
+                    .nodes
+                    .get("SaveStateNode")
+                    .and_then(|result| result["saved_to"].as_str())
+                {
+                    if let Ok(content) = std::fs::read_to_string(saved_to) {
+                        *captured = Some(content);
+                    }
+                }
+            }
+        }
+    });
 
     let final_ctx = workflow
         .run(event, on_progress)
@@ -376,6 +406,37 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         .get("EmitStateNode")
         .expect("EmitStateNode should have stamped a result");
     assert_eq!(emit_state_result["emitted"], json!(true));
+
+    // --- SaveStateNode's per-task write: D31-committed path + partial shape
+    // (D10) — lands under `sdlc/`, `tasks` is an object, and `review`/
+    // `docs`/`pr` are all absent since `SaveStateNode` runs before
+    // `ConsolidatedReviewNode`'s per-task cycle even gets to `PatchDocsNode`/
+    // `PullRequestNode` in the *final* pass (`UpdateTaskStatusNode ->
+    // SaveStateNode` closes the loop, then `TaskQueueRouterNode` finds no
+    // more pending tasks and moves on to `PatchDocsNode`).
+    let save_state_result = final_ctx
+        .nodes
+        .get("SaveStateNode")
+        .expect("SaveStateNode should have stamped a result");
+    let saved_to = save_state_result["saved_to"].as_str().unwrap();
+    assert!(saved_to.ends_with("sdlc/sdlc-flow-state.json"));
+
+    let captured_content = save_state_snapshot
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("SaveStateNode's write should have been captured mid-run");
+    let state_json: serde_json::Value = serde_json::from_str(&captured_content)
+        .expect("SaveStateNode's on-disk file should parse as JSON");
+    assert!(state_json["tasks"].is_object());
+    assert_eq!(state_json["status"], json!("done"));
+    assert!(state_json["review"].is_null());
+    assert!(state_json["docs"].is_null());
+    assert!(state_json["pr"].is_null());
+    assert!(state_json["bail_reason"].is_null());
+    assert!(state_json["branch"].as_str().is_some());
+    assert!(state_json["started_at"].as_str().is_some());
+    assert!(state_json["updated_at"].as_str().is_some());
 
     // --- Parity-shape assertions (contract §6) -----------------------------
     for identity in [
@@ -483,14 +544,25 @@ async fn workflow_terminal_stub_reachable_when_no_pending_tasks() {
     // model nodes.
     let worktree = temp_worktree();
     let spec_dir = worktree.join("planning").join("fixture-spec");
+    let sdlc_dir = spec_dir.join("sdlc");
+    std::fs::create_dir_all(&sdlc_dir).unwrap();
+    // D31-committed shape (D10): `tasks` is an object keyed by task id, not
+    // an array, and the file lives under the `sdlc/` subdirectory.
     let state = json!({
         "spec_slug": "fixture-spec",
-        "tasks": [
-            { "task_id": 1, "title": "Done already", "description": "d", "status": "done" }
-        ]
+        "branch": "sdlc/fixture-spec",
+        "worktree_path": worktree.to_string_lossy(),
+        "started_at": "2026-07-25T00:00:00Z",
+        "updated_at": "2026-07-25T00:00:00Z",
+        "status": "done",
+        "current_task": 1,
+        "tasks": {
+            "1": { "task_id": 1, "title": "Done already", "description": "d", "status": "done" }
+        },
+        "bail_reason": null,
     });
     std::fs::write(
-        spec_dir.join("sdlc-flow-state.json"),
+        sdlc_dir.join("sdlc-flow-state.json"),
         serde_json::to_string_pretty(&state).unwrap(),
     )
     .unwrap();

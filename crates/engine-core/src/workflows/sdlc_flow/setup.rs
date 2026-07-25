@@ -259,8 +259,10 @@ impl Node for SetupWorktreeNode {
 
 /// Deterministic router: keeps the Opus planning-fallback path
 /// (`GenerateTasksNode`) off the common path. Routes to `LoadTaskStateNode`
-/// when the spec directory already has `sdlc-flow-state.json` or
-/// `tasks.json`, else to `GenerateTasksNode`.
+/// when the spec directory already has `sdlc/sdlc-flow-state.json` (the
+/// D31-committed path — see
+/// `D10-committed-state-path-schema-alignment.md`) or `tasks.json`, else to
+/// `GenerateTasksNode`.
 pub struct SpecExistsRouterNode;
 
 #[async_trait::async_trait]
@@ -282,7 +284,8 @@ impl Router for SpecExistsRouterNode {
     fn route(&self, ctx: &TaskContext) -> Option<String> {
         let spec_slug = ctx.event.get("spec_slug")?.as_str()?;
         let dir = spec_dir(ctx, spec_slug);
-        if dir.join("sdlc-flow-state.json").exists() || dir.join("tasks.json").exists() {
+        if dir.join("sdlc").join("sdlc-flow-state.json").exists() || dir.join("tasks.json").exists()
+        {
             Some("LoadTaskStateNode".to_string())
         } else {
             Some("GenerateTasksNode".to_string())
@@ -290,10 +293,10 @@ impl Router for SpecExistsRouterNode {
     }
 }
 
-/// Deterministic node: loads `sdlc-flow-state.json` if present, else
-/// bootstraps a fresh `SDLCState` from `tasks.json`; applies the
-/// `task_range` filter; writes the resulting `SDLCState` (`model_dump`
-/// shape) to its own output.
+/// Deterministic node: loads `sdlc/sdlc-flow-state.json` (the
+/// D31-committed path/schema) if present, else bootstraps a fresh
+/// `SDLCState` from `tasks.json`; applies the `task_range` filter; writes
+/// the resulting `SDLCState` (`model_dump` shape) to its own output.
 pub struct LoadTaskStateNode;
 
 #[async_trait::async_trait]
@@ -301,16 +304,17 @@ impl Node for LoadTaskStateNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let event = parse_event(&ctx)?;
         let dir = spec_dir(&ctx, &event.spec_slug);
-        let state_path = dir.join("sdlc-flow-state.json");
+        let state_path = dir.join("sdlc").join("sdlc-flow-state.json");
         let tasks_path = dir.join("tasks.json");
 
         let mut state: SDLCState = if state_path.exists() {
             let raw = std::fs::read_to_string(&state_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", state_path.display()))
             })?;
-            serde_json::from_str(&raw).map_err(|err| {
+            let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
                 NodeError::new(format!("failed to parse {}: {err}", state_path.display()))
-            })?
+            })?;
+            SDLCState::from_committed_state_json(&value)?
         } else if tasks_path.exists() {
             let raw = std::fs::read_to_string(&tasks_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", tasks_path.display()))
@@ -583,13 +587,28 @@ mod tests {
     #[test]
     fn spec_exists_routes_to_load_when_state_file_present() {
         let worktree = temp_dir();
-        let dir = worktree.join("planning").join("my-spec");
+        let dir = worktree.join("planning").join("my-spec").join("sdlc");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("sdlc-flow-state.json"), "{}").unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
         let router = SpecExistsRouterNode;
         assert_eq!(router.route(&ctx), Some("LoadTaskStateNode".to_string()));
+    }
+
+    #[test]
+    fn spec_exists_ignores_state_file_at_old_flat_path() {
+        // Regression guard for D10: a leftover pre-fix flat-path file must
+        // NOT be treated as "spec exists" — only the `sdlc/`-subdirectory
+        // path counts.
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sdlc-flow-state.json"), "{}").unwrap();
+
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let router = SpecExistsRouterNode;
+        assert_eq!(router.route(&ctx), Some("GenerateTasksNode".to_string()));
     }
 
     // --- LoadTaskStateNode ------------------------------------------------
@@ -635,10 +654,19 @@ mod tests {
         let dir = worktree.join("planning").join("my-spec");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
         let state = SDLCState::new("my-spec");
+        let run_meta = super::super::schema::RunMeta {
+            branch: "sdlc/my-spec".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-07-25T00:00:00Z".to_string(),
+            updated_at: "2026-07-25T00:00:00Z".to_string(),
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
         std::fs::write(
-            dir.join("sdlc-flow-state.json"),
-            serde_json::to_string(&state).unwrap(),
+            sdlc_dir.join("sdlc-flow-state.json"),
+            serde_json::to_string(&committed).unwrap(),
         )
         .unwrap();
 
@@ -647,6 +675,41 @@ mod tests {
         let out = node.process(ctx).await.expect("load should succeed");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["spec_slug"], "my-spec");
+    }
+
+    #[tokio::test]
+    async fn load_parses_committed_object_shaped_tasks() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
+        let mut state = SDLCState::new("my-spec");
+        state.tasks.push(SDLCTask::new(1, "One", "d1"));
+        state.tasks.push(SDLCTask::new(2, "Two", "d2"));
+        let run_meta = super::super::schema::RunMeta {
+            branch: "sdlc/my-spec".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-07-25T00:00:00Z".to_string(),
+            updated_at: "2026-07-25T00:00:00Z".to_string(),
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        std::fs::write(
+            sdlc_dir.join("sdlc-flow-state.json"),
+            serde_json::to_string(&committed).unwrap(),
+        )
+        .unwrap();
+
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let node = LoadTaskStateNode;
+        let out = node.process(ctx).await.expect("load should succeed");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        let task_ids: Vec<u64> = loaded["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["task_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(task_ids, vec![1, 2]);
     }
 
     #[tokio::test]

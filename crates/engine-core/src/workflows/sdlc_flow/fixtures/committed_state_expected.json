@@ -1,0 +1,100 @@
+{
+  "spec_slug": "EN.4.1-fixture-golden",
+  "branch": "sdlc/EN.4.1-fixture-golden",
+  "worktree_path": "trees/sdlc/EN.4.1-fixture-golden",
+  "started_at": "2026-07-25T00:00:00Z",
+  "updated_at": "2026-07-25T00:10:00Z",
+  "status": "done",
+  "current_task": 2,
+  "tasks": {
+    "1": {
+      "task_id": 1,
+      "title": "Task 1",
+      "description": "description",
+      "acceptance_criteria": [],
+      "status": "done",
+      "validation_commands": [],
+      "attempt_count": 1,
+      "max_attempts": 3
+    },
+    "2": {
+      "task_id": 2,
+      "title": "Task 2",
+      "description": "description",
+      "acceptance_criteria": [],
+      "status": "done",
+      "validation_commands": [],
+      "attempt_count": 2,
+      "max_attempts": 3
+    }
+  },
+  "review": {
+    "verdict": "PASS",
+    "findings": [],
+    "attempts": 1
+  },
+  "docs": {
+    "changed": [
+      "docs/architecture.md"
+    ],
+    "created": []
+  },
+  "bail_reason": null,
+  "pr": {
+    "url": "https://github.com/bredmond1019/engine-rs/pull/1",
+    "number": 1
+  },
+  "telemetry": {
+    "total_attempts": 3,
+    "budget_spent": 0.05,
+    "tasks_passed": 2,
+    "tasks_failed": 0
+  },
+  "policy": {
+    "output_verbosity": "normal",
+    "prompt_cache": false,
+    "review_mode": "per_task",
+    "review_skip_max_files": 2,
+    "review_skip_max_diff_lines": 40,
+    "model_tiers": {
+      "implement": "sonnet",
+      "implement_simple": "sonnet",
+      "review": "sonnet",
+      "triage": "sonnet",
+      "generate": "sonnet"
+    },
+    "local": {
+      "endpoint": "http://localhost:11434",
+      "model": "qwen2.5-coder:7b",
+      "constrained_json": false
+    },
+    "simple_task_max_files": 2,
+    "llm_triage": false,
+    "max_attempts": 3,
+    "close_out": {
+      "reuse": {
+        "validation": false,
+        "review": false,
+        "docs": false
+      }
+    }
+  },
+  "outcomes": {
+    "wall_clock_secs": 42.0,
+    "total_attempts": 3,
+    "total_retries": 1,
+    "tasks_passed": 2,
+    "tasks_failed": 0,
+    "review_verdicts": [
+      "ConsolidatedReviewNode:PASS"
+    ],
+    "total_input_tokens": 100,
+    "total_output_tokens": 50,
+    "total_cost_usd": 0.02,
+    "model_tier_used": {
+      "implement": "sonnet"
+    }
+  },
+  "phase_id": "EN.4",
+  "block_id": "EN.4.1"
+}

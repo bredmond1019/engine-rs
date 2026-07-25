@@ -470,6 +470,7 @@ async fn experiment_four_profiles_real_cli_ranked_by_cost() {
         let state_path = worktree
             .join("planning")
             .join("experiment-spec")
+            .join("sdlc")
             .join("sdlc-flow-state.json");
         assert!(
             state_path.exists(),

@@ -28,7 +28,7 @@ use crate::routing::Router;
 #[cfg(test)]
 use super::policy::{ModelTier, OutputVerbosity};
 use super::policy::{ReviewMode, SdlcPolicy};
-use super::schema::{SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
+use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
     ModelTransport,
@@ -138,7 +138,13 @@ fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPoli
 /// structural failure (re-implementation is unlikely to converge) rather
 /// than a minor, fixable one. Mirrors
 /// `review_router_node._STRUCTURAL_ISSUE_THRESHOLD` in Python.
-const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
+///
+/// `pub(crate)` (not private) because `wrap_up::derive_terminal_signal` also
+/// needs this exact threshold to reconstruct, post hoc, whether a
+/// `ConsolidatedReviewNode` verdict that reached `WrapUpNode` did so via the
+/// structural branch (this same gate `ReviewRouterNode::route` uses) rather
+/// than some other path — the two must never independently drift.
+pub(crate) const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
 
 /// Return the most recently mutated `SDLCState` among every node identity
 /// that can write one: `IncrementAttemptNode` (the retry back-edge target,
@@ -1622,11 +1628,61 @@ impl Node for UpdateTaskStatusNode {
 
 // --- SaveStateNode ----------------------------------------------------------
 
+/// Read the `branch_name` stamped by `SetupWorktreeNode`, if the run went
+/// through it. Absent in unit tests that drive `SaveStateNode` directly.
+fn branch_name(ctx: &TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")
+        .and_then(|value| value.get("branch_name"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// Read `started_at` back out of an already-committed D31 state file at
+/// `state_path`, if one exists and parses. Used to preserve the run's
+/// original start time across a resumed run's per-task saves — every write
+/// after the first must NOT stamp a fresh `started_at`, or a resumed run
+/// would appear to restart its wall-clock every time `SaveStateNode` fires.
+fn existing_started_at(state_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(state_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    SDLCState::from_committed_state_json(&value)
+        .ok()?
+        .started_at
+}
+
+/// Build this write's [`RunMeta`]: `branch`/`worktree_path` come straight
+/// from `SetupWorktreeNode`'s output; `started_at` is preserved from an
+/// existing on-disk committed file if one is already there (a resume),
+/// otherwise stamped fresh (this run's first save); `updated_at` is always
+/// stamped fresh.
+fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMeta {
+    let now = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .to_string();
+    let started_at = existing_started_at(state_path).unwrap_or_else(|| now.clone());
+    RunMeta {
+        branch: branch_name(ctx).unwrap_or_default(),
+        worktree_path: worktree.to_string(),
+        started_at,
+        updated_at: now,
+    }
+}
+
 /// Deterministic node: serializes the latest `SDLCState` to
-/// `planning/{spec_slug}/sdlc-flow-state.json` inside the worktree and
-/// commits it via the injectable [`CommandRunner`] seam, so state survives
-/// across resumed runs. A non-zero `git commit` (e.g. "nothing to commit")
-/// is logged, not treated as a failure — mirrors the Python behavior.
+/// `planning/{spec_slug}/sdlc/sdlc-flow-state.json` inside the worktree
+/// (the D31-committed path/schema shared with base-template's JS
+/// `sdlc-flow.js` engine — see `D10-committed-state-path-schema-alignment.md`)
+/// and commits it via the injectable [`CommandRunner`] seam, so state
+/// survives across resumed runs. A non-zero `git commit` (e.g. "nothing to
+/// commit") is logged, not treated as a failure — mirrors the Python
+/// behavior.
+///
+/// This per-task save point never has `review`/`docs`/`pr` yet (those are
+/// end-of-run outputs from `ConsolidatedReviewNode`/`PatchDocsNode`/
+/// `PullRequestNode`, none of which have run at this point in the loop) and
+/// is never itself a terminal write (`WrapUpNode` is the only node that
+/// derives a [`super::schema::TerminalSignal`]) — so it always calls
+/// `to_committed_state_json` with `None` for all four.
 pub struct SaveStateNode {
     runner: CommandRunner,
 }
@@ -1660,12 +1716,17 @@ impl Node for SaveStateNode {
         let worktree = worktree_path(&ctx)?;
         let state = latest_state(&ctx)?;
 
-        let state_dir = Path::new(&worktree).join("planning").join(&state.spec_slug);
+        let state_dir = Path::new(&worktree)
+            .join("planning")
+            .join(&state.spec_slug)
+            .join("sdlc");
         std::fs::create_dir_all(&state_dir).map_err(|err| {
             NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
         })?;
         let state_path = state_dir.join("sdlc-flow-state.json");
-        let json = serde_json::to_string_pretty(&state)
+        let run_meta = build_run_meta(&ctx, &worktree, &state_path);
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        let json = serde_json::to_string_pretty(&committed)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
         std::fs::write(&state_path, json).map_err(|err| {
             NodeError::new(format!("failed to write {}: {err}", state_path.display()))
@@ -3459,11 +3520,64 @@ mod tests {
 
         let saved_to = out.nodes["SaveStateNode"]["saved_to"].as_str().unwrap();
         assert!(Path::new(saved_to).exists());
-        assert!(saved_to.ends_with("sdlc-flow-state.json"));
+        assert!(saved_to.ends_with("sdlc/sdlc-flow-state.json"));
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0][0], "add");
         assert_eq!(recorded[1][0], "commit");
+
+        let content = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(value["tasks"].is_object());
+        assert_eq!(value["status"], json!("running"));
+        assert!(value["review"].is_null());
+        assert!(value["docs"].is_null());
+        assert!(value["pr"].is_null());
+        assert!(value["bail_reason"].is_null());
+        assert!(value["started_at"].as_str().is_some());
+        assert!(value["updated_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn save_state_preserves_started_at_across_resumed_saves() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = SaveStateNode::new().with_runner(runner.clone());
+        let out = node.process(ctx.clone()).await.expect("first save");
+        let saved_to = out.nodes["SaveStateNode"]["saved_to"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first_started_at = {
+            let content = std::fs::read_to_string(&saved_to).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+            value["started_at"].as_str().unwrap().to_string()
+        };
+
+        // Simulate a resumed second save (e.g. a subsequent task's
+        // `SaveStateNode` run) — `started_at` must not change, since it is
+        // read back from the file `SaveStateNode` just wrote above rather
+        // than recomputed.
+        let node2 = SaveStateNode::new().with_runner(runner);
+        let out2 = node2.process(ctx).await.expect("second save");
+        let saved_to2 = out2.nodes["SaveStateNode"]["saved_to"].as_str().unwrap();
+        let content = std::fs::read_to_string(saved_to2).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["started_at"].as_str().unwrap(), first_started_at);
     }
 }

@@ -29,7 +29,10 @@ use crate::policy::telemetry::RunTelemetryInputs;
 use crate::policy::RESOLVED_POLICY_IDENTITY;
 
 use super::policy::SdlcPolicy;
-use super::schema::{RunOutcomes, SDLCState};
+use super::schema::{
+    CommittedDocs, CommittedPr, CommittedReview, RunMeta, RunOutcomes, SDLCState, TerminalSignal,
+};
+use super::task_loop::STRUCTURAL_ISSUE_THRESHOLD;
 use super::{get_result, put_result};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
@@ -78,25 +81,195 @@ fn worktree_path(ctx: &TaskContext) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Persist `state` (already stamped with `policy`/`outcomes`) to
-/// `planning/{spec_slug}/sdlc-flow-state.json` inside `worktree` — the same
-/// path convention `task_loop::SaveStateNode` writes to. This is the only
-/// point in the run where the resolved policy + outcome summary reach the
-/// durable on-disk state file: `SaveStateNode` runs earlier in the graph
-/// (inside the task loop) and never re-runs after `WrapUpNode`, so without
-/// this write the policy/outcomes blocks are computed here and then
-/// discarded when the run ends.
-fn persist_state(worktree: &str, state: &SDLCState) -> Result<String, NodeError> {
+/// Read the `branch_name` stamped by `SetupWorktreeNode`, if present.
+/// Mirrors [`worktree_path`]/`task_loop::branch_name`.
+fn branch_name(ctx: &TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")
+        .and_then(|value| value.get("branch_name"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// Read `started_at` back out of an already-committed D31 state file at
+/// `state_path`, if one exists and parses — preserves the run's original
+/// start time when `WrapUpNode` is the *second* (or later) write to this
+/// file (`task_loop::SaveStateNode` already wrote at least once during the
+/// task loop for any run with at least one task). Not hoisted into a shared
+/// helper with `task_loop::existing_started_at` (a byte-identical copy):
+/// this module intentionally stays independent of `task_loop.rs`'s private
+/// seams, matching this file's existing `latest_state`/`worktree_path`
+/// local-copy convention (see `latest_state`'s doc comment).
+fn existing_started_at(state_path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(state_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    SDLCState::from_committed_state_json(&value)
+        .ok()?
+        .started_at
+}
+
+/// Build this write's [`RunMeta`]: `branch`/`worktree_path` from
+/// `SetupWorktreeNode`'s output, `started_at` preserved from an existing
+/// on-disk committed file if present (else stamped fresh — a run with zero
+/// tasks never went through `SaveStateNode`), `updated_at` always fresh.
+fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Path) -> RunMeta {
+    let now = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .to_string();
+    let started_at = existing_started_at(state_path).unwrap_or_else(|| now.clone());
+    RunMeta {
+        branch: branch_name(ctx).unwrap_or_default(),
+        worktree_path: worktree.to_string(),
+        started_at,
+        updated_at: now,
+    }
+}
+
+/// Reshape `ConsolidatedReviewNode`'s last output (if the run reached
+/// review at least once) into the D31 committed-state `review` block.
+/// `attempts` is stamped `1`: this engine's `ctx` retains only the *latest*
+/// `ConsolidatedReviewNode` result (see [`latest_state`]'s "most recently
+/// mutated" pattern used throughout this workflow), not a running count of
+/// how many times review itself was attempted, so there is no real
+/// per-review attempt counter to report here today — `1` reflects "review
+/// ran and this is its outcome" rather than a meaningful retry count.
+fn committed_review(ctx: &TaskContext) -> Option<CommittedReview> {
+    let review = get_result(ctx, "ConsolidatedReviewNode")?;
+    let verdict = review.get("verdict")?.as_str()?.to_string();
+    let findings = review
+        .get("issues")
+        .and_then(|value| value.as_array())
+        .map(|issues| {
+            issues
+                .iter()
+                .filter_map(|issue| issue.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(CommittedReview {
+        verdict,
+        findings,
+        attempts: 1,
+    })
+}
+
+/// Reshape `PatchDocsNode`'s output (if the run reached docs-patching) into
+/// the D31 committed-state `docs` block. `PatchDocsNode` only ever patches
+/// existing docs (its output is `files_patched`, no notion of new files), so
+/// `created` is always empty — see `schema::CommittedDocs`'s doc comment.
+fn committed_docs(ctx: &TaskContext) -> Option<CommittedDocs> {
+    let docs = get_result(ctx, "PatchDocsNode")?;
+    let changed = docs
+        .get("files_patched")
+        .and_then(|value| value.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(CommittedDocs {
+        changed,
+        created: Vec::new(),
+    })
+}
+
+/// The D31 committed-state `pr` block is always `None` from this call site:
+/// the declared graph runs `WrapUpNode -> PullRequestNode` (see
+/// `graph.rs`'s schema), so `PullRequestNode` has not run — and cannot have
+/// a result in `ctx` — by the time `WrapUpNode::process` executes. This is a
+/// known, documented limitation of this fix (not a regression it
+/// introduces): no node in the current graph re-saves state *after*
+/// `PullRequestNode` runs, so `pr` can never be populated in the on-disk
+/// file today. See `D10-committed-state-path-schema-alignment.md`'s
+/// Consequences section.
+fn committed_pr(_ctx: &TaskContext) -> Option<CommittedPr> {
+    None
+}
+
+/// Derive this run's [`TerminalSignal`], if any, by inspecting the two
+/// model-judgment stages that can route straight to `WrapUpNode` rather
+/// than back through a retry loop: `TriageTaskNode`'s `MAJOR_BAIL` verdict,
+/// and `ConsolidatedReviewNode`'s `FAIL`/`PARTIAL` verdict when
+/// `ReviewRouterNode` classified the issue count as structural (`0`, or
+/// over `task_loop::STRUCTURAL_ISSUE_THRESHOLD` — the exact same gate
+/// `ReviewRouterNode::route` uses, so this can never disagree with the
+/// router's own decision about *whether* this was a structural stop).
+/// `None` on the happy path (every task passed cleanly, or `ctx` has
+/// neither stage's output — e.g. a unit test driving `WrapUpNode` directly).
+fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
+    if let Some(triage) = get_result(ctx, "TriageTaskNode") {
+        if triage.get("verdict").and_then(|v| v.as_str()) == Some("MAJOR_BAIL") {
+            let reason = triage
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Max attempts reached without a passing run.")
+                .to_string();
+            return Some(TerminalSignal::MajorBail(reason));
+        }
+    }
+
+    if let Some(review) = get_result(ctx, "ConsolidatedReviewNode") {
+        let verdict = review.get("verdict").and_then(|v| v.as_str());
+        let issue_count = review
+            .get("issues")
+            .and_then(|v| v.as_array())
+            .map(std::vec::Vec::len)
+            .unwrap_or(0);
+        let structural = issue_count == 0 || issue_count > STRUCTURAL_ISSUE_THRESHOLD;
+        if structural {
+            let summary = review
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match verdict {
+                Some("FAIL") => return Some(TerminalSignal::ReviewFail(summary)),
+                Some("PARTIAL") => return Some(TerminalSignal::StructuralFail(summary)),
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
+/// `planning/{spec_slug}/sdlc/sdlc-flow-state.json` inside `worktree` — the
+/// D31-committed path (see `D10-committed-state-path-schema-alignment.md`)
+/// `task_loop::SaveStateNode` also writes to. Creates the `sdlc/`
+/// intermediate directory if needed.
+fn state_path_for(worktree: &str, spec_slug: &str) -> Result<std::path::PathBuf, NodeError> {
     let state_dir = std::path::Path::new(worktree)
         .join("planning")
-        .join(&state.spec_slug);
+        .join(spec_slug)
+        .join("sdlc");
     std::fs::create_dir_all(&state_dir).map_err(|err| {
         NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
     })?;
-    let state_path = state_dir.join("sdlc-flow-state.json");
-    let json = serde_json::to_string_pretty(state)
+    Ok(state_dir.join("sdlc-flow-state.json"))
+}
+
+/// Persist `state` (already stamped with `policy`/`outcomes`) to
+/// `state_path` in the D31-committed JSON shape. This is the only point in
+/// the run where the resolved policy + outcome summary, and (when present)
+/// `review`/`docs`/a derived `bail_reason`, reach the durable on-disk state
+/// file: `SaveStateNode` runs earlier in the graph (inside the task loop)
+/// and never re-runs after `WrapUpNode`, so without this write those blocks
+/// are computed here and then discarded when the run ends.
+#[allow(clippy::too_many_arguments)]
+fn persist_state(
+    state_path: &std::path::Path,
+    state: &SDLCState,
+    run_meta: &RunMeta,
+    review: Option<&CommittedReview>,
+    docs: Option<&CommittedDocs>,
+    pr: Option<&CommittedPr>,
+    terminal_signal: Option<&TerminalSignal>,
+) -> Result<String, NodeError> {
+    let committed = state.to_committed_state_json(run_meta, review, docs, pr, terminal_signal);
+    let json = serde_json::to_string_pretty(&committed)
         .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
-    std::fs::write(&state_path, json).map_err(|err| {
+    std::fs::write(state_path, json).map_err(|err| {
         NodeError::new(format!("failed to write {}: {err}", state_path.display()))
     })?;
     Ok(state_path.to_string_lossy().to_string())
@@ -247,6 +420,11 @@ impl Node for WrapUpNode {
         state.policy = Some(policy);
         state.outcomes = Some(outcomes);
 
+        let terminal_signal = derive_terminal_signal(&ctx);
+        state.bail_reason = super::schema::derive_bail_reason(terminal_signal.as_ref());
+        state.global_status =
+            super::schema::derive_committed_status(&state, terminal_signal.as_ref()).to_string();
+
         let spec_slug = &state.spec_slug;
         let tasks_passed = state.telemetry.tasks_passed;
         let tasks_failed = state.telemetry.tasks_failed;
@@ -290,12 +468,27 @@ impl Node for WrapUpNode {
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
 
         // Persist the policy/outcomes-stamped state to the durable on-disk
-        // file (EN.3.C task 6 fix) when this run went through
-        // `SetupWorktreeNode`. Absent in unit tests that drive `WrapUpNode`
-        // directly with no worktree — that's not a real run, so there is
-        // nothing to persist to.
+        // file (EN.3.C task 6 fix; D31-committed path/schema, EN.4.1) when
+        // this run went through `SetupWorktreeNode`. Absent in unit tests
+        // that drive `WrapUpNode` directly with no worktree — that's not a
+        // real run, so there is nothing to persist to.
         let saved_to = match worktree_path(&ctx) {
-            Some(worktree) => Some(persist_state(&worktree, &state)?),
+            Some(worktree) => {
+                let state_path = state_path_for(&worktree, spec_slug)?;
+                let run_meta = build_run_meta(&ctx, &worktree, &state_path);
+                let review = committed_review(&ctx);
+                let docs = committed_docs(&ctx);
+                let pr = committed_pr(&ctx);
+                Some(persist_state(
+                    &state_path,
+                    &state,
+                    &run_meta,
+                    review.as_ref(),
+                    docs.as_ref(),
+                    pr.as_ref(),
+                    terminal_signal.as_ref(),
+                )?)
+            }
             None => None,
         };
 
@@ -663,14 +856,21 @@ mod tests {
         let saved_to = result["saved_to"]
             .as_str()
             .expect("saved_to present when a worktree is set");
-        assert!(saved_to.ends_with("sdlc-flow-state.json"));
+        assert!(saved_to.ends_with("sdlc/sdlc-flow-state.json"));
 
         // Re-read the actual on-disk file the aggregator (task 7) reads
         // from — not the transient ctx output — to confirm the policy +
-        // outcomes blocks are populated there.
+        // outcomes blocks are populated there, in the D31-committed shape.
         let on_disk = std::fs::read_to_string(saved_to).expect("state file exists on disk");
-        let on_disk_state: SDLCState =
-            serde_json::from_str(&on_disk).expect("on-disk file parses as SDLCState");
+        let on_disk_value: serde_json::Value =
+            serde_json::from_str(&on_disk).expect("on-disk file parses as JSON");
+        assert!(on_disk_value["tasks"].is_object());
+        assert_eq!(on_disk_value["status"], json!("done"));
+        assert_eq!(on_disk_value["review"]["verdict"], json!("PASS"));
+        assert!(on_disk_value["bail_reason"].is_null());
+
+        let on_disk_state = SDLCState::from_committed_state_json(&on_disk_value)
+            .expect("on-disk file parses as SDLCState");
 
         let stamped_policy = on_disk_state
             .policy
@@ -689,6 +889,82 @@ mod tests {
             vec!["ConsolidatedReviewNode:PASS".to_string()]
         );
         assert_eq!(outcomes.model_tier_used["triage"], "haiku");
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_populates_bail_reason_and_blocked_status_on_major_bail() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Failed;
+        task.attempt_count = 3;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 0;
+        state.telemetry.tasks_failed = 1;
+        state.telemetry.total_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({
+                "verdict": "MAJOR_BAIL",
+                "reason": "Max attempts (3) reached without a passing run.",
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Max attempts (3) reached without a passing run.")
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_populates_bail_reason_on_structural_review_fail() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Failed;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 0;
+        state.telemetry.tasks_failed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "FAIL", "summary": "structural issues", "issues": [] }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(value["bail_reason"], json!("structural issues"));
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

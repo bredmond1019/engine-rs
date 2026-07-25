@@ -391,6 +391,35 @@ async fn happy_path_reaches_tail_with_auto_pr_false() {
         round_tripped.task_context.nodes.get("WrapUpNode"),
         final_ctx.nodes.get("WrapUpNode")
     );
+
+    // --- D31-committed on-disk state file (D10) ------------------------------
+    // The real path/schema shared with base-template's JS `sdlc-flow.js`
+    // engine (D31) and already assumed by `bastion`'s `flow.rs` reader and
+    // `run-sdlc-flow.sh`'s `jq` queries — NOT the old flat
+    // `planning/{spec}/sdlc-flow-state.json` path/array-tasks shape.
+    let state_path = worktree
+        .join("planning")
+        .join("fixture-e2e-spec")
+        .join("sdlc")
+        .join("sdlc-flow-state.json");
+    assert!(
+        state_path.exists(),
+        "committed state file should land at the sdlc/-subdirectory path"
+    );
+    let state_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap())
+            .expect("committed state file should parse as JSON");
+    assert!(
+        state_json["tasks"].is_object(),
+        "tasks must be an object, not an array: {state_json:?}"
+    );
+    assert_eq!(state_json["status"], json!("done"));
+    assert_eq!(state_json["current_task"], json!(1));
+    assert!(state_json["branch"].as_str().is_some());
+    assert!(state_json["worktree_path"].as_str().is_some());
+    assert!(state_json["started_at"].as_str().is_some());
+    assert!(state_json["updated_at"].as_str().is_some());
+    assert!(state_json["bail_reason"].is_null());
 }
 
 #[tokio::test]
@@ -529,4 +558,20 @@ async fn never_passing_task_bails_at_max_attempts_and_reaches_wrap_up_tail() {
     let round_tripped: EventsRow =
         serde_json::from_str(&json_str).expect("EventsRow should deserialize");
     assert_eq!(round_tripped, row);
+
+    // --- D31-committed on-disk state file reflects the MAJOR_BAIL terminal --
+    // signal: `status == "blocked"` and a populated `bail_reason` (D10).
+    let state_path = worktree
+        .join("planning")
+        .join("fixture-e2e-spec")
+        .join("sdlc")
+        .join("sdlc-flow-state.json");
+    let state_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap())
+            .expect("committed state file should parse as JSON");
+    assert_eq!(state_json["status"], json!("blocked"));
+    assert!(
+        state_json["bail_reason"].as_str().is_some(),
+        "bail_reason should be populated on the MAJOR_BAIL path: {state_json:?}"
+    );
 }

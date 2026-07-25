@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::node::NodeError;
+
 use super::policy::{PartialPolicy, SdlcPolicy};
 
 /// Lifecycle states for a single SDLC task (`SDLCTaskStatus` in Python).
@@ -346,6 +348,32 @@ pub struct SDLCState {
     /// `WrapUpNode` finalizes it at the run tail.
     #[serde(default)]
     pub outcomes: Option<RunOutcomes>,
+    /// D31-committed-state field (EN.4.1): the git branch this run executed
+    /// on, stamped by `SetupWorktreeNode`. `None` for states from before this
+    /// fix, or for a state that never went through `SetupWorktreeNode`.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// D31-committed-state field (EN.4.1): the worktree path this run
+    /// executed in, stamped by `SetupWorktreeNode`. Same absence rules as
+    /// [`Self::branch`].
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    /// D31-committed-state field (EN.4.1): ISO-8601 timestamp of the run's
+    /// first `SaveStateNode`/`WrapUpNode` write, preserved across resumes
+    /// (see `task_loop::SaveStateNode::process`'s resume handling).
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// D31-committed-state field (EN.4.1): ISO-8601 timestamp of the most
+    /// recent write to this state, recomputed fresh on every save.
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// D31-committed-state field (EN.4.1): human-readable reason the run
+    /// terminated early (`MAJOR_BAIL` / structural review failure), or
+    /// `None` on the happy path. Derived by [`derive_bail_reason`] from a
+    /// [`TerminalSignal`] at the point of writing, not maintained
+    /// incrementally.
+    #[serde(default)]
+    pub bail_reason: Option<String>,
 }
 
 impl SDLCState {
@@ -361,8 +389,337 @@ impl SDLCState {
             telemetry: SDLCTelemetry::default(),
             policy: None,
             outcomes: None,
+            branch: None,
+            worktree_path: None,
+            started_at: None,
+            updated_at: None,
+            bail_reason: None,
         }
     }
+
+    /// Reshape this state into the D31-committed on-disk JSON shape shared
+    /// with base-template's `.claude/workflows/sdlc-flow.js` (governed by
+    /// `D31-committed-authoritative-state.md`, aligned here by
+    /// `D10-committed-state-path-schema-alignment.md`): `tasks` becomes a
+    /// JSON object keyed by each task's `task_id` (as a string) rather than
+    /// an array, `status`/`current_task`/`bail_reason` are derived rather
+    /// than stored, and `branch`/`worktree_path`/`started_at`/`updated_at`
+    /// come from the caller's [`RunMeta`] (the authoritative values for
+    /// *this* write) rather than `self`'s own same-named fields (those exist
+    /// only so [`Self::from_committed_state_json`] can round-trip them back
+    /// onto a resumed `SDLCState`, e.g. so `started_at` survives a resume —
+    /// see `task_loop::SaveStateNode`).
+    ///
+    /// `review`/`docs`/`pr` are accepted as explicit parameters rather than
+    /// stored as `SDLCState` fields: they are transient, per-write outputs
+    /// (`ConsolidatedReviewNode`/`PatchDocsNode`/`PullRequestNode`'s results)
+    /// that only exist at specific points in the run, and storing them on
+    /// the long-lived `SDLCState` risks a resumed load replaying a *stale*
+    /// review/docs/pr block from a previous save rather than reflecting
+    /// "not available yet". Passing them as parameters means each call site
+    /// supplies exactly what it currently has (or `None`).
+    ///
+    /// `telemetry`/`policy`/`outcomes`/`phase_id`/`block_id` ride along as
+    /// additive top-level keys — every real consumer of this file
+    /// (`bastion`'s `flow.rs`, `run-sdlc-flow.sh`'s `jq` queries) ignores
+    /// unknown keys (no `deny_unknown_fields` anywhere in this codebase, and
+    /// D37 already set this additive-schema-growth precedent for `tokens`).
+    #[must_use]
+    pub fn to_committed_state_json(
+        &self,
+        run_meta: &RunMeta,
+        review: Option<&CommittedReview>,
+        docs: Option<&CommittedDocs>,
+        pr: Option<&CommittedPr>,
+        terminal_signal: Option<&TerminalSignal>,
+    ) -> serde_json::Value {
+        let mut tasks_obj = serde_json::Map::with_capacity(self.tasks.len());
+        for task in &self.tasks {
+            tasks_obj.insert(
+                task.task_id.to_string(),
+                serde_json::to_value(task).unwrap_or(serde_json::Value::Null),
+            );
+        }
+
+        let status = derive_committed_status(self, terminal_signal);
+        let current_task = derive_current_task(&self.tasks);
+        let bail_reason = derive_bail_reason(terminal_signal);
+
+        serde_json::json!({
+            "spec_slug": self.spec_slug,
+            "branch": run_meta.branch,
+            "worktree_path": run_meta.worktree_path,
+            "started_at": run_meta.started_at,
+            "updated_at": run_meta.updated_at,
+            "status": status,
+            "current_task": current_task,
+            "tasks": serde_json::Value::Object(tasks_obj),
+            "review": review,
+            "docs": docs,
+            "bail_reason": bail_reason,
+            "pr": pr,
+            "telemetry": self.telemetry,
+            "policy": self.policy,
+            "outcomes": self.outcomes,
+            "phase_id": self.phase_id,
+            "block_id": self.block_id,
+        })
+    }
+
+    /// Reverse of [`Self::to_committed_state_json`]: parse a D31-committed
+    /// JSON `Value` (as read off disk) back into an `SDLCState`. `tasks` is
+    /// read out of its object-keyed-by-`task_id` shape and sorted
+    /// numerically by the object's own string keys back into
+    /// `Vec<SDLCTask>`. `review`/`docs`/`pr` are intentionally NOT
+    /// reconstructed onto the returned `SDLCState` (see the field-vs-param
+    /// design note on [`Self::to_committed_state_json`]) — callers that need
+    /// them should read the parsed `Value` directly.
+    pub fn from_committed_state_json(value: &serde_json::Value) -> Result<Self, NodeError> {
+        let spec_slug = value
+            .get("spec_slug")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| NodeError::new("committed state JSON missing \"spec_slug\""))?
+            .to_string();
+
+        let tasks = match value.get("tasks") {
+            Some(serde_json::Value::Object(map)) => {
+                let mut entries: Vec<(u32, SDLCTask)> = Vec::with_capacity(map.len());
+                for (key, task_value) in map {
+                    let task_id: u32 = key.parse().map_err(|_| {
+                        NodeError::new(format!("committed state JSON: invalid task id key {key:?}"))
+                    })?;
+                    let task: SDLCTask =
+                        serde_json::from_value(task_value.clone()).map_err(|err| {
+                            NodeError::new(format!(
+                                "committed state JSON: failed to parse task {key:?}: {err}"
+                            ))
+                        })?;
+                    entries.push((task_id, task));
+                }
+                entries.sort_by_key(|(task_id, _)| *task_id);
+                entries.into_iter().map(|(_, task)| task).collect()
+            }
+            // Absent, null, or (defensively) a legacy array — no tasks
+            // recoverable from this shape; callers that need the array form
+            // never produced this file in the first place post-EN.4.1.
+            _ => Vec::new(),
+        };
+
+        let telemetry = value
+            .get("telemetry")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let policy = value
+            .get("policy")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let outcomes = value
+            .get("outcomes")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let phase_id = value
+            .get("phase_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let block_id = value
+            .get("block_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let branch = value
+            .get("branch")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let worktree_path = value
+            .get("worktree_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let started_at = value
+            .get("started_at")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let updated_at = value
+            .get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let bail_reason = value
+            .get("bail_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let global_status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(default_global_status);
+
+        Ok(Self {
+            spec_slug,
+            phase_id,
+            block_id,
+            global_status,
+            tasks,
+            telemetry,
+            policy,
+            outcomes,
+            branch,
+            worktree_path,
+            started_at,
+            updated_at,
+            bail_reason,
+        })
+    }
+}
+
+/// Run-level metadata supplied fresh at every
+/// [`SDLCState::to_committed_state_json`] call — the D31 fields that live
+/// outside `SDLCState`'s own long-lived data (see that method's doc comment
+/// for why `branch`/`worktree_path`/`started_at`/`updated_at` are parameters
+/// rather than read from `self`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunMeta {
+    /// The git branch this run executed on.
+    pub branch: String,
+    /// The worktree (or plain checkout) path this run executed in.
+    pub worktree_path: String,
+    /// ISO-8601 timestamp of this run's first state write. Callers preserve
+    /// this across resumes rather than recomputing it fresh.
+    pub started_at: String,
+    /// ISO-8601 timestamp of this specific write. Always recomputed fresh.
+    pub updated_at: String,
+}
+
+/// The `ConsolidatedReviewNode` verdict block, reshaped into the D31
+/// committed-state `review` key (`{verdict, findings, attempts}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedReview {
+    /// The review verdict string (`"PASS"` / `"FAIL"` / `"PARTIAL"`).
+    pub verdict: String,
+    /// Issues raised by the review, if any.
+    #[serde(default)]
+    pub findings: Vec<String>,
+    /// Number of review attempts made.
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// The `PatchDocsNode` output, reshaped into the D31 committed-state `docs`
+/// key (`{changed, created}`). `PatchDocsNode` only ever patches existing
+/// docs (`files_patched`) — it has no concept of newly-created files — so
+/// `created` is always empty from this engine today; the field exists for
+/// D31-shape parity and forward-compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CommittedDocs {
+    /// Doc files patched this run.
+    #[serde(default)]
+    pub changed: Vec<String>,
+    /// Doc files newly created this run (always empty; see struct doc).
+    #[serde(default)]
+    pub created: Vec<String>,
+}
+
+/// The `PullRequestNode` output, reshaped into the D31 committed-state `pr`
+/// key (`{url, number}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedPr {
+    /// The opened PR's URL.
+    pub url: String,
+    /// The opened PR's number.
+    pub number: u64,
+}
+
+/// Why an SDLC Flow run ended before every task completed cleanly — the one
+/// shared seam [`derive_committed_status`] and [`derive_bail_reason`] both
+/// key off of, so a run's `status`/`bail_reason` can never independently
+/// disagree about *whether* it bailed (only about the message). `None`
+/// (absent, not a variant) means the happy path: still running, or done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalSignal {
+    /// `TriageTaskNode` classified a task's repeated test failure as
+    /// unrecoverable (`SDLCTriageVerdict::MajorBail`, typically "max
+    /// attempts reached").
+    MajorBail(String),
+    /// `ConsolidatedReviewNode` returned a definitive `FAIL` verdict that
+    /// `ReviewRouterNode` routed straight to `WrapUpNode` (0 issues, or more
+    /// issues than the structural threshold, `task_loop::
+    /// STRUCTURAL_ISSUE_THRESHOLD`) rather than back through the retry loop.
+    ReviewFail(String),
+    /// `ConsolidatedReviewNode` returned `PARTIAL` but `ReviewRouterNode`
+    /// still routed to `WrapUpNode` because the issue count was structural
+    /// (0, or over threshold) rather than a small fixable set — the same
+    /// routing gate as [`Self::ReviewFail`], distinguished only by the
+    /// upstream verdict string.
+    StructuralFail(String),
+}
+
+impl TerminalSignal {
+    /// The human-readable message carried by whichever variant this is.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::MajorBail(message)
+            | Self::ReviewFail(message)
+            | Self::StructuralFail(message) => message,
+        }
+    }
+}
+
+/// Derive the D31 committed-state `status` string
+/// (`"running"|"review"|"docs"|"wrapup"|"blocked"|"done"`) from a state
+/// snapshot and an optional [`TerminalSignal`].
+///
+/// A `Some` terminal signal (of any variant) always yields `"blocked"` — the
+/// one real terminal-failure value this engine ever writes (there is no
+/// `"bailed"` anywhere in the codebase; see `run-sdlc-flow.sh`). Absent a
+/// terminal signal, every task reaching `Done`/`Skipped` yields `"done"`;
+/// anything else yields `"running"`.
+///
+/// `"review"`/`"docs"`/`"wrapup"` are base-template JS-engine-only
+/// intermediate-phase markers: that engine writes committed state at each of
+/// those distinct phase boundaries. This Rust engine has only two state-write
+/// call sites — `task_loop::SaveStateNode` (mid task-loop, always
+/// `"running"` unless a terminal signal is threaded in) and
+/// `wrap_up::WrapUpNode` (the run's tail, `"done"` or `"blocked"`) — so those
+/// three literal values are currently unreachable outputs; the return type
+/// still allows for them for D31-shape parity and forward-compatibility if a
+/// future call site ever writes state mid-docs/mid-review.
+#[must_use]
+pub fn derive_committed_status(
+    state: &SDLCState,
+    terminal_signal: Option<&TerminalSignal>,
+) -> &'static str {
+    if terminal_signal.is_some() {
+        return "blocked";
+    }
+    let all_terminal = !state.tasks.is_empty()
+        && state
+            .tasks
+            .iter()
+            .all(|task| matches!(task.status, SDLCTaskStatus::Done | SDLCTaskStatus::Skipped));
+    if all_terminal {
+        "done"
+    } else {
+        "running"
+    }
+}
+
+/// Derive the D31 committed-state `current_task` value: the lowest
+/// `task_id` among tasks not yet `Done`/`Skipped`, or (if every task is
+/// terminal) the highest `task_id`, or `0` if `tasks` is empty.
+#[must_use]
+pub fn derive_current_task(tasks: &[SDLCTask]) -> u32 {
+    let next_pending = tasks
+        .iter()
+        .filter(|task| !matches!(task.status, SDLCTaskStatus::Done | SDLCTaskStatus::Skipped))
+        .map(|task| task.task_id)
+        .min();
+    if let Some(task_id) = next_pending {
+        return task_id;
+    }
+    tasks.iter().map(|task| task.task_id).max().unwrap_or(0)
+}
+
+/// Derive the D31 committed-state `bail_reason`: `Some(message)` for a
+/// `Some` [`TerminalSignal`] of any variant, `None` on the happy path.
+#[must_use]
+pub fn derive_bail_reason(terminal_signal: Option<&TerminalSignal>) -> Option<String> {
+    terminal_signal.map(|signal| signal.message().to_string())
 }
 
 #[cfg(test)]
@@ -591,5 +948,372 @@ mod tests {
             serde_json::to_string(&outcomes).unwrap(),
             serde_json::to_string(&telemetry).unwrap()
         );
+    }
+
+    // --- D31 committed-state adapter (EN.4.1) ------------------------------
+
+    fn run_meta() -> RunMeta {
+        RunMeta {
+            branch: "sdlc/EN.4.1-fixture".to_string(),
+            worktree_path: "trees/sdlc/EN.4.1-fixture".to_string(),
+            started_at: "2026-07-25T00:00:00Z".to_string(),
+            updated_at: "2026-07-25T00:10:00Z".to_string(),
+        }
+    }
+
+    fn task(task_id: u32, status: SDLCTaskStatus) -> SDLCTask {
+        let mut task = SDLCTask::new(task_id, format!("Task {task_id}"), "description");
+        task.status = status;
+        task
+    }
+
+    #[test]
+    fn to_committed_state_json_reshapes_tasks_into_an_object_keyed_by_id() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![
+            task(1, SDLCTaskStatus::Done),
+            task(2, SDLCTaskStatus::InProgress),
+        ];
+
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let tasks = json["tasks"].as_object().expect("tasks is an object");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks["1"]["status"], serde_json::json!("done"));
+        assert_eq!(tasks["2"]["status"], serde_json::json!("in_progress"));
+    }
+
+    #[test]
+    fn to_committed_state_json_empty_tasks_round_trip_as_empty_object() {
+        let state = SDLCState::new("EN.4.1-fixture");
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        assert_eq!(json["tasks"], serde_json::json!({}));
+        assert_eq!(json["status"], serde_json::json!("running"));
+        assert_eq!(json["current_task"], serde_json::json!(0));
+        assert_eq!(json["bail_reason"], serde_json::Value::Null);
+        assert_eq!(json["review"], serde_json::Value::Null);
+        assert_eq!(json["docs"], serde_json::Value::Null);
+        assert_eq!(json["pr"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn to_committed_state_json_carries_run_meta_fields() {
+        let state = SDLCState::new("EN.4.1-fixture");
+        let meta = run_meta();
+        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        assert_eq!(json["spec_slug"], serde_json::json!("EN.4.1-fixture"));
+        assert_eq!(json["branch"], serde_json::json!(meta.branch));
+        assert_eq!(json["worktree_path"], serde_json::json!(meta.worktree_path));
+        assert_eq!(json["started_at"], serde_json::json!(meta.started_at));
+        assert_eq!(json["updated_at"], serde_json::json!(meta.updated_at));
+    }
+
+    #[test]
+    fn to_committed_state_json_includes_review_docs_pr_when_supplied() {
+        let state = SDLCState::new("EN.4.1-fixture");
+        let review = CommittedReview {
+            verdict: "PASS".to_string(),
+            findings: vec![],
+            attempts: 1,
+        };
+        let docs = CommittedDocs {
+            changed: vec!["docs/architecture.md".to_string()],
+            created: vec![],
+        };
+        let pr = CommittedPr {
+            url: "https://github.com/bredmond1019/engine-rs/pull/1".to_string(),
+            number: 1,
+        };
+
+        let json =
+            state.to_committed_state_json(&run_meta(), Some(&review), Some(&docs), Some(&pr), None);
+        assert_eq!(json["review"]["verdict"], serde_json::json!("PASS"));
+        assert_eq!(json["review"]["attempts"], serde_json::json!(1));
+        assert_eq!(
+            json["docs"]["changed"],
+            serde_json::json!(["docs/architecture.md"])
+        );
+        assert_eq!(json["docs"]["created"], serde_json::json!([]));
+        assert_eq!(json["pr"]["number"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn to_committed_state_json_includes_additive_top_level_keys() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.phase_id = Some("EN.4".to_string());
+        state.block_id = Some("EN.4.1".to_string());
+        state.telemetry.total_attempts = 2;
+        state.policy = Some(SdlcPolicy::default());
+        state.outcomes = Some(RunOutcomes::default());
+
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        assert_eq!(json["phase_id"], serde_json::json!("EN.4"));
+        assert_eq!(json["block_id"], serde_json::json!("EN.4.1"));
+        assert_eq!(json["telemetry"]["total_attempts"], serde_json::json!(2));
+        assert!(json["policy"].is_object());
+        assert!(json["outcomes"].is_object());
+    }
+
+    #[test]
+    fn committed_state_json_round_trips_with_empty_tasks() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        let meta = run_meta();
+        state.started_at = Some(meta.started_at.clone());
+        let json = state.to_committed_state_json(&meta, None, None, None, None);
+
+        let round_tripped = SDLCState::from_committed_state_json(&json).expect("parses");
+        assert_eq!(round_tripped.spec_slug, "EN.4.1-fixture");
+        assert_eq!(round_tripped.tasks, Vec::<SDLCTask>::new());
+        assert_eq!(round_tripped.branch, Some(meta.branch));
+        assert_eq!(round_tripped.worktree_path, Some(meta.worktree_path));
+        assert_eq!(round_tripped.started_at, Some(meta.started_at));
+        assert_eq!(round_tripped.updated_at, Some(meta.updated_at));
+    }
+
+    #[test]
+    fn committed_state_json_round_trips_with_mixed_task_states() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![
+            task(1, SDLCTaskStatus::Done),
+            task(2, SDLCTaskStatus::Failed),
+            task(3, SDLCTaskStatus::Pending),
+        ];
+        state.telemetry.total_attempts = 5;
+        state.telemetry.tasks_passed = 1;
+        state.telemetry.tasks_failed = 1;
+
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let round_tripped = SDLCState::from_committed_state_json(&json).expect("parses");
+
+        assert_eq!(round_tripped.tasks.len(), 3);
+        assert_eq!(round_tripped.tasks[0].task_id, 1);
+        assert_eq!(round_tripped.tasks[0].status, SDLCTaskStatus::Done);
+        assert_eq!(round_tripped.tasks[1].task_id, 2);
+        assert_eq!(round_tripped.tasks[1].status, SDLCTaskStatus::Failed);
+        assert_eq!(round_tripped.tasks[2].task_id, 3);
+        assert_eq!(round_tripped.tasks[2].status, SDLCTaskStatus::Pending);
+        assert_eq!(round_tripped.telemetry.total_attempts, 5);
+    }
+
+    #[test]
+    fn committed_state_json_round_trips_out_of_order_task_keys() {
+        // Build the JSON directly (not via `to_committed_state_json`) with
+        // task keys inserted out of numeric order, to prove the numeric
+        // (not insertion-order or lexical-string) sort in
+        // `from_committed_state_json`.
+        let json = serde_json::json!({
+            "spec_slug": "EN.4.1-fixture",
+            "branch": "b",
+            "worktree_path": "w",
+            "started_at": "s",
+            "updated_at": "u",
+            "status": "running",
+            "current_task": 2,
+            "tasks": {
+                "10": { "task_id": 10, "title": "Ten", "description": "d" },
+                "2": { "task_id": 2, "title": "Two", "description": "d" },
+            },
+            "bail_reason": null,
+        });
+
+        let round_tripped = SDLCState::from_committed_state_json(&json).expect("parses");
+        assert_eq!(
+            round_tripped
+                .tasks
+                .iter()
+                .map(|t| t.task_id)
+                .collect::<Vec<_>>(),
+            vec![2, 10]
+        );
+    }
+
+    #[test]
+    fn committed_state_json_round_trips_with_policy_outcomes_telemetry() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.telemetry.total_attempts = 3;
+        state.telemetry.budget_spent = 1.25;
+        state.policy = Some(SdlcPolicy::default());
+        state.outcomes = Some(RunOutcomes {
+            wall_clock_secs: 10.0,
+            ..RunOutcomes::default()
+        });
+
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let round_tripped = SDLCState::from_committed_state_json(&json).expect("parses");
+
+        assert_eq!(round_tripped.telemetry.total_attempts, 3);
+        assert_eq!(round_tripped.telemetry.budget_spent, 1.25);
+        assert_eq!(round_tripped.policy, Some(SdlcPolicy::default()));
+        assert_eq!(
+            round_tripped.outcomes.map(|o| o.wall_clock_secs),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn from_committed_state_json_missing_spec_slug_errors() {
+        let json = serde_json::json!({ "status": "running" });
+        let err = SDLCState::from_committed_state_json(&json).unwrap_err();
+        assert!(err.to_string().contains("spec_slug"));
+    }
+
+    #[test]
+    fn derive_committed_status_blocked_for_every_terminal_signal_variant() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![task(1, SDLCTaskStatus::InProgress)];
+
+        for signal in [
+            TerminalSignal::MajorBail("max attempts reached".to_string()),
+            TerminalSignal::ReviewFail("review FAIL, 0 issues".to_string()),
+            TerminalSignal::StructuralFail("review PARTIAL, 12 issues".to_string()),
+        ] {
+            assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
+        }
+
+        // Blocked even if every task happens to already be terminal — a
+        // terminal signal always wins over task-state.
+        state.tasks = vec![task(1, SDLCTaskStatus::Done)];
+        let signal = TerminalSignal::MajorBail("bail".to_string());
+        assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
+    }
+
+    #[test]
+    fn derive_committed_status_done_when_all_tasks_terminal_and_no_signal() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![
+            task(1, SDLCTaskStatus::Done),
+            task(2, SDLCTaskStatus::Skipped),
+        ];
+        assert_eq!(derive_committed_status(&state, None), "done");
+    }
+
+    #[test]
+    fn derive_committed_status_running_when_any_task_pending_and_no_signal() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![
+            task(1, SDLCTaskStatus::Done),
+            task(2, SDLCTaskStatus::Pending),
+        ];
+        assert_eq!(derive_committed_status(&state, None), "running");
+    }
+
+    #[test]
+    fn derive_committed_status_running_when_no_tasks_and_no_signal() {
+        let state = SDLCState::new("EN.4.1-fixture");
+        assert_eq!(derive_committed_status(&state, None), "running");
+    }
+
+    #[test]
+    fn derive_current_task_empty_is_zero() {
+        assert_eq!(derive_current_task(&[]), 0);
+    }
+
+    #[test]
+    fn derive_current_task_all_pending_is_lowest_id() {
+        let tasks = vec![
+            task(3, SDLCTaskStatus::Pending),
+            task(1, SDLCTaskStatus::Pending),
+            task(2, SDLCTaskStatus::Pending),
+        ];
+        assert_eq!(derive_current_task(&tasks), 1);
+    }
+
+    #[test]
+    fn derive_current_task_mixed_is_lowest_non_terminal_id() {
+        let tasks = vec![
+            task(1, SDLCTaskStatus::Done),
+            task(2, SDLCTaskStatus::Failed),
+            task(3, SDLCTaskStatus::Pending),
+        ];
+        assert_eq!(derive_current_task(&tasks), 2);
+    }
+
+    #[test]
+    fn derive_current_task_all_done_is_last_id() {
+        let tasks = vec![
+            task(1, SDLCTaskStatus::Done),
+            task(2, SDLCTaskStatus::Skipped),
+            task(3, SDLCTaskStatus::Done),
+        ];
+        assert_eq!(derive_current_task(&tasks), 3);
+    }
+
+    #[test]
+    fn derive_bail_reason_per_variant() {
+        assert_eq!(
+            derive_bail_reason(Some(&TerminalSignal::MajorBail("m".to_string()))),
+            Some("m".to_string())
+        );
+        assert_eq!(
+            derive_bail_reason(Some(&TerminalSignal::ReviewFail("r".to_string()))),
+            Some("r".to_string())
+        );
+        assert_eq!(
+            derive_bail_reason(Some(&TerminalSignal::StructuralFail("s".to_string()))),
+            Some("s".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_bail_reason_none_for_happy_path() {
+        assert_eq!(derive_bail_reason(None), None);
+    }
+
+    #[test]
+    fn to_committed_state_json_matches_golden_fixture() {
+        let mut state = SDLCState::new("EN.4.1-fixture-golden");
+        state.phase_id = Some("EN.4".to_string());
+        state.block_id = Some("EN.4.1".to_string());
+        let mut t1 = task(1, SDLCTaskStatus::Done);
+        t1.attempt_count = 1;
+        let mut t2 = task(2, SDLCTaskStatus::Done);
+        t2.attempt_count = 2;
+        state.tasks = vec![t1, t2];
+        state.telemetry = SDLCTelemetry {
+            total_attempts: 3,
+            budget_spent: 0.05,
+            tasks_passed: 2,
+            tasks_failed: 0,
+        };
+        state.policy = Some(SdlcPolicy::default());
+        state.outcomes = Some(RunOutcomes {
+            wall_clock_secs: 42.0,
+            total_attempts: 3,
+            total_retries: 1,
+            tasks_passed: 2,
+            tasks_failed: 0,
+            review_verdicts: vec!["ConsolidatedReviewNode:PASS".to_string()],
+            total_input_tokens: 100,
+            total_output_tokens: 50,
+            total_cost_usd: 0.02,
+            model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
+        });
+
+        let meta = RunMeta {
+            branch: "sdlc/EN.4.1-fixture-golden".to_string(),
+            worktree_path: "trees/sdlc/EN.4.1-fixture-golden".to_string(),
+            started_at: "2026-07-25T00:00:00Z".to_string(),
+            updated_at: "2026-07-25T00:10:00Z".to_string(),
+        };
+        let review = CommittedReview {
+            verdict: "PASS".to_string(),
+            findings: vec![],
+            attempts: 1,
+        };
+        let docs = CommittedDocs {
+            changed: vec!["docs/architecture.md".to_string()],
+            created: vec![],
+        };
+        let pr = CommittedPr {
+            url: "https://github.com/bredmond1019/engine-rs/pull/1".to_string(),
+            number: 1,
+        };
+
+        let actual =
+            state.to_committed_state_json(&meta, Some(&review), Some(&docs), Some(&pr), None);
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/committed_state_expected.json"))
+                .expect("golden fixture parses as JSON");
+
+        assert_eq!(actual, expected);
     }
 }
