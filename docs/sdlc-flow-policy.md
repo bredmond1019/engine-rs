@@ -39,6 +39,39 @@ generic `crate::policy::RunTelemetry`; the event's `policy` and `profile` fields
 (cross-run aggregation — `PolicyAggregate` is now a type alias for the generic
 `crate::policy::PolicyAggregate<SdlcPolicy>`).
 
+## Resolved once per run, at dispatch (EN.5.D)
+
+Through `EN.4.0`/`EN.4.x`, every model node called `resolve_policy_for_run(&ctx, &worktree)` itself,
+inside `process()` — every node re-read `harness.json` and re-resolved the same policy
+independently, and no served run ever reached the policy-aware `registry_for_policy` registry at
+all (`engine-serve`'s `Dispatcher` only ever built the default-policy graph). `EN.5.D` closes that
+gap: `WorkflowFactory` (`engine-serve::dispatch`) now takes the triggering event payload, resolves
+policy exactly once inside the factory — before the `Workflow` is even constructed — builds
+`registry_for_policy(&policy)`, and seeds the result into the run's initial `ctx.nodes` under
+`policy::RESOLVED_POLICY_IDENTITY` (`Workflow::with_seeded_nodes`). Nodes now read the stamp via
+`policy::resolved_policy_strict(&ctx)` rather than re-resolving it; reading an absent/unparsable
+stamp is an `Err`, not a silent `SdlcPolicy::default()` — a policy that fails to resolve (an unknown
+`profile`, a malformed inline `policy` override) fails the *dispatch*, surfaced as
+`DispatchError::PolicyResolutionFailed` (HTTP 422, naming the offending profile) rather than quietly
+falling back once the run is already underway.
+
+**Config source, decoupled from a worktree.** Resolving `sdlc.policy`/`sdlc.profiles` out of
+`harness.json` no longer requires a worktree path in hand: `policy::PolicyConfigSource` has three
+variants — `Worktree(path)` (read `<path>/planning/harness.json`, what `SDLC_FLOW` uses, since its
+served process is itself a real repo checkout), `HarnessFile(path)` (an explicit file path), and
+`Builtin` (skip the file entirely — builtin + profile + event layers only). The three workflows with
+no repo checkout at dispatch time (`RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`) all
+resolve via `PolicyConfigSource::Builtin` in their `engine-serve::workflows` registrations, so a
+worktree-free trigger resolves policy successfully instead of falling back to
+`std::env::current_dir()` (which was never actually the run's own worktree anyway — `SDLC_FLOW`'s
+own dispatch-time read is off the *serving process's* cwd, not the run's eventual
+`SetupWorktreeNode` output, since that node hasn't run yet at dispatch time).
+
+See `planning/decisions/D11-policy-dispatch-seam.md` and `docs/architecture.md`'s `Dispatcher`
+entry for the full mechanism; `crates/engine-core/tests/policy_dispatch_e2e.rs` is the hermetic
+end-to-end proof (stubbed transports, no live model calls) that a `profile` sent over `POST
+/events/` actually reaches a served run and changes which transport a judgment stage calls.
+
 ## Configuring a run
 
 Four layers, resolved high-to-low precedence — **per-run event `policy` override > per-run event
@@ -203,7 +236,30 @@ instead of the Claude CLI — for cheap, zero-cost judgment calls on cheap hardw
 - `tasks_passed` / `tasks_failed`.
 - `review_verdicts` — e.g. `["TriageTaskNode:RETRYABLE", "ConsolidatedReviewNode:PASS"]`.
 - `total_input_tokens` / `total_output_tokens` / `total_cost_usd`.
-- `model_tier_used` — per-stage tier actually used for that run.
+- `model_tier_used` — per-stage tier actually **called**, not the resolved policy's intent (see
+  below).
+
+**Observed vs. intended tier (`EN.5.D`).** `openai_compat_transport`'s `local` tier fails fast and
+silently falls back to the real cloud transport when its endpoint is unreachable — deliberately, so
+a down local server never hard-fails a run. That fallback is invisible to intent-derived telemetry:
+if `model_tier_used` just echoed the resolved policy, a run whose `local`-tier review stage silently
+fell back to cloud would still report `"review": "local"`. `RunTelemetry` instead harvests each
+stage's tier from what the transport actually stamped —
+`ctx.nodes[stage]["transport"]["tier"]`/`["model"]`/`["endpoint"]` (a `MetaTransport`, EN.5.D task 9;
+`openai_compat_meta_transport` stamps `{"tier": "local", ...}` on a successful local call and
+`{"tier": "cloud", ...}` on the fallback) — and this **observed** value overrides any
+caller-supplied `model_tier_used` entry for that same stage. A stage that ran no model this run (or
+whose node only exposes the plain, non-meta `with_transport` seam — still generic `"cloud"`-tier,
+per `ClaudeCodeStep`'s doc comment) simply has no observed entry, leaving the caller-supplied value,
+if any, as the only source for that key.
+
+`Workflow::run_with` (`crates/engine-core/src/workflow.rs`) now stamps this generic
+`policy::telemetry::RunTelemetry` snapshot into every completed run's
+`TaskContext::metadata["run_telemetry"]` automatically (`EN.5.D` task 10) — not only under the
+`#[ignore]`d profile-ranking experiments. `SDLC_FLOW`'s own `WrapUpNode` still separately computes
+its precise `RunOutcomes` (with `total_attempts`/`tasks_passed`/etc. it alone can derive from
+`SDLCState`) into `ctx.nodes["WrapUpNode"]`/the on-disk state file below — the two writes sit at
+different `ctx` locations and don't disturb each other.
 
 This is persisted to `planning/<spec-slug>/sdlc/sdlc-flow-state.json` (the same file
 `SaveStateNode` writes throughout the run — `WrapUpNode`'s policy/outcomes blocks land in that

@@ -186,9 +186,32 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   failures (e.g. an unresolvable node identity); distinct from `NodeError` — a node's own failure
   is captured in its `NodeRun` and does not short-circuit `run()` with an `Err`.
 - `Dispatcher` (`engine-serve::dispatch`) — dual-registry (`workflow_registry` + `schema_registry`)
-  lookup keyed by `workflow_type`; `register` takes a boxed `WorkflowFactory` closure
-  (`Box<dyn Fn() -> Workflow + Send + Sync>`); `dispatch(workflow_type)` resolves a registered
-  `Workflow` or returns `DispatchError::UnknownWorkflowType`.
+  lookup keyed by `workflow_type`; `register` takes a boxed `WorkflowFactory` closure. As of
+  `EN.5.D`, `WorkflowFactory` is `Box<dyn Fn(&serde_json::Value) -> Result<Workflow, String> + Send
+  + Sync>` — it receives the triggering event's `data` payload so a registration can resolve its
+  own policy (the four-layer `builtin < harness < profile < event` precedence, `crate::policy`
+  framework) and assemble a policy-dependent registry (`registry_for_policy`) *before* the
+  `Workflow` is built, rather than the old zero-argument factory
+  (`Box<dyn Fn() -> Workflow + Send + Sync>`), which could only ever build the same default-policy
+  graph regardless of what the event asked for. `dispatch_with_event(workflow_type, event)` is the
+  primary entry point: it resolves the registration and hands `event` to its factory, returning
+  `DispatchError::UnknownWorkflowType` for an unregistered type or
+  `DispatchError::PolicyResolutionFailed(message)` — distinct, and surfaced as a different HTTP
+  status by `post_events` — when the factory's own policy resolution fails against `event` (e.g. an
+  unknown `profile` name, a malformed inline `policy` override). `dispatch(workflow_type)` is a thin
+  convenience wrapper calling `dispatch_with_event` with an empty (`Null`) event, kept for callers
+  with no event payload in hand. Every builtin registration
+  (`engine-serve::workflows::register_{sdlc_flow,research_agent,diagnostic_intake,
+  proposal_generator}`) resolves policy against a workflow-appropriate
+  `policy::PolicyConfigSource` — `SDLC_FLOW` (which runs embedded in a real repo checkout) uses
+  `PolicyConfigSource::Worktree(current_dir)`; the other three (channel/API-shaped, no repo
+  checkout at dispatch time) use `PolicyConfigSource::Builtin` (builtin + profile + event layers
+  only, no filesystem access) — so a worktree-free workflow never falls back to
+  `std::env::current_dir()` to resolve its policy. The resolved policy is seeded into the run's
+  initial `ctx.nodes` under `policy::RESOLVED_POLICY_IDENTITY` (via `Workflow::with_seeded_nodes`),
+  so policy is resolved **once per run at dispatch** — no node re-resolves it (and re-reads
+  `harness.json`) inside its own `process()`. See
+  `planning/decisions/D11-policy-dispatch-seam.md`.
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state.
@@ -260,9 +283,13 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
    gated) — from local CLI, remote BastionUI over Tailscale, or an orchestrator-equivalent event
    POST. A live run can be cancelled mid-flight via `POST /events/{run_id}/abort` (EN.2.B, same
    API-key gate), which resolves the run's registered `CancellationToken` and calls `cancel()`.
-2. `Dispatcher::dispatch(workflow_type)` resolves the event to a registered `Workflow` via the dual
-   registry (`workflow_registry` + `schema_registry`), returning `DispatchError::
-   UnknownWorkflowType` (surfaced as HTTP 422) for an unregistered type.
+2. `Dispatcher::dispatch_with_event(workflow_type, &body.data)` resolves the event to a registered
+   `Workflow` via the dual registry (`workflow_registry` + `schema_registry`), feeding the
+   triggering event's `data` to the registration's policy-aware `WorkflowFactory` (`EN.5.D`) so it
+   can resolve its own policy and assemble the policy-dependent registry before the `Workflow` is
+   built. Returns `DispatchError::UnknownWorkflowType` (surfaced as HTTP 422) for an unregistered
+   type, or `DispatchError::PolicyResolutionFailed` (also HTTP 422, naming the offending profile)
+   when the factory's policy resolution fails against `data` — e.g. an unknown `profile` name.
 3. `Workflow::run` seeds all nodes declared in the `WorkflowSchema` PENDING in `TaskContext::node_runs`,
    emits the initial in-memory snapshot via `on_progress`, which fans out to both:
    - `LiveStateStore::record` — the in-memory run-state map the local Console reads with no DB poll.
@@ -278,6 +305,14 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
    `CancellationToken` and optional `Budget` ledger, halting the walk the same way a node error
    does (still `Ok`, nodes not yet reached stay Pending) and stamping the reason
    (`metadata.cancellation` or `metadata.budget`) into `TaskContext::metadata`.
+   Every completed (or halted) run's `run_with` also stamps a workflow-agnostic
+   `policy::telemetry::RunTelemetry` snapshot into `metadata.run_telemetry` (`EN.5.D`) — wall-clock,
+   token/cost totals, review verdicts, and `model_tier_used` harvested from whatever identities
+   `ctx.nodes` carries by that point. `model_tier_used` prefers each stage's **observed** transport
+   stamp (`ctx.nodes[stage]["transport"]["tier"]`, written by `ClaudeCodeStep`/
+   `openai_compat_transport`'s tier-aware `MetaTransport` seam) over the resolved policy's intent,
+   so a `local`-tier stage that silently fell back to cloud (endpoint unreachable) is reported as
+   what actually ran, not what the policy asked for.
 5. Local Console reads live state directly via `LiveStateStore::get`/`list_active` (in-memory,
    no DB poll); remote observers (BastionUI) subscribe to serve's `GET /workflows` /
    `GET /workflows/{type}/graph` read-API rather than polling Postgres. The durable writer
