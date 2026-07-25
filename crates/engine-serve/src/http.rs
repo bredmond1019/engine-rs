@@ -121,7 +121,10 @@ async fn post_events(
         return HttpResponse::Unauthorized().finish();
     }
 
-    let workflow = match state.dispatcher.dispatch(&body.workflow_type) {
+    let workflow = match state
+        .dispatcher
+        .dispatch_with_event(&body.workflow_type, &body.data)
+    {
         Ok(workflow) => workflow,
         Err(DispatchError::UnknownWorkflowType(workflow_type)) => {
             return HttpResponse::UnprocessableEntity().json(serde_json::json!({
@@ -129,11 +132,12 @@ async fn post_events(
                 "workflow_type": workflow_type,
             }));
         }
-        // No builtin registration resolves policy against the event yet
-        // (EN.5.D task 7 wires `dispatch_with_event`+`body.data` through
-        // here and maps this to a dedicated 4xx naming the offending
-        // profile); kept as a real arm rather than `unreachable!()` since
-        // `dispatch`'s empty-payload factory call can still fail today.
+        // A registered workflow's factory (EN.5.D task 7) failed to resolve
+        // policy against `body.data` — an unknown `profile` name or a
+        // malformed `policy` override. 4xx, never a 500, and the offending
+        // profile is named in `message` (surfaced verbatim from the
+        // factory's own error, e.g. `resolve_profile_from`'s "unknown
+        // profile '...'").
         Err(DispatchError::PolicyResolutionFailed(message)) => {
             return HttpResponse::UnprocessableEntity().json(serde_json::json!({
                 "error": "policy resolution failed",
@@ -320,6 +324,82 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: Vec<String> = test::read_body_json(resp).await;
         assert!(body.contains(&"fixture".to_string()));
+    }
+
+    /// An `AppState` whose sole registration's factory fails policy
+    /// resolution against any event naming a `profile`, mirroring what a
+    /// real workflow's `resolve_policy_for_run_from` does against an
+    /// unknown profile name (EN.5.D task 7).
+    fn test_app_state_with_policy_aware_factory() -> AppState {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            fixture_schema("fixture"),
+            Box::new(|event: &serde_json::Value| {
+                if let Some(profile) = event.get("profile").and_then(|v| v.as_str()) {
+                    return Err(format!("unknown profile '{profile}'"));
+                }
+                let mut registry = NodeRegistry::new();
+                registry.register(Box::new(MarkerNode));
+                Ok(Workflow::new(registry, fixture_schema("fixture")))
+            }),
+        );
+
+        AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_forwards_data_to_the_factory_for_policy_resolution() {
+        let state = test_app_state_with_policy_aware_factory();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "fixture", "data": {} }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 202);
+    }
+
+    #[actix_web::test]
+    async fn post_events_with_unknown_profile_returns_4xx_naming_the_profile_and_never_runs() {
+        let state = test_app_state_with_policy_aware_factory();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "fixture",
+                "data": { "profile": "not-a-real-profile" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 422);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"], "policy resolution failed");
+        assert!(body["message"]
+            .as_str()
+            .expect("message should be a string")
+            .contains("not-a-real-profile"));
     }
 
     #[actix_web::test]
