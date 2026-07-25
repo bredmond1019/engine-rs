@@ -6,13 +6,13 @@ doc_id: data-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.1.0, cancellation, abort, budget gate, engine-contract]
+keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.2.0, cancellation, abort, budget gate, engine-contract, event read api]
 related: [architecture, D6-cancellation-and-budget-semantics, D20-shared-data-contract]
 ---
 
 # Data Contract (Consumer View)
 
-**Pinned Contract Version: 1.1.0**
+**Pinned Contract Version: 1.2.0**
 
 The **canonical, authoritative** contract is owned by the orchestrator:
 `orchestrator/docs/data-contract.md`. This file is engine-rs's *consumer* view — it pins the
@@ -138,6 +138,15 @@ would be a MAJOR contract bump; see `planning/decisions/D6-cancellation-and-budg
 Both are produced by `Workflow::run_with` (`crates/engine-core/src/workflow.rs`) at the node
 boundary, before dispatching the next node — see `docs/architecture.md` § Core Types.
 
+The canonical contract's v1.2.0 adds a third run-level annotation, `metadata.failure` — written by
+the orchestrator's Celery worker when a workflow raises inside `process_incoming_event`, on a
+fresh session that survives the enclosing transaction's rollback: `{ "failure": { "failed": true,
+"error": "<ExcType>: <msg>", "at": "<iso8601>" } }`. Like `cancellation` and `budget`, it lives in
+the existing `TaskContext::metadata: serde_json::Value` free-form field — no `engine_contract`
+Rust type changes shape. engine-rs's own execution path (`Workflow::run_with`) does not yet stamp
+`metadata.failure` on a raising run; whether it should is future work, not this re-pin — `§6`'s
+`pending|running|success|failed` `NodeRunStatus` vocabulary is unchanged either way.
+
 ---
 
 ## HTTP surface parity
@@ -152,6 +161,15 @@ canonical contract's §7, so a caller can target either runtime:
 | `GET` | `/workflows` | `http::list_workflows` |
 | `GET` | `/workflows/{type}/graph` | `http::workflow_graph` — `404` for an unregistered type |
 | `POST` | `/events/{run_id}/abort` | `abort::abort_run` (EN.2.B) — same `X-API-Key` gate; `401`/`404`/`202` per the canonical contract §7 |
+
+The canonical contract's v1.2.0 adds a sixth route, `GET /events/{event_id}` (`X-API-Key` gated,
+`404` for unknown/malformed ids, `200 {event_id, workflow_type, status, created_at, updated_at,
+task_context}` with `status` derived server-side), implemented in the orchestrator's own Python
+API (`OR.Y`) — **not** in `engine-serve`. `POST /events/` also gains an `event_id` field on its
+`202` body there. Neither is ported to `engine-serve`/`http::post_events` by this re-pin; adding
+the matching route and response field to engine-rs's own HTTP surface (to keep the two runtimes
+interchangeable per the "same HTTP surface" goal above) is future work, tracked separately from
+this pin.
 
 `POST /events/{run_id}/abort` is backed by `abort::RunRegistry`, a per-run `CancellationToken`
 registry: `post_events` mints and registers a token alongside the freshly-minted `run_id` before
@@ -180,3 +198,4 @@ against a finished `run_id` correctly 404s rather than triggering a token nobody
 |---|---|---|
 | 1.0.1 | 2026-07-02 | Retroactive: `engine-contract`'s types (`EventsRow`, `TaskContext`, `NodeRun`, `NodeRunStatus`, `Usage`) were built matching canonical 1.0.1 during EN.0.B, but this consumer doc did not exist yet (Gap 2, `core/_planning/engine-rs/orchestrator-contract-conformance/notes.md`). Backfilled here rather than left undocumented. |
 | 1.1.0 | 2026-07-16 | Re-pin to 1.1.0. Registers the canonical's v1.1.0 additions, both introduced by engine-rs's own EN.2.B: `POST /events/{run_id}/abort` (§ HTTP surface parity above) and the `metadata.cancellation` / `metadata.budget` run-level annotations (§ above). No `engine_contract` Rust type changed shape — both additions live in the existing `TaskContext::metadata: serde_json::Value` free-form field, per D6. |
+| 1.2.0 | 2026-07-24 | Re-pin from 1.1.0 to 1.2.0 (`OR.Y`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.2.0 additions, none yet ported to `engine-serve`: the orchestrator's own `GET /events/{event_id}` read route and the `event_id` field on `POST /events/`'s 202 body (§ HTTP surface parity above), and the `metadata.failure` run-level annotation (§ Run-level `metadata` annotations above). No `engine_contract` Rust type changed shape — `metadata.failure` lives in the existing free-form `metadata` field, per D6. Porting the read route and `event_id` field to `engine-serve` for HTTP-surface parity is future work. |

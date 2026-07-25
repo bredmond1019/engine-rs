@@ -162,12 +162,23 @@ fn write_fixture_files(worktree: &Path) {
 }
 
 /// Injected `TestTaskNode` runner: FAILs (`status = 1`) on its first
-/// invocation, PASSes (`status = 0`) on every subsequent one — drives the
-/// task's first attempt to fail and its retry to pass.
+/// harness-check invocation, PASSes (`status = 0`) on every subsequent one —
+/// drives the task's first attempt to fail and its retry to pass.
+/// Special-cases `git status --porcelain` (the write-verification guard's
+/// probe) to report `src/lib.rs` as modified, matching `build_workflow`'s
+/// stubbed `ImplementTaskNode` claim, and does NOT consume a slot in the
+/// fail/pass sequence — only the actual harness-check calls do.
 fn fail_then_pass_runner() -> (CommandRunner, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_clone = calls.clone();
-    let runner: CommandRunner = Arc::new(move |_program, _args, _cwd| {
+    let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+        if program == "git" && args.first() == Some(&"status") {
+            return Ok(CommandOutput {
+                status: 0,
+                stdout: " M src/lib.rs\n".to_string(),
+                stderr: String::new(),
+            });
+        }
         let n = calls_clone.fetch_add(1, Ordering::SeqCst);
         Ok(CommandOutput {
             status: if n == 0 { 1 } else { 0 },

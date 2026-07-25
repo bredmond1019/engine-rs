@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-20T13:14:48Z"
+timestamp: "2026-07-24T19:30:32Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,37 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [run: 2026-07-24]
+
+### `EN.4.A-research-agent` done — RESEARCH_AGENT (company brief + prospecting mode, policy-aware)
+- **What:** Ran `/sdlc-flow EN.4.A-research-agent` (branch `EN.4.A-research-agent-flow`); all 9 tasks passed. Task 1 scaffolded the `research_agent` workflow module (six leaf-file stubs + `WORKFLOW_TYPE = "RESEARCH_AGENT"`) and registered it in `workflows/mod.rs`. Task 2 added `ResearchAgentPolicy`/`PartialResearchAgentPolicy` implementing the EN.4.0 `Policy` trait (research/prospect model tiers, output verbosity, prompt cache, local config). Task 3 added `ResearchAgentEventSchema`, `ResearchMode`, `CompanyBrief`, and `ProspectingResult` with `json_schema()` builders. Task 4 added three named policy profiles (`baseline`/`cheap-fast`/`thorough`), `resolve_policy_for_run`, and a matching `research_agent.{policy,profiles}` section in `harness.json`. Task 5 built `CompanyResearchNode`: wraps `ClaudeCodeStep` with WebSearch/WebFetch tools + a `CompanyBrief` schema, resolves/applies the run policy, parses the reply, and persists `research-agent-state.json` telemetry. Task 6 built the sibling `ProspectingResearchNode` (four-pillar vertical mapping, same structural pattern). Task 7 added `ResearchModeRouterNode` plus graph/registry assembly, registered as `RESEARCH_AGENT` in engine-serve (`register_research_agent` → `register_builtin_workflows`), making it dispatchable and visible in `GET /workflows`. Task 8 added a hermetic e2e suite (`crates/engine-core/tests/research_agent_e2e.rs`) covering both modes' router→terminal-node round-trips against `engine-contract::EventsRow`, a no-Local-rewire assertion on `registry_for_policy`, dispatcher registration, and a `#[ignore]`-gated named-profile experiment harness via `policy::aggregate_state_files`. Task 9 validated the full block (fmt/clippy/test/release-build all green) with no code changes needed.
+- **Why:** Closes Block EN.4.A of `master-plan.md` Phase 4 — the first of the diagnostic-funnel-adjacent workflows built on the EN.4.0 shared policy framework, and the source of `CompanyResearchNode` that EN.4.C (`PROPOSAL_GENERATOR`) is expected to reuse.
+- **Verdict:** PASS (review found no findings). Docs: `docs/research-agent-workflow.md` created, `docs/index.md` updated.
+- **Status:** `planning/state.json` block `EN.4.A` set to `"closed"`; `planning/status.md` Progress Table row added under Phase 4 and flipped to Done.
+- **Next:** EN.4.B — DIAGNOSTIC_INTAKE extractor (net-new, policy-aware).
+
+```
+f64cded docs: add RESEARCH_AGENT workflow reference for EN.4.A
+30b4f31 feat: implement EN.4.A-research-agent-task8
+0d09745 feat: implement EN.4.A-research-agent-task7
+e3112b2 feat: implement EN.4.A-research-agent-task6
+62187f2 feat: implement EN.4.A-research-agent-task5
+3ff23d3 feat: implement EN.4.A-research-agent-task4
+33f9921 feat: implement EN.4.A-research-agent-task3
+416ad99 feat: implement EN.4.A-research-agent-task2
+```
+
+---
+
+## [2026-07-24]
+
+### TestTaskNode harness check-kind parity + live-tested critical write-permission gap in ImplementTaskNode/ConsolidatedReviewNode
+- **What:** Ported the four missing harness check kinds (`forbidden-pattern-scan`, `baseline-diff`, `count-delta`, `warning-scan`) into `TestTaskNode` from the Python reference, with 10 new unit tests — fixes the gate that made real per-project harnesses (e.g. orchestrator's) unpassable through `/sdlc-flow` regardless of code correctness. Also root-caused a deeper, more serious gap while live-testing against orchestrator's `or-y-event-read-api` spec through `bastion serve`: `ImplementTaskNode`/`ConsolidatedReviewNode` build their `claude-code-rs` `Config` from `Config::default()` (`dangerously_skip_permissions: false`, no `allowed_tools` grant), and `graph.rs` registers them plain with no `.with_config()` override — the exact wiring `bastion serve`'s engine mount uses. Confirmed live: two full `SDLC_FLOW` triggers both reported `ImplementTaskNode` success with a plausible written-files summary, but orchestrator's working tree stayed completely clean — no files were ever actually written. Every `/sdlc-flow` run through `bastion serve` today is a no-op on the real codebase despite reporting success.
+- **Why:** The four missing check kinds were blocking real per-project harnesses from ever passing through `/sdlc-flow`, independent of code correctness — needed fixing to unblock genuine SDLC validation. The deeper write-permission gap surfaced only because of live end-to-end testing against a real orchestrator spec through `bastion serve`, and is a materially more serious finding: it means the engine has been silently no-op'ing on real codebases while reporting success.
+- **Status:** Did not fix the write-permission gap — captured as carryover `sdlc-flow-implement-node-no-write-permission` (already recorded in `planning/state.json` `carryover[]`; also notes the secondary branch-staleness issue where a long-running flow's end-review diffs against a moving `main`). It needs a human call on the safety tradeoff of granting an autonomous, network-triggered node blanket write/skip-permissions.
 
 ---
 

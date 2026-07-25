@@ -19,5 +19,6 @@ related: [core:engine-rs]
 | [data-contract.md](data-contract.md) | Pinned orchestrator data-contract version, field mappings to `engine_contract` Rust types, HTTP surface parity, re-pin checklist |
 | [sdlc-flow-workflow.md](sdlc-flow-workflow.md) | The `SDLC_FLOW` graph — node roles (model vs. deterministic), triggering from `engine-rs`/bastion (event `policy`/`profile` fields), stopping a run, reading outputs, inspecting/resuming state |
 | [sdlc-flow-policy.md](sdlc-flow-policy.md) | SDLC Flow's tunable `SdlcPolicy` (model tiers, review mode, verbosity, local-model tier) — 4-layer resolution, the four named policy profiles (`baseline`, `cheap-fast`, `pragmatist`, `batch-reviewer`), structured-output adoption, and `RunOutcomes` telemetry/aggregation |
+| [research-agent-workflow.md](research-agent-workflow.md) | The `RESEARCH_AGENT` graph — dual-mode router (company brief vs. prospecting), event schema, tunable `ResearchAgentPolicy` + named profiles, triggering, and reading `research-agent-state.json` outputs |
 
 For project strategy and current focus, see [`planning/`](../planning/index.md).

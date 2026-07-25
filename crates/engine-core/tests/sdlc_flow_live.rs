@@ -119,6 +119,16 @@ fn stub_outcome(text: &str) -> Outcome {
     }
 }
 
+/// Builds a throwaway temp dir AND `git init`s it. `TestTaskNode`'s
+/// write-verification guard (when left on its real, unstubbed
+/// `CommandRunner`) shells out to a real `git status --porcelain`; without
+/// an actual repo there, that call always fails ("not a git repository")
+/// and reports zero changes regardless of what really happened on disk —
+/// which would only go unnoticed here because a real `ImplementTaskNode`
+/// call was separately observed to often leave `modified_files` empty
+/// (short-circuiting the guard before it ever calls `git status`; see
+/// `verify_claimed_writes`'s doc comment in `task_loop.rs`). A real repo
+/// makes the guard's ground truth genuine instead of accidentally-correct.
 fn temp_worktree(tag: &str) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -127,6 +137,13 @@ fn temp_worktree(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(dir.join("planning").join("fixture-live-spec")).unwrap();
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .current_dir(&dir)
+        .status()
+        .expect("git init should spawn");
+    assert!(status.success(), "git init should succeed in {dir:?}");
     dir
 }
 
@@ -269,6 +286,136 @@ fn build_live_workflow(worktree: &Path) -> Workflow {
     let schema = graph::schema();
     Workflow::new_validated(registry, schema)
         .expect("SDLC_FLOW declared graph must pass WorkflowValidator::validate")
+}
+
+/// Builds the `SDLC_FLOW` `Workflow` from the actual production
+/// registration path — [`graph::registry()`], the exact wiring
+/// `engine-serve`'s `register_sdlc_flow` mounts for `bastion serve`
+/// (`crates/engine-serve/src/workflows.rs`) — rather than hand-rolling a
+/// `NodeRegistry` the way [`build_live_workflow`] does. This is a
+/// deliberately NARROWER substitution than that function's: only the
+/// identities that touch git/gh for real in ways this test doesn't want to
+/// exercise (`SetupWorktreeNode`, `SaveStateNode`, `PullRequestNode`,
+/// `EmitStateNode`) are overridden. `ImplementTaskNode`, `TestTaskNode`,
+/// and `PatchDocsNode` keep EXACTLY what `registry()` gives them —
+/// including the real `agentic_write_config` grant — so a regression in
+/// `registry()` itself (e.g. someone drops the
+/// `.with_config(agentic_write_config(...))` call, or a future refactor
+/// silently reverts write permission) fails THIS test the same way the
+/// original bug was discovered: a real run that reports success but never
+/// wrote anything to disk. `build_live_workflow` above constructs its own
+/// `Config` for `ImplementTaskNode` independent of `registry()` and would
+/// never notice such a regression.
+///
+/// `TriageTaskNode`/`ConsolidatedReviewNode` get an `isolated: true`
+/// override on top of `registry()`'s bare default — required whenever this
+/// test itself runs nested inside another live `claude` session (as it
+/// does when driven by an in-session coding agent); production doesn't
+/// need this since `bastion serve` is never itself nested. See the module
+/// doc's note on `Config::isolated`'s credential-refresh race.
+fn build_live_workflow_via_production_registry(worktree: &Path) -> Workflow {
+    let mut registry = graph::registry();
+
+    registry.register(Box::new(FixtureSetupNode {
+        worktree_path: worktree.to_string_lossy().to_string(),
+    }));
+    registry.register(Box::new(TriageTaskNode::new().with_config(Config {
+        isolated: true,
+        ..Config::default()
+    })));
+    registry.register(Box::new(
+        ConsolidatedReviewNode::new()
+            .with_runner(noop_runner())
+            .with_config(Config {
+                isolated: true,
+                ..Config::default()
+            }),
+    ));
+    registry.register(Box::new(SaveStateNode::new().with_runner(noop_runner())));
+    registry.register(Box::new(PullRequestNode::new().with_runner(noop_runner())));
+    registry.register(Box::new(EmitStateNode::new().with_runner(noop_runner())));
+
+    let schema = graph::schema();
+    Workflow::new_validated(registry, schema)
+        .expect("SDLC_FLOW declared graph must pass WorkflowValidator::validate")
+}
+
+/// Live smoke test — runs the whole `SDLC_FLOW` graph through the actual
+/// production registration path ([`graph::registry()`]) with a real
+/// `claude` CLI session, rather than [`build_live_workflow`]'s hand-rolled
+/// registry. Exists specifically to catch regressions IN `registry()`
+/// itself — this is the exact class of bug this ticket
+/// (`sdlc-flow-write-permission`) started from: `registry()` granted
+/// `ImplementTaskNode` no write permission at all, so every real
+/// `/sdlc-flow` run silently no-op'd on the codebase while still reporting
+/// success (`planning/decisions/D8-autonomous-node-write-permission.md`).
+/// `live_full_workflow_real_implement_and_review` below builds its own
+/// `Config` for `ImplementTaskNode` and would never have caught that
+/// regression; this test fails loudly the same way the original bug was
+/// actually found. Ignored for the same reason as every other test in this
+/// file; run manually with `cargo test -p engine-core --test
+/// sdlc_flow_live -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn live_full_workflow_via_production_registry() {
+    let worktree = temp_worktree("registry");
+    // One retry of headroom, same rationale as the test below.
+    write_fixture_files(&worktree, 2);
+
+    let workflow = build_live_workflow_via_production_registry(&worktree);
+    let event = json!({ "spec_slug": "fixture-live-spec", "auto_pr": false });
+
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    // --- registry()'s real agentic_write_config grant actually let -------
+    // --- ImplementTaskNode write the marker file into the scoped worktree
+    let marker_path = worktree.join(MARKER_FILE);
+    assert!(
+        marker_path.exists(),
+        "expected registry()'s production ImplementTaskNode wiring to create {} inside {} \
+         — if this fails, registry()'s agentic_write_config grant has regressed",
+        MARKER_FILE,
+        worktree.display(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_path)
+            .unwrap_or_default()
+            .trim(),
+        MARKER_CONTENT
+    );
+
+    // --- The real (unstubbed) TestTaskNode harness check AND write- -------
+    // --- verification guard both genuinely passed against the real repo --
+    let test_result = final_ctx
+        .nodes
+        .get("TestTaskNode")
+        .expect("TestTaskNode should have run");
+    assert_eq!(
+        test_result["all_passed"],
+        json!(true),
+        "TestTaskNode result: {test_result:#?}"
+    );
+
+    // --- registry()'s real PatchDocsNode write-config grant also ran -----
+    let patch_docs_run = final_ctx
+        .node_runs
+        .get("PatchDocsNode")
+        .expect("PatchDocsNode should have run");
+    assert_eq!(patch_docs_run.status, NodeRunStatus::Success);
+
+    // --- The tail is reached, exactly as through the real dispatcher -----
+    for identity in ["WrapUpNode", "PullRequestNode", "EmitStateNode"] {
+        let run = final_ctx
+            .node_runs
+            .get(identity)
+            .unwrap_or_else(|| panic!("expected a NodeRun for '{identity}'"));
+        assert_eq!(run.status, NodeRunStatus::Success);
+    }
+
+    std::fs::remove_dir_all(&worktree).ok();
 }
 
 /// Live smoke test — actually runs the whole `SDLC_FLOW` graph with a real

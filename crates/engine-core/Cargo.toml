@@ -14,8 +14,10 @@ futures = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 claude-code-rs = { workspace = true }
+regex = { workspace = true }
 engine-contract = { path = "../engine-contract" }
 
 [dev-dependencies]
 tokio = { workspace = true }
 uuid = { workspace = true }
+engine-serve = { path = "../engine-serve" }

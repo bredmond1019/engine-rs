@@ -93,22 +93,22 @@ fn apply_policy(
 /// Deterministically classify the current task's diff as "trivial" against
 /// the resolved policy's `review_skip_max_files`/`review_skip_max_diff_lines`
 /// thresholds (lever #3a, `trivial_skip` mode) — zero model tokens spent.
-/// Reads `git diff --numstat main..HEAD` via the injectable [`CommandRunner`]
-/// seam: one line per changed file, `<added>\t<deleted>\t<path>`. Any
-/// unparsable line (e.g. a binary file's `-\t-\tpath`) is treated
-/// conservatively as non-trivial. Falls back to non-trivial (`false`) when
-/// the worktree path or the `git diff` invocation is unavailable, so this
-/// never turns a `process` failure into an error path — trivial-skip is an
-/// optimization, not a correctness requirement.
+/// Reads `git diff --numstat <base_sha>..HEAD` via the injectable
+/// [`CommandRunner`] seam: one line per changed file,
+/// `<added>\t<deleted>\t<path>`. The diff base is the SHA `SetupWorktreeNode`
+/// captured at worktree-setup time (see [`base_sha`]), falling back to
+/// `main..HEAD` when absent (e.g. unit tests with no `SetupWorktreeNode`
+/// output). Any unparsable line (e.g. a binary file's `-\t-\tpath`) is
+/// treated conservatively as non-trivial. Falls back to non-trivial
+/// (`false`) when the worktree path or the `git diff` invocation is
+/// unavailable, so this never turns a `process` failure into an error path
+/// — trivial-skip is an optimization, not a correctness requirement.
 fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPolicy) -> bool {
     let Ok(worktree) = worktree_path(ctx) else {
         return false;
     };
-    let Ok(output) = runner(
-        "git",
-        &["diff", "--numstat", "main..HEAD"],
-        Path::new(&worktree),
-    ) else {
+    let range = diff_range(ctx);
+    let Ok(output) = runner("git", &["diff", "--numstat", &range], Path::new(&worktree)) else {
         return false;
     };
 
@@ -191,6 +191,28 @@ fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .ok_or_else(|| NodeError::new("SetupWorktreeNode output missing worktree_path"))
+}
+
+/// Read the base commit SHA captured by `SetupWorktreeNode` at worktree-setup
+/// time, if present. Mirrors [`worktree_path`] but returns `None` rather than
+/// an error when absent (best-effort: `SetupWorktreeNode` omits `base_sha`
+/// when `git rev-parse HEAD` failed or the runner is a no-op stub, and
+/// callers here fall back to `main..HEAD` in that case).
+fn base_sha(ctx: &TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")
+        .and_then(|value| value.get("base_sha"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// Build the `git diff` range argument (`<base_sha>..HEAD` when a base SHA
+/// was captured at worktree-setup time, `main..HEAD` otherwise) shared by
+/// [`classify_trivial`] and `ConsolidatedReviewNode`.
+fn diff_range(ctx: &TaskContext) -> String {
+    match base_sha(ctx) {
+        Some(sha) => format!("{sha}..HEAD"),
+        None => "main..HEAD".to_string(),
+    }
 }
 
 fn current_task_fields(ctx: &TaskContext) -> Result<&serde_json::Value, NodeError> {
@@ -442,12 +464,12 @@ struct CheckResult {
 /// validation suite via the injectable [`CommandRunner`] seam so tests can
 /// drive fail-then-pass across attempts without a real subprocess.
 ///
-/// Only the `command` check kind (the default) is fully ported; the richer
-/// kinds (`forbidden-pattern-scan`, `baseline-diff`, `count-delta`,
-/// `warning-scan`) are left as a documented reduced-scope TODO for EN.3.B+
-/// (see this spec's Amendment Log) — an unsupported kind fails closed with a
-/// message noting the gap, so a harness.json using them doesn't silently
-/// pass.
+/// Every check `kind` from the Python port
+/// (`orchestrator/app/workflows/sdlc_flow_workflow_nodes/test_task_node.py`)
+/// is supported: `command` (the default), `forbidden-pattern-scan`,
+/// `baseline-diff`, `count-delta`, `warning-scan`. Any *other* kind still
+/// fails closed via [`Self::run_unsupported_kind`], so a harness.json typo
+/// or a genuinely new kind never silently passes.
 pub struct TestTaskNode {
     runner: CommandRunner,
 }
@@ -511,6 +533,221 @@ impl TestTaskNode {
         }
     }
 
+    /// Runs `command` (`sh -c <command>`) via the injectable runner,
+    /// returning stdout+stderr — the shared shell-out primitive every check
+    /// kind below builds on.
+    fn shell_out(&self, command: &str, worktree: &Path) -> CommandOutput {
+        (self.runner)("sh", &["-c", command], worktree).unwrap_or(CommandOutput {
+            status: -1,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    /// `forbidden-pattern-scan`: grep for each rule's pattern under its
+    /// paths, drop matches covered by that rule's `allowlistPattern`, fail
+    /// on any match left.
+    fn run_forbidden_pattern_scan(
+        &self,
+        check: &serde_json::Value,
+        worktree: &Path,
+    ) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+
+        let mut violations: Vec<String> = Vec::new();
+        let mut output_parts: Vec<String> = Vec::new();
+        for rule in check
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let pattern = rule.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let paths = rule.get("paths").and_then(|v| v.as_str()).unwrap_or("");
+            let grep_command = format!("grep -rnE '{pattern}' {paths}");
+            let stdout = self.shell_out(&grep_command, worktree).stdout;
+
+            let mut matches: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+            if let Some(allowlist) = rule.get("allowlistPattern").and_then(|v| v.as_str()) {
+                if let Ok(re) = regex::Regex::new(allowlist) {
+                    matches.retain(|line| !re.is_match(line));
+                }
+            }
+            violations.extend(matches.into_iter().map(str::to_string));
+            output_parts.push(stdout);
+        }
+
+        let passed = violations.is_empty();
+        let message = if passed {
+            String::new()
+        } else {
+            format!("{} forbidden-pattern match(es)", violations.len())
+        };
+        CheckResult {
+            name,
+            kind: "forbidden-pattern-scan".to_string(),
+            passed,
+            output: output_parts.join("\n"),
+            message,
+        }
+    }
+
+    /// `baseline-diff`: run `baselineCommand` and `command`, both expected
+    /// to emit a JSON array; fail on any `command` entry whose `compareKeys`
+    /// projection isn't present in the baseline's.
+    fn run_baseline_diff(&self, check: &serde_json::Value, worktree: &Path) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        let compare_keys: Vec<String> = check
+            .get("compareKeys")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+
+        let baseline_command = check
+            .get("baselineCommand")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let command = check.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let baseline_stdout = self.shell_out(baseline_command, worktree).stdout;
+        let current_stdout = self.shell_out(command, worktree).stdout;
+
+        let baseline_entries: Vec<serde_json::Value> =
+            serde_json::from_str(&baseline_stdout).unwrap_or_default();
+        let current_entries: Vec<serde_json::Value> =
+            serde_json::from_str(&current_stdout).unwrap_or_default();
+
+        let key = |entry: &serde_json::Value| -> Vec<Option<String>> {
+            compare_keys
+                .iter()
+                .map(|k| entry.get(k).map(|v| v.to_string()))
+                .collect()
+        };
+        let baseline_keys: std::collections::HashSet<Vec<Option<String>>> =
+            baseline_entries.iter().map(key).collect();
+        let new_entries: usize = current_entries
+            .iter()
+            .filter(|entry| !baseline_keys.contains(&key(entry)))
+            .count();
+
+        let passed = new_entries == 0;
+        let message = if passed {
+            String::new()
+        } else {
+            format!("{new_entries} net-new violation(s)")
+        };
+        CheckResult {
+            name,
+            kind: "baseline-diff".to_string(),
+            passed,
+            output: current_stdout,
+            message,
+        }
+    }
+
+    /// `count-delta`: extract a count from `command`'s stdout via
+    /// `countPattern`, comparing it to `baseline` in the `failOn` direction
+    /// (`"decrease"` fails when the count dropped; anything else fails when
+    /// it rose).
+    fn run_count_delta(&self, check: &serde_json::Value, worktree: &Path) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        let baseline_count = check.get("baseline").and_then(|v| v.as_i64()).unwrap_or(0);
+        let command = check.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let count_pattern = check
+            .get("countPattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let stdout = self.shell_out(command, worktree).stdout;
+        let current_count = regex::Regex::new(count_pattern)
+            .ok()
+            .and_then(|re| re.find(&stdout))
+            .and_then(|m| m.as_str().split_whitespace().next())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let fail_on = check
+            .get("failOn")
+            .and_then(|v| v.as_str())
+            .unwrap_or("decrease");
+        let passed = if fail_on == "decrease" {
+            current_count >= baseline_count
+        } else {
+            current_count <= baseline_count
+        };
+        let message = if passed {
+            String::new()
+        } else {
+            format!("count {current_count} vs baseline {baseline_count} ({fail_on})")
+        };
+        CheckResult {
+            name,
+            kind: "count-delta".to_string(),
+            passed,
+            output: stdout,
+            message,
+        }
+    }
+
+    /// `warning-scan`: run `command`, scan combined stdout+stderr for every
+    /// `warningPatterns` entry. Only fails the check itself when `gates` is
+    /// true (default `false` for this kind — matches the Python port).
+    fn run_warning_scan(&self, check: &serde_json::Value, worktree: &Path) -> CheckResult {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        let command = check.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let outcome = self.shell_out(command, worktree);
+        let combined = format!("{}{}", outcome.stdout, outcome.stderr);
+
+        let found: Vec<String> = check
+            .get("warningPatterns")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .filter(|pattern| {
+                regex::Regex::new(pattern)
+                    .map(|re| re.is_match(&combined))
+                    .unwrap_or(false)
+            })
+            .map(str::to_string)
+            .collect();
+
+        let gates = check
+            .get("gates")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let passed = !gates || found.is_empty();
+        let message = if found.is_empty() {
+            String::new()
+        } else {
+            format!("warning pattern(s) matched: {found:?}")
+        };
+        CheckResult {
+            name,
+            kind: "warning-scan".to_string(),
+            passed,
+            output: combined,
+            message,
+        }
+    }
+
     fn run_unsupported_kind(&self, check: &serde_json::Value, kind: &str) -> CheckResult {
         let name = check
             .get("name")
@@ -527,6 +764,111 @@ impl TestTaskNode {
                  (TODO(EN.3.B+): richer harness kinds)"
             ),
         }
+    }
+
+    /// List every path `git status --porcelain` reports as changed
+    /// (modified, added, deleted, renamed, or untracked) in `worktree`, via
+    /// the injectable [`CommandRunner`] seam. Each porcelain line is either
+    /// `XY path` or, for a rename, `XY orig -> new` — this returns the
+    /// right-hand path in the rename case (the file's current location) and
+    /// the single path otherwise. Returns an empty list (never errors) when
+    /// the runner invocation itself fails, so a spawn failure here degrades
+    /// to "nothing looks changed" rather than aborting the node.
+    fn changed_files(&self, worktree: &Path) -> Vec<String> {
+        let output =
+            (self.runner)("git", &["status", "--porcelain"], worktree).unwrap_or(CommandOutput {
+                status: -1,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                if line.len() <= 3 {
+                    return None;
+                }
+                let rest = line[3..].trim();
+                if rest.is_empty() {
+                    return None;
+                }
+                // Rename/copy lines look like `orig -> new`; keep the
+                // destination path.
+                let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(path.trim_matches('"').to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// Write-verification guard: checks [`Self::changed_files`]'s report of
+    /// what actually changed in the worktree against `ImplementTaskNode`'s
+    /// claimed `modified_files` from ctx.
+    ///
+    /// The pass condition is deliberately "the worktree shows ANY change at
+    /// all", not "the specific claimed paths changed": a real (non-stubbed)
+    /// `claude` call was observed live to leave `modified_files` empty even
+    /// on a genuinely successful write (the model's own JSON self-report is
+    /// not a reliable enumeration of what it touched — see
+    /// `sdlc_flow_live.rs`'s `live_full_workflow_real_implement_and_review`).
+    /// Gating on exact claim-vs-disk matching would false-fail a real,
+    /// useful write whose self-reported paths are incomplete or off by a
+    /// prefix/suffix quirk; gating on "did anything change" is robust to
+    /// that unreliability while still catching the guard's actual target —
+    /// the original bug this exists for (`planning/decisions/
+    /// D8-autonomous-node-write-permission.md`): a claimed, narrated write
+    /// that never touched disk at all.
+    ///
+    /// Only trips (a failed [`CheckResult`], routed through the normal
+    /// triage/retry machinery exactly like a harness-check failure) when
+    /// the worktree shows ZERO changes AND the claim was non-empty — the
+    /// model asserted specific writes but nothing happened anywhere. A
+    /// claim-empty-and-nothing-changed pair passes: a genuinely no-op task
+    /// (e.g. investigation-only) is legitimate and indistinguishable from
+    /// this state without a task-level "expected to write" signal this
+    /// node doesn't have.
+    fn verify_claimed_writes(&self, ctx: &TaskContext, worktree: &Path) -> Option<CheckResult> {
+        let modified_files: Vec<String> = get_result(ctx, "ImplementTaskNode")
+            .and_then(|value| value.get("modified_files"))
+            .and_then(|value| value.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Short-circuit BEFORE invoking `changed_files` (which calls the
+        // injected runner): an empty claim never trips the guard, so there
+        // is no need to spend a `git status` call on it. This also keeps
+        // this guard's runner-call count at zero for empty claims, matching
+        // callers (tests and otherwise) that assume `TestTaskNode`'s runner
+        // is only invoked for actual harness-check commands when
+        // `ImplementTaskNode` made no write claim.
+        if modified_files.is_empty() {
+            return None;
+        }
+
+        let changed = self.changed_files(worktree);
+        if !changed.is_empty() {
+            return None;
+        }
+
+        Some(CheckResult {
+            name: "write-verification".to_string(),
+            kind: "write-verification".to_string(),
+            passed: false,
+            output: changed.join("\n"),
+            message: format!(
+                "ImplementTaskNode claimed modified_files {modified_files:?} but the worktree \
+                 shows no changes at all (git status --porcelain: {changed:?})"
+            ),
+        })
     }
 
     fn run_checks(
@@ -547,10 +889,13 @@ impl TestTaskNode {
                 .and_then(|v| v.as_str())
                 .unwrap_or("command")
                 .to_string();
-            let result = if kind == "command" {
-                self.run_command_check(check, worktree)
-            } else {
-                self.run_unsupported_kind(check, &kind)
+            let result = match kind.as_str() {
+                "command" => self.run_command_check(check, worktree),
+                "forbidden-pattern-scan" => self.run_forbidden_pattern_scan(check, worktree),
+                "baseline-diff" => self.run_baseline_diff(check, worktree),
+                "count-delta" => self.run_count_delta(check, worktree),
+                "warning-scan" => self.run_warning_scan(check, worktree),
+                _ => self.run_unsupported_kind(check, &kind),
             };
 
             let gates = check.get("gates").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -575,31 +920,37 @@ impl Node for TestTaskNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let worktree = worktree_path(&ctx)?;
         let worktree = Path::new(&worktree);
-        let harness_path = worktree.join("planning").join("harness.json");
 
-        if !harness_path.exists() {
-            put_result(
-                &mut ctx,
-                "TestTaskNode",
-                json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
-            );
-            return Ok(ctx);
+        // Write-verification guard runs before the harness suite so a
+        // claimed-but-empty implement never gets a free pass through checks
+        // that happen to already be green (e.g. no `harness.json`).
+        let write_verification = self.verify_claimed_writes(&ctx, worktree);
+
+        let harness_path = worktree.join("planning").join("harness.json");
+        let (mut check_results, mut failed_names) = if harness_path.exists() {
+            let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
+                NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
+            })?;
+            let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+                NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
+            })?;
+            let checks: Vec<serde_json::Value> = harness
+                .get("validation")
+                .and_then(|v| v.get("checks"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            self.run_checks(&checks, worktree)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        if let Some(guard_result) = write_verification {
+            failed_names.insert(0, guard_result.name.clone());
+            check_results.insert(0, guard_result);
         }
 
-        let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
-            NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
-        })?;
-        let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
-            NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
-        })?;
-        let checks: Vec<serde_json::Value> = harness
-            .get("validation")
-            .and_then(|v| v.get("checks"))
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let (check_results, failed_names) = self.run_checks(&checks, worktree);
         let all_passed = failed_names.is_empty();
         let failure_summary = if all_passed {
             String::new()
@@ -917,7 +1268,8 @@ impl Router for TriageRouterNode {
 
 // --- ConsolidatedReviewNode ----------------------------------------------------
 
-/// Model node (Sonnet): reviews the task's `git diff main..HEAD` against its
+/// Model node (Sonnet): reviews the task's `git diff <base_sha>..HEAD`
+/// (falling back to `main..HEAD` when no `base_sha` was captured) against its
 /// acceptance criteria via a composed `ClaudeCodeStep`.
 pub struct ConsolidatedReviewNode {
     config: Config,
@@ -999,7 +1351,8 @@ impl Node for ConsolidatedReviewNode {
             .cloned()
             .unwrap_or_else(|| json!([]));
 
-        let diff = (self.runner)("git", &["diff", "main..HEAD"], Path::new(&worktree))
+        let range = diff_range(&ctx);
+        let diff = (self.runner)("git", &["diff", &range], Path::new(&worktree))
             .map(|output| output.stdout)
             .unwrap_or_default();
 
@@ -1886,6 +2239,371 @@ mod tests {
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
     }
 
+    fn ctx_for_worktree(worktree: &Path) -> TaskContext {
+        let mut ctx = empty_context(json!({}));
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx
+    }
+
+    fn ctx_with_implement_claim(worktree: &Path, modified_files: &[&str]) -> TaskContext {
+        let mut ctx = ctx_for_worktree(worktree);
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": modified_files,
+                "tests_added": [],
+            }),
+        );
+        ctx
+    }
+
+    fn porcelain_runner(status_lines: &'static str) -> CommandRunner {
+        Arc::new(move |program, args, _cwd| {
+            if program == "git" && args.first() == Some(&"status") {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: status_lines.to_string(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        })
+    }
+
+    /// A non-empty `modified_files` claim with none of the claimed paths
+    /// showing up in `git status --porcelain` fails the write-verification
+    /// guard, even when no `harness.json` exists, and the failure routes
+    /// through the normal `all_passed`/`check_results` shape (i.e. through
+    /// the same triage/retry path a harness failure would).
+    #[tokio::test]
+    async fn write_verification_fails_when_no_claimed_file_changed() {
+        let worktree = temp_worktree();
+        let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert_eq!(results[0]["passed"], false);
+        assert!(out.nodes["TestTaskNode"]["failure_summary"]
+            .as_str()
+            .unwrap()
+            .contains("write-verification"));
+    }
+
+    /// A claimed file that DOES show up in `git status --porcelain` passes
+    /// the guard, and (with no `harness.json`) the task overall passes.
+    #[tokio::test]
+    async fn write_verification_passes_when_claimed_file_changed() {
+        let worktree = temp_worktree();
+        let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" M src/lib.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// An empty `modified_files` claim (a genuinely no-op task) never trips
+    /// the guard, even when the worktree is completely clean.
+    #[tokio::test]
+    async fn write_verification_does_not_trip_on_empty_claim() {
+        let worktree = temp_worktree();
+        let ctx = ctx_with_implement_claim(&worktree, &[]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// No `ImplementTaskNode` output at all (e.g. a ctx driven directly in a
+    /// unit test) behaves like an empty claim — the guard never trips.
+    #[tokio::test]
+    async fn write_verification_does_not_trip_when_implement_never_ran() {
+        let worktree = temp_worktree();
+        let ctx = ctx_for_worktree(&worktree);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// A guard failure and a harness-check failure both surface in
+    /// `check_results`/`failure_summary` together when both are present.
+    #[tokio::test]
+    async fn write_verification_and_harness_failures_both_reported() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{ "name": "always_fail", "command": "exit 1", "gates": true }]),
+        );
+        let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
+
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            if program == "git" && args.first() == Some(&"status") {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        });
+
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert_eq!(results[1]["name"], "always_fail");
+    }
+
+    #[tokio::test]
+    async fn forbidden_pattern_scan_fails_on_unallowlisted_match() {
+        let worktree = temp_worktree();
+        std::fs::create_dir_all(worktree.join("app")).unwrap();
+        std::fs::write(worktree.join("app").join("bad.py"), "open(\"x\")\n").unwrap();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "forbidden-pattern-scan",
+                "name": "open-without-encoding",
+                "gates": true,
+                "rules": [{ "id": "r1", "pattern": "open\\(", "paths": "--include='*.py' app/" }],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "forbidden-pattern-scan");
+        assert_eq!(results[0]["passed"], false);
+    }
+
+    #[tokio::test]
+    async fn forbidden_pattern_scan_passes_when_match_is_allowlisted() {
+        let worktree = temp_worktree();
+        std::fs::create_dir_all(worktree.join("app")).unwrap();
+        std::fs::write(
+            worktree.join("app").join("ok.py"),
+            "open(\"x\", encoding=\"utf-8\")\n",
+        )
+        .unwrap();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "forbidden-pattern-scan",
+                "name": "open-without-encoding",
+                "gates": true,
+                "rules": [{
+                    "id": "r1",
+                    "pattern": "open\\(",
+                    "paths": "--include='*.py' app/",
+                    "allowlistPattern": "encoding=",
+                }],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn baseline_diff_fails_on_net_new_entry() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "baseline-diff",
+                "name": "net-new-lint",
+                "gates": true,
+                "compareKeys": ["file", "code"],
+                "baselineCommand": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+                "command": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"},{\"file\":\"b.py\",\"code\":\"E2\"}]'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["message"], "1 net-new violation(s)");
+    }
+
+    #[tokio::test]
+    async fn baseline_diff_passes_when_no_net_new_entries() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "baseline-diff",
+                "name": "net-new-lint",
+                "gates": true,
+                "compareKeys": ["file", "code"],
+                "baselineCommand": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+                "command": "echo '[{\"file\":\"a.py\",\"code\":\"E1\"}]'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn count_delta_fails_when_count_decreases() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "count-delta",
+                "name": "pytest-count",
+                "gates": true,
+                "baseline": 100,
+                "countPattern": "\\d+ passed",
+                "failOn": "decrease",
+                "command": "echo '90 passed'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["message"], "count 90 vs baseline 100 (decrease)");
+    }
+
+    #[tokio::test]
+    async fn count_delta_passes_when_count_holds_or_grows() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "count-delta",
+                "name": "pytest-count",
+                "gates": true,
+                "baseline": 100,
+                "countPattern": "\\d+ passed",
+                "failOn": "decrease",
+                "command": "echo '101 passed'",
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn warning_scan_does_not_gate_by_default() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "warning-scan",
+                "name": "app-import",
+                "gates": false,
+                "command": "echo 'UserWarning: field shadows an attribute'",
+                "warningPatterns": ["UserWarning"],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["passed"], true);
+        assert!(results[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("warning pattern(s) matched"));
+    }
+
+    #[tokio::test]
+    async fn warning_scan_gates_when_check_opts_in() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "warning-scan",
+                "name": "app-import",
+                "gates": true,
+                "command": "echo 'UserWarning: field shadows an attribute'",
+                "warningPatterns": ["UserWarning"],
+            }]),
+        );
+
+        let node = TestTaskNode::new();
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+    }
+
     // --- ConsolidatedReviewNode ------------------------------------------
 
     #[tokio::test]
@@ -1927,6 +2645,47 @@ mod tests {
                 api_error_status: None,
                 structured_output: None,
             };
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert!(*diff_called.lock().unwrap());
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
+    /// When `SetupWorktreeNode` stamped a `base_sha` (the SHA captured at
+    /// worktree-setup time), the review diff pins to `<base_sha>..HEAD`
+    /// instead of `main..HEAD` — so a `main` that advances mid-run doesn't
+    /// misreport unrelated commits as reversions.
+    #[tokio::test]
+    async fn review_uses_base_sha_diff_range_when_present() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": ".", "base_sha": "abc1234" }),
+        );
+
+        let diff_called = Arc::new(Mutex::new(false));
+        let diff_called_clone = diff_called.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            *diff_called_clone.lock().unwrap() = true;
+            assert_eq!(args, ["diff", "abc1234..HEAD"]);
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let canned =
+            json!({ "verdict": "PASS", "summary": "looks good", "issues": [] }).to_string();
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(canned.clone());
             Box::pin(async move { Ok(outcome) })
         });
 
@@ -2470,6 +3229,14 @@ mod tests {
         ctx
     }
 
+    fn ctx_with_worktree_and_base_sha(mut ctx: TaskContext, base_sha: &str) -> TaskContext {
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": ".", "base_sha": base_sha }),
+        );
+        ctx
+    }
+
     /// A trivial green task (small diff, under the default thresholds)
     /// classifies `trivial: true` and, under `TrivialSkip`, the router
     /// skips `ConsolidatedReviewNode` and goes straight to
@@ -2497,6 +3264,38 @@ mod tests {
 
         let router = TriageRouterNode;
         assert_eq!(router.route(&out), Some("UpdateTaskStatusNode".to_string()));
+    }
+
+    /// When `SetupWorktreeNode` stamped a `base_sha`, `classify_trivial`
+    /// diffs `<base_sha>..HEAD` instead of `main..HEAD`.
+    #[tokio::test]
+    async fn trivial_classification_uses_base_sha_diff_range_when_present() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let policy = SdlcPolicy {
+            review_mode: ReviewMode::TrivialSkip,
+            ..SdlcPolicy::default()
+        };
+
+        let ctx = ctx_with_worktree_and_base_sha(ctx_with_test_result(true, &task), "deadbee");
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            assert_eq!(args, ["diff", "--numstat", "deadbee..HEAD"]);
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "1\t1\tsrc/lib.rs\n".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = TriageTaskNode::new()
+            .with_transport(panicking_transport())
+            .with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["trivial"], true);
     }
 
     /// A non-trivial green task (diff over the thresholds) classifies

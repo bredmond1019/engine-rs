@@ -155,9 +155,21 @@ fn write_fixture_files(worktree: &Path, max_attempts: u32) {
     .unwrap();
 }
 
-/// Injected `TestTaskNode` runner that always PASSes.
+/// Injected `TestTaskNode` runner that always PASSes. Special-cases
+/// `git status --porcelain` to report `src/lib.rs` as modified so it stays
+/// consistent with `build_workflow`'s stubbed `ImplementTaskNode` claim
+/// (`modified_files: ["src/lib.rs"]`) — otherwise `TestTaskNode`'s
+/// write-verification guard would trip on every "pass" run since a claimed
+/// write never shows up in this runner's (otherwise empty) git output.
 fn always_pass_runner() -> CommandRunner {
-    Arc::new(|_program, _args, _cwd| {
+    Arc::new(|program, args, _cwd| {
+        if program == "git" && args.first() == Some(&"status") {
+            return Ok(CommandOutput {
+                status: 0,
+                stdout: " M src/lib.rs\n".to_string(),
+                stderr: String::new(),
+            });
+        }
         Ok(CommandOutput {
             status: 0,
             stdout: String::new(),

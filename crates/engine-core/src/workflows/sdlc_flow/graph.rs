@@ -41,6 +41,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use claude_code_rs::Config;
+
 use crate::node::NodeRegistry;
 use crate::nodes::openai_compat_transport::openai_compat_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
@@ -180,6 +182,12 @@ pub fn schema() -> WorkflowSchema {
 /// registered, each with its default (real-subprocess/real-transport)
 /// configuration. Tests build their own registry with stubbed transports and
 /// runners instead of calling this directly.
+///
+/// `ImplementTaskNode` and `PatchDocsNode` — the two nodes that actually
+/// mutate the worktree via an agentic tool-use session — are granted real
+/// headless write permission via [`agentic_write_config`] so a `bastion
+/// serve`-mounted `/sdlc-flow` run is not a silent no-op on the codebase
+/// (see `planning/decisions/D8-autonomous-node-write-permission.md`).
 #[must_use]
 pub fn registry() -> NodeRegistry {
     let mut registry = NodeRegistry::new();
@@ -188,7 +196,9 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(GenerateTasksNode::new()));
     registry.register(Box::new(LoadTaskStateNode));
     registry.register(Box::new(TaskQueueRouterNode));
-    registry.register(Box::new(ImplementTaskNode::new()));
+    registry.register(Box::new(
+        ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
+    ));
     registry.register(Box::new(TestTaskNode::new()));
     registry.register(Box::new(TriageTaskNode::new()));
     registry.register(Box::new(TriageRouterNode));
@@ -197,11 +207,37 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(UpdateTaskStatusNode));
     registry.register(Box::new(SaveStateNode::new()));
     registry.register(Box::new(IncrementAttemptNode));
-    registry.register(Box::new(PatchDocsNode::new()));
+    registry.register(Box::new(
+        PatchDocsNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
+    ));
     registry.register(Box::new(WrapUpNode::new()));
     registry.register(Box::new(PullRequestNode::new()));
     registry.register(Box::new(EmitStateNode::new()));
     registry
+}
+
+/// Shared `Config` for the two nodes that need real headless write
+/// permission to an agentic `claude-code-rs` session — `ImplementTaskNode`
+/// and `PatchDocsNode`. Matches the proven `sdlc_flow_live.rs` config
+/// (`dangerously_skip_permissions: true`, `disallowed_tools: ["Bash"]`,
+/// `isolated: true`): file edits only, no shell/network execution, no
+/// bleed into another interactive session. `model` is the given tier's
+/// resolved model string; for `ImplementTaskNode` this is overwritten again
+/// by `process` per the resolved policy (`with_config`'s own doc comment),
+/// so passing a fixed default here is safe — `PatchDocsNode` has no such
+/// override and uses this `model` as-is.
+///
+/// See `planning/decisions/D8-autonomous-node-write-permission.md` for the
+/// safety tradeoff this configuration encodes.
+#[must_use]
+pub fn agentic_write_config(model: &str) -> Config {
+    Config {
+        model: Some(model.to_string()),
+        disallowed_tools: vec!["Bash".to_string()],
+        dangerously_skip_permissions: true,
+        isolated: true,
+        ..Config::default()
+    }
 }
 
 /// The real `claude_code_rs::execute` transport — the cloud fallback a
@@ -396,5 +432,55 @@ mod tests {
     #[test]
     fn workflow_builds_without_panicking() {
         let _workflow = workflow();
+    }
+
+    #[test]
+    fn agentic_write_config_grants_headless_write_permission() {
+        let config = agentic_write_config("claude-sonnet-4-5");
+
+        assert!(config.dangerously_skip_permissions);
+        assert!(config.disallowed_tools.iter().any(|tool| tool == "Bash"));
+        assert!(config.isolated);
+        assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn registry_still_validates_and_contains_all_identities_after_write_grant() {
+        // registry() now grants ImplementTaskNode/PatchDocsNode headless
+        // write permission via agentic_write_config; assert that grant did
+        // not disturb the registry's identity set or schema validation.
+        let schema = schema();
+        let registry = registry();
+
+        WorkflowValidator::validate(&registry, &schema).expect("declared graph should validate");
+
+        let expected = [
+            "SetupWorktreeNode",
+            "SpecExistsRouterNode",
+            "GenerateTasksNode",
+            "LoadTaskStateNode",
+            "TaskQueueRouterNode",
+            "ImplementTaskNode",
+            "TestTaskNode",
+            "TriageTaskNode",
+            "TriageRouterNode",
+            "ConsolidatedReviewNode",
+            "ReviewRouterNode",
+            "UpdateTaskStatusNode",
+            "SaveStateNode",
+            "IncrementAttemptNode",
+            "PatchDocsNode",
+            "WrapUpNode",
+            "PullRequestNode",
+            "EmitStateNode",
+        ];
+
+        for identity in expected {
+            assert!(
+                registry.contains(identity),
+                "expected registry to contain '{identity}'"
+            );
+        }
+        assert_eq!(registry.len(), expected.len());
     }
 }
