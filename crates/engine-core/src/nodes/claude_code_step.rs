@@ -36,6 +36,38 @@ type Transport = Arc<
     dyn Fn(Config, String) -> BoxFuture<'static, claude_code_rs::Result<Outcome>> + Send + Sync,
 >;
 
+/// The tier/model/endpoint a transport actually called for one invocation —
+/// stamped onto `ctx.nodes[name]["transport"]` (`EN.5.D` task 9) so
+/// downstream telemetry harvesting reads what happened rather than what the
+/// resolved policy *intended* (the distinction that matters for
+/// `openai_compat_transport`'s silent cloud fallback: the resolved policy
+/// may say `local` while the call that actually ran was `cloud`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportInfo {
+    /// The model tier actually called, e.g. `"cloud"` or `"local"`.
+    pub tier: String,
+    /// The model name actually called.
+    pub model: String,
+    /// The HTTP endpoint actually called, when the transport is an
+    /// HTTP-based one (e.g. `openai_compat_transport`'s local endpoint).
+    /// `None` for subprocess-based (cloud CLI) calls, and for any cloud
+    /// fallback — there is no single "endpoint" for the `claude` CLI.
+    pub endpoint: Option<String>,
+}
+
+/// The injectable transport signature for transports that know their own
+/// [`TransportInfo`] (e.g. `openai_compat_transport`, which alone knows
+/// whether a given call actually hit the local endpoint or silently fell
+/// back to cloud). Additive alongside [`Transport`]: a `ClaudeCodeStep`
+/// with no [`MetaTransport`] set falls back to a generic `"cloud"`-tier
+/// `TransportInfo` derived from the plain `Transport`'s `Outcome`, so every
+/// existing `with_transport` caller keeps compiling and behaving unchanged.
+pub type MetaTransport = Arc<
+    dyn Fn(Config, String) -> BoxFuture<'static, claude_code_rs::Result<(Outcome, TransportInfo)>>
+        + Send
+        + Sync,
+>;
+
 /// Where a `ClaudeCodeStep`'s prompt text comes from: either a fixed string
 /// decided at construction, or a closure built fresh from the live
 /// `TaskContext` on each `process` call.
@@ -67,6 +99,7 @@ pub struct ClaudeCodeStep {
     config: Config,
     prompt: PromptSource,
     transport: Transport,
+    meta_transport: Option<MetaTransport>,
     cancellation_token: Option<CancellationToken>,
 }
 
@@ -98,6 +131,7 @@ impl ClaudeCodeStep {
             config,
             prompt: PromptSource::Fixed(prompt.into()),
             transport: Arc::new(default_transport),
+            meta_transport: None,
             cancellation_token: None,
         }
     }
@@ -114,6 +148,7 @@ impl ClaudeCodeStep {
             config,
             prompt: PromptSource::Builder(Arc::new(builder)),
             transport: Arc::new(default_transport),
+            meta_transport: None,
             cancellation_token: None,
         }
     }
@@ -121,6 +156,13 @@ impl ClaudeCodeStep {
     /// Override the transport used to run the Claude Code session. Tests use
     /// this to stub a real subprocess call with a canned `Outcome`/`Error`, so
     /// the gated `cargo test` suite stays hermetic (no real `claude` spawn).
+    ///
+    /// A plain `Transport` doesn't know its own tier/endpoint, so `process`
+    /// stamps a generic `"cloud"`-tier `TransportInfo` (model derived from
+    /// the returned `Outcome`, no endpoint) unless [`with_meta_transport`]
+    /// is also set.
+    ///
+    /// [`with_meta_transport`]: Self::with_meta_transport
     #[must_use]
     pub fn with_transport(
         mut self,
@@ -130,6 +172,28 @@ impl ClaudeCodeStep {
             + 'static,
     ) -> Self {
         self.transport = Arc::new(transport);
+        self
+    }
+
+    /// Override the transport with one that reports its own [`TransportInfo`]
+    /// (tier/model/endpoint actually called) alongside its `Outcome` — the
+    /// seam `openai_compat_transport` uses so a silent cloud fallback stamps
+    /// `"cloud"` even though the resolved policy said `"local"`. Takes
+    /// precedence over [`with_transport`] when both are set.
+    ///
+    /// [`with_transport`]: Self::with_transport
+    #[must_use]
+    pub fn with_meta_transport(
+        mut self,
+        meta_transport: impl Fn(
+                Config,
+                String,
+            ) -> BoxFuture<'static, claude_code_rs::Result<(Outcome, TransportInfo)>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.meta_transport = Some(Arc::new(meta_transport));
         self
     }
 
@@ -161,27 +225,62 @@ impl Node for ClaudeCodeStep {
             PromptSource::Builder(builder) => builder(&ctx),
         };
 
-        let transport_fut = (self.transport)(self.config.clone(), prompt);
-
-        let outcome = match &self.cancellation_token {
-            Some(token) => {
-                tokio::select! {
-                    // A cancel win drops `transport_fut` (tokio::select!
-                    // drops the losing branch's future) rather than awaiting
-                    // it to completion. Returning `Ok(ctx)` unchanged here —
-                    // not `Err` — is deliberate: see
-                    // `with_cancellation_token`'s doc comment.
-                    _ = token.cancelled() => {
-                        return Ok(ctx);
+        let (outcome, transport_info) = match &self.meta_transport {
+            Some(meta_transport) => {
+                let transport_fut = meta_transport(self.config.clone(), prompt);
+                match &self.cancellation_token {
+                    Some(token) => {
+                        tokio::select! {
+                            // See the plain-`transport` branch below for why a
+                            // cancel win returns `Ok(ctx)` rather than `Err`.
+                            _ = token.cancelled() => {
+                                return Ok(ctx);
+                            }
+                            result = transport_fut => {
+                                result.map_err(|err| NodeError::new(err.to_string()))?
+                            }
+                        }
                     }
-                    result = transport_fut => {
-                        result.map_err(|err| NodeError::new(err.to_string()))?
-                    }
+                    None => transport_fut
+                        .await
+                        .map_err(|err| NodeError::new(err.to_string()))?,
                 }
             }
-            None => transport_fut
-                .await
-                .map_err(|err| NodeError::new(err.to_string()))?,
+            None => {
+                let transport_fut = (self.transport)(self.config.clone(), prompt);
+
+                let outcome = match &self.cancellation_token {
+                    Some(token) => {
+                        tokio::select! {
+                            // A cancel win drops `transport_fut` (tokio::select!
+                            // drops the losing branch's future) rather than awaiting
+                            // it to completion. Returning `Ok(ctx)` unchanged here —
+                            // not `Err` — is deliberate: see
+                            // `with_cancellation_token`'s doc comment.
+                            _ = token.cancelled() => {
+                                return Ok(ctx);
+                            }
+                            result = transport_fut => {
+                                result.map_err(|err| NodeError::new(err.to_string()))?
+                            }
+                        }
+                    }
+                    None => transport_fut
+                        .await
+                        .map_err(|err| NodeError::new(err.to_string()))?,
+                };
+
+                // A plain `Transport` doesn't know its own tier/endpoint — stamp a
+                // generic `"cloud"`-tier `TransportInfo` derived from the
+                // `Outcome`'s own model attribution, with no endpoint.
+                let model = outcome.primary_model().unwrap_or(UNKNOWN_MODEL).to_string();
+                let info = TransportInfo {
+                    tier: "cloud".to_string(),
+                    model,
+                    endpoint: None,
+                };
+                (outcome, info)
+            }
         };
 
         // `primary_model` is a heuristic over the SDK's `modelUsage` map and is
@@ -195,6 +294,11 @@ impl Node for ClaudeCodeStep {
             "cost_usd": outcome.cost_usd,
             "model": model,
             "structured": outcome.structured_output,
+            "transport": {
+                "tier": transport_info.tier,
+                "model": transport_info.model,
+                "endpoint": transport_info.endpoint,
+            },
         });
         ctx.nodes.insert(self.name.clone(), output);
 
@@ -354,6 +458,61 @@ mod tests {
             run.usage.as_ref().expect("usage stamped").model,
             "claude-opus-4-8"
         );
+    }
+
+    /// A plain `Transport` (no `with_meta_transport`) doesn't know its own
+    /// tier/endpoint — `process` must stamp a generic `"cloud"`-tier
+    /// `TransportInfo` derived from the `Outcome`'s own model attribution,
+    /// with no endpoint, so existing callers get the new `transport`
+    /// sub-object for free.
+    #[tokio::test]
+    async fn plain_transport_stamps_generic_cloud_tier_transport_info() {
+        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+            .with_transport(|_config, _prompt| Box::pin(async { Ok(stub_outcome()) }));
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        assert_eq!(output["transport"]["tier"], "cloud");
+        assert_eq!(output["transport"]["model"], "claude-sonnet-4-5");
+        assert!(output["transport"]["endpoint"].is_null());
+    }
+
+    /// `with_meta_transport` takes precedence over `with_transport`: the
+    /// `TransportInfo` it returns is what gets stamped, not the generic
+    /// `"cloud"` fallback.
+    #[tokio::test]
+    async fn meta_transport_info_is_stamped_onto_the_transport_sub_object() {
+        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+            .with_meta_transport(|_config, _prompt| {
+                Box::pin(async {
+                    Ok((
+                        stub_outcome(),
+                        TransportInfo {
+                            tier: "local".to_string(),
+                            model: "qwen2.5-coder:7b".to_string(),
+                            endpoint: Some("http://localhost:11434".to_string()),
+                        },
+                    ))
+                })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        assert_eq!(output["transport"]["tier"], "local");
+        assert_eq!(output["transport"]["model"], "qwen2.5-coder:7b");
+        assert_eq!(output["transport"]["endpoint"], "http://localhost:11434");
+        // Existing readers of `content`/`model` are unaffected by which
+        // transport variant supplied the outcome.
+        assert_eq!(output["content"], "ok");
+        assert_eq!(output["model"], "claude-sonnet-4-5");
     }
 
     #[tokio::test]

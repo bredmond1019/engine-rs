@@ -20,8 +20,9 @@ pub mod claude_code_step;
 pub mod http_post;
 pub mod openai_compat_transport;
 
-pub use claude_code_step::ClaudeCodeStep;
+pub use claude_code_step::{ClaudeCodeStep, MetaTransport, TransportInfo};
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
 pub use openai_compat_transport::{
-    default_local_http_post, openai_compat_transport, openai_compat_transport_live, LocalHttpPost,
+    default_local_http_post, openai_compat_meta_transport, openai_compat_meta_transport_live,
+    openai_compat_transport, openai_compat_transport_live, LocalHttpPost,
 };

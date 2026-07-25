@@ -31,6 +31,7 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::nodes::claude_code_step::{MetaTransport, TransportInfo};
 use crate::workflows::sdlc_flow::policy::LocalConfig;
 use crate::workflows::sdlc_flow::ModelTransport;
 
@@ -213,6 +214,76 @@ pub fn openai_compat_transport_live(
     openai_compat_transport(local, default_local_http_post(), cloud_fallback)
 }
 
+/// [`openai_compat_transport`]'s tier-aware sibling: builds a
+/// [`MetaTransport`] (`EN.5.D` task 9) instead of a plain [`ModelTransport`],
+/// so the caller's `ClaudeCodeStep` (via `with_meta_transport`) can stamp
+/// what actually ran rather than what the resolved policy intended. Local
+/// success stamps `{"tier": "local", "model": local.model, "endpoint":
+/// Some(local.endpoint)}`; the cloud fallback — reached on any local-side
+/// error — stamps `{"tier": "cloud", "model": <the fallback's primary
+/// model>, "endpoint": None}`, which is exactly the case intent-derived
+/// telemetry gets wrong: the resolved policy said `local`, but this call
+/// silently fell back to cloud.
+#[must_use]
+pub fn openai_compat_meta_transport(
+    local: LocalConfig,
+    http_post: LocalHttpPost,
+    cloud_fallback: ModelTransport,
+) -> MetaTransport {
+    Arc::new(move |config: Config, prompt: String| {
+        let local = local.clone();
+        let http_post = Arc::clone(&http_post);
+        let cloud_fallback = Arc::clone(&cloud_fallback);
+
+        Box::pin(async move {
+            let url = format!(
+                "{}/v1/chat/completions",
+                local.endpoint.trim_end_matches('/')
+            );
+            let body = build_request_body(&local, &prompt);
+
+            let local_result = match (http_post)(url, body).await {
+                Ok(response) => outcome_from_chat_completion(&local.model, &response),
+                Err(err) => Err(err),
+            };
+
+            match local_result {
+                Ok(outcome) => {
+                    let info = TransportInfo {
+                        tier: "local".to_string(),
+                        model: local.model.clone(),
+                        endpoint: Some(local.endpoint.clone()),
+                    };
+                    Ok((outcome, info))
+                }
+                Err(_local_err) => {
+                    let outcome = (cloud_fallback)(config, prompt).await?;
+                    let model = outcome.primary_model().unwrap_or("unknown").to_string();
+                    let info = TransportInfo {
+                        tier: "cloud".to_string(),
+                        model,
+                        endpoint: None,
+                    };
+                    Ok((outcome, info))
+                }
+            }
+        })
+    })
+}
+
+/// Convenience: [`openai_compat_meta_transport`] wired to the real
+/// `reqwest` HTTP POST ([`default_local_http_post`]). Production callers
+/// reach for this once `graph.rs` migrates to `ClaudeCodeStep`'s
+/// `with_meta_transport` seam; tests build the transport directly with a
+/// stubbed `http_post` instead.
+#[must_use]
+pub fn openai_compat_meta_transport_live(
+    local: LocalConfig,
+    cloud_fallback: ModelTransport,
+) -> MetaTransport {
+    openai_compat_meta_transport(local, default_local_http_post(), cloud_fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +442,67 @@ mod tests {
             json!({ "type": "json_object" }),
             "constrained_json must set response_format on the request body"
         );
+    }
+
+    // -- `openai_compat_meta_transport` (task 9) --
+
+    #[tokio::test]
+    async fn meta_transport_stamps_local_tier_and_endpoint_on_success() {
+        let transport = openai_compat_meta_transport(
+            test_local_config(),
+            ok_stub_response("local reply"),
+            panicking_cloud_fallback(),
+        );
+
+        let (outcome, info) = transport(Config::default(), "hello".to_string())
+            .await
+            .expect("stubbed local call should succeed");
+
+        assert_eq!(outcome.text, "local reply");
+        assert_eq!(info.tier, "local");
+        assert_eq!(info.model, "qwen2.5-coder:7b");
+        assert_eq!(info.endpoint.as_deref(), Some("http://localhost:11434"));
+    }
+
+    #[tokio::test]
+    async fn meta_transport_stamps_cloud_tier_with_no_endpoint_when_local_is_down() {
+        let transport = openai_compat_meta_transport(
+            test_local_config(),
+            down_stub_response(),
+            cloud_stub("cloud reply"),
+        );
+
+        let (outcome, info) = transport(Config::default(), "hello".to_string())
+            .await
+            .expect("cloud fallback should succeed");
+
+        assert_eq!(outcome.text, "cloud reply");
+        assert_eq!(
+            info.tier, "cloud",
+            "a down local endpoint must stamp the cloud fallback's tier, \
+             not the resolved policy's `local` tier"
+        );
+        assert_eq!(info.model, "claude-sonnet-4-5");
+        assert_eq!(
+            info.endpoint, None,
+            "the cloud fallback has no single endpoint to stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_transport_stamps_cloud_tier_when_local_response_is_malformed() {
+        let malformed: LocalHttpPost =
+            Arc::new(|_url, _body| Box::pin(async { Ok(json!({ "unexpected": "shape" })) }));
+
+        let transport =
+            openai_compat_meta_transport(test_local_config(), malformed, cloud_stub("cloud reply"));
+
+        let (_outcome, info) = transport(Config::default(), "hello".to_string())
+            .await
+            .expect("cloud fallback should succeed on malformed local response");
+
+        assert_eq!(info.tier, "cloud");
+        assert_eq!(info.endpoint, None);
     }
 
     #[tokio::test]
