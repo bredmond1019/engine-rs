@@ -18,6 +18,28 @@ related: [status, context]
 
 ## [run: 2026-07-24]
 
+### `EN.4.B-diagnostic-intake` done — DIAGNOSTIC_INTAKE extractor (net-new, policy-aware)
+- **What:** Ran `/sdlc-flow EN.4.B-diagnostic-intake` (branch `EN.4.B-diagnostic-intake-flow`); all 8 tasks passed. Task 1 scaffolded the `diagnostic_intake` workflow module (mod.rs + five sibling stub files) and wired it into `workflows/mod.rs`. Task 2 added `DiagnosticIntakePolicy`/`PartialDiagnosticIntakePolicy` on the EN.4.0 `Policy` trait with a single Local-eligible `extract` stage, proven by a unit test that a Local-tier override survives resolution together with its `LocalConfig`. Task 3 added `DiagnosticIntakeEventSchema`, the `DiagnosticIntake` output type (with `WorkflowCandidate` `*_evidence` fields per `intake.md §3`), and `diagnostic_intake_json_schema()`. Task 4 added four named policy profiles (`baseline`/`cheap-fast`/`thorough`/`local-extract`), `resolve_policy_for_run`, and a matching `diagnostic_intake.{policy,profiles}` section in `harness.json`. Task 5 built `IntakeExtractNode`: wraps `ClaudeCodeStep` with a schema-constrained, tool-free `Config`, ports `intake.md`'s four interview groups + evidence discipline + São Paulo SMB priors into the extraction prompt, and persists `diagnostic-intake-state.json` telemetry. Task 6 assembled the single-node `DIAGNOSTIC_INTAKE` `WorkflowSchema`/`NodeRegistry` with a Local-tier rewire for `IntakeExtractNode`, registered in engine-serve's builtin dispatcher (`register_diagnostic_intake`). Task 7 added a hermetic e2e suite (`crates/engine-core/tests/diagnostic_intake_e2e.rs`) covering extraction with `*_evidence` field integrity through an `EventsRow` round-trip, the Local-tier rewire, dispatcher registration, and a `#[ignore]`-gated four-profile experiment harness. Task 8 validated the full block (fmt/clippy/test/release-build all green) with no code changes needed.
+- **Why:** Closes Block EN.4.B of `master-plan.md` Phase 4 — a net-new, policy-aware extraction workflow (no orchestrator source to port) whose sole `extract` stage is Local-tier eligible, the first workflow in this phase to exercise `registry_for_policy`'s Local-transport rewire. `DiagnosticIntake` is exported for reuse by EN.4.C (`PROPOSAL_GENERATOR`).
+- **Verdict:** PASS (review found no findings). Docs: `docs/diagnostic-intake-workflow.md` created, `docs/index.md` updated.
+- **Status:** `planning/state.json` block `EN.4.B` set to `"closed"`; `planning/status.md` Progress Table row added under Phase 4 and flipped to Done.
+- **Next:** EN.4.C — PROPOSAL_GENERATOR (policy-aware, PersistToBrainNode HTTP push).
+
+```
+d5959f4 docs: update docs for EN.4.B-diagnostic-intake
+12320ed feat: implement EN.4.B-diagnostic-intake-task7
+b65ce85 feat: implement EN.4.B-diagnostic-intake-task6
+721915a feat: implement EN.4.B-diagnostic-intake-task5
+c59e587 feat: implement EN.4.B-diagnostic-intake-task4
+dd3e149 feat: implement EN.4.B-diagnostic-intake-task3
+3bbe157 feat: implement EN.4.B-diagnostic-intake-task2
+b858fb2 feat: implement EN.4.B-diagnostic-intake-task1
+```
+
+---
+
+## [run: 2026-07-24]
+
 ### `EN.4.A-research-agent` done — RESEARCH_AGENT (company brief + prospecting mode, policy-aware)
 - **What:** Ran `/sdlc-flow EN.4.A-research-agent` (branch `EN.4.A-research-agent-flow`); all 9 tasks passed. Task 1 scaffolded the `research_agent` workflow module (six leaf-file stubs + `WORKFLOW_TYPE = "RESEARCH_AGENT"`) and registered it in `workflows/mod.rs`. Task 2 added `ResearchAgentPolicy`/`PartialResearchAgentPolicy` implementing the EN.4.0 `Policy` trait (research/prospect model tiers, output verbosity, prompt cache, local config). Task 3 added `ResearchAgentEventSchema`, `ResearchMode`, `CompanyBrief`, and `ProspectingResult` with `json_schema()` builders. Task 4 added three named policy profiles (`baseline`/`cheap-fast`/`thorough`), `resolve_policy_for_run`, and a matching `research_agent.{policy,profiles}` section in `harness.json`. Task 5 built `CompanyResearchNode`: wraps `ClaudeCodeStep` with WebSearch/WebFetch tools + a `CompanyBrief` schema, resolves/applies the run policy, parses the reply, and persists `research-agent-state.json` telemetry. Task 6 built the sibling `ProspectingResearchNode` (four-pillar vertical mapping, same structural pattern). Task 7 added `ResearchModeRouterNode` plus graph/registry assembly, registered as `RESEARCH_AGENT` in engine-serve (`register_research_agent` → `register_builtin_workflows`), making it dispatchable and visible in `GET /workflows`. Task 8 added a hermetic e2e suite (`crates/engine-core/tests/research_agent_e2e.rs`) covering both modes' router→terminal-node round-trips against `engine-contract::EventsRow`, a no-Local-rewire assertion on `registry_for_policy`, dispatcher registration, and a `#[ignore]`-gated named-profile experiment harness via `policy::aggregate_state_files`. Task 9 validated the full block (fmt/clippy/test/release-build all green) with no code changes needed.
 - **Why:** Closes Block EN.4.A of `master-plan.md` Phase 4 — the first of the diagnostic-funnel-adjacent workflows built on the EN.4.0 shared policy framework, and the source of `CompanyResearchNode` that EN.4.C (`PROPOSAL_GENERATOR`) is expected to reuse.
