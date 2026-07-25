@@ -13,6 +13,7 @@ use std::path::Path;
 use engine_contract::TaskContext;
 
 use crate::node::NodeError;
+use crate::policy::PolicyConfigSource;
 
 use super::policy::{
     self, ModelTier, OutputVerbosity, PartialLocalConfig, PartialModelTiers,
@@ -103,30 +104,77 @@ fn parse_event(ctx: &TaskContext) -> Result<ProposalGeneratorEventSchema, NodeEr
         .map_err(|err| NodeError::new(format!("invalid PROPOSAL_GENERATOR event: {err}")))
 }
 
-/// Read `planning/harness.json`'s `proposal_generator.policy` section (a
-/// [`PartialProposalGeneratorPolicy`]) out of a worktree, if the file and
-/// section exist. Delegates to the generic
-/// `crate::policy::read_harness_policy_defaults` (EN.4.0), parameterized by
-/// [`WORKFLOW_KEY`].
-fn read_harness_policy_defaults(
-    worktree: &Path,
+/// Read `proposal_generator.policy` (a [`PartialProposalGeneratorPolicy`])
+/// out of the file addressed by `source`. Delegates to the generic
+/// `crate::policy::read_harness_policy_defaults_from` (EN.5.D), parameterized
+/// by [`WORKFLOW_KEY`].
+fn read_harness_policy_defaults_from(
+    source: &PolicyConfigSource,
 ) -> Result<Option<PartialProposalGeneratorPolicy>, NodeError> {
-    crate::policy::read_harness_policy_defaults(worktree, WORKFLOW_KEY)
+    crate::policy::read_harness_policy_defaults_from(source, WORKFLOW_KEY)
 }
 
 /// Resolve `event.profile` (a named profile) to a
 /// [`PartialProposalGeneratorPolicy`] bundle, preferring a `harness.json`
-/// `proposal_generator.profiles[name]` entry over the built-in
-/// [`profile_by_name`]. Returns `Ok(None)` when the event carries no
-/// `profile` field, and `Err` when a `profile` name is given but resolves
-/// to neither source (no silent no-op). Delegates to the generic
-/// `crate::policy::resolve_profile` (EN.4.0), parameterized by
+/// `proposal_generator.profiles[name]` entry (read via `source`) over the
+/// built-in [`profile_by_name`]. Returns `Ok(None)` when the event carries no
+/// `profile` field, and `Err` when a `profile` name is given but resolves to
+/// neither source (no silent no-op). Delegates to the generic
+/// `crate::policy::resolve_profile_from` (EN.5.D), parameterized by
 /// [`WORKFLOW_KEY`] and [`profile_by_name`].
+fn resolve_profile_from(
+    profile_name: Option<&str>,
+    source: &PolicyConfigSource,
+) -> Result<Option<PartialProposalGeneratorPolicy>, NodeError> {
+    crate::policy::resolve_profile_from(profile_name, source, WORKFLOW_KEY, profile_by_name)
+}
+
+/// Read `planning/harness.json`'s `proposal_generator.policy` section out of
+/// a worktree. Thin wrapper over [`read_harness_policy_defaults_from`] with
+/// [`PolicyConfigSource::Worktree`], kept so tests/callers that already had a
+/// worktree path in hand don't need to construct a source.
+#[cfg(test)]
+fn read_harness_policy_defaults(
+    worktree: &Path,
+) -> Result<Option<PartialProposalGeneratorPolicy>, NodeError> {
+    read_harness_policy_defaults_from(&PolicyConfigSource::Worktree(worktree.to_path_buf()))
+}
+
+/// Resolve `event.profile` against a worktree. Thin wrapper over
+/// [`resolve_profile_from`] with [`PolicyConfigSource::Worktree`], kept so
+/// tests/callers that already had a worktree path in hand don't need to
+/// construct a source.
+#[cfg(test)]
 fn resolve_profile(
     profile_name: Option<&str>,
     worktree: &Path,
 ) -> Result<Option<PartialProposalGeneratorPolicy>, NodeError> {
-    crate::policy::resolve_profile(profile_name, worktree, WORKFLOW_KEY, profile_by_name)
+    resolve_profile_from(
+        profile_name,
+        &PolicyConfigSource::Worktree(worktree.to_path_buf()),
+    )
+}
+
+/// Resolve the four-layer [`ProposalGeneratorPolicy`] for this run against
+/// an arbitrary [`PolicyConfigSource`]: the inbound event's `policy`
+/// override, the resolved `profile` bundle, `source`'s
+/// `proposal_generator.policy` defaults, and the built-in default, high->low
+/// precedence via [`policy::resolve`]. A [`PolicyConfigSource::Builtin`]
+/// source resolves successfully with no filesystem access — the case a
+/// worktree-free (channel/API-triggered) run needs.
+pub fn resolve_policy_for_run_from(
+    ctx: &TaskContext,
+    source: &PolicyConfigSource,
+) -> Result<ProposalGeneratorPolicy, NodeError> {
+    let event = parse_event(ctx)?;
+    let harness_defaults = read_harness_policy_defaults_from(source)?;
+    let profile = resolve_profile_from(event.profile.as_deref(), source)?;
+    Ok(policy::resolve(
+        ProposalGeneratorPolicy::default(),
+        harness_defaults.as_ref(),
+        profile.as_ref(),
+        event.policy.as_ref(),
+    ))
 }
 
 /// Resolve the four-layer [`ProposalGeneratorPolicy`] for this run: the
@@ -134,20 +182,13 @@ fn resolve_profile(
 /// worktree's `planning/harness.json` `proposal_generator.policy` defaults,
 /// and the built-in default, high->low precedence via [`policy::resolve`].
 /// This is what every model node calls — there is no dedicated setup node
-/// in this workflow.
+/// in this workflow. Thin wrapper over [`resolve_policy_for_run_from`] with
+/// [`PolicyConfigSource::Worktree`].
 pub fn resolve_policy_for_run(
     ctx: &TaskContext,
     worktree: &Path,
 ) -> Result<ProposalGeneratorPolicy, NodeError> {
-    let event = parse_event(ctx)?;
-    let harness_defaults = read_harness_policy_defaults(worktree)?;
-    let profile = resolve_profile(event.profile.as_deref(), worktree)?;
-    Ok(policy::resolve(
-        ProposalGeneratorPolicy::default(),
-        harness_defaults.as_ref(),
-        profile.as_ref(),
-        event.policy.as_ref(),
-    ))
+    resolve_policy_for_run_from(ctx, &PolicyConfigSource::Worktree(worktree.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -381,5 +422,67 @@ mod tests {
         let ctx = base_ctx(event);
         let err = resolve_policy_for_run(&ctx, &worktree).expect_err("should fail");
         assert!(err.message.contains("unknown profile"));
+    }
+
+    // --- resolve_policy_for_run_from / PolicyConfigSource --------------------
+
+    #[test]
+    fn resolve_policy_for_run_from_builtin_source_needs_no_worktree() {
+        let ctx = base_ctx(base_event());
+        let resolved = resolve_policy_for_run_from(&ctx, &PolicyConfigSource::Builtin)
+            .expect("resolve should succeed with no filesystem access");
+        assert_eq!(resolved, ProposalGeneratorPolicy::default());
+    }
+
+    #[test]
+    fn resolve_policy_for_run_from_builtin_source_still_errors_on_unknown_profile() {
+        let mut event = base_event();
+        event.profile = Some("nonexistent".to_string());
+        let ctx = base_ctx(event);
+        let err = resolve_policy_for_run_from(&ctx, &PolicyConfigSource::Builtin)
+            .expect_err("should fail");
+        assert!(err.message.contains("unknown profile"));
+    }
+
+    #[test]
+    fn resolve_policy_for_run_from_harness_file_source_preserves_precedence() {
+        let dir = temp_dir();
+        let harness_file = dir.join("standalone-harness.json");
+        std::fs::write(
+            &harness_file,
+            serde_json::json!({
+                "proposal_generator": { "policy": { "model_tiers": { "review": "haiku" } } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let source = PolicyConfigSource::HarnessFile(harness_file);
+
+        let mut event = base_event();
+        event.policy = Some(PartialProposalGeneratorPolicy {
+            model_tiers: Some(PartialModelTiers {
+                review: Some(ModelTier::Opus),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let ctx = base_ctx(event);
+        let resolved = resolve_policy_for_run_from(&ctx, &source).expect("resolve should succeed");
+        // event > harness default
+        assert_eq!(resolved.model_tiers.review, ModelTier::Opus);
+    }
+
+    #[test]
+    fn resolve_policy_for_run_wrapper_matches_from_worktree_source() {
+        let worktree = temp_dir();
+        let mut event = base_event();
+        event.profile = Some("local-judgment".to_string());
+        let ctx = base_ctx(event);
+
+        let via_wrapper = resolve_policy_for_run(&ctx, &worktree).expect("should succeed");
+        let via_from =
+            resolve_policy_for_run_from(&ctx, &PolicyConfigSource::Worktree(worktree.clone()))
+                .expect("should succeed");
+        assert_eq!(via_wrapper, via_from);
     }
 }

@@ -22,6 +22,8 @@ use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
+use crate::policy::PolicyConfigSource;
+
 use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
@@ -39,47 +41,64 @@ pub use crate::policy::RESOLVED_POLICY_IDENTITY;
 /// `crate::policy::profiles` plumbing.
 const WORKFLOW_KEY: &str = "sdlc";
 
-/// Read `planning/harness.json`'s `sdlc.policy` section (a [`PartialPolicy`])
-/// out of a worktree, if the file and section exist. Delegates to the
-/// generic `crate::policy::read_harness_policy_defaults` (EN.4.0),
-/// parameterized by [`WORKFLOW_KEY`].
-fn read_harness_policy_defaults(worktree: &Path) -> Result<Option<PartialPolicy>, NodeError> {
-    crate::policy::read_harness_policy_defaults(worktree, WORKFLOW_KEY)
+/// Read `<workflow_key>.policy` (a [`PartialPolicy`]) out of the file
+/// addressed by `source`. Delegates to the generic
+/// `crate::policy::read_harness_policy_defaults_from` (EN.5.D), parameterized
+/// by [`WORKFLOW_KEY`].
+fn read_harness_policy_defaults_from(
+    source: &PolicyConfigSource,
+) -> Result<Option<PartialPolicy>, NodeError> {
+    crate::policy::read_harness_policy_defaults_from(source, WORKFLOW_KEY)
 }
 
 /// Resolve `event.profile` (a named profile) to a [`PartialPolicy`] bundle,
-/// preferring a `harness.json` `sdlc.profiles[name]` entry over the built-in
-/// [`profiles::profile_by_name`]. Returns `Ok(None)` when the event carries
-/// no `profile` field, and `Err` when a `profile` name is given but resolves
-/// to neither source (no silent no-op). Delegates to the generic
-/// `crate::policy::resolve_profile` (EN.4.0), parameterized by
-/// [`WORKFLOW_KEY`] and `profiles::profile_by_name`.
-fn resolve_profile(
+/// preferring a `harness.json` `sdlc.profiles[name]` entry (read via
+/// `source`) over the built-in [`profiles::profile_by_name`]. Returns
+/// `Ok(None)` when the event carries no `profile` field, and `Err` when a
+/// `profile` name is given but resolves to neither source (no silent no-op).
+/// Delegates to the generic `crate::policy::resolve_profile_from` (EN.5.D),
+/// parameterized by [`WORKFLOW_KEY`] and `profiles::profile_by_name`.
+fn resolve_profile_from(
     profile_name: Option<&str>,
-    worktree: &Path,
+    source: &PolicyConfigSource,
 ) -> Result<Option<PartialPolicy>, NodeError> {
-    crate::policy::resolve_profile(
+    crate::policy::resolve_profile_from(
         profile_name,
-        worktree,
+        source,
         WORKFLOW_KEY,
         profiles::profile_by_name,
     )
 }
 
-/// Resolve the four-layer [`SdlcPolicy`] for this run: the inbound event's
-/// `policy` override, the resolved `profile` bundle, the worktree's
-/// `planning/harness.json` `sdlc.policy` defaults, and the built-in default,
-/// high->low precedence via [`policy::resolve`].
-pub fn resolve_policy_for_run(ctx: &TaskContext, worktree: &Path) -> Result<SdlcPolicy, NodeError> {
+/// Resolve the four-layer [`SdlcPolicy`] for this run against an arbitrary
+/// [`PolicyConfigSource`]: the inbound event's `policy` override, the
+/// resolved `profile` bundle, `source`'s `sdlc.policy` defaults, and the
+/// built-in default, high->low precedence via [`policy::resolve`]. A
+/// [`PolicyConfigSource::Builtin`] source resolves successfully with no
+/// filesystem access — the case a worktree-free (channel/API-triggered) run
+/// needs.
+pub fn resolve_policy_for_run_from(
+    ctx: &TaskContext,
+    source: &PolicyConfigSource,
+) -> Result<SdlcPolicy, NodeError> {
     let event = parse_event(ctx)?;
-    let harness_defaults = read_harness_policy_defaults(worktree)?;
-    let profile = resolve_profile(event.profile.as_deref(), worktree)?;
+    let harness_defaults = read_harness_policy_defaults_from(source)?;
+    let profile = resolve_profile_from(event.profile.as_deref(), source)?;
     Ok(policy::resolve(
         SdlcPolicy::default(),
         harness_defaults.as_ref(),
         profile.as_ref(),
         event.policy.as_ref(),
     ))
+}
+
+/// Resolve the four-layer [`SdlcPolicy`] for this run: the inbound event's
+/// `policy` override, the resolved `profile` bundle, the worktree's
+/// `planning/harness.json` `sdlc.policy` defaults, and the built-in default,
+/// high->low precedence via [`policy::resolve`]. Thin wrapper over
+/// [`resolve_policy_for_run_from`] with [`PolicyConfigSource::Worktree`].
+pub fn resolve_policy_for_run(ctx: &TaskContext, worktree: &Path) -> Result<SdlcPolicy, NodeError> {
+    resolve_policy_for_run_from(ctx, &PolicyConfigSource::Worktree(worktree.to_path_buf()))
 }
 
 pub use super::{default_command_runner, CommandOutput, CommandRunner, ModelTransport};
@@ -1014,6 +1033,69 @@ mod tests {
         resolve_policy_for_run(&ctx, &repo_root).expect(
             "resolving a built-in profile name against the repo's harness.json should succeed",
         );
+    }
+
+    // --- resolve_policy_for_run_from / PolicyConfigSource --------------------
+
+    #[test]
+    fn resolve_policy_for_run_from_builtin_source_needs_no_worktree() {
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let resolved =
+            resolve_policy_for_run_from(&ctx, &crate::policy::PolicyConfigSource::Builtin)
+                .expect("resolve should succeed with no filesystem access");
+        assert_eq!(resolved, SdlcPolicy::default());
+    }
+
+    #[test]
+    fn resolve_policy_for_run_from_builtin_source_still_errors_on_unknown_profile() {
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "profile": "nonexistent",
+        }));
+        let err = resolve_policy_for_run_from(&ctx, &crate::policy::PolicyConfigSource::Builtin)
+            .expect_err("should fail");
+        assert!(err.message.contains("unknown profile"));
+    }
+
+    #[test]
+    fn resolve_policy_for_run_from_harness_file_source_preserves_precedence() {
+        let dir = temp_dir();
+        let harness_file = dir.join("standalone-harness.json");
+        std::fs::write(
+            &harness_file,
+            json!({ "sdlc": { "policy": { "max_attempts": 5 } } }).to_string(),
+        )
+        .unwrap();
+        let source = crate::policy::PolicyConfigSource::HarnessFile(harness_file);
+
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "policy": { "max_attempts": 7 },
+        }));
+        let resolved = resolve_policy_for_run_from(&ctx, &source).expect("resolve should succeed");
+        // event > harness default
+        assert_eq!(resolved.max_attempts, 7);
+    }
+
+    #[test]
+    fn resolve_policy_for_run_wrapper_matches_from_worktree_source() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            json!({ "sdlc": { "policy": { "max_attempts": 5 } } }).to_string(),
+        )
+        .unwrap();
+
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let via_wrapper = resolve_policy_for_run(&ctx, &worktree).expect("should succeed");
+        let via_from = resolve_policy_for_run_from(
+            &ctx,
+            &crate::policy::PolicyConfigSource::Worktree(worktree.clone()),
+        )
+        .expect("should succeed");
+        assert_eq!(via_wrapper, via_from);
+        assert_eq!(via_wrapper.max_attempts, 5);
     }
 
     #[tokio::test]
