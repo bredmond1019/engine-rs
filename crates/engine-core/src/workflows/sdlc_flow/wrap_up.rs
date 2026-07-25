@@ -377,6 +377,7 @@ fn finalize_outcomes(
         tasks_passed: state.telemetry.tasks_passed,
         tasks_failed: state.telemetry.tasks_failed,
         model_tier_used: model_tier_used(policy),
+        model_stages: &COST_BEARING_STAGES,
     };
     crate::policy::harvest_telemetry(ctx, now, inputs).into()
 }

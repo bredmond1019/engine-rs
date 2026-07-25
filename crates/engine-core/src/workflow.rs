@@ -24,6 +24,14 @@ use crate::validate::{ValidationError, WorkflowValidator};
 /// `cancellation::CANCELLATION_METADATA_KEY`.
 pub const BUDGET_METADATA_KEY: &str = "budget";
 
+/// The `TaskContext::metadata` key under which every run's workflow-agnostic
+/// [`policy::telemetry::RunTelemetry`] snapshot is recorded — see
+/// [`stamp_run_telemetry`]. Sibling to `CANCELLATION_METADATA_KEY`/
+/// `BUDGET_METADATA_KEY`.
+///
+/// [`policy::telemetry::RunTelemetry`]: crate::policy::telemetry::RunTelemetry
+pub const RUN_TELEMETRY_METADATA_KEY: &str = "run_telemetry";
+
 /// Optional cancellation/budget wiring for [`Workflow::run_with`]. Every
 /// field defaults to `None`, matching [`Workflow::run`]'s behavior exactly —
 /// no token means no cancellation check, no budget means no gate.
@@ -201,6 +209,7 @@ impl Workflow {
             if let Some(token) = &options.cancellation_token {
                 if token.is_cancelled() {
                     stamp_cancelled(&mut ctx.metadata);
+                    stamp_run_telemetry(&mut ctx, &self.schema.start_node);
                     on_progress(&ctx);
                     return Ok(ctx);
                 }
@@ -208,6 +217,7 @@ impl Workflow {
 
             if let BudgetDecision::Halt(reason) = ledger.check(options.budget.as_ref()) {
                 stamp_budget_halt(&mut ctx.metadata, reason);
+                stamp_run_telemetry(&mut ctx, &self.schema.start_node);
                 on_progress(&ctx);
                 return Ok(ctx);
             }
@@ -243,7 +253,55 @@ impl Workflow {
             };
         }
 
+        stamp_run_telemetry(&mut ctx, &self.schema.start_node);
         Ok(ctx)
+    }
+}
+
+/// Stamp a workflow-agnostic [`policy::telemetry::RunTelemetry`] snapshot
+/// into `metadata[RUN_TELEMETRY_METADATA_KEY]`, harvested from `ctx` alone
+/// (`EN.5.D` task 10) — previously this only happened inside the
+/// `#[ignore]`d profile-ranking experiments (or a workflow's own
+/// hand-rolled `finalize_outcomes`), so a served run's `TaskContext` carried
+/// no telemetry of its own at all.
+///
+/// Graph-agnostic: every identity `ctx.nodes` carries by this point in the
+/// run is passed as its own verdict/cost/model-tier stage, so this needs no
+/// per-workflow stage list — `policy::telemetry::{review_verdicts,
+/// total_cost_usd, observed_model_tiers}` simply find nothing to report for
+/// an identity whose output carries none of `"verdict"`/`"cost_usd"`/
+/// `"transport"`. `total_attempts`/`total_retries`/`tasks_passed`/
+/// `tasks_failed` stay `0` here (not derivable without workflow-specific
+/// state); a workflow that tracks those (e.g. SDLC's `SDLCState`) still
+/// computes its own precise `RunOutcomes` via its own `finalize_outcomes` —
+/// that write is not disturbed by this one, they sit at different `ctx`
+/// locations (`ctx.nodes["WrapUpNode"]` vs `ctx.metadata`).
+///
+/// Never fails the run: a `RunTelemetry` that somehow won't serialize is
+/// simply not stamped, rather than turning an otherwise-successful run into
+/// a `WorkflowError`.
+fn stamp_run_telemetry(ctx: &mut TaskContext, start_node_identity: &str) {
+    let identities: Vec<String> = ctx.nodes.keys().cloned().collect();
+    let stages: Vec<&str> = identities.iter().map(String::as_str).collect();
+
+    let inputs = crate::policy::telemetry::RunTelemetryInputs {
+        start_node_identity,
+        verdict_stages: &stages,
+        cost_bearing_stages: &stages,
+        model_stages: &stages,
+        total_attempts: 0,
+        total_retries: 0,
+        tasks_passed: 0,
+        tasks_failed: 0,
+        model_tier_used: std::collections::BTreeMap::new(),
+    };
+    let telemetry = crate::policy::telemetry::harvest(ctx, Utc::now(), inputs);
+
+    if let Ok(value) = serde_json::to_value(&telemetry) {
+        if !ctx.metadata.is_object() {
+            ctx.metadata = serde_json::json!({});
+        }
+        ctx.metadata[RUN_TELEMETRY_METADATA_KEY] = value;
     }
 }
 
@@ -606,5 +664,130 @@ mod tests {
             result.nodes.get("SeedReaderNode").unwrap()["saw"],
             serde_json::json!({ "a": 1 })
         );
+    }
+
+    /// Two-node fixture reused by task 10's `stamp_run_telemetry` tests:
+    /// `start_node -> SuccessNode` (terminal), wired via `connections[0]`.
+    fn two_node_workflow() -> Workflow {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(SuccessNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "start_node".to_string(),
+            crate::schema::NodeConfig::new("start_node", vec!["SuccessNode".to_string()]),
+        );
+        nodes.insert(
+            "SuccessNode".to_string(),
+            crate::schema::NodeConfig::new("SuccessNode", vec![]),
+        );
+        registry.register(Box::new(SuccessNode2));
+        let schema = WorkflowSchema::new("linear", "start_node", nodes);
+        Workflow::new(registry, schema)
+    }
+
+    /// A second distinctly-named `SuccessNode` registered under the
+    /// `"start_node"` identity, so `two_node_workflow`'s two schema entries
+    /// each have a distinct registered `Node`.
+    struct SuccessNode2;
+
+    #[async_trait::async_trait]
+    impl Node for SuccessNode2 {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "start_node"
+        }
+    }
+
+    /// `RunTelemetry` deserialized out of `metadata[RUN_TELEMETRY_METADATA_KEY]`
+    /// — panics (failing the test) if the key is absent or unparsable.
+    fn stamped_run_telemetry(ctx: &TaskContext) -> crate::policy::telemetry::RunTelemetry {
+        let value = ctx
+            .metadata
+            .get(RUN_TELEMETRY_METADATA_KEY)
+            .unwrap_or_else(|| panic!("metadata[{RUN_TELEMETRY_METADATA_KEY:?}] not stamped"));
+        serde_json::from_value(value.clone())
+            .expect("stamped run_telemetry deserializes into RunTelemetry")
+    }
+
+    #[tokio::test]
+    async fn every_run_stamps_run_telemetry_into_metadata() {
+        let workflow = two_node_workflow();
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let ctx = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .expect("run should succeed");
+
+        // Both nodes should have completed successfully.
+        assert_eq!(
+            ctx.node_runs.get("start_node").unwrap().status,
+            NodeRunStatus::Success
+        );
+        assert_eq!(
+            ctx.node_runs.get("SuccessNode").unwrap().status,
+            NodeRunStatus::Success
+        );
+
+        stamped_run_telemetry(&ctx);
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_still_stamps_run_telemetry_alongside_the_cancelled_marker() {
+        let workflow = two_node_workflow();
+
+        // Pre-cancelled: the walk halts at the very first node boundary
+        // before dispatching `start_node`.
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: Some(token),
+            budget: None,
+        };
+
+        let ctx = workflow
+            .run_with(serde_json::json!({}), on_progress, options)
+            .await
+            .expect("a cancelled run returns Ok, not Err");
+
+        assert!(ctx
+            .metadata
+            .get(crate::cancellation::CANCELLATION_METADATA_KEY)
+            .is_some());
+        stamped_run_telemetry(&ctx);
+    }
+
+    #[tokio::test]
+    async fn budget_halted_run_still_stamps_run_telemetry_alongside_the_halt_marker() {
+        let workflow = two_node_workflow();
+
+        // A zero-token cap halts before the very first node dispatches: an
+        // empty ledger's `0 >= 0` trips immediately.
+        let budget = Budget {
+            max_total_tokens: Some(0),
+            max_cost_usd: None,
+        };
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: None,
+            budget: Some(budget),
+        };
+
+        let ctx = workflow
+            .run_with(serde_json::json!({}), on_progress, options)
+            .await
+            .expect("a budget-halted run returns Ok, not Err");
+
+        assert!(ctx.metadata.get(BUDGET_METADATA_KEY).is_some());
+        stamped_run_telemetry(&ctx);
     }
 }

@@ -27,5 +27,7 @@ pub use profiles::{
 };
 pub use resolve::{merge_opt, resolve, Policy};
 pub use shaping::{apply_model_tier, apply_prompt_cache, apply_verbosity_directive};
-pub use telemetry::{harvest as harvest_telemetry, RunTelemetry, RunTelemetryInputs};
+pub use telemetry::{
+    harvest as harvest_telemetry, observed_model_tiers, RunTelemetry, RunTelemetryInputs,
+};
 pub use tier::{model_tier_to_model_string, LocalConfig, ModelTier, OutputVerbosity};

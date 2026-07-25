@@ -241,6 +241,7 @@ impl Node for ProspectingResearchNode {
             tasks_passed: 1,
             tasks_failed: 0,
             model_tier_used,
+            model_stages: &COST_BEARING_STAGES,
         };
         let telemetry = crate::policy::harvest_telemetry(&ctx, chrono::Utc::now(), inputs);
         persist_state(&worktree, "prospecting", &policy, &telemetry)?;

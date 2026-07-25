@@ -832,6 +832,7 @@ async fn experiment_named_profiles_ranked_by_cost() {
                 tasks_passed: 1,
                 tasks_failed: 0,
                 model_tier_used,
+                model_stages: &[],
             },
         );
 

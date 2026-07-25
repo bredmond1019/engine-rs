@@ -236,6 +236,7 @@ fn harvest_sums_tokens_cost_and_verdicts_from_synthetic_ctx() {
         tasks_passed: 2,
         tasks_failed: 1,
         model_tier_used: model_tier_used.clone(),
+        model_stages: &[],
     };
 
     let telemetry: RunTelemetry = harvest_telemetry(&ctx, now, inputs);
