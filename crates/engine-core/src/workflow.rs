@@ -65,6 +65,7 @@ pub type OnProgress<'a> = Box<dyn FnMut(&TaskContext) + 'a>;
 pub struct Workflow {
     registry: NodeRegistry,
     schema: WorkflowSchema,
+    seeded_nodes: HashMap<String, serde_json::Value>,
 }
 
 /// Error returned by `Workflow::run` for conditions outside a node's own
@@ -92,7 +93,11 @@ impl std::error::Error for WorkflowError {}
 
 impl Workflow {
     pub fn new(registry: NodeRegistry, schema: WorkflowSchema) -> Self {
-        Self { registry, schema }
+        Self {
+            registry,
+            schema,
+            seeded_nodes: HashMap::new(),
+        }
     }
 
     /// Run `WorkflowValidator::validate` against `registry`/`schema` before
@@ -107,7 +112,21 @@ impl Workflow {
         schema: WorkflowSchema,
     ) -> Result<Self, ValidationError> {
         WorkflowValidator::validate(&registry, &schema)?;
-        Ok(Self { registry, schema })
+        Ok(Self {
+            registry,
+            schema,
+            seeded_nodes: HashMap::new(),
+        })
+    }
+
+    /// Seed entries into the run's initial `ctx.nodes` before the walk starts.
+    /// EN.5.D uses this to carry the policy resolved **once per run at
+    /// dispatch** into the run via `policy::RESOLVED_POLICY_IDENTITY`, so no
+    /// node re-resolves it (and re-reads `harness.json`) inside `process()`.
+    #[must_use]
+    pub fn with_seeded_nodes(mut self, seeded: HashMap<String, serde_json::Value>) -> Self {
+        self.seeded_nodes = seeded;
+        self
     }
 
     /// Run the workflow to completion (or first failure).
@@ -154,7 +173,7 @@ impl Workflow {
     ) -> Result<TaskContext, WorkflowError> {
         let mut ctx = TaskContext {
             event,
-            nodes: HashMap::new(),
+            nodes: self.seeded_nodes.clone(),
             metadata: serde_json::json!({}),
             node_runs: HashMap::new(),
         };
@@ -480,5 +499,112 @@ mod tests {
             NodeRunStatus::Pending
         );
         assert!(!result.nodes.contains_key("SuccessNode"));
+    }
+
+    /// Reads a seeded entry at `ctx.nodes["X"]` and echoes it back into its
+    /// own output, proving the seed is visible to the start node.
+    struct SeedReaderNode;
+
+    #[async_trait::async_trait]
+    impl Node for SeedReaderNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            let seen = ctx.nodes.get("X").cloned();
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "saw": seen }));
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "SeedReaderNode"
+        }
+    }
+
+    #[tokio::test]
+    async fn unseeded_workflow_starts_with_empty_nodes() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(SuccessNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "SuccessNode".to_string(),
+            crate::schema::NodeConfig::new("SuccessNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "SuccessNode", nodes);
+
+        let workflow = Workflow::new(registry, schema);
+
+        let snapshots = std::rc::Rc::new(std::cell::RefCell::new(Vec::<TaskContext>::new()));
+        let snapshots_handle = snapshots.clone();
+        let on_progress: OnProgress<'_> =
+            Box::new(move |c: &TaskContext| snapshots_handle.borrow_mut().push(c.clone()));
+
+        workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .unwrap();
+
+        let snapshots = snapshots.borrow();
+        let first = &snapshots[0];
+        assert!(first.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seeded_entry_is_visible_in_the_first_snapshot() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(SuccessNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "SuccessNode".to_string(),
+            crate::schema::NodeConfig::new("SuccessNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "SuccessNode", nodes);
+
+        let mut seeded = HashMap::new();
+        seeded.insert("X".to_string(), serde_json::json!({ "a": 1 }));
+        let workflow = Workflow::new(registry, schema).with_seeded_nodes(seeded);
+
+        let snapshots = std::rc::Rc::new(std::cell::RefCell::new(Vec::<TaskContext>::new()));
+        let snapshots_handle = snapshots.clone();
+        let on_progress: OnProgress<'_> =
+            Box::new(move |c: &TaskContext| snapshots_handle.borrow_mut().push(c.clone()));
+
+        workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .unwrap();
+
+        let snapshots = snapshots.borrow();
+        let first = &snapshots[0];
+        assert_eq!(first.nodes.get("X").unwrap()["a"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn seeded_entry_is_readable_by_the_start_node() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(SeedReaderNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "SeedReaderNode".to_string(),
+            crate::schema::NodeConfig::new("SeedReaderNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "SeedReaderNode", nodes);
+
+        let mut seeded = HashMap::new();
+        seeded.insert("X".to_string(), serde_json::json!({ "a": 1 }));
+        let workflow = Workflow::new(registry, schema).with_seeded_nodes(seeded);
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let result = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.nodes.get("SeedReaderNode").unwrap()["saw"],
+            serde_json::json!({ "a": 1 })
+        );
     }
 }
