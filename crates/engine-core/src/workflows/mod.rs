@@ -19,6 +19,7 @@ use engine_contract::TaskContext;
 use futures::future::BoxFuture;
 
 pub mod diagnostic_intake;
+pub mod proposal_generator;
 pub mod research_agent;
 pub mod sdlc_flow;
 
