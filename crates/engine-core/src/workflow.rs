@@ -226,21 +226,30 @@ impl Workflow {
                 WorkflowError::new(format!("no node registered for identity '{identity}'"))
             })?;
 
-            // Routers choose their next identity at runtime via `route(ctx)`
-            // (possibly an undeclared back-edge); plain nodes keep walking
-            // the statically declared `connections[0]`. Resolve this before
-            // `node_context` consumes `ctx` so the router sees the context
-            // as it stood on entry to this node.
-            let router_next = node
-                .as_router()
-                .map(|router| crate::routing::dispatch_route(router, &ctx));
-
             let (next_ctx, failed) = node_context(node, ctx, &mut on_progress).await;
             ctx = next_ctx;
 
             if failed {
                 break;
             }
+
+            // Routers choose their next identity at runtime via `route(ctx)`
+            // (possibly an undeclared back-edge); plain nodes keep walking
+            // the statically declared `connections[0]`. Resolved *after*
+            // `node_context` so the router sees the context as it stood on
+            // exit from this node — including anything this node's own
+            // `process()` just stored under its own identity (e.g.
+            // `content_pipeline::source_router::SourceRouterNode`, whose
+            // `route()` reads back the envelope/policy its own `process()`
+            // stamped this same walk step; EN.5.A task 13's e2e is the first
+            // suite to drive a self-referential router through the real
+            // walk loop and caught this — every other router in the
+            // registry has a pure-passthrough `process()`, so this ordering
+            // change is behavior-preserving for them: their route() only
+            // ever reads a *different*, already-completed node's output).
+            let router_next = node
+                .as_router()
+                .map(|router| crate::routing::dispatch_route(router, &ctx));
 
             if let Some(run) = ctx.node_runs.get(&identity) {
                 let cost_usd = node_cost_usd(&ctx, &identity);
