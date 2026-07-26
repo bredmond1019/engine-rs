@@ -149,13 +149,15 @@ impl Router for TranslateSkipRouterNode {
 }
 
 /// Reads whichever of `SummarizeNode`/`ReviseNode` most recently stored a
-/// `SummaryResult` (bound via `summary_input`, falling back to
-/// `SummarizeNode`'s identity, then `ReviseNode`'s, when unbound) and
-/// returns its `summary` text for the translation prompt.
+/// `SummaryResult` (tries `ReviseNode` first, since it overwrites
+/// `SummarizeNode`'s output on the loop's back-edge, falling back to the
+/// bound `summary_input` identity — `SummarizeNode`'s by default when
+/// unbound — when no revise pass ran) and returns its `summary` text for
+/// the translation prompt.
 fn read_summary(ctx: &TaskContext, summary_input: &InputBinding) -> Result<String, NodeError> {
     let bound = summary_input.resolve(summarize::NODE_NAME);
-    let stored = get_result(ctx, bound)
-        .or_else(|| get_result(ctx, revise::NODE_NAME))
+    let stored = get_result(ctx, revise::NODE_NAME)
+        .or_else(|| get_result(ctx, bound))
         .ok_or_else(|| {
             NodeError::new(format!(
                 "{NODE_NAME}: no summary stored by {bound} or {}",

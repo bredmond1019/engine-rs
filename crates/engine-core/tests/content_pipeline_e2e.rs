@@ -551,6 +551,18 @@ async fn critic_loop_terminates_by_pass_verdict_after_one_revision() {
         ctx.node_runs[nn::PERSIST_TO_BRAIN].status,
         NodeRunStatus::Success
     );
+
+    // Regression: the revised summary must actually propagate downstream —
+    // the persisted digest reflects ReviseNode's corrected text, not the
+    // original SummarizeNode draft the critic flagged.
+    let output = output_of(&ctx);
+    assert_eq!(output.summary, "A corrected, more accurate summary.");
+    assert!(output
+        .digest_markdown
+        .contains("A corrected, more accurate summary."));
+    assert!(!output
+        .digest_markdown
+        .contains("A concise summary of the content."));
 }
 
 #[tokio::test]

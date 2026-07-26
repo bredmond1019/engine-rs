@@ -76,10 +76,12 @@ fn read_envelope(ctx: &TaskContext) -> Result<IngressEnvelope, NodeError> {
 /// Reads whichever of `SummarizeNode`/`ReviseNode` most recently stored a
 /// `SummaryResult` — mirrors `self_critic::read_summary`'s /
 /// `translate::read_summary`'s read-preference precedent (tries
-/// `SummarizeNode` first, falls back to `ReviseNode`).
+/// `ReviseNode` first, since it overwrites `SummarizeNode`'s output on the
+/// loop's back-edge, falling back to `SummarizeNode`'s when no revise pass
+/// ran).
 fn read_summary(ctx: &TaskContext) -> Result<SummaryResult, NodeError> {
-    let stored = get_result(ctx, summarize::NODE_NAME)
-        .or_else(|| get_result(ctx, revise::NODE_NAME))
+    let stored = get_result(ctx, revise::NODE_NAME)
+        .or_else(|| get_result(ctx, summarize::NODE_NAME))
         .ok_or_else(|| {
             NodeError::new(format!(
                 "{NODE_NAME}: no summary stored by {} or {}",

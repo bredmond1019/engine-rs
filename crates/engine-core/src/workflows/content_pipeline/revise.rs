@@ -49,12 +49,15 @@ const STABLE_SYSTEM_PROMPT: &str =
      revise stage. This system prompt is held constant across calls so \
      its tokens can be cached.";
 
-/// Reads whichever identity the bound `summary_input` resolves to (falling
-/// back to `SummarizeNode`'s identity when unbound) and returns its
-/// `summary` text for the revision prompt.
+/// Reads this node's own prior output first (`NODE_NAME` — a later loop
+/// pass revises the previous revision rather than re-deriving from
+/// scratch), falling back to whichever identity the bound `summary_input`
+/// resolves to (`SummarizeNode`'s identity when unbound) on the first
+/// pass, and returns its `summary` text for the revision prompt.
 fn read_summary(ctx: &TaskContext, summary_input: &InputBinding) -> Result<String, NodeError> {
     let bound = summary_input.resolve(summarize::NODE_NAME);
-    let stored = get_result(ctx, bound)
+    let stored = get_result(ctx, NODE_NAME)
+        .or_else(|| get_result(ctx, bound))
         .ok_or_else(|| NodeError::new(format!("{NODE_NAME}: no summary stored by {bound}")))?;
     stored
         .get("summary")
