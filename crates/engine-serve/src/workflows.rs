@@ -180,14 +180,50 @@ pub fn register_proposal_generator(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `CONTENT_PIPELINE` workflow
+/// (`engine_core::workflows::content_pipeline`) with `dispatcher`,
+/// populating both the `workflow_registry` (via a policy-aware factory
+/// built on `content_pipeline::graph::registry_for_policy`) and the
+/// `schema_registry` (via `content_pipeline::graph::schema`). See
+/// `planning/EN.5.A-content-pipeline/tasks.md`, Task 12.
+///
+/// Channel/webhook-triggered runs carry no repo checkout at dispatch time
+/// (mirrors `RESEARCH_AGENT`/`DIAGNOSTIC_INTAKE`/`PROPOSAL_GENERATOR`), so
+/// the factory resolves policy against `PolicyConfigSource::Builtin`
+/// (builtin + profile + event layers only, no filesystem access) rather
+/// than a worktree path.
+pub fn register_content_pipeline(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::content_pipeline::graph::schema(),
+        Box::new(|event: &serde_json::Value| {
+            let ctx = event_only_context(event);
+            let policy =
+                engine_core::workflows::content_pipeline::profiles::resolve_policy_for_run_from(
+                    &ctx,
+                    &PolicyConfigSource::Builtin,
+                )
+                .map_err(|err| err.to_string())?;
+            let registry =
+                engine_core::workflows::content_pipeline::graph::registry_for_policy(&policy);
+            let seeded = seed_resolved_policy(&policy)?;
+            Ok(Workflow::new(
+                registry,
+                engine_core::workflows::content_pipeline::graph::schema(),
+            )
+            .with_seeded_nodes(seeded))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
-/// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, and `PROPOSAL_GENERATOR`; future
-/// builtins register here too.
+/// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`, and
+/// `CONTENT_PIPELINE`; future builtins register here too.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_sdlc_flow(dispatcher);
     register_research_agent(dispatcher);
     register_diagnostic_intake(dispatcher);
     register_proposal_generator(dispatcher);
+    register_content_pipeline(dispatcher);
 }
 
 #[cfg(test)]
@@ -505,5 +541,98 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("PROPOSAL_GENERATOR"));
+    }
+
+    fn minimal_web_article_event() -> serde_json::Value {
+        serde_json::json!({
+            "envelope": {
+                "envelope_id": "env-1",
+                "channel_type": "web_article",
+                "timestamp": "2026-07-25T00:00:00Z",
+                "source": { "kind": "url", "url": "https://example.com/a" }
+            }
+        })
+    }
+
+    #[test]
+    fn register_content_pipeline_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_content_pipeline(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("CONTENT_PIPELINE"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_source_router_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_content_pipeline(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("CONTENT_PIPELINE")
+            .expect("CONTENT_PIPELINE schema should resolve");
+
+        assert_eq!(schema.start_node, "SourceRouterNode");
+    }
+
+    #[test]
+    fn dispatch_with_event_seeds_the_resolved_content_pipeline_policy() {
+        let mut dispatcher = Dispatcher::new();
+        register_content_pipeline(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event("CONTENT_PIPELINE", &minimal_web_article_event())
+            .expect("CONTENT_PIPELINE should dispatch to a runnable Workflow with no repo");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn dispatch_with_event_fails_loudly_on_unknown_content_pipeline_profile() {
+        let mut dispatcher = Dispatcher::new();
+        register_content_pipeline(&mut dispatcher);
+
+        let mut event = minimal_web_article_event();
+        event["profile"] = serde_json::json!("not-a-real-profile");
+
+        let result = dispatcher.dispatch_with_event("CONTENT_PIPELINE", &event);
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("not-a-real-profile"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn local_drafting_profile_over_the_event_resolves_to_a_locally_tiered_policy() {
+        use engine_core::workflows::content_pipeline::policy::ModelTier;
+
+        let mut event = minimal_web_article_event();
+        event["profile"] = serde_json::json!("local-drafting");
+        let ctx = event_only_context(&event);
+
+        let policy =
+            engine_core::workflows::content_pipeline::profiles::resolve_policy_for_run_from(
+                &ctx,
+                &PolicyConfigSource::Builtin,
+            )
+            .expect("local-drafting should resolve with no repo");
+
+        assert_eq!(policy.model_tiers.summarize, ModelTier::Local);
+        assert_eq!(policy.model_tiers.critic, ModelTier::Local);
+        assert_eq!(policy.model_tiers.revise, ModelTier::Local);
+        assert_eq!(policy.model_tiers.translate, ModelTier::Local);
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_content_pipeline() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("CONTENT_PIPELINE"));
     }
 }
