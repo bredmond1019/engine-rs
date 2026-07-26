@@ -302,6 +302,14 @@ fn build_hermetic_registry(policy: &ProposalGeneratorPolicy) -> NodeRegistry {
             .with_url(TEST_BRAIN_URL),
     ));
 
+    // EN.5.E task 4: `graph::schema()` now declares the review->revise loop
+    // cluster's guard/increment identities too — register the same cluster
+    // `graph::registry()` does so this hermetic stand-in stays a faithful
+    // match for the real declared graph shape.
+    for node in graph::revise_loop_cluster().nodes {
+        registry.register(node);
+    }
+
     registry
 }
 
@@ -524,13 +532,15 @@ fn workflow_with_no_worktree_path_resolves_policy_successfully() {
 
 /// Sanity check that this file's stub-wired registration mirrors
 /// `graph::registry_for_policy`'s node identity set exactly (same seven
-/// nodes), so the "hermetic dispatch" path this file drives is a faithful
-/// stand-in for the real one, not a different graph shape.
+/// nodes plus the review->revise loop cluster's guard/increment pair, added
+/// by `EN.5.E` task 4), so the "hermetic dispatch" path this file drives is
+/// a faithful stand-in for the real one, not a different graph shape.
 #[test]
 fn hermetic_registry_contains_the_same_seven_node_identities_as_the_real_one() {
     let policy = ProposalGeneratorPolicy::default();
     let registry = build_hermetic_registry(&policy);
     let real_registry = graph::registry();
+    let cluster = graph::revise_loop_cluster();
 
     assert_eq!(registry.len(), real_registry.len());
     for identity in [
@@ -541,6 +551,8 @@ fn hermetic_registry_contains_the_same_seven_node_identities_as_the_real_one() {
         "ProposalReviewRouterNode",
         "ProposalReviseNode",
         "PersistToBrainNode",
+        cluster.guard_identity.as_str(),
+        cluster.increment_identity.as_str(),
     ] {
         assert!(registry.contains(identity));
     }
