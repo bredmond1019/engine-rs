@@ -5,9 +5,11 @@
 //! governing principle 4). Any drift from that contract breaks `bastion` — see
 //! `planning/EN.0.B-data-contract-postgres/tasks.md`.
 
+pub mod envelope;
 pub mod events;
 pub mod task_context;
 
+pub use envelope::{ChannelType, IngressEnvelope, ReplyContext, SourcePayload};
 pub use events::EventsRow;
 pub use task_context::{NodeRun, NodeRunStatus, TaskContext, Usage};
 
