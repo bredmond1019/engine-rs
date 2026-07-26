@@ -432,7 +432,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc as StdArc;
 
-        use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
+        use claude_code_rs::parse::Usage as SdkUsage;
         use claude_code_rs::{Config as ClaudeConfig, Outcome};
         use futures::FutureExt;
 
@@ -668,7 +668,7 @@ mod tests {
             assert_eq!(review_calls.load(Ordering::SeqCst), 2);
             assert_eq!(revise_calls.load(Ordering::SeqCst), 1);
             assert!(ctx.nodes.contains_key("PersistToBrainNode"));
-            assert!(REVISE_LOOP_MAX_ITERATIONS > 2, "cap should not be hit");
+            const { assert!(REVISE_LOOP_MAX_ITERATIONS > 2, "cap should not be hit") };
         }
     }
 }
