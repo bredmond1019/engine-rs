@@ -18,7 +18,7 @@ pub mod workflows;
 
 pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
-pub use node::{Node, NodeError, NodeRegistry};
+pub use node::{Identified, InputBinding, Node, NodeError, NodeExt, NodeRegistry, WithInput};
 pub use nodes::ClaudeCodeStep;
 pub use parallel::ParallelNode;
 pub use routing::{dispatch_route, Router};
