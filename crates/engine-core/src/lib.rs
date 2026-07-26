@@ -6,6 +6,7 @@
 
 pub mod budget;
 pub mod cancellation;
+pub mod loop_combinator;
 pub mod node;
 pub mod nodes;
 pub mod parallel;
@@ -18,6 +19,7 @@ pub mod workflows;
 
 pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
+pub use loop_combinator::{build_loop, ExitPredicate, LoopCluster, LoopSpec};
 pub use node::{Identified, InputBinding, Node, NodeError, NodeExt, NodeRegistry, WithInput};
 pub use nodes::ClaudeCodeStep;
 pub use parallel::ParallelNode;
