@@ -33,14 +33,25 @@ in `crates/engine-core/src/nodes/http_post.rs`.
 ```
 ProposalCompanyResearchNode -> OpportunityIdentifierNode -> ProposalWriterNode
   -> ProposalReviewNode -> ProposalReviewRouterNode
-  -> { PersistToBrainNode | ProposalReviseNode -> PersistToBrainNode }
+  -> { PersistToBrainNode
+     | ProposalReviseNode -> {loop guard/increment cluster}
+         -> ProposalReviewNode (continue, capped) | PersistToBrainNode (cap reached) }
 ```
 
-Seven nodes, linear except for the review/revise branch. `ProposalReviewRouterNode` is a
-deterministic `Router` that reads `ProposalReviewNode`'s stored verdict off `ctx.nodes` and
-routes to whichever branch matches — a `Router::route` takes `&TaskContext` and cannot mutate
-it, so policy resolution and telemetry live in the model nodes it routes between, not in the
-router itself. `PersistToBrainNode` is the sole terminal node — no forward connection.
+Nine nodes: the original seven plus a `{guard, increment}` pair (`EN.5.E` task 4) built from
+`crate::loop_combinator::build_loop` (see [architecture.md](architecture.md#core-types)).
+`ProposalReviewRouterNode` is a deterministic `Router` that reads `ProposalReviewNode`'s stored
+verdict off `ctx.nodes` and routes to whichever branch matches — a `Router::route` takes
+`&TaskContext` and cannot mutate it, so policy resolution and telemetry live in the model nodes
+it routes between, not in the router itself. `ProposalReviseNode`'s single declared connection
+now points at the loop cluster's guard identity rather than straight to `PersistToBrainNode`:
+the guard's back-edge (via the increment node) re-enters `ProposalReviewNode` for another review
+pass, capped at `REVISE_LOOP_MAX_ITERATIONS` (3, in `graph.rs`). Once `ProposalReviewNode`
+re-runs, `ProposalReviewRouterNode` re-decides — a `pass` verdict routes straight to
+`PersistToBrainNode` (bypassing the loop cluster entirely; this is how the loop exits on a pass
+verdict), while a further `revise` verdict re-enters the cluster, up to the cap, which then forces
+an exit straight to `PersistToBrainNode` regardless of verdict. `PersistToBrainNode` is the sole
+terminal node — no forward connection.
 
 | Node | Kind | What it does |
 |---|---|---|
@@ -48,8 +59,9 @@ router itself. `PersistToBrainNode` is the sole terminal node — no forward con
 | `OpportunityIdentifierNode` | **Model** (Sonnet by default, Local-eligible) | `opportunity`-stage node. Scores automation candidates from `DiagnosticIntake` evidence when present on the event, else falls back to the upstream web brief. Recomputes each candidate's composite score and `PriorityTier` deterministically from the model's raw axis scores (never trusts the model's own arithmetic), sorts composite-descending, and stamps `{"candidates": [...]}` onto `ctx`. |
 | `ProposalWriterNode` | **Model** (Sonnet by default, cloud-default) | `writer`-stage node. Drafts the four-section `AutomationRoadmap` from `OpportunityIdentifierNode`'s ranked candidates and `ProposalCompanyResearchNode`'s brief. |
 | `ProposalReviewNode` | **Model** (Sonnet by default, Local-eligible) | `review`-stage node. Reviews the draft and stores a `pass`/`revise` verdict on `ctx`. When `ProposalGeneratorPolicy.review_mode == Skip`, short-circuits straight to `pass` before constructing a `ClaudeCodeStep` at all — zero model calls under `Skip`. |
-| `ProposalReviewRouterNode` | Deterministic router | Reads `ProposalReviewNode`'s verdict; routes `pass` -> `PersistToBrainNode`, `revise` -> `ProposalReviseNode`. Fails closed to `revise` for any ambiguous/malformed verdict text. |
-| `ProposalReviseNode` | **Model** (Sonnet by default, Local-eligible) | `revise`-stage node. Reads both the writer's draft and the reviewer's notes from `ctx.nodes` to produce a corrected, validator-passing `AutomationRoadmap` under its own node identity. |
+| `ProposalReviewRouterNode` | Deterministic router | Reads `ProposalReviewNode`'s verdict; routes `pass` -> `PersistToBrainNode`, `revise` -> `ProposalReviseNode`. Fails closed to `revise` for any ambiguous/malformed verdict text. Its upstream/downstream identities are resolved through `InputBinding` values (not literal struct fields), since the e2e test constructs it as a bare `ProposalReviewRouterNode` unit struct. |
+| `ProposalReviseNode` | **Model** (Sonnet by default, Local-eligible) | `revise`-stage node. Reads both the writer's draft and the reviewer's notes from `ctx.nodes` (via `InputBinding`, `EN.5.E`) to produce a corrected, validator-passing `AutomationRoadmap` under its own node identity. Its single declared connection points at the review/revise loop cluster's guard, not directly at `PersistToBrainNode` (see [Graph shape](#graph-shape)). |
+| loop cluster guard/increment (`ProposalRevisionGuard`/`ProposalRevisionIncrement`, identity-derived) | Deterministic routers | `crate::loop_combinator::build_loop`'s cap-enforcing back-edge pair (`EN.5.E`): the guard routes back to `ProposalReviewNode` (continue, under `REVISE_LOOP_MAX_ITERATIONS`) or to `PersistToBrainNode` (cap reached); the increment node owns the iteration counter. |
 | `PersistToBrainNode` | Deterministic, terminal | POSTs the finished roadmap — preferring `ProposalReviseNode`'s corrected draft over `ProposalWriterNode`'s original when present — to Synapse's brain-ingest endpoint over an injectable `HttpPost` seam. See [The engine↔brain persist boundary](#the-enginebrain-persist-boundary). |
 
 `registry_for_policy(&ProposalGeneratorPolicy)` in `graph.rs` rewires whichever of the three
@@ -221,9 +233,10 @@ assembles a policy/telemetry/review_verdict/revised snapshot itself from the dri
 
 ## Scope notes
 
-- **Node count is fixed at seven** — `ProposalCompanyResearchNode`,
+- **Node count is nine** as of `EN.5.E` — the original seven (`ProposalCompanyResearchNode`,
   `OpportunityIdentifierNode`, `ProposalWriterNode`, `ProposalReviewNode`,
-  `ProposalReviewRouterNode`, `ProposalReviseNode`, `PersistToBrainNode`. There is no
+  `ProposalReviewRouterNode`, `ProposalReviseNode`, `PersistToBrainNode`) plus the review/revise
+  loop cluster's guard and increment nodes (`crate::loop_combinator::build_loop`). There is no
   setup/worktree node.
 - **Reuses upstream types rather than redefining them**: `CompanyBrief` from
   `workflows::research_agent` (`ProposalCompanyResearchNode`'s output, and
@@ -235,7 +248,8 @@ assembles a policy/telemetry/review_verdict/revised snapshot itself from the dri
   [The engine↔brain persist boundary](#the-enginebrain-persist-boundary).
 - **Out of scope for this block**: PDF render (EN.4.D — not yet built).
 - **Hermetic test coverage**: `crates/engine-core/tests/proposal_generator_e2e.rs` drives the
-  full seven-node chain through both router branches (`pass` and `revise`) against stubbed
+  full nine-node chain (including the `EN.5.E` loop cluster) through both router branches (`pass`
+  and `revise`) against stubbed
   transports + `HttpPost`, verifying `EventsRow` round-tripping, deliverable validators,
   evidence-vs-brief-fallback scoring, the `PersistToBrainNode` payload shape,
   `registry_for_policy`'s Local rewiring (and that `research`/`writer` are never rewired), and

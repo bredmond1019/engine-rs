@@ -23,16 +23,14 @@
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
 
-use crate::node::{Node, NodeError};
+use crate::node::{InputBinding, Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
 use super::policy::ProposalGeneratorPolicy;
-use super::review::NODE_NAME as REVIEW_NODE_NAME;
 use super::schema::{
     automation_roadmap_json_schema, AutomationRoadmap, ProposalGeneratorEventSchema,
 };
-use super::writer::NODE_NAME as WRITER_NODE_NAME;
 
 /// The `Node::name()` identity `ProposalReviseNode` runs its composed
 /// `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
@@ -54,12 +52,22 @@ fn parse_event(ctx: &TaskContext) -> Result<ProposalGeneratorEventSchema, NodeEr
 
 /// Build the revision prompt: the upstream drafted roadmap plus the
 /// review's notes (or notes that neither is present yet — this node can
-/// also run standalone in a unit test).
-fn build_prompt(ctx: &TaskContext, event: &ProposalGeneratorEventSchema) -> String {
-    let draft = get_result(ctx, WRITER_NODE_NAME)
+/// also run standalone in a unit test). Reads both upstreams through their
+/// [`InputBinding`]s (`EN.5.E` task 1/4) rather than a `NODE_NAME` const
+/// imported from `super::writer`/`super::review` — an unbound binding falls
+/// back to today's identities (`ProposalWriterNode`/`ProposalReviewNode`),
+/// so a node that never calls `with_draft_input_from`/`with_review_input_from`
+/// behaves exactly as before this primitive existed.
+fn build_prompt(
+    ctx: &TaskContext,
+    event: &ProposalGeneratorEventSchema,
+    draft_input: &InputBinding,
+    review_input: &InputBinding,
+) -> String {
+    let draft = get_result(ctx, draft_input.resolve("ProposalWriterNode"))
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(no upstream drafted roadmap available)".to_string());
-    let notes = get_result(ctx, REVIEW_NODE_NAME)
+    let notes = get_result(ctx, review_input.resolve("ProposalReviewNode"))
         .and_then(|value| value.get("notes"))
         .and_then(|value| value.as_str())
         .filter(|notes| !notes.is_empty())
@@ -86,11 +94,15 @@ fn build_prompt(ctx: &TaskContext, event: &ProposalGeneratorEventSchema) -> Stri
 pub struct ProposalReviseNode {
     config: Config,
     transport: Option<ModelTransport>,
+    draft_input: InputBinding,
+    review_input: InputBinding,
 }
 
 impl ProposalReviseNode {
     /// Construct with the `AutomationRoadmap` `json_schema` set; `process`
-    /// overwrites `model` per the resolved `revise`-stage tier.
+    /// overwrites `model` per the resolved `revise`-stage tier. Both
+    /// upstream bindings start unbound — `EN.5.E` task 1's `InputBinding`
+    /// default, which falls back to today's identities.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -99,6 +111,8 @@ impl ProposalReviseNode {
                 ..Config::default()
             },
             transport: None,
+            draft_input: InputBinding::default(),
+            review_input: InputBinding::default(),
         }
     }
 
@@ -108,6 +122,22 @@ impl ProposalReviseNode {
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Bind the identity this node reads its drafted-roadmap upstream from.
+    /// Unbound falls back to `"ProposalWriterNode"` (today's default).
+    #[must_use]
+    pub fn with_draft_input_from(mut self, upstream: impl Into<String>) -> Self {
+        self.draft_input = InputBinding::bound(upstream);
+        self
+    }
+
+    /// Bind the identity this node reads its review-notes upstream from.
+    /// Unbound falls back to `"ProposalReviewNode"` (today's default).
+    #[must_use]
+    pub fn with_review_input_from(mut self, upstream: impl Into<String>) -> Self {
+        self.review_input = InputBinding::bound(upstream);
         self
     }
 }
@@ -130,7 +160,7 @@ impl Node for ProposalReviseNode {
         config =
             crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
         let prompt = crate::policy::apply_verbosity_directive(
-            build_prompt(&ctx, &event),
+            build_prompt(&ctx, &event, &self.draft_input, &self.review_input),
             policy.output_verbosity,
         );
 
@@ -346,11 +376,11 @@ mod tests {
         let node = ProposalReviseNode::new().with_transport(transport);
         let mut ctx = empty_ctx(base_event());
         ctx.nodes.insert(
-            WRITER_NODE_NAME.to_string(),
+            "ProposalWriterNode".to_string(),
             json!({ "situation": { "company_name": "Loja da Ana" } }),
         );
         ctx.nodes.insert(
-            REVIEW_NODE_NAME.to_string(),
+            "ProposalReviewNode".to_string(),
             json!({ "verdict": "revise", "notes": "Composite math is off for candidate 1." }),
         );
 
@@ -358,6 +388,58 @@ mod tests {
 
         let (_config, prompt) = captured.lock().unwrap().take().expect("transport called");
         assert!(prompt.contains("Composite math is off for candidate 1."));
+        assert!(prompt.contains("Loja da Ana"));
+    }
+
+    #[tokio::test]
+    async fn process_reads_bound_upstreams_via_with_input_from() {
+        // EN.5.E task 4: with the node built `with_draft_input_from`/
+        // `with_review_input_from`, it reads its draft/review notes off the
+        // *bound* identities rather than the default `ProposalWriterNode`/
+        // `ProposalReviewNode` — proving no cross-module `NODE_NAME` const
+        // is needed to wire this up.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<(Config, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let transport: ModelTransport = std::sync::Arc::new(move |config, prompt| {
+            *captured_clone.lock().unwrap() = Some((config, prompt));
+            async move {
+                Ok(Outcome {
+                    text: serde_json::to_string(&corrected_roadmap_json()).unwrap(),
+                    cost_usd: 0.0,
+                    usage: SdkUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: BTreeMap::new(),
+                    structured_output: Some(corrected_roadmap_json()),
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        });
+
+        let node = ProposalReviseNode::new()
+            .with_transport(transport)
+            .with_draft_input_from("CustomDraftNode")
+            .with_review_input_from("CustomReviewNode");
+        let mut ctx = empty_ctx(base_event());
+        ctx.nodes.insert(
+            "CustomDraftNode".to_string(),
+            json!({ "situation": { "company_name": "Loja da Ana" } }),
+        );
+        ctx.nodes.insert(
+            "CustomReviewNode".to_string(),
+            json!({ "verdict": "revise", "notes": "Bound review notes surfaced." }),
+        );
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_config, prompt) = captured.lock().unwrap().take().expect("transport called");
+        assert!(prompt.contains("Bound review notes surfaced."));
         assert!(prompt.contains("Loja da Ana"));
     }
 

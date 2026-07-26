@@ -135,6 +135,20 @@ fn temp_worktree(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(dir.join("planning").join("experiment-spec")).unwrap();
+
+    // A real `git init` so `TestTaskNode`'s write-verification guard (which
+    // shells out to a real `git status --porcelain` via the default,
+    // non-stubbed `CommandRunner` in this file's real-CLI harnesses) sees
+    // genuine untracked/modified entries after a real `ImplementTaskNode`
+    // write, instead of silently reporting "nothing changed" against a
+    // directory that was never a repo at all.
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .expect("git init should run");
+    assert!(status.success(), "git init failed in {}", dir.display());
+
     dir
 }
 
@@ -503,4 +517,157 @@ async fn experiment_four_profiles_real_cli_ranked_by_cost() {
     for worktree in &worktrees {
         std::fs::remove_dir_all(worktree).ok();
     }
+}
+
+const HAPPY_MARKER_FILE_A: &str = "HAPPY_TASK_A.txt";
+const HAPPY_MARKER_CONTENT_A: &str = "task-a-ok";
+const HAPPY_MARKER_FILE_B: &str = "HAPPY_TASK_B.txt";
+const HAPPY_MARKER_CONTENT_B: &str = "task-b-ok";
+
+/// Writes a two-task fixture with **no** deliberately-tricky task — both
+/// tasks are trivial one-file marker writes expected to pass on the first
+/// `ImplementTaskNode` attempt. Unlike [`write_fixture_files`]'s three-task
+/// fixture (which includes a task purpose-built to require a retry), this
+/// exists purely to prove the happy path: two short, simple implement
+/// phases, no triage/retry loop engaged, real cost/time captured.
+fn write_happy_path_fixture_files(worktree: &Path, max_attempts: u32) {
+    let spec_dir = worktree.join("planning").join("experiment-spec");
+    let tasks = json!([
+        {
+            "task_id": 1,
+            "title": "Create the first marker file",
+            "description": format!(
+                "Create a file named exactly `{HAPPY_MARKER_FILE_A}` in the \
+                 current working directory. Its entire content must be the \
+                 single line `{HAPPY_MARKER_CONTENT_A}` and nothing else. Do \
+                 not create or modify any other file."
+            ),
+            "acceptance_criteria": [
+                format!("{HAPPY_MARKER_FILE_A} exists in the working directory"),
+                format!("Its content is exactly \"{HAPPY_MARKER_CONTENT_A}\""),
+            ],
+            "max_attempts": max_attempts,
+        },
+        {
+            "task_id": 2,
+            "title": "Create the second marker file",
+            "description": format!(
+                "Create a file named exactly `{HAPPY_MARKER_FILE_B}` in the \
+                 current working directory. Its entire content must be the \
+                 single line `{HAPPY_MARKER_CONTENT_B}` and nothing else. Do \
+                 not create or modify any other file."
+            ),
+            "acceptance_criteria": [
+                format!("{HAPPY_MARKER_FILE_B} exists in the working directory"),
+                format!("Its content is exactly \"{HAPPY_MARKER_CONTENT_B}\""),
+            ],
+            "max_attempts": max_attempts,
+        }
+    ]);
+    std::fs::write(
+        spec_dir.join("tasks.json"),
+        serde_json::to_string_pretty(&tasks).unwrap(),
+    )
+    .unwrap();
+
+    // Non-gating (`"gates": false`): `TestTaskNode` runs *every* harness.json
+    // check on *every* task's `TestTaskNode` step, with no per-task scoping
+    // (confirmed by reading `TestTaskNode::process`/`run_checks` — checks
+    // are not indexed by `current_task_id`). A `gates: true` check for
+    // task B's marker file would therefore fail task 1's own test step
+    // (task B hasn't run yet), routing to `TriageTaskNode` and eventually
+    // `MAJOR_BAIL`-ing the whole run before task 2 ever starts — exactly
+    // what happened on the first real run of this test. Keeping both
+    // checks non-gating still surfaces their pass/fail in
+    // `check_results` for visibility, without them blocking task 1 on an
+    // artifact only task 2 creates. The real pass/fail gate for the happy
+    // path is `TestTaskNode`'s write-verification guard (did
+    // `ImplementTaskNode`'s claimed write actually show up in `git status
+    // --porcelain`, now real thanks to `temp_worktree`'s `git init`).
+    let harness = json!({
+        "validation": {
+            "checks": [
+                {
+                    "name": "task-a-marker-file-present",
+                    "kind": "command",
+                    "command": format!("grep -qx {HAPPY_MARKER_CONTENT_A} {HAPPY_MARKER_FILE_A}"),
+                    "gates": false,
+                },
+                {
+                    "name": "task-b-marker-file-present",
+                    "kind": "command",
+                    "command": format!("grep -qx {HAPPY_MARKER_CONTENT_B} {HAPPY_MARKER_FILE_B}"),
+                    "gates": false,
+                }
+            ]
+        }
+    });
+    std::fs::write(
+        worktree.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Happy-path smoke test: one real `SDLC_FLOW` run, `baseline` (all-Sonnet)
+/// profile, against a two-task fixture with no deliberately-tricky task —
+/// just enough to prove two short, simple implement phases go green first
+/// try, with the review/wrap-up tail completing, and to read the real
+/// cost/wall-clock this run actually took.
+///
+/// **Ignored by default** — spawns real `claude` CLI sessions
+/// (`ImplementTaskNode` x2, `ConsolidatedReviewNode`) and spends real
+/// tokens. Run manually:
+///
+/// ```sh
+/// cargo test -p engine-core --test sdlc_flow_experiment happy_path_two_simple_tasks_sonnet -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn happy_path_two_simple_tasks_sonnet() {
+    let worktree = temp_worktree("happy-path");
+    write_happy_path_fixture_files(&worktree, 2);
+
+    let workflow = build_experiment_workflow(&worktree);
+    let event = json!({
+        "spec_slug": "experiment-spec",
+        "auto_pr": false,
+        "profile": "baseline",
+    });
+
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .unwrap_or_else(|err| panic!("happy-path run should not error: {err}"));
+
+    assert!(
+        final_ctx
+            .nodes
+            .contains_key(setup::RESOLVED_POLICY_IDENTITY),
+        "resolved policy should have been stamped into ctx.nodes"
+    );
+
+    let state_path = worktree
+        .join("planning")
+        .join("experiment-spec")
+        .join("sdlc")
+        .join("sdlc-flow-state.json");
+    assert!(
+        state_path.exists(),
+        "expected WrapUpNode to persist {}",
+        state_path.display()
+    );
+
+    let rows =
+        aggregate::aggregate_state_files(&[state_path]).expect("sdlc-flow-state.json should parse");
+
+    print_ranked_table(rows.clone());
+
+    assert_eq!(rows.len(), 1, "expected exactly one resolved-policy row");
+    assert_eq!(
+        rows[0].pass_rate, 1.0,
+        "both trivial tasks should have passed on the happy path"
+    );
+
+    std::fs::remove_dir_all(&worktree).ok();
 }

@@ -8,7 +8,9 @@
 //! ```text
 //! ProposalCompanyResearchNode -> OpportunityIdentifierNode -> ProposalWriterNode
 //!   -> ProposalReviewNode -> ProposalReviewRouterNode
-//!   -> { PersistToBrainNode | ProposalReviseNode -> PersistToBrainNode }
+//!   -> { PersistToBrainNode
+//!      | ProposalReviseNode -> {loop guard/increment cluster}
+//!          -> ProposalReviewNode (continue, capped) | PersistToBrainNode (cap reached) }
 //! ```
 //!
 //! `ProposalReviewRouterNode` is a [`Router`]: it reads `ProposalReviewNode`'s
@@ -18,9 +20,34 @@
 //! resolution/telemetry live in the model nodes it routes between, not in
 //! the router itself. `PersistToBrainNode` is the sole terminal node — no
 //! forward connection.
+//!
+//! ## `EN.5.E` task 4 — the review/revise cluster rides the loop combinator
+//!
+//! Today's straight-line `ProposalReviseNode -> PersistToBrainNode`
+//! fall-through is replaced by [`crate::loop_combinator::build_loop`]'s
+//! `{guard router, increment node}` cluster: `ProposalReviseNode`'s single
+//! declared connection now points at the cluster's guard, whose back-edge
+//! (via the increment node) re-enters `ProposalReviewNode` for another
+//! review pass, capped at [`REVISE_LOOP_MAX_ITERATIONS`]. Once
+//! `ProposalReviewNode` re-runs, `ProposalReviewRouterNode` re-decides: a
+//! `pass` verdict routes straight to `PersistToBrainNode` (bypassing the
+//! loop cluster entirely — this is how the loop "exits on a pass verdict"),
+//! while a further `revise` verdict re-enters the cluster, up to the cap.
+//! The cluster's own [`crate::loop_combinator::LoopSpec::exit_predicate`]
+//! is therefore a pure cap backstop (`false`, never short-circuits on its
+//! own) — the verdict-based exit is already handled by
+//! `ProposalReviewRouterNode` routing around the cluster on `pass`. The
+//! guard/increment nodes are both real `Router`s (`as_router().is_some()`),
+//! so `WorkflowValidator`'s DFS cycle check skips every edge out of them —
+//! the back-edge is a runtime router edge, never a declared non-router
+//! cycle (D42).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use engine_contract::TaskContext;
+
+use crate::loop_combinator::{build_loop, ExitPredicate, LoopCluster, LoopSpec};
 use crate::node::NodeRegistry;
 use crate::nodes::openai_compat_transport::openai_compat_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
@@ -35,6 +62,43 @@ use super::review::ProposalReviewNode;
 use super::review_router::ProposalReviewRouterNode;
 use super::revise::ProposalReviseNode;
 use super::writer::ProposalWriterNode;
+
+/// Hard cap on how many times the review->revise cluster may bounce back
+/// into `ProposalReviewNode` before it forces an exit straight to
+/// `PersistToBrainNode`, regardless of verdict — the backstop against an
+/// unbounded `revise` verdict loop.
+const REVISE_LOOP_MAX_ITERATIONS: u32 = 3;
+
+/// The identity prefix the review->revise loop cluster's guard/increment
+/// nodes are derived from (`"{prefix}Guard"` / `"{prefix}Increment"`).
+const REVISE_LOOP_IDENTITY_PREFIX: &str = "ProposalRevision";
+
+/// The [`LoopSpec`] for the review->revise cluster: body entry is
+/// `ProposalReviewNode` (the back-edge re-enters review, not revise
+/// directly), exit is `PersistToBrainNode`. The predicate never fires on
+/// its own — `ProposalReviewRouterNode` already routes a `pass` verdict
+/// around the cluster entirely, so `max_iterations` is the cluster's only
+/// forced exit.
+fn revise_loop_spec() -> LoopSpec {
+    let never_exits: ExitPredicate = Arc::new(|_ctx: &TaskContext| false);
+    LoopSpec::new(
+        REVISE_LOOP_IDENTITY_PREFIX,
+        REVISE_LOOP_MAX_ITERATIONS,
+        never_exits,
+        "ProposalReviewNode",
+        "PersistToBrainNode",
+    )
+}
+
+/// Build the review->revise loop cluster from [`revise_loop_spec`]. `pub`
+/// so a hermetic stand-in registry (e.g. `policy_dispatch_e2e.rs`'s
+/// `build_hermetic_registry`) can register the same guard/increment nodes
+/// [`registry`] does, keeping its node identity set a faithful match for
+/// the real one.
+#[must_use]
+pub fn revise_loop_cluster() -> LoopCluster {
+    build_loop(revise_loop_spec())
+}
 
 /// The `PROPOSAL_GENERATOR` workflow's declared identity/type name, used
 /// both to register the workflow (`engine-serve`) and as
@@ -82,10 +146,12 @@ pub fn schema() -> WorkflowSchema {
             ],
         ),
     );
+    let cluster = revise_loop_cluster();
     nodes.insert(
         "ProposalReviseNode".to_string(),
-        NodeConfig::new("ProposalReviseNode", vec!["PersistToBrainNode".to_string()]),
+        NodeConfig::new("ProposalReviseNode", vec![cluster.guard_identity.clone()]),
     );
+    nodes.extend(cluster.connections);
     nodes.insert(
         "PersistToBrainNode".to_string(),
         NodeConfig::new("PersistToBrainNode", vec![]),
@@ -108,6 +174,11 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(ProposalReviewRouterNode));
     registry.register(Box::new(ProposalReviseNode::new()));
     registry.register(Box::new(PersistToBrainNode::new()));
+
+    for node in revise_loop_cluster().nodes {
+        registry.register(node);
+    }
+
     registry
 }
 
@@ -202,8 +273,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_seven_nodes() {
+    fn registry_contains_all_seven_nodes_plus_the_loop_cluster() {
         let registry = registry();
+        let cluster = revise_loop_cluster();
 
         let expected = [
             "ProposalCompanyResearchNode",
@@ -213,6 +285,8 @@ mod tests {
             "ProposalReviewRouterNode",
             "ProposalReviseNode",
             "PersistToBrainNode",
+            cluster.guard_identity.as_str(),
+            cluster.increment_identity.as_str(),
         ];
 
         for identity in expected {
@@ -347,5 +421,254 @@ mod tests {
     #[test]
     fn workflow_builds_without_panicking() {
         let _workflow = workflow();
+    }
+
+    // -- EN.5.E task 4: the combinator-backed review->revise loop, driven
+    // -- through a real `Workflow::run` walk (not the hand-driven sequence
+    // -- `proposal_generator_e2e.rs` uses).
+
+    mod loop_behavior {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as StdArc;
+
+        use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
+        use claude_code_rs::{Config as ClaudeConfig, Outcome};
+        use futures::FutureExt;
+
+        use super::*;
+        use crate::nodes::http_post::StubHttpPost;
+        use crate::policy::RESOLVED_POLICY_IDENTITY;
+
+        fn outcome(structured: serde_json::Value) -> Outcome {
+            Outcome {
+                text: serde_json::to_string(&structured).unwrap(),
+                cost_usd: 0.0,
+                usage: SdkUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: BTreeMap::new(),
+                structured_output: Some(structured),
+                is_error: false,
+                api_error_status: None,
+            }
+        }
+
+        fn constant_stub(structured: serde_json::Value) -> ModelTransport {
+            StdArc::new(move |_config: ClaudeConfig, _prompt: String| {
+                let structured = structured.clone();
+                async move { Ok(outcome(structured)) }.boxed()
+            })
+        }
+
+        /// A transport that counts its calls (via `counter`) and replies
+        /// with `structured`, regardless of prompt/config.
+        fn counting_stub(
+            structured: serde_json::Value,
+            counter: StdArc<AtomicU32>,
+        ) -> ModelTransport {
+            StdArc::new(move |_config: ClaudeConfig, _prompt: String| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let structured = structured.clone();
+                async move { Ok(outcome(structured)) }.boxed()
+            })
+        }
+
+        /// A transport that replies with the verdict at `verdicts[call_index]`,
+        /// clamped to the last entry once exhausted — lets a test script a
+        /// `revise, revise, ..., pass` (or all-`revise`) sequence across
+        /// repeated `ProposalReviewNode` visits.
+        fn scripted_verdict_stub(
+            verdicts: Vec<&'static str>,
+            counter: StdArc<AtomicU32>,
+        ) -> ModelTransport {
+            let verdicts: StdArc<Vec<String>> =
+                StdArc::new(verdicts.into_iter().map(str::to_string).collect());
+            StdArc::new(move |_config: ClaudeConfig, _prompt: String| {
+                let idx = counter.fetch_add(1, Ordering::SeqCst) as usize;
+                let verdict = verdicts
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| verdicts.last().cloned().unwrap());
+                async move { Ok(outcome(json!({ "verdict": verdict, "notes": "loop test" }))) }
+                    .boxed()
+            })
+        }
+
+        fn company_brief_json() -> serde_json::Value {
+            json!({
+                "company_name": "Loja da Ana",
+                "summary": "Retail SMB tracking orders manually over WhatsApp.",
+                "recent_developments": [],
+                "pain_points": [],
+                "outreach_hooks": [],
+                "sources": [],
+            })
+        }
+
+        fn scored_candidates_json() -> serde_json::Value {
+            json!({
+                "candidates": [
+                    {
+                        "name": "WhatsApp order tracking",
+                        "frequency": 5.0,
+                        "time_cost": 4.0,
+                        "buildability": 4.0,
+                        "rationale": "Happens daily and is fully manual today.",
+                    }
+                ]
+            })
+        }
+
+        fn roadmap_json() -> serde_json::Value {
+            json!({
+                "situation": {
+                    "company_name": "Loja da Ana",
+                    "business_type": "retail SMB",
+                    "team_size": 4,
+                    "painful_workflow_summary": "Orders tracked by scrolling WhatsApp threads.",
+                    "candidate_count": 1,
+                },
+                "candidates": [
+                    {
+                        "name": "WhatsApp order tracking",
+                        "frequency": 5.0,
+                        "time_cost": 4.0,
+                        "buildability": 4.0,
+                        "composite": 4.35,
+                        "tier": "quick_win",
+                        "rationale": "Happens daily and is fully manual today.",
+                    }
+                ],
+                "top_profiles": [
+                    {
+                        "name": "WhatsApp order tracking",
+                        "today": "Manually scrolled.",
+                        "proposed_solution": "Automated bot with human approval gate.",
+                        "stack": "WhatsApp Business API + small service.",
+                        "rough_scope": "2-3 weeks.",
+                        "expected_roi": "Saves ~5 hrs/week.",
+                    }
+                ],
+                "recommendation": {
+                    "start_with": "WhatsApp order tracking",
+                    "phase_1_scope": ["Order intake bot"],
+                    "investment": "R$8,000-12,000 fixed fee",
+                    "how_it_works": "Connects to WhatsApp Business API.",
+                    "call_to_action": "Book a call to proceed.",
+                },
+            })
+        }
+
+        /// Assembles the real `PROPOSAL_GENERATOR` `Workflow` — [`schema`] +
+        /// [`registry`]'s shape, but with every model node's transport
+        /// stubbed and `PersistToBrainNode`'s `HttpPost` stubbed — and seeds
+        /// the resolved policy the way `engine-serve`'s dispatch factory
+        /// would (EN.5.D task 8), so `Workflow::run` can drive it directly.
+        #[allow(clippy::too_many_arguments)]
+        fn build_workflow(
+            review_transport: ModelTransport,
+            revise_transport: ModelTransport,
+            http_post: StubHttpPost,
+        ) -> Workflow {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(
+                ProposalCompanyResearchNode::new()
+                    .with_transport(constant_stub(company_brief_json())),
+            ));
+            registry.register(Box::new(
+                OpportunityIdentifierNode::new()
+                    .with_transport(constant_stub(scored_candidates_json())),
+            ));
+            registry.register(Box::new(
+                ProposalWriterNode::new().with_transport(constant_stub(roadmap_json())),
+            ));
+            registry.register(Box::new(
+                ProposalReviewNode::new().with_transport(review_transport),
+            ));
+            registry.register(Box::new(ProposalReviewRouterNode));
+            registry.register(Box::new(
+                ProposalReviseNode::new().with_transport(revise_transport),
+            ));
+            registry.register(Box::new(
+                PersistToBrainNode::new()
+                    .with_http_post(StdArc::new(http_post))
+                    .with_url("https://brain.example/ingest/proposal-generator-loop-test"),
+            ));
+            for node in revise_loop_cluster().nodes {
+                registry.register(node);
+            }
+
+            let workflow = Workflow::new_validated(registry, schema())
+                .expect("assembled review->revise cluster should validate");
+
+            let mut seeded = StdHashMap::new();
+            seeded.insert(
+                RESOLVED_POLICY_IDENTITY.to_string(),
+                serde_json::to_value(ProposalGeneratorPolicy::default())
+                    .expect("policy serializes"),
+            );
+            workflow.with_seeded_nodes(seeded)
+        }
+
+        #[tokio::test]
+        async fn revise_loop_stops_at_max_iterations_when_verdict_never_passes() {
+            let review_calls = StdArc::new(AtomicU32::new(0));
+            let review_transport = scripted_verdict_stub(vec!["revise"], review_calls.clone());
+            let revise_calls = StdArc::new(AtomicU32::new(0));
+            let revise_transport = counting_stub(roadmap_json(), revise_calls.clone());
+            let http_post = StubHttpPost::succeeding(json!({ "ok": true }));
+
+            let workflow = build_workflow(review_transport, revise_transport, http_post.clone());
+
+            let ctx = workflow
+                .run(json!({ "company_name": "Loja da Ana" }), Box::new(|_| {}))
+                .await
+                .expect("run should succeed");
+
+            // Every visit says "revise", so the guard only ever exits via
+            // the cap — `ProposalReviewNode`/`ProposalReviseNode` each run
+            // exactly `REVISE_LOOP_MAX_ITERATIONS` times before the guard
+            // forces the exit to `PersistToBrainNode`.
+            assert_eq!(
+                review_calls.load(Ordering::SeqCst),
+                REVISE_LOOP_MAX_ITERATIONS
+            );
+            assert_eq!(
+                revise_calls.load(Ordering::SeqCst),
+                REVISE_LOOP_MAX_ITERATIONS
+            );
+            assert!(ctx.nodes.contains_key("PersistToBrainNode"));
+            assert!(http_post.last_call().is_some());
+        }
+
+        #[tokio::test]
+        async fn revise_loop_exits_early_on_a_pass_verdict_before_the_cap() {
+            let review_calls = StdArc::new(AtomicU32::new(0));
+            // "revise" on the first review, "pass" on the second — the loop
+            // must exit as soon as the router sees "pass" (well before
+            // `REVISE_LOOP_MAX_ITERATIONS`), routing straight to
+            // `PersistToBrainNode` and never revisiting the guard again.
+            let review_transport =
+                scripted_verdict_stub(vec!["revise", "pass"], review_calls.clone());
+            let revise_calls = StdArc::new(AtomicU32::new(0));
+            let revise_transport = counting_stub(roadmap_json(), revise_calls.clone());
+            let http_post = StubHttpPost::succeeding(json!({ "ok": true }));
+
+            let workflow = build_workflow(review_transport, revise_transport, http_post.clone());
+
+            let ctx = workflow
+                .run(json!({ "company_name": "Loja da Ana" }), Box::new(|_| {}))
+                .await
+                .expect("run should succeed");
+
+            assert_eq!(review_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(revise_calls.load(Ordering::SeqCst), 1);
+            assert!(ctx.nodes.contains_key("PersistToBrainNode"));
+            assert!(REVISE_LOOP_MAX_ITERATIONS > 2, "cap should not be hit");
+        }
     }
 }

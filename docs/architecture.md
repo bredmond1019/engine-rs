@@ -31,7 +31,18 @@ types: dispatch, in-memory live state, the durable-write bridge, and the actix-w
 engine-rs/
 ├── Cargo.toml            (workspace root — resolver 2, workspace.package, workspace.dependencies)
 ├── crates/
-│   ├── engine-core/       ← node.rs (Node trait + NodeRegistry + as_router() hook), schema.rs
+│   ├── engine-core/       ← node.rs (Node trait + NodeRegistry + as_router() hook; now also
+│   │                         `Identified<N>`/`NodeExt::with_identity` for instance-backed node
+│   │                         identity and `InputBinding`/`WithInput<N>`/`NodeExt::with_input_from`
+│   │                         for declarative upstream-input bindings, EN.5.E task 1),
+│   │                         loop_combinator.rs (`build_loop(LoopSpec) -> LoopCluster` — the
+│   │                         reusable `{guard router, increment node, back-edge}` bounded-loop
+│   │                         builder, generalizing the hand-written `sdlc_flow` retry idiom,
+│   │                         EN.5.E task 2), dispatch.rs (Dispatcher — dual `workflow_registry` +
+│   │                         `schema_registry` lookup by `workflow_type`, `WorkflowFactory`,
+│   │                         `DispatchError::UnknownWorkflowType`/`PolicyResolutionFailed`; moved
+│   │                         here from `engine-serve` in EN.5.E task 3, which now re-exports it),
+│   │                         schema.rs
 │   │                         (WorkflowSchema/NodeConfig), workflow.rs (Workflow pointer-walk
 │   │                         runner + on_progress seam + Router-aware dispatch + new_validated() +
 │   │                         run_with() cancellation/budget-aware entry point, EN.2.B),
@@ -52,9 +63,10 @@ engine-rs/
 │   │                         docs/data-contract.md for the full pin)
 │   ├── engine-store/      ← postgres.rs: sqlx::PgPool connect/insert_event/update_event/
 │   │                         get_event for the durable `events` record
-│   └── engine-serve/      ← bastion serve embedding (EN.1.C): dispatch.rs (Dispatcher — dual
-│   │                         workflow_registry/schema_registry lookup by workflow_type,
-│   │                         DispatchError::UnknownWorkflowType/PolicyResolutionFailed, EN.5.D),
+│   └── engine-serve/      ← bastion serve embedding (EN.1.C): dispatch.rs (a thin re-export of
+│   │                         `engine_core::dispatch` — Dispatcher/DispatchError/WorkflowFactory
+│   │                         moved to `engine-core` in EN.5.E task 3 so every existing
+│   │                         `engine_serve::dispatch::*` import site keeps resolving unchanged),
 │   │                         live_state.rs (LiveStateStore —
 │   │                         in-memory Arc<RwLock<HashMap<RunId, TaskContext>>> record/get/
 │   │                         list_active/remove, no-DB-poll read path for the local Console),
@@ -186,7 +198,34 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 - `WorkflowError` (`engine-core::workflow`) — a `{ message: String }` struct for graph-shape
   failures (e.g. an unresolvable node identity); distinct from `NodeError` — a node's own failure
   is captured in its `NodeRun` and does not short-circuit `run()` with an `Err`.
-- `Dispatcher` (`engine-serve::dispatch`) — dual-registry (`workflow_registry` + `schema_registry`)
+- `Identified<N>` / `NodeExt::with_identity` (`engine-core::node`, EN.5.E task 1) — a delegating
+  wrapper that overrides `Node::name()` with an owned instance string while forwarding
+  `process`/`as_router` to the wrapped node unchanged, constructed via a blanket
+  `NodeExt::with_identity` extension method (no existing `impl Node` block needs editing). This is
+  instance-backed node identity: the same node *type* can be registered more than once, under
+  distinct identities, in one graph or across graphs.
+- `InputBinding` / `WithInput<N>` / `NodeExt::with_input_from` (`engine-core::node`, EN.5.E task 1)
+  — a declarative binding from a node to the identity of the upstream node whose `ctx.nodes` entry
+  it should read, replacing a hardcoded `NODE_NAME` const imported from another module.
+  `InputBinding` is meant to be held as a struct field by individual node authors (mirroring the
+  `with_transport`/`with_http_post`/`with_clock` builder convention) and resolved via
+  `InputBinding::resolve` inside `process`; `WithInput<N>` is a generic wrapper-based alternative
+  (via `NodeExt::with_input_from`) for callers who want the binding without authoring a bespoke
+  per-struct builder. An unbound `InputBinding` (the `default()`) falls back to a caller-supplied
+  default, so existing nodes are unaffected until they opt in.
+- `LoopSpec` / `LoopCluster` / `build_loop` (`engine-core::loop_combinator`, EN.5.E task 2) — a
+  reusable builder for the `{guard router, increment node, back-edge}` cluster idiom (generalized
+  from the hand-written `sdlc_flow::graph`/`task_loop` retry loop). `build_loop(LoopSpec) ->
+  LoopCluster` returns two boxed nodes (a guard `Router` and an increment node, both identity-
+  derived via `with_identity` so distinct-prefix clusters coexist in one registry) plus their
+  declared `NodeConfig` connections, ready to merge into a `NodeRegistry`/`WorkflowSchema`. The
+  guard reads the increment node's stored iteration count off `ctx.nodes` and routes either back to
+  the increment node (continue) or to `LoopSpec::exit_to` (cap reached, or `exit_predicate`
+  satisfied); the increment node is the cluster's only state-mutating member, and is itself a
+  `Router` (unconditionally routing to `body_entry`) purely so the back-edge is a runtime router
+  edge — `WorkflowValidator`'s DFS cycle check skips both hops, per D42.
+- `Dispatcher` (`engine-core::dispatch`, re-exported from `engine-serve::dispatch` as of EN.5.E
+  task 3) — dual-registry (`workflow_registry` + `schema_registry`)
   lookup keyed by `workflow_type`; `register` takes a boxed `WorkflowFactory` closure. As of
   `EN.5.D`, `WorkflowFactory` is `Box<dyn Fn(&serde_json::Value) -> Result<Workflow, String> + Send
   + Sync>` — it receives the triggering event's `data` payload so a registration can resolve its
