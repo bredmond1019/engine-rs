@@ -16,6 +16,26 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-26]
+
+### `EN.5.E-composition-primitives` done — instance identities, input bindings, bounded-loop combinator, Dispatcher into engine-core
+- **What:** Ran `/sdlc-flow EN.5.E-composition-primitives` (branch `EN.5.E-composition-primitives-flow`); all 6 tasks passed. Task 1 added instance-backed node identity — a delegating `Identified<N>` wrapper constructed via a blanket `NodeExt::with_identity` extension method (not a per-struct field), so none of the 43 existing `impl Node` blocks needed editing — and declarative input bindings (`InputBinding`, `with_input_from`, `WithInput<N>`), both exported from `engine-core`'s `lib.rs` with full unit coverage. Task 2 added `crates/engine-core/src/loop_combinator.rs` — `build_loop(LoopSpec)` emitting a `{guard router, increment node, back-edge}` cluster with both nodes real `Router` impls (so `WorkflowValidator`'s DFS cycle-skip covers both hops of the back-edge per D42), covered by 5 unit tests. Task 3 moved `Dispatcher`/`DispatchError`/`WorkflowFactory` verbatim into `engine-core::dispatch` (with all 8 unit tests), reducing `engine-serve::dispatch` to a re-export so every existing import site — the bastion path dep, `http.rs`, `workflows.rs`, `dispatch_integration`/`abort_integration`, and the four engine-core e2e tests — kept resolving unchanged. Task 4 rebuilt `PROPOSAL_GENERATOR`'s review→revise cluster on the loop combinator (bounded back-edge revise→review, capped at 3 iterations, exits on a `pass` verdict routed straight to `PersistToBrainNode`), with `revise.rs`/`review_router.rs` reading their upstream/downstream via `InputBinding` instead of cross-module `NODE_NAME` consts, while `proposal_generator_e2e.rs` stayed byte-identical and green; `graph::revise_loop_cluster()` was made `pub` so `tests/policy_dispatch_e2e.rs`'s hermetic registry could register the same guard/increment nodes. Task 5 added a hermetic `crates/engine-core/tests/composition.rs` proving duplicate node identities with independent input bindings, an identity-overridden router + loop-combinator cluster validating clean, and in-process sub-workflow dispatch via `engine_core::dispatch::Dispatcher` with zero HTTP calls — driven through the real `Workflow` runner (using `futures::executor::block_on` for the inner sub-workflow run to sidestep a non-`Send` `OnProgress` future). Task 6 validated the full suite — `fmt --check`, `clippy -D warnings`, `cargo test` (workspace), `cargo build --release`, plus the spec's spot-check binaries (composition, proposal_generator_e2e, validator, engine-serve) — all green, and confirmed `proposal_generator_e2e.rs`, `sdlc_flow/`, `engine-contract`, and `router.rs` are byte-identical to the block's base commit.
+- **Why:** Closes the second of the three EN.5.D/E/F substrate blocks `EN.5.A` (CONTENT_PIPELINE) was blocked on — nodes can now appear twice in one graph under independent instance identities, bind their inputs declaratively instead of hardcoded `NODE_NAME` consts, compose a bounded critic/revise loop from a spec instead of hand-writing one, and dispatch a sub-workflow in-process rather than over HTTP. `EN.5.A`'s `SourceRouterNode` and critic loop are specified directly on top of this block's `with_input_from` and combinator surfaces; `EN.6.C`'s fan-out depends on its instance identities.
+- **Verdict:** PASS (review found no findings). Docs: `docs/architecture.md`, `docs/proposal-generator-workflow.md` updated.
+- **Status:** `planning/state.json` block `EN.5.E` set to `"closed"`; `planning/status.md` Progress Table row added under Phase 5 and flipped to Done. `EN.5.A` is now unblocked (both EN.5.D and EN.5.E are closed); `EN.5.F` is the one remaining infrastructure block, gating `EN.6.A`.
+- **Next:** EN.4.D — DELIVERABLE_RENDER (net-new, roadmap → PDF), EN.5.A — CONTENT_PIPELINE (now unblocked), or EN.5.F — async run lifecycle (non-blocking POST /events/, SSE progress stream) ahead of EN.6.A.
+
+```
+c903b14 docs: update docs for EN.5.E-composition-primitives
+8be0f6f feat: implement EN.5.E-composition-primitives-task5
+f0211a4 feat: implement EN.5.E-composition-primitives-task4
+0645d51 feat: implement EN.5.E-composition-primitives-task3
+9161fc5 feat: implement EN.5.E-composition-primitives-task2
+f0ca0a4 feat: implement EN.5.E-composition-primitives-task1
+d162e8b test: add happy-path fixture for sdlc-flow experiment harness
+5053fec chore: wrap up EN.5.D-policy-dispatch-seam
+```
+
 ## [run: 2026-07-25]
 
 ### `EN.5.D-policy-dispatch-seam` done — policy-aware WorkflowFactory, resolve-once, derived Overlay, observed tiers
