@@ -54,7 +54,8 @@ engine-rs/
 │   │                         get_event for the durable `events` record
 │   └── engine-serve/      ← bastion serve embedding (EN.1.C): dispatch.rs (Dispatcher — dual
 │   │                         workflow_registry/schema_registry lookup by workflow_type,
-│   │                         DispatchError::UnknownWorkflowType), live_state.rs (LiveStateStore —
+│   │                         DispatchError::UnknownWorkflowType/PolicyResolutionFailed, EN.5.D),
+│   │                         live_state.rs (LiveStateStore —
 │   │                         in-memory Arc<RwLock<HashMap<RunId, TaskContext>>> record/get/
 │   │                         list_active/remove, no-DB-poll read path for the local Console),
 │   │                         durable.rs (DurableHandle/spawn_durable_writer/durable_on_progress —

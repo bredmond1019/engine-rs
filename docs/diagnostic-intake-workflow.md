@@ -87,8 +87,12 @@ the glue) to recognize, not assume, in the notes.
 Same four-layer precedence as `SdlcPolicy`/`ResearchAgentPolicy` — **per-run event `policy`
 override > per-run event `profile` > `harness.json` `diagnostic_intake.policy` defaults >
 built-in default** — resolved via the shared `crate::policy::resolve` framework (EN.4.0). There
-is no dedicated setup node in this workflow; `IntakeExtractNode::process` calls
-`profiles::resolve_policy_for_run(ctx, worktree)` itself before applying shaping to its `Config`.
+is no dedicated setup node in this workflow, and (as of `EN.5.D`) no node resolves policy for
+itself either: `engine-serve::workflows::register_diagnostic_intake`'s `WorkflowFactory` resolves
+policy once, at dispatch, via `profiles::resolve_policy_for_run_from(&event.data,
+&PolicyConfigSource::Builtin)` (no repo checkout in hand at dispatch time) and seeds the result
+into the run's initial `ctx.nodes`. `IntakeExtractNode::process` reads that stamp with
+`crate::policy::resolved_policy_strict(&ctx)` rather than re-resolving it.
 
 Knobs (a single-stage subset of `SdlcPolicy`'s):
 

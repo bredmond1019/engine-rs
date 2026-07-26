@@ -68,7 +68,12 @@ are runtime-only — declared but not walked by the graph's acyclic-shape valida
 | `PullRequestNode` | Deterministic | Pushes the branch and opens a PR via `gh pr create` — never auto-merges (human review gate, decision D25). No-op (`{pr_url: null, skipped: true}`) when `event.auto_pr == false` (default `true`). |
 | `EmitStateNode` | Deterministic | Runs `mev emit-state --write` in the worktree to refresh the brain freshness spine. Terminal node. |
 
-**Nodes that read the tunable policy:** `SetupWorktreeNode` (resolves it), `ImplementTaskNode`,
+**Nodes that read the tunable policy:** `SetupWorktreeNode` (resolves it, but idempotently as of
+`EN.5.D` — a served run's dispatch factory, `engine-serve::register_sdlc_flow`, already resolves
+policy via `resolve_policy_for_run_from(&event.data, &PolicyConfigSource::Worktree(cwd))` and
+seeds `RESOLVED_POLICY_IDENTITY` before this node runs, so it only resolves + stamps when no
+policy was seeded yet — in-tree/CLI-driven runs and unit tests driving this node directly),
+`ImplementTaskNode`,
 `TriageTaskNode`, `ConsolidatedReviewNode`, `TriageRouterNode`, `WrapUpNode` — plus
 `registry_for_policy` in `graph.rs`, which isn't a node but decides whether `TriageTaskNode`/
 `ConsolidatedReviewNode` get rewired to the local-model transport. Every other node either has a

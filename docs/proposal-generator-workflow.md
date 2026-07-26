@@ -107,9 +107,13 @@ and `automation_roadmap_json_schema()`, set on the underlying `claude_code_rs::C
 
 Same four-layer precedence as `SdlcPolicy`/`ResearchAgentPolicy` — **per-run event `policy`
 override > per-run event `profile` > `harness.json` `proposal_generator.policy` defaults >
-built-in default** — resolved via the shared `crate::policy::resolve` framework. Each model
-node calls `profiles::resolve_policy_for_run(ctx, worktree)` itself before applying shaping to
-its `Config` (there is no setup node).
+built-in default** — resolved via the shared `crate::policy::resolve` framework. There is no
+setup node, and (as of `EN.5.D`) no model node resolves policy for itself either:
+`engine-serve::workflows::register_proposal_generator`'s `WorkflowFactory` resolves policy once,
+at dispatch, via `profiles::resolve_policy_for_run_from(&event.data,
+&PolicyConfigSource::Builtin)` (no repo checkout in hand at dispatch time) and seeds the result
+into the run's initial `ctx.nodes`. Each model node reads that stamp with
+`crate::policy::resolved_policy_strict(&ctx)` rather than re-resolving it.
 
 Knobs:
 

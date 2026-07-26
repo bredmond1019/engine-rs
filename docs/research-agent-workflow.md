@@ -101,8 +101,12 @@ model's pre-parsed structured output over fence-stripped text parsing, the same 
 Same four-layer precedence as `SdlcPolicy` — **per-run event `policy` override > per-run event
 `profile` > `harness.json` `research_agent.policy` defaults > built-in default** — resolved via
 the shared `crate::policy::resolve` framework (EN.4.0). Unlike `SetupWorktreeNode` in
-`sdlc_flow` (there is no setup node here), each terminal node calls
-`profiles::resolve_policy_for_run(ctx, worktree)` itself before applying shaping to its `Config`.
+`sdlc_flow` (there is no setup node here), and (as of `EN.5.D`) unlike either terminal node
+resolving it for itself: `engine-serve::workflows::register_research_agent`'s `WorkflowFactory`
+resolves policy once, at dispatch, via `profiles::resolve_policy_for_run_from(&event.data,
+&PolicyConfigSource::Builtin)` (no repo checkout in hand at dispatch time) and seeds the result
+into the run's initial `ctx.nodes`. Each terminal node reads that stamp with
+`crate::policy::resolved_policy_strict(&ctx)` rather than re-resolving it.
 
 Knobs (a strict subset of `SdlcPolicy`'s — only what the two stages need):
 
