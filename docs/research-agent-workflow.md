@@ -1,13 +1,13 @@
 ---
 type: Reference
 title: Research Agent Workflow
-description: How the RESEARCH_AGENT workflow works — dual-mode graph (company brief vs. prospecting), event schema, tunable ResearchAgentPolicy, triggering, and reading outputs
+description: How the RESEARCH_AGENT workflow works — dual-mode graph (company brief vs. prospecting) terminating in a MaterializeDocNode write, event schema, tunable ResearchAgentPolicy, triggering, and reading outputs
 doc_id: research-agent-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief]
-related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, data-contract]
+keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief, materialize-doc-node, opportunity]
+related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, data-contract, materialize-doc-node, opportunity-edit-workflows]
 ---
 
 # Research Agent Workflow
@@ -25,20 +25,34 @@ Source: `crates/engine-core/src/workflows/research_agent/` (`mod.rs`, `schema.rs
 ## Graph shape
 
 ```
-ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode }
+ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode
 ```
 
-Exactly three nodes. `ResearchModeRouterNode` is the start node and a deterministic `Router`
+Four nodes. `ResearchModeRouterNode` is the start node and a deterministic `Router`
 that reads `event.mode` and routes to whichever terminal node matches — a `Router::route` takes
-`&TaskContext` and cannot mutate it, so policy resolution and telemetry live in the two terminal
-nodes instead, not in the router. Both terminal nodes are graph exit points (neither declares a
-forward connection).
+`&TaskContext` and cannot mutate it, so policy resolution and telemetry live in the two research
+nodes instead, not in the router. Both research branches converge on a single shared
+`MaterializeDocNode` instance (`EN.7.B`) — the graph's **only** exit point; neither
+`CompanyResearchNode` nor `ProspectingResearchNode` is terminal anymore.
 
 | Node | Kind | What it does |
 |---|---|---|
 | `ResearchModeRouterNode` | Deterministic router | Deserializes the event into `ResearchAgentEventSchema`; routes to `CompanyResearchNode` for `mode: "company"`, `ProspectingResearchNode` for `mode: "prospecting"`, or `None` for an invalid/malformed event. |
 | `CompanyResearchNode` | **Model** (Sonnet by default, tunable via policy) | Wraps `ClaudeCodeStep` with `WebSearch`/`WebFetch` tools granted and a `CompanyBrief` `json_schema`. Resolves the run's `ResearchAgentPolicy`, applies research-stage tier/prompt-cache/verbosity shaping, parses the reply into a `CompanyBrief`, stamps it + usage onto `ctx`, and persists `research-agent-state.json`. |
 | `ProspectingResearchNode` | **Model** (Sonnet by default, tunable via policy) | Same shape as `CompanyResearchNode` for the `prospect` stage: resolves policy, applies shaping, runs a `WebSearch`-backed sweep, parses a `ProspectingResult`, stamps `ctx` + usage, and persists `research-agent-state.json`. |
+| `MaterializeDocNode` (`EN.7.B`) | Deterministic writer | Configured with model `"opportunity"` and an ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference — exactly one of the two runs per event, so it reads whichever is present. Writes/updates the resulting `CompanyBrief`/`ProspectingResult` into the Brain corpus as an Opportunity `.md` document via `mev`'s `plan_ingest` (kind auto-detected from the payload shape — no adapter node needed). See [materialize-doc-node.md](materialize-doc-node.md). |
+
+### Behaviour change: a served run now requires a resolvable brain root
+
+Before `EN.7.B`, a `RESEARCH_AGENT` run succeeded whether or not a Brain corpus was reachable —
+the research nodes were the graph's exit points. **As of `EN.7.B`, a run now *ends* by writing**:
+`MaterializeDocNode`'s brain root is left unset on the registered node, so it resolves via
+`crate::brain_root::resolve_brain_root()` (`ENGINE_BRAIN_ROOT` env var, else walking up from the
+process cwd for `brain.toml`) at run time. In an environment with no resolvable brain root, the
+run now **fails loudly with a `NodeError`** where it previously succeeded. This is the block's
+intended semantics, not a bug — there is deliberately no event field to opt out of the write; set
+`ENGINE_BRAIN_ROOT` (or run from within the brain checkout) for any deployment that triggers
+`RESEARCH_AGENT`.
 
 `registry_for_policy(&ResearchAgentPolicy)` in `graph.rs` never rewires either stage to the
 `local` model tier — both `research` and `prospect` are cloud-only `WebSearch`-backed stages that
@@ -167,20 +181,34 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   mechanics) to rank named profiles by cost.
 - **`ctx.nodes["CompanyResearchNode"]` / `ctx.nodes["ProspectingResearchNode"]`** — the parsed
   `CompanyBrief` / `ProspectingResult`, plus usage, on the final `TaskContext`.
+- **`ctx.nodes["MaterializeDocNode"]`** — the terminal write's result stamp:
+  `{materialized, dry_run, model: "opportunity", paths, warnings}`, naming the Opportunity `.md`
+  path written or updated under `business/docs/opportunities/`. See
+  [materialize-doc-node.md § Result stamp](materialize-doc-node.md#result-stamp).
 
 ## Scope notes
 
-- **Node count is fixed at three** — `ResearchModeRouterNode`, `CompanyResearchNode`,
-  `ProspectingResearchNode`. There is no setup/worktree node; each terminal node resolves its
-  own worktree path from an upstream `SetupWorktreeNode` result if present in `ctx.nodes`,
-  falling back to `std::env::current_dir()` otherwise.
+- **Node count is fixed at four** (as of `EN.7.B`) — `ResearchModeRouterNode`,
+  `CompanyResearchNode`, `ProspectingResearchNode`, `MaterializeDocNode`. There is no
+  setup/worktree node; each research node resolves its own worktree path from an upstream
+  `SetupWorktreeNode` result if present in `ctx.nodes`, falling back to
+  `std::env::current_dir()` otherwise.
 - **Out of scope for this block**: intake extraction (EN.4.B), PDF render (EN.4.D — not yet
   built). Proposal generation (EN.4.C, built) reuses `CompanyResearchNode`, re-exported from
   `workflows::research_agent` — see [proposal-generator-workflow.md](proposal-generator-workflow.md).
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
-  only acquires and reasons; a downstream `PersistToBrainNode` (not part of this block) would own
-  handing a brief off to Synapse's ingest endpoint.
+  only acquires and reasons and writes the repo-tracked source `.md` document via `mev`
+  in-process (`MaterializeDocNode`, D53's fourth boundary-test channel); Synapse still owns the
+  derived index (embeddings, `brain_edges`, retrieval) over whatever gets written here — see
+  [materialize-doc-node.md § Why this node exists](materialize-doc-node.md#why-this-node-exists-d53s-fourth-boundary-test-channel).
+  Editing an already-written opportunity's `stage`/`actions[]` after this run completes is the
+  separate `OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION` micro-workflows — see
+  [opportunity-edit-workflows.md](opportunity-edit-workflows.md).
 - **Hermetic test coverage**: `crates/engine-core/tests/research_agent_e2e.rs` drives both modes
-  end-to-end against a stubbed transport, asserts `registry_for_policy` never rewires to `local`,
-  and asserts dispatcher registration (`is_registered("RESEARCH_AGENT")`); a `#[ignore]`-gated
-  experiment harness exercises the full profile-resolve → run → persist → aggregate pipeline.
+  end-to-end against a stubbed transport and a stubbed `MaterializeDocNode` (no real corpus write),
+  asserts `registry_for_policy` never rewires to `local`, and asserts dispatcher registration
+  (`is_registered("RESEARCH_AGENT")`); a `#[ignore]`-gated experiment harness exercises the full
+  profile-resolve → run → persist → aggregate pipeline.
+  `crates/engine-core/tests/opportunity_loop_e2e.rs` (`EN.7.B`) drives the real `Workflow::run`
+  walk with the real `MevDocMaterializer` against a `tempfile::tempdir()` corpus, proving both
+  research branches close the loop and the write is idempotent on re-run.
