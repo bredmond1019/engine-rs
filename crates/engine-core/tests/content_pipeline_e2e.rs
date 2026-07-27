@@ -66,9 +66,11 @@ use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{EventsRow, NodeRunStatus, TaskContext};
 use engine_core::node::NodeRegistry;
+use engine_core::nodes::channel_transport::StubChannelTransport;
 use engine_core::nodes::http_post::StubHttpPost;
 use engine_core::policy::{self, PolicyConfigSource};
 use engine_core::workflow::Workflow;
+use engine_core::workflows::content_pipeline::action_dispatch::ActionDispatchNode;
 use engine_core::workflows::content_pipeline::critic_router::CriticRouterNode;
 use engine_core::workflows::content_pipeline::digest_render::DigestRenderNode;
 use engine_core::workflows::content_pipeline::fetch_article::{
@@ -346,6 +348,12 @@ fn build_registry(stubs: &Stubs) -> NodeRegistry {
         PersistToBrainNode::new()
             .with_http_post(Arc::new(stubs.http_post.clone()))
             .with_url(TEST_BRAIN_URL),
+    ));
+    // `EN.6.A`'s egress terminal node — this EN.5.A fixture only needs the
+    // graph to validate and run end-to-end; dispatch behavior itself is
+    // exercised by `action_dispatch_e2e.rs` (EN.6.A task 6).
+    registry.register(Box::new(
+        ActionDispatchNode::new().with_transport(Arc::new(StubChannelTransport::succeeding())),
     ));
     registry
 }
