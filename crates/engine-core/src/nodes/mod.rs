@@ -37,6 +37,14 @@
 //! `doc_materializer` seam to write it into the Brain corpus. It lives here
 //! rather than under a `workflows::*` module because every future pipeline
 //! appends it; `EN.7.B` wires concrete instances into specific graphs.
+//!
+//! `opportunity_edit` (`EN.7.B` task 3) is `OpportunityEditNode` — the
+//! generic node that drives one `doc_materializer::OpportunityEdit`
+//! operation (`set-stage` | `add-action`), configured with WHICH edit it
+//! performs and reading that edit's arguments off `ctx.event`. Lives here
+//! for the same reason `materialize_doc` does; `EN.7.B` task 5 wires two
+//! `with_identity`-distinguished instances into the `set-stage` /
+//! `add-action` single-node micro-workflows.
 
 pub mod channel_transport;
 pub mod claude_code_step;
@@ -44,6 +52,7 @@ pub mod doc_materializer;
 pub mod http_post;
 pub mod materialize_doc;
 pub mod openai_compat_transport;
+pub mod opportunity_edit;
 
 pub use channel_transport::{
     ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody, StubChannelTransport,
@@ -61,3 +70,4 @@ pub use openai_compat_transport::{
     default_local_http_post, openai_compat_meta_transport, openai_compat_meta_transport_live,
     openai_compat_transport, openai_compat_transport_live, LocalHttpPost,
 };
+pub use opportunity_edit::{OpportunityEditNode, OpportunityEditOp};
