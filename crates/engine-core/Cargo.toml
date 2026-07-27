@@ -17,6 +17,8 @@ claude-code-rs = { workspace = true }
 regex = { workspace = true }
 uuid = { workspace = true }
 engine-contract = { path = "../engine-contract" }
+mev = { workspace = true }
+okf-core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
