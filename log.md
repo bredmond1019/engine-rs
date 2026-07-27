@@ -16,6 +16,26 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-27]
+
+### `EN.5.F-async-run-lifecycle` done — non-blocking trigger, run readback, SSE progress stream
+- **What:** Ran `/sdlc-flow EN.5.F-async-run-lifecycle` (branch `EN.5.F-async-run-lifecycle-flow`); all 7 tasks passed. Task 1 gave `LiveStateStore` bounded terminal-run retention — `mark_terminal`/`get_record` move a finished run out of the live map into a 100-entry completed ring (carrying `workflow_type`/`created_at`/`updated_at`), while `record`/`get`/`list_active`/`remove` kept their exact prior signatures so `http.rs`/`abort.rs` and bastion's `GET /api/runs/{id}` projection stayed unchanged. Task 2 flipped `POST /events/` from awaiting the run inline to spawning it via `actix_web::rt::spawn` (the current-thread arbiter, required because `engine_core::workflow::OnProgress` carries no `Send` bound) and returning `202 {run_id, event_id}` immediately — seeded with a default `Budget` read from `ENGINE_RUN_MAX_COST_USD`/`ENGINE_RUN_MAX_TOKENS` via a memoized `OnceLock` helper rather than a new `AppState` field (bastion constructs `AppState` as a struct literal over an unpinned path dep, so any new field is a cross-repo compile break), with the spawned task marking the run terminal and deregistering the `RunRegistry` token on every exit path; the `500` failure arm is gone entirely. Task 3 added the canonical `GET /events/{event_id}` readback — `{event_id, workflow_type, status, created_at, updated_at, task_context}`, server-derived status (`running`/`succeeded`/`cancelled`/`budget_halted`/`failed`), `X-API-Key` gated, 404 on unknown/malformed ids, served DB-free from `LiveStateStore` plus a module-local live-run-metadata side table for still-running workflow_type/created_at. Task 4 added `crates/engine-serve/src/stream.rs` and `GET /events/{event_id}/stream` — a per-run `tokio::sync::broadcast` tee with a terminal-frame cache so a late subscriber still gets one terminal frame, wired as a third fan-out inside `post_events`'s existing `on_progress` closure. Task 5 wrote the hermetic `tests/async_lifecycle.rs` (5 tests) proving the block's acceptance surface end to end: sub-100ms 202 against a slow node, readback's running→terminal transition, one SSE frame per node transition plus a terminal frame, abort of a spawned run reading back cancelled, and a run exceeding the $5 default budget halting with the budget marker. Task 6 updated `docs/data-contract.md` — the readback and stream routes marked ported/extension, the 500-removal semantic change and default-budget env knobs documented, a dated changelog row added with the Pinned Contract Version held at 1.3.0. Task 7 validated the full suite — `fmt`/`clippy -D warnings`/`cargo test` (91+ tests across `engine-serve`/`engine-store`)/`cargo build --release`, plus `cargo check --manifest-path ../bastion/Cargo.toml`, confirming `AppState` gained no public field and bastion's tree stayed clean after reverting the incidental `Cargo.lock` regeneration from the new `futures` workspace dep.
+- **Why:** Closes the last of the four EN.5.D/E/A/F Phase-5 substrate blocks — `EN.6.A` (egress seam: `ChannelTransport` + `ActionDispatchNode` + workflow-trigger dispatch) and the whole Phase 6 channel/adapter fan-out behind it were blocked on a non-blocking trigger path, since a Slack ACK needs ~3s and a pipeline run can take minutes.
+- **Verdict:** PASS (review found no findings). Docs: `docs/data-contract.md` updated.
+- **Status:** `planning/state.json` block `EN.5.F` set to `"closed"`; `planning/status.md` Progress Table row added under Phase 5 and flipped to Done. `EN.6.A` is now unblocked.
+- **Next:** EN.4.D — DELIVERABLE_RENDER (net-new, roadmap → PDF), or EN.6.A — the egress seam now that EN.5.D/E/A/F are all done.
+
+```
+c8e861e docs: update docs for EN.5.F-async-run-lifecycle
+f7c6ab1 feat: implement EN.5.F-async-run-lifecycle-task6
+e0705d7 chore: flow state — task 5 passed
+fb59383 feat: implement EN.5.F-async-run-lifecycle-task5
+6fb8f63 feat: implement EN.5.F-async-run-lifecycle-task4
+27cfcbf feat: implement EN.5.F-async-run-lifecycle-task3
+afb5ea9 feat: implement EN.5.F-async-run-lifecycle-task2
+574f69d feat: implement EN.5.F-async-run-lifecycle-task1
+```
+
 ## [run: 2026-07-26]
 
 ### `EN.5.A-content-pipeline` done — envelope-based content core (bounded self-critic loop, translate, digest, PersistToBrain)

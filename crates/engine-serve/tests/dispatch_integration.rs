@@ -98,10 +98,13 @@ fn test_app_state() -> AppState {
 /// state the local read API (`LiveStateStore::get`) can see with no Postgres
 /// involved anywhere in the request path (the `AppState.durable` handle was
 /// spawned with `pool: None`, so no `engine-store`/`sqlx` call is reachable).
+/// EN.5.F: the trigger spawns the run rather than awaiting it, so this test
+/// waits for `RunRegistry` deregistration before reading the run's snapshot.
 #[actix_web::test]
 async fn triggering_through_dispatch_records_live_state_with_no_db_query() {
     let state = test_app_state();
     let live = state.live.clone();
+    let runs = state.runs.clone();
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(state))
@@ -126,6 +129,18 @@ async fn triggering_through_dispatch_records_live_state_with_no_db_query() {
         .as_str()
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .expect("response carries a parseable run_id");
+
+    // EN.5.F: the trigger no longer awaits the run, so wait for the spawned
+    // task's cleanup (registry deregistration) before reading the "final"
+    // snapshot back.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while runs.get(run_id).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spawned run did not finish cleanup within 5s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 
     // Local read path: in-memory only, no Postgres query.
     let snapshot = live

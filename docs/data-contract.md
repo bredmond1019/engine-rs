@@ -6,7 +6,7 @@ doc_id: data-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.3.0, cancellation, abort, budget gate, engine-contract, event read api, ingest]
+keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.3.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback]
 related: [architecture, D6-cancellation-and-budget-semantics, D20-shared-data-contract]
 ---
 
@@ -161,20 +161,54 @@ canonical contract's §7, so a caller can target either runtime:
 | `GET` | `/workflows` | `http::list_workflows` |
 | `GET` | `/workflows/{type}/graph` | `http::workflow_graph` — `404` for an unregistered type |
 | `POST` | `/events/{run_id}/abort` | `abort::abort_run` (EN.2.B) — same `X-API-Key` gate; `401`/`404`/`202` per the canonical contract §7 |
+| `GET` | `/events/{event_id}` | `http::get_event` (EN.5.F) — `X-API-Key` gated (401); `404` for an unknown or malformed id; `200 {event_id, workflow_type, status, created_at, updated_at, task_context}`, `status` derived server-side |
 
-The canonical contract's v1.2.0 adds a sixth route, `GET /events/{event_id}` (`X-API-Key` gated,
-`404` for unknown/malformed ids, `200 {event_id, workflow_type, status, created_at, updated_at,
-task_context}` with `status` derived server-side), implemented in the orchestrator's own Python
-API (`OR.Y`) — **not** in `engine-serve`. `POST /events/` also gains an `event_id` field on its
-`202` body there. Neither is ported to `engine-serve`/`http::post_events` by this re-pin; adding
-the matching route and response field to engine-rs's own HTTP surface (to keep the two runtimes
-interchangeable per the "same HTTP surface" goal above) is future work, tracked separately from
-this pin.
+The canonical contract's v1.2.0 route `GET /events/{event_id}` and the `event_id` field on
+`POST /events/`'s `202` body are now **ported** to `engine-serve` (EN.5.F). `POST /events/` spawns
+the run instead of awaiting it (`http::post_events`, via `actix_web::rt::spawn` — the current-thread
+arbiter, since `OnProgress` is not `Send`) and returns `202 {run_id, event_id}` immediately;
+`event_id` always equals `run_id` — both are the `events.id` primary key. `GET /events/{event_id}`
+reads back the canonical shape quoted above, serving only from the in-memory `LiveStateStore`
+(task 1's bounded completed-run ring, `COMPLETED_RUN_RETENTION = 100`, plus the still-live map) —
+there is no Postgres fallback; CI has no `DATABASE_URL` and this route must stay DB-free.
+
+engine-rs also exposes `GET /events/{event_id}/stream` (`crate::stream::stream_event`), an
+**engine-rs-only extension** with no counterpart in the canonical contract (so it is not a parity
+gap in either direction, in either runtime). It is `X-API-Key` gated, nests under the run it
+streams — mirroring the existing `POST /events/{run_id}/abort` convention — and emits
+`text/event-stream` frames over a `tokio::sync::broadcast` tee fed by `on_progress`: one frame per
+node transition plus a terminal frame, after which the stream ends.
+
+**Server-derived `status` (`http::derive_terminal_status`).** A non-terminal run always reads back
+`"running"`. For a terminal run, checked in order against the retained snapshot:
+
+| condition | status |
+|---|---|
+| `metadata.cancellation.cancelled == true` (`engine_core::stamp_cancelled`) | `cancelled` |
+| `metadata.budget.halted == true` (`engine_core::workflow::stamp_budget_halt`) | `budget_halted` |
+| `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
+| none of the above | `succeeded` |
+
+**Semantic change: `POST /events/` no longer returns `500` on a failed run.** Before EN.5.F, a
+failed run's error surfaced synchronously as `500 {error, run_id}` from the awaited handler. Now
+that the run is spawned and the `202` response is sent before the run can fail, failure surfaces
+asynchronously instead: through the `GET /events/{event_id}` readback (`status: "failed"`) and the
+terminal SSE frame on `GET /events/{event_id}/stream`. `POST /events/` itself never returns `500`
+for a run failure anymore.
+
+**Default run budget (EN.5.F).** `post_events` no longer passes `budget: None` — every HTTP-triggered
+run gets a default `Budget` read from the environment (`http::default_budget_from_env`, memoized):
+`ENGINE_RUN_MAX_COST_USD` (default `5.0`) and `ENGINE_RUN_MAX_TOKENS` (default unset, i.e. no cap).
+This is read directly from the environment inside `http.rs` rather than added as an `AppState`
+field, because `bastion` constructs `engine_serve::http::AppState` as a struct literal over an
+unpinned path dependency and any new public field would be an immediate cross-repo compile break
+for zero gain.
 
 `POST /events/{run_id}/abort` is backed by `abort::RunRegistry`, a per-run `CancellationToken`
 registry: `post_events` mints and registers a token alongside the freshly-minted `run_id` before
-running, and deregisters it once the run ends (success, failure, or cancellation) so a later abort
-against a finished `run_id` correctly 404s rather than triggering a token nobody checks anymore.
+spawning the run, and the spawned task deregisters it once the run ends (success, failure,
+cancellation, or budget halt) so a later abort against a finished `run_id` correctly 404s rather
+than triggering a token nobody checks anymore.
 
 The canonical contract's v1.3.0 adds two more routes, `POST /ingest/proposal` and
 `POST /ingest/artifact` (`OR.Q`), implemented only in the orchestrator's own Python API
@@ -213,3 +247,4 @@ placeholder `BRAIN_INGEST_URL` constant rather than this route — pointing it a
 | 1.1.0 | 2026-07-16 | Re-pin to 1.1.0. Registers the canonical's v1.1.0 additions, both introduced by engine-rs's own EN.2.B: `POST /events/{run_id}/abort` (§ HTTP surface parity above) and the `metadata.cancellation` / `metadata.budget` run-level annotations (§ above). No `engine_contract` Rust type changed shape — both additions live in the existing `TaskContext::metadata: serde_json::Value` free-form field, per D6. |
 | 1.2.0 | 2026-07-24 | Re-pin from 1.1.0 to 1.2.0 (`OR.Y`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.2.0 additions, none yet ported to `engine-serve`: the orchestrator's own `GET /events/{event_id}` read route and the `event_id` field on `POST /events/`'s 202 body (§ HTTP surface parity above), and the `metadata.failure` run-level annotation (§ Run-level `metadata` annotations above). No `engine_contract` Rust type changed shape — `metadata.failure` lives in the existing free-form `metadata` field, per D6. Porting the read route and `event_id` field to `engine-serve` for HTTP-surface parity is future work. |
 | 1.3.0 | 2026-07-24 | Re-pin from 1.2.0 to 1.3.0 (`OR.Q`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.3.0 additions, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact`, both `X-API-Key` gated with a typed `422` on malformed bodies. `/ingest/proposal` gives `EN.4.C`'s `PersistToBrainNode` a live endpoint matching the payload it already stubs — `{artifact_id, company_name, doc_type, section, content, roadmap}` → `200 {artifact_id, chunks_written}`. No `engine_contract` Rust type changed shape; these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. `EN.4.C` (built, see [proposal-generator-workflow.md](proposal-generator-workflow.md)) still POSTs to a hardcoded placeholder URL rather than this route; wiring `PersistToBrainNode` to POST here for real remains open follow-on work. |
+| 1.3.0 | 2026-07-27 | `EN.5.F` (engine-rs-side; not a canonical re-pin — **Pinned Contract Version stays 1.3.0**, this ports an already-canonical route rather than adding a new one). Ports the canonical v1.2.0 `GET /events/{event_id}` route and the `event_id` field on `POST /events/`'s `202` body into `engine-serve` (§ HTTP surface parity above): `POST /events/` now spawns the run and returns `202 {run_id, event_id}` immediately instead of awaiting it, and no longer returns `500` on a run failure — failure now surfaces through the `GET /events/{event_id}` readback (`status: "failed"`) and the terminal SSE frame. Adds `GET /events/{event_id}/stream`, an engine-rs-only SSE extension with no canonical counterpart. Sets a default HTTP-path `Budget` read from `ENGINE_RUN_MAX_COST_USD` (default `5.0`) / `ENGINE_RUN_MAX_TOKENS` (default unset). `LiveStateStore` now retains the most recent 100 completed runs (`COMPLETED_RUN_RETENTION`) in a bounded ring for the readback. No `engine_contract` Rust type changed shape. |

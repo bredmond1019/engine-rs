@@ -1,73 +1,79 @@
 # Handoff — Hand off an in-flight session cleanly to a fresh agent.
 
 Use this when the current session has grown large enough that continuing in a new context is
-better than pressing on. It creates or updates `planning/handoff.md` so the next agent can
-orient instantly after running `/prime`, then wraps up the session by logging work and
-committing lingering changes.
+better than pressing on. It writes `planning/handoff.md` so the next agent can orient instantly
+after `/prime`, logs the work, and commits.
 
 ## Variables
 
 $ARGUMENTS — optional free-text note to include in the handoff (e.g. "focus on the parser
-             next, the renderer is blocked on the tokenizer fix"). If omitted, the agent
-             derives context from git history and status.md.
+             next, the renderer is blocked on the tokenizer fix"). If omitted, derive context
+             from git history and status.md.
 
 ## Execution Model
 
-Run inline — do NOT spawn a subagent. `/log-work` and `/commit` are invoked as Skill tool
-calls from the main agent context; they have their own confirmation gates that require the
-main loop.
+**Run entirely inline. Spawn no subagents, and do NOT invoke `/log-work`, `/commit`, or
+`/backlog-ticket` as skills — their steps are inlined below.**
+
+This is deliberate and is the whole point of the command. `/handoff` exists to *serialize the
+current session's context to disk*, and the main agent is the only thing that holds that
+context. A subagent cold-starts and has to reconstruct the session narrative from `git log` —
+slow, lossy, and exactly the reconstruction the handoff is meant to prevent. Delegating also
+fires at the end of a long session, when re-serializing instructions into a subagent prompt
+costs the most.
+
+Budget: ~3 file reads, ~3 file writes, 2 shell calls. If you find yourself spawning an agent
+or reading more than five files, stop — you are re-deriving something you already know.
 
 ## Instructions
 
-### Step 1 — Gather current state
+### Step 1 — Gather (3 reads + 1 shell call)
 
-Read these files (all relative to the project root):
+Read:
+- `planning/status.md` — current focus, block statuses
+- `planning/state.json` — `tracks[].blocks[]` statuses and the existing `carryover[]`
+- `planning/handoff.md` — only if it exists (you are updating, not blindly replacing)
 
-- `planning/status.md` — current focus, block statuses, last updated date
-- `log.md` — the three most recent entries (for narrative context)
-- Any in-flight task spec visible from status.md (e.g. `planning/<current-block>/tasks.md`)
-- `planning/handoff.md` — if it exists, read it (you are updating it, not replacing blindly)
-- `planning/state.json` — the existing `carryover[]` (you are appending to it, not duplicating)
-- `docs/state/state-schema.md` — the `carryover[]` section, for the field shape
+Run once: `git log --oneline -10 && git status --short`
 
-Run:
-- `git log --oneline -10` — recent commits
-- `git diff --stat` — uncommitted changes
-- `git status` — untracked files and staged state
+Do **not** re-read `log.md`, the task spec, or `docs/state/state-schema.md` — you have the
+session context those would reconstruct. Read them only if you genuinely lack something.
 
-### Step 2 — Drain durable context into `state.json` `carryover[]`
+### Step 2 — Flip closed blocks, then drain durable context
 
-**This is what keeps `handoff.md` disposable.** Before writing the handoff, route anything that must
-outlive *this* handoff (so the next one can't overwrite it away) into the right durable home — do **not**
-leave it living only in the prose below:
+**2a — Flip any block this session closed** to `status: "closed"` in `planning/state.json`
+`tracks[].blocks[]`. Do this **before** Step 4's `emit-state`: that authored field is the
+*input* the derivation reads, and `emit-state` never infers completion from `status.md` (the
+sync is one-way by design). Skipping this leaves `focus` and every generated surface stale
+until someone reconciles by hand — the `engine-rs` `state-json-block-status-stale` incident,
+2026-07-03.
 
-- **Committed, sequenced work** with real dependencies → a `tracks[].blocks[]` block in `planning/state.json`.
-- **Free-floating ideas/chores** not on this repo's critical path → the company brain's HQ `backlog[]`
-  (via `/backlog-ticket` at the brain).
-- **Durable caveats, known-issues, environmental notes, and not-yet-ticketed deferred follow-ons** →
-  append a `carryover[]` entry to `planning/state.json`. This is the in-between lane the other two miss:
-  - `kind: constraint` — a rule the next agent must honor.
-  - `kind: known_issue` — a don't-re-investigate fact.
-  - `kind: env` — a transient environmental caveat (e.g. "installed binary is stale, rebuild first").
-  - `kind: deferred` — a real follow-on you haven't ticketed yet; promote it to a block/backlog when ready.
+**2b — Drain anything that must outlive this handoff** into `planning/state.json`'s
+`carryover[]`, so the next handoff can't overwrite it away. One quick pass, not a routing
+ceremony — append an entry with `slug`, `scope`, `kind`, `text`, `created` (plus optional
+`related` / `clears_when`), where `kind` is one of:
 
-  Follow the `carryover[]` field shape in `docs/state/state-schema.md` (`slug`, `scope`, `kind`, `text`,
-  optional `related` + `clears_when`, `created`). Keep it valid JSON; append, don't duplicate an existing
-  slug. **Delete** any existing `carryover[]` entry whose `clears_when` resolved this session. If this repo
-  has no `planning/state.json` yet, skip this step.
+| kind | for |
+|---|---|
+| `constraint` | a rule the next agent must honor |
+| `known_issue` | a don't-re-investigate fact |
+| `env` | a transient environmental caveat ("installed binary is stale, rebuild first") |
+| `deferred` | a real follow-on you haven't ticketed yet |
 
-After making any changes to `planning/state.json`'s `carryover[]`, or after writing/updating a
-block's `tasks.json`, run `mev emit-state --write` to ensure the new state is tracked across
-brains. Never hand-edit a block's `tasks` field yourself — it's a derived pointer + status summary
-(see `docs/state/state-schema.md`), not something you inject entries into.
+Append; don't duplicate an existing slug. **Delete** any entry whose `clears_when` resolved
+this session. Skip entirely if this repo has no `planning/state.json`.
 
-The handoff prose in Step 3 then *points at* these slugs instead of being their only home.
+Sequenced work with real dependencies belongs in `tracks[].blocks[]`, and free-floating ideas
+belong in the HQ `backlog[]` — but **do not invoke `/update-state` or `/backlog-ticket` from
+here**. Note them in the handoff prose and let the next session file them properly.
+
+Never hand-edit a block's `tasks` field — it's a derived pointer, not somewhere to inject
+entries.
 
 ### Step 3 — Write `planning/handoff.md`
 
-Create or overwrite `planning/handoff.md` using the template below. Be specific and honest:
-the next agent has zero session memory and will rely entirely on this file + `/prime` to
-orient. If $ARGUMENTS was provided, weave it in as the primary focus note.
+The next agent has zero session memory. Be specific and honest. If `$ARGUMENTS` was provided,
+weave it in as the primary focus note.
 
 ```markdown
 ---
@@ -80,67 +86,85 @@ created: YYYY-MM-DD
 > **For the next agent:** Read this immediately after `/prime`. Delete this file once consumed.
 
 ## What we're doing and why
-<One paragraph. State the goal, why it matters right now, and any non-obvious background
-the next agent needs to avoid re-deriving it. Reference specific file paths or decision
-numbers where helpful.>
+<One paragraph: the goal, why it matters now, and any non-obvious background the next agent
+would otherwise re-derive. Cite file paths and decision numbers.>
 
 ## Completed this session
-<Bulleted list of concrete things done — commits made, files changed, decisions reached.
-Pull from git log and $ARGUMENTS. Be specific: "bumped harness-config loader to sonnet in
-all 3 engines (sdlc-block.js:473, sdlc-task.js:455, sdlc-run.js:326)" not "fixed engine".>
+<Concrete things done — commits, files changed, decisions reached. "bumped harness-config
+loader to sonnet in all 3 engines (sdlc-block.js:473, sdlc-task.js:455, sdlc-run.js:326)",
+not "fixed engine".>
 
 ## Remaining work
-<Bulleted list of what's left, in priority order. Mark blockers explicitly.
-If work is blocked on an answer to an open question, say so.>
+<What's left, in priority order. Mark blockers explicitly.>
 
 ## Durable State Updates
-<List any items you added to `state.json`'s `carryover[]`, and any block whose `tasks.json` you
-created or changed this session. Note their slug / block ID so the next agent can find them easily
-without having to hunt.>
+<`carryover[]` slugs added or deleted, and any block whose status you flipped. Slug / block ID
+only — the next agent can look them up.>
 
 ## Open questions / choices
-<Bulleted list of unresolved decisions or things to verify before proceeding. If none, write
-"None — clear to proceed.">
-
-## Context the next agent needs
-<Only ephemeral, this-session framing the next agent needs to read the above. Durable constraints,
-known-issues, and env caveats belong in `state.json` `carryover[]` (Step 2) — reference their slugs
-here, don't restate them. Omit this section if Step 2 captured everything.>
+<Unresolved decisions, or things to verify before proceeding.>
 
 ## First command after `/prime`
 `<exact command to run first>`
 ```
 
-Fill every section. Do not leave placeholder text. If a section is genuinely empty, say why
-(e.g. "No open questions — the approach is settled per D14.").
+**Omit a section rather than padding it.** An absent "Open questions" reads as "none"; a
+section full of filler wastes the next agent's attention, which is the one thing this file
+exists to protect.
 
-### Step 4 — Invoke `/log-work`
+### Step 4 — Log, regenerate, commit (2 shell calls, no delegation)
 
-Invoke the `/log-work` skill. Pass $ARGUMENTS as the argument if it was provided, so the
-log entry gets the same narrative. `/log-work` will ask for confirmation before writing — let
-that flow normally.
+**4a — Append to `log.md`** (repo root, `type: Log`; create with OKF frontmatter if missing).
+Add a `### <title>` sub-entry under today's `## [YYYY-MM-DD]` section, creating that date
+section at the top just below `# Log` if absent:
 
-### Step 5 — Invoke `/commit`
+```markdown
+### <Short title of the session>
+- **What:** <what was built / changed / decided>
+- **Why:** <what prompted it — the problem, request, or insight>
+- **Refs:** <driving plan / decision / tasks — omit if none>
+```
 
-After `/log-work` completes, invoke the `/commit` skill. This will pick up `planning/handoff.md`
-(just written), the `state.json` `carryover[]` edits, plus any other uncommitted changes. `/commit`
-will show staged files and ask for confirmation — let that flow normally.
+**Why** is required. If `$ARGUMENTS` doesn't make the reason clear, ask one brief question.
+Bump `log.md`'s frontmatter `timestamp` to the current ISO-8601 time.
 
-### Step 6 — Report
+**4b — Bump `planning/status.md`'s frontmatter `timestamp`** to the same time, and update any
+hand-maintained prose (`## Momentum`, narrative callouts) that this session changed. Do **not**
+hand-write the focus line — Step 4c derives it. Never edit `master-plan.md` from this command.
 
-Tell the user:
-- `planning/handoff.md` was written (or updated)
-- Log entry was appended
+**4c — Run `mev emit-state --write`.** It walks up to find `brain.toml` itself; no `cd` needed.
+This regenerates every derived surface from the state you authored in Step 2a: leaf `state.json`
+focus fields, the brain rollup, the per-project cache doc + `synced_from` watermark, tier
+rollups, the HQ Operating Board, and `master-plan.md`'s wave tables.
+
+Do not reimplement any of that by hand. If the run reports `W_EMIT_NO_SENTINEL` against a
+target this repo feeds, report it rather than inventing the missing sentinel pair.
+
+- **No `brain.toml` found** (standalone repo) → skip 4c and say so in the report.
+- **`_root` repos only** (`brain`, `learn-ai`, `base-template`) → additionally update *this*
+  repo's `###` subsection in `BRAIN_ROOT/README.md`'s `## Quick Status` by hand; `emit-state`
+  doesn't generate it (no `generated:` sentinel). Verify the heading matches before writing —
+  never touch another project's subsection.
+
+**4d — Commit.** Stage `planning/handoff.md`, the `state.json` edits, `log.md`, `status.md`, and
+any other uncommitted work. Write a conventional-commit message. Show the staged file list and
+get confirmation before committing. Branch first if on the default branch. Do not push unless
+asked.
+
+### Step 5 — Report
+
+- `planning/handoff.md` written (or updated)
+- Blocks flipped to `closed`; `carryover[]` slugs added or cleared
+- The `emit-state --write` summary, or that it was skipped (standalone)
 - What was committed
-- The exact command sequence to start the next session:
-  1. Open a fresh Claude Code session in this directory
-  2. Run `/prime` — it will surface the handoff automatically
-  3. Run the first command listed in the handoff
+- Next session: open a fresh session here → `/prime` (it surfaces the handoff automatically) →
+  run the first command listed in the handoff
+
+If a settled architectural decision came out of this session, say so and suggest `/log-decision`
+— do not author one inline.
 
 ## Context / Files to Read
 
 - `planning/status.md`
-- `log.md` (last 3 entries)
-- The current in-flight task spec (path from status.md, if any)
-- `planning/handoff.md` (if it already exists)
-- `planning/state.json` (existing `carryover[]`) + `docs/state/state-schema.md` (`carryover[]` field shape)
+- `planning/state.json` (`tracks[].blocks[]` + `carryover[]`)
+- `planning/handoff.md` (only if it already exists)
