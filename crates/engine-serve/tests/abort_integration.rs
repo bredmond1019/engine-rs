@@ -3,6 +3,11 @@
 //! `POST /events/{run_id}/abort`, and asserts the 401 / 404 / success paths
 //! plus the live-state snapshot for that run reflecting the cancelled
 //! terminal state stamped by `Workflow::run_with` (task 3).
+//!
+//! EN.5.F: the trigger is now non-blocking — `POST /events/` spawns the run
+//! and returns before it finishes — so the trigger response is no longer a
+//! valid "the run is done" signal. The full round-trip test waits on
+//! `RunRegistry` deregistration (the spawned task's last action) instead.
 
 use std::collections::HashMap as StdHashMap;
 use std::rc::Rc;
@@ -144,6 +149,7 @@ async fn aborting_a_live_run_stamps_cancelled_and_returns_success() {
     let release = Arc::new(Notify::new());
     let state = test_app_state(release.clone());
     let live = state.live.clone();
+    let runs = state.runs.clone();
     let app = Rc::new(
         test::init_service(
             App::new()
@@ -196,6 +202,23 @@ async fn aborting_a_live_run_stamps_cancelled_and_returns_success() {
 
     let trigger_resp = trigger_handle.await.expect("trigger task panicked");
     assert_eq!(trigger_resp.status(), 202);
+    let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+    assert_eq!(trigger_body["run_id"], serde_json::json!(run_id));
+    assert_eq!(trigger_body["event_id"], serde_json::json!(run_id));
+
+    // The trigger now returns before the run finishes, so wait for the
+    // spawned task's cleanup instead of treating the 202 as the finish
+    // line. Deregistration is the last thing that task does (after
+    // `mark_terminal`), so observing it means the final snapshot and the
+    // terminal marking are both already visible.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while runs.get(run_id).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spawned run did not finish cleanup within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     let snapshot = live
         .get(run_id)
