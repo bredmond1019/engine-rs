@@ -26,7 +26,10 @@
 //! `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md`
 //! document via `mev`/`okf-core` in-process — a live `mev`-backed
 //! implementation plus a test stub that records the last call it was
-//! handed, mirroring `http_post`'s shape.
+//! handed, mirroring `http_post`'s shape. `EN.7.B` extends the seam with a
+//! second operation, `edit_opportunity`, over `OpportunityEdit`'s
+//! `SetStage`/`AddAction` variants — the write half of the opportunity-edit
+//! micro-workflows, reusing the same `MaterializeOutcome` result shape.
 //!
 //! `materialize_doc` (`EN.7.A` task 4) is `MaterializeDocNode` itself — the
 //! generic, reusable node that reads a `BrainDocModel`-shaped artifact out
@@ -49,7 +52,8 @@ pub use channel_transport::{
 pub use claude_code_step::{ClaudeCodeStep, MetaTransport, TransportInfo};
 pub use doc_materializer::{
     doc_materializer_live, DocMaterializer, MaterializeDiagnostic, MaterializeOutcome,
-    MaterializedFile, RecordedMaterializeCall, StubDocMaterializer,
+    MaterializedFile, OpportunityEdit, RecordedEditCall, RecordedMaterializeCall,
+    StubDocMaterializer,
 };
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
 pub use materialize_doc::MaterializeDocNode;
