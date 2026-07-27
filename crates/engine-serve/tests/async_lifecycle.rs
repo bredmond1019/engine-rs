@@ -117,6 +117,31 @@ impl Node for NeverNode {
     }
 }
 
+/// A node that echoes `ctx.event`'s `"marker"` field into its own output —
+/// used to prove one run's state never bleeds into another's readback under
+/// real concurrency.
+struct EchoNode;
+
+#[async_trait::async_trait]
+impl Node for EchoNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        let marker = ctx
+            .event
+            .get("marker")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        ctx.nodes.insert(
+            self.name().to_string(),
+            serde_json::json!({ "marker": marker }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "MarkerNode"
+    }
+}
+
 fn single_node_schema(workflow_type: &str, node_identity: &str) -> WorkflowSchema {
     let mut nodes = StdHashMap::new();
     nodes.insert(
@@ -463,6 +488,82 @@ async fn stream_delivers_one_frame_per_node_transition_then_a_terminal_frame() {
         }),
         "expected a frame showing NodeB's running transition: {non_terminal:?}"
     );
+}
+
+/// **Concurrent run isolation.** Every process-global registry this feature
+/// relies on (`LiveStateStore`, `live_run_metadata()`, the stream registry,
+/// `RunRegistry`) is keyed by `run_id` and shared across every run in the
+/// process — exactly the shape of bug a keying mistake or a stale-snapshot
+/// crossed-wire would hide behind in a single-run test. Fire many runs
+/// concurrently, each carrying a distinct marker, and assert every readback
+/// shows *only* its own run's marker, never another's.
+#[actix_web::test]
+async fn many_concurrent_runs_never_cross_contaminate_readbacks() {
+    const WORKFLOW_TYPE: &str = "async-lifecycle-concurrency";
+    const RUN_COUNT: usize = 25;
+
+    let mut dispatcher = Dispatcher::new();
+    dispatcher.register(
+        single_node_schema(WORKFLOW_TYPE, "MarkerNode"),
+        Box::new(|_event: &serde_json::Value| {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(EchoNode));
+            Ok(Workflow::new(
+                registry,
+                single_node_schema(WORKFLOW_TYPE, "MarkerNode"),
+            ))
+        }),
+    );
+    let state = app_state_with(dispatcher);
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let mut event_ids = Vec::with_capacity(RUN_COUNT);
+    for i in 0..RUN_COUNT {
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", API_KEY))
+            .set_json(
+                serde_json::json!({ "workflow_type": WORKFLOW_TYPE, "data": { "marker": i } }),
+            )
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let event_id = trigger_body["event_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("event_id should be a parseable UUID");
+        event_ids.push((i, event_id));
+    }
+
+    for (i, event_id) in event_ids {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (status, body) = get_event!(app, event_id);
+            if status == 200 && body["status"] != "running" {
+                assert_eq!(
+                    body["status"], "succeeded",
+                    "run {i} ({event_id}) did not succeed: {body}"
+                );
+                assert_eq!(
+                    body["task_context"]["nodes"]["MarkerNode"]["marker"],
+                    serde_json::json!(i),
+                    "run {i} ({event_id}) read back a different run's marker — cross-contamination: {body}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "run {i} ({event_id}) never reached a terminal readback"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }
 
 /// **Abort of a spawned run still stamps terminal state.** Trigger, abort

@@ -53,6 +53,7 @@ use engine_core::{
     Budget, CancellationToken, OnProgress, RunOptions, BUDGET_METADATA_KEY,
     CANCELLATION_METADATA_KEY,
 };
+use futures::FutureExt;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -215,6 +216,45 @@ fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadata>> {
 /// | `metadata.budget.halted == true` (`BUDGET_METADATA_KEY`, `engine_core::workflow::stamp_budget_halt`) | `budget_halted` |
 /// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
 /// | none of the above                                                    | `succeeded`     |
+/// An empty `TaskContext`, used as the fallback when a run fails or panics
+/// before `on_progress` ever recorded a snapshot to fall back to.
+fn empty_task_context() -> TaskContext {
+    TaskContext {
+        event: serde_json::Value::Null,
+        nodes: StdHashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: StdHashMap::new(),
+    }
+}
+
+/// Stamp `ctx.metadata.failure = { failed: true, error: message }` so
+/// [`derive_terminal_status`] reports `"failed"` instead of falling through
+/// to its `"succeeded"` default.
+fn stamp_failure(ctx: &mut TaskContext, message: &str) {
+    let failure = serde_json::json!({ "failed": true, "error": message });
+    match ctx.metadata.as_object_mut() {
+        Some(metadata) => {
+            metadata.insert("failure".to_string(), failure);
+        }
+        None => ctx.metadata = serde_json::json!({ "failure": failure }),
+    }
+}
+
+/// Extract a human-readable message from a `catch_unwind` panic payload —
+/// the two shapes `std::panic!`/`.unwrap()`/`.expect()` actually produce
+/// (`&str` for a literal, `String` for a formatted message), falling back to
+/// a placeholder for anything else (a custom payload type via
+/// `std::panic::panic_any`).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 pub(crate) fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
     let cancelled = snapshot
         .metadata
@@ -352,29 +392,31 @@ async fn post_events(
         // response was sent long ago either way, so there is no status code
         // to map failure to — the readback (task 3) and the terminal SSE
         // frame (task 4) are how it surfaces.
-        let final_ctx = match workflow.run_with(data, on_progress, options).await {
-            Ok(ctx) => ctx,
-            Err(err) => {
+        //
+        // `catch_unwind` guards against a node implementation panicking
+        // instead of returning `Err` (an internal `unwrap()`/`expect()`/
+        // index-panic): without it, the panic would abort this spawned
+        // task before reaching the cleanup below, leaking the run in
+        // `live_run_metadata()`/`RunRegistry` forever and leaving any SSE
+        // subscriber hanging with no terminal frame.
+        let run_result =
+            std::panic::AssertUnwindSafe(workflow.run_with(data, on_progress, options))
+                .catch_unwind()
+                .await;
+
+        let final_ctx = match run_result {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(err)) => {
                 eprintln!("run {run_id} failed: {err}");
-                // No accumulated `TaskContext` comes back from a structural
-                // `WorkflowError`; fall back to the last snapshot `on_progress`
-                // recorded, or an empty context if none was ever recorded.
-                let mut ctx = live.get(run_id).unwrap_or_else(|| TaskContext {
-                    event: serde_json::Value::Null,
-                    nodes: StdHashMap::new(),
-                    metadata: serde_json::json!({}),
-                    node_runs: StdHashMap::new(),
-                });
-                // Stamp a failure marker so `derive_terminal_status` reports
-                // "failed" instead of falling through to its "succeeded"
-                // default — a structural error must not read back as success.
-                let failure = serde_json::json!({ "failed": true, "error": err.to_string() });
-                match ctx.metadata.as_object_mut() {
-                    Some(metadata) => {
-                        metadata.insert("failure".to_string(), failure);
-                    }
-                    None => ctx.metadata = serde_json::json!({ "failure": failure }),
-                }
+                let mut ctx = live.get(run_id).unwrap_or_else(empty_task_context);
+                stamp_failure(&mut ctx, &err.to_string());
+                ctx
+            }
+            Err(panic_payload) => {
+                let message = panic_message(&panic_payload);
+                eprintln!("run {run_id} panicked: {message}");
+                let mut ctx = live.get(run_id).unwrap_or_else(empty_task_context);
+                stamp_failure(&mut ctx, &format!("node panicked: {message}"));
                 ctx
             }
         };
@@ -796,6 +838,115 @@ mod tests {
     /// gives a test a window to read `GET /events/{event_id}` while the run
     /// is still live, before letting it complete. Mirrors
     /// `abort_integration.rs`'s `WaitNode`.
+    struct PanicNode;
+
+    #[async_trait::async_trait]
+    impl Node for PanicNode {
+        async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            panic!("PanicNode always panics — regression fixture for the catch_unwind guard");
+        }
+
+        fn name(&self) -> &str {
+            "PanicNode"
+        }
+    }
+
+    fn panic_fixture_schema() -> WorkflowSchema {
+        let mut nodes = StdHashMap::new();
+        nodes.insert(
+            "PanicNode".to_string(),
+            engine_core::NodeConfig::new("PanicNode", vec![]),
+        );
+        WorkflowSchema::new("panic-fixture", "PanicNode", nodes)
+    }
+
+    fn test_app_state_with_panic_node() -> AppState {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            panic_fixture_schema(),
+            Box::new(|_event: &serde_json::Value| {
+                let mut registry = NodeRegistry::new();
+                registry.register(Box::new(PanicNode));
+                Ok(Workflow::new(registry, panic_fixture_schema()))
+            }),
+        );
+
+        AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_panicking_node_reads_back_as_failed_instead_of_leaking_the_run_forever() {
+        // Regression test for the confirmed-but-previously-unfixed gap: a
+        // node panicking (as opposed to returning `Err`) used to abort the
+        // spawned task before its cleanup ran, leaking the run in
+        // `live_run_metadata()`/`RunRegistry` forever (`GET /events/{id}`
+        // reporting "running" indefinitely, `POST /events/{id}/abort` never
+        // 404ing). `catch_unwind` around `run_with` now guarantees cleanup
+        // always runs.
+        let state = test_app_state_with_panic_node();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "panic-fixture", "data": {} }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let event_id = trigger_body["event_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("event_id should be a parseable UUID");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let poll_req = test::TestRequest::get()
+                .uri(&format!("/events/{event_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let poll_resp = test::call_service(&app, poll_req).await;
+            let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+            if poll_body["status"] != "running" {
+                assert_eq!(
+                    poll_body["status"], "failed",
+                    "a panicking node must read back as failed, not succeeded or stuck running"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run never left \"running\" — the panic leaked the run instead of terminating it"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Cleanup must have fully run: an abort against a run that has
+        // already gone terminal reads as unknown, proving
+        // `RunRegistry::deregister` executed on the panic path too.
+        let abort_req = test::TestRequest::post()
+            .uri(&format!("/events/{event_id}/abort"))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let abort_resp = test::call_service(&app, abort_req).await;
+        assert_eq!(
+            abort_resp.status(),
+            404,
+            "the cancellation token should have been deregistered once the panicked run went terminal"
+        );
+    }
+
     struct WaitNode {
         release: std::sync::Arc<tokio::sync::Notify>,
     }

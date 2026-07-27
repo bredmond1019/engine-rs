@@ -115,7 +115,9 @@ fn registry() -> &'static RwLock<Registry> {
 /// Get-or-create the live sender for `run_id`.
 fn sender_for(run_id: RunId) -> broadcast::Sender<StreamFrame> {
     {
-        let guard = registry().read().expect("stream registry lock poisoned on read");
+        let guard = registry()
+            .read()
+            .expect("stream registry lock poisoned on read");
         if let Some(sender) = guard.live.get(&run_id) {
             return sender.clone();
         }
