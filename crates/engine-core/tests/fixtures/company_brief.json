@@ -1,0 +1,34 @@
+{
+  "company_name": "Anthropic",
+  "outreach_hooks": [
+    "Claude Code quadrupled subscriptions—how are you handling internal engineering knowledge at 4× scale? I build private RAG systems that let distributed eng teams search docs/decisions/incident postmortems instantly, cutting onboarding time and reducing duplicate work.",
+    "Saw you brought on 32 safety researchers to tackle AI misuse risks—that's a lot of threat models, academic papers, and incident data to wrangle. I specialize in agentic research assistants that index internal corpora and surface relevant findings on-demand, so your red team can move faster.",
+    "With your IPO filing and $965B valuation, investor diligence and board reporting just got real. I build workflow automation for compliance docs, cross-functional reporting pipelines, and executive briefing bots—freeing your ops team to focus on strategic work, not manual data gathering.",
+    "381 open positions + top hires from OpenAI/Microsoft/academia means serious onboarding friction. I design interactive AI assistants that answer 'how do we do X here?' instantly—trained on your internal repos, Slack history, and runbooks—so new engineers ship code week one, not month two."
+  ],
+  "pain_points": [
+    "Hypergrowth scaling challenges: 381+ open positions and quadrupling subscriptions signal urgent needs in onboarding automation, internal knowledge management, and cross-team coordination systems as headcount explodes",
+    "Enterprise customer success strain: With cloud partnerships (AWS, Google) and rapidly growing enterprise/team subscriptions, they likely need better internal tooling for customer documentation, integration playbooks, and support knowledge bases accessible to distributed teams",
+    "Safety research infrastructure: Hiring 32 AI misuse experts and launching safety initiatives requires robust internal research systems—private RAG over threat models, incident databases, policy documents, and academic literature to accelerate red-teaming and risk assessment",
+    "Pre-IPO operational readiness: Confidential IPO filing and investor meetings demand tight process documentation, compliance workflows, cross-functional reporting automation, and executive briefing systems to manage diligence and board communications at scale",
+    "Distributed talent integration: New hires from diverse backgrounds (OpenAI, Microsoft, academia, startups) need rapid access to internal context—engineering docs, safety protocols, product specs, research findings—suggesting a need for intelligent onboarding assistants and searchable institutional knowledge"
+  ],
+  "recent_developments": [
+    "Filed confidentially for IPO on June 1, 2026 after $65B Series H raise at $965B valuation, becoming the most valuable private AI company",
+    "Launched Claude Opus 5 (July 24) and Claude Sonnet 5 (June 30) with frontier performance for agents and coding",
+    "Major hiring spree bringing on Andrej Karpathy (OpenAI co-founder), John Jumper (Nobel laureate), Tom Blomfield (Monzo/YC), Eric Boyd (ex-Microsoft Azure AI), with 381 open positions across engineering, sales, and safety",
+    "Expanded product portfolio with Claude for Teachers (K-12 education), Claude Cowork (knowledge work), and redeployed Fable 5 globally",
+    "Business subscriptions to Claude Code quadrupled since start of 2026; ARR reached ~$30-47B by mid-2026",
+    "Launched safety hiring push for 32 experts to tackle AI misuse risks (nuclear, financial scams, etc.) with salaries in mid-to-upper $200Ks",
+    "Committed $10M to Canadian AI research and proposed industry-wide jailbreak severity scoring framework with Amazon, Microsoft, Google"
+  ],
+  "sources": [
+    "https://www.taskade.com/blog/anthropic-claude-history",
+    "https://www.anthropic.com/news/anthropic-raises-30-billion-series-g-funding-380-billion-post-money-valuation",
+    "https://sacra.com/c/anthropic/",
+    "https://www.recruitingfromscratch.com/blog/anthropic-hiring-2026",
+    "https://www.axios.com/2026/07/15/anthropic-hiring-catastrophe-amodei",
+    "https://www.anthropic.com"
+  ],
+  "summary": "Anthropic is an AI safety and research company that develops Claude, a family of frontier AI models (Mythos, Fable, Opus, Sonnet, Haiku). Operating as a public benefit corporation, they monetize through API access, subscriptions (Pro/Team/Enterprise), and cloud partnerships with AWS and Google Cloud. As of mid-2026, Anthropic has reached ~$30-47B ARR, raised $65B Series H at $965B valuation (surpassing OpenAI), filed confidentially for IPO in June 2026, and is in hypergrowth mode with 381+ open positions. Recent 2026 highlights include hiring top AI talent (Andrej Karpathy, John Jumper, Tom Blomfield), launching Claude Opus 5 and Sonnet 5, expanding specialized products (Claude Code, Cowork, Claude for Teachers), and scaling safety initiatives."
+}
