@@ -5,11 +5,26 @@
 
 use engine_contract::envelope::{ChannelType, IngressEnvelope};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::policy::PartialContentPipelinePolicy;
 
 fn default_target_lang() -> String {
     "pt-BR".to_string()
+}
+
+/// An optional chain/trigger request an inbound `CONTENT_PIPELINE` event can
+/// carry, asking `ActionDispatchNode` (`EN.6.A` task 3) to dispatch a
+/// follow-on `TriggerWorkflow` action once this run completes. Mirrors the
+/// private shape `action_dispatch.rs` already parses directly off the raw
+/// event — this is the typed schema surface for the same field (task 3
+/// predates this typed field on `ContentPipelineInput`; task 4 adds it here
+/// so the declared schema documents what the node already accepts).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerRequest {
+    pub workflow_type: String,
+    #[serde(default)]
+    pub event: Value,
 }
 
 /// The `event` schema for `workflow_type = "CONTENT_PIPELINE"`.
@@ -26,6 +41,9 @@ pub struct ContentPipelineInput {
     /// Named profile override (EN.4.0 convention).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Optional workflow-chain request; see [`TriggerRequest`] (`EN.6.A`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerRequest>,
 }
 
 /// The self-critic verdict for one loop pass.
@@ -105,6 +123,38 @@ mod tests {
         assert!(input.translate);
         assert_eq!(input.target_lang, "es");
         assert_eq!(input.profile.as_deref(), Some("baseline"));
+    }
+
+    #[test]
+    fn content_pipeline_input_deserializes_without_a_trigger_field() {
+        let input: ContentPipelineInput =
+            serde_json::from_value(minimal_web_article_event()).expect("deserializes");
+        assert!(input.trigger.is_none());
+    }
+
+    #[test]
+    fn content_pipeline_input_deserializes_with_a_trigger_field() {
+        let mut event = minimal_web_article_event();
+        event["trigger"] = json!({
+            "workflow_type": "OTHER_WORKFLOW",
+            "event": { "foo": "bar" },
+        });
+
+        let input: ContentPipelineInput = serde_json::from_value(event).expect("deserializes");
+        let trigger = input.trigger.expect("trigger present");
+        assert_eq!(trigger.workflow_type, "OTHER_WORKFLOW");
+        assert_eq!(trigger.event["foo"], json!("bar"));
+    }
+
+    #[test]
+    fn trigger_request_round_trips() {
+        let trigger = TriggerRequest {
+            workflow_type: "OTHER_WORKFLOW".to_string(),
+            event: json!({ "foo": "bar" }),
+        };
+        let value = serde_json::to_value(&trigger).expect("serializes");
+        let round_tripped: TriggerRequest = serde_json::from_value(value).expect("deserializes");
+        assert_eq!(round_tripped, trigger);
     }
 
     #[test]

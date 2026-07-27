@@ -22,31 +22,11 @@ use engine_serve::dispatch::Dispatcher;
 use engine_serve::durable::spawn_durable_writer;
 use engine_serve::http::{configure, AppState};
 use engine_serve::live_state::LiveStateStore;
+use engine_serve::test_fixtures::WaitNode;
 use tokio::sync::Notify;
 
 const FIXTURE_WORKFLOW_TYPE: &str = "abort-fixture";
 const API_KEY: &str = "abort-test-key";
-
-/// First node in the fixture graph: blocks in `process` until `release` is
-/// notified, so the test has a window to grab the freshly-minted `run_id`
-/// from the live-state store and abort it while the run is still live.
-struct WaitNode {
-    release: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl Node for WaitNode {
-    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        self.release.notified().await;
-        ctx.nodes
-            .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
-        Ok(ctx)
-    }
-
-    fn name(&self) -> &str {
-        "WaitNode"
-    }
-}
 
 /// Second node in the fixture graph. A cancellation triggered while
 /// `WaitNode` is running is only observed at the next node boundary (task 3
@@ -85,9 +65,7 @@ fn test_app_state(release: Arc<Notify>) -> AppState {
         fixture_schema(),
         Box::new(move |_event: &serde_json::Value| {
             let mut registry = NodeRegistry::new();
-            registry.register(Box::new(WaitNode {
-                release: release.clone(),
-            }));
+            registry.register(Box::new(WaitNode::new(release.clone())));
             registry.register(Box::new(SuccessNode));
             Ok(Workflow::new(registry, fixture_schema()))
         }),

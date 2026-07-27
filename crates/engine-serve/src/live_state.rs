@@ -168,13 +168,6 @@ impl LiveStateStore {
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     ) {
-        {
-            let mut live = self
-                .inner
-                .write()
-                .expect("live state store lock poisoned on write");
-            live.remove(&run_id);
-        }
         let record = RunRecord {
             snapshot: snapshot.clone(),
             workflow_type: workflow_type.into(),
@@ -182,11 +175,23 @@ impl LiveStateStore {
             updated_at,
             terminal: true,
         };
-        let mut completed = self
-            .completed
+        // Insert into the completed ring *before* removing from the live
+        // map: `inner` and `completed` are separate locks, so a `get`/
+        // `get_record` landing between the two operations must never find
+        // the run in neither — briefly present in both is fine, absent from
+        // both is a spurious "unknown run".
+        {
+            let mut completed = self
+                .completed
+                .write()
+                .expect("completed run ring lock poisoned on write");
+            completed.insert(run_id, record);
+        }
+        let mut live = self
+            .inner
             .write()
-            .expect("completed run ring lock poisoned on write");
-        completed.insert(run_id, record);
+            .expect("live state store lock poisoned on write");
+        live.remove(&run_id);
     }
 }
 
@@ -341,6 +346,43 @@ mod tests {
             "a live run must never be evicted by the completed-run cap"
         );
         assert!(store.list_active().contains(&live_run));
+    }
+
+    #[test]
+    fn a_run_is_never_absent_from_both_maps_during_mark_terminal() {
+        // Regression test: `mark_terminal` used to remove the run from the
+        // live map before inserting it into the completed ring, so a
+        // `get`/`get_record` landing between the two separate lock
+        // acquisitions could find the run in neither. Hammer the
+        // transition from a concurrent reader, across many iterations, to
+        // catch a reordering regression.
+        for _ in 0..500 {
+            let store = LiveStateStore::new();
+            let run_id = Uuid::new_v4();
+            let snapshot = fixture_context("racing");
+            store.record(run_id, &snapshot);
+
+            let reader_store = store.clone();
+            let missing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader_missing = missing.clone();
+            let reader = std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    if reader_store.get(run_id).is_none() {
+                        reader_missing.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                }
+            });
+
+            let now = Utc::now();
+            store.mark_terminal(run_id, &snapshot, "wf", now, now);
+            reader.join().expect("reader thread should not panic");
+
+            assert!(
+                !missing.load(std::sync::atomic::Ordering::SeqCst),
+                "run vanished from both the live map and the completed ring mid-transition"
+            );
+        }
     }
 
     #[test]

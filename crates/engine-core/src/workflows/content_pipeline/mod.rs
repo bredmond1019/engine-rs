@@ -41,11 +41,14 @@
 //!   (task 11).
 //! - `graph` — the declared `WorkflowSchema` / `NodeRegistry` /
 //!   `registry_for_policy` (Local rewire) / `Workflow` assembly (task 12).
+//! - `action_dispatch` — `ActionDispatchNode`, the egress terminal node
+//!   appended after `PersistToBrainNode` (`EN.6.A` task 3).
 //!
 //! `WORKFLOW_TYPE` lives in `graph` (mirrors `proposal_generator::graph` /
 //! `research_agent::graph` / `diagnostic_intake::graph` /
 //! `sdlc_flow::graph`).
 
+pub mod action_dispatch;
 pub mod critic_router;
 pub mod digest_render;
 pub mod fetch_article;

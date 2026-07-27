@@ -55,6 +55,7 @@ pub fn baseline() -> PartialContentPipelinePolicy {
         local: None,
         max_critic_iterations: Some(3),
         critic_confidence_threshold: Some(0.8),
+        dispatch_verbosity: Some(OutputVerbosity::Normal),
     }
 }
 
@@ -79,6 +80,7 @@ pub fn local_drafting() -> PartialContentPipelinePolicy {
         }),
         max_critic_iterations: None,
         critic_confidence_threshold: None,
+        dispatch_verbosity: None,
     }
 }
 
@@ -98,6 +100,7 @@ pub fn fast_summarize() -> PartialContentPipelinePolicy {
         local: None,
         max_critic_iterations: None,
         critic_confidence_threshold: None,
+        dispatch_verbosity: None,
     }
 }
 
@@ -275,6 +278,7 @@ mod tests {
         assert_eq!(p.prompt_cache, Some(false));
         assert_eq!(p.max_critic_iterations, Some(3));
         assert_eq!(p.critic_confidence_threshold, Some(0.8));
+        assert_eq!(p.dispatch_verbosity, Some(OutputVerbosity::Normal));
     }
 
     #[test]

@@ -15,11 +15,21 @@
 //! to the brain ingest endpoint (Synapse's `POST /ingest/*`, `OR.Q`) — a
 //! `reqwest`-backed live implementation plus a test stub that records the
 //! last payload it was handed.
+//!
+//! `channel_transport` (`EN.6.A` task 1) is the injectable egress seam
+//! `ActionDispatchNode` calls to deliver a run's outbound actions (digest
+//! replies, workflow-trigger chaining) to the channel that originated it —
+//! mirrors `http_post`'s trait + live impl + recording stub shape.
 
+pub mod channel_transport;
 pub mod claude_code_step;
 pub mod http_post;
 pub mod openai_compat_transport;
 
+pub use channel_transport::{
+    ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody, StubChannelTransport,
+    UnwiredChannelTransport, WorkflowTriggerDispatch,
+};
 pub use claude_code_step::{ClaudeCodeStep, MetaTransport, TransportInfo};
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
 pub use openai_compat_transport::{

@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-25T21:30:39Z"
+timestamp: "2026-07-27T18:08:43Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,26 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ---
+
+## [run: 2026-07-27]
+
+### `EN.6.A-egress-dispatch` done — ChannelTransport seam, ActionDispatchNode, workflow-trigger dispatch
+- **What:** Ran `/sdlc-flow EN.6.A-egress-dispatch` (branch `EN.6.A-egress-dispatch-flow`); all 7 tasks passed. Task 1 landed the `ChannelTransport` egress seam in `engine-core` — `OutboundAction`/`OutboundBody`/`ChannelSendReceipt` types, the trait, `StubChannelTransport`, and `UnwiredChannelTransport` (mirroring `HttpPost`). Task 2 gave `WorkflowTriggerDispatch` a working POST to `/events/` — `{workflow_type, data}` carrying an `X-API-Key` header (via an additive `HttpPost::post_with_headers`, default-delegating so every existing call site stayed untouched), an 8-hop chain-depth cap, and a preference for an injected in-process `Dispatcher` (fire-and-forget via `tokio::task::spawn_blocking`, since `Workflow::run`'s `OnProgress` isn't `Send` and can't cross an await point inside the Send-bound `ChannelTransport::send`) over the HTTP loopback fallback; `channel_transport_live()` now routes `WorkflowTrigger` through it and every other channel to `UnwiredChannelTransport`. Task 3 added `ActionDispatchNode`, the deterministic terminal `CONTENT_PIPELINE` egress node — a digest reply `OutboundAction` when `reply_context` is present, a `TriggerWorkflow` action when the raw event carries a `trigger` request, sent over the injectable seam, never failing the run on a transport error (`delivered:false` receipt instead), with every stored receipt stamped with the run's `envelope_id`. Task 4 wired `ActionDispatchNode` into the declared graph after `PersistToBrainNode`, added a non-model `dispatch_verbosity` policy stage that never rewires under Local, and gave `ContentPipelineInput` a typed `trigger` field — plus a collateral fix to the pre-existing `content_pipeline_e2e.rs` fixture, which needed `ActionDispatchNode` registered to keep `Workflow::new_validated` satisfied. Task 5 wired `engine-serve`'s `register_content_pipeline` to re-register `ActionDispatchNode` with `channel_transport_live` pointed at a new `ENGINE_EVENTS_URL` env var (falling back to the prior localhost placeholder), updated `harness.json`'s `dispatch_verbosity` default, and brought `architecture.md` §3.3/§5/§7.2 back in sync with the shipped API. Task 6 added the hermetic `action_dispatch_e2e.rs` suite driving the real graph through `PersistToBrainNode → ActionDispatchNode`, covering reply-digest matching, fire-and-forget, `TriggerWorkflow` dispatch (URL/payload/`X-API-Key` via `StubHttpPost::last_call`), chain-depth-cap refusal, unwired-channel `delivered=false` naming EN.6.D, failing-transport resilience, `EventsRow` round-trip with receipts, and Local-profile rewire leaving `ActionDispatchNode` untouched. Task 7 ran the full workspace gate (`fmt`/`clippy -D warnings`/`test --workspace`/`build --release`) clean, with the architecture doc already in sync — no changes needed.
+- **Why:** Gives every EN.6.B–D channel adapter a single already-tested `ChannelTransport` seam to implement against, and closes the loop for workflow chaining (a triggered child run can itself trigger further runs, capped and correlated) now that `EN.5.F` made `/events/` non-blocking.
+- **Verdict:** PASS (review found no findings). Docs: `docs/content-pipeline-workflow.md`, `docs/index.md` updated.
+- **Status:** `planning/state.json` block `EN.6.A` set to `"closed"`; `planning/status.md` Progress Table gained a new Phase 6 section with `EN.6.A` flipped to Done.
+- **Next:** EN.6.C/D — Slack/Telegram/WhatsApp adapter skeletons (need detailing before scheduling) now that the `ChannelTransport` seam exists, or EN.4.D — DELIVERABLE_RENDER (net-new, roadmap → PDF), independently available.
+
+```
+4bd6865 chore: flow state — docs
+0cdd99a docs: update docs for EN.6.A-egress-dispatch
+26f4633 feat: implement EN.6.A-egress-dispatch-task6
+24c969e feat: implement EN.6.A-egress-dispatch-task5
+befc20a feat: implement EN.6.A-egress-dispatch-task4
+c9d7746 feat: implement EN.6.A-egress-dispatch-task3
+4c2bf3f feat: implement EN.6.A-egress-dispatch-task2
+40a7a82 feat: implement EN.6.A-egress-dispatch-task1
+```
 
 ## [run: 2026-07-27]
 

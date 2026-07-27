@@ -717,6 +717,7 @@ dependencies = [
  "chrono",
  "engine-contract",
  "engine-core",
+ "engine-serve",
  "engine-store",
  "futures",
  "serde",

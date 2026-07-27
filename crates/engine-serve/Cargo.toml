@@ -18,3 +18,14 @@ sqlx = { workspace = true }
 actix-web = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+
+[features]
+# Exposes `test_fixtures` (shared Node fixtures for unit + integration
+# tests) outside of `cfg(test)`. Never enabled by a normal dependent —
+# only by this crate's own [dev-dependencies] entry below, so every
+# `tests/*.rs` integration binary gets it, but `bastion` (a normal
+# dependent) never does.
+test-fixtures = []
+
+[dev-dependencies]
+engine-serve = { path = ".", features = ["test-fixtures"] }
