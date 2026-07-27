@@ -56,7 +56,18 @@ engine-rs/
 │   │                         with_cancellation_token(), EN.2.B; http_post.rs — the injectable
                          `HttpPost` trait seam + `reqwest`-backed live impl + `StubHttpPost` test
                          double, EN.4.C, used by `proposal_generator::PersistToBrainNode` to POST
-                         a finished artifact to Synapse's brain-ingest endpoint)
+                         a finished artifact to Synapse's brain-ingest endpoint; channel_transport.rs
+                         — the injectable `ChannelTransport` egress seam `ActionDispatchNode` calls
+                         to deliver outbound actions to the channel that originated them, EN.6.A;
+                         doc_materializer.rs — the injectable `DocMaterializer` seam
+                         `MaterializeDocNode` calls to plan + write a `BrainDocModel`-shaped
+                         artifact into the Brain corpus via `mev`/`okf-core` in-process, live impl
+                         + `StubDocMaterializer` test double, EN.7.A task 3; materialize_doc.rs —
+                         `MaterializeDocNode` itself, the generic writer node every future pipeline
+                         appends, EN.7.A task 4), brain_root.rs (`resolve_brain_root`/
+                         `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
+                         `mev::brain::config::find_brain_root` walking up from cwd for
+                         `brain.toml`, typed `BrainRootError`, EN.7.A task 2)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -101,6 +112,23 @@ engine-rs/
     read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow,
     and 422 for an unregistered workflow_type)
 ```
+
+## Injectable Seams
+
+Three `crates/engine-core/src/nodes/*` seams share one shape — a trait, a live implementation
+backed by the real external dependency, and a recording test stub — so production callers reach
+for the live impl while the gated `cargo test` suite injects the stub and never performs the real
+I/O:
+
+| Seam | Trait / live impl | Test stub | Used by | Boundary |
+|---|---|---|---|---|
+| `http_post.rs` (`EN.4.C`) | `HttpPost` / `ReqwestHttpPost` (`http_post_live()`) | `StubHttpPost` | `proposal_generator::PersistToBrainNode`, `content_pipeline::PersistToBrainNode` | POSTs a finished artifact to Synapse's brain-ingest endpoint (`OR.Q`) |
+| `channel_transport.rs` (`EN.6.A`) | `ChannelTransport` / `channel_transport_live()` | `StubChannelTransport` | `content_pipeline::ActionDispatchNode` | Delivers outbound actions (digest replies, workflow-trigger chaining) back to the channel that originated the run |
+| `doc_materializer.rs` (`EN.7.A`) | `DocMaterializer` / `MevDocMaterializer` (`doc_materializer_live()`) | `StubDocMaterializer` | `nodes::MaterializeDocNode` | Plans + writes a `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md` document via `mev`/`okf-core` in-process (D53's fourth boundary-test channel) |
+
+See [materialize-doc-node.md](materialize-doc-node.md) for the `DocMaterializer` seam and
+`MaterializeDocNode` in detail, and [content-pipeline-workflow.md](content-pipeline-workflow.md)
+for `HttpPost` and `ChannelTransport` in their workflow context.
 
 ## Build & CI
 
