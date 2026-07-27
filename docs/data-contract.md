@@ -6,13 +6,13 @@ doc_id: data-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.3.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback]
+keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.4.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse]
 related: [architecture, D6-cancellation-and-budget-semantics, D20-shared-data-contract]
 ---
 
 # Data Contract (Consumer View)
 
-**Pinned Contract Version: 1.3.0**
+**Pinned Contract Version: 1.4.0**
 
 The **canonical, authoritative** contract is owned by the orchestrator:
 `orchestrator/docs/data-contract.md`. This file is engine-rs's *consumer* view — it pins the
@@ -223,6 +223,18 @@ now has a live target to POST to instead of its `HttpPost` stub, but still POSTs
 placeholder `BRAIN_INGEST_URL` constant rather than this route — pointing it at the real Synapse
 `/ingest/proposal` endpoint is unfinished follow-on work (see `planning/decisions/D9-engine-brain-boundary.md`).
 
+The canonical contract's v1.4.0 adds three more routes, `GET /recall`, `GET /walk`, and
+`GET /pulse` (`OR.Q2`) — the read half of the D51 HTTP adapter whose write half (`POST
+/ingest/*`) landed in v1.3.0, implemented only in the orchestrator's own Python API (`app/api/
+read.py`), **not** in `engine-serve`, and not planned to be: these are corpus-read routes
+engine-rs could *call* as a client, not routes it needs to *serve* for runtime interchangeability
+(the two runtimes' interchangeability contract is about `events`/`task_context`, not the Brain
+corpus). All three reuse the same `X-API-Key` gate as `POST /events/` and reject a missing/
+malformed query param with a typed `422` (never `500`). No `engine_contract` Rust type changes
+shape — no engine-rs workflow calls any of the three today; wiring a hybrid workflow to `GET
+/recall` (e.g. to ground a proposal draft in existing corpus content before persisting it via
+`POST /ingest/proposal`) remains open follow-on work.
+
 ---
 
 ## Re-pin checklist (when the canonical contract bumps)
@@ -248,3 +260,4 @@ placeholder `BRAIN_INGEST_URL` constant rather than this route — pointing it a
 | 1.2.0 | 2026-07-24 | Re-pin from 1.1.0 to 1.2.0 (`OR.Y`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.2.0 additions, none yet ported to `engine-serve`: the orchestrator's own `GET /events/{event_id}` read route and the `event_id` field on `POST /events/`'s 202 body (§ HTTP surface parity above), and the `metadata.failure` run-level annotation (§ Run-level `metadata` annotations above). No `engine_contract` Rust type changed shape — `metadata.failure` lives in the existing free-form `metadata` field, per D6. Porting the read route and `event_id` field to `engine-serve` for HTTP-surface parity is future work. |
 | 1.3.0 | 2026-07-24 | Re-pin from 1.2.0 to 1.3.0 (`OR.Q`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.3.0 additions, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact`, both `X-API-Key` gated with a typed `422` on malformed bodies. `/ingest/proposal` gives `EN.4.C`'s `PersistToBrainNode` a live endpoint matching the payload it already stubs — `{artifact_id, company_name, doc_type, section, content, roadmap}` → `200 {artifact_id, chunks_written}`. No `engine_contract` Rust type changed shape; these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. `EN.4.C` (built, see [proposal-generator-workflow.md](proposal-generator-workflow.md)) still POSTs to a hardcoded placeholder URL rather than this route; wiring `PersistToBrainNode` to POST here for real remains open follow-on work. |
 | 1.3.0 | 2026-07-27 | `EN.5.F` (engine-rs-side; not a canonical re-pin — **Pinned Contract Version stays 1.3.0**, this ports an already-canonical route rather than adding a new one). Ports the canonical v1.2.0 `GET /events/{event_id}` route and the `event_id` field on `POST /events/`'s `202` body into `engine-serve` (§ HTTP surface parity above): `POST /events/` now spawns the run and returns `202 {run_id, event_id}` immediately instead of awaiting it, and no longer returns `500` on a run failure — failure now surfaces through the `GET /events/{event_id}` readback (`status: "failed"`) and the terminal SSE frame. Adds `GET /events/{event_id}/stream`, an engine-rs-only SSE extension with no canonical counterpart. Sets a default HTTP-path `Budget` read from `ENGINE_RUN_MAX_COST_USD` (default `5.0`) / `ENGINE_RUN_MAX_TOKENS` (default unset). `LiveStateStore` now retains the most recent 100 completed runs (`COMPLETED_RUN_RETENTION`) in a bounded ring for the readback. No `engine_contract` Rust type changed shape. |
+| 1.4.0 | 2026-07-27 | Re-pin from 1.3.0 to 1.4.0 (`OR.Q2`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.4.0 additions, orchestrator-only (§ HTTP surface parity above): `GET /recall`, `GET /walk`, `GET /pulse` — the read half of the D51 HTTP adapter whose write half (`POST /ingest/*`) landed in v1.3.0, thin `X-API-Key`-gated adapters over the orchestrator's `app/brain/` read core. No `engine_contract` Rust type changed shape; these are corpus-read routes engine-rs could call as a client, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. No engine-rs workflow calls any of the three today; wiring one (e.g. grounding a proposal draft via `GET /recall` before persisting through `POST /ingest/proposal`) remains open follow-on work. |
