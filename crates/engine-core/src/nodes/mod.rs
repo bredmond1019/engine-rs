@@ -27,11 +27,19 @@
 //! document via `mev`/`okf-core` in-process — a live `mev`-backed
 //! implementation plus a test stub that records the last call it was
 //! handed, mirroring `http_post`'s shape.
+//!
+//! `materialize_doc` (`EN.7.A` task 4) is `MaterializeDocNode` itself — the
+//! generic, reusable node that reads a `BrainDocModel`-shaped artifact out
+//! of an upstream node's `TaskContext` (or `ctx.event`) and calls the
+//! `doc_materializer` seam to write it into the Brain corpus. It lives here
+//! rather than under a `workflows::*` module because every future pipeline
+//! appends it; `EN.7.B` wires concrete instances into specific graphs.
 
 pub mod channel_transport;
 pub mod claude_code_step;
 pub mod doc_materializer;
 pub mod http_post;
+pub mod materialize_doc;
 pub mod openai_compat_transport;
 
 pub use channel_transport::{
@@ -44,6 +52,7 @@ pub use doc_materializer::{
     MaterializedFile, RecordedMaterializeCall, StubDocMaterializer,
 };
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
+pub use materialize_doc::MaterializeDocNode;
 pub use openai_compat_transport::{
     default_local_http_post, openai_compat_meta_transport, openai_compat_meta_transport_live,
     openai_compat_transport, openai_compat_transport_live, LocalHttpPost,

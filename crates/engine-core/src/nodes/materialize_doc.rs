@@ -1,0 +1,359 @@
+//! `MaterializeDocNode` (`EN.7.A` task 4) — the generic, reusable node every
+//! pipeline appends to write a `BrainDocModel`-shaped artifact out of an
+//! upstream node's `TaskContext` into the Brain corpus as a source `.md`
+//! document, via the injectable [`crate::nodes::doc_materializer`] seam.
+//!
+//! Lives under `nodes/`, not under a `workflows::*` module, because it is
+//! generic across pipelines (`EN.7.B` wires instances of it into specific
+//! graphs — that wiring, and the `set-stage`/`add-action` micro-workflows,
+//! are explicitly out of scope here). Modeled on
+//! `crate::workflows::content_pipeline::persist_to_brain::PersistToBrainNode`'s
+//! builder-seam shape: a `NODE_NAME` const, `put_result`/`get_result` for
+//! `ctx.nodes` access, and node-name-prefixed `NodeError` messages.
+//!
+//! Brain-root resolution: an explicit [`MaterializeDocNode::with_brain_root`]
+//! value wins; otherwise `process` calls
+//! [`crate::brain_root::resolve_brain_root`] (which itself honours
+//! `ENGINE_BRAIN_ROOT` before walking up from cwd for `brain.toml`).
+//!
+//! Result stamp: `process` writes `{"materialized", "dry_run", "model",
+//! "paths", "warnings"}` onto `ctx.nodes[self.name()]` — deliberately
+//! `self.name()` rather than the bare `NODE_NAME` const, so a node wrapped in
+//! `EN.5.E`'s `NodeExt::with_identity` lands its result under its own
+//! override identity and two instances can co-exist in one graph without
+//! colliding (exactly what `EN.7.B` needs).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use engine_contract::TaskContext;
+use serde_json::{json, Value};
+
+use crate::brain_root::resolve_brain_root;
+use crate::node::{Node, NodeError};
+use crate::nodes::doc_materializer::{doc_materializer_live, DocMaterializer};
+use crate::workflows::{get_result, put_result};
+
+/// The `Node::name()` identity `MaterializeDocNode` runs under by default,
+/// and the `ctx.nodes` key its result is stamped onto when no identity
+/// override (`NodeExt::with_identity`) is applied.
+pub const NODE_NAME: &str = "MaterializeDocNode";
+
+/// The generic writer node: reads a `BrainDocModel`-shaped artifact out of
+/// an upstream node's `TaskContext` (or the run's own `ctx.event` when no
+/// upstream is configured) and calls the injectable [`DocMaterializer`] seam
+/// to write it into the Brain corpus.
+pub struct MaterializeDocNode {
+    model: String,
+    materializer: Arc<dyn DocMaterializer>,
+    brain_root: Option<PathBuf>,
+    source_node: Option<String>,
+    write: bool,
+}
+
+impl MaterializeDocNode {
+    /// Construct for `model` (one of `"opportunity"`, `"learning-artifact"`,
+    /// `"proposal"` — validated by the seam, not here) with the live
+    /// `mev`-backed materializer, `write = true`, no explicit brain root,
+    /// and no explicit source node (reads `ctx.event`).
+    #[must_use]
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            materializer: doc_materializer_live(),
+            brain_root: None,
+            source_node: None,
+            write: true,
+        }
+    }
+
+    /// Override the [`DocMaterializer`] seam. Tests inject a
+    /// `StubDocMaterializer` so the gated suite never touches disk.
+    #[must_use]
+    pub fn with_materializer(mut self, materializer: Arc<dyn DocMaterializer>) -> Self {
+        self.materializer = materializer;
+        self
+    }
+
+    /// Pin the brain root explicitly, bypassing `resolve_brain_root`. Tests
+    /// use this to point at a `tempfile::tempdir()` corpus.
+    #[must_use]
+    pub fn with_brain_root(mut self, brain_root: impl Into<PathBuf>) -> Self {
+        self.brain_root = Some(brain_root.into());
+        self
+    }
+
+    /// Read the input artifact from `upstream`'s stored `ctx.nodes` entry
+    /// instead of `ctx.event`.
+    #[must_use]
+    pub fn with_source_node(mut self, upstream: impl Into<String>) -> Self {
+        self.source_node = Some(upstream.into());
+        self
+    }
+
+    /// Whether to actually write to disk (`true`, the default) or dry-run
+    /// (`false` — nothing touches disk, but the stamped result still names
+    /// the path(s) that would have been written).
+    #[must_use]
+    pub fn with_write(mut self, write: bool) -> Self {
+        self.write = write;
+        self
+    }
+
+    /// Resolve the input artifact: from `source_node`'s stored `ctx.nodes`
+    /// entry when configured, otherwise from `ctx.event`.
+    fn read_input<'a>(&self, ctx: &'a TaskContext) -> Result<&'a Value, NodeError> {
+        match &self.source_node {
+            Some(upstream) => get_result(ctx, upstream).ok_or_else(|| {
+                NodeError::new(format!("{}: no artifact stored by {upstream}", self.name()))
+            }),
+            None => Ok(&ctx.event),
+        }
+    }
+
+    /// Resolve the brain root: the explicit `with_brain_root` value when
+    /// set, otherwise `crate::brain_root::resolve_brain_root()`.
+    fn resolve_root(&self) -> Result<PathBuf, NodeError> {
+        match &self.brain_root {
+            Some(root) => Ok(root.clone()),
+            None => resolve_brain_root().map_err(|err| {
+                NodeError::new(format!(
+                    "{}: failed to resolve brain root (set ENGINE_BRAIN_ROOT to override): {err}",
+                    self.name()
+                ))
+            }),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Node for MaterializeDocNode {
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        let root = self.resolve_root()?;
+        let input = self.read_input(&ctx)?.clone();
+
+        let outcome = self
+            .materializer
+            .materialize(&root, &self.model, &input, self.write)
+            .await
+            .map_err(|err| NodeError::new(format!("{}: {err}", self.name())))?;
+
+        if let Some(error) = outcome.errors().first() {
+            return Err(NodeError::new(format!(
+                "{}: materialize failed for '{}': {}",
+                self.name(),
+                error.file.display(),
+                error.message
+            )));
+        }
+
+        let paths: Vec<Value> = outcome
+            .planned
+            .iter()
+            .map(|file| json!(file.path.display().to_string()))
+            .collect();
+        let warnings: Vec<Value> = outcome
+            .warnings()
+            .iter()
+            .map(|diag| json!(diag.message.clone()))
+            .collect();
+
+        let mut ctx = ctx;
+        put_result(
+            &mut ctx,
+            self.name(),
+            json!({
+                "materialized": outcome.wrote,
+                "dry_run": !self.write,
+                "model": self.model,
+                "paths": paths,
+                "warnings": warnings,
+            }),
+        );
+
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        NODE_NAME
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use crate::node::NodeExt;
+    use crate::nodes::doc_materializer::{
+        MaterializeDiagnostic, MaterializeOutcome, MaterializedFile, StubDocMaterializer,
+    };
+
+    use super::*;
+
+    fn empty_ctx(event: Value) -> TaskContext {
+        TaskContext {
+            event,
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        }
+    }
+
+    fn success_outcome() -> MaterializeOutcome {
+        MaterializeOutcome {
+            wrote: true,
+            planned: vec![MaterializedFile {
+                path: PathBuf::from("/tmp/brain/opportunities/acme.md"),
+                note: "created".to_string(),
+            }],
+            diagnostics: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn process_passes_configured_model_root_and_write_flag_through_to_the_seam() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub.clone()))
+            .with_brain_root("/tmp/brain")
+            .with_write(false);
+
+        let ctx = empty_ctx(json!({"company_name": "Acme"}));
+        node.process(ctx).await.expect("process should succeed");
+
+        let call = stub
+            .last_call()
+            .expect("materialize should have been called");
+        assert_eq!(call.root, PathBuf::from("/tmp/brain"));
+        assert_eq!(call.model, "opportunity");
+        assert_eq!(call.input, json!({"company_name": "Acme"}));
+        assert!(!call.write);
+    }
+
+    #[tokio::test]
+    async fn process_reads_input_from_configured_source_node() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub.clone()))
+            .with_brain_root("/tmp/brain")
+            .with_source_node("UpstreamNode");
+
+        let mut ctx = empty_ctx(json!({}));
+        put_result(&mut ctx, "UpstreamNode", json!({"company_name": "Acme"}));
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let call = stub
+            .last_call()
+            .expect("materialize should have been called");
+        assert_eq!(call.input, json!({"company_name": "Acme"}));
+    }
+
+    #[tokio::test]
+    async fn process_errors_when_configured_source_node_is_missing() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub))
+            .with_brain_root("/tmp/brain")
+            .with_source_node("NopeNode");
+
+        let ctx = empty_ctx(json!({}));
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(err.message.contains("MaterializeDocNode"));
+        assert!(err.message.contains("no artifact stored by NopeNode"));
+    }
+
+    #[tokio::test]
+    async fn process_surfaces_a_seam_failure_as_a_node_error() {
+        let stub = StubDocMaterializer::failing("unknown model 'not-a-model'");
+        let node = MaterializeDocNode::new("not-a-model")
+            .with_materializer(Arc::new(stub))
+            .with_brain_root("/tmp/brain");
+
+        let ctx = empty_ctx(json!({}));
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(err.message.contains("MaterializeDocNode"));
+        assert!(err.message.contains("unknown model"));
+    }
+
+    #[tokio::test]
+    async fn process_surfaces_an_error_severity_diagnostic_as_a_node_error_even_on_success() {
+        let outcome = MaterializeOutcome {
+            wrote: false,
+            planned: vec![MaterializedFile {
+                path: PathBuf::from("/tmp/brain/opportunities/acme.md"),
+                note: "created".to_string(),
+            }],
+            diagnostics: vec![MaterializeDiagnostic {
+                severity: "error".to_string(),
+                file: PathBuf::from("/tmp/brain/opportunities/acme.md"),
+                code: "E_EMIT_WRITE_FAILED".to_string(),
+                message: "permission denied".to_string(),
+            }],
+        };
+        let stub = StubDocMaterializer::succeeding(outcome);
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub))
+            .with_brain_root("/tmp/brain");
+
+        let ctx = empty_ctx(json!({}));
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(err.message.contains("MaterializeDocNode"));
+        assert!(err.message.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn process_stamps_the_documented_result_keys() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub))
+            .with_brain_root("/tmp/brain");
+
+        let ctx = empty_ctx(json!({}));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["materialized"], json!(true));
+        assert_eq!(result["dry_run"], json!(false));
+        assert_eq!(result["model"], json!("opportunity"));
+        assert_eq!(result["paths"], json!(["/tmp/brain/opportunities/acme.md"]));
+        assert_eq!(result["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn with_write_false_stamps_dry_run_true() {
+        let stub = StubDocMaterializer::succeeding(MaterializeOutcome {
+            wrote: false,
+            ..success_outcome()
+        });
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub))
+            .with_brain_root("/tmp/brain")
+            .with_write(false);
+
+        let ctx = empty_ctx(json!({}));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["dry_run"], json!(true));
+        assert_eq!(result["materialized"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn identity_override_stamps_result_under_the_overridden_identity() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub))
+            .with_brain_root("/tmp/brain")
+            .with_identity("MaterializeOpportunityDoc");
+
+        let ctx = empty_ctx(json!({}));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        assert!(ctx.nodes.contains_key("MaterializeOpportunityDoc"));
+        assert!(!ctx.nodes.contains_key(NODE_NAME));
+    }
+}
