@@ -261,15 +261,66 @@ pub fn register_content_pipeline(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `OPPORTUNITY_SET_STAGE` workflow
+/// (`engine_core::workflows::opportunity_edit::graph`) with `dispatcher`,
+/// populating both the `workflow_registry` and the `schema_registry`. See
+/// `planning/EN.7.B-research-opportunity-loop/tasks.md`, Task 6.
+///
+/// This is the **first model-free workflow** registered in this module:
+/// `OpportunityEditNode` calls no model and reads no `harness.json`
+/// section (see `opportunity_edit::graph`'s module doc), so this factory
+/// resolves no policy and seeds no policy stamp — unlike every other
+/// `register_*` function above, there is no `resolve_policy_for_run_from`
+/// call and no `seed_resolved_policy` call. Do not "restore" that hop; it
+/// was never dropped, it was never needed.
+pub fn register_opportunity_set_stage(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::opportunity_edit::graph::set_stage_schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::opportunity_edit::graph::set_stage_registry(),
+                engine_core::workflows::opportunity_edit::graph::set_stage_schema(),
+            ))
+        }),
+    );
+}
+
+/// Register the `OPPORTUNITY_ADD_ACTION` workflow
+/// (`engine_core::workflows::opportunity_edit::graph`) with `dispatcher`,
+/// populating both the `workflow_registry` and the `schema_registry`. See
+/// `planning/EN.7.B-research-opportunity-loop/tasks.md`, Task 6.
+///
+/// This is the **second model-free workflow** registered in this module,
+/// alongside [`register_opportunity_set_stage`]: `OpportunityEditNode`
+/// calls no model and reads no `harness.json` section (see
+/// `opportunity_edit::graph`'s module doc), so this factory resolves no
+/// policy and seeds no policy stamp — there is no `resolve_policy_for_run_from`
+/// call and no `seed_resolved_policy` call. Do not "restore" that hop; it
+/// was never dropped, it was never needed.
+pub fn register_opportunity_add_action(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::opportunity_edit::graph::add_action_schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::opportunity_edit::graph::add_action_registry(),
+                engine_core::workflows::opportunity_edit::graph::add_action_schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
-/// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`, and
-/// `CONTENT_PIPELINE`; future builtins register here too.
+/// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
+/// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, and `OPPORTUNITY_ADD_ACTION`;
+/// future builtins register here too.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_sdlc_flow(dispatcher);
     register_research_agent(dispatcher);
     register_diagnostic_intake(dispatcher);
     register_proposal_generator(dispatcher);
     register_content_pipeline(dispatcher);
+    register_opportunity_set_stage(dispatcher);
+    register_opportunity_add_action(dispatcher);
 }
 
 #[cfg(test)]
@@ -733,5 +784,122 @@ mod tests {
         let workflow =
             workflow.expect("CONTENT_PIPELINE should dispatch with a configured events URL");
         let _ = workflow;
+    }
+
+    #[test]
+    fn register_opportunity_set_stage_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_opportunity_set_stage(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("OPPORTUNITY_SET_STAGE"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_set_opportunity_stage_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_opportunity_set_stage(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("OPPORTUNITY_SET_STAGE")
+            .expect("OPPORTUNITY_SET_STAGE schema should resolve");
+
+        assert_eq!(schema.start_node, "SetOpportunityStageNode");
+    }
+
+    #[test]
+    fn dispatch_opportunity_set_stage_builds_a_runnable_workflow_with_no_policy_stamp() {
+        let mut dispatcher = Dispatcher::new();
+        register_opportunity_set_stage(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "OPPORTUNITY_SET_STAGE",
+                &serde_json::json!({ "slug": "acme", "stage": "contacted" }),
+            )
+            .expect("OPPORTUNITY_SET_STAGE should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_opportunity_set_stage() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("OPPORTUNITY_SET_STAGE"));
+    }
+
+    #[test]
+    fn register_opportunity_add_action_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_opportunity_add_action(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("OPPORTUNITY_ADD_ACTION"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_add_opportunity_action_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_opportunity_add_action(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("OPPORTUNITY_ADD_ACTION")
+            .expect("OPPORTUNITY_ADD_ACTION schema should resolve");
+
+        assert_eq!(schema.start_node, "AddOpportunityActionNode");
+    }
+
+    #[test]
+    fn dispatch_opportunity_add_action_builds_a_runnable_workflow_with_no_policy_stamp() {
+        let mut dispatcher = Dispatcher::new();
+        register_opportunity_add_action(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "OPPORTUNITY_ADD_ACTION",
+                &serde_json::json!({
+                    "slug": "acme",
+                    "at": "2026-07-27T00:00:00Z",
+                    "kind": "call",
+                    "note": "left voicemail",
+                }),
+            )
+            .expect("OPPORTUNITY_ADD_ACTION should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_opportunity_add_action() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("OPPORTUNITY_ADD_ACTION"));
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_all_seven_workflow_types() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        for workflow_type in [
+            "SDLC_FLOW",
+            "RESEARCH_AGENT",
+            "DIAGNOSTIC_INTAKE",
+            "PROPOSAL_GENERATOR",
+            "CONTENT_PIPELINE",
+            "OPPORTUNITY_SET_STAGE",
+            "OPPORTUNITY_ADD_ACTION",
+        ] {
+            assert!(
+                dispatcher.is_registered(workflow_type),
+                "expected {workflow_type} to be registered"
+            );
+        }
     }
 }
