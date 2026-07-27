@@ -9,11 +9,11 @@ retrieval.
 
 ## THE BOUNDARY TEST — read this before scoping any new work
 
-Brain (Synapse) or Engine (engine-rs)? Ask in order. Governed by brain **D51**; this block is
+Brain (Synapse), Engine (engine-rs), or Factory/Doc (mev/okf-core)? Ask in order. Governed by brain **D51** & **D53**; this block is
 byte-identical in `core/orchestrator/CLAUDE.md`.
 
 ```
-THE BOUNDARY TEST — Brain (Synapse) or Engine (engine-rs)?  Ask in order.
+THE BOUNDARY TEST — Brain (Synapse), Engine (engine-rs), or Factory/Doc (mev/okf-core)?  Ask in order.
 
 1. Does it need IN-PROCESS access to embeddings, pgvector, brain_edges,
    or the memory tables?                                    YES -> Synapse
@@ -21,6 +21,8 @@ THE BOUNDARY TEST — Brain (Synapse) or Engine (engine-rs)?  Ask in order.
    (brief, proposal, PDF, PR, code)?                        YES -> engine-rs
 3. Is it maintaining the corpus itself (freshness, validation,
    distillation, retrieval quality, scheduled chores)?      YES -> Synapse
+4. Does it serialize or write a repo-tracked source document
+   (.md with OKF frontmatter)?                              YES -> mev / okf-core (via engine-rs)
 
 TIEBREAKER — if 1 and 2 are both YES, the work is a hybrid.
    SPLIT it at the ingest seam. Never let one repo own both halves.
