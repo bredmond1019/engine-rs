@@ -947,23 +947,7 @@ mod tests {
         );
     }
 
-    struct WaitNode {
-        release: std::sync::Arc<tokio::sync::Notify>,
-    }
-
-    #[async_trait::async_trait]
-    impl Node for WaitNode {
-        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
-            self.release.notified().await;
-            ctx.nodes
-                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
-            Ok(ctx)
-        }
-
-        fn name(&self) -> &str {
-            "WaitNode"
-        }
-    }
+    use crate::test_fixtures::WaitNode;
 
     fn wait_fixture_schema() -> WorkflowSchema {
         let mut nodes = StdHashMap::new();
@@ -985,9 +969,7 @@ mod tests {
             wait_fixture_schema(),
             Box::new(move |_event: &serde_json::Value| {
                 let mut registry = NodeRegistry::new();
-                registry.register(Box::new(WaitNode {
-                    release: release_for_factory.clone(),
-                }));
+                registry.register(Box::new(WaitNode::new(release_for_factory.clone())));
                 Ok(Workflow::new(registry, wait_fixture_schema()))
             }),
         );

@@ -27,6 +27,7 @@ use engine_serve::dispatch::Dispatcher;
 use engine_serve::durable::spawn_durable_writer;
 use engine_serve::http::{configure, AppState};
 use engine_serve::live_state::LiveStateStore;
+use engine_serve::test_fixtures::WaitNode;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -49,30 +50,6 @@ impl Node for SleepNode {
 
     fn name(&self) -> &str {
         "SleepNode"
-    }
-}
-
-/// A node that blocks in `process` until `release` is notified — gives the
-/// test a deterministic window to observe the run mid-flight before letting
-/// it proceed. Mirrors `abort_integration.rs`'s and `http.rs`'s `WaitNode`.
-struct WaitNode {
-    identity: &'static str,
-    release: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl Node for WaitNode {
-    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        self.release.notified().await;
-        ctx.nodes.insert(
-            self.identity.to_string(),
-            serde_json::json!({ "ran": true }),
-        );
-        Ok(ctx)
-    }
-
-    fn name(&self) -> &str {
-        self.identity
     }
 }
 
@@ -262,10 +239,7 @@ async fn readback_transitions_from_running_to_terminal_for_the_same_run() {
         single_node_schema(WORKFLOW_TYPE, "WaitNode"),
         Box::new(move |_event: &serde_json::Value| {
             let mut registry = NodeRegistry::new();
-            registry.register(Box::new(WaitNode {
-                identity: "WaitNode",
-                release: release_for_factory.clone(),
-            }));
+            registry.register(Box::new(WaitNode::new(release_for_factory.clone())));
             Ok(Workflow::new(
                 registry,
                 single_node_schema(WORKFLOW_TYPE, "WaitNode"),
@@ -358,14 +332,14 @@ async fn stream_delivers_one_frame_per_node_transition_then_a_terminal_frame() {
         two_node_schema(WORKFLOW_TYPE, "NodeA", "NodeB"),
         Box::new(move |_event: &serde_json::Value| {
             let mut registry = NodeRegistry::new();
-            registry.register(Box::new(WaitNode {
-                identity: "NodeA",
-                release: release_a_for_factory.clone(),
-            }));
-            registry.register(Box::new(WaitNode {
-                identity: "NodeB",
-                release: release_b_for_factory.clone(),
-            }));
+            registry.register(Box::new(WaitNode::named(
+                "NodeA",
+                release_a_for_factory.clone(),
+            )));
+            registry.register(Box::new(WaitNode::named(
+                "NodeB",
+                release_b_for_factory.clone(),
+            )));
             Ok(Workflow::new(
                 registry,
                 two_node_schema(WORKFLOW_TYPE, "NodeA", "NodeB"),
@@ -580,14 +554,11 @@ async fn aborting_a_spawned_run_reads_back_cancelled_with_the_marker_in_metadata
         two_node_schema(WORKFLOW_TYPE, "WaitNode", "SuccessNode"),
         Box::new(move |_event: &serde_json::Value| {
             let mut registry = NodeRegistry::new();
-            registry.register(Box::new(WaitNode {
-                identity: "WaitNode",
-                release: release_for_factory.clone(),
-            }));
-            registry.register(Box::new(WaitNode {
-                identity: "SuccessNode",
-                release: Arc::new(Notify::new()), // never awaited — this node should never run
-            }));
+            registry.register(Box::new(WaitNode::new(release_for_factory.clone())));
+            registry.register(Box::new(WaitNode::named(
+                "SuccessNode",
+                Arc::new(Notify::new()), // never awaited — this node should never run
+            )));
             Ok(Workflow::new(
                 registry,
                 two_node_schema(WORKFLOW_TYPE, "WaitNode", "SuccessNode"),

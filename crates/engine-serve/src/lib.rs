@@ -10,6 +10,8 @@ pub mod durable;
 pub mod http;
 pub mod live_state;
 pub mod stream;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_fixtures;
 pub mod workflows;
 
 /// Placeholder identifying this crate; exists so the workspace has at least one
