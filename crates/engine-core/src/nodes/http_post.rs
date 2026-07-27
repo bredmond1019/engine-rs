@@ -34,6 +34,23 @@ pub struct HttpPostResponse {
 #[async_trait]
 pub trait HttpPost: Send + Sync {
     async fn post(&self, url: &str, json_body: Value) -> Result<HttpPostResponse, String>;
+
+    /// Same as [`HttpPost::post`], but attaches `headers` (name/value
+    /// pairs) to the outbound request. Added in `EN.6.A` task 2 for the
+    /// workflow-trigger self-POST to `/events/`, which 401s without an
+    /// `X-API-Key` header (`engine-serve`'s `check_api_key`) — the brain
+    /// ingest POST this seam was built for needs no auth header, so the
+    /// default implementation just ignores `headers` and delegates to
+    /// `post`. Only impls that need to actually send headers (and test
+    /// stubs asserting on them) override this.
+    async fn post_with_headers(
+        &self,
+        url: &str,
+        json_body: Value,
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpPostResponse, String> {
+        self.post(url, json_body).await
+    }
 }
 
 /// The real HTTP POST: `reqwest::Client::post(url).json(&body).send()`,
@@ -67,6 +84,36 @@ impl HttpPost for ReqwestHttpPost {
             body,
         })
     }
+
+    async fn post_with_headers(
+        &self,
+        url: &str,
+        json_body: Value,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpPostResponse, String> {
+        let mut request = reqwest::Client::new().post(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+
+        let response = request
+            .json(&json_body)
+            .send()
+            .await
+            .map_err(|err| format!("HTTP POST request failed: {err}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("HTTP POST endpoint returned HTTP {status}"));
+        }
+
+        let body = response.json::<Value>().await.unwrap_or(Value::Null);
+
+        Ok(HttpPostResponse {
+            status: status.as_u16(),
+            body,
+        })
+    }
 }
 
 /// Convenience constructor: an `Arc<dyn HttpPost>` wrapping [`ReqwestHttpPost`].
@@ -82,9 +129,17 @@ pub fn http_post_live() -> Arc<dyn HttpPost> {
 /// POSTed and returns a configurable success/failure response, so unit tests
 /// (this module, `persist_to_brain.rs`, the e2e test) can assert on both the
 /// outbound payload and how the node handles a failure.
+/// A `post_with_headers` call's recorded headers, as owned `(name, value)`
+/// pairs.
+type RecordedHeaders = Vec<(String, String)>;
+
 #[derive(Clone)]
 pub struct StubHttpPost {
     last_call: Arc<Mutex<Option<(String, Value)>>>,
+    /// Headers passed to the most recent `post_with_headers` call, if any
+    /// (added `EN.6.A` task 2 so `WorkflowTriggerDispatch`'s `X-API-Key`
+    /// header is assertable). A plain `post` call leaves this `None`.
+    last_headers: Arc<Mutex<Option<RecordedHeaders>>>,
     result: Arc<Mutex<Result<HttpPostResponse, String>>>,
 }
 
@@ -94,6 +149,7 @@ impl StubHttpPost {
     pub fn succeeding(body: Value) -> Self {
         Self {
             last_call: Arc::new(Mutex::new(None)),
+            last_headers: Arc::new(Mutex::new(None)),
             result: Arc::new(Mutex::new(Ok(HttpPostResponse { status: 200, body }))),
         }
     }
@@ -103,15 +159,23 @@ impl StubHttpPost {
     pub fn failing(error: impl Into<String>) -> Self {
         Self {
             last_call: Arc::new(Mutex::new(None)),
+            last_headers: Arc::new(Mutex::new(None)),
             result: Arc::new(Mutex::new(Err(error.into()))),
         }
     }
 
-    /// The `(url, json_body)` pair passed to the most recent `post` call, if
-    /// any.
+    /// The `(url, json_body)` pair passed to the most recent `post` (or
+    /// `post_with_headers`) call, if any.
     #[must_use]
     pub fn last_call(&self) -> Option<(String, Value)> {
         self.last_call.lock().unwrap().clone()
+    }
+
+    /// The headers passed to the most recent `post_with_headers` call, if
+    /// any call has gone through that path yet.
+    #[must_use]
+    pub fn last_headers(&self) -> Option<RecordedHeaders> {
+        self.last_headers.lock().unwrap().clone()
     }
 }
 
@@ -120,6 +184,21 @@ impl HttpPost for StubHttpPost {
     async fn post(&self, url: &str, json_body: Value) -> Result<HttpPostResponse, String> {
         *self.last_call.lock().unwrap() = Some((url.to_string(), json_body));
         self.result.lock().unwrap().clone()
+    }
+
+    async fn post_with_headers(
+        &self,
+        url: &str,
+        json_body: Value,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpPostResponse, String> {
+        *self.last_headers.lock().unwrap() = Some(
+            headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        );
+        self.post(url, json_body).await
     }
 }
 
@@ -176,6 +255,66 @@ mod tests {
             .expect("succeeding stub should return Ok");
 
         assert_eq!(response.body, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn stub_records_headers_only_when_post_with_headers_is_used() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        assert_eq!(stub.last_headers(), None);
+
+        stub.post("https://example.com/plain", json!({}))
+            .await
+            .expect("succeeding stub should return Ok");
+        assert_eq!(
+            stub.last_headers(),
+            None,
+            "a plain post() call should not populate last_headers"
+        );
+
+        stub.post_with_headers(
+            "https://example.com/events/",
+            json!({"workflow_type": "X"}),
+            &[("X-API-Key", "secret"), ("X-Other", "value")],
+        )
+        .await
+        .expect("succeeding stub should return Ok");
+
+        assert_eq!(
+            stub.last_headers(),
+            Some(vec![
+                ("X-API-Key".to_string(), "secret".to_string()),
+                ("X-Other".to_string(), "value".to_string()),
+            ])
+        );
+        let (url, body) = stub.last_call().expect("call should be recorded");
+        assert_eq!(url, "https://example.com/events/");
+        assert_eq!(body, json!({"workflow_type": "X"}));
+    }
+
+    #[tokio::test]
+    async fn default_post_with_headers_ignores_headers_and_delegates_to_post() {
+        struct HeaderlessHttpPost;
+
+        #[async_trait]
+        impl HttpPost for HeaderlessHttpPost {
+            async fn post(
+                &self,
+                _url: &str,
+                _json_body: Value,
+            ) -> Result<HttpPostResponse, String> {
+                Ok(HttpPostResponse {
+                    status: 200,
+                    body: json!({"via": "post"}),
+                })
+            }
+        }
+
+        let response = HeaderlessHttpPost
+            .post_with_headers("https://example.com", json!({}), &[("X-API-Key", "k")])
+            .await
+            .expect("default post_with_headers should delegate to post");
+
+        assert_eq!(response.body, json!({"via": "post"}));
     }
 
     #[test]
