@@ -1,6 +1,6 @@
 ---
 type: Reference
-title: engine-rs ⇄ Orchestrator Data Contract (Consumer)
+title: engine-rs <-> Orchestrator Data Contract (Consumer)
 description: engine-rs's pinned view of the orchestrator's versioned data contract — how each contract field maps to engine-rs's Rust types, and how engine-rs's own HTTP/write surface tracks the same contract it ports. The canonical contract lives in the orchestrator (Python) repo.
 doc_id: data-contract
 layer: [engine]
