@@ -64,14 +64,41 @@ pub struct StreamFrame {
 /// process-global, mirroring `http.rs`'s `live_run_metadata` precedent.
 struct Registry {
     live: RwLock<StdHashMap<RunId, broadcast::Sender<StreamFrame>>>,
-    terminal: RwLock<StdHashMap<RunId, StreamFrame>>,
+    terminal: RwLock<TerminalCache>,
+}
+
+/// Bounded FIFO cache of terminal frames, mirroring
+/// [`crate::live_state::LiveStateStore`]'s completed-run ring so a
+/// long-lived server process doesn't accumulate one cloned `TaskContext`
+/// per completed run forever.
+#[derive(Default)]
+struct TerminalCache {
+    entries: StdHashMap<RunId, StreamFrame>,
+    order: std::collections::VecDeque<RunId>,
+}
+
+impl TerminalCache {
+    fn insert(&mut self, run_id: RunId, frame: StreamFrame) {
+        if self.entries.insert(run_id, frame).is_none() {
+            self.order.push_back(run_id);
+        }
+        while self.order.len() > crate::live_state::COMPLETED_RUN_RETENTION {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, run_id: RunId) -> Option<StreamFrame> {
+        self.entries.get(&run_id).cloned()
+    }
 }
 
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Registry {
         live: RwLock::new(StdHashMap::new()),
-        terminal: RwLock::new(StdHashMap::new()),
+        terminal: RwLock::new(TerminalCache::default()),
     })
 }
 
@@ -129,18 +156,23 @@ pub fn publish_terminal(run_id: RunId, final_context: &TaskContext) {
     let sender = sender_for(run_id);
     let _ = sender.send(frame.clone());
 
-    // Retire the live sender (drop it so parked receivers observe `Closed`
-    // right after this frame) and cache the frame for late subscribers.
-    registry()
-        .live
-        .write()
-        .expect("stream registry lock poisoned on write")
-        .remove(&run_id);
+    // Cache the frame *before* retiring the live sender: `live` and
+    // `terminal` are separate locks, so a `subscribe` landing between the
+    // two operations must find the frame already cached rather than
+    // falling through to `sender_for`, which would hand it a fresh
+    // broadcast channel nobody will ever publish to again.
     registry()
         .terminal
         .write()
         .expect("terminal frame cache lock poisoned on write")
         .insert(run_id, frame);
+    // Retire the live sender so parked receivers observe `Closed` right
+    // after this frame.
+    registry()
+        .live
+        .write()
+        .expect("stream registry lock poisoned on write")
+        .remove(&run_id);
 }
 
 /// Subscribe to `run_id`'s tee. If the run has already gone terminal,
@@ -153,8 +185,7 @@ pub fn subscribe(run_id: RunId) -> broadcast::Receiver<StreamFrame> {
         .terminal
         .read()
         .expect("terminal frame cache lock poisoned on read")
-        .get(&run_id)
-        .cloned()
+        .get(run_id)
     {
         let (one_shot, receiver) = broadcast::channel(1);
         let _ = one_shot.send(frame);

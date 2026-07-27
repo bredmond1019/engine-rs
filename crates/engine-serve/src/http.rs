@@ -359,12 +359,23 @@ async fn post_events(
                 // No accumulated `TaskContext` comes back from a structural
                 // `WorkflowError`; fall back to the last snapshot `on_progress`
                 // recorded, or an empty context if none was ever recorded.
-                live.get(run_id).unwrap_or_else(|| TaskContext {
+                let mut ctx = live.get(run_id).unwrap_or_else(|| TaskContext {
                     event: serde_json::Value::Null,
                     nodes: StdHashMap::new(),
                     metadata: serde_json::json!({}),
                     node_runs: StdHashMap::new(),
-                })
+                });
+                // Stamp a failure marker so `derive_terminal_status` reports
+                // "failed" instead of falling through to its "succeeded"
+                // default — a structural error must not read back as success.
+                let failure = serde_json::json!({ "failed": true, "error": err.to_string() });
+                match ctx.metadata.as_object_mut() {
+                    Some(metadata) => {
+                        metadata.insert("failure".to_string(), failure);
+                    }
+                    None => ctx.metadata = serde_json::json!({ "failure": failure }),
+                }
+                ctx
             }
         };
 
@@ -451,6 +462,31 @@ async fn get_event(
             "created_at": created_at,
             "updated_at": Utc::now(),
             "task_context": snapshot,
+        }));
+    }
+
+    // Registered by `post_events` before the run is spawned, but the run
+    // only gets its first `LiveStateStore` snapshot once `on_progress` fires
+    // at the first node boundary — a poll landing in that window must still
+    // read back "running", not 404 a run_id the client was just handed.
+    if let Some((workflow_type, created_at)) = live_run_metadata()
+        .read()
+        .expect("live run metadata lock poisoned on read")
+        .get(&event_id)
+        .cloned()
+    {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "event_id": event_id,
+            "workflow_type": workflow_type,
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": Utc::now(),
+            "task_context": TaskContext {
+                event: serde_json::Value::Null,
+                nodes: StdHashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: StdHashMap::new(),
+            },
         }));
     }
 
@@ -936,6 +972,82 @@ mod tests {
                 assert_eq!(poll_body["event_id"], event_id.to_string());
                 assert_eq!(poll_body["workflow_type"], "wait-fixture");
                 assert!(poll_body.get("task_context").is_some());
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run never reached a terminal status");
+    }
+
+    fn unresolvable_fixture_schema(workflow_type: &str) -> WorkflowSchema {
+        let mut nodes = StdHashMap::new();
+        nodes.insert(
+            "GhostNode".to_string(),
+            engine_core::NodeConfig::new("GhostNode", vec![]),
+        );
+        WorkflowSchema::new(workflow_type, "GhostNode", nodes)
+    }
+
+    fn test_app_state_with_unresolvable_workflow() -> AppState {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            unresolvable_fixture_schema("ghost-fixture"),
+            Box::new(|_event: &serde_json::Value| {
+                // Deliberately empty registry: the schema's start node
+                // "GhostNode" is never registered, so `run_with` returns a
+                // structural `WorkflowError` instead of `Ok`.
+                let registry = NodeRegistry::new();
+                Ok(Workflow::new(
+                    registry,
+                    unresolvable_fixture_schema("ghost-fixture"),
+                ))
+            }),
+        );
+
+        AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_structural_workflow_error_reads_back_as_failed_not_succeeded() {
+        let state = test_app_state_with_unresolvable_workflow();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "ghost-fixture", "data": {} }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let event_id = trigger_body["event_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("event_id should be a parseable UUID");
+
+        for _ in 0..200 {
+            let poll_req = test::TestRequest::get()
+                .uri(&format!("/events/{event_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let poll_resp = test::call_service(&app, poll_req).await;
+            let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+            if poll_body["status"] != "running" {
+                assert_eq!(
+                    poll_body["status"], "failed",
+                    "a structural WorkflowError must read back as failed, not succeeded"
+                );
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

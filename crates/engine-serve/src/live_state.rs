@@ -168,13 +168,6 @@ impl LiveStateStore {
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     ) {
-        {
-            let mut live = self
-                .inner
-                .write()
-                .expect("live state store lock poisoned on write");
-            live.remove(&run_id);
-        }
         let record = RunRecord {
             snapshot: snapshot.clone(),
             workflow_type: workflow_type.into(),
@@ -182,11 +175,23 @@ impl LiveStateStore {
             updated_at,
             terminal: true,
         };
-        let mut completed = self
-            .completed
+        // Insert into the completed ring *before* removing from the live
+        // map: `inner` and `completed` are separate locks, so a `get`/
+        // `get_record` landing between the two operations must never find
+        // the run in neither — briefly present in both is fine, absent from
+        // both is a spurious "unknown run".
+        {
+            let mut completed = self
+                .completed
+                .write()
+                .expect("completed run ring lock poisoned on write");
+            completed.insert(run_id, record);
+        }
+        let mut live = self
+            .inner
             .write()
-            .expect("completed run ring lock poisoned on write");
-        completed.insert(run_id, record);
+            .expect("live state store lock poisoned on write");
+        live.remove(&run_id);
     }
 }
 
