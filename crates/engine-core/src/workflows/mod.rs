@@ -20,6 +20,7 @@ use futures::future::BoxFuture;
 
 pub mod content_pipeline;
 pub mod diagnostic_intake;
+pub mod opportunity_edit;
 pub mod proposal_generator;
 pub mod research_agent;
 pub mod sdlc_flow;

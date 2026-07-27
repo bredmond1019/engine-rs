@@ -31,6 +31,9 @@ use serde_json::{json, Value};
 use crate::brain_root::resolve_brain_root;
 use crate::node::{Node, NodeError};
 use crate::nodes::doc_materializer::{doc_materializer_live, DocMaterializer, OpportunityEdit};
+use crate::workflows::opportunity_edit::schema::{
+    AddOpportunityActionEvent, SetOpportunityStageEvent,
+};
 use crate::workflows::put_result;
 
 /// The `Node::name()` identity `OpportunityEditNode` runs under by default,
@@ -140,8 +143,14 @@ impl OpportunityEditNode {
     }
 
     /// Build the `OpportunityEdit` this node's configured op describes,
-    /// reading its arguments off `ctx.event`. A missing or non-string
-    /// argument is a `NodeError` naming the field.
+    /// reading its arguments off `ctx.event`. The fields read here are
+    /// exactly the fields declared by `workflows::opportunity_edit::schema`'s
+    /// `SetOpportunityStageEvent` / `AddOpportunityActionEvent` — those
+    /// schema types are the single source of truth for "which fields does
+    /// this event carry"; this builder assembles one of them field-by-field
+    /// (rather than a single `serde_json::from_value`) purely so a missing
+    /// or ill-typed field can be reported as a `NodeError` naming that
+    /// field, instead of one opaque serde error.
     fn build_edit(&self, event: &Value) -> Result<OpportunityEdit, NodeError> {
         let node_name = self.name();
         let slug = require_str(event, node_name, "slug")?;
@@ -149,17 +158,27 @@ impl OpportunityEditNode {
         match self.op {
             OpportunityEditOp::SetStage => {
                 let stage = require_str(event, node_name, "stage")?;
-                Ok(OpportunityEdit::SetStage { slug, stage })
+                let event = SetOpportunityStageEvent { slug, stage };
+                Ok(OpportunityEdit::SetStage {
+                    slug: event.slug,
+                    stage: event.stage,
+                })
             }
             OpportunityEditOp::AddAction => {
                 let at = require_str(event, node_name, "at")?;
                 let kind = require_str(event, node_name, "kind")?;
                 let note = require_str(event, node_name, "note")?;
-                Ok(OpportunityEdit::AddAction {
+                let event = AddOpportunityActionEvent {
                     slug,
                     at,
                     kind,
                     note,
+                };
+                Ok(OpportunityEdit::AddAction {
+                    slug: event.slug,
+                    at: event.at,
+                    kind: event.kind,
+                    note: event.note,
                 })
             }
         }
