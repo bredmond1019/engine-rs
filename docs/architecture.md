@@ -69,14 +69,22 @@ engine-rs/
 │   │                         `engine_serve::dispatch::*` import site keeps resolving unchanged),
 │   │                         live_state.rs (LiveStateStore —
 │   │                         in-memory Arc<RwLock<HashMap<RunId, TaskContext>>> record/get/
-│   │                         list_active/remove, no-DB-poll read path for the local Console),
+│   │                         list_active/remove, no-DB-poll read path for the local Console; now
+│   │                         also mark_terminal/get_record, EN.5.F — moves a finished run out of
+│   │                         the live map into a bounded 100-entry completed ring so a terminal
+│   │                         run's snapshot survives for HTTP readback),
 │   │                         durable.rs (DurableHandle/spawn_durable_writer/durable_on_progress —
 │   │                         mpsc-bridged async writer mapping on_progress TaskContext snapshots to
 │   │                         engine_contract::EventsRow, inserting the first PENDING snapshot per
 │   │                         run and updating subsequent ones; self-skips Postgres I/O when no
 │   │                         pool/DATABASE_URL is configured), http.rs (actix-web surface: POST
-│   │                         /events/ with X-API-Key gating dispatch + live-state + durable-write,
-│   │                         GET /health, GET /workflows, GET /workflows/{type}/graph), abort.rs
+│   │                         /events/ with X-API-Key gating dispatch + live-state + durable-write
+│   │                         (now spawns the run and returns 202 {run_id, event_id} immediately,
+│   │                         EN.5.F), GET /health, GET /workflows, GET /workflows/{type}/graph,
+│   │                         GET /events/{event_id} (server-derived status readback, EN.5.F)),
+│   │                         stream.rs (GET /events/{event_id}/stream — per-run
+│   │                         tokio::sync::broadcast SSE tee with a terminal-frame cache for late
+│   │                         subscribers, EN.5.F), abort.rs
 │   │                         (POST /events/{run_id}/abort, X-API-Key gated, EN.2.B — backed by a
 │   │                         per-run CancellationToken RunRegistry minted/registered/deregistered
 │   │                         around each post_events run_with call)
@@ -254,7 +262,12 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `planning/decisions/D11-policy-dispatch-seam.md`.
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
-  local Console's no-DB-poll read path for live run state.
+  local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
+  finished run's snapshot out of the live map into a bounded 100-entry completed ring
+  (`COMPLETED_RUN_RETENTION`) instead of dropping it, and `get_record` reads back that snapshot
+  plus `workflow_type`/`created_at`/`updated_at`/a `terminal` flag; `get` checks the live map
+  first, then falls back to the completed ring, so a terminal run keeps serving its last snapshot,
+  while `list_active` only reads the live map so terminal runs are excluded.
 - `DurableHandle` / `spawn_durable_writer` / `durable_on_progress` (`engine-serve::durable`) — an
   mpsc-bridged async durable-write seam mapping `on_progress` `TaskContext` snapshots to
   `engine_contract::EventsRow`: inserts the first (all-PENDING) snapshot per run via
@@ -262,17 +275,30 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   self-skips Postgres I/O (does not fail) when no pool/`DATABASE_URL` is configured. The pure
   `message_to_row(message, created_at, updated_at) -> EventsRow` mapping is tested directly for a
   byte-identical contract shape without a live Postgres connection.
-- HTTP surface (`engine-serve::http`, actix-web) — `configure(cfg)` registers four routes shared
-  by the serve binary and the test harness: `GET /health`, `GET /workflows` (list registered
-  workflow types), `GET /workflows/{type}/graph` (schema graph for a type), and `POST /events/`
-  (X-API-Key gated; dispatches the event, records live state, and enqueues the durable write).
-  `post_events` builds the `OnProgress` box inline and `.await`s `workflow.run_with` directly
-  (EN.2.B; previously `workflow.run`, EN.2.0) — no `web::block`/thread-pool escape hatch, since
-  actix request futures already run on a per-worker single-threaded runtime and `Node::process` is
-  now async. `post_events` mints a `CancellationToken` per run, registers it in `RunRegistry`
-  keyed by `run_id` for the duration of the run, and deregisters it unconditionally after
-  `run_with` returns (`Ok` or `Err`) — so a finished run's `run_id` 404s on a later abort call
-  rather than staying abort-able forever.
+- HTTP surface (`engine-serve::http`, actix-web) — `configure(cfg)` registers routes shared by the
+  serve binary and the test harness: `GET /health`, `GET /workflows` (list registered workflow
+  types), `GET /workflows/{type}/graph` (schema graph for a type), `POST /events/` (X-API-Key
+  gated; dispatches the event, records live state, and enqueues the durable write), and (EN.5.F)
+  `GET /events/{event_id}` (X-API-Key gated readback of a run's canonical shape, served from
+  `LiveStateStore` with no DB query — `404` for an unknown or malformed id).
+  `post_events` mints the `run_id`/`event_id` (they are always equal — both the `events.id`
+  primary key), then spawns the run via `actix_web::rt::spawn` and returns `202 {run_id,
+  event_id}` immediately instead of awaiting `workflow.run_with` (EN.5.F; previously awaited
+  in-request, EN.2.B) — the spawned task marks the run terminal in `LiveStateStore` on every exit
+  path and no longer surfaces a run failure as HTTP `500`; a failed run is now only observable
+  through the `GET /events/{event_id}` readback (`status: "failed"`) or the SSE terminal frame
+  below. `post_events` mints a `CancellationToken` per run, registers it in `RunRegistry` keyed by
+  `run_id` for the duration of the run, and deregisters it unconditionally after `run_with`
+  returns (`Ok` or `Err`) — so a finished run's `run_id` 404s on a later abort call rather than
+  staying abort-able forever. Every HTTP-triggered run is seeded with a default `Budget` read from
+  `ENGINE_RUN_MAX_COST_USD` (default `5.0`) / `ENGINE_RUN_MAX_TOKENS` (default unset).
+- SSE stream (`engine-serve::stream`, EN.5.F) — `GET /events/{event_id}/stream`, a third fan-out
+  registered inside `post_events`'s `on_progress` closure alongside `LiveStateStore::record` and
+  the durable writer. A per-run `tokio::sync::broadcast` sender is registered in a process-global
+  registry keyed by `run_id`; subscribers get every `TaskContext` snapshot as an SSE frame. A
+  small terminal-frame cache means a subscriber that connects *after* a run has already finished
+  still receives a one-shot terminal frame (reusing `http::derive_terminal_status`, `pub(crate)`)
+  and closes cleanly, rather than hanging on an unpublished channel.
 - Abort endpoint (`engine-serve::abort`, EN.2.B) — `POST /events/{run_id}/abort`, gated by the
   same `check_api_key` (widened from private to `pub(crate)`) as `/events/`, backed by
   `RunRegistry` (a registry of live per-run `CancellationToken`s). Looks up `run_id`: `401` on a
