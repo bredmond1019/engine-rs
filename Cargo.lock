@@ -718,6 +718,7 @@ dependencies = [
  "engine-contract",
  "engine-core",
  "engine-store",
+ "futures",
  "serde",
  "serde_json",
  "sqlx",

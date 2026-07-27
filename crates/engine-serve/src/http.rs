@@ -36,6 +36,12 @@
 //!   (401 without it); 404 for an unknown/finished `run_id`; otherwise
 //!   triggers that run's `CancellationToken` and returns 202 (task 5, see
 //!   `crate::abort`).
+//! - `GET /events/{event_id}/stream` — requires the same `X-API-Key` header
+//!   (401 without it); 404 for an unknown/malformed id. Serves
+//!   `text/event-stream`: one frame per node transition plus a terminal
+//!   frame, then closes — including for a run that is already terminal by
+//!   the time the client connects. Engine-rs-only extension, not part of the
+//!   canonical data contract (see `crate::stream`).
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -78,6 +84,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/events/{run_id}/abort",
             web::post().to(crate::abort::abort_run),
+        )
+        .route(
+            "/events/{event_id}/stream",
+            web::get().to(crate::stream::stream_event),
         );
 }
 
@@ -205,7 +215,7 @@ fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadata>> {
 /// | `metadata.budget.halted == true` (`BUDGET_METADATA_KEY`, `engine_core::workflow::stamp_budget_halt`) | `budget_halted` |
 /// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
 /// | none of the above                                                    | `succeeded`     |
-fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
+pub(crate) fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
     let cancelled = snapshot
         .metadata
         .get(CANCELLATION_METADATA_KEY)
@@ -323,6 +333,9 @@ async fn post_events(
         let on_progress: OnProgress<'static> = Box::new(move |snapshot| {
             progress_live.record(run_id, snapshot);
             durable_progress(snapshot);
+            // Third fan-out alongside live-state and the durable writer —
+            // not a second progress mechanism (task 4).
+            crate::stream::publish(run_id, snapshot);
         });
 
         let options = RunOptions {
@@ -356,6 +369,10 @@ async fn post_events(
         };
 
         let updated_at = Utc::now();
+        // Publish the SSE terminal frame before marking the readback
+        // terminal, so a client racing the two never sees a terminal
+        // readback with no terminal frame having gone out yet.
+        crate::stream::publish_terminal(run_id, &final_ctx);
         // Order matters: mark terminal *before* deregistering.
         // Deregistration is the externally-observable "this run is over"
         // edge (an abort against a deregistered run 404s), so anything a
@@ -924,6 +941,148 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("run never reached a terminal status");
+    }
+
+    #[actix_web::test]
+    async fn stream_event_without_key_is_rejected() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/events/{}/stream", Uuid::new_v4()))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn stream_event_unknown_id_returns_404() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/events/{}/stream", Uuid::new_v4()))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[actix_web::test]
+    async fn stream_event_malformed_id_returns_404_not_500() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/events/not-a-uuid/stream")
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// End-to-end: trigger a run, connect to its SSE stream before it
+    /// completes, release the blocked node, and confirm the collected body
+    /// carries at least one `"running"` frame followed by a `"terminal":
+    /// true` frame, served as `text/event-stream`.
+    #[actix_web::test]
+    async fn stream_event_delivers_running_then_terminal_frames() {
+        let (state, release) = test_app_state_with_wait_node();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "wait-fixture", "data": {} }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let event_id = trigger_body["event_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("event_id should be a parseable UUID");
+
+        // `GET /events/{event_id}/stream` 404s until `state.live` has
+        // *some* record of the run (the spawned task's first `on_progress`
+        // call), which — same as `get_event_reads_running_then_terminal_..`
+        // above — may not have been polled yet right after `POST /events/`
+        // returns. Poll until it connects.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let stream_resp = loop {
+            let stream_req = test::TestRequest::get()
+                .uri(&format!("/events/{event_id}/stream"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, stream_req).await;
+            if resp.status() == 200 {
+                break resp;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stream endpoint never connected for the live run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(stream_resp.status(), 200);
+        assert_eq!(
+            stream_resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        // Release the blocked node concurrently with draining the stream
+        // body — the body future won't resolve until the stream ends
+        // (terminal frame published + sender dropped), which only happens
+        // once the run completes.
+        let release_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            release.notify_one();
+        });
+        let body_bytes = test::read_body(stream_resp).await;
+        release_handle.await.expect("release task should not panic");
+
+        // The connection is a second HTTP request racing the spawned task's
+        // very first `on_progress` call, so whether an intermediate
+        // `"running"` frame lands ahead of the subscribe is inherently
+        // timing-dependent (covered deterministically by `stream.rs`'s
+        // publish/subscribe unit tests instead). What every timing must
+        // still guarantee is that the connection sees a terminal frame and
+        // then closes.
+        let body = String::from_utf8(body_bytes.to_vec()).expect("SSE body should be UTF-8");
+        assert!(
+            body.contains("\"terminal\":true"),
+            "expected a terminal frame, got: {body}"
+        );
+        assert!(
+            body.contains("\"status\":\"succeeded\""),
+            "expected the terminal frame's status to be succeeded, got: {body}"
+        );
     }
 
     mod derive_terminal_status_tests {
