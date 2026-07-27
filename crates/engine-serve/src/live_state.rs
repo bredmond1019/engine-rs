@@ -349,6 +349,43 @@ mod tests {
     }
 
     #[test]
+    fn a_run_is_never_absent_from_both_maps_during_mark_terminal() {
+        // Regression test: `mark_terminal` used to remove the run from the
+        // live map before inserting it into the completed ring, so a
+        // `get`/`get_record` landing between the two separate lock
+        // acquisitions could find the run in neither. Hammer the
+        // transition from a concurrent reader, across many iterations, to
+        // catch a reordering regression.
+        for _ in 0..500 {
+            let store = LiveStateStore::new();
+            let run_id = Uuid::new_v4();
+            let snapshot = fixture_context("racing");
+            store.record(run_id, &snapshot);
+
+            let reader_store = store.clone();
+            let missing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader_missing = missing.clone();
+            let reader = std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    if reader_store.get(run_id).is_none() {
+                        reader_missing.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                }
+            });
+
+            let now = Utc::now();
+            store.mark_terminal(run_id, &snapshot, "wf", now, now);
+            reader.join().expect("reader thread should not panic");
+
+            assert!(
+                !missing.load(std::sync::atomic::Ordering::SeqCst),
+                "run vanished from both the live map and the completed ring mid-transition"
+            );
+        }
+    }
+
+    #[test]
     fn list_active_excludes_terminal_runs() {
         let store = LiveStateStore::new();
         let live_run = Uuid::new_v4();

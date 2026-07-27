@@ -60,11 +60,19 @@ pub struct StreamFrame {
 }
 
 /// Registry of live per-run senders, plus a side cache of the single last
-/// (terminal) frame for runs that have already finished. Both maps are
-/// process-global, mirroring `http.rs`'s `live_run_metadata` precedent.
+/// (terminal) frame for runs that have already finished — both behind
+/// **one** lock. `subscribe`'s "is this run terminal, or should I get/create
+/// a live sender" decision and `publish_terminal`'s "cache the frame and
+/// retire the live sender" transition must be atomic relative to each
+/// other: two separate locks let a `subscribe` straddle the two halves of
+/// `publish_terminal`'s transition (its terminal-cache check landing before
+/// the insert, its live-sender lookup landing after the removal) and mint a
+/// channel nobody will ever publish to again — the exact "orphan channel"
+/// hang this registry exists to prevent. A single `RwLock` closes that
+/// window entirely: the two operations can never interleave.
 struct Registry {
-    live: RwLock<StdHashMap<RunId, broadcast::Sender<StreamFrame>>>,
-    terminal: RwLock<TerminalCache>,
+    live: StdHashMap<RunId, broadcast::Sender<StreamFrame>>,
+    terminal: TerminalCache,
 }
 
 /// Bounded FIFO cache of terminal frames, mirroring
@@ -94,30 +102,29 @@ impl TerminalCache {
     }
 }
 
-fn registry() -> &'static Registry {
-    static REGISTRY: OnceLock<Registry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Registry {
-        live: RwLock::new(StdHashMap::new()),
-        terminal: RwLock::new(TerminalCache::default()),
+fn registry() -> &'static RwLock<Registry> {
+    static REGISTRY: OnceLock<RwLock<Registry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        RwLock::new(Registry {
+            live: StdHashMap::new(),
+            terminal: TerminalCache::default(),
+        })
     })
 }
 
 /// Get-or-create the live sender for `run_id`.
 fn sender_for(run_id: RunId) -> broadcast::Sender<StreamFrame> {
     {
-        let guard = registry()
-            .live
-            .read()
-            .expect("stream registry lock poisoned on read");
-        if let Some(sender) = guard.get(&run_id) {
+        let guard = registry().read().expect("stream registry lock poisoned on read");
+        if let Some(sender) = guard.live.get(&run_id) {
             return sender.clone();
         }
     }
     let mut guard = registry()
-        .live
         .write()
         .expect("stream registry lock poisoned on write");
     guard
+        .live
         .entry(run_id)
         .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
         .clone()
@@ -152,27 +159,20 @@ pub fn publish_terminal(run_id: RunId, final_context: &TaskContext) {
         terminal: true,
     };
 
-    // Best-effort delivery to whoever is already listening.
-    let sender = sender_for(run_id);
-    let _ = sender.send(frame.clone());
-
-    // Cache the frame *before* retiring the live sender: `live` and
-    // `terminal` are separate locks, so a `subscribe` landing between the
-    // two operations must find the frame already cached rather than
-    // falling through to `sender_for`, which would hand it a fresh
-    // broadcast channel nobody will ever publish to again.
-    registry()
-        .terminal
+    // One write-lock acquisition for the whole transition: best-effort
+    // delivery to whoever is already listening, caching the frame, and
+    // retiring the live sender, all atomically relative to `subscribe`. A
+    // `subscribe` call can only ever observe this run in the state *before*
+    // this transition (live, not yet terminal) or *after* it (terminal,
+    // cached) — never the torn state that mints an orphan channel.
+    let mut guard = registry()
         .write()
-        .expect("terminal frame cache lock poisoned on write")
-        .insert(run_id, frame);
-    // Retire the live sender so parked receivers observe `Closed` right
-    // after this frame.
-    registry()
-        .live
-        .write()
-        .expect("stream registry lock poisoned on write")
-        .remove(&run_id);
+        .expect("stream registry lock poisoned on write");
+    if let Some(sender) = guard.live.get(&run_id) {
+        let _ = sender.send(frame.clone());
+    }
+    guard.terminal.insert(run_id, frame);
+    guard.live.remove(&run_id);
 }
 
 /// Subscribe to `run_id`'s tee. If the run has already gone terminal,
@@ -180,13 +180,16 @@ pub fn publish_terminal(run_id: RunId, final_context: &TaskContext) {
 /// frame (one `Ok`, then `Closed`) instead of a live channel nobody will
 /// ever publish to again. Otherwise returns (creating if necessary) a
 /// receiver on the run's live broadcast channel.
+///
+/// Takes the write lock unconditionally (even on the cache-hit path) so
+/// this check-then-act is atomic relative to `publish_terminal`'s own
+/// single-lock transition — see [`Registry`]'s docs.
 pub fn subscribe(run_id: RunId) -> broadcast::Receiver<StreamFrame> {
-    if let Some(frame) = registry()
-        .terminal
-        .read()
-        .expect("terminal frame cache lock poisoned on read")
-        .get(run_id)
-    {
+    let mut guard = registry()
+        .write()
+        .expect("stream registry lock poisoned on write");
+
+    if let Some(frame) = guard.terminal.get(run_id) {
         let (one_shot, receiver) = broadcast::channel(1);
         let _ = one_shot.send(frame);
         // Drop the sender immediately: the receiver already has its one
@@ -196,7 +199,11 @@ pub fn subscribe(run_id: RunId) -> broadcast::Receiver<StreamFrame> {
         return receiver;
     }
 
-    sender_for(run_id).subscribe()
+    guard
+        .live
+        .entry(run_id)
+        .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+        .subscribe()
 }
 
 /// Pull the next frame off `receiver`, transparently skipping past a
@@ -360,6 +367,47 @@ mod tests {
             recv_next(&mut receiver).await.is_none(),
             "late subscriber's stream should close after the terminal frame"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subscribers_racing_publish_terminal_never_hang() {
+        // Regression test: `publish_terminal` used to retire the live
+        // sender (making `sender_for` mint a brand-new one) before caching
+        // the terminal frame, so a `subscribe` landing in that window got a
+        // receiver on a channel nobody would ever publish to again — an
+        // unbounded hang. Race many subscribers against the publish across
+        // many iterations to catch a reordering regression.
+        for _ in 0..200 {
+            let run_id = Uuid::new_v4();
+            let ctx = fixture_context("racing");
+
+            let publisher = tokio::task::spawn_blocking(move || {
+                publish_terminal(run_id, &ctx);
+            });
+
+            let mut subscriber_tasks = Vec::new();
+            for _ in 0..8 {
+                subscriber_tasks.push(tokio::spawn(async move {
+                    let mut receiver = subscribe(run_id);
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                        loop {
+                            match recv_next(&mut receiver).await {
+                                Some(frame) if frame.terminal => break,
+                                Some(_) => continue,
+                                None => break,
+                            }
+                        }
+                    })
+                    .await
+                    .expect("subscriber hung across the publish_terminal race window")
+                }));
+            }
+
+            publisher.await.expect("publisher thread should not panic");
+            for task in subscriber_tasks {
+                task.await.expect("subscriber task should not panic");
+            }
+        }
     }
 
     #[tokio::test]

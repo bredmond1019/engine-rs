@@ -908,6 +908,51 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn get_event_is_never_404_immediately_after_trigger() {
+        // Regression test for the early-poll 404: `GET /events/{event_id}`
+        // used to consult only `LiveStateStore`, which has no entry for a
+        // run until its first `on_progress` snapshot lands — a window that
+        // spans at least one executor yield after `POST /events/` returns.
+        // Poll with no sleep and no retry loop: the very next request must
+        // already read back "running" via `live_run_metadata()`, whether or
+        // not the spawned task has been polled yet.
+        let (state, _release) = test_app_state_with_wait_node();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "wait-fixture", "data": {} }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let event_id = trigger_body["event_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("event_id should be a parseable UUID");
+
+        let poll_req = test::TestRequest::get()
+            .uri(&format!("/events/{event_id}"))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let poll_resp = test::call_service(&app, poll_req).await;
+        assert_eq!(
+            poll_resp.status(),
+            200,
+            "a run_id just handed back by POST /events/ must never 404"
+        );
+        let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+        assert_eq!(poll_body["status"], "running");
+        assert_eq!(poll_body["workflow_type"], "wait-fixture");
+    }
+
+    #[actix_web::test]
     async fn get_event_reads_running_then_terminal_for_the_same_run() {
         let (state, release) = test_app_state_with_wait_node();
         let app = test::init_service(
