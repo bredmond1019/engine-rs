@@ -19,6 +19,15 @@
 //!   the response was already sent before the run could fail, so failure
 //!   surfaces through the `GET /events/{event_id}` readback and the SSE
 //!   terminal frame instead.
+//! - `GET /events/{event_id}` — requires a valid `X-API-Key` header (401
+//!   without it); `404` for an unknown id or a malformed/non-UUID path
+//!   segment (never a `500`). Returns `200 {event_id, workflow_type, status,
+//!   created_at, updated_at, task_context}` — the canonical readback shape.
+//!   `status` is derived server-side (see [`derive_terminal_status`]) from
+//!   whether the run is still live, and from the `metadata.cancellation` /
+//!   `metadata.budget` / `metadata.failure` annotations and `node_runs`
+//!   statuses once terminal. Serves only from [`crate::live_state::LiveStateStore`]
+//!   — no Postgres access on this path.
 //! - `GET /health` — 200.
 //! - `GET /workflows` — the list of registered workflow types.
 //! - `GET /workflows/{type}/graph` — the schema/graph for a registered type,
@@ -29,12 +38,15 @@
 //!   `crate::abort`).
 
 use std::collections::HashMap as StdHashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
-use chrono::Utc;
-use engine_contract::TaskContext;
-use engine_core::{Budget, CancellationToken, OnProgress, RunOptions};
+use chrono::{DateTime, Utc};
+use engine_contract::{NodeRunStatus, TaskContext};
+use engine_core::{
+    Budget, CancellationToken, OnProgress, RunOptions, BUDGET_METADATA_KEY,
+    CANCELLATION_METADATA_KEY,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -62,6 +74,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             web::get().to(workflow_graph),
         )
         .route("/events/", web::post().to(post_events))
+        .route("/events/{event_id}", web::get().to(get_event))
         .route(
             "/events/{run_id}/abort",
             web::post().to(crate::abort::abort_run),
@@ -160,6 +173,76 @@ fn default_budget_from_env() -> Budget {
     })
 }
 
+/// `(workflow_type, created_at)` for a run that is still live — everything
+/// the `GET /events/{event_id}` readback (below) needs for a running run
+/// beyond the `TaskContext` snapshot `LiveStateStore` already carries.
+/// `LiveStateStore::record` only stores the snapshot, and `mark_terminal` is
+/// the first place `workflow_type`/`created_at` get attached (task 1's
+/// `RunRecord`) — so a *running* run's readback needs this side table.
+type RunMetadata = (String, DateTime<Utc>);
+
+/// Same not-an-`AppState`-field trick as [`default_budget_from_env`]: a
+/// process-global map keyed by `run_id`, populated by `post_events` right
+/// after minting the id (before spawning) and cleared by the spawned task's
+/// cleanup once the run goes terminal (task 1's retained `RunRecord` takes
+/// over from there).
+fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadata>> {
+    static LIVE_RUN_METADATA: OnceLock<RwLock<StdHashMap<Uuid, RunMetadata>>> = OnceLock::new();
+    LIVE_RUN_METADATA.get_or_init(|| RwLock::new(StdHashMap::new()))
+}
+
+/// The server-derived `status` string for the `GET /events/{event_id}`
+/// readback (contract: `{event_id, workflow_type, status, created_at,
+/// updated_at, task_context}`, `status` derived server-side).
+///
+/// Derivation table, checked in order against a **terminal** run's retained
+/// snapshot (a non-terminal run short-circuits to `"running"` before this is
+/// ever called — see [`get_event`]):
+///
+/// | condition                                                            | status          |
+/// |-----------------------------------------------------------------------|-----------------|
+/// | `metadata.cancellation.cancelled == true` (`CANCELLATION_METADATA_KEY`, `engine_core::stamp_cancelled`) | `cancelled` |
+/// | `metadata.budget.halted == true` (`BUDGET_METADATA_KEY`, `engine_core::workflow::stamp_budget_halt`) | `budget_halted` |
+/// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
+/// | none of the above                                                    | `succeeded`     |
+fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
+    let cancelled = snapshot
+        .metadata
+        .get(CANCELLATION_METADATA_KEY)
+        .and_then(|v| v.get("cancelled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if cancelled {
+        return "cancelled";
+    }
+
+    let budget_halted = snapshot
+        .metadata
+        .get(BUDGET_METADATA_KEY)
+        .and_then(|v| v.get("halted"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if budget_halted {
+        return "budget_halted";
+    }
+
+    let failure_marker = snapshot
+        .metadata
+        .get("failure")
+        .and_then(|v| v.get("failed"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let any_node_failed = snapshot
+        .node_runs
+        .values()
+        .any(|node_run| node_run.status == NodeRunStatus::Failed);
+    if failure_marker || any_node_failed {
+        return "failed";
+    }
+
+    "succeeded"
+}
+
 /// `POST /events/` — trigger dispatch: 401 on a missing/bad `X-API-Key`, 422
 /// on an unregistered `workflow_type`, otherwise **spawns** the workflow
 /// (feeding the live-state store and the durable writer through
@@ -227,9 +310,13 @@ async fn post_events(
 
     let budget = default_budget_from_env();
 
-    actix_web::rt::spawn(async move {
-        let created_at = Utc::now();
+    let created_at = Utc::now();
+    live_run_metadata()
+        .write()
+        .expect("live run metadata lock poisoned on write")
+        .insert(run_id, (workflow_type.clone(), created_at));
 
+    actix_web::rt::spawn(async move {
         let mut durable_progress =
             durable_on_progress(durable_handle, run_id, workflow_type.clone(), data.clone());
         let progress_live = live.clone();
@@ -274,6 +361,10 @@ async fn post_events(
         // edge (an abort against a deregistered run 404s), so anything a
         // client can read after that edge must already be in place.
         live.mark_terminal(run_id, &final_ctx, workflow_type, created_at, updated_at);
+        live_run_metadata()
+            .write()
+            .expect("live run metadata lock poisoned on write")
+            .remove(&run_id);
         runs.deregister(run_id);
     });
 
@@ -281,6 +372,72 @@ async fn post_events(
         "run_id": run_id,
         "event_id": run_id,
     }))
+}
+
+/// `GET /events/{event_id}` — the canonical readback (contract § HTTP
+/// surface parity): `200 {event_id, workflow_type, status, created_at,
+/// updated_at, task_context}`, `status` derived server-side (see
+/// [`derive_terminal_status`]). `X-API-Key` gated (401 without); `404` for
+/// an unknown id **and** for a malformed/non-UUID path segment — never a
+/// `500`.
+///
+/// Serves only from task 1's [`LiveStateStore`] — a terminal run from the
+/// retained completed ring, a still-live run from the live map (paired with
+/// [`live_run_metadata`] for the `workflow_type`/`created_at` a live run
+/// hasn't recorded into a `RunRecord` yet). **No Postgres fallback** — CI has
+/// no `DATABASE_URL` and this route must stay DB-free.
+async fn get_event(
+    path: web::Path<String>,
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if !check_api_key(&req, &state.api_key) {
+        return HttpResponse::Unauthorized().finish();
+    }
+
+    let raw_id = path.into_inner();
+    let event_id = match Uuid::parse_str(&raw_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return HttpResponse::NotFound()
+                .json(serde_json::json!({ "error": "unknown or malformed event_id" }));
+        }
+    };
+
+    // Terminal first: once a run is marked terminal it moves out of the live
+    // map entirely (`LiveStateStore::mark_terminal`), so a retained record
+    // always means "this is the terminal readback", never a stale race
+    // against a still-live snapshot.
+    if let Some(record) = state.live.get_record(event_id) {
+        let status = derive_terminal_status(&record.snapshot);
+        return HttpResponse::Ok().json(serde_json::json!({
+            "event_id": event_id,
+            "workflow_type": record.workflow_type,
+            "status": status,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "task_context": record.snapshot,
+        }));
+    }
+
+    if let Some(snapshot) = state.live.get(event_id) {
+        let (workflow_type, created_at) = live_run_metadata()
+            .read()
+            .expect("live run metadata lock poisoned on read")
+            .get(&event_id)
+            .cloned()
+            .unwrap_or_else(|| ("unknown".to_string(), Utc::now()));
+        return HttpResponse::Ok().json(serde_json::json!({
+            "event_id": event_id,
+            "workflow_type": workflow_type,
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": Utc::now(),
+            "task_context": snapshot,
+        }));
+    }
+
+    HttpResponse::NotFound().json(serde_json::json!({ "error": "unknown or malformed event_id" }))
 }
 
 #[cfg(test)]
@@ -580,6 +737,265 @@ mod tests {
         // run.
         assert!(live.list_active().is_empty());
         assert!(runs.get(Uuid::new_v4()).is_none());
+    }
+
+    /// Fixture node that blocks in `process` until `release` is notified —
+    /// gives a test a window to read `GET /events/{event_id}` while the run
+    /// is still live, before letting it complete. Mirrors
+    /// `abort_integration.rs`'s `WaitNode`.
+    struct WaitNode {
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Node for WaitNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            self.release.notified().await;
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "WaitNode"
+        }
+    }
+
+    fn wait_fixture_schema() -> WorkflowSchema {
+        let mut nodes = StdHashMap::new();
+        nodes.insert(
+            "WaitNode".to_string(),
+            engine_core::NodeConfig::new("WaitNode", vec![]),
+        );
+        WorkflowSchema::new("wait-fixture", "WaitNode", nodes)
+    }
+
+    /// An `AppState` whose sole registration is a single-node `WaitNode`
+    /// workflow, plus the `Notify` used to release it.
+    fn test_app_state_with_wait_node() -> (AppState, std::sync::Arc<tokio::sync::Notify>) {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_for_factory = release.clone();
+
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            wait_fixture_schema(),
+            Box::new(move |_event: &serde_json::Value| {
+                let mut registry = NodeRegistry::new();
+                registry.register(Box::new(WaitNode {
+                    release: release_for_factory.clone(),
+                }));
+                Ok(Workflow::new(registry, wait_fixture_schema()))
+            }),
+        );
+
+        let state = AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        };
+        (state, release)
+    }
+
+    #[actix_web::test]
+    async fn get_event_without_key_is_rejected() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/events/{}", Uuid::new_v4()))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn get_event_unknown_id_returns_404() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/events/{}", Uuid::new_v4()))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[actix_web::test]
+    async fn get_event_malformed_id_returns_404_not_500() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/events/not-a-uuid")
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[actix_web::test]
+    async fn get_event_reads_running_then_terminal_for_the_same_run() {
+        let (state, release) = test_app_state_with_wait_node();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "wait-fixture", "data": {} }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let event_id = trigger_body["event_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("event_id should be a parseable UUID");
+
+        // The spawned task's initial `on_progress` snapshot (RUNNING,
+        // recorded before `WaitNode::process` ever blocks on `release`) may
+        // not have been polled yet at this point — `POST /events/` returns
+        // as soon as the run is spawned, not once it starts — so poll until
+        // the readback observes it, same as `abort_integration.rs`'s
+        // `live.list_active()` loop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mid_run_req = test::TestRequest::get()
+                .uri(&format!("/events/{event_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let mid_run_resp = test::call_service(&app, mid_run_req).await;
+            if mid_run_resp.status() == 200 {
+                let mid_run_body: serde_json::Value = test::read_body_json(mid_run_resp).await;
+                if mid_run_body["status"] == "running" {
+                    assert_eq!(mid_run_body["event_id"], event_id.to_string());
+                    assert_eq!(mid_run_body["workflow_type"], "wait-fixture");
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run never reached a running status readback"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        release.notify_one();
+        // Give the spawned task a chance to run to completion and mark
+        // itself terminal before the next readback.
+        for _ in 0..200 {
+            let poll_req = test::TestRequest::get()
+                .uri(&format!("/events/{event_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let poll_resp = test::call_service(&app, poll_req).await;
+            let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+            if poll_body["status"] == "succeeded" {
+                assert_eq!(poll_body["event_id"], event_id.to_string());
+                assert_eq!(poll_body["workflow_type"], "wait-fixture");
+                assert!(poll_body.get("task_context").is_some());
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run never reached a terminal status");
+    }
+
+    mod derive_terminal_status_tests {
+        use super::{derive_terminal_status, NodeRunStatus};
+        use engine_contract::{NodeRun, TaskContext};
+        use std::collections::HashMap as StdHashMap;
+
+        fn empty_context(metadata: serde_json::Value) -> TaskContext {
+            TaskContext {
+                event: serde_json::Value::Null,
+                nodes: StdHashMap::new(),
+                metadata,
+                node_runs: StdHashMap::new(),
+            }
+        }
+
+        #[test]
+        fn succeeded_when_no_markers_and_no_failed_nodes() {
+            let ctx = empty_context(serde_json::json!({}));
+            assert_eq!(derive_terminal_status(&ctx), "succeeded");
+        }
+
+        #[test]
+        fn cancelled_when_cancellation_marker_is_set() {
+            let ctx = empty_context(serde_json::json!({
+                "cancellation": { "cancelled": true, "at": "2026-01-01T00:00:00Z" }
+            }));
+            assert_eq!(derive_terminal_status(&ctx), "cancelled");
+        }
+
+        #[test]
+        fn budget_halted_when_budget_marker_is_set() {
+            let ctx = empty_context(serde_json::json!({
+                "budget": { "halted": true, "reason": { "cap": "cost" } }
+            }));
+            assert_eq!(derive_terminal_status(&ctx), "budget_halted");
+        }
+
+        #[test]
+        fn failed_when_failure_marker_is_set() {
+            let ctx = empty_context(serde_json::json!({
+                "failure": { "failed": true, "error": "boom", "at": "2026-01-01T00:00:00Z" }
+            }));
+            assert_eq!(derive_terminal_status(&ctx), "failed");
+        }
+
+        #[test]
+        fn failed_when_any_node_run_failed() {
+            let mut ctx = empty_context(serde_json::json!({}));
+            ctx.node_runs.insert(
+                "SomeNode".to_string(),
+                NodeRun {
+                    status: NodeRunStatus::Failed,
+                    started_at: None,
+                    completed_at: None,
+                    error: Some("boom".to_string()),
+                    input: None,
+                    usage: None,
+                },
+            );
+            assert_eq!(derive_terminal_status(&ctx), "failed");
+        }
+
+        #[test]
+        fn cancellation_takes_precedence_over_budget_and_failure() {
+            let ctx = empty_context(serde_json::json!({
+                "cancellation": { "cancelled": true, "at": "2026-01-01T00:00:00Z" },
+                "budget": { "halted": true },
+                "failure": { "failed": true }
+            }));
+            assert_eq!(derive_terminal_status(&ctx), "cancelled");
+        }
     }
 
     mod budget_from_env_vars_tests {
