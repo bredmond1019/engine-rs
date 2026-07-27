@@ -1,18 +1,19 @@
 ---
 type: Reference
 title: Content Pipeline Workflow
-description: How the CONTENT_PIPELINE workflow works — the envelope-based, channel-agnostic thirteen-node graph, bounded self-critic loop, optional translation, event schema, tunable ContentPipelinePolicy, the engine-brain persist boundary, triggering, and reading outputs
+description: How the CONTENT_PIPELINE workflow works — the envelope-based, channel-agnostic fourteen-node graph, bounded self-critic loop, optional translation, event schema, tunable ContentPipelinePolicy, the engine-brain persist boundary, the egress dispatch node, triggering, and reading outputs
 doc_id: content-pipeline-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [content-pipeline, workflow, graph, policy, ingress-envelope, self-critic, translate, persist-to-brain, http-post]
+keywords: [content-pipeline, workflow, graph, policy, ingress-envelope, self-critic, translate, persist-to-brain, http-post, action-dispatch, channel-transport]
 related: [architecture, proposal-generator-workflow, research-agent-workflow, diagnostic-intake-workflow, sdlc-flow-policy, data-contract, D9-engine-brain-boundary]
 ---
 
 # Content Pipeline Workflow
 
-`CONTENT_PIPELINE` (block `EN.5.A`) is a policy-aware, thirteen-node workflow that turns any
+`CONTENT_PIPELINE` (block `EN.5.A`, egress dispatch added in `EN.6.A`) is a policy-aware,
+fourteen-node workflow that turns any
 channel-agnostic `IngressEnvelope` — a web article, a YouTube transcript, or a human/agent
 channel message — into a summarized, optionally-translated digest, POSTed to the company brain
 (Synapse) as durable knowledge. It rebuilds Synapse's original `CONTENT_PIPELINE` around the
@@ -27,11 +28,14 @@ Source: `crates/engine-core/src/workflows/content_pipeline/` (`mod.rs`, `schema.
 `profiles.rs`, `source_router.rs`, `fetch_article.rs`, `fetch_transcript.rs`,
 `normalize_channel_content.rs`, `summarize.rs`, `self_critic.rs`, `critic_router.rs`,
 `increment_critic_iteration.rs`, `revise.rs`, `translate.rs`, `digest_render.rs`,
-`persist_to_brain.rs`, `graph.rs`), registered from `crates/engine-serve/src/workflows.rs`
-(`register_content_pipeline` → `register_builtin_workflows`). The channel-agnostic envelope
-contract (`ChannelType`, `ReplyContext`, `SourcePayload`, `IngressEnvelope`) lives in
-`crates/engine-contract/src/envelope.rs`. The injectable HTTP-POST seam `PersistToBrainNode` uses
-lives in `crates/engine-core/src/nodes/http_post.rs`.
+`persist_to_brain.rs`, `action_dispatch.rs`, `graph.rs`), registered from
+`crates/engine-serve/src/workflows.rs` (`register_content_pipeline` →
+`register_builtin_workflows`). The channel-agnostic envelope contract (`ChannelType`,
+`ReplyContext`, `SourcePayload`, `IngressEnvelope`) lives in `crates/engine-contract/src/envelope.rs`.
+The injectable HTTP-POST seam `PersistToBrainNode` uses lives in
+`crates/engine-core/src/nodes/http_post.rs`. The injectable egress seam `ActionDispatchNode` uses
+(`ChannelTransport`, `OutboundAction`, `WorkflowTriggerDispatch`) lives in
+`crates/engine-core/src/nodes/channel_transport.rs`.
 
 ## Graph shape
 
@@ -40,10 +44,10 @@ SourceRouterNode -> { FetchArticleNode | FetchTranscriptNode | NormalizeChannelC
   -> SummarizeNode -> SelfCriticNode -> CriticRouterNode
   -> { TranslateSkipRouterNode -> { TranslateNode | DigestRenderNode }
      | IncrementCriticIterationNode -> ReviseNode -> SelfCriticNode }  // back-edge
-TranslateNode -> DigestRenderNode -> PersistToBrainNode  // terminal in EN.5.A
+TranslateNode -> DigestRenderNode -> PersistToBrainNode -> ActionDispatchNode  // terminal as of EN.6.A
 ```
 
-Thirteen nodes. `SourceRouterNode` is a `Router` that parses/validates the inbound
+Fourteen nodes. `SourceRouterNode` is a `Router` that parses/validates the inbound
 `ContentPipelineInput`, resolves the run's policy (via `PolicyConfigSource::Builtin` — a channel
 envelope carries no repo checkout), stamps the envelope + resolved policy onto `ctx`, and routes
 purely on `SourcePayload` kind: `Url` → `FetchArticleNode`, `VideoId` → `FetchTranscriptNode`,
@@ -56,8 +60,9 @@ plus the resolved loop bounds and routes to `TranslateSkipRouterNode` (pass, con
 met, or iteration cap reached) or `IncrementCriticIterationNode` (revise, back-edge — bump the
 counter, run `ReviseNode`, re-enter `SelfCriticNode`). `TranslateSkipRouterNode` is a third
 `Router`: translate-on routes through `TranslateNode` first, translate-off skips straight to
-`DigestRenderNode`. `PersistToBrainNode` is the sole terminal node — no forward connection (EN.6.A
-wires an `ActionDispatchNode` after it later).
+`DigestRenderNode`. `ActionDispatchNode` is the sole terminal node as of `EN.6.A` — it runs after
+`PersistToBrainNode` and never fails the run on a transport error (see
+[The egress dispatch boundary](#the-egress-dispatch-boundary)).
 
 Per `routing.rs`'s D42 declared-acyclic / runtime-cyclic contract, the `ReviseNode ->
 SelfCriticNode` back-edge is never walked by `WorkflowValidator`'s DFS cycle check because it is
@@ -78,7 +83,8 @@ non-router connection.
 | `TranslateSkipRouterNode` | Deterministic router | Reads `ContentPipelineInput.translate`; routes `true` → `TranslateNode`, `false` → `DigestRenderNode`. |
 | `TranslateNode` | **Model** (Sonnet by default, Local-eligible) | `translate`-stage node. Translates the current summary to `target_lang` (defaults to `pt-BR`), stores `{translated_markdown}`. |
 | `DigestRenderNode` | Deterministic | Deterministically assembles `ContentPipelineOutput`, including a UUID-v5-derived, retry-idempotent `artifact_id` (minted from a fixed namespace + `envelope_id`, so the same envelope always mints the same artifact id). |
-| `PersistToBrainNode` | Deterministic, terminal | POSTs the finished digest as a `LearningArtifact` to Synapse's ingest endpoint over an injectable `HttpPost` seam. See [The engine↔brain persist boundary](#the-enginebrain-persist-boundary). |
+| `PersistToBrainNode` | Deterministic | POSTs the finished digest as a `LearningArtifact` to Synapse's ingest endpoint over an injectable `HttpPost` seam. See [The engine↔brain persist boundary](#the-enginebrain-persist-boundary). |
+| `ActionDispatchNode` | Deterministic, terminal | `EN.6.A` egress node. Builds a `Digest` reply `OutboundAction` when the envelope's `reply_context` is present, and/or a `TriggerWorkflow` `OutboundAction` when the raw event carries a `trigger` chain-request; sends each over an injectable `ChannelTransport` seam and never fails the run on a transport error. See [The egress dispatch boundary](#the-egress-dispatch-boundary). |
 
 `registry_for_policy(&ContentPipelinePolicy)` in `graph.rs` rewires whichever of the four
 Local-eligible stages — `summarize`, `critic`, `revise`, `translate` — the policy resolves to
@@ -164,6 +170,7 @@ Knobs:
 | Field | Values | What it controls |
 |---|---|---|
 | `output_verbosity` | `terse` \| `normal` \| `verbose` | Verbosity directive added to model nodes' prompts. |
+| `dispatch_verbosity` | `terse` \| `normal` \| `verbose` | `EN.6.A` telemetry-only knob for `ActionDispatchNode`'s egress logging; not a `ModelTier` field, so it never rewires under a Local profile. |
 | `prompt_cache` | `bool` | Whether a stable system-prompt anchor is added for provider-side prompt caching. |
 | `model_tiers.{summarize,critic,revise,translate}` | `sonnet` \| `haiku` \| `opus` \| `local` | Per-stage model tier — all four stages are Local-eligible. |
 | `local.{endpoint,model,constrained_json}` | string / string / bool | Local-endpoint config, applied when any of the four stages resolves to `ModelTier::Local`. |
@@ -232,8 +239,35 @@ and future callers can override the target without touching the constant.
 
 Per THE BOUNDARY TEST, this node only POSTs — no embedding model is loaded, no `pgvector`
 connection is opened, and no corpus table is written from this repo. What happens behind the
-ingest endpoint is entirely Synapse's concern. Terminal in `EN.5.A`: no forward connection —
-EN.6.A wires an `ActionDispatchNode` after it later.
+ingest endpoint is entirely Synapse's concern. No longer terminal as of `EN.6.A`: it forwards to
+`ActionDispatchNode` — see [The egress dispatch boundary](#the-egress-dispatch-boundary).
+
+## The egress dispatch boundary
+
+`ActionDispatchNode` (`action_dispatch.rs`, `EN.6.A`) is the workflow's terminal egress node,
+wired after `PersistToBrainNode` in `graph.rs`. It reads the run's `IngressEnvelope` and raw event
+to decide what (if anything) to send back out:
+
+- **Reply digest** — when `envelope.reply_context` is present, it builds a `Digest`
+  `OutboundAction` carrying the rendered digest back to the originating channel. A
+  fire-and-forget run (no `reply_context`, e.g. a scheduled or webhook-triggered ingest) sends
+  nothing on this path.
+- **Chain trigger** — when the raw event carries a `trigger` field (`{workflow_type, event}`,
+  mirrored as the typed `TriggerRequest` in `schema.rs`), it builds a `TriggerWorkflow`
+  `OutboundAction` and stamps the parent's `envelope_id` onto the outgoing event's `data` for
+  correlation. `WorkflowTriggerDispatch` (`channel_transport.rs`, `EN.6.A`) enforces an 8-hop
+  `chain_depth` cap before sending — a request at or above the cap is refused rather than
+  recursing.
+
+Both actions are sent through the injectable `crate::nodes::channel_transport::ChannelTransport`
+seam (`with_transport`); a transport error is recorded as a `delivered: false` receipt and never
+fails the run. `WorkflowTriggerDispatch` prefers an injected in-process `Dispatcher`
+(fire-and-forget via `spawn_blocking`) over its `POST /events/` HTTP fallback (carrying an
+`X-API-Key` header), and `channel_transport_live()` routes every other channel to
+`UnwiredChannelTransport` (`EN.6.C`/`EN.6.D` — real Telegram/WhatsApp adapters are still open
+follow-on work). `crates/engine-serve/src/workflows.rs` re-registers `ActionDispatchNode` with
+`channel_transport_live` pointed at the deployment-configured `ENGINE_EVENTS_URL` (default
+`http://localhost:8080/events/`).
 
 ## How to trigger a run
 
@@ -277,15 +311,19 @@ schema above.
   `translated_markdown`).
 - **`ctx.nodes["PersistToBrainNode"]`** — `{"posted": true, "status", "artifact_id",
   "response"}`, the brain-push result.
+- **`ctx.nodes["ActionDispatchNode"]`** — `{"dispatched": [{envelope_id, channel_type,
+  reply_context, body, receipt}]}`, one entry per `OutboundAction` sent (reply digest and/or
+  chain trigger), each stamped with the run's `envelope_id`.
 
 This workflow has no dedicated `content-pipeline-state.json` telemetry writer of its own.
 
 ## Scope notes
 
-- **Node count is thirteen** as of `EN.5.A`: `SourceRouterNode`, `FetchArticleNode`,
+- **Node count is fourteen** as of `EN.6.A`: `SourceRouterNode`, `FetchArticleNode`,
   `FetchTranscriptNode`, `NormalizeChannelContentNode`, `SummarizeNode`, `SelfCriticNode`,
   `CriticRouterNode`, `IncrementCriticIterationNode`, `ReviseNode`, `TranslateSkipRouterNode`,
-  `TranslateNode`, `DigestRenderNode`, `PersistToBrainNode`. There is no setup/worktree node.
+  `TranslateNode`, `DigestRenderNode`, `PersistToBrainNode`, `ActionDispatchNode`. There is no
+  setup/worktree node.
 - **Routes on `SourcePayload` kind, never `ChannelType`** — this is deliberate: adding a new
   channel later (Slack, Telegram, WhatsApp, Email — Phase 6) costs zero graph edits, only a new
   `SourcePayload` variant and, if needed, a new converge node.
@@ -296,10 +334,16 @@ This workflow has no dedicated `content-pipeline-state.json` telemetry writer of
   wired into the workspace yet; `UnimplementedTranscriptFetch` errors descriptively rather than
   silently returning empty content. The `with_fetch` seam is where later channel work plugs in a
   real implementation.
-- **Out of scope for this block**: real channel adapters (Slack/Telegram/WhatsApp/Email —
-  Phase 6), the real Synapse `OR.Q` ingest endpoint, `ActionDispatchNode` (EN.6.A).
+- **Out of scope for this block**: real channel adapters for Slack/Email; Telegram/WhatsApp are
+  routed through `UnwiredChannelTransport` pending `EN.6.C`/`EN.6.D`, and the real Synapse `OR.Q`
+  ingest endpoint remains a placeholder URL.
 - **Hermetic test coverage**: `crates/engine-core/tests/content_pipeline_e2e.rs` drives the full
   `Workflow::run` walk loop through every branch (both fetch/normalize converge paths, the
   self-critic loop's pass/revise/cap exits, translate on/off, the persist payload shape, retry
   idempotency of `artifact_id`, `registry_for_policy`'s Local rewire, `EventsRow` round-tripping,
   dispatcher registration, and a `#[ignore]`-gated ranked-profile experiment harness).
+  `crates/engine-core/tests/action_dispatch_e2e.rs` (`EN.6.A`) covers `ActionDispatchNode`
+  end-to-end: reply-path digest matching, fire-and-forget (no `reply_context`), `TriggerWorkflow`
+  dispatch (URL/payload/`X-API-Key` header), chain-depth-cap refusal, unwired-channel
+  `delivered: false` naming, failing-transport resilience, `EventsRow` receipt round-tripping, and
+  the Local-profile rewire leaving `ActionDispatchNode` untouched.
