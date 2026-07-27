@@ -1,10 +1,11 @@
 //! `ResearchModeRouterNode` + the declared `WorkflowSchema` / `NodeRegistry`
-//! / `Workflow` assembly — filled in task 7.
+//! / `Workflow` assembly — filled in task 7, closed into a terminal write
+//! by `EN.7.B` task 4.
 //!
 //! Declared graph shape:
 //!
 //! ```text
-//! ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode }
+//! ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode
 //! ```
 //!
 //! `ResearchModeRouterNode` is the start node and a [`Router`]: it reads
@@ -12,15 +13,26 @@
 //! the two terminal nodes matches — it never mutates `ctx`, so (per the
 //! spec's Context Pointers) policy resolution and telemetry cannot live
 //! here; each terminal node resolves its own policy and writes its own
-//! `research-agent-state.json` record (tasks 5/6). Both `CompanyResearchNode`
-//! and `ProspectingResearchNode` are graph exit points — neither declares a
-//! forward connection.
+//! `research-agent-state.json` record (tasks 5/6). `CompanyResearchNode`
+//! and `ProspectingResearchNode` both converge on a single shared
+//! `MaterializeDocNode` instance (`EN.7.B`), which is the graph's only exit
+//! point — a run now *ends* by writing or updating the resulting
+//! `CompanyBrief`/`ProspectingResult` artifact into the Brain corpus as an
+//! Opportunity doc. `MaterializeDocNode` is configured with an ordered
+//! `with_source_nodes` preference (`CompanyResearchNode` then
+//! `ProspectingResearchNode`) since exactly one of the two runs per event;
+//! its brain root is left unset so it resolves via
+//! `crate::brain_root::resolve_brain_root` (`ENGINE_BRAIN_ROOT`, then
+//! walk-up) at run time — a served run with no resolvable brain root now
+//! fails loudly by design, per the spec's Context Pointers ("Consequence to
+//! accept deliberately").
 
 use std::collections::HashMap;
 
 use engine_contract::TaskContext;
 
 use crate::node::{Node, NodeError, NodeRegistry};
+use crate::nodes::materialize_doc::MaterializeDocNode;
 use crate::routing::Router;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
@@ -85,11 +97,21 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "CompanyResearchNode".to_string(),
-        NodeConfig::new("CompanyResearchNode", vec![]),
+        NodeConfig::new(
+            "CompanyResearchNode",
+            vec!["MaterializeDocNode".to_string()],
+        ),
     );
     nodes.insert(
         "ProspectingResearchNode".to_string(),
-        NodeConfig::new("ProspectingResearchNode", vec![]),
+        NodeConfig::new(
+            "ProspectingResearchNode",
+            vec!["MaterializeDocNode".to_string()],
+        ),
+    );
+    nodes.insert(
+        "MaterializeDocNode".to_string(),
+        NodeConfig::new("MaterializeDocNode", vec![]),
     );
 
     WorkflowSchema::new(WORKFLOW_TYPE, "ResearchModeRouterNode", nodes)
@@ -105,6 +127,10 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(ResearchModeRouterNode));
     registry.register(Box::new(CompanyResearchNode::new()));
     registry.register(Box::new(ProspectingResearchNode::new()));
+    registry.register(Box::new(
+        MaterializeDocNode::new("opportunity")
+            .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]),
+    ));
     registry
 }
 
@@ -115,7 +141,9 @@ pub fn registry() -> NodeRegistry {
 /// stage is ever rewired to the `Local` transport here. This is the
 /// per-workflow analog of `sdlc_flow::graph::registry_for_policy`'s
 /// no-rewire-`implement` guard, but for `RESEARCH_AGENT` it applies to
-/// *both* terminal nodes, not just one.
+/// *both* terminal research nodes, not just one — `MaterializeDocNode` is
+/// deterministic and carries no `ModelTier` at all, so it is never a
+/// rewrite candidate either way.
 #[must_use]
 pub fn registry_for_policy(_policy: &ResearchAgentPolicy) -> NodeRegistry {
     registry()
@@ -172,13 +200,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_three_nodes() {
+    fn registry_contains_all_four_nodes() {
         let registry = registry();
 
         let expected = [
             "ResearchModeRouterNode",
             "CompanyResearchNode",
             "ProspectingResearchNode",
+            "MaterializeDocNode",
         ];
 
         for identity in expected {
@@ -188,6 +217,41 @@ mod tests {
             );
         }
         assert_eq!(registry.len(), expected.len());
+    }
+
+    #[test]
+    fn materialize_doc_node_is_the_only_identity_declaring_no_connections() {
+        let schema = schema();
+
+        let terminal_identities: Vec<&String> = schema
+            .nodes
+            .iter()
+            .filter(|(_, config)| config.connections.is_empty())
+            .map(|(identity, _)| identity)
+            .collect();
+
+        assert_eq!(
+            terminal_identities,
+            vec!["MaterializeDocNode"],
+            "MaterializeDocNode should be the only node declaring no forward connection"
+        );
+    }
+
+    #[test]
+    fn both_research_branches_connect_to_materialize_doc_node() {
+        let schema = schema();
+
+        for identity in ["CompanyResearchNode", "ProspectingResearchNode"] {
+            let config = schema
+                .nodes
+                .get(identity)
+                .unwrap_or_else(|| panic!("schema should declare '{identity}'"));
+            assert_eq!(
+                config.connections,
+                vec!["MaterializeDocNode".to_string()],
+                "'{identity}' should connect only to MaterializeDocNode"
+            );
+        }
     }
 
     #[test]
@@ -223,6 +287,7 @@ mod tests {
         assert!(policy_registry.contains("ResearchModeRouterNode"));
         assert!(policy_registry.contains("CompanyResearchNode"));
         assert!(policy_registry.contains("ProspectingResearchNode"));
+        assert!(policy_registry.contains("MaterializeDocNode"));
     }
 
     #[test]

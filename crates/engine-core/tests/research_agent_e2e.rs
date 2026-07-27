@@ -12,15 +12,17 @@
 //! way to pre-stamp a `SetupWorktreeNode` result) cannot be handed a
 //! controlled temp-dir worktree path up front. Rather than redirect the
 //! whole test process's current directory (a global, racy side effect
-//! across parallel test threads), this file drives the two-hop walk
-//! (`ResearchModeRouterNode::route` -> the routed terminal node's
-//! `Node::process`) directly against the same registered node instances
+//! across parallel test threads), this file drives the three-hop walk
+//! (`ResearchModeRouterNode::route` -> the routed research branch's
+//! `Node::process` -> the shared `MaterializeDocNode`'s `Node::process`,
+//! per `EN.7.B`) directly against the same registered node instances
 //! [`build_registry`] would hand to a real `Workflow` — real composition,
-//! real routing decision, real terminal-node logic, just not through
-//! `Workflow::run`'s own walk loop. [`assembled_workflow_builds`] below
-//! separately confirms the declared graph + registry still assemble via
-//! `Workflow::new_validated` (the same check `Workflow::run` would have
-//! exercised internally).
+//! real routing decision, real node logic, just not through
+//! `Workflow::run`'s own walk loop; `MaterializeDocNode` is stubbed
+//! ([`stub_materialize_doc_node`]) so this suite never touches a real
+//! corpus. [`assembled_workflow_builds`] below separately confirms the
+//! declared graph + registry still assemble via `Workflow::new_validated`
+//! (the same check `Workflow::run` would have exercised internally).
 //!
 //! Covers the spec's acceptance criteria for task 8:
 //! (a) a `mode: company` event routes `ResearchModeRouterNode ->
@@ -48,6 +50,10 @@ use chrono::Utc;
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{EventsRow, NodeRunStatus, TaskContext};
 use engine_core::node::NodeRegistry;
+use engine_core::nodes::doc_materializer::{
+    MaterializeOutcome, MaterializedFile, StubDocMaterializer,
+};
+use engine_core::nodes::materialize_doc::MaterializeDocNode;
 use engine_core::policy;
 use engine_core::workflow::Workflow;
 use engine_core::workflows::research_agent::graph::{self, ResearchModeRouterNode};
@@ -58,6 +64,26 @@ use engine_core::workflows::research_agent::CompanyResearchNode;
 use futures::FutureExt;
 use serde_json::json;
 use uuid::Uuid;
+
+/// Builds a `MaterializeDocNode` wired with a `StubDocMaterializer` that
+/// always succeeds, so this hermetic suite never touches a real corpus —
+/// `EN.7.B` closes `RESEARCH_AGENT`'s graph on this node, so every registry
+/// this file builds must include it (stubbed) to stay a valid,
+/// `WorkflowValidator`-passing graph.
+fn stub_materialize_doc_node() -> MaterializeDocNode {
+    let outcome = MaterializeOutcome {
+        wrote: true,
+        planned: vec![MaterializedFile {
+            path: PathBuf::from("/tmp/brain/business/docs/opportunities/stub.md"),
+            note: "created".to_string(),
+        }],
+        diagnostics: vec![],
+    };
+    MaterializeDocNode::new("opportunity")
+        .with_materializer(Arc::new(StubDocMaterializer::succeeding(outcome)))
+        .with_brain_root("/tmp/brain")
+        .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])
+}
 
 fn temp_worktree(tag: &str) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -143,6 +169,7 @@ fn build_registry() -> NodeRegistry {
     registry.register(Box::new(
         ProspectingResearchNode::new().with_transport(stub_prospecting_transport()),
     ));
+    registry.register(Box::new(stub_materialize_doc_node()));
     registry
 }
 
@@ -167,10 +194,16 @@ fn stamp_resolved_policy(ctx: &mut TaskContext, worktree: &Path) {
 
 /// Drives the full logical `RESEARCH_AGENT` walk against the exact node
 /// instances a real `Workflow` built from [`build_registry`] would use:
-/// `ResearchModeRouterNode::route` picks the terminal identity from
-/// `event.mode`, then that node's `Node::process` runs for real (stubbed
-/// transport only). See the module doc for why this drives the nodes
-/// directly rather than through `Workflow::run`.
+/// `ResearchModeRouterNode::route` picks the research-branch identity from
+/// `event.mode`, that node's `Node::process` runs for real (stubbed
+/// transport only), and then — since `EN.7.B` closes the graph on a shared
+/// `MaterializeDocNode` — that node's `Node::process` runs too (stubbed
+/// materializer only), matching `graph::schema()`'s declared
+/// `connections[0]`. See the module doc for why this drives the nodes
+/// directly rather than through `Workflow::run`. Returns the routed
+/// research-branch identity (not `"MaterializeDocNode"`) so every existing
+/// caller's `target == "CompanyResearchNode"`-style assertion keeps its
+/// original meaning.
 async fn drive(event: serde_json::Value, worktree: &Path) -> (String, TaskContext) {
     let registry = build_registry();
 
@@ -206,6 +239,24 @@ async fn drive(event: serde_json::Value, worktree: &Path) -> (String, TaskContex
     // `TaskContext` matches what a real `Workflow::run` would have produced
     // (mirrors `workflow.rs`'s own post-`process` success stamping).
     if let Some(run) = ctx.node_runs.get_mut(&target) {
+        run.status = engine_contract::NodeRunStatus::Success;
+        run.completed_at = Some(chrono::Utc::now());
+    }
+
+    // Follow the declared graph's next hop (`EN.7.B`): both research
+    // branches converge on `MaterializeDocNode`, so drive it too.
+    let next = graph::schema()
+        .next_after(&target)
+        .expect("routed research node should declare a connection to MaterializeDocNode")
+        .to_string();
+    let materialize = registry
+        .get(&next)
+        .unwrap_or_else(|| panic!("'{next}' should be registered"));
+    let mut ctx = materialize
+        .process(ctx)
+        .await
+        .unwrap_or_else(|err| panic!("'{next}' should process successfully: {err}"));
+    if let Some(run) = ctx.node_runs.get_mut(&next) {
         run.status = engine_contract::NodeRunStatus::Success;
         run.completed_at = Some(chrono::Utc::now());
     }
@@ -344,6 +395,7 @@ fn registry_for_policy_rewires_nothing_to_local_on_websearch_stages() {
         "ResearchModeRouterNode",
         "CompanyResearchNode",
         "ProspectingResearchNode",
+        "MaterializeDocNode",
     ] {
         assert!(
             policy_registry.contains(identity),
