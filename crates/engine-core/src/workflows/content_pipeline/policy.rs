@@ -13,7 +13,10 @@
 //! `revise` (`ReviseNode`), `translate` (`TranslateNode`) — all
 //! Local-eligible per `graph::registry_for_policy`. The fetch/normalize/
 //! render/persist stages have no `ModelTier` field and never rewire to
-//! Local.
+//! Local. `EN.6.A` adds a fifth, non-model `dispatch` stage
+//! (`ActionDispatchNode`): `dispatch_verbosity` is telemetry/verbosity
+//! config only — there is no `dispatch` entry in `ModelTiers`, no rewire
+//! branch in `graph::registry_for_policy`, and it is never Local-eligible.
 //!
 //! Built on `EN.5.D`'s derived [`crate::policy::Overlay`] — this module does
 //! not hand-write another `merge_opt`/`merge_local`/`apply_override` trio.
@@ -72,6 +75,12 @@ pub struct ContentPipelinePolicy {
     /// Confidence exit threshold in `[0, 1]`; the loop also exits early
     /// once `CriticEvaluation.confidence` meets or exceeds this value.
     pub critic_confidence_threshold: f64,
+    /// Verbosity for the non-model `dispatch` stage (`ActionDispatchNode`,
+    /// `EN.6.A`) — telemetry/logging shaping only. This is deliberately
+    /// **not** a `ModelTier`: the dispatch stage is a deterministic egress
+    /// node, never Local-eligible, and `graph::registry_for_policy` has no
+    /// rewire branch for it.
+    pub dispatch_verbosity: OutputVerbosity,
 }
 
 impl Default for ContentPipelinePolicy {
@@ -85,6 +94,7 @@ impl Default for ContentPipelinePolicy {
             local: LocalConfig::default(),
             max_critic_iterations: 3,
             critic_confidence_threshold: 0.8,
+            dispatch_verbosity: OutputVerbosity::Normal,
         }
     }
 }
@@ -112,6 +122,7 @@ pub struct PartialContentPipelinePolicy {
     pub local: Option<PartialLocalConfig>,
     pub max_critic_iterations: Option<u32>,
     pub critic_confidence_threshold: Option<f64>,
+    pub dispatch_verbosity: Option<OutputVerbosity>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -156,6 +167,7 @@ impl crate::policy::Policy for ContentPipelinePolicy {
                 base.critic_confidence_threshold,
                 over.critic_confidence_threshold,
             ),
+            dispatch_verbosity: merge_opt(base.dispatch_verbosity, over.dispatch_verbosity),
         }
     }
 }
@@ -225,6 +237,19 @@ mod tests {
         assert!(!policy.prompt_cache);
         assert_eq!(policy.max_critic_iterations, 3);
         assert!((policy.critic_confidence_threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(policy.dispatch_verbosity, OutputVerbosity::Normal);
+    }
+
+    #[test]
+    fn dispatch_verbosity_overrides_independently_of_model_tiers() {
+        let event = PartialContentPipelinePolicy {
+            dispatch_verbosity: Some(OutputVerbosity::Verbose),
+            ..Default::default()
+        };
+        let resolved = resolve(ContentPipelinePolicy::default(), None, None, Some(&event));
+        assert_eq!(resolved.dispatch_verbosity, OutputVerbosity::Verbose);
+        // Untouched model tiers still fall through to builtin.
+        assert_eq!(resolved.model_tiers.summarize, ModelTier::Sonnet);
     }
 
     #[test]

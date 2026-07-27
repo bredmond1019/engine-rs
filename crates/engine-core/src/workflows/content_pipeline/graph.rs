@@ -12,7 +12,8 @@
 //!   -> SummarizeNode -> SelfCriticNode -> CriticRouterNode
 //!   -> { TranslateSkipRouterNode -> { TranslateNode | DigestRenderNode }
 //!      | IncrementCriticIterationNode -> ReviseNode -> SelfCriticNode }  // back-edge
-//! TranslateNode -> DigestRenderNode -> PersistToBrainNode  // terminal in EN.5.A
+//! TranslateNode -> DigestRenderNode -> PersistToBrainNode
+//!   -> ActionDispatchNode  // terminal (EN.6.A egress)
 //! ```
 //!
 //! `CriticRouterNode` is a [`Router`]: it reads `SelfCriticNode`'s stored
@@ -26,8 +27,10 @@
 //! `max_critic_iterations` (architecture.md §4). `TranslateSkipRouterNode`
 //! is likewise a [`Router`]: translate-on routes through `TranslateNode`
 //! first, translate-off skips straight to `DigestRenderNode`.
-//! `PersistToBrainNode` is the sole terminal node — no forward connection
-//! (EN.6.A wires an `ActionDispatchNode` after it later).
+//! `PersistToBrainNode` forwards to `ActionDispatchNode` (`EN.6.A`), the
+//! sole terminal node — the outbound egress seam that replies to the
+//! originating channel (or dispatches nothing for fire-and-forget runs)
+//! and/or chains a follow-on workflow trigger.
 //!
 //! Per `routing.rs`'s D42 declared-acyclic / runtime-cyclic contract, the
 //! `ReviseNode -> SelfCriticNode` back-edge is never walked by
@@ -45,6 +48,7 @@ use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 use crate::workflows::ModelTransport;
 
+use super::action_dispatch::ActionDispatchNode;
 use super::critic_router::CriticRouterNode;
 use super::digest_render::DigestRenderNode;
 use super::fetch_article::FetchArticleNode;
@@ -144,7 +148,11 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "PersistToBrainNode".to_string(),
-        NodeConfig::new("PersistToBrainNode", vec![]),
+        NodeConfig::new("PersistToBrainNode", vec!["ActionDispatchNode".to_string()]),
+    );
+    nodes.insert(
+        "ActionDispatchNode".to_string(),
+        NodeConfig::new("ActionDispatchNode", vec![]),
     );
 
     WorkflowSchema::new(WORKFLOW_TYPE, "SourceRouterNode", nodes)
@@ -170,6 +178,7 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(TranslateNode::new()));
     registry.register(Box::new(DigestRenderNode));
     registry.register(Box::new(PersistToBrainNode::new()));
+    registry.register(Box::new(ActionDispatchNode::new()));
 
     registry
 }
@@ -190,8 +199,11 @@ fn real_cloud_transport() -> ModelTransport {
 /// (`TranslateNode`) — `policy` resolves to [`ModelTier::Local`] rewired to
 /// route through [`openai_compat_transport_live`] (falling back to the real
 /// `claude` CLI transport on any local-endpoint failure). **Never**
-/// rewires the fetch/normalize/render/persist stages — they carry no
-/// `ModelTier` field and are not model nodes at all (architecture.md §5).
+/// rewires the fetch/normalize/render/persist/dispatch stages — they carry
+/// no `ModelTier` field and are not model nodes at all (architecture.md
+/// §5); `ActionDispatchNode`'s `dispatch` stage is deterministic egress and
+/// is never Local-eligible (`policy.rs`'s `dispatch_verbosity` is
+/// telemetry/verbosity config only, not a `ModelTier`).
 /// This is the four-stage analog of `proposal_generator::graph::registry_for_policy`.
 #[must_use]
 pub fn registry_for_policy(policy: &ContentPipelinePolicy) -> NodeRegistry {
@@ -243,7 +255,7 @@ mod tests {
     use super::*;
     use crate::validate::WorkflowValidator;
 
-    const ALL_NODE_IDENTITIES: [&str; 13] = [
+    const ALL_NODE_IDENTITIES: [&str; 14] = [
         "SourceRouterNode",
         "FetchArticleNode",
         "FetchTranscriptNode",
@@ -257,6 +269,7 @@ mod tests {
         "TranslateNode",
         "DigestRenderNode",
         "PersistToBrainNode",
+        "ActionDispatchNode",
     ];
 
     #[test]
@@ -319,9 +332,18 @@ mod tests {
     }
 
     #[test]
-    fn persist_to_brain_is_terminal() {
+    fn persist_to_brain_forwards_to_action_dispatch() {
         let schema = schema();
-        assert!(schema.nodes["PersistToBrainNode"].connections.is_empty());
+        assert_eq!(
+            schema.nodes["PersistToBrainNode"].connections,
+            vec!["ActionDispatchNode".to_string()]
+        );
+    }
+
+    #[test]
+    fn action_dispatch_is_terminal() {
+        let schema = schema();
+        assert!(schema.nodes["ActionDispatchNode"].connections.is_empty());
     }
 
     #[test]
@@ -398,13 +420,14 @@ mod tests {
     #[test]
     fn registry_for_policy_never_rewires_fetch_normalize_render_persist_stages() {
         // `FetchArticleNode`, `FetchTranscriptNode`,
-        // `NormalizeChannelContentNode`, `DigestRenderNode`, and
-        // `PersistToBrainNode` have no `ModelTier` field at all — there is
-        // no branch in `registry_for_policy` that could rewire them, by
-        // construction. This test documents that: a policy with every
-        // model-eligible tier set to Local still leaves those five
-        // identities registered (i.e. present, not silently dropped) with
-        // no policy hook available to touch them.
+        // `NormalizeChannelContentNode`, `DigestRenderNode`,
+        // `PersistToBrainNode`, and `ActionDispatchNode` have no
+        // `ModelTier` field at all — there is no branch in
+        // `registry_for_policy` that could rewire them, by construction.
+        // This test documents that: a policy with every model-eligible
+        // tier set to Local still leaves those six identities registered
+        // (i.e. present, not silently dropped) with no policy hook
+        // available to touch them.
         let mut policy = ContentPipelinePolicy::default();
         policy.model_tiers.summarize = ModelTier::Local;
         policy.model_tiers.critic = ModelTier::Local;
@@ -418,9 +441,27 @@ mod tests {
             "NormalizeChannelContentNode",
             "DigestRenderNode",
             "PersistToBrainNode",
+            "ActionDispatchNode",
         ] {
             assert!(registry.contains(identity));
         }
+        assert_eq!(registry.len(), super::registry().len());
+    }
+
+    #[test]
+    fn registry_for_policy_leaves_action_dispatch_untouched_under_local_profile() {
+        // Local profile (all four model-eligible stages set to Local)
+        // must not add, remove, or otherwise disturb the `dispatch` stage
+        // — `ActionDispatchNode` carries no `ModelTier` and is not part of
+        // the Local rewire at all.
+        let mut policy = ContentPipelinePolicy::default();
+        policy.model_tiers.summarize = ModelTier::Local;
+        policy.model_tiers.critic = ModelTier::Local;
+        policy.model_tiers.revise = ModelTier::Local;
+        policy.model_tiers.translate = ModelTier::Local;
+
+        let registry = registry_for_policy(&policy);
+        assert!(registry.contains("ActionDispatchNode"));
         assert_eq!(registry.len(), super::registry().len());
     }
 }

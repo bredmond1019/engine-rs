@@ -180,6 +180,33 @@ pub fn register_proposal_generator(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Env var this crate reads for the base URL its own served `POST /events/`
+/// endpoint is reachable at, so a served `CONTENT_PIPELINE` run's
+/// `ActionDispatchNode` self-POSTs a `TriggerWorkflow` action back to the
+/// right place (`EN.6.A` task 5) instead of `action_dispatch.rs`'s
+/// `DEFAULT_EVENTS_URL` local-dev placeholder. Unset falls back to that
+/// same placeholder, so a deployment that never sets this var keeps
+/// today's behavior unchanged. The `X-API-Key` header the self-POST needs
+/// is wired separately: `channel_transport_live` builds a
+/// `WorkflowTriggerDispatch` via `WorkflowTriggerDispatch::new`, which
+/// already reads it from `ENGINE_EVENTS_API_KEY` (`channel_transport.rs`).
+const EVENTS_URL_ENV: &str = "ENGINE_EVENTS_URL";
+
+/// The local-dev placeholder `ActionDispatchNode::new()` defaults to
+/// (`action_dispatch.rs`'s private `DEFAULT_EVENTS_URL`, duplicated here
+/// since this crate has no dependency path to that private const) —
+/// [`EVENTS_URL_ENV`]'s fallback when unset.
+const DEFAULT_EVENTS_URL: &str = "http://localhost:8080/events/";
+
+/// Read [`EVENTS_URL_ENV`], falling back to [`DEFAULT_EVENTS_URL`] when
+/// unset or empty.
+fn events_url_from_env() -> String {
+    std::env::var(EVENTS_URL_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_EVENTS_URL.to_string())
+}
+
 /// Register the `CONTENT_PIPELINE` workflow
 /// (`engine_core::workflows::content_pipeline`) with `dispatcher`,
 /// populating both the `workflow_registry` (via a policy-aware factory
@@ -192,6 +219,16 @@ pub fn register_proposal_generator(dispatcher: &mut Dispatcher) {
 /// the factory resolves policy against `PolicyConfigSource::Builtin`
 /// (builtin + profile + event layers only, no filesystem access) rather
 /// than a worktree path.
+///
+/// `EN.6.A` task 5: after `registry_for_policy` builds the policy-rewired
+/// registry, this re-registers `ActionDispatchNode` with a
+/// `channel_transport_live` pointed at [`events_url_from_env`]'s
+/// deployment-configured `/events/` URL rather than the node's own
+/// local-dev placeholder default — mirroring how `registry_for_policy`
+/// itself re-registers a node to override its transport. The dispatch
+/// stage carries no `ModelTier` and is never Local-eligible
+/// (`content_pipeline::policy`), so this override applies identically
+/// regardless of the resolved policy.
 pub fn register_content_pipeline(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::content_pipeline::graph::schema(),
@@ -203,8 +240,17 @@ pub fn register_content_pipeline(dispatcher: &mut Dispatcher) {
                     &PolicyConfigSource::Builtin,
                 )
                 .map_err(|err| err.to_string())?;
-            let registry =
+            let mut registry =
                 engine_core::workflows::content_pipeline::graph::registry_for_policy(&policy);
+            registry.register(Box::new(
+                engine_core::workflows::content_pipeline::action_dispatch::ActionDispatchNode::new(
+                )
+                .with_transport(
+                    engine_core::nodes::channel_transport::channel_transport_live(
+                        events_url_from_env(),
+                    ),
+                ),
+            ));
             let seeded = seed_resolved_policy(&policy)?;
             Ok(Workflow::new(
                 registry,
@@ -634,5 +680,58 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("CONTENT_PIPELINE"));
+    }
+
+    /// `events_url_from_env` (`EN.6.A` task 5): unset/empty falls back to
+    /// the local-dev placeholder; a configured value overrides it. Runs as
+    /// a single test (rather than split across parallel `#[test]`s) since
+    /// `std::env::var`/`set_var` are process-global and no other test in
+    /// this file touches `ENGINE_EVENTS_URL` — self-contained regardless of
+    /// `cargo test`'s default parallel execution.
+    #[test]
+    fn events_url_from_env_falls_back_then_honors_the_configured_value() {
+        // SAFETY: this test owns `ENGINE_EVENTS_URL` end-to-end (no other
+        // test in this crate reads or writes it) and always restores the
+        // unset state before returning, so it cannot leak a stale value to
+        // any other test even under `cargo test`'s default parallelism.
+        unsafe {
+            std::env::remove_var(EVENTS_URL_ENV);
+        }
+        assert_eq!(events_url_from_env(), DEFAULT_EVENTS_URL);
+
+        unsafe {
+            std::env::set_var(EVENTS_URL_ENV, "https://engine.example.com/events/");
+        }
+        assert_eq!(events_url_from_env(), "https://engine.example.com/events/");
+
+        unsafe {
+            std::env::remove_var(EVENTS_URL_ENV);
+        }
+        assert_eq!(events_url_from_env(), DEFAULT_EVENTS_URL);
+    }
+
+    /// A served `CONTENT_PIPELINE` dispatch still builds a runnable
+    /// `Workflow` when `ENGINE_EVENTS_URL` is configured — the
+    /// `ActionDispatchNode` re-registration in `register_content_pipeline`
+    /// does not disturb the rest of the policy-aware assembly.
+    #[test]
+    fn dispatch_with_event_builds_content_pipeline_with_a_configured_events_url() {
+        unsafe {
+            std::env::set_var(EVENTS_URL_ENV, "https://engine.example.com/events/");
+        }
+
+        let mut dispatcher = Dispatcher::new();
+        register_content_pipeline(&mut dispatcher);
+
+        let workflow =
+            dispatcher.dispatch_with_event("CONTENT_PIPELINE", &minimal_web_article_event());
+
+        unsafe {
+            std::env::remove_var(EVENTS_URL_ENV);
+        }
+
+        let workflow =
+            workflow.expect("CONTENT_PIPELINE should dispatch with a configured events URL");
+        let _ = workflow;
     }
 }
