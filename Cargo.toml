@@ -28,3 +28,4 @@ claude-code-rs = { path = "../claude-code-rs" }
 regex = "1"
 mev = { path = "../mev" }
 okf-core = { path = "../okf-core" }
+tempfile = "3"

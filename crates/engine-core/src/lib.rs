@@ -2,8 +2,11 @@
 //!
 //! `Node` trait + registry land in EN.1.A task 1. `WorkflowSchema`/`NodeConfig`
 //! land in EN.1.A task 2. The `Workflow` pointer-walk runner + `on_progress`
-//! seam land in EN.1.A task 3 — see `docs/architecture.md` for the module map.
+//! seam land in EN.1.A task 3. Brain-root / target-corpus resolution
+//! (`ENGINE_BRAIN_ROOT`, walk-up via `mev::brain::config::find_brain_root`)
+//! lands in EN.7.A task 2 — see `docs/architecture.md` for the module map.
 
+pub mod brain_root;
 pub mod budget;
 pub mod cancellation;
 pub mod dispatch;
@@ -18,6 +21,7 @@ pub mod validate;
 pub mod workflow;
 pub mod workflows;
 
+pub use brain_root::{resolve_brain_root, resolve_brain_root_from, BrainRootError};
 pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
 pub use dispatch::{DispatchError, Dispatcher, WorkflowFactory};
