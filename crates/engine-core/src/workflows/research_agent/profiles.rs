@@ -17,8 +17,8 @@ use crate::node::NodeError;
 use crate::policy::PolicyConfigSource;
 
 use super::policy::{
-    self, ModelTier, OutputVerbosity, PartialModelTiers, PartialResearchAgentPolicy,
-    ResearchAgentPolicy,
+    self, ContactDepth, ModelTier, OutputVerbosity, PartialContactEnrichment, PartialModelTiers,
+    PartialResearchAgentPolicy, ResearchAgentPolicy,
 };
 use super::schema::ResearchAgentEventSchema;
 
@@ -40,6 +40,11 @@ pub fn baseline() -> PartialResearchAgentPolicy {
             research: Some(ModelTier::Sonnet),
             prospect: Some(ModelTier::Sonnet),
         }),
+        contact_enrichment: Some(PartialContactEnrichment {
+            research: Some(ContactDepth::Standard),
+            prospect: Some(ContactDepth::Standard),
+            max_fetches: Some(4),
+        }),
         ..Default::default()
     }
 }
@@ -55,6 +60,11 @@ pub fn cheap_fast() -> PartialResearchAgentPolicy {
             research: Some(ModelTier::Haiku),
             prospect: Some(ModelTier::Haiku),
         }),
+        contact_enrichment: Some(PartialContactEnrichment {
+            research: Some(ContactDepth::Off),
+            prospect: Some(ContactDepth::Off),
+            max_fetches: Some(0),
+        }),
         ..Default::default()
     }
 }
@@ -67,6 +77,14 @@ pub fn thorough() -> PartialResearchAgentPolicy {
         model_tiers: Some(PartialModelTiers {
             research: Some(ModelTier::Opus),
             prospect: Some(ModelTier::Opus),
+        }),
+        // Prospecting deliberately stays `standard` even at `thorough` so a
+        // broad sweep never multiplies deep enrichment across dozens of
+        // leads.
+        contact_enrichment: Some(PartialContactEnrichment {
+            research: Some(ContactDepth::Deep),
+            prospect: Some(ContactDepth::Standard),
+            max_fetches: Some(8),
         }),
         ..Default::default()
     }
@@ -234,30 +252,42 @@ mod tests {
     #[test]
     fn baseline_matches_documented_knob_values() {
         let p = baseline();
-        let tiers = p.model_tiers.expect("model_tiers set");
+        let tiers = p.model_tiers.clone().expect("model_tiers set");
         assert_eq!(tiers.research, Some(ModelTier::Sonnet));
         assert_eq!(tiers.prospect, Some(ModelTier::Sonnet));
         assert_eq!(p.output_verbosity, Some(OutputVerbosity::Normal));
         assert_eq!(p.prompt_cache, Some(false));
+        let ce = p.contact_enrichment.expect("contact_enrichment set");
+        assert_eq!(ce.research, Some(ContactDepth::Standard));
+        assert_eq!(ce.prospect, Some(ContactDepth::Standard));
+        assert_eq!(ce.max_fetches, Some(4));
     }
 
     #[test]
     fn cheap_fast_matches_documented_knob_values() {
         let p = cheap_fast();
-        let tiers = p.model_tiers.expect("model_tiers set");
+        let tiers = p.model_tiers.clone().expect("model_tiers set");
         assert_eq!(tiers.research, Some(ModelTier::Haiku));
         assert_eq!(tiers.prospect, Some(ModelTier::Haiku));
         assert_eq!(p.output_verbosity, Some(OutputVerbosity::Terse));
         assert_eq!(p.prompt_cache, Some(true));
+        let ce = p.contact_enrichment.expect("contact_enrichment set");
+        assert_eq!(ce.research, Some(ContactDepth::Off));
+        assert_eq!(ce.prospect, Some(ContactDepth::Off));
+        assert_eq!(ce.max_fetches, Some(0));
     }
 
     #[test]
     fn thorough_matches_documented_knob_values() {
         let p = thorough();
-        let tiers = p.model_tiers.expect("model_tiers set");
+        let tiers = p.model_tiers.clone().expect("model_tiers set");
         assert_eq!(tiers.research, Some(ModelTier::Opus));
         assert_eq!(tiers.prospect, Some(ModelTier::Opus));
         assert_eq!(p.output_verbosity, Some(OutputVerbosity::Verbose));
+        let ce = p.contact_enrichment.expect("contact_enrichment set");
+        assert_eq!(ce.research, Some(ContactDepth::Deep));
+        assert_eq!(ce.prospect, Some(ContactDepth::Standard));
+        assert_eq!(ce.max_fetches, Some(8));
     }
 
     #[test]
