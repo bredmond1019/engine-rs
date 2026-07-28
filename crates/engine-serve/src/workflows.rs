@@ -468,6 +468,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_schema_terminates_in_merge_contacts_node_with_no_outgoing_edges() {
+        let mut dispatcher = Dispatcher::new();
+        register_research_agent(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("RESEARCH_AGENT")
+            .expect("RESEARCH_AGENT schema should resolve");
+
+        let config = schema
+            .nodes
+            .get("MergeContactsNode")
+            .expect("schema should declare 'MergeContactsNode'");
+        assert!(
+            config.connections.is_empty(),
+            "MergeContactsNode should have no outgoing edges"
+        );
+    }
+
+    #[test]
     fn register_builtin_workflows_registers_research_agent() {
         let mut dispatcher = Dispatcher::new();
 

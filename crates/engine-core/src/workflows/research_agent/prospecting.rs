@@ -28,7 +28,7 @@ use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
-use super::policy::{ModelTier, ResearchAgentPolicy};
+use super::policy::{ContactDepth, ModelTier, ResearchAgentPolicy};
 use super::schema::{prospecting_result_json_schema, ProspectingResult, ResearchAgentEventSchema};
 
 /// The `Node::name()` identity `ProspectingResearchNode` runs its composed
@@ -61,13 +61,85 @@ fn parse_event(ctx: &TaskContext) -> Result<ResearchAgentEventSchema, NodeError>
         .map_err(|err| NodeError::new(format!("invalid RESEARCH_AGENT event: {err}")))
 }
 
-/// Build the prospecting-sweep prompt from the triggering event. Ports
-/// `orchestrator`'s reddit-prospecting-inspired flow: forum/web sweep ->
-/// pain points -> four-pillar vertical mapping -> outreach hooks, framed
+/// Build the per-prospect contact-acquisition + extraction directive block
+/// appended to the base prospecting prompt, shaped by the resolved `depth`
+/// (and, at non-`Off` depths, the `max_fetches` budget). Returns an empty
+/// string at [`ContactDepth::Off`] so the run behaves exactly as it did
+/// before `EN.4.E` — no contact directive, no per-prospect fetches.
+///
+/// Calibrated to this mode, not copy-pasted from company mode: breadth of
+/// prospects matters more than depth of contact here (company mode is
+/// where deep enrichment belongs), so both non-`Off` depths cap the spend
+/// at **one cheap attempt per identifiable business** and explicitly tell
+/// the model to skip pseudonymous individuals rather than burn fetches
+/// chasing them. `Deep` is permitted but deliberately not reached by any
+/// built-in profile (`thorough` pins prospecting at `Standard`) — treat it
+/// as `Standard` plus the public-profile sweep, with `max_fetches` still
+/// the authoritative per-run cap.
+fn contact_directive(depth: ContactDepth, max_fetches: u8) -> String {
+    match depth {
+        ContactDepth::Off => String::new(),
+        ContactDepth::Standard => format!(
+            "\n\nACQUISITION — reachable contacts, one attempt per identifiable business \
+             (total run budget: up to {max_fetches} extra page loads beyond what you've \
+             already fetched; self-limit to this budget across the whole sweep, not per \
+             prospect). Breadth beats depth here: prioritize surfacing more prospects over \
+             chasing contact detail on any one of them. For a prospect that is an \
+             identifiable business (has a named company, storefront, or public profile you \
+             can attribute to an operating entity), spend at most one cheap look at its \
+             public profile page or its site's contact/footer surface. Explicitly SKIP \
+             pseudonymous individuals — a forum handle, a personal account with no business \
+             attached — do not spend fetches chasing them; a pseudonymous poster with no \
+             contact is a normal, correct result, not a gap to fill.\n\n\
+             EXTRACTION — report every reachable channel you found under that prospect's \
+             `contacts`. A generic channel with no named individual (e.g. \
+             `contato@company.example`, a storefront WhatsApp number) is still a valid \
+             contact — record it with an empty `name` rather than discarding it.\n\n\
+             ANTI-FABRICATION (mandatory): only report a contact channel that appears \
+             verbatim in a page you actually fetched. Never construct an email, phone \
+             number, or handle from the company's domain or a person's name. Most leads \
+             will legitimately have no contacts — an empty `contacts` list is the correct, \
+             expected answer for the majority of prospects; do not pressure yourself toward \
+             filling the field. Acquisition and anti-fabrication compose, they do not \
+             compete: search hard where it's cheap, report only what you saw."
+        ),
+        ContactDepth::Deep => format!(
+            "\n\nACQUISITION — reachable contacts, one attempt per identifiable business \
+             plus a public-profile sweep (total run budget: up to {max_fetches} extra page \
+             loads beyond what you've already fetched; self-limit to this budget across the \
+             whole sweep, not per prospect). Breadth beats depth here: prioritize surfacing \
+             more prospects over chasing contact detail on any one of them. For a prospect \
+             that is an identifiable business (has a named company, storefront, or public \
+             profile you can attribute to an operating entity), spend at most one cheap look \
+             at its public profile page or its site's contact/footer surface, and also check \
+             its public LinkedIn/Instagram/Facebook profile if you find one linked. \
+             Explicitly SKIP pseudonymous individuals — a forum handle, a personal account \
+             with no business attached — do not spend fetches chasing them; a pseudonymous \
+             poster with no contact is a normal, correct result, not a gap to fill.\n\n\
+             EXTRACTION — report every reachable channel you found under that prospect's \
+             `contacts`. A generic channel with no named individual (e.g. \
+             `contato@company.example`, a storefront WhatsApp number) is still a valid \
+             contact — record it with an empty `name` rather than discarding it.\n\n\
+             ANTI-FABRICATION (mandatory): only report a contact channel that appears \
+             verbatim in a page you actually fetched. Never construct an email, phone \
+             number, or handle from the company's domain or a person's name. Most leads \
+             will legitimately have no contacts — an empty `contacts` list is the correct, \
+             expected answer for the majority of prospects; do not pressure yourself toward \
+             filling the field. Acquisition and anti-fabrication compose, they do not \
+             compete: search hard where it's cheap, report only what you saw."
+        ),
+    }
+}
+
+/// Build the prospecting-sweep prompt from the triggering event, shaped by
+/// the resolved `contact_enrichment.prospect` depth + `max_fetches` (task
+/// 3's policy knob — resolved once by the caller, never re-resolved here).
+/// Ports `orchestrator`'s reddit-prospecting-inspired flow: forum/web sweep
+/// -> pain points -> four-pillar vertical mapping -> outreach hooks, framed
 /// against this practice's own positioning (business/docs
 /// `brand.md`/`services.md`) so prospects map back onto real, sellable
 /// service pillars rather than generic leads.
-fn build_prompt(event: &ResearchAgentEventSchema) -> String {
+fn build_prompt(event: &ResearchAgentEventSchema, depth: ContactDepth, max_fetches: u8) -> String {
     let vertical = event.vertical.as_deref().unwrap_or("a relevant vertical");
     let topic = event
         .topic
@@ -75,7 +147,7 @@ fn build_prompt(event: &ResearchAgentEventSchema) -> String {
         .map(|topic| format!(" Narrow the sweep to: {topic}."))
         .unwrap_or_default();
 
-    format!(
+    let base = format!(
         "You are prospecting on behalf of a solo AI & Automations Engineer who \
          builds production-grade agentic systems for small and mid-size \
          businesses across four service pillars: private knowledge systems \
@@ -91,9 +163,13 @@ fn build_prompt(event: &ResearchAgentEventSchema) -> String {
          hook per prospect grounded in what they actually said.\n\n\
          Respond with strict JSON matching this shape: {{\"vertical\": str, \
          \"prospects\": [{{\"name\": str, \"pain_points\": [str], \"pillar\": \
-         str, \"outreach_hook\": str, \"source\": str}}], \
+         str, \"outreach_hook\": str, \"source\": str, \"contacts\": \
+         [{{\"name\": str, \"role\": str, \"emails\": [str], \"whatsapp\": \
+         [str], \"phones\": [str], \"links\": [str], \"note\": str}}]}}], \
          \"common_pain_points\": [str], \"sources\": [str]}}."
-    )
+    );
+
+    format!("{base}{}", contact_directive(depth, max_fetches))
 }
 
 /// Read the worktree path stamped by an upstream setup node, if this run
@@ -195,8 +271,12 @@ impl Node for ProspectingResearchNode {
         );
         config =
             crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
-        let prompt =
-            crate::policy::apply_verbosity_directive(build_prompt(&event), policy.output_verbosity);
+        let contact_depth = policy.contact_enrichment.prospect;
+        let max_fetches = policy.contact_enrichment.max_fetches;
+        let prompt = crate::policy::apply_verbosity_directive(
+            build_prompt(&event, contact_depth, max_fetches),
+            policy.output_verbosity,
+        );
 
         let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -220,13 +300,20 @@ impl Node for ProspectingResearchNode {
                 ))
             })?;
 
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            serde_json::to_value(&result).map_err(|err| {
-                NodeError::new(format!("failed to serialize ProspectingResult: {err}"))
-            })?,
-        );
+        let mut result_value = serde_json::to_value(&result).map_err(|err| {
+            NodeError::new(format!("failed to serialize ProspectingResult: {err}"))
+        })?;
+        // Stamp the resolved contact-enrichment depth alongside the result so
+        // EN.4.0 telemetry can attribute cost to the setting that caused it.
+        // `ProspectingResult` ignores unknown fields on deserialize, so this
+        // is a transparent addition to the node's result object.
+        if let Some(obj) = result_value.as_object_mut() {
+            obj.insert(
+                "contact_enrichment_depth".to_string(),
+                serde_json::to_value(contact_depth).unwrap_or_default(),
+            );
+        }
+        put_result(&mut ctx, NODE_NAME, result_value);
 
         let model_tier_used = std::collections::BTreeMap::from([(
             "prospect".to_string(),
@@ -494,5 +581,161 @@ mod tests {
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("invalid RESEARCH_AGENT event"));
+    }
+
+    // --- Task 5: policy-driven per-lead contact acquisition ---
+
+    #[test]
+    fn off_depth_prompt_has_no_contact_directive() {
+        let prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4);
+        assert!(!prompt.to_lowercase().contains("acquisition"));
+        assert!(!prompt.to_lowercase().contains("anti-fabrication"));
+    }
+
+    #[test]
+    fn standard_depth_names_one_attempt_and_skip_pseudonymous_and_budget() {
+        let prompt = build_prompt(&prospecting_event(), ContactDepth::Standard, 4);
+        assert!(prompt.contains("ACQUISITION"));
+        assert!(prompt.contains("one attempt per identifiable business"));
+        assert!(prompt.contains("SKIP pseudonymous individuals"));
+        assert!(prompt.contains("up to 4 extra page loads"));
+        // Standard does not add the social-profile sweep (the base prompt's
+        // own "LinkedIn posts" forum-sweep mention is unaffected by depth).
+        assert!(!prompt.contains("public LinkedIn/Instagram/Facebook"));
+    }
+
+    #[test]
+    fn deep_depth_adds_public_profile_sweep_and_keeps_one_attempt_rule() {
+        let prompt = build_prompt(&prospecting_event(), ContactDepth::Deep, 8);
+        assert!(prompt.contains("LinkedIn"));
+        assert!(prompt.contains("Instagram"));
+        assert!(prompt.contains("Facebook"));
+        assert!(prompt.contains("one attempt per identifiable business"));
+        assert!(prompt.contains("SKIP pseudonymous individuals"));
+        assert!(prompt.contains("up to 8 extra page loads"));
+    }
+
+    #[test]
+    fn non_off_depths_carry_anti_fabrication_directive() {
+        for depth in [ContactDepth::Standard, ContactDepth::Deep] {
+            let prompt = build_prompt(&prospecting_event(), depth, 4);
+            assert!(
+                prompt.contains("Never construct"),
+                "depth {depth:?} missing the anti-fabrication directive"
+            );
+            assert!(
+                prompt.contains("legitimately have no contacts"),
+                "depth {depth:?} missing the most-leads-have-none framing"
+            );
+            assert!(
+                prompt.contains("do not compete"),
+                "depth {depth:?} missing the composing-not-competing framing"
+            );
+        }
+    }
+
+    #[test]
+    fn breadth_over_depth_framing_present_at_non_off_depths() {
+        for depth in [ContactDepth::Standard, ContactDepth::Deep] {
+            let prompt = build_prompt(&prospecting_event(), depth, 4);
+            assert!(prompt.to_lowercase().contains("breadth"));
+        }
+    }
+
+    #[test]
+    fn stable_system_prompt_is_byte_identical_across_all_depths() {
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for depth in [
+            ContactDepth::Off,
+            ContactDepth::Standard,
+            ContactDepth::Deep,
+        ] {
+            let _ = build_prompt(&prospecting_event(), depth, 4);
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+    }
+
+    #[test]
+    fn no_prompt_synthesizes_a_contact_channel() {
+        for depth in [ContactDepth::Standard, ContactDepth::Deep] {
+            let prompt = build_prompt(&prospecting_event(), depth, 4);
+            assert!(!prompt.to_lowercase().contains("info@{domain}"));
+            assert!(!prompt.to_lowercase().contains("guess an address"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_transport_with_contact_populates_lead_contacts() {
+        let mut result_json = stub_result_json();
+        result_json["prospects"][0]["contacts"] = json!([{
+            "name": "",
+            "role": "",
+            "emails": [],
+            "whatsapp": ["+55 11 91234-5678"],
+            "phones": [],
+            "links": [],
+            "note": "WhatsApp link found in profile bio",
+        }]);
+
+        let node = ProspectingResearchNode::new().with_transport(stub_transport(Some(result_json)));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let result: ProspectingResult =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid ProspectingResult");
+        assert_eq!(result.prospects[0].contacts.len(), 1);
+        assert_eq!(
+            result.prospects[0].contacts[0].whatsapp,
+            vec!["+55 11 91234-5678"]
+        );
+    }
+
+    #[tokio::test]
+    async fn leads_with_no_contacts_key_yield_empty_vec_and_succeed() {
+        // stub_result_json() carries no "contacts" key on its prospect.
+        let node =
+            ProspectingResearchNode::new().with_transport(stub_transport(Some(stub_result_json())));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let result: ProspectingResult =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid ProspectingResult");
+        assert_eq!(result.prospects[0].contacts, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn resolved_contact_enrichment_depth_is_stamped_into_the_result() {
+        let policy = ResearchAgentPolicy {
+            contact_enrichment: super::super::policy::ContactEnrichment {
+                prospect: ContactDepth::Deep,
+                ..ResearchAgentPolicy::default().contact_enrichment
+            },
+            ..ResearchAgentPolicy::default()
+        };
+        let node =
+            ProspectingResearchNode::new().with_transport(stub_transport(Some(stub_result_json())));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(
+            ctx.nodes[NODE_NAME]["contact_enrichment_depth"],
+            json!("deep")
+        );
     }
 }

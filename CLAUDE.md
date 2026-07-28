@@ -69,7 +69,33 @@ housekeeping. There is no global scheduler.
    atomic file in `planning/decisions/` and link back.
 5. **Verified identity / handles:** none — treat these as the only authoritative
    identities/URLs; flag any other handle or profile link as unverified before publishing it.
-6. <!-- Add project-specific standing rules here (prompt handling, registries, deployment
+6. **Nodes are configurable, not hardcoded.** Anything that trades cost, latency, or quality —
+   model tier, verbosity, prompt caching, loop/retry bounds, fetch or tool budgets, local-vs-cloud
+   routing, how much telemetry a stage emits, whether an optional enrichment step runs at all —
+   belongs on that workflow's `Policy` surface (`EN.4.0`), resolving through the four layers
+   (per-run event `policy` override > named `profile` bundle > `planning/harness.json` defaults >
+   built-in default). **Never bake such a value into a prompt string, a node constructor, or a
+   `const`.** The test: *if a future run might reasonably want a different value for cost, speed, or
+   quality reasons, it is a knob.* Practical consequences:
+   - **Give every knob a built-in default that is behavior-stable** — adding the knob must not
+     change what an existing run does.
+   - **Every workflow ships the three named profiles** (`baseline` = explicit no-op, `cheap-fast` =
+     the cost/latency floor, `thorough` = the quality ceiling) and sets the new knob in each. A knob
+     absent from the profile bundles is a knob nobody will find.
+   - **Keep the shape invariant across settings.** A policy knob may change a *prompt*, a bound, or
+     a tier; it must not change an emitted JSON schema, a declared graph's node set, or a data
+     contract. Cost control belongs in the prompt and in a node's own no-op path, not in a
+     conditional rewire — one graph, validated once, is what makes runs comparable.
+   - **Keep cache breakpoints run-invariant.** Policy-varying text goes in the per-run prompt body,
+     never in a `STABLE_SYSTEM_PROMPT` prefix.
+   - **Stamp the resolved value** into the node's `ctx.nodes` result so `RunTelemetry` /
+     `PolicyAggregate` can attribute observed cost to the setting that caused it.
+   - **Document it in `planning/harness.json`** alongside the existing no-op defaults, so the knob is
+     discoverable without reading the Rust.
+   - *Where feasible* is a real qualifier: a value fixed by an external contract (a wire format, a
+     required header, an interface another repo pins) is not a knob. Say so in a comment rather than
+     leaving the next reader to wonder.
+7. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
    boundaries, code style, etc.). -->
 
 ## Known bugs

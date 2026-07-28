@@ -65,11 +65,58 @@ pub struct ResearchAgentEventSchema {
     pub profile: Option<String>,
 }
 
+/// A reachable contact channel surfaced during a research run — shaped
+/// field-for-field like okf-core's `Contact` (`../okf-core/src/doc/
+/// opportunity.rs`) so `MergeContactsNode` (task 7) can hand this straight to
+/// mev's `plan_merge_contacts` without a lossy remap. Every field is
+/// `#[serde(default)]`-tolerant so a partial model response still
+/// deserializes rather than failing the whole brief/lead.
+///
+/// **Anti-fabrication contract (load-bearing).** Only ever populate a field
+/// with a channel that appeared verbatim in a fetched source. Never
+/// construct an email/phone/handle from a domain or a person's name. A
+/// generic channel with no named human (e.g. `contato@acme.example`, a
+/// storefront WhatsApp number) is still a valid contact — record it with an
+/// empty `name` rather than discarding it. An empty `contacts[]` on the
+/// enclosing brief/lead is the correct, expected answer when nothing
+/// reachable was found; that reason belongs in `note` or the brief summary,
+/// never invented data.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResearchContact {
+    /// The named individual this channel reaches, if one was identified.
+    /// Empty for a generic/company-level channel (e.g. `contato@`, a
+    /// storefront WhatsApp) — that is a valid contact, not a missing one.
+    #[serde(default)]
+    pub name: String,
+    /// The named individual's role/title, if stated in the source.
+    #[serde(default)]
+    pub role: String,
+    /// Email addresses seen verbatim in a fetched source.
+    #[serde(default)]
+    pub emails: Vec<String>,
+    /// WhatsApp numbers/links seen verbatim in a fetched source.
+    #[serde(default)]
+    pub whatsapp: Vec<String>,
+    /// Phone numbers seen verbatim in a fetched source.
+    #[serde(default)]
+    pub phones: Vec<String>,
+    /// Other reachable links (LinkedIn/Instagram/Facebook profile, contact
+    /// page, etc.) seen verbatim in a fetched source.
+    #[serde(default)]
+    pub links: Vec<String>,
+    /// Free-form context — e.g. why this channel was recorded, or why no
+    /// contact could be found for this brief/lead.
+    #[serde(default)]
+    pub note: String,
+}
+
 /// A single, named company's research brief — the structured output of
 /// `CompanyResearchNode`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompanyBrief {
     /// The researched company's name (echoes/normalizes the event input).
+    /// **Load-bearing key** — mev's `detect_kind` classifies a brief by this
+    /// field's presence; do not rename or remove it.
     pub company_name: String,
     /// A short paragraph summarizing what the company does.
     pub summary: String,
@@ -85,6 +132,16 @@ pub struct CompanyBrief {
     /// Source URLs the brief was drawn from.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Reachable contact channels surfaced during the run. Empty is the
+    /// correct answer when nothing verbatim was found — see
+    /// [`ResearchContact`]'s anti-fabrication contract.
+    #[serde(default)]
+    pub contacts: Vec<ResearchContact>,
+    /// The company's URL/domain. Deterministically stamped from the
+    /// trigger event's `company_url` by `CompanyResearchNode` when the event
+    /// carries one (task 4) — this field is not solely model-dependent.
+    #[serde(default)]
+    pub company_url: Option<String>,
 }
 
 /// A single prospect discovered during a prospecting sweep, mapped onto one
@@ -104,6 +161,11 @@ pub struct ProspectLead {
     /// Source URL where this prospect was found.
     #[serde(default)]
     pub source: Option<String>,
+    /// Reachable contact channels surfaced for this prospect. Empty is the
+    /// normal, expected result for most leads — see
+    /// [`ResearchContact`]'s anti-fabrication contract.
+    #[serde(default)]
+    pub contacts: Vec<ResearchContact>,
 }
 
 /// A forum/web sweep distilled into pain points, a four-pillar vertical
@@ -124,8 +186,34 @@ pub struct ProspectingResult {
     pub sources: Vec<String>,
 }
 
+/// Shared sub-schema for a [`ResearchContact`] entry, used by both
+/// `company_brief_json_schema()` and `prospecting_result_json_schema()` so
+/// the shape stays identical wherever `contacts` appears. `required` is at
+/// most `["name"]` intentionally left EMPTY — even `name` is optional, since
+/// a generic channel with no named human is still a valid contact. This
+/// sub-schema is INVARIANT across `contact_enrichment` policy settings
+/// (task 3+); only the prompt text varies with depth, never the emitted
+/// schema, so `detect_kind` and the okf-core mapping stay stable regardless
+/// of policy.
+fn research_contact_json_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "role": { "type": "string" },
+            "emails": { "type": "array", "items": { "type": "string" } },
+            "whatsapp": { "type": "array", "items": { "type": "string" } },
+            "phones": { "type": "array", "items": { "type": "string" } },
+            "links": { "type": "array", "items": { "type": "string" } },
+            "note": { "type": "string" },
+        },
+        "required": [],
+    })
+}
+
 /// JSON schema matching [`CompanyBrief`], passed as `Config.json_schema` by
-/// `CompanyResearchNode`.
+/// `CompanyResearchNode`. `contacts` is deliberately absent from
+/// `required` — an empty `contacts[]` is a valid, expected answer.
 pub fn company_brief_json_schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -136,13 +224,17 @@ pub fn company_brief_json_schema() -> serde_json::Value {
             "pain_points": { "type": "array", "items": { "type": "string" } },
             "outreach_hooks": { "type": "array", "items": { "type": "string" } },
             "sources": { "type": "array", "items": { "type": "string" } },
+            "contacts": { "type": "array", "items": research_contact_json_schema() },
+            "company_url": { "type": "string" },
         },
         "required": ["company_name", "summary"],
     })
 }
 
 /// JSON schema matching [`ProspectingResult`], passed as `Config.json_schema`
-/// by `ProspectingResearchNode`.
+/// by `ProspectingResearchNode`. `contacts` (per-prospect) is deliberately
+/// absent from each prospect's `required` list — an empty `contacts[]` is a
+/// valid, expected answer for most leads.
 pub fn prospecting_result_json_schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -158,6 +250,7 @@ pub fn prospecting_result_json_schema() -> serde_json::Value {
                         "pillar": { "type": "string" },
                         "outreach_hook": { "type": "string" },
                         "source": { "type": "string" },
+                        "contacts": { "type": "array", "items": research_contact_json_schema() },
                     },
                     "required": ["name", "pillar"],
                 },
@@ -248,6 +341,16 @@ mod tests {
             pain_points: vec!["Manual invoicing".to_string()],
             outreach_hooks: vec!["Recent Series B raise".to_string()],
             sources: vec!["https://acme.example/news".to_string()],
+            contacts: vec![ResearchContact {
+                name: "Jane Founder".to_string(),
+                role: "Founder".to_string(),
+                emails: vec!["jane@acme.example".to_string()],
+                whatsapp: vec![],
+                phones: vec![],
+                links: vec![],
+                note: String::new(),
+            }],
+            company_url: Some("https://acme.example".to_string()),
         };
         let json = serde_json::to_string(&brief).expect("serializes");
         let round_tripped: CompanyBrief = serde_json::from_str(&json).expect("deserializes");
@@ -264,6 +367,7 @@ mod tests {
                 pillar: "automation".to_string(),
                 outreach_hook: Some("Posted about contract delays on r/legaltech".to_string()),
                 source: Some("https://reddit.com/r/legaltech/abc".to_string()),
+                contacts: vec![],
             }],
             common_pain_points: vec!["Manual contract review".to_string()],
             sources: vec!["https://reddit.com/r/legaltech".to_string()],
@@ -286,5 +390,99 @@ mod tests {
     fn prospecting_result_schema_requires_vertical() {
         let schema = prospecting_result_json_schema();
         assert_eq!(schema["required"], serde_json::json!(["vertical"]));
+    }
+
+    #[test]
+    fn research_contact_round_trips_through_serde_json() {
+        let contact = ResearchContact {
+            name: "Jane Founder".to_string(),
+            role: "Founder".to_string(),
+            emails: vec!["jane@acme.example".to_string()],
+            whatsapp: vec!["+55 11 99999-0000".to_string()],
+            phones: vec![],
+            links: vec!["https://linkedin.com/in/jane".to_string()],
+            note: "Named decision-maker".to_string(),
+        };
+        let json = serde_json::to_string(&contact).expect("serializes");
+        let round_tripped: ResearchContact = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(contact, round_tripped);
+    }
+
+    #[test]
+    fn research_contact_defaults_when_fields_absent() {
+        let contact: ResearchContact =
+            serde_json::from_value(serde_json::json!({})).expect("deserializes with defaults");
+        assert_eq!(contact, ResearchContact::default());
+    }
+
+    #[test]
+    fn company_brief_deserializes_with_no_contacts_or_company_url_keys() {
+        let json = serde_json::json!({
+            "company_name": "Acme Corp",
+            "summary": "Widget manufacturer.",
+        });
+        let brief: CompanyBrief = serde_json::from_value(json).expect("deserializes with defaults");
+        assert_eq!(brief.contacts, Vec::new());
+        assert_eq!(brief.company_url, None);
+    }
+
+    #[test]
+    fn prospect_lead_deserializes_with_no_contacts_key() {
+        let json = serde_json::json!({
+            "name": "Jane Doe Legal",
+            "pillar": "automation",
+        });
+        let lead: ProspectLead = serde_json::from_value(json).expect("deserializes with defaults");
+        assert_eq!(lead.contacts, Vec::new());
+    }
+
+    #[test]
+    fn company_brief_schema_does_not_require_contacts() {
+        let schema = company_brief_json_schema();
+        let required = schema["required"].as_array().expect("required is an array");
+        assert!(!required.iter().any(|v| v == "contacts"));
+        // The contact sub-schema itself is likewise not name-required.
+        assert_eq!(
+            schema["properties"]["contacts"]["items"]["required"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn prospecting_result_schema_does_not_require_contacts() {
+        let schema = prospecting_result_json_schema();
+        let prospect_required = schema["properties"]["prospects"]["items"]["required"]
+            .as_array()
+            .expect("required is an array");
+        assert!(!prospect_required.iter().any(|v| v == "contacts"));
+    }
+
+    #[test]
+    fn detect_kind_guard_keys_survive_serialization() {
+        // mev's `detect_kind` classifies a brief by the presence of
+        // `company_name`, and a prospecting result by `prospects`/
+        // `vertical`. Contact enrichment must never move or rename these.
+        let brief = CompanyBrief {
+            company_name: "Acme Corp".to_string(),
+            summary: "Widget manufacturer.".to_string(),
+            recent_developments: vec![],
+            pain_points: vec![],
+            outreach_hooks: vec![],
+            sources: vec![],
+            contacts: vec![],
+            company_url: None,
+        };
+        let brief_json = serde_json::to_value(&brief).expect("serializes");
+        assert!(brief_json.get("company_name").is_some());
+
+        let result = ProspectingResult {
+            vertical: "legal-tech".to_string(),
+            prospects: vec![],
+            common_pain_points: vec![],
+            sources: vec![],
+        };
+        let result_json = serde_json::to_value(&result).expect("serializes");
+        assert!(result_json.get("prospects").is_some());
+        assert!(result_json.get("vertical").is_some());
     }
 }

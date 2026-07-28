@@ -58,8 +58,6 @@
 // require. Validation is downstream only; never run this against base-template itself.
 // =============================================================================
 
-import fs from 'node:fs'
-
 export const meta = {
   name: 'sdlc-task',
   description: 'Lean single-unit SDLC engine — implement → fast-test → fix → commit, in place or in a worktree',
@@ -139,24 +137,33 @@ const MAX_TASK_ATTEMPTS = 3   // implement→test→fix attempts per task before
 // root, this reports whether planning/ is such a symlink and resolves where its bytes
 // actually live, so state-writing steps can stage through the real path instead of
 // the link (and never "repair" the failure by checking out/committing in the vault
-// repo). Pure + synchronous — runs in-process rather than shelling out to python3
-// like the git-staging recipes below, so the engine itself can branch on the result.
-// Returns { vaulted, planningPath } where planningPath is always the absolute
-// resolved directory: the vault's realpath when vaulted, the plain planning/
-// directory otherwise. (Duplicated from sdlc-flow.js: the engines are deliberately
-// standalone files with no shared import.)
-function detectPlanningVault(repoRoot) {
-  const planningPath = `${repoRoot}/planning`
-  try {
-    if (fs.lstatSync(planningPath).isSymbolicLink()) {
-      return { vaulted: true, planningPath: fs.realpathSync(planningPath) }
-    }
-    return { vaulted: false, planningPath: fs.realpathSync(planningPath) }
-  } catch {
-    // planning/ missing or unreadable — treat as not vaulted; callers fall back to
-    // the legacy single-repo path, which already tolerates a missing directory.
-    return { vaulted: false, planningPath }
+// repo). The Workflow runtime has no filesystem/Node API access (no fs, no process,
+// no require, and `import` declarations don't even parse) — so this shells out via a
+// cheap Haiku agent instead of calling fs.lstatSync/realpathSync in-process, exactly
+// like every other filesystem check in this engine. Returns { vaulted, planningPath }
+// where planningPath is always the absolute resolved directory: the vault's realpath
+// when vaulted, the plain planning/ directory otherwise. (Duplicated from sdlc-flow.js:
+// the engines are deliberately standalone files with no shared import.)
+const VAULT_DETECT_SCHEMA = {
+  type: 'object',
+  required: ['vaulted', 'planningPath'],
+  properties: {
+    vaulted:      { type: 'boolean', description: 'true iff planning/ is a symlink' },
+    planningPath: { type: 'string', description: 'the resolved absolute real path of planning/' }
   }
+}
+async function detectPlanningVault(repoRoot) {
+  const result = await agent(`
+Determine whether planning/ in this repo is a symlink (a brain-vaulted repo) or a plain directory.
+Run exactly this ONE Bash call (from the repo root, ${repoRoot}):
+  cd ${repoRoot} && { [ -L planning ] && echo "SYMLINK" || echo "PLAIN"; } && python3 -c "import os; print(os.path.realpath('planning'))"
+The first line is SYMLINK or PLAIN. The second line is the resolved absolute real path (this works
+for both cases — realpath of a plain directory is itself).
+Return via StructuredOutput: vaulted (true iff the first line is SYMLINK), planningPath (the
+resolved absolute path from the second line).
+`, { label: 'detect-vault', schema: VAULT_DETECT_SCHEMA, model: 'haiku' })
+  if (!result) return { vaulted: false, planningPath: `${repoRoot}/planning` }
+  return result
 }
 
 log(`Target: ${blockId} (${selectedTasks ? [...selectedTasks].sort((a, b) => a - b).join(', ') : 'all tasks'})`)
@@ -1045,7 +1052,7 @@ if (!bailed) {
   // and the wrong repair is to checkout/commit inside the vault. The right behaviour is to stage+commit
   // them THROUGH their real path via `git -C <vault>`, on whatever branch the vault repo is already on,
   // with no checkout at all. detectPlanningVault() resolves which case applies.
-  const vault = detectPlanningVault(runDir)
+  const vault = await detectPlanningVault(runDir)
   bookkeepResult = await tracedAgent(`${W}
 You are the lean bookkeeping close-out for an /sdlc-task run. Flip ONLY the authored status markers a
 passing run leaves stale, then commit. Do NOT write a log.md narrative entry, a D18 amendment log, or

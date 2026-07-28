@@ -45,12 +45,22 @@
 //! for the same reason `materialize_doc` does; `EN.7.B` task 5 wires two
 //! `with_identity`-distinguished instances into the `set-stage` /
 //! `add-action` single-node micro-workflows.
+//!
+//! `merge_contacts` (`EN.4.E` task 7) is `MergeContactsNode` — the terminal
+//! node that collects the contacts a `RESEARCH_AGENT` run surfaced (company
+//! brief top-level `contacts[]`, or per-lead `contacts[]` flattened across a
+//! prospecting result's `prospects[]`) and merges them into the opportunity
+//! `MaterializeDocNode` just wrote, via `doc_materializer::OpportunityEdit::
+//! MergeContacts`. Lives here for the same reason its siblings do; the
+//! `RESEARCH_AGENT` graph wires one instance in after `MaterializeDocNode`
+//! on both research branches.
 
 pub mod channel_transport;
 pub mod claude_code_step;
 pub mod doc_materializer;
 pub mod http_post;
 pub mod materialize_doc;
+pub mod merge_contacts;
 pub mod openai_compat_transport;
 pub mod opportunity_edit;
 
@@ -66,6 +76,7 @@ pub use doc_materializer::{
 };
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
 pub use materialize_doc::MaterializeDocNode;
+pub use merge_contacts::MergeContactsNode;
 pub use openai_compat_transport::{
     default_local_http_post, openai_compat_meta_transport, openai_compat_meta_transport_live,
     openai_compat_transport, openai_compat_transport_live, LocalHttpPost,

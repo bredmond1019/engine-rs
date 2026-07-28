@@ -6,8 +6,8 @@ doc_id: materialize-doc-node
 layer: [engine, factory]
 project: engine-rs
 status: active
-keywords: [materialize-doc-node, doc-materializer, mev, okf-core, brain-root, opportunity, learning-artifact, proposal, dry-run, D53]
-related: [architecture, docs-index, content-pipeline-workflow, proposal-generator-workflow, D53-engine-executes-mev-writes-brain-docs]
+keywords: [materialize-doc-node, doc-materializer, mev, okf-core, brain-root, opportunity, learning-artifact, proposal, dry-run, D53, merge-contacts, opportunity-edit]
+related: [architecture, docs-index, content-pipeline-workflow, proposal-generator-workflow, D53-engine-executes-mev-writes-brain-docs, research-agent-workflow, opportunity-edit-workflows]
 ---
 
 # MaterializeDocNode and the `DocMaterializer` Seam
@@ -76,11 +76,28 @@ pub trait DocMaterializer: Send + Sync {
 ```
 
 `edit_opportunity` (`EN.7.B` task 2) is the seam's second operation — it plans + applies one
-`OpportunityEdit` (`SetStage` | `AddAction`) against an already-written Opportunity document,
-reusing this same `MaterializeOutcome` result shape (no new type). `MaterializeDocNode` never
-calls it; `OpportunityEditNode` does. Full details — the `OpportunityEdit` enum, valid-stage
-validation, idempotency, and the error surface — live in
-[opportunity-edit-workflows.md](opportunity-edit-workflows.md), not duplicated here.
+`OpportunityEdit` (`SetStage` | `AddAction` | `MergeContacts`) against an already-written
+Opportunity document, reusing this same `MaterializeOutcome` result shape (no new type).
+`MaterializeDocNode` never calls it; `OpportunityEditNode` and (for `MergeContacts`) `MergeContactsNode`
+do. Full details for `SetStage`/`AddAction` — the enum, valid-stage validation, idempotency, and
+the error surface — live in [opportunity-edit-workflows.md](opportunity-edit-workflows.md), not
+duplicated here.
+
+`MergeContacts { slug, contacts }` (`EN.4.E`) is the enum's third variant — added by the contact-
+enrichment block, not `EN.7.B`. `MevDocMaterializer` routes it to
+`mev::doc::opportunity::plan_merge_contacts(slug, contacts, root)`, which matches each incoming
+`Contact` against the opportunity's existing `contacts:` list by `name`, unions
+`emails`/`whatsapp`/`phones`/`links`, and fills `role`/`note` only when the existing value is
+empty — so a re-run never duplicates a contact or clobbers a human-edited note.
+`StubDocMaterializer` records a `MergeContacts` call the same way it records `SetStage`/
+`AddAction`, via the same `last_edit()` accessor. `MergeContactsNode`
+(`crates/engine-core/src/nodes/merge_contacts.rs`) is the node that calls this operation — modeled
+directly on `MaterializeDocNode`'s builder shape (`with_materializer`/`with_brain_root`/
+`with_source_nodes`/`with_write`) — wired downstream of `MaterializeDocNode` in the
+`RESEARCH_AGENT` graph. See [research-agent-workflow.md § Contacts: extraction contract and the
+two-step write](research-agent-workflow.md#contacts-extraction-contract-and-the-two-step-write)
+for the full contract (anti-fabrication rule, why contacts route through mev's merge planner
+instead of the ingest mapping, and why the zero-contact case makes no seam call at all).
 
 - **`MevDocMaterializer`** (live) — dispatches `model` to the matching mev planner (`plan_ingest`
   for `"opportunity"`, `plan_document` over an `okf_core::LearningArtifact`/`okf_core::Proposal`

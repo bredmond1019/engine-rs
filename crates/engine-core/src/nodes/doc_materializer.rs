@@ -93,10 +93,13 @@ impl MaterializeOutcome {
 const VALID_MODELS: [&str; 3] = ["opportunity", "learning-artifact", "proposal"];
 
 /// One opportunity-edit operation the `DocMaterializer::edit_opportunity`
-/// seam can perform — `EN.7.B`'s addition alongside `materialize`. Only the
-/// two variants the block names (`set-stage`, `add-action`); `merge-contacts`
-/// is deliberately out of scope (its driver, `EN.4.E`, is not shipped — see
-/// `planning/EN.7.B-research-opportunity-loop/tasks.md` "Out of scope").
+/// seam can perform — `EN.7.B`'s addition alongside `materialize`, extended
+/// by `EN.4.E` with `MergeContacts`. Routes through mev's
+/// `plan_merge_contacts`, which owns the conflict policy: match on `name`,
+/// union `emails`/`whatsapp`/`phones`/`links`, fill `role`/`note` only when
+/// the existing value is empty. Runs as a second graph step after
+/// `MaterializeDocNode` writes the opportunity (mev loads by slug, so the
+/// doc must already exist).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum OpportunityEdit {
@@ -109,6 +112,10 @@ pub enum OpportunityEdit {
         at: String,
         kind: String,
         note: String,
+    },
+    MergeContacts {
+        slug: String,
+        contacts: Value,
     },
 }
 
@@ -262,6 +269,9 @@ impl DocMaterializer for MevDocMaterializer {
                     kind,
                     note,
                 } => mev::doc::opportunity::plan_add_action(slug, at, kind, note, &root),
+                OpportunityEdit::MergeContacts { slug, contacts } => {
+                    mev::doc::opportunity::plan_merge_contacts(slug, contacts, &root)
+                }
             };
 
             let planned: Vec<MaterializedFile> = plan
@@ -736,6 +746,95 @@ mod tests {
             bytes_after_first, bytes_after_second,
             "repeat add-action must not change the file's bytes"
         );
+    }
+
+    #[test]
+    fn merge_contacts_edit_serializes_with_op_merge_contacts_and_round_trips() {
+        let edit = OpportunityEdit::MergeContacts {
+            slug: "acme-corp".to_string(),
+            contacts: json!([{"name": "Jane Doe", "emails": ["jane@acme.com"]}]),
+        };
+
+        let value = serde_json::to_value(&edit).expect("serialize");
+        assert_eq!(value["op"], json!("merge-contacts"));
+        assert_eq!(value["slug"], json!("acme-corp"));
+
+        let round_tripped: OpportunityEdit = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(round_tripped, edit);
+    }
+
+    #[tokio::test]
+    async fn stub_records_the_merge_contacts_edit_call_it_is_handed() {
+        let stub = StubDocMaterializer::succeeding(MaterializeOutcome {
+            wrote: true,
+            planned: vec![MaterializedFile {
+                path: PathBuf::from("/tmp/brain/opportunities/acme-corp.md"),
+                note: "updated".to_string(),
+            }],
+            diagnostics: vec![],
+        });
+
+        let edit = OpportunityEdit::MergeContacts {
+            slug: "acme-corp".to_string(),
+            contacts: json!([{"name": "Jane Doe", "emails": ["jane@acme.com"]}]),
+        };
+
+        let outcome = stub
+            .edit_opportunity(Path::new("/tmp/brain"), &edit, true)
+            .await
+            .expect("succeeding stub should return Ok");
+        assert!(outcome.wrote);
+
+        let call = stub.last_edit().expect("edit call should be recorded");
+        assert_eq!(call.root, PathBuf::from("/tmp/brain"));
+        assert_eq!(call.edit, edit);
+        assert!(call.write);
+    }
+
+    #[tokio::test]
+    async fn live_impl_merge_contacts_merges_into_an_existing_opportunity() {
+        let dir = write_acme_corp_opportunity().await;
+        let path = dir.path().join("business/docs/opportunities/acme-corp.md");
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::MergeContacts {
+            slug: "acme-corp".to_string(),
+            contacts: json!([{"name": "Jane Doe", "emails": ["jane@acme.com"]}]),
+        };
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("merge-contacts should succeed");
+
+        assert!(outcome.wrote, "diagnostics: {:?}", outcome.diagnostics);
+        let after = std::fs::read_to_string(&path).expect("read opportunity file");
+        assert!(after.contains("Jane Doe"));
+        assert!(after.contains("jane@acme.com"));
+    }
+
+    #[tokio::test]
+    async fn live_impl_merge_contacts_unknown_slug_returns_ok_with_error_diagnostic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("business/docs/opportunities"))
+            .expect("create opportunities dir");
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::MergeContacts {
+            slug: "no-such-opportunity".to_string(),
+            contacts: json!([{"name": "Jane Doe", "emails": ["jane@acme.com"]}]),
+        };
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("unknown slug should still be Ok, not Err");
+
+        assert!(!outcome.wrote);
+        assert!(outcome.planned.is_empty());
+        assert!(!outcome.errors().is_empty());
+        let path = dir
+            .path()
+            .join("business/docs/opportunities/no-such-opportunity.md");
+        assert!(!path.exists(), "unknown slug must not create a file");
     }
 
     #[tokio::test]
