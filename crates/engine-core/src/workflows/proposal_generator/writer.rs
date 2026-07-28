@@ -210,6 +210,16 @@ impl Node for ProposalWriterNode {
             ));
         }
 
+        // Stamp the resolved locale into this node's ctx.nodes result so
+        // RunTelemetry/PolicyAggregate can attribute observed cost/quality
+        // to the locale that caused it (CLAUDE.md rule 6). `authored_locale`
+        // is that stamp: it lives on `AutomationRoadmap` itself (set above,
+        // deterministically, from the event) rather than as a sibling key,
+        // so this node's `ctx.nodes` entry stays byte-identical to the
+        // `AutomationRoadmap` the roadmap round-trips through downstream
+        // (`PersistToBrainNode` re-serializes the strict schema type, which
+        // would silently drop any extra sibling key and break that
+        // round-trip).
         put_result(
             &mut ctx,
             NODE_NAME,
@@ -217,16 +227,6 @@ impl Node for ProposalWriterNode {
                 NodeError::new(format!("failed to serialize AutomationRoadmap: {err}"))
             })?,
         );
-
-        // Stamp the resolved locale into this node's ctx.nodes result so
-        // RunTelemetry/PolicyAggregate can attribute observed cost/quality
-        // to the locale that caused it (CLAUDE.md rule 6).
-        if let Some(entry) = ctx.nodes.get_mut(NODE_NAME).and_then(|v| v.as_object_mut()) {
-            entry.insert(
-                "locale".to_string(),
-                serde_json::to_value(event.locale).unwrap_or_default(),
-            );
-        }
 
         Ok(ctx)
     }
