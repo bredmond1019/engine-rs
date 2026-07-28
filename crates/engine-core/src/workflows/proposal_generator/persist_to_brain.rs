@@ -239,6 +239,7 @@ mod tests {
 
     fn sample_roadmap_json() -> serde_json::Value {
         json!({
+            "authored_locale": "pt-BR",
             "situation": {
                 "company_name": "Loja da Ana",
                 "business_type": "retail SMB",
@@ -270,7 +271,12 @@ mod tests {
             "recommendation": {
                 "start_with": "WhatsApp order tracking",
                 "phase_1_scope": ["Order intake bot"],
-                "investment": "R$8,000-12,000 fixed fee",
+                "investment": {
+                    "currency": "BRL",
+                    "min": 8_000.0,
+                    "max": 12_000.0,
+                    "basis": "fixed",
+                },
                 "how_it_works": "Connects to WhatsApp Business API.",
                 "call_to_action": "Book a call to proceed.",
             },
