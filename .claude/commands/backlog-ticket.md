@@ -7,9 +7,8 @@ $ARGUMENTS — free-form description of the idea, improvement, or research threa
 
 ## Execution Model
 
-Spawn a subagent to execute all steps below.
-Pass the resolved `$ARGUMENTS` value and the complete Instructions section in the subagent prompt.
-Return the subagent's result to the user.
+**Run entirely inline. Spawn no subagent.** This is a single-file append plus a `state.json`
+node write — small enough that a subagent round trip adds latency without adding value.
 
 ## Instructions
 

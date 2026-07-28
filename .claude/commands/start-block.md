@@ -6,9 +6,8 @@ $ARGUMENTS — optional block identifier to start (e.g. `<spec-slug>`). If omitt
 
 ## Execution Model
 
-Spawn a Haiku subagent (Agent tool, `model: "haiku"`) to execute all steps below.
-Pass the resolved `$ARGUMENTS` value and the complete Instructions section in the subagent prompt.
-Return the subagent's result to the user.
+**Run entirely inline. Spawn no subagent.** This is a small status.md/state.json edit — a
+subagent round trip adds latency without adding value.
 
 ## Instructions
 

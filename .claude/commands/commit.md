@@ -6,9 +6,8 @@ $ARGUMENTS — optional commit message override or scope hint.
 
 ## Execution Model
 
-Spawn a Haiku subagent (Agent tool, `model: "haiku"`) to execute all steps below.
-Pass the resolved `$ARGUMENTS` value and the complete Instructions section in the subagent prompt.
-Return the subagent's result to the user.
+**Run entirely inline. Spawn no subagent.** Committing is a handful of git commands plus a
+confirmation prompt — the round trip through a subagent adds latency without adding value.
 
 ## Instructions
 

@@ -36,17 +36,17 @@
 //   A triage MAJOR / immediate-bail reason breaks straight out (does NOT burn the
 //   remaining attempts); the run stops and reports for human pickup.
 //
-// STATE (committed — NOT gitignored — at planning/<spec>/sdlc/)
-//   sdlc-task-state.json   the authoritative run index (per-task summary/issues/
-//                          fixes/commit + the Block-A `tokens` block). Committed in the
-//                          worktree under --worktree; in place it is written uncommitted
-//                          each task (cat-visible for crash inspection) and swept into
-//                          ONE final `chore:` commit at the end.
+// STATE (NOT gitignored, but deliberately never committed — at planning/<spec>/sdlc/)
+//   sdlc-task-state.json   the authoritative run index (per-task summary/issues/fixes/commit +
+//                          the Block-A `tokens` block). Written to disk after every task and
+//                          again at the end (cat-visible for crash inspection); read back off
+//                          disk only, by --resume — never out of git — so it is disk-only, never
+//                          committed (D46: planning/ may be a vaulted symlink into the brain repo,
+//                          where a plain `git add planning/...` fails).
 //
 // COMMIT STRATEGY
 //   feat: implement <stem>         implement agent (per task)
 //   fix:  fix pass P for <stem>    fix agent (per pass)
-//   chore: sdlc-task state — <…>   state-writer (committed writes)
 //   chore: sdlc-task bookkeep — <…>  bookkeep close-out (on a passing run)
 //
 // MODEL TIERING (the token lever — see the MODEL map below)
@@ -57,6 +57,8 @@
 // IMPLEMENTATION RULE: engines are self-contained — lift, don't import. No cross-engine
 // require. Validation is downstream only; never run this against base-template itself.
 // =============================================================================
+
+import fs from 'node:fs'
 
 export const meta = {
   name: 'sdlc-task',
@@ -130,6 +132,32 @@ const stateFile     = `${blockDir}/sdlc/sdlc-task-state.json`   // COMMITTED aut
 const baseBranchName = `${blockId}-task`.toLowerCase().replace(/[^a-z0-9.-]/g, '-')  // worktree branch base
 
 const MAX_TASK_ATTEMPTS = 3   // implement→test→fix attempts per task before bail (final on Opus)
+
+// D46: a vaulted repo's planning/ is a relative symlink into a brain-owned vault
+// (e.g. planning -> ../_planning/<repo>), so a plain `git add planning/...` from the
+// repo root fails with "pathspec is beyond a symbolic link". Given the invoking repo
+// root, this reports whether planning/ is such a symlink and resolves where its bytes
+// actually live, so state-writing steps can stage through the real path instead of
+// the link (and never "repair" the failure by checking out/committing in the vault
+// repo). Pure + synchronous — runs in-process rather than shelling out to python3
+// like the git-staging recipes below, so the engine itself can branch on the result.
+// Returns { vaulted, planningPath } where planningPath is always the absolute
+// resolved directory: the vault's realpath when vaulted, the plain planning/
+// directory otherwise. (Duplicated from sdlc-flow.js: the engines are deliberately
+// standalone files with no shared import.)
+function detectPlanningVault(repoRoot) {
+  const planningPath = `${repoRoot}/planning`
+  try {
+    if (fs.lstatSync(planningPath).isSymbolicLink()) {
+      return { vaulted: true, planningPath: fs.realpathSync(planningPath) }
+    }
+    return { vaulted: false, planningPath: fs.realpathSync(planningPath) }
+  } catch {
+    // planning/ missing or unreadable — treat as not vaulted; callers fall back to
+    // the legacy single-repo path, which already tolerates a missing directory.
+    return { vaulted: false, planningPath }
+  }
+}
 
 log(`Target: ${blockId} (${selectedTasks ? [...selectedTasks].sort((a, b) => a - b).join(', ') : 'all tasks'})`)
 log(`Spec: ${specFile} | mode: ${useWorktree ? 'worktree' : 'in-place'}${resumeMode ? ' | RESUME' : ''}`)
@@ -221,9 +249,9 @@ const STATE_WRITE_SCHEMA = {
   type: 'object',
   required: ['written'],
   properties: {
-    written:    { type: 'boolean', description: 'true if state.json was written (and committed when asked)' },
-    commitHash: { type: 'string' },
-    notes:      { type: 'string' }
+    written:   { type: 'boolean', description: 'true if sdlc-task-state.json was written to disk' },
+    startedAt: { type: 'string',  description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' },
+    notes:     { type: 'string' }
   }
 }
 
@@ -528,14 +556,10 @@ Return using StructuredOutput: done=true, and note which baselines were written 
 // COMMITTED AUTHORITATIVE STATE (Block A)
 //
 // `state` is the in-memory source of truth; writeTaskState() persists it to sdlc-task-state.json.
-// COMMIT CADENCE mirrors the rest of the engine family:
-//   --worktree → commit every write (the worktree is throwaway; mirrors sdlc-flow).
-//   in place   → write uncommitted each task (cat-visible for crash inspection) and sweep into ONE
-//                final `chore:` state commit at the end (mirrors sdlc-run's defer-to-final pattern,
-//                keeping the current branch free of per-task state-churn commits).
-// The runtime has no fs/clock, so a Haiku writer stamps started_at/updated_at and does the Write
-// (+ git when committing). Committed report/code commits remain the authoritative resume signal;
-// state is the at-a-glance index.
+// WRITE-ONLY — no git command ever runs here (see writeTaskState below for why). The runtime has no
+// fs/clock, so a Haiku writer stamps started_at/updated_at and does the Write. Committed
+// report/code commits remain the authoritative resume signal; state on disk is the at-a-glance index,
+// read back only by --resume.
 // ----------------------------------------------------------------
 const state = {
   spec_slug: blockId,
@@ -550,42 +574,55 @@ const state = {
   tokens: { stages: [], total: { promptTokEst: 0, filesReadKb: 0, inTokEst: 0, outTok: 0 } },  // Block A — refreshed on every write
 }
 
-// Persist `state` to sdlc-task-state.json. `commit` controls whether this write is also committed.
-async function writeTaskState(label, { cwd, commit }) {
-  state.tokens = buildTokensBlock()   // Block A — refresh the committed token roll-up before persisting
+// Learned from the first successful state write of this process. Later writes are handed it as a
+// literal so they can skip reading the state file back — the `cat` exists only to preserve
+// started_at, and once any write has reported the value it used, re-reading it is a wasted Bash
+// round trip. A fresh process — including every --resume — starts empty, so the first write always
+// does the full read-and-preserve path and resume semantics are unchanged. A failed write leaves
+// this null, so the next write re-reads rather than inventing a new started_at.
+let cachedStartedAt = null
+
+// Persist `state` to sdlc-task-state.json. This is deliberately WRITE-ONLY — no git command runs
+// here, and the `commit` option (if a caller still passes one) is ignored.
+//
+// Why: this run-state lives under planning/<blockId>/sdlc/, and under D46 every vaulted repo's
+// planning/ is a relative symlink into a brain-owned vault, so `git add planning/...` fails with
+// "fatal: pathspec is beyond a symbolic link". The state-writer agent used to "repair" that failure
+// by operating in the brain repo directly and checking out the run's branch there — contaminating
+// HQ with spec-named branches and a `chore: sdlc-task state` commit per task. Run-state is read back
+// only off disk (by --resume, via ${stateFile}), never out of git history, so there is no need to
+// commit it at all — removing the commit removes the git verb the agent was getting wrong.
+async function writeTaskState(label, { cwd }) {
+  state.tokens = buildTokensBlock()   // Block A — refresh the token roll-up before persisting
   const stateJson = JSON.stringify(state, null, 2)
-  const commitStep = commit
-    ? `STEP 4 — commit on the branch (never git add -A; stage explicitly):
-  cd ${cwd} && git add ${stateFile}
-  cd ${cwd} && git commit -m "$(cat <<'EOF'
-chore: sdlc-task state — ${label}
-EOF
-)" || echo "NOTHING_TO_COMMIT"
-  cd ${cwd} && git log --oneline -1`
-    : `STEP 4 — do NOT commit. Leave ${stateFile} written but unstaged (it is swept into one final commit later).`
+  const firstWrite = cachedStartedAt === null
   const result = await agent(`
-You maintain the COMMITTED, authoritative run-state for an /sdlc-task pipeline. You run from the run
-root. Write ONE JSON file${commit ? ' and commit it' : ''} — do not run checks, edit source, or touch anything else.
+You maintain the run-state for an /sdlc-task pipeline. You run from the run root. Write ONE JSON
+file to disk — do NOT run git commands, do not run checks, do not edit source, do not touch anything
+else. This state is read back off disk only (never out of git); it is deliberately not committed.
 
-STEP 1 — timestamps + preserved start time (from the run root):
-  cd ${cwd} && NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  cd ${cwd} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-  If that file exists and has a "started_at" value, REUSE it verbatim. Otherwise started_at = NOW.
+STEP 1 — run this as ONE Bash call, exactly as written. Do not split it into several calls.
+${firstWrite
+  ? `  cd ${cwd} && mkdir -p ${blockDir}/sdlc && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise started_at = NOW.`
+  : `  cd ${cwd} && date -u +%Y-%m-%dT%H:%M:%SZ
+  That single line of output is NOW. started_at is already known for this run — use exactly
+  "${cachedStartedAt}". Do NOT read the existing state file and do NOT run mkdir: the directory
+  already exists and an earlier write in this run already established started_at.`}
 
-STEP 2 — ensure the dir exists:
-  cd ${cwd} && mkdir -p ${blockDir}/sdlc
-
-STEP 3 — write ${stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
-  "started_at" (preserved or NOW) and "updated_at" (NOW) right after "branch". Valid JSON only
+STEP 2 — write ${stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
+  "started_at" (${firstWrite ? 'preserved or NOW, per STEP 1' : 'the value given in STEP 1'}) and "updated_at" (NOW) right after "branch". Valid JSON only
   (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except for
   adding those two timestamp keys):
 ${stateJson}
 
-${commitStep}
-
-Use the Write tool for the file. Return via StructuredOutput: written=true on success, commitHash from
-the final git log line (empty string when not committed / nothing to commit).
+Use the Write tool for the file. Do not run \`git add\`, \`git commit\`, \`git checkout\`,
+\`git switch\`, or \`git branch\` — this write is disk-only. Return via StructuredOutput: written=true
+once the file is written to disk, and startedAt set to the started_at value you used.
 `, withModel({ label: `state:${label}`, schema: STATE_WRITE_SCHEMA }, MODEL.stateWriter))
+  if (result && result.startedAt) cachedStartedAt = result.startedAt
   if (!result || !result.written) {
     log(`(state) could not persist task state for "${label}" — continuing`)
   }
@@ -976,10 +1013,10 @@ Return via StructuredOutput:
     log(`Task ${taskNum}: triage → RETRYABLE — fix pass ${attempt}/${MAX_TASK_ATTEMPTS - 1}. ${tr?.reason || ''}`)
   }
 
-  // One state write per task. --worktree commits each write; in place writes uncommitted (swept at end).
+  // One state write per task — disk-only, never committed (see writeTaskState).
   t.status = taskPassed ? 'passed' : 'failed'
   if (bailed && !taskPassed) { state.status = 'blocked'; state.bail_reason = bailReason }
-  await writeTaskState(`task ${taskNum} ${t.status}`, { cwd: runDir, commit: useWorktree })
+  await writeTaskState(`task ${taskNum} ${t.status}`, { cwd: runDir })
 
   if (bailed) break
 }
@@ -1002,6 +1039,13 @@ const fullRun = !selectedTasks   // no explicit selection = every task in the sp
 const blockDone = !bailed && fullRun && passedTasks.length === taskList.length
 let bookkeepResult = null
 if (!bailed) {
+  // D46: when planning/ is a vaulted symlink, ${specFile}, planning/status.md, and planning/state.json
+  // do not live in this repo at all — they live in the brain-owned vault repo at the symlink target. A
+  // plain `git add` against any of them from the run root fails ("pathspec is beyond a symbolic link"),
+  // and the wrong repair is to checkout/commit inside the vault. The right behaviour is to stage+commit
+  // them THROUGH their real path via `git -C <vault>`, on whatever branch the vault repo is already on,
+  // with no checkout at all. detectPlanningVault() resolves which case applies.
+  const vault = detectPlanningVault(runDir)
   bookkeepResult = await tracedAgent(`${W}
 You are the lean bookkeeping close-out for an /sdlc-task run. Flip ONLY the authored status markers a
 passing run leaves stale, then commit. Do NOT write a log.md narrative entry, a D18 amendment log, or
@@ -1042,14 +1086,30 @@ Target:
      ? `- Do NOT run \`mev emit-state --write\`: this is a linked git worktree, where emit-state refuses to run. The derived surfaces regenerate on MAIN when the branch merges (/clean-worktree or /merge-train). Set emitStateRan=false.`
      : `- Then regenerate derived surfaces (this run is IN PLACE on main, so emit-state is safe): cd ${runDir} && mev emit-state --write . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation.`}
 
-5. Commit your edits (stage explicitly — never git add -A):
+5. Commit your edits (stage explicitly — never git add -A). NEVER run git checkout, git switch, or git
+   branch outside this repo's own root (${runDir})${vault.vaulted ? ` or the vault's own root (${vault.planningPath})` : ''} —
+   if a git add fails, report the failure in notes; do not relocate the commit to make it succeed.
+${vault.vaulted ? `
+   planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a different repo. Every
+   file this step touches (the spec, status.md, state.json) lives under planning/, so stage + commit them
+   ALL there, via \`git -C\`, on whatever branch that repo is already on. Do NOT cd into it and do NOT
+   checkout/switch/branch there:
+   cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/${blockId}/tasks.md 2>/dev/null || true
+   cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/status.md
+   cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
+   cd ${runDir} && git -C ${vault.planningPath} diff --cached --quiet || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+chore: sdlc-task bookkeep — ${blockId}
+EOF
+)"
+   cd ${runDir} && git -C ${vault.planningPath} log --oneline -1` : `
+   planning/ is a plain directory here (not vaulted) — everything commits together as before:
    cd ${runDir} && git add ${specFile} planning/status.md
    cd ${runDir} && git add planning/state.json 2>/dev/null || true
    cd ${runDir} && git commit -m "$(cat <<'EOF'
 chore: sdlc-task bookkeep — ${blockId}
 EOF
 )" || echo "NOTHING_TO_COMMIT"
-   cd ${runDir} && git log --oneline -1
+   cd ${runDir} && git log --oneline -1`}
 
 Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emitStateRan, commitHash, notes.
 `, withModel({ label: 'bookkeep', schema: BOOKKEEP_SCHEMA }, MODEL.bookkeep))
@@ -1060,9 +1120,9 @@ Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emi
   }
 }
 
-// In-place mode wrote state uncommitted per task — sweep it into ONE final commit now. Worktree mode
-// already committed each write, so a final commit is a cheap no-op (NOTHING_TO_COMMIT).
-await writeTaskState(`run ${state.status} (${passedTasks.length}/${taskList.length})`, { cwd: runDir, commit: true })
+// Final run-state write — disk-only, never committed (see writeTaskState). Captures the final
+// token roll-up after the bookkeep close-out ran.
+await writeTaskState(`run ${state.status} (${passedTasks.length}/${taskList.length})`, { cwd: runDir })
 
 const tokensBlock = state.tokens   // already rebuilt by the writeTaskState call just above (no traced agent ran since); reuse it rather than rebuilding (carry-in #3)
 log(`Token roll-up: ${tokensBlock.total.inTokEst} inTokEst${tokensBlock.total.outTok ? ` | ${tokensBlock.total.outTok} outTok` : ''} across ${tokensBlock.stages.length} stage(s) — persisted in ${stateFile}.`)

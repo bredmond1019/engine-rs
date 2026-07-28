@@ -11,9 +11,10 @@ $ARGUMENTS — title or free-form description of what to capture, optionally inc
 
 ## Execution Model
 
-Spawn a subagent (Agent tool) to execute all steps below. Pass the resolved `$ARGUMENTS`
-and this whole Instructions section in the subagent prompt. Return the subagent's result
-to the user.
+**Run entirely inline. Spawn no subagent.** The notes file must be populated from what was
+actually discussed in *this* session — a subagent cold-starts with no memory of that conversation
+and can only reconstruct it from `git log`, which defeats the point of a capture. The main agent
+already holds the context.
 
 ## Instructions
 

@@ -629,10 +629,19 @@ const STATE_WRITE_SCHEMA = {
   required: ['written'],
   properties: {
     written: { type: 'boolean', description: 'true if the state file was written successfully' },
+    startedAt: { type: 'string', description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' },
     stateFile: { type: 'string' },
     notes: { type: 'string' }
   }
 }
+
+// Learned from the first successful state write of this process. Later writes are handed it as a
+// literal so they can skip reading the state file back — the `cat` exists only to preserve
+// started_at, and once any write has reported the value it used, re-reading it is a wasted Bash
+// round trip. A fresh process — including every --resume — starts empty, so the first write always
+// does the full read-and-preserve path and resume semantics are unchanged. A failed write leaves
+// this null, so the next write re-reads rather than inventing a new started_at.
+let cachedStartedAt = null
 
 // Persist the phase + tokens state after a phase resolves (write-only — the wrap-up commit stages it).
 // On success the phase is appended to completed_phases (monotonic, deduped). On failure, failed_phase +
@@ -645,25 +654,28 @@ async function recordPhaseState(phaseName, { failed = false } = {}) {
   }
   const failedPhase = failed ? phaseName : null
   const tokensJson = JSON.stringify(buildTokensBlock(), null, 2)
+  const firstWrite = cachedStartedAt === null
   const result = await agent(`
 You maintain the SDLC pipeline's committed run-state. Write ONE JSON file — do not run any checks,
 edit code, or commit anything (the wrap-up stage commits this file later).
 
-STEP 1 — current UTC timestamp + preserved start time:
-  NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-  If that file already exists and contains a "started_at" value, REUSE it verbatim for started_at
-  below. Otherwise set started_at = the NOW value.
+STEP 1 — run this as ONE Bash call, exactly as written. Do not split it into several calls.
+${firstWrite
+  ? `  mkdir -p planning/${blockId}/sdlc && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and contains a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise set started_at = the NOW value.`
+  : `  date -u +%Y-%m-%dT%H:%M:%SZ
+  That single line of output is NOW. started_at is already known for this run and is written into
+  the template below — do NOT read the existing state file and do NOT run mkdir: the directory
+  already exists and an earlier write in this run already established started_at.`}
 
-STEP 2 — ensure the directory exists:
-  mkdir -p planning/${blockId}/sdlc
-
-STEP 3 — write ${stateFile} with EXACTLY this JSON (valid JSON only: double quotes, no trailing
-commas, no markdown fences). Substitute <STARTED_AT> (preserved or NOW) and <NOW> from STEP 1, and
+STEP 2 — write ${stateFile} with EXACTLY this JSON (valid JSON only: double quotes, no trailing
+commas, no markdown fences). Substitute ${firstWrite ? '<STARTED_AT> (preserved or NOW) and ' : ''}<NOW> from STEP 1, and
 insert the "tokens" object verbatim as given:
 {
   "spec_slug": ${JSON.stringify(blockId)},
-  "started_at": "<STARTED_AT>",
+  "started_at": ${firstWrite ? '"<STARTED_AT>"' : JSON.stringify(cachedStartedAt)},
   "updated_at": "<NOW>",
   "current_phase": ${JSON.stringify(phaseName)},
   "completed_phases": ${JSON.stringify(completedPhases)},
@@ -674,8 +686,9 @@ insert the "tokens" object verbatim as given:
 }
 
 Use the Write tool to write ${stateFile}. Do NOT git add or commit. Then return via StructuredOutput
-(written=true on success).
+(written=true on success, and startedAt set to the started_at value you used).
 `, withModel({ label: `state:${phaseName}${failed ? ':failed' : ''}`, schema: STATE_WRITE_SCHEMA }, MODEL.scout))
+  if (result && result.startedAt) cachedStartedAt = result.startedAt
   if (!result || !result.written) {
     log(`(state) could not persist run state for "${phaseName}"${failed ? ' (failure record)' : ''} — continuing`)
   }

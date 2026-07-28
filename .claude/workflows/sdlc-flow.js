@@ -59,6 +59,8 @@
 //   worklog.md             the human-readable trail — one short section per task
 // =============================================================================
 
+import fs from 'node:fs'
+
 export const meta = {
   name: 'sdlc-flow',
   description: 'Run a spec sequentially on one branch (or --worktree) with a per-task test→fix loop, one end review, a docs patch, and a PR',
@@ -101,6 +103,31 @@ function parseRange(spec) {
     for (let i = Math.min(a, b); i <= Math.max(a, b); i++) out.add(i)
   }
   return [...out].sort((x, y) => x - y)
+}
+
+// D46: a vaulted repo's planning/ is a relative symlink into a brain-owned vault
+// (e.g. planning -> ../_planning/<repo>), so a plain `git add planning/...` from the
+// repo root fails with "pathspec is beyond a symbolic link". Given the invoking repo
+// root, this reports whether planning/ is such a symlink and resolves where its bytes
+// actually live, so state-writing steps can stage through the real path instead of
+// the link (and never "repair" the failure by checking out/committing in the vault
+// repo). Pure + synchronous — runs in-process rather than shelling out to python3
+// like the git-staging recipes below, so the engine itself can branch on the result.
+// Returns { vaulted, planningPath } where planningPath is always the absolute
+// resolved directory: the vault's realpath when vaulted, the plain planning/
+// directory otherwise.
+function detectPlanningVault(repoRoot) {
+  const planningPath = `${repoRoot}/planning`
+  try {
+    if (fs.lstatSync(planningPath).isSymbolicLink()) {
+      return { vaulted: true, planningPath: fs.realpathSync(planningPath) }
+    }
+    return { vaulted: false, planningPath: fs.realpathSync(planningPath) }
+  } catch {
+    // planning/ missing or unreadable — treat as not vaulted; callers fall back to
+    // the legacy single-repo path, which already tolerates a missing directory.
+    return { vaulted: false, planningPath }
+  }
 }
 
 const autoMergeFlag = hasFlag('--auto-merge')
@@ -300,8 +327,8 @@ const STATE_WRITE_SCHEMA = {
   type: 'object',
   required: ['written'],
   properties: {
-    written:   { type: 'boolean', description: 'true if state.json (+ worklog.md) were written and committed' },
-    commitHash:{ type: 'string' },
+    written:   { type: 'boolean', description: 'true if sdlc-flow-state.json (+ worklog.md) were written to disk' },
+    startedAt: { type: 'string',  description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' },
     notes:     { type: 'string' }
   }
 }
@@ -621,46 +648,66 @@ const state = {
   tokens: { stages: [], total: { promptTokEst: 0, filesReadKb: 0, inTokEst: 0, outTok: 0 } },  // Block A — refreshed by writeFlowState on every write
 }
 
-// Persist `state` to the committed state.json + append `worklogEntry` (markdown) to worklog.md, then
-// commit both on the branch. `label` names the commit. `extraAdd` lists any other paths to stage
-// (e.g. the tasks.md checkbox edit was made by an upstream agent on the branch already).
+// Learned from the first successful state write of this process. Later writes are handed it as a
+// literal so they can skip reading the state file back — the `cat` exists only to preserve
+// started_at, and once any write has reported the value it used, re-reading it is a wasted Bash
+// round trip. A fresh process — including every --resume — starts empty, so the first write always
+// does the full read-and-preserve path and resume semantics are unchanged. A failed write leaves
+// this null, so the next write re-reads rather than inventing a new started_at.
+let cachedStartedAt = null
+// Set once a write with a non-empty worklogEntry lands, so later writes skip the "write the header
+// if the file is missing" branch (and the existence check it implies).
+let worklogHeaderWritten = false
+
+// Persist `state` to sdlc-flow-state.json + append `worklogEntry` (markdown) to worklog.md.
+// `label` names the write for logging. This is deliberately WRITE-ONLY — no git command runs here.
+//
+// Why: this run-state lives under planning/<blockId>/sdlc/, and under D46 every vaulted repo's
+// planning/ is a relative symlink into a brain-owned vault, so `git add planning/...` fails with
+// "fatal: pathspec is beyond a symbolic link". The state-writer agent used to "repair" that failure
+// by operating in the brain repo directly and checking out the run's branch there — contaminating
+// HQ with spec-named branches and a `chore: flow state` commit per task. Run-state is read back only
+// off disk (by --resume, via ${stateFile}), never out of git history, so there is no need to commit
+// it at all — removing the commit removes the git verb the agent was getting wrong. `extraAdd` is
+// kept in the signature for callers that have not yet been migrated off it; it is ignored here.
 async function writeFlowState(label, worklogEntry, { cwd, extraAdd = [] } = {}) {
-  state.tokens = buildTokensBlock()   // Block A — refresh the committed token roll-up before persisting
+  state.tokens = buildTokensBlock()   // Block A — refresh the token roll-up before persisting
   const stateJson = JSON.stringify(state, null, 2)
-  const addList = ['planning/' + blockId + '/sdlc/sdlc-flow-state.json', 'planning/' + blockId + '/sdlc/worklog.md', ...extraAdd]
+  const firstWrite = cachedStartedAt === null
   const result = await agent(`
-You maintain the COMMITTED, authoritative run-state for an /sdlc-flow pipeline. You run from the
-WORKTREE root. Write two files and commit them — do not run checks, edit source, or touch anything else.
+You maintain the run-state for an /sdlc-flow pipeline. You run from the WORKTREE root. Write two
+files to disk — do NOT run git commands, do not run checks, do not edit source, do not touch
+anything else. This state is read back off disk only (never out of git); it is deliberately not
+committed.
 
-STEP 1 — timestamps + preserved start time (from the worktree root):
-  cd ${cwd} && NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  cd ${cwd} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-  If that file exists and has a "started_at" value, REUSE it verbatim. Otherwise started_at = NOW.
+STEP 1 — run this as ONE Bash call, exactly as written. Do not split it into several calls.
+${firstWrite
+  ? `  cd ${cwd} && mkdir -p ${blockDir}/sdlc && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise started_at = NOW.`
+  : `  cd ${cwd} && date -u +%Y-%m-%dT%H:%M:%SZ
+  That single line of output is NOW. started_at is already known for this run — use exactly
+  "${cachedStartedAt}". Do NOT read the existing state file and do NOT run mkdir: the directory
+  already exists and an earlier write in this run already established started_at.`}
 
-STEP 2 — ensure the dir exists:
-  cd ${cwd} && mkdir -p ${blockDir}/sdlc
-
-STEP 3 — write ${stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
-  "started_at" (preserved or NOW) and "updated_at" (NOW) right after "branch". Valid JSON only
+STEP 2 — write ${stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
+  "started_at" (${firstWrite ? 'preserved or NOW, per STEP 1' : 'the value given in STEP 1'}) and "updated_at" (NOW) right after "branch". Valid JSON only
   (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except for
   adding those two timestamp keys):
 ${stateJson}
 
-STEP 4 — append to ${worklogFile}. If the file does not exist, first write a header line
-  "# Worklog — ${blockId}" then a blank line. Then append this section verbatim (a blank line before it):
+STEP 3 — append to ${worklogFile}. ${worklogHeaderWritten
+  ? 'The file already exists — append only, do not write a header. Append'
+  : `If the file does not exist, first write a header line "# Worklog — ${blockId}" then a blank line. Then append`} this section verbatim (a blank line before it):
 ${worklogEntry ? '```\n' + worklogEntry + '\n```' : '(no worklog entry this write — skip the append)'}
 
-STEP 5 — commit on the branch (never git add -A; stage explicitly):
-  cd ${cwd} && git add ${addList.join(' ')}
-  cd ${cwd} && git commit -m "$(cat <<'EOF'
-chore: flow state — ${label}
-EOF
-)" || echo "NOTHING_TO_COMMIT"
-  cd ${cwd} && git log --oneline -1
-
-Use the Write tool for both files. Return via StructuredOutput: written=true on success, commitHash from
-the final git log line (empty string if nothing was committed).
+Use the Write tool for both files. Do not run `git add`, `git commit`, `git checkout`, `git switch`,
+or `git branch` — this write is disk-only. Return via StructuredOutput: written=true once both files
+are written to disk, and startedAt set to the started_at value you used.
 `, withModel({ label: `state:${label}`, schema: STATE_WRITE_SCHEMA }, MODEL.stateWriter))
+  if (result && result.startedAt) cachedStartedAt = result.startedAt
+  if (result && result.written && worklogEntry) worklogHeaderWritten = true
   if (!result || !result.written) {
     log(`(state) could not persist flow state for "${label}" — continuing`)
   }
@@ -1144,7 +1191,7 @@ Return via StructuredOutput:
     t.commit ? `Commit: ${t.commit}` : '',
     t.validated ? `Validated: ${t.validated}` : '',
   ].filter(Boolean).join('\n')
-  await writeFlowState(`task ${taskNum} ${t.status}`, worklogEntry, { cwd: worktreePath, extraAdd: [specFile] })
+  await writeFlowState(`task ${taskNum} ${t.status}`, worklogEntry, { cwd: worktreePath })
 
   if (bailed) break
 }
@@ -1338,6 +1385,16 @@ log(`Wrap-up. Verdict: ${finalVerdict} | passed ${passedTasks.length}/${taskList
 
 // Wrap-up writes status/log + the D18 amendment log ON THE BRANCH (so the PR is self-contained — no
 // deferred ff-merge dance). Sonnet: the human-facing prose + amendment judgment is the work.
+//
+// D46: when planning/ is a vaulted symlink, `planning/status.md` and `planning/state.json` do not
+// live in this repo at all — they live in the brain-owned vault repo at their symlink target. A
+// plain `git add planning/status.md` from the worktree root fails ("pathspec is beyond a symbolic
+// link"), and the wrong repair is to checkout/commit inside the vault. The right behaviour is to
+// stage+commit the vaulted files THROUGH their real path via `git -C <vault>`, on whatever branch
+// the vault repo is already on, with no checkout at all — while repo-local files (log.md, the spec)
+// stay staged and committed in the invoking repo exactly as before. detectPlanningVault() resolves
+// which case applies.
+const vault = detectPlanningVault(worktreePath)
 const wrapupResult = await tracedAgent(`${W}
 You are the wrap-up agent for an /sdlc-flow run. Write the human-facing status/log + the D18 amendment log
 ON THIS BRANCH (the PR will carry them), then commit. All Bash from the worktree root.
@@ -1398,7 +1455,30 @@ Target:
      - YYYY-MM-DD [task N] <what changed vs the spec, and why>
    If the spec has a provenance stub ("**Status:**"/"**Last run:**"), update it. Return the lines in amendments[].
 
-5. Commit on the branch (stage explicitly — never git add -A):
+5. Commit (stage explicitly — never git add -A). NEVER run git checkout, git switch, or git branch
+   outside this repo's own root (${worktreePath})${vault.vaulted ? ` or the vault's own root (${vault.planningPath})` : ''} —
+   if a git add fails, report the failure in notes; do not relocate the commit to make it succeed.
+${vault.vaulted ? `
+   planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a different repo.
+   Stage + commit the vaulted files THERE, via \`git -C\`, on whatever branch that repo is already on.
+   Do NOT cd into it and do NOT checkout/switch/branch there:
+   cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/status.md
+   cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
+   cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+chore: wrap up ${stem}
+EOF
+)"
+   cd ${worktreePath} && git -C ${vault.planningPath} log --oneline -1
+
+   Repo-local files stay staged and committed in THIS repo, on this branch, as before:
+   cd ${worktreePath} && git add log.md
+   cd ${worktreePath} && git add ${specFile} 2>/dev/null || true
+   cd ${worktreePath} && git commit -m "$(cat <<'EOF'
+chore: wrap up ${stem}
+EOF
+)"
+   cd ${worktreePath} && git log --oneline -1` : `
+   planning/ is a plain directory here (not vaulted) — everything commits together as before:
    cd ${worktreePath} && git add planning/status.md log.md
    cd ${worktreePath} && git add planning/state.json 2>/dev/null || true
    cd ${worktreePath} && git add ${specFile} 2>/dev/null || true
@@ -1406,7 +1486,7 @@ Target:
 chore: wrap up ${stem}
 EOF
 )"
-   cd ${worktreePath} && git log --oneline -1
+   cd ${worktreePath} && git log --oneline -1`}
 
 Return via StructuredOutput: statusUpdated, devlogUpdated, nextFocus, amendments[], commitHash,
 blockStatusFlipped (the state.json block id closed in step 2b, or ""), notes.

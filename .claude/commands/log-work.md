@@ -13,12 +13,14 @@ narrative from git history and the task spec.
 
 ## Execution Model
 
-Spawn a subagent (Agent tool) to execute all steps below; pass the resolved `$ARGUMENTS` and this whole
-Instructions section in its prompt; return its result to the user. This command **authors state**
-(flips closed-block status, appends the Log entry, surgically updates `status.md`, offers to record a
-decision) and then shells out to `mev emit-state --write`, which is what actually regenerates the
-**freshness spine** (the watermarked caches + generated rollups that `mev validate-brain --sync`
-checks) — so favour accuracy over speed in the authored parts, use a capable model, not the cheapest.
+**Run entirely inline. Spawn no subagent.** This command **authors state** (flips closed-block
+status, appends the Log entry, surgically updates `status.md`, offers to record a decision) and
+then shells out to `mev emit-state --write`, which is what actually regenerates the **freshness
+spine** (the watermarked caches + generated rollups that `mev validate-brain --sync` checks) — so
+favour accuracy over speed in the authored parts. A subagent cold-starts and has to reconstruct
+this session's narrative from `git log` alone; the main agent already holds the session context
+needed for an accurate `log.md` entry, and a round trip through a subagent adds latency without
+adding value here.
 
 ## Instructions
 

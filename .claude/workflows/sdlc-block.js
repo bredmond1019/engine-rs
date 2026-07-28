@@ -279,7 +279,16 @@ const STATE_LOAD_SCHEMA = {
     blocks:    { type: 'object',  description: 'the per-block status map (slug -> {status,...}), or {} when absent', additionalProperties: true }
   }
 }
-const STATE_WRITE_SCHEMA = { type: 'object', required: ['written'], properties: { written: { type: 'boolean' }, commitHash: { type: 'string' } } }
+const STATE_WRITE_SCHEMA = { type: 'object', required: ['written'], properties: { written: { type: 'boolean' }, startedAt: { type: 'string', description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' }, commitHash: { type: 'string' } } }
+
+// Learned from the first successful state write of this process — or, on --resume, seeded from the
+// load-state agent below, which already reads started_at back. Later writes are handed it as a
+// literal so they can skip reading the state file back: the `cat` exists only to preserve
+// started_at, so once the value is known, re-reading it is a wasted Bash round trip. A fresh
+// process starts empty, so the first write does the full read-and-preserve path and resume
+// semantics are unchanged. A failed write leaves this null, so the next write re-reads rather than
+// inventing a new started_at.
+let cachedStartedAt = null
 
 // ================================================================
 // TOKEN TELEMETRY — the canonical committed-state token contract (Block A; engines are self-contained,
@@ -454,30 +463,37 @@ function refreshStateTokens() {
 async function writeBlockState(label) {
   refreshStateTokens()
   const stateJson = JSON.stringify(state, null, 2)
+  const firstWrite = cachedStartedAt === null
   const r = await agent(`
 You maintain the SDLC orchestrator's committed state breadcrumb. Overwrite ONE JSON file and commit it
 on the current branch — do NOT run checks, edit code, or touch anything else. You run from the MAIN repo root.
 
-STEP 1 — current UTC timestamp + preserved start time:
-  NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-  If that file exists and has a "started_at" value, REUSE it verbatim. Otherwise started_at = NOW.
+STEP 1 — run this as ONE Bash call, exactly as written. Do not split it into several calls.
+${firstWrite
+  ? `  mkdir -p ${stateDir} && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise started_at = NOW.`
+  : `  date -u +%Y-%m-%dT%H:%M:%SZ
+  That single line of output is NOW. started_at is already known for this run — use exactly
+  "${cachedStartedAt}". Do NOT read the existing state file and do NOT run mkdir: the directory
+  already exists and started_at is already established.`}
 
-STEP 2 — ensure the dir exists:  mkdir -p ${stateDir}
-
-STEP 3 — write ${stateFile} with EXACTLY this JSON, inserting two extra top-level keys "started_at"
-  (preserved or NOW) and "updated_at" (NOW) right after "mode". Valid JSON only (double quotes, no
+STEP 2 — write ${stateFile} with EXACTLY this JSON, inserting two extra top-level keys "started_at"
+  (${firstWrite ? 'preserved or NOW, per STEP 1' : 'the value given in STEP 1'}) and "updated_at" (NOW) right after "mode". Valid JSON only (double quotes, no
   trailing commas, no markdown fences). The object to write (verbatim except those two keys):
 ${stateJson}
 
-STEP 4 — commit on the current branch (stage explicitly):
+STEP 3 — commit on the current branch (stage explicitly):
   git add ${stateFile}
   git commit -m "chore: block orchestration state — ${label}" || echo "NOTHING_TO_COMMIT"
   git log --oneline -1
 
-Use the Write tool for the file. Return via StructuredOutput: written=true on success, commitHash from the
-final git log line (empty string if nothing was committed).
+Use the Write tool for the file. Return via StructuredOutput: written=true on success, startedAt set to
+the started_at value you used, and commitHash from the final git log line (empty string if nothing was
+committed).
 `, { label: `state:${label}`, schema: STATE_WRITE_SCHEMA, model: 'haiku' })
+  if (r && r.startedAt) cachedStartedAt = r.startedAt
   if (!r || !r.written) log(`(state) could not persist orchestration state for "${label}" — continuing`)
 }
 
@@ -737,6 +753,9 @@ Otherwise parse it as JSON and return exists=true, startedAt = its "started_at" 
 "blocks" object verbatim (the per-block status map, keyed by slug).
 Return via StructuredOutput: exists, startedAt, blocks.
 `, { label: 'load-state', schema: STATE_LOAD_SCHEMA, phase: 'Enumerate', model: 'haiku' })
+  // The loader already read started_at back — seed the write-side cache from it so this resumed
+  // run's very first state write can skip the read too.
+  if (loaded?.exists && loaded.startedAt) cachedStartedAt = loaded.startedAt
   if (loaded?.exists && loaded.blocks && typeof loaded.blocks === 'object') {
     for (const [slug, st] of Object.entries(loaded.blocks)) {
       if (state.blocks[slug] && st && (st.status === 'done' || st.status === 'merged')) {
