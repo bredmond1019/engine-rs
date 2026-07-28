@@ -37,6 +37,47 @@ impl Default for ModelTiers {
     }
 }
 
+/// How hard a research node should look for reachable contact channels.
+/// `off` restores the pre-`EN.4.E` behavior exactly (no contact directive at
+/// all — the schema still carries the field, a run simply reports none).
+/// `standard` visits the company's own contact-bearing surfaces
+/// (contact/about/team page, footer, `mailto:`/`wa.me` links). `deep`
+/// additionally sweeps public LinkedIn/Instagram/Facebook profiles and hunts
+/// for the named decision-maker. Acquisition depth only ever changes the
+/// *prompt* — the emitted JSON schema always describes `contacts`, so
+/// `detect_kind` and the okf-core mapping are stable across every setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactDepth {
+    Off,
+    Standard,
+    Deep,
+}
+
+/// Per-stage contact-acquisition policy — mirrors [`ModelTiers`]'s per-stage
+/// shape, plus `max_fetches`, the cap on the EXTRA page loads spent on
+/// contact acquisition per run (contact acquisition costs real fetches and
+/// real latency, so it is a policy knob per `CLAUDE.md` standing rule 6, not
+/// a hardcoded prompt constant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactEnrichment {
+    pub research: ContactDepth,
+    pub prospect: ContactDepth,
+    pub max_fetches: u8,
+}
+
+impl Default for ContactEnrichment {
+    /// Behavior-stable baseline: `standard` acquisition on both stages,
+    /// capped at 4 extra fetches.
+    fn default() -> Self {
+        Self {
+            research: ContactDepth::Standard,
+            prospect: ContactDepth::Standard,
+            max_fetches: 4,
+        }
+    }
+}
+
 /// The fully-resolved, per-run Research Agent policy — the merge of
 /// built-in defaults, `harness.json`'s `research_agent.policy` defaults, a
 /// named `profile`, and any per-run event override, high->low precedence in
@@ -49,17 +90,20 @@ pub struct ResearchAgentPolicy {
     /// Configuration for the `local` model tier — carried for API-shape
     /// parity only; neither `research` nor `prospect` ever resolves to it.
     pub local: LocalConfig,
+    /// Per-stage contact-acquisition depth + fetch cap (`EN.4.E`).
+    pub contact_enrichment: ContactEnrichment,
 }
 
 impl Default for ResearchAgentPolicy {
     /// The safe default: normal verbosity, all-Sonnet tiers, prompt-cache
-    /// off.
+    /// off, standard contact enrichment on both stages.
     fn default() -> Self {
         Self {
             output_verbosity: OutputVerbosity::Normal,
             prompt_cache: false,
             model_tiers: ModelTiers::default(),
             local: LocalConfig::default(),
+            contact_enrichment: ContactEnrichment::default(),
         }
     }
 }
@@ -83,6 +127,7 @@ pub struct PartialResearchAgentPolicy {
     pub prompt_cache: Option<bool>,
     pub model_tiers: Option<PartialModelTiers>,
     pub local: Option<PartialLocalConfig>,
+    pub contact_enrichment: Option<PartialContactEnrichment>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -91,6 +136,31 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
     }
     if let Some(v) = over.prospect {
         base.prospect = v;
+    }
+    base
+}
+
+/// All-optional mirror of [`ContactEnrichment`] for partial overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialContactEnrichment {
+    pub research: Option<ContactDepth>,
+    pub prospect: Option<ContactDepth>,
+    pub max_fetches: Option<u8>,
+}
+
+fn merge_contact_enrichment(
+    mut base: ContactEnrichment,
+    over: &PartialContactEnrichment,
+) -> ContactEnrichment {
+    if let Some(v) = over.research {
+        base.research = v;
+    }
+    if let Some(v) = over.prospect {
+        base.prospect = v;
+    }
+    if let Some(v) = over.max_fetches {
+        base.max_fetches = v;
     }
     base
 }
@@ -112,6 +182,10 @@ impl crate::policy::Policy for ResearchAgentPolicy {
             local: match &over.local {
                 Some(l) => base.local.overlay(l),
                 None => base.local,
+            },
+            contact_enrichment: match &over.contact_enrichment {
+                Some(ce) => merge_contact_enrichment(base.contact_enrichment, ce),
+                None => base.contact_enrichment,
             },
         }
     }
@@ -249,5 +323,123 @@ mod tests {
         let policy = ResearchAgentPolicy::default();
         assert_ne!(policy.model_tiers.research, ModelTier::Local);
         assert_ne!(policy.model_tiers.prospect, ModelTier::Local);
+    }
+
+    #[test]
+    fn contact_enrichment_builtin_default_is_standard_standard_4() {
+        let policy = ResearchAgentPolicy::default();
+        assert_eq!(policy.contact_enrichment.research, ContactDepth::Standard);
+        assert_eq!(policy.contact_enrichment.prospect, ContactDepth::Standard);
+        assert_eq!(policy.contact_enrichment.max_fetches, 4);
+    }
+
+    #[test]
+    fn contact_depth_serializes_to_documented_snake_case_strings() {
+        assert_eq!(
+            serde_json::to_value(ContactDepth::Off).unwrap(),
+            serde_json::json!("off")
+        );
+        assert_eq!(
+            serde_json::to_value(ContactDepth::Standard).unwrap(),
+            serde_json::json!("standard")
+        );
+        assert_eq!(
+            serde_json::to_value(ContactDepth::Deep).unwrap(),
+            serde_json::json!("deep")
+        );
+    }
+
+    #[test]
+    fn harness_default_overrides_builtin_for_contact_enrichment() {
+        let harness = PartialResearchAgentPolicy {
+            contact_enrichment: Some(PartialContactEnrichment {
+                research: Some(ContactDepth::Deep),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(ResearchAgentPolicy::default(), Some(&harness), None, None);
+        assert_eq!(resolved.contact_enrichment.research, ContactDepth::Deep);
+        // Untouched fields fall through to builtin.
+        assert_eq!(resolved.contact_enrichment.prospect, ContactDepth::Standard);
+        assert_eq!(resolved.contact_enrichment.max_fetches, 4);
+    }
+
+    #[test]
+    fn profile_beats_harness_defaults_for_contact_enrichment() {
+        let harness = PartialResearchAgentPolicy {
+            contact_enrichment: Some(PartialContactEnrichment {
+                max_fetches: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let profile = PartialResearchAgentPolicy {
+            contact_enrichment: Some(PartialContactEnrichment {
+                max_fetches: Some(8),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ResearchAgentPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            None,
+        );
+        assert_eq!(resolved.contact_enrichment.max_fetches, 8);
+    }
+
+    #[test]
+    fn event_override_beats_profile_for_contact_enrichment() {
+        let profile = PartialResearchAgentPolicy {
+            contact_enrichment: Some(PartialContactEnrichment {
+                prospect: Some(ContactDepth::Off),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialResearchAgentPolicy {
+            contact_enrichment: Some(PartialContactEnrichment {
+                prospect: Some(ContactDepth::Deep),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ResearchAgentPolicy::default(),
+            None,
+            Some(&profile),
+            Some(&event),
+        );
+        assert_eq!(resolved.contact_enrichment.prospect, ContactDepth::Deep);
+    }
+
+    #[test]
+    fn partial_override_of_only_max_fetches_leaves_both_depths_untouched() {
+        let event = PartialResearchAgentPolicy {
+            contact_enrichment: Some(PartialContactEnrichment {
+                max_fetches: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(ResearchAgentPolicy::default(), None, None, Some(&event));
+        assert_eq!(resolved.contact_enrichment.max_fetches, 1);
+        assert_eq!(resolved.contact_enrichment.research, ContactDepth::Standard);
+        assert_eq!(resolved.contact_enrichment.prospect, ContactDepth::Standard);
+    }
+
+    #[test]
+    fn deserializes_partial_contact_enrichment_from_harness_json_shape() {
+        let json = r#"{
+            "contact_enrichment": { "research": "deep", "prospect": "off", "max_fetches": 8 }
+        }"#;
+        let partial: PartialResearchAgentPolicy =
+            serde_json::from_str(json).expect("valid PartialResearchAgentPolicy JSON");
+        let ce = partial.contact_enrichment.expect("contact_enrichment set");
+        assert_eq!(ce.research, Some(ContactDepth::Deep));
+        assert_eq!(ce.prospect, Some(ContactDepth::Off));
+        assert_eq!(ce.max_fetches, Some(8));
     }
 }

@@ -189,7 +189,9 @@ impl OpportunityEditNode {
 /// out for the result stamp without re-parsing `ctx.event`.
 fn edit_slug(edit: &OpportunityEdit) -> &str {
     match edit {
-        OpportunityEdit::SetStage { slug, .. } | OpportunityEdit::AddAction { slug, .. } => slug,
+        OpportunityEdit::SetStage { slug, .. }
+        | OpportunityEdit::AddAction { slug, .. }
+        | OpportunityEdit::MergeContacts { slug, .. } => slug,
     }
 }
 

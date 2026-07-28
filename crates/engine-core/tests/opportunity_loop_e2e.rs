@@ -126,6 +126,11 @@ fn research_registry(root: &Path) -> NodeRegistry {
             .with_brain_root(root)
             .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]),
     ));
+    registry.register(Box::new(
+        engine_core::nodes::merge_contacts::MergeContactsNode::new()
+            .with_brain_root(root)
+            .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]),
+    ));
     registry
 }
 
