@@ -16,6 +16,26 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-28]
+
+### `EN.4.E-contact-enrichment` done — RESEARCH_AGENT extracts reachable contacts and lifts source links into the materialized opportunity
+- **What:** Ran `/sdlc-flow EN.4.E-contact-enrichment` (branch `EN.4.E-contact-enrichment-flow`); all 11 tasks passed. Task 1 gave `Opportunity::from_company_brief`/`from_prospecting_result` (okf-core, committed separately in that repo as `b41c462`) order-stable/deduped lifting of `company_url`→`url` and `sources[]`→`links[]`, via new `json_str_opt`/`json_str_array_deduped` helpers. Task 2 added `ResearchContact` (`{name, role, emails[], whatsapp[], phones[], links[], note}`, field-for-field with okf-core's `Contact`) plus `contacts[]`/`company_url` on `CompanyBrief`/`ProspectLead`, with a shared invariant JSON sub-schema never listed in `required`. Task 3 added a `contact_enrichment` policy knob (`{research, prospect, max_fetches}`, depths `off`/`standard`/`deep`) to `ResearchAgentPolicy`, wired through all four resolution layers, with the three named profiles set (`baseline` standard/standard/4, `cheap-fast` off/off/0, `thorough` deep/standard/8) and documented in `harness.json`. Task 4 gave `CompanyResearchNode`'s prompt a policy-driven acquisition + anti-fabrication directive (contact/about/team page, footer, `mailto:`/`wa.me` links, plus LinkedIn/Instagram/Facebook and a named-decision-maker ask at `deep`), deterministically stamped the trigger's `company_url` onto the parsed brief (event always wins over the model), and stamped the resolved depth into node telemetry, with `STABLE_SYSTEM_PROMPT` staying byte-identical across depths. Task 5 gave `ProspectingResearchNode` the equivalent per-lead directive — one cheap attempt per identifiable business, explicit skip-pseudonymous-individuals rule. Task 6 added `OpportunityEdit::MergeContacts` to the `DocMaterializer` seam, routed to `mev::doc::opportunity::plan_merge_contacts` with unknown-slug handled as an Ok+diagnostic outcome (not a hard failure), and replaced the stale "not shipped" doc comment this block was named in. Task 7 added `MergeContactsNode`, the new terminal node collecting a run's company/prospecting contacts and merging them via the seam, with a clean no-op when zero contacts are found (mirroring mev's `detect_kind`/title-derivation rules locally since they're private to mev's crate). Task 8 wired the `RESEARCH_AGENT` declared graph to terminate in the shared `MergeContactsNode`, reached from `MaterializeDocNode` on both branches, registered via engine-serve's existing `registry_for_policy` delegation, and updated the EN.7.B `opportunity_loop_e2e.rs` fixture's hand-built registry to keep passing `WorkflowValidator`. Task 9 added a hermetic 8-test e2e suite (`research_agent_contacts_e2e.rs`) proving the real `Workflow::run` end-to-end — company/prospecting contact lifting, byte-idempotent re-runs, zero-contact success paths, the `cheap-fast`/`off` no-op path, and contact-channel unioning via mev's real `plan_merge_contacts` — all reconstructed through okf-core's real frontmatter parser. Task 10 updated `docs/research-agent-workflow.md`, `docs/materialize-doc-node.md`, `docs/architecture.md`, and `docs/index.md` to document the five-node graph, the `ResearchContact` shape, the `contact_enrichment` knob's per-profile table, the anti-fabrication contract, and the two-step ingest→merge write. Task 11 (validation-only) confirmed all 8 Validation Commands green (engine-rs fmt/clippy/test/build-release; okf-core fmt/clippy/test; mev test) with both sibling repos left clean.
+- **Why:** Closes the merge-contacts gap `EN.7.B` explicitly parked (`doc_materializer.rs`'s comment named this block as the driver), turning the previously hand-run `mev doc opportunity merge-contacts` step into part of the automated `RESEARCH_AGENT` workflow — giving downstream outreach work (`EN.6.H`) a real contact channel to dispatch against.
+- **Verdict:** PASS (review found no findings). Docs: `docs/research-agent-workflow.md`, `docs/materialize-doc-node.md`, `docs/architecture.md`, `docs/index.md` updated.
+- **Status:** `planning/state.json` block `EN.4.E` set to `"closed"`; `planning/status.md` flipped `EN.4.E` to Done and refreshed Momentum/Current focus.
+- **Next:** EN.6.C/D (Slack, Telegram/WhatsApp adapter skeletons — need detailing before scheduling), EN.4.D (DELIVERABLE_RENDER, net-new), or EN.7.C (Materialize→harvest gate — in-process vs human-approval → Synapse ingest), independently available.
+
+```
+d79dc1f feat: implement EN.4.E-contact-enrichment-task10
+ddddac2 feat: implement EN.4.E-contact-enrichment-task9
+662a6e5 feat: implement EN.4.E-contact-enrichment-task8
+a967fd3 feat: implement EN.4.E-contact-enrichment-task7
+bc4cfac feat: implement EN.4.E-contact-enrichment-task6
+d9866b2 feat: implement EN.4.E-contact-enrichment-task5
+4579130 feat: implement EN.4.E-contact-enrichment-task4
+0a00b69 feat: implement EN.4.E-contact-enrichment-task3
+```
+
 ## [run: 2026-07-27]
 
 ### `EN.7.B-research-opportunity-loop` done — RESEARCH_AGENT terminates in MaterializeDocNode, set-stage/add-action micro-workflows
