@@ -1,11 +1,12 @@
 //! `ResearchModeRouterNode` + the declared `WorkflowSchema` / `NodeRegistry`
 //! / `Workflow` assembly — filled in task 7, closed into a terminal write
-//! by `EN.7.B` task 4.
+//! by `EN.7.B` task 4, extended to a terminal contact-merge step by `EN.4.E`
+//! task 8.
 //!
 //! Declared graph shape:
 //!
 //! ```text
-//! ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode
+//! ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode -> MergeContactsNode
 //! ```
 //!
 //! `ResearchModeRouterNode` is the start node and a [`Router`]: it reads
@@ -15,17 +16,24 @@
 //! here; each terminal node resolves its own policy and writes its own
 //! `research-agent-state.json` record (tasks 5/6). `CompanyResearchNode`
 //! and `ProspectingResearchNode` both converge on a single shared
-//! `MaterializeDocNode` instance (`EN.7.B`), which is the graph's only exit
-//! point — a run now *ends* by writing or updating the resulting
-//! `CompanyBrief`/`ProspectingResult` artifact into the Brain corpus as an
-//! Opportunity doc. `MaterializeDocNode` is configured with an ordered
+//! `MaterializeDocNode` instance (`EN.7.B`), configured with an ordered
 //! `with_source_nodes` preference (`CompanyResearchNode` then
 //! `ProspectingResearchNode`) since exactly one of the two runs per event;
 //! its brain root is left unset so it resolves via
 //! `crate::brain_root::resolve_brain_root` (`ENGINE_BRAIN_ROOT`, then
 //! walk-up) at run time — a served run with no resolvable brain root now
 //! fails loudly by design, per the spec's Context Pointers ("Consequence to
-//! accept deliberately").
+//! accept deliberately"). `MaterializeDocNode` now feeds a single shared
+//! `MergeContactsNode` instance (`EN.4.E` task 8), which is the graph's only
+//! exit point — a run now *ends* by merging whatever `contacts[]` the
+//! research node surfaced into the opportunity `MaterializeDocNode` just
+//! wrote (or reading, no-op, when the collected list is empty — the normal
+//! path for a `contact_enrichment` depth of `off`). Like
+//! `MaterializeDocNode`, `MergeContactsNode` is configured with the same
+//! ordered `with_source_nodes` preference and an unset brain root (resolves
+//! the same way at run time). The graph shape here is INVARIANT across
+//! policy depth — no rewire ever branches around `MergeContactsNode`; its
+//! own empty-list short-circuit is the only cost control.
 
 use std::collections::HashMap;
 
@@ -33,6 +41,7 @@ use engine_contract::TaskContext;
 
 use crate::node::{Node, NodeError, NodeRegistry};
 use crate::nodes::materialize_doc::MaterializeDocNode;
+use crate::nodes::merge_contacts::MergeContactsNode;
 use crate::routing::Router;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
@@ -111,7 +120,11 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "MaterializeDocNode".to_string(),
-        NodeConfig::new("MaterializeDocNode", vec![]),
+        NodeConfig::new("MaterializeDocNode", vec!["MergeContactsNode".to_string()]),
+    );
+    nodes.insert(
+        "MergeContactsNode".to_string(),
+        NodeConfig::new("MergeContactsNode", vec![]),
     );
 
     WorkflowSchema::new(WORKFLOW_TYPE, "ResearchModeRouterNode", nodes)
@@ -129,6 +142,10 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(ProspectingResearchNode::new()));
     registry.register(Box::new(
         MaterializeDocNode::new("opportunity")
+            .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]),
+    ));
+    registry.register(Box::new(
+        MergeContactsNode::new()
             .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]),
     ));
     registry
@@ -200,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_four_nodes() {
+    fn registry_contains_all_five_nodes() {
         let registry = registry();
 
         let expected = [
@@ -208,6 +225,7 @@ mod tests {
             "CompanyResearchNode",
             "ProspectingResearchNode",
             "MaterializeDocNode",
+            "MergeContactsNode",
         ];
 
         for identity in expected {
@@ -220,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_doc_node_is_the_only_identity_declaring_no_connections() {
+    fn merge_contacts_node_is_the_only_identity_declaring_no_connections() {
         let schema = schema();
 
         let terminal_identities: Vec<&String> = schema
@@ -232,8 +250,23 @@ mod tests {
 
         assert_eq!(
             terminal_identities,
-            vec!["MaterializeDocNode"],
-            "MaterializeDocNode should be the only node declaring no forward connection"
+            vec!["MergeContactsNode"],
+            "MergeContactsNode should be the only node declaring no forward connection"
+        );
+    }
+
+    #[test]
+    fn materialize_doc_node_connects_only_to_merge_contacts_node() {
+        let schema = schema();
+
+        let config = schema
+            .nodes
+            .get("MaterializeDocNode")
+            .expect("schema should declare 'MaterializeDocNode'");
+        assert_eq!(
+            config.connections,
+            vec!["MergeContactsNode".to_string()],
+            "MaterializeDocNode should connect only to MergeContactsNode"
         );
     }
 
@@ -288,6 +321,43 @@ mod tests {
         assert!(policy_registry.contains("CompanyResearchNode"));
         assert!(policy_registry.contains("ProspectingResearchNode"));
         assert!(policy_registry.contains("MaterializeDocNode"));
+        assert!(policy_registry.contains("MergeContactsNode"));
+    }
+
+    #[test]
+    fn graph_shape_is_identical_under_a_cheap_fast_off_depth_profile() {
+        use super::super::policy::{ContactDepth, ContactEnrichment};
+
+        let off_policy = ResearchAgentPolicy {
+            contact_enrichment: ContactEnrichment {
+                research: ContactDepth::Off,
+                prospect: ContactDepth::Off,
+                max_fetches: 0,
+            },
+            ..ResearchAgentPolicy::default()
+        };
+
+        let default_registry = registry();
+        let off_registry = registry_for_policy(&off_policy);
+
+        assert_eq!(off_registry.len(), default_registry.len());
+        for identity in [
+            "ResearchModeRouterNode",
+            "CompanyResearchNode",
+            "ProspectingResearchNode",
+            "MaterializeDocNode",
+            "MergeContactsNode",
+        ] {
+            assert!(
+                off_registry.contains(identity),
+                "expected off-depth registry to still contain '{identity}'"
+            );
+        }
+
+        // The declared schema itself carries no policy dependency at all —
+        // reassert it still validates against the off-depth registry.
+        WorkflowValidator::validate(&off_registry, &schema())
+            .expect("declared graph should validate under the off-depth registry too");
     }
 
     #[test]
