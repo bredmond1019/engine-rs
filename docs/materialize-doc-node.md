@@ -41,9 +41,9 @@ see `crates/engine-core/src/workflows/content_pipeline/persist_to_brain.rs` and
 `crates/engine-core/src/nodes/http_post.rs` for that separate, existing HTTP-POST-to-Synapse
 boundary (`EN.4.C`), which this node does not use or replace.
 
-**Not yet wired into any workflow.** `MaterializeDocNode` is generic and unattached — no graph,
-registry, or `WorkflowSchema` references it yet. Wiring concrete instances into the
-`RESEARCH_AGENT` terminal step and the `set-stage`/`add-action` micro-workflows is `EN.7.B`.
+**Live in two workflows.** `RESEARCH_AGENT` wires an opportunity instance (`EN.7.B`), and
+`CONTENT_PIPELINE` wires a learning-artifact instance (`EN.7.D`) — see
+[Live instances](#live-instances).
 
 ## The `DocMaterializer` seam
 
@@ -174,6 +174,7 @@ MaterializeDocNode::new(model: impl Into<String>)
     .with_source_node(upstream: impl Into<String>)
     .with_source_nodes(upstreams: impl IntoIterator<Item = impl Into<String>>)
     .with_write(write: bool)
+    .with_enabled(enabled: bool)
 ```
 
 - `new(model)` defaults to the live seam (`doc_materializer_live()`), `write = true`, no explicit
@@ -196,6 +197,14 @@ MaterializeDocNode::new(model: impl Into<String>)
   `persist_to_brain::read_source_ref`'s message style).
 - `with_write(false)` is dry-run: nothing is written to disk, but the result stamp still names the
   path(s) that would have been written and reports `dry_run: true`.
+- `with_enabled(false)` (`EN.7.D`) is the in-place no-op: `process` short-circuits **before**
+  resolving the brain root or reading the input artifact, so a disabled node cannot fail on an
+  unresolvable root, and stamps `{"materialized": false, "skipped": true, "paths": []}`. Defaults
+  to `true`, so no existing caller's behavior changed when this was added. This exists so a
+  workflow can expose materialization as a policy knob without varying its declared node set —
+  the shape-invariance rule in `CLAUDE.md` (rule 6): one graph, validated once, for every setting.
+  It is distinct from `with_write(false)`: dry-run still plans and reports the target path,
+  disabled does nothing at all.
 
 ### Errors
 
@@ -220,6 +229,7 @@ workflow):
 ```json
 {
   "materialized": true,
+  "skipped": false,
   "dry_run": false,
   "model": "opportunity",
   "paths": ["/abs/path/to/business/docs/opportunities/acme-corp.md"],
@@ -227,9 +237,31 @@ workflow):
 }
 ```
 
-## Not yet wired into any workflow
+The key set is identical on every path, so consumers never branch on presence:
 
-`MaterializeDocNode` is a standalone `Node` implementation. No `WorkflowSchema`, node registry, or
-graph references it as of `EN.7.A`. Wiring concrete instances into `RESEARCH_AGENT`'s terminal
-step and the `set-stage`/`add-action` micro-workflows is `EN.7.B` — see
-`agentic-portfolio/core/planning/mev-write-loop-master-plan.md` § Phase 2.
+| Path | `materialized` | `skipped` | `paths` |
+|---|---|---|---|
+| Wrote the document | `true` | `false` | the written path(s) |
+| Already up to date (a re-run) | `false` | `false` | empty — the planner planned no write |
+| Dry run (`with_write(false)`) | `false` | `false` | the path(s) that *would* be written |
+| Disabled (`with_enabled(false)`) | `false` | `true` | empty |
+
+## Live instances
+
+| Workflow | `model` | Reads from | Block |
+|---|---|---|---|
+| `RESEARCH_AGENT` | `"opportunity"` | `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` | `EN.7.B` |
+| `OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION` | via `OpportunityEditNode` | — | `EN.7.B` |
+| `CONTENT_PIPELINE` | `"learning-artifact"` | `with_source_node("LearningArtifactPayloadNode")` | `EN.7.D` |
+
+**The generality claim, and what backs it.** `EN.7.D` added the learning-artifact instance with
+**no edit to the writer core** — nothing changed in `okf-core`, in `mev`, or in this file's
+`doc_materializer.rs` dispatch (which already carried `"learning-artifact"`). The whole diff on
+the writer side was a model string and a source node; everything else was the consuming workflow's
+own payload adapter and policy plumbing. That is what "the writer is generic" means concretely,
+and `content_pipeline_materialize_e2e.rs` pins it — including that both doc kinds run under one
+node identity and one seam.
+
+The `with_enabled` no-op path is the one addition `EN.7.D` made *to the node itself*, and it is
+deliberately generic: a knob any workflow can use, not a content-pipeline concept leaking into a
+shared node.
