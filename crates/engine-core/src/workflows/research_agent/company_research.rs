@@ -28,7 +28,7 @@ use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
-use super::policy::{ModelTier, ResearchAgentPolicy};
+use super::policy::{ContactDepth, ModelTier, ResearchAgentPolicy};
 use super::schema::{company_brief_json_schema, CompanyBrief, ResearchAgentEventSchema};
 
 /// The `Node::name()` identity `CompanyResearchNode` runs its composed
@@ -61,13 +61,72 @@ fn parse_event(ctx: &TaskContext) -> Result<ResearchAgentEventSchema, NodeError>
         .map_err(|err| NodeError::new(format!("invalid RESEARCH_AGENT event: {err}")))
 }
 
+/// Build the contact-acquisition + extraction directive block appended to
+/// the base research prompt, shaped by the resolved `depth` (and, at
+/// non-`Off` depths, the `max_fetches` budget). Returns an empty string at
+/// [`ContactDepth::Off`] so the run behaves exactly as it did before
+/// `EN.4.E` — no contact directive at all.
+///
+/// The two halves (acquisition, extraction) compose rather than compete:
+/// effort spent *looking* carries no fabrication risk — only the
+/// *reporting* step does. Both non-`Off` depths therefore direct the model
+/// to search hard and report only what it saw verbatim.
+fn contact_directive(depth: ContactDepth, max_fetches: u8) -> String {
+    match depth {
+        ContactDepth::Off => String::new(),
+        ContactDepth::Standard => format!(
+            "\n\nACQUISITION — reachable contacts (budget: up to {max_fetches} extra page \
+             loads beyond what you've already fetched; self-limit to this budget). Visit the \
+             company's own contact-bearing surfaces: its contact/about/team (or \"quem somos\") \
+             page, the site footer and header, and any `mailto:` or `wa.me`/`api.whatsapp.com` \
+             links in the page source. For a Brazilian small/mid-size business the reachable \
+             channel is often a WhatsApp number or an Instagram handle rather than a corporate \
+             email — do not fixate on email.\n\n\
+             EXTRACTION — report every reachable channel you found under `contacts`. A generic \
+             channel with no named individual (e.g. `contato@company.example`, a storefront \
+             WhatsApp number) is still a valid contact — record it with an empty `name` rather \
+             than discarding it.\n\n\
+             ANTI-FABRICATION (mandatory): only report a contact channel that appears verbatim \
+             in a page you actually fetched. Never construct an email, phone number, or handle \
+             from the company's domain or a person's name. An empty `contacts` list is the \
+             correct, expected answer when nothing reachable was found — say so in `note` or the \
+             summary rather than guessing. Acquisition and anti-fabrication compose, they do not \
+             compete: search hard, report only what you saw."
+        ),
+        ContactDepth::Deep => format!(
+            "\n\nACQUISITION — reachable contacts (budget: up to {max_fetches} extra page \
+             loads beyond what you've already fetched; self-limit to this budget). Visit the \
+             company's own contact-bearing surfaces: its contact/about/team (or \"quem somos\") \
+             page, the site footer and header, and any `mailto:` or `wa.me`/`api.whatsapp.com` \
+             links in the page source. Also check the company's public LinkedIn, Instagram, and \
+             Facebook profiles, and look for a named decision-maker who is publicly identified \
+             (owner, founder, s\u{f3}cio, head of ops) — a named human is worth far more than \
+             a generic inbox. For a Brazilian small/mid-size business the reachable channel is \
+             often a WhatsApp number or an Instagram handle rather than a corporate email — do \
+             not fixate on email.\n\n\
+             EXTRACTION — report every reachable channel you found under `contacts`. A generic \
+             channel with no named individual (e.g. `contato@company.example`, a storefront \
+             WhatsApp number) is still a valid contact — record it with an empty `name` rather \
+             than discarding it.\n\n\
+             ANTI-FABRICATION (mandatory): only report a contact channel that appears verbatim \
+             in a page you actually fetched. Never construct an email, phone number, or handle \
+             from the company's domain or a person's name. An empty `contacts` list is the \
+             correct, expected answer when nothing reachable was found — say so in `note` or the \
+             summary rather than guessing. Acquisition and anti-fabrication compose, they do not \
+             compete: search hard, report only what you saw."
+        ),
+    }
+}
+
 /// Build the single-company research-brief prompt from the triggering
-/// event. Ports `orchestrator`'s RESEARCH_AGENT company-brief prompt,
-/// framed against this practice's own positioning (business/docs
+/// event, shaped by the resolved `contact_enrichment.research` depth +
+/// `max_fetches` (task 3's policy knob — resolved once by the caller, never
+/// re-resolved here). Ports `orchestrator`'s RESEARCH_AGENT company-brief
+/// prompt, framed against this practice's own positioning (business/docs
 /// `brand.md`/`services.md`) so the model's pain-point/outreach-hook
 /// suggestions map back onto real, sellable services rather than generic
 /// advice.
-fn build_prompt(event: &ResearchAgentEventSchema) -> String {
+fn build_prompt(event: &ResearchAgentEventSchema, depth: ContactDepth, max_fetches: u8) -> String {
     let company_name = event.company_name.as_deref().unwrap_or("the company");
     let company_url = event
         .company_url
@@ -75,7 +134,7 @@ fn build_prompt(event: &ResearchAgentEventSchema) -> String {
         .map(|url| format!(" ({url})"))
         .unwrap_or_default();
 
-    format!(
+    let base = format!(
         "You are researching a single company on behalf of a solo AI & \
          Automations Engineer who builds production-grade agentic systems for \
          small and mid-size businesses: private knowledge systems (RAG over \
@@ -90,8 +149,12 @@ fn build_prompt(event: &ResearchAgentEventSchema) -> String {
          Respond with strict JSON matching this shape: {{\"company_name\": \
          str, \"summary\": str, \"recent_developments\": [str], \
          \"pain_points\": [str], \"outreach_hooks\": [str], \"sources\": \
-         [str]}}."
-    )
+         [str], \"contacts\": [{{\"name\": str, \"role\": str, \"emails\": \
+         [str], \"whatsapp\": [str], \"phones\": [str], \"links\": [str], \
+         \"note\": str}}]}}."
+    );
+
+    format!("{base}{}", contact_directive(depth, max_fetches))
 }
 
 /// Read the worktree path stamped by an upstream setup node, if this run
@@ -193,8 +256,12 @@ impl Node for CompanyResearchNode {
         );
         config =
             crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
-        let prompt =
-            crate::policy::apply_verbosity_directive(build_prompt(&event), policy.output_verbosity);
+        let contact_depth = policy.contact_enrichment.research;
+        let max_fetches = policy.contact_enrichment.max_fetches;
+        let prompt = crate::policy::apply_verbosity_directive(
+            build_prompt(&event, contact_depth, max_fetches),
+            policy.output_verbosity,
+        );
 
         let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -211,20 +278,33 @@ impl Node for CompanyResearchNode {
             .unwrap_or_default()
             .to_string();
 
-        let brief: CompanyBrief =
-            parse_structured_or_fenced(&ctx, NODE_NAME, &content).map_err(|err| {
+        let mut brief: CompanyBrief = parse_structured_or_fenced(&ctx, NODE_NAME, &content)
+            .map_err(|err| {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse a CompanyBrief from the model's reply: {err}"
                 ))
             })?;
 
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            serde_json::to_value(&brief).map_err(|err| {
-                NodeError::new(format!("failed to serialize CompanyBrief: {err}"))
-            })?,
-        );
+        // Deterministic stamp: an explicitly-supplied trigger `company_url`
+        // always wins over the model's own value (present or absent) — the
+        // field must not be solely model-dependent.
+        if let Some(company_url) = event.company_url.as_ref() {
+            brief.company_url = Some(company_url.clone());
+        }
+
+        let mut brief_value = serde_json::to_value(&brief)
+            .map_err(|err| NodeError::new(format!("failed to serialize CompanyBrief: {err}")))?;
+        // Stamp the resolved contact-enrichment depth alongside the brief so
+        // EN.4.0 telemetry can attribute cost to the setting that caused it.
+        // `CompanyBrief` ignores unknown fields on deserialize, so this is a
+        // transparent addition to the node's result object.
+        if let Some(obj) = brief_value.as_object_mut() {
+            obj.insert(
+                "contact_enrichment_depth".to_string(),
+                serde_json::to_value(contact_depth).unwrap_or_default(),
+            );
+        }
+        put_result(&mut ctx, NODE_NAME, brief_value);
 
         let model_tier_used = std::collections::BTreeMap::from([(
             "research".to_string(),
@@ -488,5 +568,254 @@ mod tests {
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("invalid RESEARCH_AGENT event"));
+    }
+
+    // --- Task 4: policy-driven contact acquisition + company_url stamping ---
+
+    #[test]
+    fn off_depth_prompt_has_no_contact_directive() {
+        let prompt = build_prompt(&company_event(), ContactDepth::Off, 4);
+        assert!(!prompt.to_lowercase().contains("acquisition"));
+        assert!(!prompt.to_lowercase().contains("anti-fabrication"));
+    }
+
+    #[test]
+    fn standard_depth_names_contact_surfaces_and_fetch_budget() {
+        let prompt = build_prompt(&company_event(), ContactDepth::Standard, 4);
+        assert!(prompt.contains("ACQUISITION"));
+        assert!(prompt.contains("contact/about/team"));
+        assert!(prompt.contains("mailto:"));
+        assert!(prompt.contains("wa.me"));
+        assert!(prompt.contains("up to 4 extra page loads"));
+        // Standard does not add the social-profile/decision-maker sweep.
+        assert!(!prompt.contains("LinkedIn"));
+    }
+
+    #[test]
+    fn deep_depth_adds_social_profiles_and_decision_maker_ask() {
+        let prompt = build_prompt(&company_event(), ContactDepth::Deep, 8);
+        assert!(prompt.contains("LinkedIn"));
+        assert!(prompt.contains("Instagram"));
+        assert!(prompt.contains("Facebook"));
+        assert!(prompt.contains("decision-maker"));
+        assert!(prompt.contains("up to 8 extra page loads"));
+        // Deep still carries everything Standard has.
+        assert!(prompt.contains("contact/about/team"));
+        assert!(prompt.contains("mailto:"));
+    }
+
+    #[test]
+    fn non_off_depths_carry_omission_over_guess_directive() {
+        for depth in [ContactDepth::Standard, ContactDepth::Deep] {
+            let prompt = build_prompt(&company_event(), depth, 4);
+            assert!(
+                prompt.contains("Never construct"),
+                "depth {depth:?} missing the anti-fabrication directive"
+            );
+            assert!(
+                prompt.contains("empty `contacts` list is the"),
+                "depth {depth:?} missing the omission-over-guess directive"
+            );
+            assert!(
+                prompt.contains("do not compete"),
+                "depth {depth:?} missing the composing-not-competing framing"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_system_prompt_is_byte_identical_across_all_depths() {
+        // STABLE_SYSTEM_PROMPT itself never varies — it's a `const`, not a
+        // function of depth — but assert this explicitly so a future edit
+        // that tries to make it policy-varying trips a test rather than
+        // silently defeating the cache breakpoint.
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for depth in [
+            ContactDepth::Off,
+            ContactDepth::Standard,
+            ContactDepth::Deep,
+        ] {
+            let _ = build_prompt(&company_event(), depth, 4);
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+    }
+
+    #[test]
+    fn no_prompt_synthesizes_a_contact_channel() {
+        for depth in [ContactDepth::Standard, ContactDepth::Deep] {
+            let prompt = build_prompt(&company_event(), depth, 4);
+            assert!(!prompt.to_lowercase().contains("info@{domain}"));
+            assert!(!prompt.to_lowercase().contains("guess an address"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_transport_with_contact_populates_brief_contacts() {
+        let mut brief_json = stub_brief_json();
+        brief_json["contacts"] = json!([{
+            "name": "",
+            "role": "",
+            "emails": ["contato@acme.example"],
+            "whatsapp": [],
+            "phones": [],
+            "links": [],
+            "note": "Generic inbox found on contact page",
+        }]);
+
+        let node = CompanyResearchNode::new().with_transport(stub_transport(Some(brief_json)));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let brief: CompanyBrief =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
+        assert_eq!(brief.contacts.len(), 1);
+        assert_eq!(brief.contacts[0].emails, vec!["contato@acme.example"]);
+        assert_eq!(brief.contacts[0].name, "");
+    }
+
+    #[tokio::test]
+    async fn brief_with_no_contacts_key_yields_empty_vec_and_succeeds() {
+        // stub_brief_json() carries no "contacts" key at all.
+        let node =
+            CompanyResearchNode::new().with_transport(stub_transport(Some(stub_brief_json())));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let brief: CompanyBrief =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
+        assert_eq!(brief.contacts, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn company_url_from_event_lands_on_brief_when_model_omits_it() {
+        // stub_brief_json() carries no "company_url" key.
+        let node =
+            CompanyResearchNode::new().with_transport(stub_transport(Some(stub_brief_json())));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let brief: CompanyBrief =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
+        assert_eq!(brief.company_url, Some("https://acme.example".to_string()));
+    }
+
+    #[tokio::test]
+    async fn company_url_from_event_overrides_a_different_model_value() {
+        let mut brief_json = stub_brief_json();
+        brief_json["company_url"] = json!("https://model-guessed-wrong.example");
+
+        let node = CompanyResearchNode::new().with_transport(stub_transport(Some(brief_json)));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let brief: CompanyBrief =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
+        // The trigger event's company_url always wins.
+        assert_eq!(brief.company_url, Some("https://acme.example".to_string()));
+    }
+
+    #[tokio::test]
+    async fn event_without_company_url_leaves_models_value_intact() {
+        let mut event = company_event();
+        event.company_url = None;
+        let mut brief_json = stub_brief_json();
+        brief_json["company_url"] = json!("https://model-found-this.example");
+
+        let node = CompanyResearchNode::new().with_transport(stub_transport(Some(brief_json)));
+        let mut ctx = empty_ctx(event);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let brief: CompanyBrief =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
+        assert_eq!(
+            brief.company_url,
+            Some("https://model-found-this.example".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn event_without_company_url_and_model_omitting_it_leaves_none() {
+        let mut event = company_event();
+        event.company_url = None;
+        let node =
+            CompanyResearchNode::new().with_transport(stub_transport(Some(stub_brief_json())));
+        let mut ctx = empty_ctx(event);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let brief: CompanyBrief =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
+        assert_eq!(brief.company_url, None);
+    }
+
+    #[tokio::test]
+    async fn resolved_contact_enrichment_depth_is_stamped_into_the_result() {
+        let policy = ResearchAgentPolicy {
+            contact_enrichment: super::super::policy::ContactEnrichment {
+                research: ContactDepth::Deep,
+                ..ResearchAgentPolicy::default().contact_enrichment
+            },
+            ..ResearchAgentPolicy::default()
+        };
+        let node =
+            CompanyResearchNode::new().with_transport(stub_transport(Some(stub_brief_json())));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(
+            ctx.nodes[NODE_NAME]["contact_enrichment_depth"],
+            json!("deep")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_contact_model_response_is_a_success_path() {
+        // A brief that explicitly returns an empty contacts array must
+        // still complete `process` successfully — "none found" is not a
+        // failure.
+        let mut brief_json = stub_brief_json();
+        brief_json["contacts"] = json!([]);
+        let node = CompanyResearchNode::new().with_transport(stub_transport(Some(brief_json)));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let brief: CompanyBrief =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
+        assert_eq!(brief.contacts, Vec::new());
     }
 }
