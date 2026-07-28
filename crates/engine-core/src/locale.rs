@@ -66,6 +66,24 @@ impl Locale {
     }
 }
 
+/// The per-run prompt fragment instructing a model which language to write
+/// in. Callers splice this into a prompt BODY — never into a
+/// `STABLE_SYSTEM_PROMPT` (CLAUDE.md rule 6, cache breakpoints).
+///
+/// The contact carve-out is load-bearing: EN.4.E's anti-fabrication contract
+/// means contacts are scraped literals. A translated email address is a
+/// wrong email address.
+#[must_use]
+pub fn language_directive(locale: Locale) -> String {
+    format!(
+        "Write all prose fields in {}. Do not mix languages. \
+         EXCEPTION: never translate a literal contact string — an email \
+         address, phone number, WhatsApp number, handle, or URL is \
+         reproduced exactly as found.",
+        locale.language_name()
+    )
+}
+
 /// A first-engagement shape a client can be quoted. Purely descriptive —
 /// this crate never converts between engagements, only looks one up on a
 /// [`RateSheet`].
@@ -302,6 +320,18 @@ mod tests {
         assert!(!pt.is_empty());
         assert!(!en.is_empty());
         assert_ne!(pt, en);
+    }
+
+    #[test]
+    fn language_directive_names_the_locales_language_and_carries_the_contact_exception() {
+        let pt = language_directive(Locale::PtBr);
+        let en = language_directive(Locale::EnUs);
+        assert!(pt.contains("Brazilian Portuguese"));
+        assert!(en.contains("English (en-US)"));
+        assert_ne!(pt, en);
+        for directive in [&pt, &en] {
+            assert!(directive.contains("never translate a literal contact string"));
+        }
     }
 
     // --- RateCard --------------------------------------------------------

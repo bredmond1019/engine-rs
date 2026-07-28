@@ -25,6 +25,7 @@ use claude_code_rs::Config;
 use engine_contract::TaskContext;
 use serde_json::json;
 
+use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
@@ -72,7 +73,12 @@ fn parse_event(ctx: &TaskContext) -> Result<DiagnosticIntakeEventSchema, NodeErr
 /// and the São Paulo SMB priors (`intake.md §5`: WhatsApp as system of
 /// record, Pix as payment backbone, Mercado Livre/Instagram as storefront,
 /// spreadsheets as the glue).
-fn build_prompt(event: &DiagnosticIntakeEventSchema) -> String {
+///
+/// `locale` governs only the prose fields this node itself authors (e.g.
+/// summarizing/labelling), never the `*_evidence` fields — those hold the
+/// client's own words verbatim per the evidence discipline below, and must
+/// never be translated or paraphrased into the run's locale.
+fn build_prompt(event: &DiagnosticIntakeEventSchema, locale: Locale) -> String {
     format!(
         "You are extracting a structured `DiagnosticIntake` evidence record from raw \
          diagnostic-call notes or a transcript, for a paid automation diagnostic \
@@ -111,8 +117,13 @@ fn build_prompt(event: &DiagnosticIntakeEventSchema) -> String {
          company_name, company_type, team_size, primary_channels[], \
          existing_tools[], existing_automations[], and top_workflows[] where each \
          entry has name, description, frequency_evidence, time_cost_evidence, \
-         buildability_notes, knowledge_holder, failure_mode.",
+         buildability_notes, knowledge_holder, failure_mode.\n\n\
+         {directive} This directive governs the prose fields you author (e.g. \
+         `description`, `failure_mode`, `buildability_notes`) — it does NOT apply \
+         to the `*_evidence` fields, which must stay in the client's own words \
+         exactly as spoken, untranslated, per the evidence discipline above.",
         notes = event.notes,
+        directive = language_directive(locale),
     )
 }
 
@@ -218,8 +229,10 @@ impl Node for IntakeExtractNode {
         );
         config =
             crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
-        let prompt =
-            crate::policy::apply_verbosity_directive(build_prompt(&event), policy.output_verbosity);
+        let prompt = crate::policy::apply_verbosity_directive(
+            build_prompt(&event, event.locale),
+            policy.output_verbosity,
+        );
 
         let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
@@ -243,13 +256,20 @@ impl Node for IntakeExtractNode {
                 ))
             })?;
 
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            serde_json::to_value(&intake).map_err(|err| {
-                NodeError::new(format!("failed to serialize DiagnosticIntake: {err}"))
-            })?,
-        );
+        let mut intake_value = serde_json::to_value(&intake).map_err(|err| {
+            NodeError::new(format!("failed to serialize DiagnosticIntake: {err}"))
+        })?;
+        // Stamp the resolved locale alongside the intake so EN.4.0 telemetry
+        // can attribute prose-language cost/quality to the locale that
+        // caused it (CLAUDE.md rule 6). `DiagnosticIntake` ignores unknown
+        // fields on deserialize, so this is a transparent addition.
+        if let Some(obj) = intake_value.as_object_mut() {
+            obj.insert(
+                "locale".to_string(),
+                serde_json::to_value(event.locale).unwrap_or_default(),
+            );
+        }
+        put_result(&mut ctx, NODE_NAME, intake_value);
 
         let model_tier_used = std::collections::BTreeMap::from([(
             "extract".to_string(),
@@ -528,5 +548,50 @@ mod tests {
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("invalid DIAGNOSTIC_INTAKE event"));
+    }
+
+    // --- Task 6: locale-aware prose directive -----------------------------
+
+    #[test]
+    fn prompt_body_names_the_event_locale_language() {
+        let pt_prompt = build_prompt(&intake_event(), Locale::PtBr);
+        assert!(pt_prompt.contains("Brazilian Portuguese"));
+        let en_prompt = build_prompt(&intake_event(), Locale::EnUs);
+        assert!(en_prompt.contains("English (en-US)"));
+    }
+
+    #[test]
+    fn stable_system_prompt_is_byte_identical_across_locales() {
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for locale in [Locale::PtBr, Locale::EnUs] {
+            let _ = build_prompt(&intake_event(), locale);
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+    }
+
+    #[test]
+    fn locale_directive_does_not_apply_to_evidence_fields() {
+        // The directive text must be scoped away from `*_evidence` — assert
+        // the carve-out sentence is present so a future edit can't silently
+        // drop it and start implying evidence quotes should be translated.
+        let prompt = build_prompt(&intake_event(), Locale::EnUs);
+        assert!(prompt.contains("does NOT apply"));
+        assert!(prompt.contains("*_evidence"));
+    }
+
+    #[tokio::test]
+    async fn resolved_locale_is_stamped_into_the_result() {
+        let node =
+            IntakeExtractNode::new().with_transport(stub_transport(Some(stub_intake_json())));
+        let mut event = intake_event();
+        event.locale = Locale::EnUs;
+        let mut ctx = empty_ctx(event);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["locale"], json!("en-US"));
     }
 }

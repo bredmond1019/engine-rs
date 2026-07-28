@@ -23,6 +23,7 @@ use claude_code_rs::Config;
 use engine_contract::TaskContext;
 use serde_json::json;
 
+use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
@@ -126,7 +127,12 @@ fn contact_directive(depth: ContactDepth, max_fetches: u8) -> String {
 /// `brand.md`/`services.md`) so the model's pain-point/outreach-hook
 /// suggestions map back onto real, sellable services rather than generic
 /// advice.
-fn build_prompt(event: &ResearchAgentEventSchema, depth: ContactDepth, max_fetches: u8) -> String {
+fn build_prompt(
+    event: &ResearchAgentEventSchema,
+    depth: ContactDepth,
+    max_fetches: u8,
+    locale: Locale,
+) -> String {
     let company_name = event.company_name.as_deref().unwrap_or("the company");
     let company_url = event
         .company_url
@@ -154,7 +160,11 @@ fn build_prompt(event: &ResearchAgentEventSchema, depth: ContactDepth, max_fetch
          \"note\": str}}]}}."
     );
 
-    format!("{base}{}", contact_directive(depth, max_fetches))
+    format!(
+        "{base}{}\n\n{}",
+        contact_directive(depth, max_fetches),
+        language_directive(locale)
+    )
 }
 
 /// Read the worktree path stamped by an upstream setup node, if this run
@@ -259,7 +269,7 @@ impl Node for CompanyResearchNode {
         let contact_depth = policy.contact_enrichment.research;
         let max_fetches = policy.contact_enrichment.max_fetches;
         let prompt = crate::policy::apply_verbosity_directive(
-            build_prompt(&event, contact_depth, max_fetches),
+            build_prompt(&event, contact_depth, max_fetches, event.locale),
             policy.output_verbosity,
         );
 
@@ -302,6 +312,13 @@ impl Node for CompanyResearchNode {
             obj.insert(
                 "contact_enrichment_depth".to_string(),
                 serde_json::to_value(contact_depth).unwrap_or_default(),
+            );
+            // Stamp the resolved locale alongside the brief so EN.4.0
+            // telemetry can attribute prose-language cost/quality to the
+            // locale that caused it (CLAUDE.md rule 6).
+            obj.insert(
+                "locale".to_string(),
+                serde_json::to_value(event.locale).unwrap_or_default(),
             );
         }
         put_result(&mut ctx, NODE_NAME, brief_value);
@@ -575,14 +592,14 @@ mod tests {
 
     #[test]
     fn off_depth_prompt_has_no_contact_directive() {
-        let prompt = build_prompt(&company_event(), ContactDepth::Off, 4);
+        let prompt = build_prompt(&company_event(), ContactDepth::Off, 4, Locale::PtBr);
         assert!(!prompt.to_lowercase().contains("acquisition"));
         assert!(!prompt.to_lowercase().contains("anti-fabrication"));
     }
 
     #[test]
     fn standard_depth_names_contact_surfaces_and_fetch_budget() {
-        let prompt = build_prompt(&company_event(), ContactDepth::Standard, 4);
+        let prompt = build_prompt(&company_event(), ContactDepth::Standard, 4, Locale::PtBr);
         assert!(prompt.contains("ACQUISITION"));
         assert!(prompt.contains("contact/about/team"));
         assert!(prompt.contains("mailto:"));
@@ -594,7 +611,7 @@ mod tests {
 
     #[test]
     fn deep_depth_adds_social_profiles_and_decision_maker_ask() {
-        let prompt = build_prompt(&company_event(), ContactDepth::Deep, 8);
+        let prompt = build_prompt(&company_event(), ContactDepth::Deep, 8, Locale::PtBr);
         assert!(prompt.contains("LinkedIn"));
         assert!(prompt.contains("Instagram"));
         assert!(prompt.contains("Facebook"));
@@ -608,7 +625,7 @@ mod tests {
     #[test]
     fn non_off_depths_carry_omission_over_guess_directive() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&company_event(), depth, 4);
+            let prompt = build_prompt(&company_event(), depth, 4, Locale::PtBr);
             assert!(
                 prompt.contains("Never construct"),
                 "depth {depth:?} missing the anti-fabrication directive"
@@ -636,7 +653,26 @@ mod tests {
             ContactDepth::Standard,
             ContactDepth::Deep,
         ] {
-            let _ = build_prompt(&company_event(), depth, 4);
+            let _ = build_prompt(&company_event(), depth, 4, Locale::PtBr);
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+    }
+
+    // --- Task 6: locale-aware prose directive -----------------------------
+
+    #[test]
+    fn prompt_body_names_the_event_locale_language() {
+        let pt_prompt = build_prompt(&company_event(), ContactDepth::Off, 4, Locale::PtBr);
+        assert!(pt_prompt.contains("Brazilian Portuguese"));
+        let en_prompt = build_prompt(&company_event(), ContactDepth::Off, 4, Locale::EnUs);
+        assert!(en_prompt.contains("English (en-US)"));
+    }
+
+    #[test]
+    fn stable_system_prompt_is_byte_identical_across_locales() {
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for locale in [Locale::PtBr, Locale::EnUs] {
+            let _ = build_prompt(&company_event(), ContactDepth::Standard, 4, locale);
             assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
         }
     }
@@ -644,7 +680,7 @@ mod tests {
     #[test]
     fn no_prompt_synthesizes_a_contact_channel() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&company_event(), depth, 4);
+            let prompt = build_prompt(&company_event(), depth, 4, Locale::PtBr);
             assert!(!prompt.to_lowercase().contains("info@{domain}"));
             assert!(!prompt.to_lowercase().contains("guess an address"));
         }
@@ -798,6 +834,22 @@ mod tests {
             ctx.nodes[NODE_NAME]["contact_enrichment_depth"],
             json!("deep")
         );
+    }
+
+    #[tokio::test]
+    async fn resolved_locale_is_stamped_into_the_result() {
+        let node =
+            CompanyResearchNode::new().with_transport(stub_transport(Some(stub_brief_json())));
+        let mut event = company_event();
+        event.locale = Locale::EnUs;
+        let mut ctx = empty_ctx(event);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["locale"], json!("en-US"));
     }
 
     #[tokio::test]
