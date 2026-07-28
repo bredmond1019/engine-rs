@@ -56,6 +56,9 @@ pub fn baseline() -> PartialContentPipelinePolicy {
         max_critic_iterations: Some(3),
         critic_confidence_threshold: Some(0.8),
         dispatch_verbosity: Some(OutputVerbosity::Normal),
+        // Set explicitly by EN.7.D task 5; left as a fall-through here so
+        // task 2's compile stays green without pre-empting that task's work.
+        materialize: None,
     }
 }
 
@@ -81,6 +84,9 @@ pub fn local_drafting() -> PartialContentPipelinePolicy {
         max_critic_iterations: None,
         critic_confidence_threshold: None,
         dispatch_verbosity: None,
+        // Set explicitly by EN.7.D task 5; left as a fall-through here so
+        // task 2's compile stays green without pre-empting that task's work.
+        materialize: None,
     }
 }
 
@@ -101,6 +107,9 @@ pub fn fast_summarize() -> PartialContentPipelinePolicy {
         max_critic_iterations: None,
         critic_confidence_threshold: None,
         dispatch_verbosity: None,
+        // Set explicitly by EN.7.D task 5; left as a fall-through here so
+        // task 2's compile stays green without pre-empting that task's work.
+        materialize: None,
     }
 }
 
