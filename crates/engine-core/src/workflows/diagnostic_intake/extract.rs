@@ -317,6 +317,7 @@ mod tests {
             notes: "Client: \"We track orders by scrolling WhatsApp threads, probably \
                     an hour a day.\" Only Maria knows the supplier list."
                 .to_string(),
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }

@@ -208,6 +208,7 @@ mod tests {
             company_name: "Acme Corp".to_string(),
             company_url: Some("https://acme.example".to_string()),
             diagnostic_intake: None,
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }

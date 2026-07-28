@@ -326,6 +326,7 @@ mod tests {
             company_name: "Loja da Ana".to_string(),
             company_url: None,
             diagnostic_intake: None,
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }

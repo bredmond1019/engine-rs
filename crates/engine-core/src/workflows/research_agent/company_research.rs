@@ -375,6 +375,7 @@ mod tests {
             company_url: Some("https://acme.example".to_string()),
             vertical: None,
             topic: None,
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }

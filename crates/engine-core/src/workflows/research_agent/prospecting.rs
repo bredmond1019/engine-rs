@@ -384,6 +384,7 @@ mod tests {
             company_url: None,
             vertical: Some("legal-tech".to_string()),
             topic: Some("contract review pain points".to_string()),
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }
