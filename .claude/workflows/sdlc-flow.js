@@ -702,9 +702,9 @@ STEP 3 — append to ${worklogFile}. ${worklogHeaderWritten
   : `If the file does not exist, first write a header line "# Worklog — ${blockId}" then a blank line. Then append`} this section verbatim (a blank line before it):
 ${worklogEntry ? '```\n' + worklogEntry + '\n```' : '(no worklog entry this write — skip the append)'}
 
-Use the Write tool for both files. Do not run `git add`, `git commit`, `git checkout`, `git switch`,
-or `git branch` — this write is disk-only. Return via StructuredOutput: written=true once both files
-are written to disk, and startedAt set to the started_at value you used.
+Use the Write tool for both files. Do not run \`git add\`, \`git commit\`, \`git checkout\`,
+\`git switch\`, or \`git branch\` — this write is disk-only. Return via StructuredOutput: written=true
+once both files are written to disk, and startedAt set to the started_at value you used.
 `, withModel({ label: `state:${label}`, schema: STATE_WRITE_SCHEMA }, MODEL.stateWriter))
   if (result && result.startedAt) cachedStartedAt = result.startedAt
   if (result && result.written && worklogEntry) worklogHeaderWritten = true
