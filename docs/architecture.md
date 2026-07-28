@@ -62,9 +62,15 @@ engine-rs/
                          doc_materializer.rs — the injectable `DocMaterializer` seam
                          `MaterializeDocNode` calls to plan + write a `BrainDocModel`-shaped
                          artifact into the Brain corpus via `mev`/`okf-core` in-process, live impl
-                         + `StubDocMaterializer` test double, EN.7.A task 3; materialize_doc.rs —
+                         + `StubDocMaterializer` test double, EN.7.A task 3 (extended EN.7.B task 2
+                         with `edit_opportunity`/`OpportunityEdit::{SetStage,AddAction}` over
+                         mev's `plan_set_stage`/`plan_add_action`); materialize_doc.rs —
                          `MaterializeDocNode` itself, the generic writer node every future pipeline
-                         appends, EN.7.A task 4), brain_root.rs (`resolve_brain_root`/
+                         appends, EN.7.A task 4 (gains an ordered `with_source_nodes` upstream
+                         read-preference, EN.7.B task 1); opportunity_edit.rs —
+                         `OpportunityEditNode`, the generic node driving `edit_opportunity` for a
+                         configured `OpportunityEditOp` (`SetStage`/`AddAction`) read off
+                         `ctx.event`, EN.7.B task 3), brain_root.rs (`resolve_brain_root`/
                          `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
                          `mev::brain::config::find_brain_root` walking up from cwd for
                          `brain.toml`, typed `BrainRootError`, EN.7.A task 2)
@@ -124,11 +130,13 @@ I/O:
 |---|---|---|---|---|
 | `http_post.rs` (`EN.4.C`) | `HttpPost` / `ReqwestHttpPost` (`http_post_live()`) | `StubHttpPost` | `proposal_generator::PersistToBrainNode`, `content_pipeline::PersistToBrainNode` | POSTs a finished artifact to Synapse's brain-ingest endpoint (`OR.Q`) |
 | `channel_transport.rs` (`EN.6.A`) | `ChannelTransport` / `channel_transport_live()` | `StubChannelTransport` | `content_pipeline::ActionDispatchNode` | Delivers outbound actions (digest replies, workflow-trigger chaining) back to the channel that originated the run |
-| `doc_materializer.rs` (`EN.7.A`) | `DocMaterializer` / `MevDocMaterializer` (`doc_materializer_live()`) | `StubDocMaterializer` | `nodes::MaterializeDocNode` | Plans + writes a `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md` document via `mev`/`okf-core` in-process (D53's fourth boundary-test channel) |
+| `doc_materializer.rs` (`EN.7.A`, edit ops `EN.7.B`) | `DocMaterializer` / `MevDocMaterializer` (`doc_materializer_live()`) | `StubDocMaterializer` | `nodes::MaterializeDocNode`, `nodes::OpportunityEditNode` (`EN.7.B`) | Plans + writes a `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md` document via `mev`/`okf-core` in-process (D53's fourth boundary-test channel); `EN.7.B` extends the seam with `edit_opportunity` (`OpportunityEdit::SetStage`/`AddAction`, over mev's `plan_set_stage`/`plan_add_action`) for editing an already-written opportunity |
 
 See [materialize-doc-node.md](materialize-doc-node.md) for the `DocMaterializer` seam and
-`MaterializeDocNode` in detail, and [content-pipeline-workflow.md](content-pipeline-workflow.md)
-for `HttpPost` and `ChannelTransport` in their workflow context.
+`MaterializeDocNode` in detail, [opportunity-edit-workflows.md](opportunity-edit-workflows.md) for
+the `edit_opportunity` operation and `OpportunityEditNode`, and
+[content-pipeline-workflow.md](content-pipeline-workflow.md) for `HttpPost` and `ChannelTransport`
+in their workflow context.
 
 ## Build & CI
 
@@ -276,7 +284,7 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   status by `post_events` — when the factory's own policy resolution fails against `event` (e.g. an
   unknown `profile` name, a malformed inline `policy` override). `dispatch(workflow_type)` is a thin
   convenience wrapper calling `dispatch_with_event` with an empty (`Null`) event, kept for callers
-  with no event payload in hand. Every builtin registration
+  with no event payload in hand. Every policy-resolving builtin registration
   (`engine-serve::workflows::register_{sdlc_flow,research_agent,diagnostic_intake,
   proposal_generator}`) resolves policy against a workflow-appropriate
   `policy::PolicyConfigSource` — `SDLC_FLOW` (which runs embedded in a real repo checkout) uses
@@ -287,7 +295,12 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   initial `ctx.nodes` under `policy::RESOLVED_POLICY_IDENTITY` (via `Workflow::with_seeded_nodes`),
   so policy is resolved **once per run at dispatch** — no node re-resolves it (and re-reads
   `harness.json`) inside its own `process()`. See
-  `planning/decisions/D11-policy-dispatch-seam.md`.
+  `planning/decisions/D11-policy-dispatch-seam.md`. `register_opportunity_set_stage` /
+  `register_opportunity_add_action` (`OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION`, `EN.7.B`
+  task 6) are the first `register_builtin_workflows` entries with no policy layer at all —
+  `OpportunityEditNode` calls no model, so their `WorkflowFactory`s resolve no
+  `PolicyConfigSource` and seed no policy stamp; `register_builtin_workflows` now populates seven
+  workflow types in total.
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a

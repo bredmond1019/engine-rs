@@ -47,7 +47,7 @@ pub struct MaterializeDocNode {
     model: String,
     materializer: Arc<dyn DocMaterializer>,
     brain_root: Option<PathBuf>,
-    source_node: Option<String>,
+    source_nodes: Vec<String>,
     write: bool,
 }
 
@@ -62,7 +62,7 @@ impl MaterializeDocNode {
             model: model.into(),
             materializer: doc_materializer_live(),
             brain_root: None,
-            source_node: None,
+            source_nodes: Vec::new(),
             write: true,
         }
     }
@@ -84,10 +84,26 @@ impl MaterializeDocNode {
     }
 
     /// Read the input artifact from `upstream`'s stored `ctx.nodes` entry
-    /// instead of `ctx.event`.
+    /// instead of `ctx.event`. Equivalent to
+    /// `with_source_nodes([upstream])` — a one-element preference list.
     #[must_use]
     pub fn with_source_node(mut self, upstream: impl Into<String>) -> Self {
-        self.source_node = Some(upstream.into());
+        self.source_nodes = vec![upstream.into()];
+        self
+    }
+
+    /// Read the input artifact from the first of `upstreams` (in order)
+    /// whose `ctx.nodes` entry is present. `RESEARCH_AGENT` has two producer
+    /// branches (`CompanyResearchNode` | `ProspectingResearchNode`) and
+    /// exactly one runs per event, so this ordered preference list is how a
+    /// single `MaterializeDocNode` instance can sit downstream of both. An
+    /// empty list (the default) keeps reading `ctx.event`.
+    #[must_use]
+    pub fn with_source_nodes(
+        mut self,
+        upstreams: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.source_nodes = upstreams.into_iter().map(Into::into).collect();
         self
     }
 
@@ -100,15 +116,28 @@ impl MaterializeDocNode {
         self
     }
 
-    /// Resolve the input artifact: from `source_node`'s stored `ctx.nodes`
-    /// entry when configured, otherwise from `ctx.event`.
+    /// Resolve the input artifact: the first configured `source_nodes`
+    /// identity present in `ctx.nodes` wins (first-listed preference), or
+    /// `ctx.event` when no source nodes are configured. When a preference
+    /// list is configured but none of its identities is present, names every
+    /// identity tried in the error — mirrors
+    /// `content_pipeline::persist_to_brain::read_source_ref`.
     fn read_input<'a>(&self, ctx: &'a TaskContext) -> Result<&'a Value, NodeError> {
-        match &self.source_node {
-            Some(upstream) => get_result(ctx, upstream).ok_or_else(|| {
-                NodeError::new(format!("{}: no artifact stored by {upstream}", self.name()))
-            }),
-            None => Ok(&ctx.event),
+        if self.source_nodes.is_empty() {
+            return Ok(&ctx.event);
         }
+
+        for upstream in &self.source_nodes {
+            if let Some(stored) = get_result(ctx, upstream) {
+                return Ok(stored);
+            }
+        }
+
+        Err(NodeError::new(format!(
+            "{}: no artifact stored by {}",
+            self.name(),
+            self.source_nodes.join(", ")
+        )))
     }
 
     /// Resolve the brain root: the explicit `with_brain_root` value when
@@ -250,6 +279,72 @@ mod tests {
             .last_call()
             .expect("materialize should have been called");
         assert_eq!(call.input, json!({"company_name": "Acme"}));
+    }
+
+    #[tokio::test]
+    async fn process_reads_input_from_first_listed_identity_when_both_present() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub.clone()))
+            .with_brain_root("/tmp/brain")
+            .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]);
+
+        let mut ctx = empty_ctx(json!({}));
+        put_result(
+            &mut ctx,
+            "CompanyResearchNode",
+            json!({"company_name": "Acme"}),
+        );
+        put_result(
+            &mut ctx,
+            "ProspectingResearchNode",
+            json!({"vertical": "fintech"}),
+        );
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let call = stub
+            .last_call()
+            .expect("materialize should have been called");
+        assert_eq!(call.input, json!({"company_name": "Acme"}));
+    }
+
+    #[tokio::test]
+    async fn process_reads_input_from_second_listed_identity_when_only_it_is_present() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub.clone()))
+            .with_brain_root("/tmp/brain")
+            .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]);
+
+        let mut ctx = empty_ctx(json!({}));
+        put_result(
+            &mut ctx,
+            "ProspectingResearchNode",
+            json!({"vertical": "fintech"}),
+        );
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let call = stub
+            .last_call()
+            .expect("materialize should have been called");
+        assert_eq!(call.input, json!({"vertical": "fintech"}));
+    }
+
+    #[tokio::test]
+    async fn process_errors_naming_every_identity_when_none_of_a_preference_list_is_present() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub))
+            .with_brain_root("/tmp/brain")
+            .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]);
+
+        let ctx = empty_ctx(json!({}));
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(err.message.contains("MaterializeDocNode"));
+        assert!(err.message.contains("CompanyResearchNode"));
+        assert!(err.message.contains("ProspectingResearchNode"));
     }
 
     #[tokio::test]

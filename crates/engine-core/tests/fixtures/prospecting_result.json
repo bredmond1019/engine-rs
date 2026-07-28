@@ -1,0 +1,14 @@
+{
+  "vertical": "legal-tech",
+  "prospects": [
+    {
+      "name": "Jane Doe Legal",
+      "pain_points": ["Slow contract turnaround"],
+      "pillar": "automation",
+      "outreach_hook": "Posted about contract delays on r/legaltech",
+      "source": "https://reddit.com/r/legaltech/abc"
+    }
+  ],
+  "common_pain_points": ["Manual contract review"],
+  "sources": ["https://reddit.com/r/legaltech"]
+}

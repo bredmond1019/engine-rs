@@ -92,6 +92,26 @@ impl MaterializeOutcome {
 /// value is an `Err` naming this list.
 const VALID_MODELS: [&str; 3] = ["opportunity", "learning-artifact", "proposal"];
 
+/// One opportunity-edit operation the `DocMaterializer::edit_opportunity`
+/// seam can perform — `EN.7.B`'s addition alongside `materialize`. Only the
+/// two variants the block names (`set-stage`, `add-action`); `merge-contacts`
+/// is deliberately out of scope (its driver, `EN.4.E`, is not shipped — see
+/// `planning/EN.7.B-research-opportunity-loop/tasks.md` "Out of scope").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum OpportunityEdit {
+    SetStage {
+        slug: String,
+        stage: String,
+    },
+    AddAction {
+        slug: String,
+        at: String,
+        kind: String,
+        note: String,
+    },
+}
+
 /// The injectable doc-materialize seam: plan + apply a `BrainDocModel`-shaped
 /// write for `model`/`input` under `root`, honouring `write` (`false` is a
 /// dry run — nothing touches disk, but `planned` still names the target
@@ -104,6 +124,19 @@ pub trait DocMaterializer: Send + Sync {
         root: &Path,
         model: &str,
         input: &Value,
+        write: bool,
+    ) -> Result<MaterializeOutcome, String>;
+
+    /// Plan + apply one [`OpportunityEdit`] under `root`, honouring `write`
+    /// the same way `materialize` does. An invalid stage or an unknown slug
+    /// is a NORMAL mev outcome (an `Ok` carrying an error-severity
+    /// diagnostic), not a transport failure — `Err` is reserved for
+    /// join/IO failures in the live impl. Reuses the same
+    /// [`MaterializeOutcome`] shape as `materialize` — no new result type.
+    async fn edit_opportunity(
+        &self,
+        root: &Path,
+        edit: &OpportunityEdit,
         write: bool,
     ) -> Result<MaterializeOutcome, String>;
 }
@@ -208,6 +241,57 @@ impl DocMaterializer for MevDocMaterializer {
         .await
         .map_err(|err| format!("doc materialize task panicked: {err}"))?
     }
+
+    async fn edit_opportunity(
+        &self,
+        root: &Path,
+        edit: &OpportunityEdit,
+        write: bool,
+    ) -> Result<MaterializeOutcome, String> {
+        let root = root.to_path_buf();
+        let edit = edit.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let plan = match &edit {
+                OpportunityEdit::SetStage { slug, stage } => {
+                    mev::doc::opportunity::plan_set_stage(slug, stage, &root)
+                }
+                OpportunityEdit::AddAction {
+                    slug,
+                    at,
+                    kind,
+                    note,
+                } => mev::doc::opportunity::plan_add_action(slug, at, kind, note, &root),
+            };
+
+            let planned: Vec<MaterializedFile> = plan
+                .actions
+                .iter()
+                .map(|action| MaterializedFile {
+                    path: action.path.clone(),
+                    note: action.note.clone(),
+                })
+                .collect();
+
+            let plan_diagnostics: Vec<MaterializeDiagnostic> =
+                plan.diagnostics.iter().map(map_diagnostic).collect();
+
+            let apply_diagnostics = mev::brain::emit::apply_plan(&plan, write);
+            let mut diagnostics = plan_diagnostics;
+            diagnostics.extend(apply_diagnostics.iter().map(map_diagnostic));
+
+            let has_error = diagnostics.iter().any(MaterializeDiagnostic::is_error);
+            let wrote = write && !planned.is_empty() && !has_error;
+
+            Ok(MaterializeOutcome {
+                wrote,
+                planned,
+                diagnostics,
+            })
+        })
+        .await
+        .map_err(|err| format!("doc materialize task panicked: {err}"))?
+    }
 }
 
 /// Convenience constructor: an `Arc<dyn DocMaterializer>` wrapping
@@ -230,13 +314,25 @@ pub struct RecordedMaterializeCall {
     pub write: bool,
 }
 
+/// The `(root, edit, write)` tuple a `StubDocMaterializer` `edit_opportunity`
+/// call was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedEditCall {
+    pub root: PathBuf,
+    pub edit: OpportunityEdit,
+    pub write: bool,
+}
+
 /// Test-stub `DocMaterializer`: records the last `(root, model, input,
 /// write)` call it was handed and returns a configurable
 /// `Ok(MaterializeOutcome)` / `Err(String)` — same `Arc<Mutex<..>>`
 /// interior-mutability shape as `StubHttpPost::succeeding`/`failing`.
+/// Also records the last `edit_opportunity` call it was handed; both trait
+/// methods share the same configured `succeeding`/`failing` result.
 #[derive(Clone)]
 pub struct StubDocMaterializer {
     last_call: Arc<Mutex<Option<RecordedMaterializeCall>>>,
+    last_edit: Arc<Mutex<Option<RecordedEditCall>>>,
     result: Arc<Mutex<Result<MaterializeOutcome, String>>>,
 }
 
@@ -246,6 +342,7 @@ impl StubDocMaterializer {
     pub fn succeeding(outcome: MaterializeOutcome) -> Self {
         Self {
             last_call: Arc::new(Mutex::new(None)),
+            last_edit: Arc::new(Mutex::new(None)),
             result: Arc::new(Mutex::new(Ok(outcome))),
         }
     }
@@ -255,6 +352,7 @@ impl StubDocMaterializer {
     pub fn failing(error: impl Into<String>) -> Self {
         Self {
             last_call: Arc::new(Mutex::new(None)),
+            last_edit: Arc::new(Mutex::new(None)),
             result: Arc::new(Mutex::new(Err(error.into()))),
         }
     }
@@ -264,6 +362,13 @@ impl StubDocMaterializer {
     #[must_use]
     pub fn last_call(&self) -> Option<RecordedMaterializeCall> {
         self.last_call.lock().unwrap().clone()
+    }
+
+    /// The `(root, edit, write)` tuple passed to the most recent
+    /// `edit_opportunity` call, if any.
+    #[must_use]
+    pub fn last_edit(&self) -> Option<RecordedEditCall> {
+        self.last_edit.lock().unwrap().clone()
     }
 }
 
@@ -280,6 +385,20 @@ impl DocMaterializer for StubDocMaterializer {
             root: root.to_path_buf(),
             model: model.to_string(),
             input: input.clone(),
+            write,
+        });
+        self.result.lock().unwrap().clone()
+    }
+
+    async fn edit_opportunity(
+        &self,
+        root: &Path,
+        edit: &OpportunityEdit,
+        write: bool,
+    ) -> Result<MaterializeOutcome, String> {
+        *self.last_edit.lock().unwrap() = Some(RecordedEditCall {
+            root: root.to_path_buf(),
+            edit: edit.clone(),
             write,
         });
         self.result.lock().unwrap().clone()
@@ -416,5 +535,231 @@ mod tests {
         assert!(err.contains("opportunity"));
         assert!(err.contains("learning-artifact"));
         assert!(err.contains("proposal"));
+    }
+
+    #[tokio::test]
+    async fn stub_records_the_edit_call_it_is_handed_and_returns_its_configured_result() {
+        let stub = StubDocMaterializer::succeeding(MaterializeOutcome {
+            wrote: true,
+            planned: vec![MaterializedFile {
+                path: PathBuf::from("/tmp/brain/opportunities/acme-corp.md"),
+                note: "updated".to_string(),
+            }],
+            diagnostics: vec![],
+        });
+
+        let edit = OpportunityEdit::SetStage {
+            slug: "acme-corp".to_string(),
+            stage: "contacted".to_string(),
+        };
+
+        let outcome = stub
+            .edit_opportunity(Path::new("/tmp/brain"), &edit, true)
+            .await
+            .expect("succeeding stub should return Ok");
+        assert!(outcome.wrote);
+
+        let call = stub.last_edit().expect("edit call should be recorded");
+        assert_eq!(call.root, PathBuf::from("/tmp/brain"));
+        assert_eq!(call.edit, edit);
+        assert!(call.write);
+        assert!(
+            stub.last_call().is_none(),
+            "edit_opportunity must not record onto the materialize call slot"
+        );
+    }
+
+    /// Sets up a tempdir corpus with one written `acme-corp` opportunity
+    /// (via the live `materialize` path) — the shared fixture every
+    /// `edit_opportunity` live-impl test builds on.
+    async fn write_acme_corp_opportunity() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("business/docs/opportunities"))
+            .expect("create opportunities dir");
+
+        let live = MevDocMaterializer;
+        let outcome = live
+            .materialize(dir.path(), "opportunity", &company_brief_payload(), true)
+            .await
+            .expect("live materialize should succeed");
+        assert!(outcome.wrote, "diagnostics: {:?}", outcome.diagnostics);
+
+        dir
+    }
+
+    #[tokio::test]
+    async fn live_impl_set_stage_changes_the_stage_on_disk() {
+        let dir = write_acme_corp_opportunity().await;
+        let path = dir.path().join("business/docs/opportunities/acme-corp.md");
+        let before = std::fs::read_to_string(&path).expect("read opportunity file");
+        assert!(before.contains("stage: identified"));
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::SetStage {
+            slug: "acme-corp".to_string(),
+            stage: "contacted".to_string(),
+        };
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("set-stage should succeed");
+
+        assert!(outcome.wrote, "diagnostics: {:?}", outcome.diagnostics);
+        let after = std::fs::read_to_string(&path).expect("read opportunity file");
+        assert!(after.contains("stage: contacted"));
+        assert!(!after.contains("stage: identified"));
+    }
+
+    #[tokio::test]
+    async fn live_impl_repeated_set_stage_plans_nothing_and_leaves_bytes_unchanged() {
+        let dir = write_acme_corp_opportunity().await;
+        let path = dir.path().join("business/docs/opportunities/acme-corp.md");
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::SetStage {
+            slug: "acme-corp".to_string(),
+            stage: "contacted".to_string(),
+        };
+        live.edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("first set-stage should succeed");
+        let bytes_after_first = std::fs::read(&path).expect("read opportunity file");
+
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("repeat set-stage should succeed");
+
+        assert!(
+            outcome.planned.is_empty(),
+            "identical repeat should plan zero actions"
+        );
+        assert!(!outcome.wrote);
+        let bytes_after_second = std::fs::read(&path).expect("read opportunity file");
+        assert_eq!(
+            bytes_after_first, bytes_after_second,
+            "repeat set-stage must not change the file's bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_impl_invalid_stage_returns_ok_with_error_diagnostic_and_writes_nothing() {
+        let dir = write_acme_corp_opportunity().await;
+        let path = dir.path().join("business/docs/opportunities/acme-corp.md");
+        let before = std::fs::read(&path).expect("read opportunity file");
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::SetStage {
+            slug: "acme-corp".to_string(),
+            stage: "not-a-real-stage".to_string(),
+        };
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("invalid stage should still be Ok, not Err");
+
+        assert!(!outcome.wrote);
+        assert!(outcome.planned.is_empty());
+        let errors = outcome.errors();
+        assert!(
+            errors.iter().any(|d| d.code == "E_DOC_BAD_STAGE"),
+            "expected an E_DOC_BAD_STAGE diagnostic, got: {:?}",
+            outcome.diagnostics
+        );
+        let bad_stage_diag = errors
+            .iter()
+            .find(|d| d.code == "E_DOC_BAD_STAGE")
+            .expect("checked above");
+        for stage in mev::doc::opportunity::VALID_STAGES {
+            assert!(
+                bad_stage_diag.message.contains(stage),
+                "expected error message to name valid stage '{stage}': {}",
+                bad_stage_diag.message
+            );
+        }
+
+        let after = std::fs::read(&path).expect("read opportunity file");
+        assert_eq!(before, after, "invalid stage must not write to disk");
+    }
+
+    #[tokio::test]
+    async fn live_impl_add_action_appends_one_entry() {
+        let dir = write_acme_corp_opportunity().await;
+        let path = dir.path().join("business/docs/opportunities/acme-corp.md");
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::AddAction {
+            slug: "acme-corp".to_string(),
+            at: "2026-07-27".to_string(),
+            kind: "email".to_string(),
+            note: "Sent intro email".to_string(),
+        };
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("add-action should succeed");
+
+        assert!(outcome.wrote, "diagnostics: {:?}", outcome.diagnostics);
+        let after = std::fs::read_to_string(&path).expect("read opportunity file");
+        assert!(after.contains("Sent intro email"));
+    }
+
+    #[tokio::test]
+    async fn live_impl_repeated_add_action_plans_nothing_and_leaves_bytes_unchanged() {
+        let dir = write_acme_corp_opportunity().await;
+        let path = dir.path().join("business/docs/opportunities/acme-corp.md");
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::AddAction {
+            slug: "acme-corp".to_string(),
+            at: "2026-07-27".to_string(),
+            kind: "email".to_string(),
+            note: "Sent intro email".to_string(),
+        };
+        live.edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("first add-action should succeed");
+        let bytes_after_first = std::fs::read(&path).expect("read opportunity file");
+
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("repeat add-action should succeed");
+
+        assert!(
+            outcome.planned.is_empty(),
+            "identical repeat should plan zero actions"
+        );
+        assert!(!outcome.wrote);
+        let bytes_after_second = std::fs::read(&path).expect("read opportunity file");
+        assert_eq!(
+            bytes_after_first, bytes_after_second,
+            "repeat add-action must not change the file's bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_impl_unknown_slug_returns_ok_with_error_diagnostic_and_creates_no_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("business/docs/opportunities"))
+            .expect("create opportunities dir");
+
+        let live = MevDocMaterializer;
+        let edit = OpportunityEdit::SetStage {
+            slug: "no-such-opportunity".to_string(),
+            stage: "contacted".to_string(),
+        };
+        let outcome = live
+            .edit_opportunity(dir.path(), &edit, true)
+            .await
+            .expect("unknown slug should still be Ok, not Err");
+
+        assert!(!outcome.wrote);
+        assert!(outcome.planned.is_empty());
+        assert!(!outcome.errors().is_empty());
+        let path = dir
+            .path()
+            .join("business/docs/opportunities/no-such-opportunity.md");
+        assert!(!path.exists(), "unknown slug must not create a file");
     }
 }

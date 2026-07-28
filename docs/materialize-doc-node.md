@@ -65,8 +65,22 @@ pub trait DocMaterializer: Send + Sync {
         input: &Value,
         write: bool,
     ) -> Result<MaterializeOutcome, String>;
+
+    async fn edit_opportunity(
+        &self,
+        root: &Path,
+        edit: &OpportunityEdit,
+        write: bool,
+    ) -> Result<MaterializeOutcome, String>;
 }
 ```
+
+`edit_opportunity` (`EN.7.B` task 2) is the seam's second operation — it plans + applies one
+`OpportunityEdit` (`SetStage` | `AddAction`) against an already-written Opportunity document,
+reusing this same `MaterializeOutcome` result shape (no new type). `MaterializeDocNode` never
+calls it; `OpportunityEditNode` does. Full details — the `OpportunityEdit` enum, valid-stage
+validation, idempotency, and the error surface — live in
+[opportunity-edit-workflows.md](opportunity-edit-workflows.md), not duplicated here.
 
 - **`MevDocMaterializer`** (live) — dispatches `model` to the matching mev planner (`plan_ingest`
   for `"opportunity"`, `plan_document` over an `okf_core::LearningArtifact`/`okf_core::Proposal`
@@ -141,19 +155,28 @@ MaterializeDocNode::new(model: impl Into<String>)
     .with_materializer(materializer: Arc<dyn DocMaterializer>)
     .with_brain_root(root: impl Into<PathBuf>)
     .with_source_node(upstream: impl Into<String>)
+    .with_source_nodes(upstreams: impl IntoIterator<Item = impl Into<String>>)
     .with_write(write: bool)
 ```
 
 - `new(model)` defaults to the live seam (`doc_materializer_live()`), `write = true`, no explicit
-  brain root (falls through to `resolve_brain_root()`), and no explicit source node (reads
-  `ctx.event` directly).
+  brain root (falls through to `resolve_brain_root()`), and an empty source-node preference list
+  (reads `ctx.event` directly).
 - `with_materializer` swaps in a `StubDocMaterializer` for tests.
 - `with_brain_root` pins the corpus root explicitly, bypassing `resolve_brain_root` — tests point
   this at a `tempfile::tempdir()`.
-- `with_source_node(upstream)` reads the input artifact from `upstream`'s stored `ctx.nodes` entry
-  instead of `ctx.event`. A configured-but-absent upstream is a `NodeError` naming the missing
-  identity (`"{node}: no artifact stored by {upstream}"`), matching `persist_to_brain`'s message
-  style.
+- `with_source_node(upstream)` (`EN.7.A`) reads the input artifact from `upstream`'s stored
+  `ctx.nodes` entry instead of `ctx.event`. Equivalent to `with_source_nodes([upstream])` — a
+  one-element preference list; the two builders share one `source_nodes: Vec<String>` field, so
+  there is a single `read_input` code path.
+- `with_source_nodes(upstreams)` (`EN.7.B` task 1) configures an **ordered** preference list:
+  `read_input` returns the first upstream (in list order) whose `ctx.nodes` entry is present, or
+  `ctx.event` when the list is empty. This is how one shared `MaterializeDocNode` instance can sit
+  downstream of `RESEARCH_AGENT`'s two mutually-exclusive producer branches
+  (`CompanyResearchNode` | `ProspectingResearchNode` — exactly one runs per event; see
+  [research-agent-workflow.md](research-agent-workflow.md)). A configured-but-fully-absent
+  preference list is a `NodeError` naming every identity tried, joined by `", "` (mirrors
+  `persist_to_brain::read_source_ref`'s message style).
 - `with_write(false)` is dry-run: nothing is written to disk, but the result stamp still names the
   path(s) that would have been written and reports `dry_run: true`.
 
@@ -163,7 +186,8 @@ MaterializeDocNode::new(model: impl Into<String>)
 
 - brain-root resolution failure (`resolve_brain_root`'s `BrainRootError`, with a hint to set
   `ENGINE_BRAIN_ROOT`);
-- a missing configured source node;
+- an exhausted source-node preference list (none of the configured identities present in
+  `ctx.nodes`);
 - the seam returning `Err(String)` (including an unknown `model` value, which names the three
   valid models);
 - any error-severity diagnostic in an otherwise-successful `MaterializeOutcome`.
