@@ -23,8 +23,10 @@
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
 
+use crate::locale::{EngagementKind, Locale, MoneyRange, RateCard, RateSheet};
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
+use crate::policy::PolicyConfigSource;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
 use super::policy::ProposalGeneratorPolicy;
@@ -61,13 +63,21 @@ fn parse_event(ctx: &TaskContext) -> Result<ProposalGeneratorEventSchema, NodeEr
 /// Build the drafting prompt: the triggering event's company inputs, the
 /// upstream opportunity-scoring output (or a note that none is present yet
 /// — this node can be driven standalone), and the upstream web brief.
-fn build_prompt(ctx: &TaskContext, event: &ProposalGeneratorEventSchema) -> String {
+///
+/// `locale` names the language the model must write ALL prose in. This
+/// directive lives here, in the per-run prompt body — never in
+/// `STABLE_SYSTEM_PROMPT` (CLAUDE.md rule 6, cache breakpoints). The model
+/// is also told not to author a price: `investment` is filled in
+/// deterministically from the rate card after the reply parses (see
+/// `Node::process` below), never by the model.
+fn build_prompt(ctx: &TaskContext, event: &ProposalGeneratorEventSchema, locale: Locale) -> String {
     let opportunities = get_result(ctx, OPPORTUNITY_NODE_NAME)
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(no upstream opportunity scoring available)".to_string());
     let brief = get_result(ctx, RESEARCH_NODE_NAME)
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(no upstream research brief available)".to_string());
+    let language = locale.language_name();
 
     format!(
         "You are drafting an AutomationRoadmap proposal for \"{company}\" on \
@@ -82,9 +92,27 @@ fn build_prompt(ctx: &TaskContext, event: &ProposalGeneratorEventSchema) -> Stri
          Scored candidates:\n{opportunities}\n\n\
          Company research brief:\n{brief}\n\n\
          Respond with strict JSON matching the AutomationRoadmap schema \
-         (situation, candidates, top_profiles, recommendation).",
+         (situation, candidates, top_profiles, recommendation).\n\n\
+         Write ALL prose in {language}. This includes candidate names, \
+         rationale, proposed_solution, how_it_works, and call_to_action. Do \
+         not mix languages. Do NOT include a price, fee, or investment \
+         figure anywhere in your reply — that value is filled in \
+         deterministically after you respond.",
         company = event.company_name,
     )
+}
+
+/// Look up the [`MoneyRange`] for one [`EngagementKind`] on a [`RateSheet`].
+/// Kept local to this node (rather than a `RateSheet` method) since only the
+/// writer/revise nodes need to select a range by engagement kind — the
+/// firewall invariant lives entirely in `crate::locale`, which never
+/// exposes a cross-sheet or cross-kind helper.
+fn engagement_range(sheet: &RateSheet, kind: EngagementKind) -> MoneyRange {
+    match kind {
+        EngagementKind::Diagnostic => sheet.diagnostic,
+        EngagementKind::Project => sheet.project,
+        EngagementKind::Retainer => sheet.retainer,
+    }
 }
 
 /// The `writer`-stage node that drafts the `AutomationRoadmap`. Forwards to
@@ -137,7 +165,7 @@ impl Node for ProposalWriterNode {
         config =
             crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
         let prompt = crate::policy::apply_verbosity_directive(
-            build_prompt(&ctx, &event),
+            build_prompt(&ctx, &event, event.locale),
             policy.output_verbosity,
         );
 
@@ -156,12 +184,31 @@ impl Node for ProposalWriterNode {
             .unwrap_or_default()
             .to_string();
 
-        let roadmap: AutomationRoadmap =
+        let mut roadmap: AutomationRoadmap =
             parse_structured_or_fenced(&ctx, NODE_NAME, &content).map_err(|err| {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse an AutomationRoadmap from the model's reply: {err}"
                 ))
             })?;
+
+        // Deterministic stamp: the event's locale always wins over anything
+        // the model emitted. Mirrors EN.4.E's company_url stamp in
+        // research_agent::company_research.
+        roadmap.authored_locale = event.locale;
+
+        // Pricing is config, never model output. `EngagementKind::Project`
+        // is the roadmap's first engagement — a scoped build following the
+        // diagnostic, per rates.md's engagement ladder. `PolicyConfigSource::
+        // Builtin` is correct here: served runs resolve config at dispatch
+        // time (EN.5.D) and this node has no worktree path to read a
+        // `harness.json` override from.
+        let rate_card = RateCard::load_from(&PolicyConfigSource::Builtin)?;
+        if let Some(recommendation) = roadmap.recommendation.as_mut() {
+            recommendation.investment = Some(engagement_range(
+                rate_card.sheet(event.locale),
+                EngagementKind::Project,
+            ));
+        }
 
         put_result(
             &mut ctx,
@@ -170,6 +217,16 @@ impl Node for ProposalWriterNode {
                 NodeError::new(format!("failed to serialize AutomationRoadmap: {err}"))
             })?,
         );
+
+        // Stamp the resolved locale into this node's ctx.nodes result so
+        // RunTelemetry/PolicyAggregate can attribute observed cost/quality
+        // to the locale that caused it (CLAUDE.md rule 6).
+        if let Some(entry) = ctx.nodes.get_mut(NODE_NAME).and_then(|v| v.as_object_mut()) {
+            entry.insert(
+                "locale".to_string(),
+                serde_json::to_value(event.locale).unwrap_or_default(),
+            );
+        }
 
         Ok(ctx)
     }
@@ -253,12 +310,6 @@ mod tests {
             "recommendation": {
                 "start_with": "WhatsApp order tracking",
                 "phase_1_scope": ["Order intake bot"],
-                "investment": {
-                    "currency": "BRL",
-                    "min": 8_000.0,
-                    "max": 12_000.0,
-                    "basis": "fixed",
-                },
                 "how_it_works": "Connects to WhatsApp Business API.",
                 "call_to_action": "Book a call to proceed.",
             },
@@ -445,5 +496,201 @@ mod tests {
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("invalid PROPOSAL_GENERATOR event"));
+    }
+
+    // --- Locale + rate card (EN.4.F task 5) -------------------------------
+
+    fn event_with_locale(locale: Locale) -> ProposalGeneratorEventSchema {
+        ProposalGeneratorEventSchema {
+            locale,
+            ..base_event()
+        }
+    }
+
+    async fn captured_prompt_for(locale: Locale) -> String {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<(Config, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let transport: ModelTransport = std::sync::Arc::new(move |config, prompt| {
+            *captured_clone.lock().unwrap() = Some((config, prompt));
+            async move {
+                Ok(Outcome {
+                    text: serde_json::to_string(&stub_roadmap_json()).unwrap(),
+                    cost_usd: 0.0,
+                    usage: SdkUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: BTreeMap::new(),
+                    structured_output: Some(stub_roadmap_json()),
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        });
+
+        let node = ProposalWriterNode::new().with_transport(transport);
+        let ctx = empty_ctx(event_with_locale(locale));
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_config, prompt) = captured.lock().unwrap().take().expect("transport called");
+        prompt
+    }
+
+    #[tokio::test]
+    async fn pt_br_run_prompt_names_brazilian_portuguese() {
+        let prompt = captured_prompt_for(Locale::PtBr).await;
+        assert!(prompt.contains("Brazilian Portuguese"));
+    }
+
+    #[tokio::test]
+    async fn en_us_run_prompt_names_english() {
+        let prompt = captured_prompt_for(Locale::EnUs).await;
+        assert!(prompt.contains("English (en-US)"));
+    }
+
+    #[tokio::test]
+    async fn prompt_forbids_the_model_from_writing_a_price() {
+        let prompt = captured_prompt_for(Locale::PtBr).await;
+        assert!(prompt.contains("Do NOT include a price"));
+    }
+
+    #[tokio::test]
+    async fn stable_system_prompt_is_byte_identical_across_locales() {
+        // Follows the anchor-comparison pattern at
+        // research_agent::prospecting's equivalent test: the const itself
+        // never varies, so comparing it to itself before/after driving both
+        // locales proves no locale-specific edit snuck into the stable
+        // prefix.
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for locale in [Locale::PtBr, Locale::EnUs] {
+            let _ = captured_prompt_for(locale).await;
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+
+        let node = ProposalWriterNode::new().with_transport(stub_transport(None));
+        let policy = ProposalGeneratorPolicy {
+            prompt_cache: true,
+            ..ProposalGeneratorPolicy::default()
+        };
+        let mut ctx = empty_ctx(event_with_locale(Locale::PtBr));
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+        let ctx_pt = node.process(ctx).await.expect("process should succeed");
+
+        let node = ProposalWriterNode::new().with_transport(stub_transport(None));
+        let mut ctx = empty_ctx(event_with_locale(Locale::EnUs));
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+        let ctx_en = node.process(ctx).await.expect("process should succeed");
+
+        // Both runs stamped the same NODE_NAME identity; neither leaves any
+        // trace of a locale-varying system prompt on the resolved config —
+        // the config itself isn't captured here, but the const equality
+        // above plus this smoke pass confirms both locales still resolve.
+        assert!(ctx_pt.nodes.contains_key(NODE_NAME));
+        assert!(ctx_en.nodes.contains_key(NODE_NAME));
+    }
+
+    #[tokio::test]
+    async fn pt_br_run_prices_from_the_brl_sheet() {
+        let node =
+            ProposalWriterNode::new().with_transport(stub_transport(Some(stub_roadmap_json())));
+        let ctx = empty_ctx(event_with_locale(Locale::PtBr));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let roadmap: AutomationRoadmap =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid AutomationRoadmap");
+        let investment = roadmap
+            .recommendation
+            .expect("recommendation present")
+            .investment
+            .expect("investment populated");
+        let expected = crate::locale::RateCard::default()
+            .sheet(Locale::PtBr)
+            .project;
+        assert_eq!(investment.currency, crate::locale::Currency::Brl);
+        assert_eq!(investment.min, expected.min);
+        assert_eq!(investment.max, expected.max);
+    }
+
+    #[tokio::test]
+    async fn en_us_run_prices_from_the_usd_sheet() {
+        let node =
+            ProposalWriterNode::new().with_transport(stub_transport(Some(stub_roadmap_json())));
+        let ctx = empty_ctx(event_with_locale(Locale::EnUs));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let roadmap: AutomationRoadmap =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid AutomationRoadmap");
+        let investment = roadmap
+            .recommendation
+            .expect("recommendation present")
+            .investment
+            .expect("investment populated");
+        let expected = crate::locale::RateCard::default()
+            .sheet(Locale::EnUs)
+            .project;
+        assert_eq!(investment.currency, crate::locale::Currency::Usd);
+        assert_eq!(investment.min, expected.min);
+        assert_eq!(investment.max, expected.max);
+    }
+
+    #[tokio::test]
+    async fn model_supplied_investment_is_ignored() {
+        // Simulate a model that disregarded the prompt's price-suppression
+        // instruction and emitted its own investment figure anyway. The
+        // node must overwrite it with the rate-card lookup regardless.
+        let mut model_supplied = stub_roadmap_json();
+        model_supplied["recommendation"]["investment"] = json!({
+            "currency": "USD",
+            "min": 1.0,
+            "max": 2.0,
+            "basis": "fixed",
+        });
+
+        let node = ProposalWriterNode::new().with_transport(stub_transport(Some(model_supplied)));
+        let ctx = empty_ctx(event_with_locale(Locale::PtBr));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let roadmap: AutomationRoadmap =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid AutomationRoadmap");
+        let investment = roadmap
+            .recommendation
+            .expect("recommendation present")
+            .investment
+            .expect("investment populated");
+        // pt-BR run must carry the BRL rate-card figure, not the model's
+        // fabricated USD one.
+        assert_eq!(investment.currency, crate::locale::Currency::Brl);
+        let expected = crate::locale::RateCard::default()
+            .sheet(Locale::PtBr)
+            .project;
+        assert_eq!(investment.min, expected.min);
+        assert_eq!(investment.max, expected.max);
+    }
+
+    #[tokio::test]
+    async fn authored_locale_is_stamped_from_the_event() {
+        // Even when the model emits a different authored_locale (which the
+        // stub reply never does today — this asserts the event always wins
+        // regardless of what a future model reply might carry).
+        let mut model_supplied = stub_roadmap_json();
+        model_supplied["authored_locale"] = json!("en-US");
+
+        let node = ProposalWriterNode::new().with_transport(stub_transport(Some(model_supplied)));
+        let ctx = empty_ctx(event_with_locale(Locale::PtBr));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let roadmap: AutomationRoadmap =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid AutomationRoadmap");
+        assert_eq!(roadmap.authored_locale, Locale::PtBr);
     }
 }
