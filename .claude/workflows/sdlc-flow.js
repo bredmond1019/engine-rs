@@ -59,8 +59,6 @@
 //   worklog.md             the human-readable trail — one short section per task
 // =============================================================================
 
-import fs from 'node:fs'
-
 export const meta = {
   name: 'sdlc-flow',
   description: 'Run a spec sequentially on one branch (or --worktree) with a per-task test→fix loop, one end review, a docs patch, and a PR',
@@ -111,23 +109,32 @@ function parseRange(spec) {
 // root, this reports whether planning/ is such a symlink and resolves where its bytes
 // actually live, so state-writing steps can stage through the real path instead of
 // the link (and never "repair" the failure by checking out/committing in the vault
-// repo). Pure + synchronous — runs in-process rather than shelling out to python3
-// like the git-staging recipes below, so the engine itself can branch on the result.
-// Returns { vaulted, planningPath } where planningPath is always the absolute
-// resolved directory: the vault's realpath when vaulted, the plain planning/
-// directory otherwise.
-function detectPlanningVault(repoRoot) {
-  const planningPath = `${repoRoot}/planning`
-  try {
-    if (fs.lstatSync(planningPath).isSymbolicLink()) {
-      return { vaulted: true, planningPath: fs.realpathSync(planningPath) }
-    }
-    return { vaulted: false, planningPath: fs.realpathSync(planningPath) }
-  } catch {
-    // planning/ missing or unreadable — treat as not vaulted; callers fall back to
-    // the legacy single-repo path, which already tolerates a missing directory.
-    return { vaulted: false, planningPath }
+// repo). The Workflow runtime has no filesystem/Node API access (no fs, no process,
+// no require, and `import` declarations don't even parse) — so this shells out via a
+// cheap Haiku agent instead of calling fs.lstatSync/realpathSync in-process, exactly
+// like every other filesystem check in this engine. Returns { vaulted, planningPath }
+// where planningPath is always the absolute resolved directory: the vault's realpath
+// when vaulted, the plain planning/ directory otherwise.
+const VAULT_DETECT_SCHEMA = {
+  type: 'object',
+  required: ['vaulted', 'planningPath'],
+  properties: {
+    vaulted:      { type: 'boolean', description: 'true iff planning/ is a symlink' },
+    planningPath: { type: 'string', description: 'the resolved absolute real path of planning/' }
   }
+}
+async function detectPlanningVault(repoRoot) {
+  const result = await agent(`
+Determine whether planning/ in this repo is a symlink (a brain-vaulted repo) or a plain directory.
+Run exactly this ONE Bash call (from the repo root, ${repoRoot}):
+  cd ${repoRoot} && { [ -L planning ] && echo "SYMLINK" || echo "PLAIN"; } && python3 -c "import os; print(os.path.realpath('planning'))"
+The first line is SYMLINK or PLAIN. The second line is the resolved absolute real path (this works
+for both cases — realpath of a plain directory is itself).
+Return via StructuredOutput: vaulted (true iff the first line is SYMLINK), planningPath (the
+resolved absolute path from the second line).
+`, { label: 'detect-vault', schema: VAULT_DETECT_SCHEMA, model: 'haiku' })
+  if (!result) return { vaulted: false, planningPath: `${repoRoot}/planning` }
+  return result
 }
 
 const autoMergeFlag = hasFlag('--auto-merge')
@@ -1394,7 +1401,7 @@ log(`Wrap-up. Verdict: ${finalVerdict} | passed ${passedTasks.length}/${taskList
 // the vault repo is already on, with no checkout at all — while repo-local files (log.md, the spec)
 // stay staged and committed in the invoking repo exactly as before. detectPlanningVault() resolves
 // which case applies.
-const vault = detectPlanningVault(worktreePath)
+const vault = await detectPlanningVault(worktreePath)
 const wrapupResult = await tracedAgent(`${W}
 You are the wrap-up agent for an /sdlc-flow run. Write the human-facing status/log + the D18 amendment log
 ON THIS BRANCH (the PR will carry them), then commit. All Bash from the worktree root.
