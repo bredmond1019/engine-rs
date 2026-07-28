@@ -215,6 +215,7 @@ mod tests {
             company_name: "Acme Corp".to_string(),
             company_url: None,
             diagnostic_intake: None,
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }

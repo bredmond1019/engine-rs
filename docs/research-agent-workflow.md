@@ -6,7 +6,7 @@ doc_id: research-agent-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief, materialize-doc-node, opportunity, contacts, merge-contacts, contact-enrichment]
+keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief, materialize-doc-node, opportunity, contacts, merge-contacts, contact-enrichment, locale, language directive]
 related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, data-contract, materialize-doc-node, opportunity-edit-workflows]
 ---
 
@@ -93,8 +93,14 @@ or
 | `mode` | both, required | `"company"` \| `"prospecting"` — selects which terminal node the router dispatches to. |
 | `company_name` / `company_url` | `company` | Optional inputs for the single-company brief. |
 | `vertical` / `topic` | `prospecting` | Optional seed inputs narrowing the sweep. |
+| `locale` | both, optional | `Locale` (`"pt-BR"` \| `"en-US"`), defaults to `"pt-BR"` when omitted (`EN.4.F`). Drives the language `CompanyResearchNode`/`ProspectingResearchNode` write their prose in via `crate::locale::language_directive(locale)`, spliced into the per-run prompt body (never the `STABLE_SYSTEM_PROMPT`, so prompt caching is unaffected across locales). Both nodes stamp the resolved `locale` alongside their result onto `ctx` for telemetry. A per-client attribute, not a policy knob — it is not on `ResearchAgentPolicy`. |
 | `policy` | both, optional | Per-run `PartialResearchAgentPolicy` override — highest-precedence layer. |
 | `profile` | both, optional | Name of a built-in or `harness.json`-defined policy profile bundle. |
+
+**Contact strings are never translated.** The language directive governs prose fields only —
+`ResearchContact` values (email, phone, WhatsApp number, handle, URL) are scraped literals under
+`EN.4.E`'s anti-fabrication contract, and the directive itself carries an explicit exception
+telling the model to reproduce any literal contact string exactly as found, regardless of locale.
 
 All per-mode input fields are optional at the schema level (`Option<String>`) — `ResearchMode`
 alone determines which subset a given run is expected to populate; the model nodes' prompts, not

@@ -41,7 +41,7 @@ pub enum PolicyConfigSource {
 
 impl PolicyConfigSource {
     /// The concrete file path to read, or `None` for [`PolicyConfigSource::Builtin`].
-    fn harness_path(&self) -> Option<PathBuf> {
+    pub(crate) fn harness_path(&self) -> Option<PathBuf> {
         match self {
             PolicyConfigSource::Worktree(worktree) => {
                 Some(worktree.join("planning").join("harness.json"))

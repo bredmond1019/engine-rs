@@ -19,6 +19,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::locale::Locale;
+
 use super::policy::PartialDiagnosticIntakePolicy;
 
 /// Inbound event schema for the `DIAGNOSTIC_INTAKE` workflow. Mirrors the
@@ -31,6 +33,13 @@ pub struct DiagnosticIntakeEventSchema {
     /// prompt ports `intake.md`'s interview groups + evidence discipline
     /// against this text.
     pub notes: String,
+    /// The client's locale — drives the language this run's prose is written
+    /// in. Deliberately NOT on `DiagnosticIntakePolicy`: per CLAUDE.md rule 6
+    /// a policy knob trades cost, latency, or quality, and a client's market
+    /// is none of those. It is a per-client attribute and belongs on the
+    /// event.
+    #[serde(default)]
+    pub locale: Locale,
     /// Optional per-run policy override — the highest-precedence of the
     /// four `DiagnosticIntakePolicy` resolution layers (event override >
     /// named `profile` > `harness.json` `diagnostic_intake.policy`
@@ -214,5 +223,28 @@ mod tests {
             schema["required"],
             serde_json::json!(["company_name", "company_type", "team_size", "top_workflows"])
         );
+    }
+
+    #[test]
+    fn event_without_locale_defaults_to_pt_br() {
+        let json = serde_json::json!({ "notes": "raw notes only" });
+        let event: DiagnosticIntakeEventSchema =
+            serde_json::from_value(json).expect("deserializes with defaults");
+        assert_eq!(event.locale, crate::locale::Locale::PtBr);
+    }
+
+    #[test]
+    fn event_with_en_us_locale_parses() {
+        let json = serde_json::json!({ "notes": "raw notes only", "locale": "en-US" });
+        let event: DiagnosticIntakeEventSchema =
+            serde_json::from_value(json).expect("deserializes");
+        assert_eq!(event.locale, crate::locale::Locale::EnUs);
+    }
+
+    #[test]
+    fn event_with_unsupported_locale_tag_fails() {
+        let json = serde_json::json!({ "notes": "raw notes only", "locale": "en-GB" });
+        let result: Result<DiagnosticIntakeEventSchema, _> = serde_json::from_value(json);
+        assert!(result.is_err());
     }
 }

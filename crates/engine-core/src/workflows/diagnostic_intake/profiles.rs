@@ -217,6 +217,7 @@ mod tests {
     fn base_event() -> DiagnosticIntakeEventSchema {
         DiagnosticIntakeEventSchema {
             notes: "Client call transcript: ...".to_string(),
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }

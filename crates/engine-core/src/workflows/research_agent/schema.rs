@@ -20,6 +20,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::locale::Locale;
+
 use super::policy::PartialResearchAgentPolicy;
 
 /// Which terminal node `ResearchModeRouterNode` routes to: a single-company
@@ -53,6 +55,12 @@ pub struct ResearchAgentEventSchema {
     /// (`ResearchMode::Prospecting`).
     #[serde(default)]
     pub topic: Option<String>,
+    /// The client's locale — drives the language this run's prose is written
+    /// in. Deliberately NOT on `ResearchAgentPolicy`: per CLAUDE.md rule 6 a
+    /// policy knob trades cost, latency, or quality, and a client's market is
+    /// none of those. It is a per-client attribute and belongs on the event.
+    #[serde(default)]
+    pub locale: Locale,
     /// Optional per-run policy override — the highest-precedence of the
     /// four `ResearchAgentPolicy` resolution layers (event override >
     /// named `profile` > `harness.json` `research_agent.policy` defaults >
@@ -295,6 +303,7 @@ mod tests {
             company_url: Some("https://acme.example".to_string()),
             vertical: None,
             topic: None,
+            locale: Locale::default(),
             policy: None,
             profile: Some("baseline".to_string()),
         };
@@ -312,6 +321,7 @@ mod tests {
             company_url: None,
             vertical: Some("legal-tech".to_string()),
             topic: Some("contract review pain points".to_string()),
+            locale: Locale::default(),
             policy: None,
             profile: None,
         };
@@ -484,5 +494,27 @@ mod tests {
         let result_json = serde_json::to_value(&result).expect("serializes");
         assert!(result_json.get("prospects").is_some());
         assert!(result_json.get("vertical").is_some());
+    }
+
+    #[test]
+    fn event_without_locale_defaults_to_pt_br() {
+        let json = serde_json::json!({ "mode": "company" });
+        let event: ResearchAgentEventSchema =
+            serde_json::from_value(json).expect("deserializes with defaults");
+        assert_eq!(event.locale, Locale::PtBr);
+    }
+
+    #[test]
+    fn event_with_en_us_locale_parses() {
+        let json = serde_json::json!({ "mode": "company", "locale": "en-US" });
+        let event: ResearchAgentEventSchema = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(event.locale, Locale::EnUs);
+    }
+
+    #[test]
+    fn event_with_unsupported_locale_tag_fails() {
+        let json = serde_json::json!({ "mode": "company", "locale": "en-GB" });
+        let result: Result<ResearchAgentEventSchema, _> = serde_json::from_value(json);
+        assert!(result.is_err());
     }
 }

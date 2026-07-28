@@ -36,7 +36,8 @@ use crate::node::{Node, NodeError};
 use crate::nodes::http_post::{http_post_live, HttpPost};
 use crate::workflows::{get_result, put_result};
 
-use super::schema::{AutomationRoadmap, ProposalGeneratorEventSchema};
+use super::schema::{AutomationRoadmap, Investment, ProposalGeneratorEventSchema};
+use crate::locale::Currency;
 
 /// The `Node::name()` identity `PersistToBrainNode` runs under, and the
 /// `ctx.nodes` key its result is stamped onto.
@@ -91,6 +92,23 @@ fn read_roadmap(ctx: &TaskContext) -> Result<AutomationRoadmap, NodeError> {
     })
 }
 
+/// Format a money range in its OWN currency only. Never annotates with a
+/// second currency and never converts — see EN.4.F's firewall invariant.
+fn format_money(range: &Investment) -> String {
+    let symbol = match range.currency {
+        Currency::Brl => "R$",
+        Currency::Usd => "$",
+    };
+    let min = range.min;
+    let max = range.max;
+    let suffix = match range.basis {
+        crate::locale::EngagementBasis::Fixed => "fixed",
+        crate::locale::EngagementBasis::PerMonth => "per month",
+        crate::locale::EngagementBasis::PerHour => "per hour",
+    };
+    format!("{symbol}{min:.0}-{max:.0} {suffix}")
+}
+
 /// Render a plain-language summary of the roadmap for the brain's own
 /// embedding step (which happens behind the ingest endpoint, never here).
 fn roadmap_to_content(company_name: &str, roadmap: &AutomationRoadmap) -> String {
@@ -108,9 +126,17 @@ fn roadmap_to_content(company_name: &str, roadmap: &AutomationRoadmap) -> String
         .map(|r| r.start_with.clone())
         .unwrap_or_default();
 
+    let investment = roadmap
+        .recommendation
+        .as_ref()
+        .and_then(|r| r.investment.as_ref())
+        .map(format_money)
+        .unwrap_or_default();
+
     format!(
         "AutomationRoadmap for {company_name}. Situation: {situation_summary}. \
-         Candidates: {candidates}. Recommended first engagement: {recommended}.",
+         Candidates: {candidates}. Recommended first engagement: {recommended}. \
+         Investment: {investment}.",
         candidates = candidate_names.join(", "),
     )
 }
@@ -231,6 +257,7 @@ mod tests {
             company_name: "Loja da Ana".to_string(),
             company_url: None,
             diagnostic_intake: None,
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }
@@ -238,6 +265,7 @@ mod tests {
 
     fn sample_roadmap_json() -> serde_json::Value {
         json!({
+            "authored_locale": "pt-BR",
             "situation": {
                 "company_name": "Loja da Ana",
                 "business_type": "retail SMB",
@@ -269,7 +297,12 @@ mod tests {
             "recommendation": {
                 "start_with": "WhatsApp order tracking",
                 "phase_1_scope": ["Order intake bot"],
-                "investment": "R$8,000-12,000 fixed fee",
+                "investment": {
+                    "currency": "BRL",
+                    "min": 8_000.0,
+                    "max": 12_000.0,
+                    "basis": "fixed",
+                },
                 "how_it_works": "Connects to WhatsApp Business API.",
                 "call_to_action": "Book a call to proceed.",
             },
@@ -392,5 +425,79 @@ mod tests {
     #[test]
     fn default_constructs_without_panicking() {
         let _node = PersistToBrainNode::default();
+    }
+
+    #[tokio::test]
+    async fn payload_roadmap_investment_round_trips_as_an_object() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+
+        let mut ctx = empty_ctx(base_event());
+        ctx.nodes
+            .insert(WRITER_NODE_NAME.to_string(), sample_roadmap_json());
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_url, body) = stub.last_call().expect("post should have been recorded");
+        assert_eq!(
+            body["roadmap"]["recommendation"]["investment"]["currency"],
+            json!("BRL")
+        );
+        assert_eq!(
+            body["roadmap"]["recommendation"]["investment"]["min"],
+            json!(8_000.0)
+        );
+        assert_eq!(
+            body["roadmap"]["recommendation"]["investment"]["max"],
+            json!(12_000.0)
+        );
+        assert_eq!(
+            body["roadmap"]["recommendation"]["investment"]["basis"],
+            json!("fixed")
+        );
+    }
+
+    #[tokio::test]
+    async fn brl_roadmap_content_shows_no_dollar_figure() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+
+        let mut ctx = empty_ctx(base_event());
+        ctx.nodes
+            .insert(WRITER_NODE_NAME.to_string(), sample_roadmap_json());
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_url, body) = stub.last_call().expect("post should have been recorded");
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("R$"));
+        // Every literal '$' in a BRL-priced roadmap must be the second
+        // character of an "R$" pair — no bare USD figure anywhere.
+        assert_eq!(content.matches("R$").count(), content.matches('$').count());
+    }
+
+    #[tokio::test]
+    async fn usd_roadmap_content_shows_no_real_figure() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+
+        let mut usd_roadmap = sample_roadmap_json();
+        usd_roadmap["authored_locale"] = json!("en-US");
+        usd_roadmap["recommendation"]["investment"] = json!({
+            "currency": "USD",
+            "min": 5_000.0,
+            "max": 15_000.0,
+            "basis": "fixed",
+        });
+
+        let mut ctx = empty_ctx(base_event());
+        ctx.nodes.insert(WRITER_NODE_NAME.to_string(), usd_roadmap);
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_url, body) = stub.last_call().expect("post should have been recorded");
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains('$'));
+        assert!(!content.contains("R$"));
     }
 }

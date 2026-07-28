@@ -223,6 +223,7 @@ mod tests {
             company_url: None,
             vertical: None,
             topic: None,
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }

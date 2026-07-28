@@ -23,6 +23,7 @@ use claude_code_rs::Config;
 use engine_contract::TaskContext;
 use serde_json::json;
 
+use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
@@ -139,7 +140,12 @@ fn contact_directive(depth: ContactDepth, max_fetches: u8) -> String {
 /// against this practice's own positioning (business/docs
 /// `brand.md`/`services.md`) so prospects map back onto real, sellable
 /// service pillars rather than generic leads.
-fn build_prompt(event: &ResearchAgentEventSchema, depth: ContactDepth, max_fetches: u8) -> String {
+fn build_prompt(
+    event: &ResearchAgentEventSchema,
+    depth: ContactDepth,
+    max_fetches: u8,
+    locale: Locale,
+) -> String {
     let vertical = event.vertical.as_deref().unwrap_or("a relevant vertical");
     let topic = event
         .topic
@@ -169,7 +175,11 @@ fn build_prompt(event: &ResearchAgentEventSchema, depth: ContactDepth, max_fetch
          \"common_pain_points\": [str], \"sources\": [str]}}."
     );
 
-    format!("{base}{}", contact_directive(depth, max_fetches))
+    format!(
+        "{base}{}\n\n{}",
+        contact_directive(depth, max_fetches),
+        language_directive(locale)
+    )
 }
 
 /// Read the worktree path stamped by an upstream setup node, if this run
@@ -274,7 +284,7 @@ impl Node for ProspectingResearchNode {
         let contact_depth = policy.contact_enrichment.prospect;
         let max_fetches = policy.contact_enrichment.max_fetches;
         let prompt = crate::policy::apply_verbosity_directive(
-            build_prompt(&event, contact_depth, max_fetches),
+            build_prompt(&event, contact_depth, max_fetches, event.locale),
             policy.output_verbosity,
         );
 
@@ -311,6 +321,13 @@ impl Node for ProspectingResearchNode {
             obj.insert(
                 "contact_enrichment_depth".to_string(),
                 serde_json::to_value(contact_depth).unwrap_or_default(),
+            );
+            // Stamp the resolved locale alongside the result so EN.4.0
+            // telemetry can attribute prose-language cost/quality to the
+            // locale that caused it (CLAUDE.md rule 6).
+            obj.insert(
+                "locale".to_string(),
+                serde_json::to_value(event.locale).unwrap_or_default(),
             );
         }
         put_result(&mut ctx, NODE_NAME, result_value);
@@ -384,6 +401,7 @@ mod tests {
             company_url: None,
             vertical: Some("legal-tech".to_string()),
             topic: Some("contract review pain points".to_string()),
+            locale: crate::locale::Locale::default(),
             policy: None,
             profile: None,
         }
@@ -587,14 +605,19 @@ mod tests {
 
     #[test]
     fn off_depth_prompt_has_no_contact_directive() {
-        let prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4);
+        let prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4, Locale::PtBr);
         assert!(!prompt.to_lowercase().contains("acquisition"));
         assert!(!prompt.to_lowercase().contains("anti-fabrication"));
     }
 
     #[test]
     fn standard_depth_names_one_attempt_and_skip_pseudonymous_and_budget() {
-        let prompt = build_prompt(&prospecting_event(), ContactDepth::Standard, 4);
+        let prompt = build_prompt(
+            &prospecting_event(),
+            ContactDepth::Standard,
+            4,
+            Locale::PtBr,
+        );
         assert!(prompt.contains("ACQUISITION"));
         assert!(prompt.contains("one attempt per identifiable business"));
         assert!(prompt.contains("SKIP pseudonymous individuals"));
@@ -606,7 +629,7 @@ mod tests {
 
     #[test]
     fn deep_depth_adds_public_profile_sweep_and_keeps_one_attempt_rule() {
-        let prompt = build_prompt(&prospecting_event(), ContactDepth::Deep, 8);
+        let prompt = build_prompt(&prospecting_event(), ContactDepth::Deep, 8, Locale::PtBr);
         assert!(prompt.contains("LinkedIn"));
         assert!(prompt.contains("Instagram"));
         assert!(prompt.contains("Facebook"));
@@ -618,7 +641,7 @@ mod tests {
     #[test]
     fn non_off_depths_carry_anti_fabrication_directive() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&prospecting_event(), depth, 4);
+            let prompt = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
             assert!(
                 prompt.contains("Never construct"),
                 "depth {depth:?} missing the anti-fabrication directive"
@@ -637,7 +660,7 @@ mod tests {
     #[test]
     fn breadth_over_depth_framing_present_at_non_off_depths() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&prospecting_event(), depth, 4);
+            let prompt = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
             assert!(prompt.to_lowercase().contains("breadth"));
         }
     }
@@ -650,7 +673,26 @@ mod tests {
             ContactDepth::Standard,
             ContactDepth::Deep,
         ] {
-            let _ = build_prompt(&prospecting_event(), depth, 4);
+            let _ = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+    }
+
+    // --- Task 6: locale-aware prose directive -----------------------------
+
+    #[test]
+    fn prompt_body_names_the_event_locale_language() {
+        let pt_prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4, Locale::PtBr);
+        assert!(pt_prompt.contains("Brazilian Portuguese"));
+        let en_prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4, Locale::EnUs);
+        assert!(en_prompt.contains("English (en-US)"));
+    }
+
+    #[test]
+    fn stable_system_prompt_is_byte_identical_across_locales() {
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for locale in [Locale::PtBr, Locale::EnUs] {
+            let _ = build_prompt(&prospecting_event(), ContactDepth::Standard, 4, locale);
             assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
         }
     }
@@ -658,7 +700,7 @@ mod tests {
     #[test]
     fn no_prompt_synthesizes_a_contact_channel() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&prospecting_event(), depth, 4);
+            let prompt = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
             assert!(!prompt.to_lowercase().contains("info@{domain}"));
             assert!(!prompt.to_lowercase().contains("guess an address"));
         }
@@ -737,5 +779,21 @@ mod tests {
             ctx.nodes[NODE_NAME]["contact_enrichment_depth"],
             json!("deep")
         );
+    }
+
+    #[tokio::test]
+    async fn resolved_locale_is_stamped_into_the_result() {
+        let node =
+            ProspectingResearchNode::new().with_transport(stub_transport(Some(stub_result_json())));
+        let mut event = prospecting_event();
+        event.locale = Locale::EnUs;
+        let mut ctx = empty_ctx(event);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["locale"], json!("en-US"));
     }
 }

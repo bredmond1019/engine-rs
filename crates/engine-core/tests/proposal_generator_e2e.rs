@@ -232,7 +232,6 @@ fn stub_roadmap_json(painful_workflow_summary: &str) -> Value {
         "recommendation": {
             "start_with": "WhatsApp order tracking",
             "phase_1_scope": ["Order intake bot"],
-            "investment": "R$8,000-12,000 fixed fee",
             "how_it_works": "Connects to WhatsApp Business API.",
             "call_to_action": "Book a call to proceed.",
         },

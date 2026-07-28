@@ -6,7 +6,7 @@ doc_id: diagnostic-intake-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [diagnostic-intake, workflow, graph, policy, structured extraction, local model, evidence contract]
+keywords: [diagnostic-intake, workflow, graph, policy, structured extraction, local model, evidence contract, locale, language directive]
 related: [architecture, research-agent-workflow, sdlc-flow-workflow, sdlc-flow-policy, data-contract]
 ---
 
@@ -42,6 +42,7 @@ both the start node and the sole (terminal) node — there is no router.
 ```json
 {
   "notes": "Client call transcript: ...",
+  "locale": "pt-BR",
   "profile": "baseline"
 }
 ```
@@ -49,6 +50,7 @@ both the start node and the sole (terminal) node — there is no router.
 | Field | Notes |
 |---|---|
 | `notes` | Required. Raw diagnostic-call notes or transcript text. `IntakeExtractNode`'s prompt ports `intake.md`'s four interview groups + evidence discipline against this text. |
+| `locale` | Optional `Locale` (`"pt-BR"` \| `"en-US"`), defaults to `"pt-BR"` when omitted (`EN.4.F`). Drives the language `IntakeExtractNode` writes its prose fields in, via `crate::locale::language_directive(locale)` spliced into the per-run prompt body (never the stable system prompt). The directive governs prose only — `*_evidence` fields still hold the client's own words verbatim (see [Evidence discipline](#evidence-discipline)), and any literal contact string in the notes is reproduced exactly, never translated. Not a policy knob — it is not on `DiagnosticIntakePolicy`. |
 | `policy` | Optional per-run `PartialDiagnosticIntakePolicy` override — highest-precedence layer. |
 | `profile` | Optional. Name of a built-in or `harness.json`-defined policy profile bundle (e.g. `"baseline"`, `"local-extract"`). |
 

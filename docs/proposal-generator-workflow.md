@@ -6,7 +6,7 @@ doc_id: proposal-generator-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [proposal-generator, workflow, graph, policy, automation-roadmap, persist-to-brain, http-post, review-router]
+keywords: [proposal-generator, workflow, graph, policy, automation-roadmap, persist-to-brain, http-post, review-router, locale, rate card, firewall, investment, authored_locale]
 related: [architecture, research-agent-workflow, diagnostic-intake-workflow, sdlc-flow-policy, data-contract, D9-engine-brain-boundary]
 ---
 
@@ -80,6 +80,7 @@ including `research`, to `Local`.
   "company_name": "Acme Corp",
   "company_url": "https://acme.example",
   "diagnostic_intake": { "...": "an EN.4.B DiagnosticIntake, when a call already happened" },
+  "locale": "pt-BR",
   "profile": "local-judgment"
 }
 ```
@@ -89,6 +90,7 @@ including `research`, to `Local`.
 | `company_name` | Required. Seeds `ProposalCompanyResearchNode`'s web research and echoes into the deliverable's Section 1. |
 | `company_url` | Optional. |
 | `diagnostic_intake` | Optional `DiagnosticIntake` (re-exported from `workflows::diagnostic_intake`). When present, `OpportunityIdentifierNode` scores candidates from its `*_evidence` fields (`rubric.md §1`); when absent, it falls back to the web research brief. |
+| `locale` | Optional `Locale` (`"pt-BR"` \| `"en-US"`), defaults to `"pt-BR"` when omitted (`EN.4.F`). Selects both the language `ProposalWriterNode`/`ProposalReviseNode` write their prose in and which `RateCard` sheet prices `FirstEngagement.investment` — see [Locale and the firewalled rate card](#locale-and-the-firewalled-rate-card). A per-client attribute, not a cost/latency/quality tradeoff, so it lives here on the event schema rather than on `ProposalGeneratorPolicy` (`CLAUDE.md` rule 6). |
 | `policy` | Optional per-run `PartialProposalGeneratorPolicy` override — highest-precedence layer. |
 | `profile` | Optional name of a built-in or `harness.json`-defined policy profile bundle. |
 
@@ -105,7 +107,15 @@ Four sections, mirroring `deliverable.md §2`:
 3. **`WorkflowProfile` list** — at most `MAX_TOP_PROFILES` (3) per-workflow detail pages:
    `name`, `today`, `proposed_solution`, `stack`, `rough_scope`, `expected_roi`.
 4. **`FirstEngagement`** — `start_with` (the highest-scoring Quick Win, or the highest Core
-   Build if there is no Quick Win, per `rubric.md §4`), `phase_1_scope`.
+   Build if there is no Quick Win, per `rubric.md §4`), `phase_1_scope`, `investment` (see
+   [Locale and the firewalled rate card](#locale-and-the-firewalled-rate-card)), `how_it_works`,
+   `call_to_action`.
+
+`AutomationRoadmap` also carries `authored_locale: Locale` (`EN.4.F`) — the locale this
+roadmap's prose was actually written in, distinct from the locale a later run might request;
+`EN.4.D`'s renderer compares the two and refuses on a mismatch rather than emitting a
+mixed-language document. Defaults to `Locale::PtBr` when absent, so a pre-`EN.4.F` roadmap
+round-trips unchanged.
 
 `PriorityTier` (`schema.rs`) is derived from the composite score, not asserted by the model:
 `>= 4.0` → `QuickWin`, `2.5..=3.9` → `CoreBuild`, `< 2.5` → `Phase2`. `schema.rs` also carries
@@ -114,6 +124,50 @@ composite/sort/`≤3`-profile validators (`validate_composite_scores`,
 and `automation_roadmap_json_schema()`, set on the underlying `claude_code_rs::Config` by
 `ProposalWriterNode`/`ProposalReviseNode` the same way `research_agent`'s nodes set
 `company_brief_json_schema()`.
+
+## Locale and the firewalled rate card
+
+`EN.4.F` replaces model-authored pricing with structured config the engine — not the model —
+resolves. `FirstEngagement.investment` (`type Investment = crate::locale::MoneyRange`) is a
+`{ currency, min, max, basis }` object, never a free-text string, and `ProposalWriterNode` /
+`ProposalReviseNode` populate it deterministically:
+
+```rust
+let rate_card = RateCard::load_from(&PolicyConfigSource::Builtin)?;
+let investment = investment_for(EngagementKind::from(&roadmap), rate_card.sheet(event.locale));
+```
+
+`RateCard::sheet(locale)` is the **only** accessor — there is deliberately no method that returns
+or converts between both sheets. `RateCard::load_from` reads the `rate_card` section of
+`planning/harness.json` (see `Notes` there for the ported `business/docs/rates.md` figures and
+their provenance caveats); an absent file/section resolves to `RateCard::default()` (the same
+figures, hardcoded as a behavior-stable fallback), and a *present but malformed* section is a
+hard error rather than a silent fallback — once a human starts editing the section, this crate
+trusts it or fails loudly.
+
+**The firewall invariant.** The two sheets (`pt_br`/BRL, `en_us`/USD) are "never quoted in the
+same conversation, never cross-converted" (`business/docs/rates.md`). `crate::locale` defines
+**no** conversion between `Currency::Brl` and `Currency::Usd` anywhere — no rate constant, no
+helper function, no test — and `RateSheet::validate()` rejects a rate card whose ranges don't all
+carry their own sheet's currency. A future contributor asked to "show both currencies in one
+proposal" should look here first: the absence of a conversion path is the feature, not an
+oversight. `grep -rniE '(brl.*(to|into).*usd|usd.*(to|into).*brl|exchange_rate|convert_currency)'
+crates/` staying empty is this invariant's human-runnable check (see the spec's Validation
+Commands).
+
+**Language, not just currency.** `event.locale` also drives the language the model writes all
+prose in, via `crate::locale::language_directive(locale)` — spliced into the per-run prompt
+*body* passed to `ClaudeCodeStep`, never into `ProposalWriterNode`'s `STABLE_SYSTEM_PROMPT` (which
+stays byte-identical across locales, so provider-side prompt caching still hits regardless of
+which locale a run requests — `CLAUDE.md` rule 6's cache-breakpoint clause). The directive's
+contact carve-out is load-bearing: `EN.4.E`'s anti-fabrication contract means contacts are scraped
+literals, and a translated email address or phone number is a wrong one.
+
+`AutomationRoadmap.authored_locale` is stamped from `event.locale` **after** parsing the model's
+structured reply — deterministically overwriting whatever the model itself emitted for that
+field, mirroring how `investment` is engine-computed rather than model-authored. This closes the
+loop for `EN.4.0` telemetry: a `RunTelemetry`/`PolicyAggregate` consumer can attribute observed
+prose-language and pricing-currency cost/quality to the locale that actually caused it.
 
 ## Policy: `ProposalGeneratorPolicy`
 
@@ -170,7 +224,7 @@ for the full record. It builds
   "doc_type": "automation_roadmap",
   "section": "full",
   "content": "<plain-language summary rendered from the roadmap>",
-  "roadmap": { "...": "the full structured AutomationRoadmap" }
+  "roadmap": { "...": "the full structured AutomationRoadmap, incl. authored_locale and a structured investment (EN.4.F)" }
 }
 ```
 
