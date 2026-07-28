@@ -170,6 +170,12 @@ pub struct WorkflowProfile {
     pub expected_roi: String,
 }
 
+/// The quoted price for the recommended first engagement. Populated
+/// deterministically from `locale::RateCard` — **never authored by the
+/// model**. See EN.4.F: a model inventing prices cannot honour `rates.md`'s
+/// floors or its BRL/USD firewall.
+pub type Investment = crate::locale::MoneyRange;
+
 /// Section 4 — Recommended First Engagement (`deliverable.md §2` Section
 /// 4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,8 +186,11 @@ pub struct FirstEngagement {
     pub start_with: String,
     #[serde(default)]
     pub phase_1_scope: Vec<String>,
-    /// e.g. "R$8,000-12,000 fixed fee."
-    pub investment: String,
+    /// Populated from the rate card by `ProposalWriterNode` / `ProposalReviseNode`,
+    /// keyed on the run's locale. `None` on a partially-built roadmap, matching
+    /// how `situation`/`recommendation` are already optional.
+    #[serde(default)]
+    pub investment: Option<Investment>,
     pub how_it_works: String,
     pub call_to_action: String,
 }
@@ -199,6 +208,12 @@ pub struct AutomationRoadmap {
     #[serde(default)]
     pub top_profiles: Vec<WorkflowProfile>,
     pub recommendation: Option<FirstEngagement>,
+    /// The locale this roadmap's prose was actually written in — distinct
+    /// from the locale a later run requests. `EN.4.D`'s renderer compares the
+    /// two and refuses on a mismatch rather than emitting a mixed-language
+    /// document.
+    #[serde(default)]
+    pub authored_locale: crate::locale::Locale,
 }
 
 /// Validation error surfaced by [`validate_composite_scores`],
@@ -377,11 +392,10 @@ pub fn automation_roadmap_json_schema() -> serde_json::Value {
                 "properties": {
                     "start_with": { "type": "string" },
                     "phase_1_scope": { "type": "array", "items": { "type": "string" } },
-                    "investment": { "type": "string" },
                     "how_it_works": { "type": "string" },
                     "call_to_action": { "type": "string" },
                 },
-                "required": ["start_with", "investment", "how_it_works", "call_to_action"],
+                "required": ["start_with", "how_it_works", "call_to_action"],
             },
         },
         "required": ["situation", "candidates", "top_profiles", "recommendation"],
@@ -420,7 +434,12 @@ mod tests {
         FirstEngagement {
             start_with: "WhatsApp order tracking".to_string(),
             phase_1_scope: vec!["Order intake bot".to_string()],
-            investment: "R$8,000-12,000 fixed fee".to_string(),
+            investment: Some(Investment {
+                currency: crate::locale::Currency::Brl,
+                min: 8_000.0,
+                max: 12_000.0,
+                basis: crate::locale::EngagementBasis::Fixed,
+            }),
             how_it_works: "Connects to WhatsApp Business API.".to_string(),
             call_to_action: "Book a call to proceed.".to_string(),
         }
@@ -442,6 +461,7 @@ mod tests {
                 expected_roi: "Saves ~5 hrs/week.".to_string(),
             }],
             recommendation: Some(sample_engagement()),
+            authored_locale: Locale::default(),
         }
     }
 
@@ -593,5 +613,48 @@ mod tests {
         let json = serde_json::json!({ "company_name": "Loja da Ana", "locale": "en-GB" });
         let result: Result<ProposalGeneratorEventSchema, _> = serde_json::from_value(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn roadmap_round_trips_with_authored_locale() {
+        let mut roadmap = sample_roadmap();
+        roadmap.authored_locale = Locale::EnUs;
+        let json = serde_json::to_string(&roadmap).expect("serializes");
+        let round_tripped: AutomationRoadmap = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(round_tripped.authored_locale, Locale::EnUs);
+        assert_eq!(roadmap, round_tripped);
+    }
+
+    #[test]
+    fn roadmap_without_authored_locale_defaults_to_pt_br() {
+        let json = serde_json::json!({
+            "situation": null,
+            "candidates": [],
+            "top_profiles": [],
+            "recommendation": null,
+        });
+        let roadmap: AutomationRoadmap = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(roadmap.authored_locale, Locale::PtBr);
+    }
+
+    #[test]
+    fn json_schema_no_longer_describes_investment() {
+        let schema = automation_roadmap_json_schema();
+        let recommendation_properties = &schema["properties"]["recommendation"]["properties"];
+        assert!(
+            recommendation_properties
+                .as_object()
+                .expect("properties is an object")
+                .get("investment")
+                .is_none(),
+            "recommendation.properties must not describe investment"
+        );
+        let required = schema["properties"]["recommendation"]["required"]
+            .as_array()
+            .expect("required is an array");
+        assert!(
+            !required.iter().any(|v| v == "investment"),
+            "recommendation.required must not list investment"
+        );
     }
 }
