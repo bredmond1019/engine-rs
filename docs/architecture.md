@@ -6,7 +6,7 @@ doc_id: architecture
 layer: [engine, console]
 project: engine-rs
 status: active
-keywords: [architecture, module map, core types, data flow, Rust, workflow runtime]
+keywords: [architecture, module map, core types, data flow, Rust, workflow runtime, locale, rate card]
 related: [docs-index, context, master-plan]
 ---
 
@@ -73,7 +73,10 @@ engine-rs/
                          `ctx.event`, EN.7.B task 3), brain_root.rs (`resolve_brain_root`/
                          `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
                          `mev::brain::config::find_brain_root` walking up from cwd for
-                         `brain.toml`, typed `BrainRootError`, EN.7.A task 2)
+                         `brain.toml`, typed `BrainRootError`, EN.7.A task 2), locale.rs —
+                         `Locale`/`Currency`/`MoneyRange`/`RateSheet`/`RateCard`, the two-sheet,
+                         firewalled rate card + language directive threaded through the
+                         diagnostic funnel's event schemas, EN.4.F)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -268,6 +271,28 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   satisfied); the increment node is the cluster's only state-mutating member, and is itself a
   `Router` (unconditionally routing to `body_entry`) purely so the back-edge is a runtime router
   edge — `WorkflowValidator`'s DFS cycle check skips both hops, per D42.
+- `Locale` / `Currency` / `MoneyRange` / `RateSheet` / `RateCard` (`engine-core::locale`,
+  `EN.4.F`) — a client's market segmentation, threaded through the diagnostic funnel's event
+  schemas (`ResearchAgentEventSchema`, `DiagnosticIntakeEventSchema`,
+  `ProposalGeneratorEventSchema`) as a `#[serde(default)]` field, `Locale::PtBr` by default.
+  `Locale::currency()` is a total, infallible mapping to which of `business/docs/rates.md`'s two
+  rate sheets applies; `Locale::language_name()`/`language_directive(locale)` produce the
+  per-run prompt-body fragment a model node splices in (never into a `STABLE_SYSTEM_PROMPT` —
+  `CLAUDE.md` rule 6's cache-breakpoint clause) to select the language its prose is written in,
+  with an explicit carve-out never to translate a literal contact string. `RateCard::sheet(locale)`
+  is the only accessor onto a `RateSheet`'s `MoneyRange`s (`diagnostic`/`project`/`retainer`) and
+  `hourly_floor`; `RateCard::load_from(&PolicyConfigSource)` reads the `rate_card` section of
+  `harness.json`, falling back to the ported `business/docs/rates.md` figures
+  (`RateCard::default()`) when the section is absent, and hard-erroring — never silently
+  defaulting — on a malformed or currency-mismatched section (`RateSheet::validate`). **The
+  firewall invariant**: this module defines no conversion between `Currency::Brl` and
+  `Currency::Usd` anywhere — no rate constant, no helper, no test — matching `rates.md`'s "never
+  quoted in the same conversation, never cross-converted" rule; see
+  [proposal-generator-workflow.md § Locale and the firewalled rate card](proposal-generator-workflow.md#locale-and-the-firewalled-rate-card)
+  for how `ProposalWriterNode`/`ProposalReviseNode` consume it to populate
+  `FirstEngagement.investment` deterministically instead of letting the model author a price.
+  `Locale` is a per-client attribute, not a cost/latency/quality tradeoff, so it is deliberately
+  **not** a knob on any workflow's `Policy` struct or named profile bundle.
 - `Dispatcher` (`engine-core::dispatch`, re-exported from `engine-serve::dispatch` as of EN.5.E
   task 3) — dual-registry (`workflow_registry` + `schema_registry`)
   lookup keyed by `workflow_type`; `register` takes a boxed `WorkflowFactory` closure. As of
