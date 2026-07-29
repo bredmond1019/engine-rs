@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-29T04:00:00Z"
+timestamp: "2026-07-29T05:00:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,40 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-29]
+
+### `EN.6.E-research-ingress-dispatch` — self-feeding RESEARCH_AGENT → CONTENT_PIPELINE dispatch, review-fixed, docs patched
+- **What:** Ran `/sdlc-task EN.6.E-research-ingress-dispatch` in place on `main` (no worktree/
+  branch). All 7 tasks passed (task 3 needed one triage→fix cycle). Added
+  `ResearchIngressDispatchNode` as the new terminal `RESEARCH_AGENT` node — gated by a default-off
+  `ingress_dispatch` policy knob, it wraps a finished run's research output as an
+  `IngressEnvelope` and sends a `TriggerWorkflow{CONTENT_PIPELINE}` action over the existing
+  `ChannelTransport` egress seam (`EN.6.A`), with a deterministic `envelope_id` and propagated
+  `chain_depth`. `/code-review med --fix` then surfaced 6 findings but did not actually apply any
+  of them (verified via a clean `git status`); fixed 4 by hand: (1)
+  `ingress_dispatch.rs:175` — a materialize that legitimately planned zero actions now soft-skips
+  instead of hard-failing the run via `?`; (2) `engine-serve/src/workflows.rs:102` —
+  `register_research_agent` now rewires the node's transport to `ENGINE_EVENTS_URL`, mirroring
+  `register_content_pipeline`'s `ActionDispatchNode` override (previously hardcoded to
+  `localhost:8080` in any deployment); (3) `resolve_dispatch` now propagates a corrupted/
+  unparsable resolved-policy stamp instead of silently falling back, matching
+  `CompanyResearchNode`/`ProspectingResearchNode`; (4) extracted `DEFAULT_EVENTS_URL` +
+  `receipt_from_send_result` into `channel_transport.rs`, shared by `ActionDispatchNode` and the
+  new node instead of duplicated. Deliberately left two findings unfixed — `thorough()` enabling
+  `ingress_dispatch` and `registry_for_policy`'s registry-then-override pattern — both are the
+  task's own intentional, test-covered design, not bugs. Added 3 new tests for the two behavioral
+  fixes. `/close-out --no-review` then ran the full validation suite (fmt/clippy/`nextest
+  --workspace` 1258 tests/`build --release`, all green), found no blocking coverage gaps, and
+  `/update-docs --patch` updated `docs/research-agent-workflow.md` (new "Self-feeding dispatch"
+  section, six-node graph shape, policy/profile tables) plus stale terminal-node references in
+  `docs/index.md`/`docs/architecture.md`/`docs/content-pipeline-workflow.md`.
+- **Why:** `EN.6.E` closes the omni-channel Phase 6 self-feeding loop — a `RESEARCH_AGENT` run can
+  now automatically chain into `CONTENT_PIPELINE` at the `thorough` quality tier, without a human
+  manually re-triggering content generation off research output. The review-fix pass matters
+  because `--fix` silently not applying its own findings would otherwise have shipped a hard
+  run-failure bug (soft-skip case) and a wrong-URL production bug (missing `ENGINE_EVENTS_URL`
+  wiring) straight to `main`.
+- **Refs:** `planning/EN.6.E-research-ingress-dispatch/tasks.md`; `docs/research-agent-workflow.md`
+  § Self-feeding dispatch; commits `10c349a`..`be167c2`.
 
 ### `EN.7.C-materialize-harvest-gate` — the materialize→harvest gate; Phase 7 complete
 - **What:** Ran `/sdlc-flow` for `EN.7.C-materialize-harvest-gate` on branch
