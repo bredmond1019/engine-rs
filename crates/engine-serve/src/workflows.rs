@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_schema_terminates_in_merge_contacts_node_with_no_outgoing_edges() {
+    fn resolve_schema_terminates_in_research_ingress_dispatch_node_with_no_outgoing_edges() {
         let mut dispatcher = Dispatcher::new();
         register_research_agent(&mut dispatcher);
 
@@ -503,11 +503,11 @@ mod tests {
 
         let config = schema
             .nodes
-            .get("MergeContactsNode")
-            .expect("schema should declare 'MergeContactsNode'");
+            .get("ResearchIngressDispatchNode")
+            .expect("schema should declare 'ResearchIngressDispatchNode'");
         assert!(
             config.connections.is_empty(),
-            "MergeContactsNode should have no outgoing edges"
+            "ResearchIngressDispatchNode should have no outgoing edges"
         );
     }
 
