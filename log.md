@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-29T01:05:00Z"
+timestamp: "2026-07-29T04:00:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,43 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [run: 2026-07-29]
+
+### Traced the per-task/review test-relink slowdown to base-template; wrote its fix as a ticket there; applied a local link-time mitigation here
+- **What:** `/prime` surfaced the still-open `EN.7.D` review/PR handoff plus carryover
+  `harness-per-task-relinks-all-test-binaries`. Reviewed that carryover in depth against the real
+  code (`sdlc-flow.js`/`sdlc-task.js`'s duplicated `renderCheckList`, `harness.schema.json`) and
+  confirmed the root cause: `testDepth: "fast"` filters to `gates: true` checks, not to a cheap
+  subset, and `engine-core`'s 25 integration-test binaries each relink the whole crate regardless
+  of whether `cargo test` is filtered. The user then reported the *same* slowdown hit an ad hoc
+  `cargo test engine-core` during an earlier review session — confirming a package-scoped filtered
+  invocation still builds every target before filtering, so the review tool's own verification
+  step pays the same cost the SDLC per-task loop does. Wrote and registered a ticket in
+  `base-template` (`planning/ticket-per-task-fast-checks/{tasks.md,tasks.json}`,
+  `BT.ticket.per-task-fast-checks`, wave 26): optional `perTask`/`fastCommand` fields on the check
+  schema (default-preserving), wired through both engines' `renderCheckList` + harness-config
+  loader, plus a default `"perTask": false"` on the Rust/Next.js `build` checks in
+  `harness.examples.md` so new projects get the safe win for free. That ticket is now running via
+  `/sdlc-task` in `base-template`, independently of this repo. In parallel, applied a local,
+  base-template-independent mitigation: `[profile.dev]` in the workspace root `Cargo.toml`
+  (`debug = "line-tables-only"` + `split-debuginfo = "unpacked"`), which cuts per-binary link cost
+  for any `cargo test` invocation (the `test` profile inherits `dev`) regardless of command shape,
+  without touching `cargo build --release` or `harness.json`.
+- **Why:** The `EN.7.D` review that should have taken minutes took roughly an hour across two
+  separate attempts (the earlier `/sdlc-flow` run and, per the user, an ad hoc review-time
+  `cargo test engine-core`), and this project's test suite will only keep growing — this needed a
+  real fix, not a one-off workaround, and the fix belongs in `base-template` since every downstream
+  project using this harness will eventually hit the same wall as its own suite grows.
+- **Refs:** `base-template/planning/ticket-per-task-fast-checks/tasks.md`, carryover
+  `harness-per-task-relinks-all-test-binaries` (updated, now points at the real ticket).
+- **Verdict:** Ticket written and running in `base-template`; `Cargo.toml` change applied locally,
+  uncommitted. `EN.7.D`'s review/PR is still the open item — untouched this session.
+- **Next:** Finish the `EN.7.D` code review and open its PR; decide whether the `Cargo.toml` change
+  rides in that PR or its own; once `BT.ticket.per-task-fast-checks` lands, sync it down and edit
+  this repo's `planning/harness.json` (`test.fastCommand` + `build.perTask: false`).
 
 ---
 
