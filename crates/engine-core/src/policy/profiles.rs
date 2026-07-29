@@ -240,18 +240,21 @@ pub fn resolve_profile<P: DeserializeOwned>(
 mod tests {
     use super::*;
     use serde::Deserialize;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
+    /// Each call yields a directory unique across the whole filesystem, not
+    /// merely within this process. `nextest` runs every test in its own OS
+    /// process, so a pid-plus-counter scheme (the original approach here)
+    /// resets its counter to 0 per test and collides whenever the OS reuses a
+    /// pid for a new short-lived test process before the prior test's
+    /// (never-cleaned-up) directory of the same name is gone — a stale
+    /// `planning/harness.json` from an unrelated test then gets read by this
+    /// one. `tempfile::Builder` mints a randomized suffix, so no two calls
+    /// (in this process or any other) can land on the same path.
     fn temp_dir() -> std::path::PathBuf {
-        let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "engine-core-policy-profiles-test-{}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        tempfile::Builder::new()
+            .prefix("engine-core-policy-profiles-test-")
+            .tempdir()
+            .expect("create temp dir")
+            .keep()
     }
 
     #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
