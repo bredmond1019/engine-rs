@@ -7,7 +7,7 @@ layer: [engine, factory]
 project: engine-rs
 status: active
 keywords: [materialize-doc-node, doc-materializer, mev, okf-core, brain-root, opportunity, learning-artifact, proposal, dry-run, D53, merge-contacts, opportunity-edit]
-related: [architecture, docs-index, content-pipeline-workflow, proposal-generator-workflow, D53-engine-executes-mev-writes-brain-docs, research-agent-workflow, opportunity-edit-workflows]
+related: [architecture, docs-index, content-pipeline-workflow, proposal-generator-workflow, D53-engine-executes-mev-writes-brain-docs, research-agent-workflow, opportunity-edit-workflows, harvest-gate]
 ---
 
 # MaterializeDocNode and the `DocMaterializer` Seam
@@ -265,3 +265,16 @@ node identity and one seam.
 The `with_enabled` no-op path is the one addition `EN.7.D` made *to the node itself*, and it is
 deliberately generic: a knob any workflow can use, not a content-pipeline concept leaking into a
 shared node.
+
+## See also — the downstream harvest gate
+
+`EN.7.C` adds a materialize-\>harvest gate (`crate::nodes::harvest_gate::HarvestGate`) immediately
+downstream of this node in `CONTENT_PIPELINE`: `MaterializeDocNode`'s write behavior is unchanged
+by the gate — the `.md` is written identically regardless of harvest mode — but what happens to
+the finished artifact afterward (an explicit Synapse ingest POST, none, or a deferred
+human-approval hand-off) is now gate-governed. `MaterializeDocNode`'s `with_enabled` in-place
+no-op is the pattern that gate's own `off` mode follows: the node/hop stays present, the run
+continues, and a stable key set is stamped either way. See
+[harvest-gate.md](harvest-gate.md) for the full gate, and
+[content-pipeline-workflow.md](content-pipeline-workflow.md#the-enginebrain-persist-boundary) for
+`PersistToBrainNode`, the gate's execution site.

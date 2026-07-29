@@ -278,13 +278,31 @@ silently didn't is worse than a run that stops. To turn the behavior off, turn i
 ```
 
 `language` is the event's `target_lang` when `translated_markdown` is present on the output,
-`"en"` otherwise (the digest was never translated, so it's still in its original language). It
-awaits an injectable `crate::nodes::http_post::HttpPost` seam (an `async_trait` object, `Arc<dyn
-HttpPost>` — production code uses the `reqwest`-backed `http_post_live`; the gated `cargo test`
-suite injects a stub that records the last `(url, payload)` pair, so no live network call happens
-in tests) to POST the payload. Non-2xx responses (or a transport failure) surface as a
-`NodeError` — there is no fallback target for a failed brain push. On success it stamps
-`{"posted": true, "status", "artifact_id", "response"}` onto `ctx`.
+`"en"` otherwise (the digest was never translated, so it's still in its original language). The
+payload is built first and unconditionally, in every harvest mode.
+
+**`EN.7.C`: gate-governed, not unconditional.** `PersistToBrainNode` no longer always pushes.
+It resolves a `crate::nodes::harvest_gate::HarvestGate` (see [harvest-gate.md](harvest-gate.md))
+from `ContentPipelinePolicy.harvest` and branches:
+
+- `off` (**built-in default**) — no POST. Indexing is left to the existing manifest /
+  `index_brain` freshness reindex.
+- `in_process` — POST synchronously, in-run, over the injectable
+  `crate::nodes::http_post::HttpPost` seam (an `async_trait` object, `Arc<dyn HttpPost>` —
+  production code uses the `reqwest`-backed `http_post_live`; the gated `cargo test` suite
+  injects a stub that records the last `(url, payload)` pair, so no live network call happens in
+  tests). This is the pre-`EN.7.C` behavior. Non-2xx responses (or a transport failure) surface
+  as a `NodeError` — there is no fallback target for a failed brain push.
+- `approval` — no POST in-run. A `pending` record (`{artifact_id, url, payload, doc_paths}`) is
+  stamped instead, completed later by the `HARVEST_APPROVE` micro-workflow, which POSTs the exact
+  same payload to the same URL.
+
+`process` stamps one stable key set in every mode:
+`{"posted", "skipped", "harvest_mode", "status", "artifact_id", "response", "pending"}`, with
+`status`/`response`/`pending` `null` where they do not apply. See
+[harvest-gate.md](harvest-gate.md) for the full mode table, the four-layer resolution, the named
+profiles (including the new `curated-harvest`, which resolves `in_process`), and the
+`HARVEST_APPROVE` hand-off.
 
 **Not yet wired to a real endpoint.** `PersistToBrainNode::new()` currently POSTs to a hardcoded
 placeholder `BRAIN_INGEST_URL` constant (`http://localhost:8000/ingest/learning`) —
@@ -364,8 +382,9 @@ schema above.
 - **`ctx.nodes["DigestRenderNode"]`** — the assembled `ContentPipelineOutput`
   (`artifact_id`, `source_channel`, `summary`, `entities`, `digest_markdown`, `digest_html`,
   `translated_markdown`).
-- **`ctx.nodes["PersistToBrainNode"]`** — `{"posted": true, "status", "artifact_id",
-  "response"}`, the brain-push result.
+- **`ctx.nodes["PersistToBrainNode"]`** — `{"posted", "skipped", "harvest_mode", "status",
+  "artifact_id", "response", "pending"}`, the harvest-gate-governed brain-push result (see
+  [harvest-gate.md](harvest-gate.md)).
 - **`ctx.nodes["ActionDispatchNode"]`** — `{"dispatched": [{envelope_id, channel_type,
   reply_context, body, receipt}]}`, one entry per `OutboundAction` sent (reply digest and/or
   chain trigger), each stamped with the run's `envelope_id`.
