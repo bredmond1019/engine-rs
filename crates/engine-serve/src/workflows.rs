@@ -309,10 +309,34 @@ pub fn register_opportunity_add_action(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `HARVEST_APPROVE` workflow
+/// (`engine_core::workflows::harvest_approve::graph`) with `dispatcher`,
+/// populating both the `workflow_registry` and the `schema_registry`. See
+/// `planning/EN.7.C-materialize-harvest-gate/tasks.md`, Task 7.
+///
+/// A **third model-free workflow** registered in this module, alongside
+/// [`register_opportunity_set_stage`] / [`register_opportunity_add_action`]:
+/// `HarvestApproveNode` calls no model and reads no `harness.json` section
+/// (see `harvest_approve::graph`'s module doc), so this factory resolves no
+/// policy and seeds no policy stamp — there is no `resolve_policy_for_run_from`
+/// call and no `seed_resolved_policy` call. Do not "restore" that hop; it
+/// was never dropped, it was never needed.
+pub fn register_harvest_approve(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::harvest_approve::graph::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::harvest_approve::graph::registry(),
+                engine_core::workflows::harvest_approve::graph::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
-/// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, and `OPPORTUNITY_ADD_ACTION`;
-/// future builtins register here too.
+/// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`, and
+/// `HARVEST_APPROVE`; future builtins register here too.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_sdlc_flow(dispatcher);
     register_research_agent(dispatcher);
@@ -321,6 +345,7 @@ pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_content_pipeline(dispatcher);
     register_opportunity_set_stage(dispatcher);
     register_opportunity_add_action(dispatcher);
+    register_harvest_approve(dispatcher);
 }
 
 #[cfg(test)]
@@ -914,6 +939,79 @@ mod tests {
             "CONTENT_PIPELINE",
             "OPPORTUNITY_SET_STAGE",
             "OPPORTUNITY_ADD_ACTION",
+        ] {
+            assert!(
+                dispatcher.is_registered(workflow_type),
+                "expected {workflow_type} to be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn register_harvest_approve_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_harvest_approve(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("HARVEST_APPROVE"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_harvest_approve_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_harvest_approve(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("HARVEST_APPROVE")
+            .expect("HARVEST_APPROVE schema should resolve");
+
+        assert_eq!(schema.start_node, "HarvestApproveNode");
+    }
+
+    #[test]
+    fn dispatch_harvest_approve_builds_a_runnable_workflow_with_no_policy_stamp() {
+        let mut dispatcher = Dispatcher::new();
+        register_harvest_approve(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "HARVEST_APPROVE",
+                &serde_json::json!({
+                    "artifact_id": "artifact-1",
+                    "url": "https://brain.example/ingest/learning",
+                    "payload": {"artifact_id": "artifact-1"},
+                    "doc_paths": ["brain/content/learning/artifact-1.md"],
+                }),
+            )
+            .expect("HARVEST_APPROVE should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_harvest_approve() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("HARVEST_APPROVE"));
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_all_eight_workflow_types() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        for workflow_type in [
+            "SDLC_FLOW",
+            "RESEARCH_AGENT",
+            "DIAGNOSTIC_INTAKE",
+            "PROPOSAL_GENERATOR",
+            "CONTENT_PIPELINE",
+            "OPPORTUNITY_SET_STAGE",
+            "OPPORTUNITY_ADD_ACTION",
+            "HARVEST_APPROVE",
         ] {
             assert!(
                 dispatcher.is_registered(workflow_type),
