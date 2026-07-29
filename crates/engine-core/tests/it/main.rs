@@ -32,6 +32,7 @@ mod policy_framework;
 mod proposal_generator_e2e;
 mod research_agent_contacts_e2e;
 mod research_agent_e2e;
+mod research_ingress_dispatch_e2e;
 mod sdlc_flow_e2e;
 mod sdlc_flow_experiment;
 mod sdlc_flow_live;
