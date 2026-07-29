@@ -22,6 +22,7 @@ mod composition;
 mod content_pipeline_e2e;
 mod content_pipeline_materialize_e2e;
 mod diagnostic_intake_e2e;
+mod harvest_gate_e2e;
 mod locale_rate_card;
 mod materialize_doc;
 mod opportunity_loop_e2e;
