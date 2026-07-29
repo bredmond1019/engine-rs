@@ -452,6 +452,39 @@ async fn materialization_runs_before_the_synapse_push() {
 }
 
 #[tokio::test]
+async fn a_first_ever_write_creates_the_missing_corpus_subtree() {
+    // Regression: `mev::brain::emit::apply_plan` calls `std::fs::write`
+    // directly and never creates directories, so a first-ever write into a
+    // brain root with no `docs/content/learning-corpus/` used to fail with
+    // `E_EMIT_WRITE_FAILED` and halt the run. The real corpus does NOT have
+    // that directory yet, so this is the production path, not an edge case.
+    //
+    // Deliberately does NOT call `learning_corpus_dir` — the whole point is
+    // that the target subtree is absent. Every other test here pre-creates
+    // it (mirroring `opportunity_loop_e2e.rs`), which is exactly what
+    // masked this.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    assert!(!tmp.path().join("docs/content/learning-corpus").exists());
+
+    let ctx = run_at(
+        tmp.path(),
+        &ContentPipelinePolicy::default(),
+        web_article_event("env-missing-subtree"),
+    )
+    .await;
+
+    assert_eq!(
+        ctx.node_runs["MaterializeDocNode"].status,
+        NodeRunStatus::Success,
+        "a missing corpus subtree must not fail the run"
+    );
+    assert_eq!(ctx.nodes["MaterializeDocNode"]["materialized"], json!(true));
+
+    let path = written_path(&ctx);
+    assert!(path.exists(), "expected {path:?} to have been created");
+}
+
+#[tokio::test]
 async fn the_same_node_and_seam_serve_both_doc_kinds() {
     // The generality claim, asserted mechanically: constructing the writer
     // for the opportunity model and for the learning-artifact model differs

@@ -53,12 +53,29 @@ impl Default for MaterializeConfig {
     }
 }
 
+/// Deserialize a nested `Option<Option<T>>` so an explicit JSON `null`
+/// survives as `Some(None)` ("override to unset") rather than collapsing
+/// into `None` ("not overridden"), which is what serde's stock `Option`
+/// impl would do. Paired with `#[serde(default)]` on the struct, an
+/// *absent* key still deserializes to `None`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// All-optional mirror of [`MaterializeConfig`] for per-field overrides
 /// across the four resolution layers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialMaterializeConfig {
     pub enabled: Option<bool>,
+    /// `None` = not overridden; `Some(None)` = override to "resolve at run
+    /// time"; `Some(Some(path))` = pin this root. An explicit JSON `null`
+    /// deserializes to `Some(None)` — see [`double_option`].
+    #[serde(deserialize_with = "double_option")]
     pub corpus_root: Option<Option<String>>,
     pub write: Option<bool>,
 }
