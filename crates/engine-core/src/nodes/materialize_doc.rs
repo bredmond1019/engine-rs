@@ -16,12 +16,21 @@
 //! [`crate::brain_root::resolve_brain_root`] (which itself honours
 //! `ENGINE_BRAIN_ROOT` before walking up from cwd for `brain.toml`).
 //!
-//! Result stamp: `process` writes `{"materialized", "dry_run", "model",
-//! "paths", "warnings"}` onto `ctx.nodes[self.name()]` — deliberately
+//! Result stamp: `process` writes `{"materialized", "skipped", "dry_run",
+//! "model", "paths", "warnings"}` onto `ctx.nodes[self.name()]` — deliberately
 //! `self.name()` rather than the bare `NODE_NAME` const, so a node wrapped in
 //! `EN.5.E`'s `NodeExt::with_identity` lands its result under its own
 //! override identity and two instances can co-exist in one graph without
 //! colliding (exactly what `EN.7.B` needs).
+//!
+//! Enable/disable (`EN.7.D` task 1): [`MaterializeDocNode::with_enabled`]
+//! defaults to `true` (every existing caller unaffected). When disabled,
+//! `process` short-circuits before resolving the brain root or reading the
+//! input artifact — nothing touches disk, the seam is never called, and an
+//! unresolvable brain root raises no error — and stamps
+//! `{"materialized": false, "skipped": true, ...}`, keeping the same key set
+//! as an enabled run (`skipped: false` there) so consumers read one stable
+//! shape.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +58,7 @@ pub struct MaterializeDocNode {
     brain_root: Option<PathBuf>,
     source_nodes: Vec<String>,
     write: bool,
+    enabled: bool,
 }
 
 impl MaterializeDocNode {
@@ -64,6 +74,7 @@ impl MaterializeDocNode {
             brain_root: None,
             source_nodes: Vec::new(),
             write: true,
+            enabled: true,
         }
     }
 
@@ -116,6 +127,18 @@ impl MaterializeDocNode {
         self
     }
 
+    /// Enable/disable the node (default `true`, so every existing caller —
+    /// `RESEARCH_AGENT`'s live instance included — is byte-for-byte
+    /// unaffected). When `false`, `process` short-circuits before resolving
+    /// the brain root or reading the input artifact: nothing touches disk,
+    /// the seam is never called, and no error is raised even when the brain
+    /// root would otherwise be unresolvable.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
     /// Resolve the input artifact: the first configured `source_nodes`
     /// identity present in `ctx.nodes` wins (first-listed preference), or
     /// `ctx.event` when no source nodes are configured. When a preference
@@ -158,6 +181,23 @@ impl MaterializeDocNode {
 #[async_trait::async_trait]
 impl Node for MaterializeDocNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        if !self.enabled {
+            let mut ctx = ctx;
+            put_result(
+                &mut ctx,
+                self.name(),
+                json!({
+                    "materialized": false,
+                    "skipped": true,
+                    "dry_run": !self.write,
+                    "model": self.model,
+                    "paths": Vec::<Value>::new(),
+                    "warnings": Vec::<Value>::new(),
+                }),
+            );
+            return Ok(ctx);
+        }
+
         let root = self.resolve_root()?;
         let input = self.read_input(&ctx)?.clone();
 
@@ -193,6 +233,7 @@ impl Node for MaterializeDocNode {
             self.name(),
             json!({
                 "materialized": outcome.wrote,
+                "skipped": false,
                 "dry_run": !self.write,
                 "model": self.model,
                 "paths": paths,
@@ -412,10 +453,78 @@ mod tests {
 
         let result = &ctx.nodes[NODE_NAME];
         assert_eq!(result["materialized"], json!(true));
+        assert_eq!(result["skipped"], json!(false));
         assert_eq!(result["dry_run"], json!(false));
         assert_eq!(result["model"], json!("opportunity"));
         assert_eq!(result["paths"], json!(["/tmp/brain/opportunities/acme.md"]));
         assert_eq!(result["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn disabled_node_never_calls_the_seam_and_stamps_the_skip() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub.clone()))
+            .with_brain_root("/tmp/brain")
+            .with_enabled(false);
+
+        let ctx = empty_ctx(json!({}));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        assert!(
+            stub.last_call().is_none(),
+            "disabled node must never call the seam"
+        );
+
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["materialized"], json!(false));
+        assert_eq!(result["skipped"], json!(true));
+        assert_eq!(result["dry_run"], json!(false));
+        assert_eq!(result["model"], json!("opportunity"));
+        assert_eq!(result["paths"], json!([]));
+        assert_eq!(result["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn disabled_node_succeeds_even_with_an_unresolvable_brain_root() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        // No `with_brain_root` set, so an enabled run would fall through to
+        // `resolve_brain_root()` — which may fail depending on cwd/env. The
+        // disabled path must succeed regardless, since it never resolves
+        // the root at all.
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub.clone()))
+            .with_enabled(false);
+
+        let ctx = empty_ctx(json!({}));
+        let ctx = node
+            .process(ctx)
+            .await
+            .expect("disabled process should always succeed");
+
+        assert!(stub.last_call().is_none());
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["skipped"], json!(true));
+        assert_eq!(result["materialized"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn with_enabled_defaults_to_true_and_leaves_enabled_behavior_unchanged() {
+        let stub = StubDocMaterializer::succeeding(success_outcome());
+        let node = MaterializeDocNode::new("opportunity")
+            .with_materializer(Arc::new(stub.clone()))
+            .with_brain_root("/tmp/brain");
+
+        let ctx = empty_ctx(json!({}));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        assert!(
+            stub.last_call().is_some(),
+            "enabled node must call the seam"
+        );
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["skipped"], json!(false));
+        assert_eq!(result["materialized"], json!(true));
     }
 
     #[tokio::test]

@@ -67,7 +67,11 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::{EventsRow, NodeRunStatus, TaskContext};
 use engine_core::node::NodeRegistry;
 use engine_core::nodes::channel_transport::StubChannelTransport;
+use engine_core::nodes::doc_materializer::{
+    MaterializeOutcome, MaterializedFile, StubDocMaterializer,
+};
 use engine_core::nodes::http_post::StubHttpPost;
+use engine_core::nodes::materialize_doc::MaterializeDocNode;
 use engine_core::policy::{self, PolicyConfigSource};
 use engine_core::workflow::Workflow;
 use engine_core::workflows::content_pipeline::action_dispatch::ActionDispatchNode;
@@ -81,6 +85,7 @@ use engine_core::workflows::content_pipeline::fetch_transcript::{
 };
 use engine_core::workflows::content_pipeline::graph;
 use engine_core::workflows::content_pipeline::increment_critic_iteration::IncrementCriticIterationNode;
+use engine_core::workflows::content_pipeline::learning_artifact::LearningArtifactPayloadNode;
 use engine_core::workflows::content_pipeline::normalize_channel_content::NormalizeChannelContentNode;
 use engine_core::workflows::content_pipeline::persist_to_brain::PersistToBrainNode;
 use engine_core::workflows::content_pipeline::policy::{ContentPipelinePolicy, ModelTier};
@@ -291,6 +296,10 @@ struct Stubs {
     revise: ModelTransport,
     translate: ModelTransport,
     http_post: StubHttpPost,
+    /// `EN.7.D`'s materialize seam. Stubbed here so this EN.5.A fixture
+    /// stays disk-free; the real `MevDocMaterializer` against a tempdir
+    /// corpus is exercised by `content_pipeline_materialize_e2e.rs`.
+    materializer: StubDocMaterializer,
 }
 
 impl Stubs {
@@ -311,6 +320,14 @@ impl Stubs {
             revise: stub_transport_returning(revised_summary_json()),
             translate: stub_transport_returning(translated_json()),
             http_post: StubHttpPost::succeeding(json!({"ok": true})),
+            materializer: StubDocMaterializer::succeeding(MaterializeOutcome {
+                wrote: true,
+                planned: vec![MaterializedFile {
+                    path: PathBuf::from("/tmp/brain/learning/artifact.md"),
+                    note: "created".to_string(),
+                }],
+                diagnostics: vec![],
+            }),
         }
     }
 }
@@ -344,6 +361,16 @@ fn build_registry(stubs: &Stubs) -> NodeRegistry {
         TranslateNode::new().with_transport(stubs.translate.clone()),
     ));
     registry.register(Box::new(DigestRenderNode));
+    // `EN.7.D`'s materialize tail — the digest is written to the corpus
+    // before the Synapse push. Stubbed seam, so this suite never touches
+    // disk; a pinned brain root keeps `resolve_brain_root` out of the run.
+    registry.register(Box::new(LearningArtifactPayloadNode));
+    registry.register(Box::new(
+        MaterializeDocNode::new("learning-artifact")
+            .with_source_node("LearningArtifactPayloadNode")
+            .with_materializer(Arc::new(stubs.materializer.clone()))
+            .with_brain_root("/tmp/brain"),
+    ));
     registry.register(Box::new(
         PersistToBrainNode::new()
             .with_http_post(Arc::new(stubs.http_post.clone()))

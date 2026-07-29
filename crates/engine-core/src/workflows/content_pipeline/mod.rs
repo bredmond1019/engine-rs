@@ -55,6 +55,7 @@ pub mod fetch_article;
 pub mod fetch_transcript;
 pub mod graph;
 pub mod increment_critic_iteration;
+pub mod learning_artifact;
 pub mod normalize_channel_content;
 pub mod persist_to_brain;
 pub mod policy;

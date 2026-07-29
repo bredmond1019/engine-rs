@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-27T19:40:09Z"
+timestamp: "2026-07-29T04:00:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -16,7 +16,54 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-29]
+
+### Traced the per-task/review test-relink slowdown to base-template; wrote its fix as a ticket there; applied a local link-time mitigation here
+- **What:** `/prime` surfaced the still-open `EN.7.D` review/PR handoff plus carryover
+  `harness-per-task-relinks-all-test-binaries`. Reviewed that carryover in depth against the real
+  code (`sdlc-flow.js`/`sdlc-task.js`'s duplicated `renderCheckList`, `harness.schema.json`) and
+  confirmed the root cause: `testDepth: "fast"` filters to `gates: true` checks, not to a cheap
+  subset, and `engine-core`'s 25 integration-test binaries each relink the whole crate regardless
+  of whether `cargo test` is filtered. The user then reported the *same* slowdown hit an ad hoc
+  `cargo test engine-core` during an earlier review session — confirming a package-scoped filtered
+  invocation still builds every target before filtering, so the review tool's own verification
+  step pays the same cost the SDLC per-task loop does. Wrote and registered a ticket in
+  `base-template` (`planning/ticket-per-task-fast-checks/{tasks.md,tasks.json}`,
+  `BT.ticket.per-task-fast-checks`, wave 26): optional `perTask`/`fastCommand` fields on the check
+  schema (default-preserving), wired through both engines' `renderCheckList` + harness-config
+  loader, plus a default `"perTask": false"` on the Rust/Next.js `build` checks in
+  `harness.examples.md` so new projects get the safe win for free. That ticket is now running via
+  `/sdlc-task` in `base-template`, independently of this repo. In parallel, applied a local,
+  base-template-independent mitigation: `[profile.dev]` in the workspace root `Cargo.toml`
+  (`debug = "line-tables-only"` + `split-debuginfo = "unpacked"`), which cuts per-binary link cost
+  for any `cargo test` invocation (the `test` profile inherits `dev`) regardless of command shape,
+  without touching `cargo build --release` or `harness.json`.
+- **Why:** The `EN.7.D` review that should have taken minutes took roughly an hour across two
+  separate attempts (the earlier `/sdlc-flow` run and, per the user, an ad hoc review-time
+  `cargo test engine-core`), and this project's test suite will only keep growing — this needed a
+  real fix, not a one-off workaround, and the fix belongs in `base-template` since every downstream
+  project using this harness will eventually hit the same wall as its own suite grows.
+- **Refs:** `base-template/planning/ticket-per-task-fast-checks/tasks.md`, carryover
+  `harness-per-task-relinks-all-test-binaries` (updated, now points at the real ticket).
+- **Verdict:** Ticket written and running in `base-template`; `Cargo.toml` change applied locally,
+  uncommitted. `EN.7.D`'s review/PR is still the open item — untouched this session.
+- **Next:** Finish the `EN.7.D` code review and open its PR; decide whether the `Cargo.toml` change
+  rides in that PR or its own; once `BT.ticket.per-task-fast-checks` lands, sync it down and edit
+  this repo's `planning/harness.json` (`test.fastCommand` + `build.perTask: false`).
+
+---
+
 ## [run: 2026-07-28]
+
+### `EN.7.D` implemented inline after the sdlc-flow proved too slow — learning-artifact materialization, plus a masked production bug
+- **What:** Authored the `EN.7.D` spec (`/generate-tasks`, 9 tasks) from the brain program plan `core/planning/mev-write-loop-master-plan.md` § Phase 4 `EN.4.A` (program letters do not match local block ids). A `/sdlc-flow` run got through tasks 1–3 in ~an hour, because `testDepth: "fast"` means "only `gates: true` checks" (`sdlc-flow.js:1161`, `:527`) and all four of this repo's checks are gating — so every per-task tripwire ran the full suite plus a release build. Drove tasks 4–9 inline instead: targeted tests per task, full gate paid once at the end. Landed the materialize tail `DigestRenderNode -> LearningArtifactPayloadNode -> MaterializeDocNode -> PersistToBrainNode -> ActionDispatchNode` (materialize deliberately BEFORE the Synapse push, which halts the run on a non-2xx), a `materialize {enabled, corpus_root, write}` policy knob resolving through all four layers and stated in all three named profiles, a `with_enabled` in-place no-op on the shared node so the declared node set never varies by policy, and `build_learning_artifact_payload` extracted from `PersistToBrainNode` so the written document and the ingested payload cannot drift. Full gate green: 38 suites / 1168 tests / 0 failures, plus fmt, clippy `-D warnings`, and `build --release`; `okf-core` and `mev` trees clean. An interrupted `/code-review --fix` left two fixes behind, both verified and committed as `d1a8787` — the important one being `ensure_plan_parents()`: `mev`'s `apply_plan` calls `std::fs::write` and never creates directories, so a first-ever write into a brain root lacking `docs/content/learning-corpus/` failed and halted the run. That directory does not exist in the real corpus, so the first real run would have hit it; every e2e test pre-created it (copying `opportunity_loop_e2e.rs`), which masked it. Added a regression test that deliberately does not pre-create the subtree, confirmed failing without the fix.
+- **Why:** `EN.7.D` is the block that proves the `MaterializeDocNode` writer is generic rather than an opportunity-specific tool — a generic abstraction with one live instance is unproven. It cost a model string and a source node: zero edits to `okf-core`, `mev`, or the seam's model dispatch, which already carried `"learning-artifact"` from `EN.7.A`. The inline run was chosen over restarting the flow because the 9 tasks form one causal chain (policy -> payload -> graph -> e2e) that one context holds comfortably, and because the per-task full-suite cost bought little when tasks 1–6 are only meaningfully verifiable by the task-7 e2e anyway.
+- **Refs:** `planning/EN.7.D-learning-artifact-materialization/tasks.md`, `core/planning/mev-write-loop-master-plan.md` (Phase 4 `EN.4.A`), D53, commits `e4305ee`..`d1a8787`.
+- **Verdict:** All 9 tasks green and fully gated. Code review NOT completed (stopped early); no PR opened yet.
+- **Next:** `/code-review` the branch and open the PR; implement the `perTask`/`fastCommand` harness-schema fields in base-template so per-task tripwires stop relinking all 25 integration-test binaries; decide the `ENGINE_BRAIN_ROOT` deployment question before any served content run.
+
+---
+
 
 ### `EN.4.F-locale-rate-card` done — locale threaded through the diagnostic funnel, pricing off a firewalled two-sheet rate card
 - **What:** Resumed `/sdlc-flow EN.4.F-locale-rate-card` on branch `EN.4.F-locale-rate-card-flow` after two prior bails on the `MoneyRange` string-vs-struct mismatch, and ran tasks 1–10 through to a PASS review. Task 4 resolved the mismatch by making `Investment` a `MoneyRange` type alias with `authored_locale` stamped on `AutomationRoadmap`. Task 5 fixed the real bug behind the earlier bails: `ProposalWriterNode`/`ProposalReviseNode` had been merging a redundant sibling `"locale"` key into `ctx.nodes[NODE_NAME]`, which `PersistToBrainNode`'s strict re-parse through `AutomationRoadmap` silently dropped, breaking the round trip the e2e tests asserted on — removing the extra key and relying solely on `authored_locale` fixed it (mirrored onto `ProposalReviseNode`, outside the task's declared files, since a reviewer-rejected draft would otherwise lose its locale stamp and price). Task 6 spliced a new `language_directive(Locale)` helper into `CompanyResearchNode`/`ProspectingResearchNode`/`IntakeExtractNode` prompt bodies while keeping each `STABLE_SYSTEM_PROMPT` byte-identical across locales. Task 7 added a currency-aware `format_money` helper to `PersistToBrainNode`'s plain-language rendering. Task 8 added a hermetic `locale_rate_card.rs` e2e suite (per-locale pricing, no cross-sheet leakage, floor compliance, byte-identical prompts, a real firewall grep guard). Task 9 documented the block across `data-contract.md`/`proposal-generator-workflow.md`/`research-agent-workflow.md`/`diagnostic-intake-workflow.md`/`architecture.md`/`index.md`, explicitly noting the `investment`-shape change is not a Pinned Contract Version bump since `AutomationRoadmap` is opaque to the canonical contract. Task 10 validated the full suite (fmt, clippy `-D warnings`, `cargo test`, `cargo build --release`) green with no further code changes. Notable decisions: `Locale`'s `PtBr` default uses `#[derive(Default)]`/`#[default]` per `clippy::derivable_impls` rather than a manual `impl Default`; `hourly_floor` stayed a plain `f64` (internal scoping guidance, not a client-facing engagement, so no `MoneyRange`); `RateSheet::validate()` enforces the firewall invariant that every `MoneyRange`'s currency matches its sheet's currency.

@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Content Pipeline Workflow
-description: How the CONTENT_PIPELINE workflow works — the envelope-based, channel-agnostic fourteen-node graph, bounded self-critic loop, optional translation, event schema, tunable ContentPipelinePolicy, the engine-brain persist boundary, the egress dispatch node, triggering, and reading outputs
+description: How the CONTENT_PIPELINE workflow works — the envelope-based, channel-agnostic sixteen-node graph, bounded self-critic loop, optional translation, event schema, tunable ContentPipelinePolicy, the engine-brain persist boundary, the egress dispatch node, triggering, and reading outputs
 doc_id: content-pipeline-workflow
 layer: [engine]
 project: engine-rs
@@ -12,8 +12,8 @@ related: [architecture, proposal-generator-workflow, research-agent-workflow, di
 
 # Content Pipeline Workflow
 
-`CONTENT_PIPELINE` (block `EN.5.A`, egress dispatch added in `EN.6.A`) is a policy-aware,
-fourteen-node workflow that turns any
+`CONTENT_PIPELINE` (block `EN.5.A`, egress dispatch added in `EN.6.A`, corpus materialization in
+`EN.7.D`) is a policy-aware, sixteen-node workflow that turns any
 channel-agnostic `IngressEnvelope` — a web article, a YouTube transcript, or a human/agent
 channel message — into a summarized, optionally-translated digest, POSTed to the company brain
 (Synapse) as durable knowledge. It rebuilds Synapse's original `CONTENT_PIPELINE` around the
@@ -44,10 +44,11 @@ SourceRouterNode -> { FetchArticleNode | FetchTranscriptNode | NormalizeChannelC
   -> SummarizeNode -> SelfCriticNode -> CriticRouterNode
   -> { TranslateSkipRouterNode -> { TranslateNode | DigestRenderNode }
      | IncrementCriticIterationNode -> ReviseNode -> SelfCriticNode }  // back-edge
-TranslateNode -> DigestRenderNode -> PersistToBrainNode -> ActionDispatchNode  // terminal as of EN.6.A
+TranslateNode -> DigestRenderNode -> LearningArtifactPayloadNode -> MaterializeDocNode
+  -> PersistToBrainNode -> ActionDispatchNode  // terminal as of EN.6.A
 ```
 
-Fourteen nodes. `SourceRouterNode` is a `Router` that parses/validates the inbound
+Sixteen nodes. `SourceRouterNode` is a `Router` that parses/validates the inbound
 `ContentPipelineInput`, resolves the run's policy (via `PolicyConfigSource::Builtin` — a channel
 envelope carries no repo checkout), stamps the envelope + resolved policy onto `ctx`, and routes
 purely on `SourcePayload` kind: `Url` → `FetchArticleNode`, `VideoId` → `FetchTranscriptNode`,
@@ -63,6 +64,12 @@ counter, run `ReviseNode`, re-enter `SelfCriticNode`). `TranslateSkipRouterNode`
 `DigestRenderNode`. `ActionDispatchNode` is the sole terminal node as of `EN.6.A` — it runs after
 `PersistToBrainNode` and never fails the run on a transport error (see
 [The egress dispatch boundary](#the-egress-dispatch-boundary)).
+
+`LearningArtifactPayloadNode` + `MaterializeDocNode` are `EN.7.D`'s materialize tail — see
+[Materializing the digest as a source document](#materializing-the-digest-as-a-source-document).
+They sit **between** `DigestRenderNode` and `PersistToBrainNode`, not after it: `PersistToBrainNode`
+halts the run on a non-2xx, so materializing first means an unreachable Synapse cannot cost the run
+its written document.
 
 Per `routing.rs`'s D42 declared-acyclic / runtime-cyclic contract, the `ReviseNode ->
 SelfCriticNode` back-edge is never walked by `WorkflowValidator`'s DFS cycle check because it is
@@ -83,6 +90,8 @@ non-router connection.
 | `TranslateSkipRouterNode` | Deterministic router | Reads `ContentPipelineInput.translate`; routes `true` → `TranslateNode`, `false` → `DigestRenderNode`. |
 | `TranslateNode` | **Model** (Sonnet by default, Local-eligible) | `translate`-stage node. Translates the current summary to `target_lang` (defaults to `pt-BR`), stores `{translated_markdown}`. |
 | `DigestRenderNode` | Deterministic | Deterministically assembles `ContentPipelineOutput`, including a UUID-v5-derived, retry-idempotent `artifact_id` (minted from a fixed namespace + `envelope_id`, so the same envelope always mints the same artifact id). |
+| `LearningArtifactPayloadNode` | Deterministic | `EN.7.D` adapter: builds the `LearningArtifact` payload (`build_learning_artifact_payload`) and stamps it flat, so the generic `MaterializeDocNode` can read it via `with_source_node`. The single source of that payload shape — `PersistToBrainNode` POSTs the same builder's output. |
+| `MaterializeDocNode` | Deterministic | `EN.7.D`: the same generic writer node `RESEARCH_AGENT` uses, configured with model `"learning-artifact"`. Writes the digest into the Brain corpus as a source `.md` via `mev`/`okf-core`. See [Materializing the digest as a source document](#materializing-the-digest-as-a-source-document). |
 | `PersistToBrainNode` | Deterministic | POSTs the finished digest as a `LearningArtifact` to Synapse's ingest endpoint over an injectable `HttpPost` seam. See [The engine↔brain persist boundary](#the-enginebrain-persist-boundary). |
 | `ActionDispatchNode` | Deterministic, terminal | `EN.6.A` egress node. Builds a `Digest` reply `OutboundAction` when the envelope's `reply_context` is present, and/or a `TriggerWorkflow` `OutboundAction` when the raw event carries a `trigger` chain-request; sends each over an injectable `ChannelTransport` seam and never fails the run on a transport error. See [The egress dispatch boundary](#the-egress-dispatch-boundary). |
 
@@ -176,6 +185,9 @@ Knobs:
 | `local.{endpoint,model,constrained_json}` | string / string / bool | Local-endpoint config, applied when any of the four stages resolves to `ModelTier::Local`. |
 | `max_critic_iterations` | `u32`, ceiling 10 | Bounded self-critic loop cap — see [The bounded self-critic loop](#the-bounded-self-critic-loop). |
 | `critic_confidence_threshold` | `f64`, `[0, 1]` | Confidence exit threshold the loop also checks each pass. |
+| `materialize.enabled` | `bool`, default `true` | `EN.7.D`: whether `MaterializeDocNode` writes the digest to the corpus. `false` restores pre-`EN.7.D` behavior exactly — the node stays in the graph and no-ops (`{"materialized": false, "skipped": true}`), never resolving a brain root. |
+| `materialize.corpus_root` | `string \| null`, default `null` | Target corpus root. `null` resolves at run time via `resolve_brain_root` (`ENGINE_BRAIN_ROOT`, then walk-up for `brain.toml`). Where harvested knowledge ultimately *lives* is a separate, deliberately-deferred decision — this is a parameter precisely so that decision stays open. |
+| `materialize.write` | `bool`, default `true` | `false` is a dry run: the target path is still planned and stamped, but nothing lands on disk. |
 
 **Bounds are rejected, not clamped.** `validate_bounds` runs once on the fully-resolved policy
 (after all four layers merge) and returns `Err` for `max_critic_iterations == 0` or `>
@@ -193,14 +205,57 @@ Three built-in bundles in `profiles.rs` (`profile_by_name`), looked up first in
 
 | Name | Tradeoff |
 |---|---|
-| `baseline` | Explicit no-op control — all four tiers Sonnet, normal verbosity, prompt cache off, default loop bounds (3 iterations, 0.8 confidence) — spelled out for clarity, matches the built-in default. |
-| `local-drafting` | Rewires all four Local-eligible stages (`summarize`, `critic`, `revise`, `translate`) to `ModelTier::Local` with `constrained_json` on; leaves the other knobs untouched (`None`) so it composes cleanly with other override layers. |
-| `fast-summarize` | Rewires only `summarize` to `ModelTier::Haiku`; every other knob untouched. |
+| `baseline` | Explicit no-op control — all four tiers Sonnet, normal verbosity, prompt cache off, default loop bounds (3 iterations, 0.8 confidence), materialization on with a run-time-resolved root — spelled out for clarity, matches the built-in default. |
+| `local-drafting` | Rewires all four Local-eligible stages (`summarize`, `critic`, `revise`, `translate`) to `ModelTier::Local` with `constrained_json` on; leaves the other model knobs untouched (`None`) so it composes cleanly with other override layers. Materialization stays on and writing: a cheaper tier is a quality trade, not a durability one. |
+| `fast-summarize` | Rewires only `summarize` to `ModelTier::Haiku`; every other model knob untouched. Materialization stays on and writing, same reasoning as `local-drafting`. |
 
 `planning/harness.json` carries a matching `content_pipeline.{policy,profiles}` section (mirroring
 `sdlc.{policy,profiles}` — see
 [sdlc-flow-policy.md](sdlc-flow-policy.md#2-planningharnessjson--sdlcpolicy-this-repos-defaults)
 for the reader/precedence mechanics, identical here).
+
+## Materializing the digest as a source document
+
+`EN.7.D`. The finished digest is written into the Brain corpus as a source `.md` document before it
+is pushed to Synapse — D53's fourth boundary-test channel: **mev writes the source document,
+Synapse still owns the derived index.** Two nodes do it:
+
+1. **`LearningArtifactPayloadNode`** (`learning_artifact.rs`) builds the `LearningArtifact` payload
+   — `{artifact_id, channel_type, source_ref, summary, digest_markdown, entities, language}` — and
+   stamps it flat as its own result. `build_learning_artifact_payload` is the single source of that
+   shape: `PersistToBrainNode` POSTs the output of the same function, so the written document and
+   the ingested payload can never drift.
+2. **`MaterializeDocNode`** (`nodes/materialize_doc.rs`) — the *same generic node*
+   `RESEARCH_AGENT` uses for opportunities, constructed here with model `"learning-artifact"` and
+   `with_source_node("LearningArtifactPayloadNode")`. It calls the `DocMaterializer` seam, which
+   dispatches to `mev::doc::plan_document` over `okf_core::LearningArtifact::from_payload`.
+
+**This is the block's whole point.** Adding a second doc kind required *no* change to the writer
+core — no edit to `okf-core`, `mev`, or `doc_materializer.rs`. The difference between the
+opportunity instance and this one is the model string and the source node. `EN.7.D`'s
+`the_same_node_and_seam_serve_both_doc_kinds` test pins that claim.
+
+Where the document lands: `okf_core::LearningArtifact`'s `index_intent` targets
+`docs/content/learning-corpus/`, with the filename derived from the `artifact_id` slug. That path is
+sketch-level and expected to move — **where externally-harvested knowledge lives, and how it is
+organized, is a separate future decision** deliberately not made here. `materialize.corpus_root`
+exists so that decision stays open.
+
+**Idempotency** comes from two layers stacked: `artifact_id` is UUID-v5-derived from `envelope_id`
+(so a retried webhook mints the same id, hence the same slug and path), and the materializer plans
+no write at all when the target file is already up to date. A second identical run therefore stamps
+`{"materialized": false, "skipped": false, "paths": []}` with an "already up to date" diagnostic —
+distinct from the policy-disabled path, which stamps `"skipped": true`.
+
+**Result stamp** (`ctx.nodes["MaterializeDocNode"]`):
+`{"materialized", "skipped", "dry_run", "model", "paths", "warnings"}`. The resolved knob is
+observable from `paths`/`dry_run`/`skipped`, so telemetry can attribute a write to the setting that
+caused it.
+
+**Failure posture:** a materialize error fails the node and halts the run. That is deliberate — the
+same "fail loudly" posture `RESEARCH_AGENT` took: a run that was supposed to write a document and
+silently didn't is worse than a run that stops. To turn the behavior off, turn it off explicitly
+(`materialize.enabled = false`).
 
 ## The engine↔brain persist boundary
 
@@ -319,11 +374,13 @@ This workflow has no dedicated `content-pipeline-state.json` telemetry writer of
 
 ## Scope notes
 
-- **Node count is fourteen** as of `EN.6.A`: `SourceRouterNode`, `FetchArticleNode`,
+- **Node count is sixteen** as of `EN.7.D`: `SourceRouterNode`, `FetchArticleNode`,
   `FetchTranscriptNode`, `NormalizeChannelContentNode`, `SummarizeNode`, `SelfCriticNode`,
   `CriticRouterNode`, `IncrementCriticIterationNode`, `ReviseNode`, `TranslateSkipRouterNode`,
-  `TranslateNode`, `DigestRenderNode`, `PersistToBrainNode`, `ActionDispatchNode`. There is no
-  setup/worktree node.
+  `TranslateNode`, `DigestRenderNode`, `LearningArtifactPayloadNode`, `MaterializeDocNode`,
+  `PersistToBrainNode`, `ActionDispatchNode`. There is no setup/worktree node. The node set is
+  invariant across every policy setting — `materialize.enabled = false` no-ops the node in place
+  rather than removing it from the graph.
 - **Routes on `SourcePayload` kind, never `ChannelType`** — this is deliberate: adding a new
   channel later (Slack, Telegram, WhatsApp, Email — Phase 6) costs zero graph edits, only a new
   `SourcePayload` variant and, if needed, a new converge node.

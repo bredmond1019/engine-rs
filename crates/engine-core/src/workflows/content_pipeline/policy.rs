@@ -27,6 +27,79 @@ pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity};
 pub use crate::policy::PartialLocalConfig;
 use crate::policy::{merge_opt, Overlay};
 
+/// Materialization knob for the `EN.7.D` learning-artifact instance:
+/// whether `MaterializeDocNode` writes a doc at all (`enabled`), where it
+/// writes it (`corpus_root`), and whether the write is real vs a dry-run
+/// (`write`). `enabled: false` is the documented switch that restores
+/// pre-`EN.7.D` behavior exactly (the node stays in the graph and stamps a
+/// skip result — see `nodes::materialize_doc::MaterializeDocNode::with_enabled`).
+/// `corpus_root: None` means resolve via `crate::brain_root::resolve_brain_root`
+/// (`ENGINE_BRAIN_ROOT`, then walk-up) rather than a policy-pinned root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializeConfig {
+    pub enabled: bool,
+    pub corpus_root: Option<String>,
+    pub write: bool,
+}
+
+impl Default for MaterializeConfig {
+    /// Built-in default: enabled, real writes, root resolved at run time.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            corpus_root: None,
+            write: true,
+        }
+    }
+}
+
+/// Deserialize a nested `Option<Option<T>>` so an explicit JSON `null`
+/// survives as `Some(None)` ("override to unset") rather than collapsing
+/// into `None` ("not overridden"), which is what serde's stock `Option`
+/// impl would do. Paired with `#[serde(default)]` on the struct, an
+/// *absent* key still deserializes to `None`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// All-optional mirror of [`MaterializeConfig`] for per-field overrides
+/// across the four resolution layers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialMaterializeConfig {
+    pub enabled: Option<bool>,
+    /// `None` = not overridden; `Some(None)` = override to "resolve at run
+    /// time"; `Some(Some(path))` = pin this root. An explicit JSON `null`
+    /// deserializes to `Some(None)` — see [`double_option`].
+    #[serde(deserialize_with = "double_option")]
+    pub corpus_root: Option<Option<String>>,
+    pub write: Option<bool>,
+}
+
+impl Overlay for MaterializeConfig {
+    type Partial = PartialMaterializeConfig;
+
+    /// Merge one override layer onto `self`, field-by-field (`Some` in
+    /// `over` wins, `None` falls through to `self`). `corpus_root` is
+    /// itself an `Option<String>`, so the partial wraps it in a second
+    /// `Option` to distinguish "not overridden" (`None`) from "override to
+    /// unset/resolve-at-runtime" (`Some(None)`).
+    fn overlay(self, over: &Self::Partial) -> Self {
+        MaterializeConfig {
+            enabled: merge_opt(self.enabled, over.enabled),
+            corpus_root: match &over.corpus_root {
+                Some(v) => v.clone(),
+                None => self.corpus_root,
+            },
+            write: merge_opt(self.write, over.write),
+        }
+    }
+}
+
 /// Hard ceiling on `max_critic_iterations` across every override layer.
 /// A caller-supplied value above this (via `harness.json`, a named
 /// profile, or a per-event override) is rejected by
@@ -81,6 +154,11 @@ pub struct ContentPipelinePolicy {
     /// node, never Local-eligible, and `graph::registry_for_policy` has no
     /// rewire branch for it.
     pub dispatch_verbosity: OutputVerbosity,
+    /// `EN.7.D` learning-artifact materialization knob for the
+    /// `MaterializeDocNode` instance wired between `DigestRenderNode` and
+    /// `PersistToBrainNode`. Built-in default restores the write, at the
+    /// runtime-resolved brain root, unconditionally.
+    pub materialize: MaterializeConfig,
 }
 
 impl Default for ContentPipelinePolicy {
@@ -95,6 +173,7 @@ impl Default for ContentPipelinePolicy {
             max_critic_iterations: 3,
             critic_confidence_threshold: 0.8,
             dispatch_verbosity: OutputVerbosity::Normal,
+            materialize: MaterializeConfig::default(),
         }
     }
 }
@@ -123,6 +202,7 @@ pub struct PartialContentPipelinePolicy {
     pub max_critic_iterations: Option<u32>,
     pub critic_confidence_threshold: Option<f64>,
     pub dispatch_verbosity: Option<OutputVerbosity>,
+    pub materialize: Option<PartialMaterializeConfig>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -168,6 +248,10 @@ impl crate::policy::Policy for ContentPipelinePolicy {
                 over.critic_confidence_threshold,
             ),
             dispatch_verbosity: merge_opt(base.dispatch_verbosity, over.dispatch_verbosity),
+            materialize: match &over.materialize {
+                Some(m) => base.materialize.overlay(m),
+                None => base.materialize,
+            },
         }
     }
 }
@@ -238,6 +322,141 @@ mod tests {
         assert_eq!(policy.max_critic_iterations, 3);
         assert!((policy.critic_confidence_threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(policy.dispatch_verbosity, OutputVerbosity::Normal);
+        assert!(policy.materialize.enabled);
+        assert_eq!(policy.materialize.corpus_root, None);
+        assert!(policy.materialize.write);
+    }
+
+    #[test]
+    fn materialize_config_default_matches_documented_builtin() {
+        assert_eq!(
+            MaterializeConfig::default(),
+            MaterializeConfig {
+                enabled: true,
+                corpus_root: None,
+                write: true,
+            }
+        );
+    }
+
+    #[test]
+    fn materialize_enabled_overrides_independently_through_all_four_layers() {
+        let harness = PartialContentPipelinePolicy {
+            materialize: Some(PartialMaterializeConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(ContentPipelinePolicy::default(), Some(&harness), None, None);
+        assert!(!resolved.materialize.enabled);
+        // Untouched fields still fall through to builtin.
+        assert_eq!(resolved.materialize.corpus_root, None);
+        assert!(resolved.materialize.write);
+
+        let profile = PartialContentPipelinePolicy {
+            materialize: Some(PartialMaterializeConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ContentPipelinePolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            None,
+        );
+        assert!(resolved.materialize.enabled, "profile beats harness");
+
+        let event = PartialContentPipelinePolicy {
+            materialize: Some(PartialMaterializeConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ContentPipelinePolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        assert!(!resolved.materialize.enabled, "event beats profile");
+    }
+
+    #[test]
+    fn materialize_corpus_root_overrides_independently_of_enabled_and_write() {
+        let event = PartialContentPipelinePolicy {
+            materialize: Some(PartialMaterializeConfig {
+                corpus_root: Some(Some("/tmp/custom-corpus".to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(ContentPipelinePolicy::default(), None, None, Some(&event));
+        assert_eq!(
+            resolved.materialize.corpus_root,
+            Some("/tmp/custom-corpus".to_string())
+        );
+        // enabled/write untouched by the override, fall through to builtin.
+        assert!(resolved.materialize.enabled);
+        assert!(resolved.materialize.write);
+    }
+
+    #[test]
+    fn materialize_write_overrides_independently_of_enabled_and_corpus_root() {
+        let event = PartialContentPipelinePolicy {
+            materialize: Some(PartialMaterializeConfig {
+                write: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(ContentPipelinePolicy::default(), None, None, Some(&event));
+        assert!(!resolved.materialize.write);
+        assert!(resolved.materialize.enabled);
+        assert_eq!(resolved.materialize.corpus_root, None);
+    }
+
+    #[test]
+    fn materialize_partial_overlay_setting_only_corpus_root_leaves_others_at_lower_layer() {
+        let base = MaterializeConfig {
+            enabled: false,
+            corpus_root: None,
+            write: false,
+        };
+        let over = PartialMaterializeConfig {
+            corpus_root: Some(Some("/tmp/root".to_string())),
+            ..Default::default()
+        };
+        let merged = base.clone().overlay(&over);
+        assert_eq!(merged.corpus_root, Some("/tmp/root".to_string()));
+        assert!(!merged.enabled, "untouched enabled falls through to base");
+        assert!(!merged.write, "untouched write falls through to base");
+    }
+
+    #[test]
+    fn materialize_serde_round_trip_holds_for_config_and_partial() {
+        let config = MaterializeConfig {
+            enabled: false,
+            corpus_root: Some("/tmp/corpus".to_string()),
+            write: false,
+        };
+        let json = serde_json::to_string(&config).expect("serialize MaterializeConfig");
+        let round_tripped: MaterializeConfig =
+            serde_json::from_str(&json).expect("deserialize MaterializeConfig");
+        assert_eq!(round_tripped, config);
+
+        let partial = PartialMaterializeConfig {
+            enabled: Some(true),
+            corpus_root: Some(Some("/tmp/corpus".to_string())),
+            write: None,
+        };
+        let json = serde_json::to_string(&partial).expect("serialize PartialMaterializeConfig");
+        let round_tripped: PartialMaterializeConfig =
+            serde_json::from_str(&json).expect("deserialize PartialMaterializeConfig");
+        assert_eq!(round_tripped, partial);
     }
 
     #[test]

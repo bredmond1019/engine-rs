@@ -27,7 +27,7 @@ use crate::policy::PolicyConfigSource;
 
 use super::policy::{
     self, validate_bounds, ContentPipelinePolicy, ModelTier, OutputVerbosity,
-    PartialContentPipelinePolicy, PartialLocalConfig, PartialModelTiers,
+    PartialContentPipelinePolicy, PartialLocalConfig, PartialMaterializeConfig, PartialModelTiers,
 };
 use super::schema::ContentPipelineInput;
 
@@ -56,6 +56,14 @@ pub fn baseline() -> PartialContentPipelinePolicy {
         max_critic_iterations: Some(3),
         critic_confidence_threshold: Some(0.8),
         dispatch_verbosity: Some(OutputVerbosity::Normal),
+        // Restates the built-in `MaterializeConfig::default()` explicitly,
+        // so `profile: "baseline"` reads as a legible no-op for the
+        // materialize knob too (EN.7.D).
+        materialize: Some(PartialMaterializeConfig {
+            enabled: Some(true),
+            corpus_root: Some(None),
+            write: Some(true),
+        }),
     }
 }
 
@@ -81,6 +89,16 @@ pub fn local_drafting() -> PartialContentPipelinePolicy {
         max_critic_iterations: None,
         critic_confidence_threshold: None,
         dispatch_verbosity: None,
+        // Local drafting trades model tier, never durability: the digest is
+        // still materialized to the corpus. `write` is stated rather than
+        // inherited so the local path's on-disk effect is explicit and a
+        // future harness-level `write: false` cannot silently reach it
+        // (EN.7.D).
+        materialize: Some(PartialMaterializeConfig {
+            enabled: Some(true),
+            corpus_root: None,
+            write: Some(true),
+        }),
     }
 }
 
@@ -101,6 +119,14 @@ pub fn fast_summarize() -> PartialContentPipelinePolicy {
         max_critic_iterations: None,
         critic_confidence_threshold: None,
         dispatch_verbosity: None,
+        // Same reasoning as `local_drafting`: a cheaper summarize tier is a
+        // quality trade, not a durability one — the digest is still written
+        // (EN.7.D).
+        materialize: Some(PartialMaterializeConfig {
+            enabled: Some(true),
+            corpus_root: None,
+            write: Some(true),
+        }),
     }
 }
 
@@ -510,6 +536,118 @@ mod tests {
         let resolved = resolve_policy_for_run_from(&ctx, &source).expect("resolve should succeed");
         // event > harness default
         assert_eq!(resolved.model_tiers.critic, ModelTier::Opus);
+    }
+
+    // EN.7.D task 5 — the `materialize` knob across the named profiles.
+
+    #[test]
+    fn every_named_profile_sets_materialize_explicitly() {
+        for (name, bundle) in [
+            ("baseline", baseline()),
+            ("local-drafting", local_drafting()),
+            ("fast-summarize", fast_summarize()),
+        ] {
+            let materialize = bundle
+                .materialize
+                .unwrap_or_else(|| panic!("profile '{name}' must state the materialize knob"));
+            assert_eq!(
+                materialize.enabled,
+                Some(true),
+                "profile '{name}' should keep materialization on"
+            );
+            assert_eq!(
+                materialize.write,
+                Some(true),
+                "profile '{name}' should state its on-disk write behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_profile_materialize_resolves_to_the_builtin_default() {
+        let resolved = policy::resolve(
+            ContentPipelinePolicy::default(),
+            None,
+            Some(&baseline()),
+            None,
+        );
+
+        assert_eq!(
+            resolved.materialize,
+            ContentPipelinePolicy::default().materialize,
+            "baseline must be an explicit no-op against the built-in default"
+        );
+    }
+
+    #[test]
+    fn event_materialize_override_beats_the_named_profile_per_field() {
+        let mut event = minimal_web_article_event();
+        event["profile"] = serde_json::json!("local-drafting");
+        event["policy"] = serde_json::json!({
+            "materialize": { "enabled": false }
+        });
+        let ctx = base_ctx(event);
+
+        let resolved = resolve_policy_for_run_from(&ctx, &PolicyConfigSource::Builtin)
+            .expect("resolve should succeed");
+
+        // The event wins on `enabled` ...
+        assert!(!resolved.materialize.enabled);
+        // ... while the untouched fields still come from the profile.
+        assert!(resolved.materialize.write);
+        assert_eq!(resolved.materialize.corpus_root, None);
+    }
+
+    #[test]
+    fn event_materialize_corpus_root_override_reaches_the_resolved_policy() {
+        let mut event = minimal_web_article_event();
+        event["policy"] = serde_json::json!({
+            "materialize": { "corpus_root": "/tmp/some-corpus" }
+        });
+        let ctx = base_ctx(event);
+
+        let resolved = resolve_policy_for_run_from(&ctx, &PolicyConfigSource::Builtin)
+            .expect("resolve should succeed");
+
+        assert_eq!(
+            resolved.materialize.corpus_root.as_deref(),
+            Some("/tmp/some-corpus")
+        );
+        assert!(resolved.materialize.enabled);
+    }
+
+    #[test]
+    fn harness_materialize_defaults_beat_the_builtin_and_lose_to_the_event() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            serde_json::json!({
+                "content_pipeline": {
+                    "policy": { "materialize": { "enabled": false, "write": false } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let source = PolicyConfigSource::Worktree(worktree);
+
+        // Harness beats the built-in default ...
+        let ctx = base_ctx(minimal_web_article_event());
+        let resolved = resolve_policy_for_run_from(&ctx, &source).expect("resolve should succeed");
+        assert!(!resolved.materialize.enabled);
+        assert!(!resolved.materialize.write);
+
+        // ... and loses to the per-run event override.
+        let mut event = minimal_web_article_event();
+        event["policy"] = serde_json::json!({ "materialize": { "enabled": true } });
+        let resolved =
+            resolve_policy_for_run_from(&base_ctx(event), &source).expect("resolve should succeed");
+        assert!(resolved.materialize.enabled);
+        assert!(
+            !resolved.materialize.write,
+            "write still comes from harness"
+        );
     }
 
     #[test]

@@ -194,6 +194,25 @@ fn plan_for_model(
     Ok(plan)
 }
 
+/// Create the parent directory of every action a plan will write, so a
+/// first-ever write into a corpus subtree that does not exist yet succeeds.
+///
+/// `mev::brain::emit::apply_plan` calls `std::fs::write` directly and never
+/// creates directories, so without this the first `learning-artifact` write
+/// into a brain root that has no `docs/content/learning-corpus/` fails with
+/// `E_EMIT_WRITE_FAILED` (`No such file or directory`) — which
+/// `MaterializeDocNode` surfaces as a hard `NodeError`, halting the whole
+/// run. Directory creation failures are deliberately swallowed here:
+/// `apply_plan` will report the real write failure as a normal
+/// error-severity diagnostic, which is the one error surface callers read.
+fn ensure_plan_parents(plan: &mev::brain::emit::EmitPlan) {
+    for action in &plan.actions {
+        if let Some(parent) = action.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+}
+
 /// Map one `mev::Diagnostic` into the engine-owned [`MaterializeDiagnostic`].
 fn map_diagnostic(diag: &mev::Diagnostic) -> MaterializeDiagnostic {
     MaterializeDiagnostic {
@@ -231,6 +250,10 @@ impl DocMaterializer for MevDocMaterializer {
 
             let plan_diagnostics: Vec<MaterializeDiagnostic> =
                 plan.diagnostics.iter().map(map_diagnostic).collect();
+
+            if write {
+                ensure_plan_parents(&plan);
+            }
 
             let apply_diagnostics = mev::brain::emit::apply_plan(&plan, write);
             let mut diagnostics = plan_diagnostics;

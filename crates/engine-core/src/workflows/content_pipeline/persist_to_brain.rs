@@ -4,15 +4,15 @@
 //!
 //! EN.4.C pattern (mirrors `proposal_generator::persist_to_brain`):
 //! `with_http_post`/`with_url` builders, live default `http_post_live()`.
-//! Reads `DigestRenderNode`'s stored `ContentPipelineOutput` plus the
-//! `source_ref` whichever of `FetchArticleNode`/`FetchTranscriptNode`/
-//! `NormalizeChannelContentNode` converged on (task 5's `{title, text,
-//! source_ref}` shape — mirrors `summarize::read_converged_content`'s
-//! read-preference), and builds the `LearningArtifact` payload
+//! `EN.7.D` task 4: the payload is no longer built inline here — it
+//! delegates to `super::learning_artifact::build_learning_artifact_payload`,
+//! the single source of the `LearningArtifact` payload shape
 //! `{artifact_id, channel_type, source_ref, summary, digest_markdown,
-//! entities, language}`. `language` is the event's `target_lang` when
-//! `translated_markdown` is present on the output, `"en"` otherwise (the
-//! digest was never translated, so it's still in its original language).
+//! entities, language}` shared with `LearningArtifactPayloadNode` (the two
+//! consumers can never drift). `MaterializeDocNode` now runs upstream of
+//! this node in the declared `CONTENT_PIPELINE` graph (task 6): the source
+//! `.md` is written before this node's Synapse push, so a failed push no
+//! longer costs the run its written document (D53).
 //!
 //! On success, stamps `{"posted": true, "status", "artifact_id",
 //! "response"}` onto `ctx.nodes[NODE_NAME]`. A non-2xx response (or
@@ -23,14 +23,13 @@
 //! `planning/EN.5.A-content-pipeline/architecture.md` §5).
 
 use engine_contract::TaskContext;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::node::{Node, NodeError};
 use crate::nodes::http_post::{http_post_live, HttpPost};
-use crate::workflows::{get_result, put_result};
+use crate::workflows::put_result;
 
-use super::schema::{ContentPipelineInput, ContentPipelineOutput};
-use super::{digest_render, fetch_article, fetch_transcript, normalize_channel_content};
+use super::learning_artifact::build_learning_artifact_payload;
 
 /// The `Node::name()` identity `PersistToBrainNode` runs under, and the
 /// `ctx.nodes` key its result is stamped onto.
@@ -43,57 +42,6 @@ pub const NODE_NAME: &str = "PersistToBrainNode";
 /// status as EN.4.C); tests stub `HttpPost`, so this does not gate the
 /// block.
 const BRAIN_INGEST_URL: &str = "http://localhost:8000/ingest/learning";
-
-/// The `language` value POSTed when the digest was never translated.
-const DEFAULT_LANGUAGE: &str = "en";
-
-/// Deserialize the inbound `CONTENT_PIPELINE` event from `ctx.event` — only
-/// `target_lang` is needed here, when the digest was translated.
-fn parse_event(ctx: &TaskContext) -> Result<ContentPipelineInput, NodeError> {
-    serde_json::from_value(ctx.event.clone()).map_err(|err| {
-        NodeError::new(format!(
-            "{NODE_NAME}: invalid CONTENT_PIPELINE event: {err}"
-        ))
-    })
-}
-
-/// Reads `DigestRenderNode`'s stored `ContentPipelineOutput`.
-fn read_output(ctx: &TaskContext) -> Result<ContentPipelineOutput, NodeError> {
-    let stored = get_result(ctx, digest_render::NODE_NAME).ok_or_else(|| {
-        NodeError::new(format!(
-            "{NODE_NAME}: no ContentPipelineOutput stored by {}",
-            digest_render::NODE_NAME
-        ))
-    })?;
-    serde_json::from_value(stored.clone()).map_err(|err| {
-        NodeError::new(format!(
-            "{NODE_NAME}: invalid stored ContentPipelineOutput: {err}"
-        ))
-    })
-}
-
-/// Reads whichever of the three task-5 converge nodes ran and pulls its
-/// `source_ref` — mirrors `summarize::read_converged_content`'s
-/// read-preference (`FetchArticleNode` -> `FetchTranscriptNode` ->
-/// `NormalizeChannelContentNode`).
-fn read_source_ref(ctx: &TaskContext) -> Result<String, NodeError> {
-    let stored = get_result(ctx, fetch_article::NODE_NAME)
-        .or_else(|| get_result(ctx, fetch_transcript::NODE_NAME))
-        .or_else(|| get_result(ctx, normalize_channel_content::NODE_NAME))
-        .ok_or_else(|| {
-            NodeError::new(format!(
-                "{NODE_NAME}: no content stored by {}, {}, or {}",
-                fetch_article::NODE_NAME,
-                fetch_transcript::NODE_NAME,
-                normalize_channel_content::NODE_NAME
-            ))
-        })?;
-    stored
-        .get("source_ref")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| NodeError::new(format!("{NODE_NAME}: content missing `source_ref`")))
-}
 
 /// The terminal node that POSTs the finished `ContentPipelineOutput` to the
 /// brain ingest endpoint over the injectable `HttpPost` seam. No forward
@@ -141,28 +89,9 @@ impl Default for PersistToBrainNode {
 #[async_trait::async_trait]
 impl Node for PersistToBrainNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        let event = parse_event(&ctx)?;
-        let output = read_output(&ctx)?;
-        let source_ref = read_source_ref(&ctx)?;
+        let payload = build_learning_artifact_payload(&ctx)?;
 
-        let language = if output.translated_markdown.is_some() {
-            event.target_lang.clone()
-        } else {
-            DEFAULT_LANGUAGE.to_string()
-        };
-
-        let channel_type = serde_json::to_value(output.source_channel)
-            .map_err(|err| NodeError::new(format!("failed to serialize channel_type: {err}")))?;
-
-        let payload = json!({
-            "artifact_id": output.artifact_id,
-            "channel_type": channel_type,
-            "source_ref": source_ref,
-            "summary": output.summary,
-            "digest_markdown": output.digest_markdown,
-            "entities": output.entities,
-            "language": language,
-        });
+        let artifact_id = payload["artifact_id"].clone();
 
         let response = self
             .http_post
@@ -179,7 +108,7 @@ impl Node for PersistToBrainNode {
             json!({
                 "posted": true,
                 "status": response.status,
-                "artifact_id": output.artifact_id,
+                "artifact_id": artifact_id,
                 "response": response.body,
             }),
         );
@@ -199,6 +128,7 @@ mod tests {
     use serde_json::json;
 
     use crate::nodes::http_post::StubHttpPost;
+    use crate::workflows::content_pipeline::{digest_render, fetch_article, fetch_transcript};
 
     use super::*;
 
@@ -294,6 +224,23 @@ mod tests {
         assert_eq!(result["posted"], json!(true));
         assert_eq!(result["status"], json!(200));
         assert_eq!(result["artifact_id"], json!("artifact-1"));
+    }
+
+    #[tokio::test]
+    async fn process_posts_a_body_identical_to_the_shared_builder_output() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+
+        let mut ctx = empty_ctx(base_event(false));
+        put_result(&mut ctx, digest_render::NODE_NAME, output_json(false));
+        put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
+
+        let expected = build_learning_artifact_payload(&ctx).expect("builder should succeed");
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_url, body) = stub.last_call().expect("post should have been recorded");
+        assert_eq!(body, expected);
     }
 
     #[tokio::test]

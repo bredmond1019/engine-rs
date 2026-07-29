@@ -12,9 +12,21 @@
 //!   -> SummarizeNode -> SelfCriticNode -> CriticRouterNode
 //!   -> { TranslateSkipRouterNode -> { TranslateNode | DigestRenderNode }
 //!      | IncrementCriticIterationNode -> ReviseNode -> SelfCriticNode }  // back-edge
-//! TranslateNode -> DigestRenderNode -> PersistToBrainNode
+//! TranslateNode -> DigestRenderNode -> LearningArtifactPayloadNode
+//!   -> MaterializeDocNode -> PersistToBrainNode
 //!   -> ActionDispatchNode  // terminal (EN.6.A egress)
 //! ```
+//!
+//! `LearningArtifactPayloadNode` + `MaterializeDocNode` are `EN.7.D`: the
+//! finished digest is materialized into the Brain corpus as a source `.md`
+//! (D53's fourth boundary-test channel — mev writes the document, Synapse
+//! still owns the derived index) before `PersistToBrainNode`'s Synapse
+//! push. That ORDER is deliberate: `PersistToBrainNode` halts the run on a
+//! non-2xx, so materializing first means an unreachable Synapse can no
+//! longer cost the run its written document. `MaterializeDocNode` is the
+//! same generic node `RESEARCH_AGENT` uses for opportunities — only the
+//! model string (`"learning-artifact"`) and its source-node differ, which
+//! is precisely the generality claim this block exists to prove.
 //!
 //! `CriticRouterNode` is a [`Router`]: it reads `SelfCriticNode`'s stored
 //! `CriticEvaluation` plus the run's resolved loop bounds (stamped by
@@ -43,6 +55,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::node::NodeRegistry;
+use crate::nodes::materialize_doc::MaterializeDocNode;
 use crate::nodes::openai_compat_transport::openai_compat_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
@@ -54,9 +67,10 @@ use super::digest_render::DigestRenderNode;
 use super::fetch_article::FetchArticleNode;
 use super::fetch_transcript::FetchTranscriptNode;
 use super::increment_critic_iteration::IncrementCriticIterationNode;
+use super::learning_artifact::{self, LearningArtifactPayloadNode};
 use super::normalize_channel_content::NormalizeChannelContentNode;
 use super::persist_to_brain::PersistToBrainNode;
-use super::policy::{ContentPipelinePolicy, ModelTier};
+use super::policy::{ContentPipelinePolicy, MaterializeConfig, ModelTier};
 use super::revise::ReviseNode;
 use super::self_critic::SelfCriticNode;
 use super::source_router::SourceRouterNode;
@@ -67,6 +81,11 @@ use super::translate::{TranslateNode, TranslateSkipRouterNode};
 /// to register the workflow (`engine-serve`) and as
 /// `WorkflowSchema::workflow_type`.
 pub const WORKFLOW_TYPE: &str = "CONTENT_PIPELINE";
+
+/// The `BrainDocModel` this workflow's `MaterializeDocNode` instance writes
+/// (`EN.7.D`). Not a policy knob: the doc kind a pipeline emits is fixed by
+/// what the pipeline produces, not a per-run cost/quality trade.
+const LEARNING_ARTIFACT_MODEL: &str = "learning-artifact";
 
 /// Build the declared `WorkflowSchema` for the `CONTENT_PIPELINE` workflow.
 #[must_use]
@@ -144,7 +163,21 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "DigestRenderNode".to_string(),
-        NodeConfig::new("DigestRenderNode", vec!["PersistToBrainNode".to_string()]),
+        NodeConfig::new(
+            "DigestRenderNode",
+            vec!["LearningArtifactPayloadNode".to_string()],
+        ),
+    );
+    nodes.insert(
+        "LearningArtifactPayloadNode".to_string(),
+        NodeConfig::new(
+            "LearningArtifactPayloadNode",
+            vec!["MaterializeDocNode".to_string()],
+        ),
+    );
+    nodes.insert(
+        "MaterializeDocNode".to_string(),
+        NodeConfig::new("MaterializeDocNode", vec!["PersistToBrainNode".to_string()]),
     );
     nodes.insert(
         "PersistToBrainNode".to_string(),
@@ -177,10 +210,37 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(TranslateSkipRouterNode));
     registry.register(Box::new(TranslateNode::new()));
     registry.register(Box::new(DigestRenderNode));
+    registry.register(Box::new(LearningArtifactPayloadNode));
+    registry.register(Box::new(materialize_doc_node(
+        &ContentPipelinePolicy::default().materialize,
+    )));
     registry.register(Box::new(PersistToBrainNode::new()));
     registry.register(Box::new(ActionDispatchNode::new()));
 
     registry
+}
+
+/// Build the `MaterializeDocNode` instance this workflow registers, from
+/// the resolved `materialize` knob (`EN.7.D`). One construction site for
+/// both [`registry`] (built-in defaults) and [`registry_for_policy`] (the
+/// run's resolved policy), so the two can never drift.
+///
+/// The node identity, its position in the graph, and its model
+/// (`"learning-artifact"`) are invariant across every setting — only the
+/// node's own configuration varies, per CLAUDE.md rule 6. `corpus_root`
+/// left unset means the node resolves the brain root at run time via
+/// `crate::brain_root::resolve_brain_root` (`ENGINE_BRAIN_ROOT`, then
+/// walk-up), exactly as `RESEARCH_AGENT`'s opportunity instance does.
+fn materialize_doc_node(materialize: &MaterializeConfig) -> MaterializeDocNode {
+    let node = MaterializeDocNode::new(LEARNING_ARTIFACT_MODEL)
+        .with_source_node(learning_artifact::NODE_NAME)
+        .with_enabled(materialize.enabled)
+        .with_write(materialize.write);
+
+    match &materialize.corpus_root {
+        Some(root) => node.with_brain_root(root),
+        None => node,
+    }
 }
 
 /// The real `claude_code_rs::execute` transport — the cloud fallback a
@@ -205,9 +265,20 @@ fn real_cloud_transport() -> ModelTransport {
 /// is never Local-eligible (`policy.rs`'s `dispatch_verbosity` is
 /// telemetry/verbosity config only, not a `ModelTier`).
 /// This is the four-stage analog of `proposal_generator::graph::registry_for_policy`.
+///
+/// It also applies `EN.7.D`'s `materialize` knob to the `MaterializeDocNode`
+/// instance (enabled / write / corpus root). That is a *configuration*
+/// change only: the node identity set this returns is identical for every
+/// policy, so one declared graph, validated once, describes every run.
 #[must_use]
 pub fn registry_for_policy(policy: &ContentPipelinePolicy) -> NodeRegistry {
     let mut registry = registry();
+
+    // EN.7.D: re-register the same identity with the run's resolved
+    // `materialize` knob. This replaces a node's configuration, never the
+    // node SET — `registry()` already registered this identity, so the
+    // declared graph is identical for every setting.
+    registry.register(Box::new(materialize_doc_node(&policy.materialize)));
 
     if policy.model_tiers.summarize == ModelTier::Local {
         registry.register(Box::new(SummarizeNode::new().with_transport(
@@ -253,9 +324,10 @@ pub fn workflow() -> Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::Node;
     use crate::validate::WorkflowValidator;
 
-    const ALL_NODE_IDENTITIES: [&str; 14] = [
+    const ALL_NODE_IDENTITIES: [&str; 16] = [
         "SourceRouterNode",
         "FetchArticleNode",
         "FetchTranscriptNode",
@@ -268,6 +340,8 @@ mod tests {
         "TranslateSkipRouterNode",
         "TranslateNode",
         "DigestRenderNode",
+        "LearningArtifactPayloadNode",
+        "MaterializeDocNode",
         "PersistToBrainNode",
         "ActionDispatchNode",
     ];
@@ -463,5 +537,87 @@ mod tests {
         let registry = registry_for_policy(&policy);
         assert!(registry.contains("ActionDispatchNode"));
         assert_eq!(registry.len(), super::registry().len());
+    }
+
+    // EN.7.D task 6 — the materialize tail.
+
+    #[test]
+    fn digest_render_forwards_to_the_learning_artifact_payload_node() {
+        let schema = schema();
+        assert_eq!(
+            schema.nodes["DigestRenderNode"].connections,
+            vec!["LearningArtifactPayloadNode".to_string()]
+        );
+    }
+
+    #[test]
+    fn materialize_tail_runs_before_the_synapse_push() {
+        // The block's ordering claim: the source `.md` is written before
+        // `PersistToBrainNode` can halt the run on a non-2xx.
+        let schema = schema();
+        assert_eq!(
+            schema.nodes["LearningArtifactPayloadNode"].connections,
+            vec!["MaterializeDocNode".to_string()]
+        );
+        assert_eq!(
+            schema.nodes["MaterializeDocNode"].connections,
+            vec!["PersistToBrainNode".to_string()]
+        );
+    }
+
+    #[test]
+    fn registry_for_policy_node_set_is_identical_across_every_materialize_setting() {
+        let identities = |registry: &NodeRegistry| {
+            let mut found: Vec<&str> = ALL_NODE_IDENTITIES
+                .iter()
+                .copied()
+                .filter(|identity| registry.contains(identity))
+                .collect();
+            found.sort_unstable();
+            found
+        };
+
+        let baseline = registry_for_policy(&ContentPipelinePolicy::default());
+
+        let mut disabled = ContentPipelinePolicy::default();
+        disabled.materialize.enabled = false;
+
+        let mut dry_run = ContentPipelinePolicy::default();
+        dry_run.materialize.write = false;
+
+        let mut pinned_root = ContentPipelinePolicy::default();
+        pinned_root.materialize.corpus_root = Some("/tmp/some-corpus".to_string());
+
+        for policy in [&disabled, &dry_run, &pinned_root] {
+            let registry = registry_for_policy(policy);
+            assert_eq!(
+                identities(&registry),
+                identities(&baseline),
+                "the materialize knob must change node CONFIGURATION, never the node set"
+            );
+            assert_eq!(registry.len(), baseline.len());
+        }
+    }
+
+    #[test]
+    fn declared_graph_still_validates_with_materialization_disabled() {
+        // Shape invariance is only meaningful if the disabled-knob registry
+        // still satisfies the one declared schema.
+        let mut policy = ContentPipelinePolicy::default();
+        policy.materialize.enabled = false;
+
+        WorkflowValidator::validate(&registry_for_policy(&policy), &schema())
+            .expect("declared graph should validate with materialization off");
+    }
+
+    #[test]
+    fn materialize_doc_node_is_built_for_the_learning_artifact_model() {
+        // The generality claim, asserted at the construction site: this
+        // workflow differs from `RESEARCH_AGENT`'s opportunity instance
+        // only by the model string and the source node.
+        assert_eq!(LEARNING_ARTIFACT_MODEL, "learning-artifact");
+
+        let node = materialize_doc_node(&MaterializeConfig::default());
+        assert_eq!(node.name(), "MaterializeDocNode");
     }
 }

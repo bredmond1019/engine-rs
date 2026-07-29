@@ -29,3 +29,15 @@ regex = "1"
 mev = { path = "../mev" }
 okf-core = { path = "../okf-core" }
 tempfile = "3"
+
+# Dev/test link-time speedup — engine-core alone compiles to 25+ integration-test binaries, each
+# statically linking the whole crate + its dependency graph (tokio/serde/actix-web/sqlx). Both
+# settings cut per-binary link cost without changing what gets compiled or tested, and without
+# touching `cargo build --release` (a separate, intentionally slower profile).
+[profile.dev]
+# Keep panic/backtrace line numbers; drop full DWARF type descriptions (biggest link-time cost
+# for a type-heavy, generic-dependency-laden crate like this one).
+debug = "line-tables-only"
+# Skip macOS's dsymutil debug-info-bundling pass (a classic slow post-link step, run once per
+# binary); leave debug info split across .o files instead. Backtraces still resolve correctly.
+split-debuginfo = "unpacked"
