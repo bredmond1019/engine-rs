@@ -126,12 +126,10 @@ impl ResearchIngressDispatchNode {
     fn resolve_dispatch(&self, ctx: &TaskContext) -> Result<IngressDispatch, NodeError> {
         match crate::policy::resolved_policy_strict::<ResearchAgentPolicy>(ctx) {
             Ok(policy) => Ok(policy.ingress_dispatch),
-            Err(err) if err.message.contains("no resolved policy stamped") => {
-                Ok(IngressDispatch {
-                    enabled: self.enabled,
-                    target_workflow_type: self.target_workflow_type.clone(),
-                })
-            }
+            Err(err) if err.message.contains("no resolved policy stamped") => Ok(IngressDispatch {
+                enabled: self.enabled,
+                target_workflow_type: self.target_workflow_type.clone(),
+            }),
             Err(err) => Err(err),
         }
     }

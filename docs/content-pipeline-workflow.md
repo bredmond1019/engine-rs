@@ -340,7 +340,10 @@ fails the run. `WorkflowTriggerDispatch` prefers an injected in-process `Dispatc
 `UnwiredChannelTransport` (`EN.6.C`/`EN.6.D` — real Telegram/WhatsApp adapters are still open
 follow-on work). `crates/engine-serve/src/workflows.rs` re-registers `ActionDispatchNode` with
 `channel_transport_live` pointed at the deployment-configured `ENGINE_EVENTS_URL` (default
-`http://localhost:8080/events/`).
+`http://localhost:8080/events/`) — `register_research_agent` mirrors this same override for
+`ResearchIngressDispatchNode` (`EN.6.E`), so `RESEARCH_AGENT`'s self-feeding trigger into
+`CONTENT_PIPELINE` reaches the same configured endpoint; see
+[research-agent-workflow.md § Self-feeding dispatch](research-agent-workflow.md#self-feeding-dispatch-researchingressdispatchnode).
 
 ## How to trigger a run
 
