@@ -56,19 +56,36 @@ Unit tests are unaffected — they stay in-file under `#[cfg(test)] mod tests` a
 
 Measured 2026-07-29 (see [D57](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D57-rust-sdlc-iteration-speed.md)):
 
-| | before (25 binaries) | after (1 binary) |
-|---|---|---|
-| Full-suite build after a one-line `engine-core` edit | 2m24s | **35s** |
-| Full-suite run | 58s | **2.2s** |
-| Full suite, nothing changed | minutes | **2.9s** |
-| Per-task tripwire (`--lib --workspace`) | 2m44s | **1m17s** |
+| | before | after (1 binary + nextest, no sccache) | + `target/` clean |
+|---|---|---|---|
+| Per-task tripwire (`--lib --workspace`, after an edit) | 2m44s | 1m17s | **6.4s** |
+| Full-suite build after a one-line `engine-core` edit | 2m24s | 35s | **5.3s** |
+| Full-suite run | 58s | 2.2s | **2.2s** |
+| Full suite, nothing changed | minutes | 2.9s | **2.8s** |
 
-*Running* the tests was never the cost — 1044 tests execute in 1.8s. Linking was.
+*Running* the tests was never the cost — 1215 tests execute in ~2s. Linking was, plus a `target/`
+directory that had rotted to 40GB (930,599 files). See "Keep `target/` clean" below.
 
 Collapsing binaries would merge processes under `cargo test`, which could break any test relying on
 process isolation (env vars, CWD, global state). **`cargo nextest run` executes every test in its
 own process regardless of binary packing**, which is exactly what makes this safe here — and why the
 nextest rule is a prerequisite for the layout rather than a stylistic preference.
+
+## Keep `target/` clean
+
+Cargo has no garbage collection: incremental state accumulates across branches, rebases, and
+abandoned builds and is never reclaimed. This repo's `target/` had reached **40GB** (17GB of it
+`incremental/`; `cargo clean` removed 930,599 files / 78.4GiB), and it was silently taxing every
+single build — a from-scratch cold build afterwards (48.9s) came out nearly **3x faster** than the
+*incremental* build after a one-line edit had been on the bloated tree (2m24s).
+
+```bash
+du -sh target        # check this first when the loop feels slow
+cargo clean          # ~3m20s when the tree is that large; budget for it once
+```
+
+Clean when it passes a few GB, or after a long branch/rebase-heavy stretch. A healthy working size
+for this workspace is ~2.4GB.
 
 ## Hermetic-test conventions
 

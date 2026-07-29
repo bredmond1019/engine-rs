@@ -97,13 +97,18 @@ housekeeping. There is no global scheduler.
      leaving the next reader to wonder.
 7. **Use `cargo nextest run`, never plain `cargo test`, for any test run you invoke yourself
    during a task** (scoped to a module: `cargo nextest run -p <crate> <module::path>`; workspace-
-   wide fast check: `cargo nextest run --lib --workspace`). `engine-core` alone has 25+
-   integration-test binaries — plain `cargo test` is a multi-minute link-time tax you pay on every
-   ad hoc check. The one exception is the task explicitly designated to own full-suite validation
-   for a spec — that task runs the real `cargo test` / `cargo build --release` gates, per
-   `planning/harness.json`'s `command` (not `fastCommand`). See "Build / test / run" below for
-   the full rationale.
-8. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
+   wide fast check: `cargo nextest run --lib --workspace`). A `PreToolUse` hook in
+   `.claude/settings.json` enforces this. Beyond the parallelism, nextest's process-per-test model
+   is what makes the single-integration-test-binary layout (rule 8) safe — the two go together.
+   The one exception is the task explicitly designated to own full-suite validation for a spec —
+   that task runs `planning/harness.json`'s authoritative `command` (`cargo nextest run
+   --workspace` + `cargo build --release`), not `fastCommand`.
+8. **One integration-test binary per crate.** New integration suites go in
+   `crates/engine-core/tests/it/<name>.rs` with a `mod <name>;` line in `tests/it/main.rs` — never
+   a new `crates/engine-core/tests/*.rs` file, which cargo builds as a separate binary that
+   statically re-links the whole ~345-crate graph. See [`docs/testing.md`](docs/testing.md) and
+   "Build / test / run" below.
+9. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
    boundaries, code style, etc.). -->
 
 ## Known bugs
@@ -130,10 +135,10 @@ cargo run
 >
 > | | before | after |
 > |---|---|---|
-> | Full suite build (after a one-line `engine-core` edit) | 2m24s | **35s** |
+> | Per-task tripwire (`--lib --workspace`, after an `engine-core` edit) | 2m44s | **6.4s** |
+> | Full suite build (after a one-line `engine-core` edit) | 2m24s | **5.3s** |
 > | Full suite run | 58s | **2.2s** |
-> | Full suite, nothing changed | minutes | **2.9s** |
-> | Per-task tripwire (`--lib --workspace`, after an `engine-core` edit) | 2m44s | **1m17s** |
+> | Full suite, nothing changed | minutes | **2.8s** |
 >
 > 1. **One integration-test binary per crate, not one per file.** cargo builds a separate binary
 >    for every `tests/*.rs`, each statically linking the crate plus its ~345-crate dependency
@@ -150,6 +155,10 @@ cargo run
 >    crate 10-30 times; see `.cargo/config.toml` for the full rationale before re-adding it.
 > 3. **`[profile.dev]` link-time settings in `Cargo.toml`** (`debug = "line-tables-only"`,
 >    `split-debuginfo = "unpacked"`) — keep backtraces, drop the expensive DWARF/dsymutil work.
+> 4. **Keep `target/` clean.** Cargo never garbage-collects incremental state. This tree had rotted
+>    to **40GB** (930,599 files), and clearing it was the single largest lever of all — a cold
+>    from-scratch build (48.9s) beat the bloated tree's *incremental* build (2m24s) by ~3x. Run
+>    `du -sh target` when the loop feels slow; `cargo clean` when it passes a few GB.
 >
 > **Scope even narrower while mid-task.** While iterating inside a single task, prefer
 > `cargo nextest run -p <crate> <module::path>` — just the touched crate and module — over even
