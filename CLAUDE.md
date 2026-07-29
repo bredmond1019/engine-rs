@@ -123,8 +123,10 @@ cargo run
 > rather than libtest's serial-per-binary model.
 >
 > **The cost in this repo is LINKING, not testing.** Measured 2026-07-29: running the full
-> workspace suite takes ~2s; everything else was compile and link. Three fixes came out of that
-> measurement, and the numbers below are why they must not be casually undone:
+> workspace suite takes ~2s; everything else was compile and link. Full detail in
+> [`docs/testing.md`](docs/testing.md); the cross-project playbook is
+> `base-template/docs/rust-sdlc-iteration-speed.md` (governed by brain decision **D57**). Three
+> fixes came out of that measurement, and the numbers below are why they must not be casually undone:
 >
 > | | before | after |
 > |---|---|---|

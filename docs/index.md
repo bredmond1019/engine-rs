@@ -16,6 +16,7 @@ related: [core:engine-rs]
 |---|---|
 | [architecture.md](architecture.md) | Overview, module map, core types, data flow |
 | [cli.md](cli.md) | Synopsis, subcommands, global flags, exit codes, examples |
+| [testing.md](testing.md) | Which test commands to run, the single-integration-test-binary layout (`tests/it/`) and how to add a suite to it, the hermetic-test conventions (no network, tempdir corpora, assert on-disk bytes), and per-task `validation_commands` in the SDLC loop |
 | [data-contract.md](data-contract.md) | Pinned orchestrator data-contract version, field mappings to `engine_contract` Rust types, HTTP surface parity, re-pin checklist |
 | [sdlc-flow-workflow.md](sdlc-flow-workflow.md) | The `SDLC_FLOW` graph — node roles (model vs. deterministic), triggering from `engine-rs`/bastion (event `policy`/`profile` fields), stopping a run, reading outputs, inspecting/resuming state |
 | [sdlc-flow-policy.md](sdlc-flow-policy.md) | SDLC Flow's tunable `SdlcPolicy` (model tiers, review mode, verbosity, local-model tier) — 4-layer resolution, the four named policy profiles (`baseline`, `cheap-fast`, `pragmatist`, `batch-reviewer`), structured-output adoption, and `RunOutcomes` telemetry/aggregation |
