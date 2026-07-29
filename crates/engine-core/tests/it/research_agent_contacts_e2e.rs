@@ -27,6 +27,7 @@ use engine_core::node::{Node, NodeRegistry};
 use engine_core::policy::{PolicyConfigSource, RESOLVED_POLICY_IDENTITY};
 use engine_core::workflow::Workflow;
 use engine_core::workflows::research_agent::graph as research_graph;
+use engine_core::workflows::research_agent::ingress_dispatch::ResearchIngressDispatchNode;
 use engine_core::workflows::research_agent::profiles;
 use engine_core::workflows::research_agent::prospecting::ProspectingResearchNode;
 use engine_core::workflows::research_agent::CompanyResearchNode;
@@ -231,6 +232,13 @@ fn research_registry(
             .with_brain_root(root)
             .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]),
     ));
+    // `EN.6.E`: the graph's new sole terminal identity. A stub transport
+    // keeps this suite hermetic; the resolved policy stamp seeded by
+    // `seeded_nodes_for` carries the built-in `enabled: false` default, so
+    // this node no-ops in place and records zero sends.
+    registry.register(Box::new(ResearchIngressDispatchNode::new().with_transport(
+        Arc::new(engine_core::nodes::channel_transport::StubChannelTransport::succeeding()),
+    )));
     registry
 }
 
