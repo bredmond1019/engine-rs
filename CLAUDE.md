@@ -95,7 +95,15 @@ housekeeping. There is no global scheduler.
    - *Where feasible* is a real qualifier: a value fixed by an external contract (a wire format, a
      required header, an interface another repo pins) is not a knob. Say so in a comment rather than
      leaving the next reader to wonder.
-7. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
+7. **Use `cargo nextest run`, never plain `cargo test`, for any test run you invoke yourself
+   during a task** (scoped to a module: `cargo nextest run -p <crate> <module::path>`; workspace-
+   wide fast check: `cargo nextest run --lib --workspace`). `engine-core` alone has 25+
+   integration-test binaries — plain `cargo test` is a multi-minute link-time tax you pay on every
+   ad hoc check. The one exception is the task explicitly designated to own full-suite validation
+   for a spec — that task runs the real `cargo test` / `cargo build --release` gates, per
+   `planning/harness.json`'s `command` (not `fastCommand`). See "Build / test / run" below for
+   the full rationale.
+8. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
    boundaries, code style, etc.). -->
 
 ## Known bugs
