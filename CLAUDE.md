@@ -129,7 +129,7 @@ cargo run
 > every `cargo` invocation.
 >
 > **Scope even narrower while mid-task.** While iterating inside a single task, prefer
-> `cargo test -p <crate> --lib <module::path>` — just the touched crate and module — over even
+> `cargo nextest run -p <crate> <module::path>` — just the touched crate and module — over even
 > the workspace-wide fast command. Only the task(s) explicitly designated to own full-suite
 > validation for the spec should run the workspace-wide `fastCommand` or the full
 > `cargo test` / `cargo build --release` gates; every other task should stay scoped to what it
