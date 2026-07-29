@@ -334,8 +334,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `register_opportunity_add_action` (`OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION`, `EN.7.B`
   task 6) are the first `register_builtin_workflows` entries with no policy layer at all —
   `OpportunityEditNode` calls no model, so their `WorkflowFactory`s resolve no
-  `PolicyConfigSource` and seed no policy stamp; `register_builtin_workflows` now populates seven
-  workflow types in total.
+  `PolicyConfigSource` and seed no policy stamp; `register_harvest_approve` (`HARVEST_APPROVE`,
+  `EN.7.C` task 7) follows the same no-policy pattern, since `HarvestApproveNode` is also
+  model-free; `register_builtin_workflows` now populates eight workflow types in total.
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
