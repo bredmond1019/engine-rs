@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=$(cat | jq -r '.tool_input.command'); if echo \"$cmd\" | grep -qE '(^|[;&|]|\\s)cargo(\\s+\\+[a-zA-Z0-9._-]+)?\\s+test(\\s|$)'; then if ! echo \"$cmd\" | grep -q 'cargo nextest' && ! echo \"$cmd\" | grep -qE '(^|\\s)NEXTEST_POLICY_OVERRIDE=1(\\s|$)'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"This repo'\"'\"'s CLAUDE.md standing rule #7 requires cargo nextest, not plain cargo test \\u2014 cargo test'\"'\"'s per-binary link time is a multi-minute tax across engine-core'\"'\"'s 25+ integration-test binaries. Rewrite: cargo test -p <crate> <module::path> -> cargo nextest run -p <crate> <module::path> (workspace-wide fast check: cargo nextest run --lib --workspace). If this is genuinely the task explicitly designated to own full-suite validation per planning/harness.json'\"'\"'s authoritative command (not fastCommand), prefix the command with NEXTEST_POLICY_OVERRIDE=1 to bypass this gate.\"}}'; exit 0; fi; fi; exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
