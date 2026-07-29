@@ -54,10 +54,21 @@
 //! MergeContacts`. Lives here for the same reason its siblings do; the
 //! `RESEARCH_AGENT` graph wires one instance in after `MaterializeDocNode`
 //! on both research branches.
+//!
+//! `harvest_gate` (`EN.7.C` task 1) is the generic materialize→harvest gate
+//! primitive: `HarvestMode` (`off` | `in_process` | `approval`, default
+//! `off`), the resolved per-run `HarvestGate` a node holds, and
+//! `pending_harvest_record` — the one constructor for the deferred-harvest
+//! record shape shared by `PersistToBrainNode` (task 4, the node that defers)
+//! and `HarvestApproveNode` (task 6, the node that completes one). Lives
+//! under `nodes/`, not `workflows::content_pipeline`, because every pipeline
+//! that materializes a doc and pushes it to Synapse's ingest endpoint
+//! inherits this gate.
 
 pub mod channel_transport;
 pub mod claude_code_step;
 pub mod doc_materializer;
+pub mod harvest_gate;
 pub mod http_post;
 pub mod materialize_doc;
 pub mod merge_contacts;
@@ -74,6 +85,7 @@ pub use doc_materializer::{
     MaterializedFile, OpportunityEdit, RecordedEditCall, RecordedMaterializeCall,
     StubDocMaterializer,
 };
+pub use harvest_gate::{pending_harvest_record, HarvestDecision, HarvestGate, HarvestMode};
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
 pub use materialize_doc::MaterializeDocNode;
 pub use merge_contacts::MergeContactsNode;
