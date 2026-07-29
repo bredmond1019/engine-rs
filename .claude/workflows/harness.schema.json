@@ -166,6 +166,14 @@
           "type": "boolean",
           "description": "Whether this check's failure blocks the review verdict. Replaces the old hardcoded 'jest is authoritative' rule. For warning-scan, gates:false reports matches as WARN; gates:true fails on any match."
         },
+        "perTask": {
+          "type": "boolean",
+          "description": "Whether this check runs in the per-task fast tripwire (/sdlc-flow testDepth:\"fast\", /sdlc-task's default). Default true. Set false for a check that only needs to gate the full/review run and adds nothing a per-task safety net needs (e.g. a release/production build already covered by a test/type check)."
+        },
+        "fastCommand": {
+          "type": "string",
+          "description": "Command substituted for `command` ONLY inside the per-task fast tripwire; review and testDepth:\"full\" always use `command` unchanged. Applies to the plain command kind and count-delta only. Use when `command` has grown too slow to repeat every task/attempt but a cheaper stack-native subset still catches regressions early."
+        },
         "baselineCommand": {
           "type": "string",
           "description": "baseline-diff only: run once at worktree creation to capture the pre-task baseline artifact. Must emit the same format as `command` (e.g. a JSON array of violation objects)."
