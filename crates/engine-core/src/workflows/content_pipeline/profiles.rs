@@ -64,6 +64,10 @@ pub fn baseline() -> PartialContentPipelinePolicy {
             corpus_root: Some(None),
             write: Some(true),
         }),
+        // EN.7.C task 2 compile-fix only: task 3 sets this explicitly per
+        // profile (harvest off for baseline/local-drafting/fast-summarize,
+        // in_process for the new curated-harvest bundle).
+        harvest: None,
     }
 }
 
@@ -99,6 +103,8 @@ pub fn local_drafting() -> PartialContentPipelinePolicy {
             corpus_root: None,
             write: Some(true),
         }),
+        // EN.7.C task 2 compile-fix only: task 3 sets this explicitly.
+        harvest: None,
     }
 }
 
@@ -127,6 +133,8 @@ pub fn fast_summarize() -> PartialContentPipelinePolicy {
             corpus_root: None,
             write: Some(true),
         }),
+        // EN.7.C task 2 compile-fix only: task 3 sets this explicitly.
+        harvest: None,
     }
 }
 
