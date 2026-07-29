@@ -395,6 +395,8 @@ const HARNESS_CONFIG_SCHEMA = {
                   command: { type: 'string' },
                   purpose: { type: 'string' },
                   gates:   { type: 'boolean' },
+                  perTask:     { type: 'boolean' },
+                  fastCommand: { type: 'string' },
                   baselineCommand: { type: 'string' },
                   compareKeys:     { type: 'array', items: { type: 'string' } },
                   countPattern:    { type: 'string' },
@@ -435,10 +437,10 @@ STEP 2 — Decide:
   - "__HARNESS_ABSENT__" (file missing) → present=false, omit config.
   - File printed but NOT valid JSON → present=false, notes="harness.json present but invalid JSON: <reason>".
   - File printed and valid JSON → present=true, and copy the parsed object into "config", keeping ONLY
-    these fields when present: stack; validation.checks[] (each: {kind, name, command, purpose, gates}
-    plus any kind-specific fields present — baselineCommand, compareKeys[], countPattern, failOn,
-    warningPatterns[], rules[] ({id, pattern, paths, allowlistPattern})). Preserve kind-specific fields
-    verbatim; ignore any other fields.
+    these fields when present: stack; validation.checks[] (each: {kind, name, command, purpose, gates,
+    perTask, fastCommand} plus any kind-specific fields present — baselineCommand, compareKeys[],
+    countPattern, failOn, warningPatterns[], rules[] ({id, pattern, paths, allowlistPattern})). Preserve
+    kind-specific fields verbatim; ignore any other fields.
 
 Return your findings using the StructuredOutput tool.
 `, { label: 'harness-config', schema: HARNESS_CONFIG_SCHEMA, model: 'sonnet' })
@@ -453,7 +455,7 @@ Return your findings using the StructuredOutput tool.
 // the engine ships NO stack defaults. Handles all D6 check kinds.
 function renderCheckList(cfg, { gatingOnly = false, cwd } = {}) {
   let checks = cfg?.validation?.checks ?? []
-  if (gatingOnly) checks = checks.filter(c => c.gates)
+  if (gatingOnly) checks = checks.filter(c => c.gates && c.perTask !== false)
   const cd = cwd ? `cd ${cwd} && ` : ''
   if (!checks.length) {
     return `The project ships no matching \`planning/harness.json\` validation ${gatingOnly ? 'GATING ' : ''}checks, so derive the checks from the spec instead:
@@ -529,8 +531,9 @@ ${ruleLines}
 
     // count-delta has no analog in this consolidated-per-run model — treat as a plain command run
     // (its exit code still gates if gates:true).
+    const cmd = (gatingOnly && c.fastCommand) ? c.fastCommand : c.command
     return `${header}:
-  ${cd}${c.command}
+  ${cd}${cmd}
   echo "CHECK${n}_EXIT:$?"`
   }).join('\n\n')
 }
