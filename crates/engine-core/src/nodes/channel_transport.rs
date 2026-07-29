@@ -84,6 +84,29 @@ pub trait ChannelTransport: Send + Sync {
     async fn send(&self, action: &OutboundAction) -> Result<ChannelSendReceipt, String>;
 }
 
+/// The local-dev placeholder `/events/` URL every `ChannelTransport`-backed
+/// dispatch node (`ActionDispatchNode`, `ResearchIngressDispatchNode`)
+/// defaults to until its deployment wires `ENGINE_EVENTS_URL`
+/// (`engine-serve::workflows::events_url_from_env`). Centralized here so
+/// those nodes share one literal instead of each declaring its own private
+/// copy.
+pub const DEFAULT_EVENTS_URL: &str = "http://localhost:8080/events/";
+
+/// Fold a [`ChannelTransport::send`] result into a [`ChannelSendReceipt`],
+/// turning a seam-level `Err` into a `delivered: false` receipt instead of
+/// propagating it — the shared "never fail the run on a transport error"
+/// behavior every dispatch node built on this seam relies on.
+#[must_use]
+pub fn receipt_from_send_result(result: Result<ChannelSendReceipt, String>) -> ChannelSendReceipt {
+    match result {
+        Ok(receipt) => receipt,
+        Err(detail) => ChannelSendReceipt {
+            delivered: false,
+            detail,
+        },
+    }
+}
+
 /// Live default until the human-channel adapters land: `TriggerWorkflow`
 /// bodies are posted to engine-serve's existing `POST /events/` endpoint
 /// via the `HttpPost` seam (no engine-core -> engine-serve dependency — the

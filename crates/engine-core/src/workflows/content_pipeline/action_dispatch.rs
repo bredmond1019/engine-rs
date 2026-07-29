@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 
 use crate::node::{Node, NodeError};
 use crate::nodes::channel_transport::{
-    channel_transport_live, ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody,
+    channel_transport_live, receipt_from_send_result, ChannelSendReceipt, ChannelTransport,
+    OutboundAction, OutboundBody, DEFAULT_EVENTS_URL,
 };
 use crate::workflows::{get_result, put_result};
 
@@ -44,13 +45,6 @@ use super::source_router::ENVELOPE_ID_METADATA_KEY;
 /// The `Node::name()` identity `ActionDispatchNode` runs under, and the
 /// `ctx.nodes` key its result is stamped onto.
 pub const NODE_NAME: &str = "ActionDispatchNode";
-
-/// The default `/events/` URL the live default `ChannelTransport` targets
-/// until `EN.6.A` task 5 wires the configured, deployment-specific URL from
-/// `engine-serve`. Mirrors `persist_to_brain::BRAIN_INGEST_URL`'s
-/// placeholder-until-wired convention; tests inject a stub transport, so
-/// this does not gate the block.
-const DEFAULT_EVENTS_URL: &str = "http://localhost:8080/events/";
 
 /// An optional chain/trigger request an inbound event can carry, asking
 /// `ActionDispatchNode` to dispatch a follow-on `TriggerWorkflow` action
@@ -223,13 +217,7 @@ impl Node for ActionDispatchNode {
 
         let mut dispatched = Vec::with_capacity(actions.len());
         for action in actions {
-            let receipt = match self.transport.send(&action).await {
-                Ok(receipt) => receipt,
-                Err(err) => ChannelSendReceipt {
-                    delivered: false,
-                    detail: err,
-                },
-            };
+            let receipt = receipt_from_send_result(self.transport.send(&action).await);
             dispatched.push(DispatchedAction {
                 envelope_id: envelope_id.clone(),
                 channel_type: action.channel_type,

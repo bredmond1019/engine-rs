@@ -99,6 +99,16 @@ pub fn register_sdlc_flow(dispatcher: &mut Dispatcher) {
 /// policy-aware factory built on `research_agent::graph::registry_for_policy`)
 /// and the `schema_registry` (via `research_agent::graph::schema`). See
 /// `planning/EN.4.A-research-agent/tasks.md`, Task 7.
+///
+/// `EN.6.E`: after `registry_for_policy` builds the policy-rewired registry,
+/// this re-registers `ResearchIngressDispatchNode` with a
+/// `channel_transport_live` pointed at [`events_url_from_env`]'s
+/// deployment-configured `/events/` URL rather than the node's own
+/// local-dev placeholder default — mirroring exactly how
+/// `register_content_pipeline` overrides `ActionDispatchNode`'s transport
+/// below, so `RESEARCH_AGENT`'s self-feeding loop into `CONTENT_PIPELINE`
+/// reaches the same configured endpoint a served `CONTENT_PIPELINE` run's
+/// own dispatch does.
 pub fn register_research_agent(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::research_agent::graph::schema(),
@@ -110,8 +120,18 @@ pub fn register_research_agent(dispatcher: &mut Dispatcher) {
                     &PolicyConfigSource::Builtin,
                 )
                 .map_err(|err| err.to_string())?;
-            let registry =
+            let mut registry =
                 engine_core::workflows::research_agent::graph::registry_for_policy(&policy);
+            registry.register(Box::new(
+                engine_core::workflows::research_agent::ingress_dispatch::ResearchIngressDispatchNode::new()
+                    .with_enabled(policy.ingress_dispatch.enabled)
+                    .with_target_workflow_type(policy.ingress_dispatch.target_workflow_type.clone())
+                    .with_transport(
+                        engine_core::nodes::channel_transport::channel_transport_live(
+                            events_url_from_env(),
+                        ),
+                    ),
+            ));
             let seeded = seed_resolved_policy(&policy)?;
             Ok(Workflow::new(
                 registry,
@@ -509,6 +529,34 @@ mod tests {
             config.connections.is_empty(),
             "ResearchIngressDispatchNode should have no outgoing edges"
         );
+    }
+
+    /// `EN.6.E`: a served `RESEARCH_AGENT` dispatch still builds a runnable
+    /// `Workflow` when `ENGINE_EVENTS_URL` is configured, and the
+    /// `ResearchIngressDispatchNode` re-registration does not disturb the
+    /// rest of the policy-aware assembly — mirrors
+    /// `dispatch_with_event_builds_content_pipeline_with_a_configured_events_url`.
+    #[test]
+    fn dispatch_with_event_builds_research_agent_with_a_configured_events_url() {
+        unsafe {
+            std::env::set_var(EVENTS_URL_ENV, "https://engine.example.com/events/");
+        }
+
+        let mut dispatcher = Dispatcher::new();
+        register_research_agent(&mut dispatcher);
+
+        let workflow = dispatcher.dispatch_with_event(
+            "RESEARCH_AGENT",
+            &serde_json::json!({ "mode": "company", "company_name": "Acme" }),
+        );
+
+        unsafe {
+            std::env::remove_var(EVENTS_URL_ENV);
+        }
+
+        let workflow =
+            workflow.expect("RESEARCH_AGENT should dispatch with a configured events URL");
+        let _ = workflow;
     }
 
     #[test]

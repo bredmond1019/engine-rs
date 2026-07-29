@@ -41,7 +41,8 @@ use serde_json::{json, Value};
 
 use crate::node::{Node, NodeError};
 use crate::nodes::channel_transport::{
-    channel_transport_live, ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody,
+    channel_transport_live, receipt_from_send_result, ChannelTransport, OutboundAction,
+    OutboundBody, DEFAULT_EVENTS_URL,
 };
 use crate::nodes::materialize_doc;
 use crate::workflows::{get_result, put_result};
@@ -51,13 +52,6 @@ use super::policy::{IngressDispatch, ResearchAgentPolicy};
 /// The `Node::name()` identity `ResearchIngressDispatchNode` runs under,
 /// and the `ctx.nodes` key its result is stamped onto.
 pub const NODE_NAME: &str = "ResearchIngressDispatchNode";
-
-/// The default `/events/` URL the live default `ChannelTransport` targets —
-/// mirrors `content_pipeline::action_dispatch::DEFAULT_EVENTS_URL`'s
-/// placeholder-until-wired convention rather than inventing a new
-/// configuration surface (the URL is deployment topology, not a policy
-/// knob; see the spec's Notes).
-const DEFAULT_EVENTS_URL: &str = "http://localhost:8080/events/";
 
 /// The two research terminal nodes, in the order this node prefers reading
 /// their stored output — mirrors the `with_source_nodes` preference
@@ -122,14 +116,23 @@ impl ResearchIngressDispatchNode {
     /// stamped `ResolvedPolicy` (`crate::policy::RESOLVED_POLICY_IDENTITY`)
     /// when present — the same stamp the two terminal research nodes read
     /// via `crate::policy::resolved_policy_strict` — falling back to this
-    /// node's own `enabled`/`target_workflow_type` fields when absent.
-    fn resolve_dispatch(&self, ctx: &TaskContext) -> IngressDispatch {
+    /// node's own `enabled`/`target_workflow_type` fields only when no stamp
+    /// is present at all (a narrow unit test driving this node in
+    /// isolation). A stamp that *is* present but fails to deserialize (a
+    /// corrupted or mismatched `ResolvedPolicy`) propagates as a hard
+    /// error, same as `CompanyResearchNode`/`ProspectingResearchNode` — a
+    /// silent fallback there would mask a serialization regression as a
+    /// quiet no-op instead of failing loudly.
+    fn resolve_dispatch(&self, ctx: &TaskContext) -> Result<IngressDispatch, NodeError> {
         match crate::policy::resolved_policy_strict::<ResearchAgentPolicy>(ctx) {
-            Ok(policy) => policy.ingress_dispatch,
-            Err(_) => IngressDispatch {
-                enabled: self.enabled,
-                target_workflow_type: self.target_workflow_type.clone(),
-            },
+            Ok(policy) => Ok(policy.ingress_dispatch),
+            Err(err) if err.message.contains("no resolved policy stamped") => {
+                Ok(IngressDispatch {
+                    enabled: self.enabled,
+                    target_workflow_type: self.target_workflow_type.clone(),
+                })
+            }
+            Err(err) => Err(err),
         }
     }
 }
@@ -183,7 +186,7 @@ fn resolve_envelope_id(ctx: &TaskContext) -> Result<String, NodeError> {
 #[async_trait::async_trait]
 impl Node for ResearchIngressDispatchNode {
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        let dispatch = self.resolve_dispatch(&ctx);
+        let dispatch = self.resolve_dispatch(&ctx)?;
 
         if !dispatch.enabled {
             let mut ctx = ctx;
@@ -200,7 +203,30 @@ impl Node for ResearchIngressDispatchNode {
         }
 
         let research_output = read_research_output(&ctx)?;
-        let envelope_id = resolve_envelope_id(&ctx)?;
+
+        // A materialize that legitimately planned zero actions (e.g.
+        // re-researching a company whose opportunity doc is already up to
+        // date) stamps no path and leaves no `envelope_id` to derive from.
+        // That is this run succeeding with nothing new to dispatch, not a
+        // failure — skip the dispatch in place rather than failing the run
+        // via `?`, matching the disabled branch's no-op shape.
+        let envelope_id = match resolve_envelope_id(&ctx) {
+            Ok(id) => id,
+            Err(_) => {
+                let mut ctx = ctx;
+                put_result(
+                    &mut ctx,
+                    NODE_NAME,
+                    json!({
+                        "skipped": true,
+                        "enabled": true,
+                        "target_workflow_type": dispatch.target_workflow_type,
+                        "reason": "no_envelope_id_to_derive_from",
+                    }),
+                );
+                return Ok(ctx);
+            }
+        };
         let chain_depth = ctx
             .event
             .get("chain_depth")
@@ -235,13 +261,7 @@ impl Node for ResearchIngressDispatchNode {
             },
         };
 
-        let receipt = match self.transport.send(&action).await {
-            Ok(receipt) => receipt,
-            Err(err) => ChannelSendReceipt {
-                delivered: false,
-                detail: err,
-            },
-        };
+        let receipt = receipt_from_send_result(self.transport.send(&action).await);
 
         let mut ctx = ctx;
         put_result(
@@ -300,6 +320,57 @@ mod tests {
             json!({ "paths": ["opportunities/acme-corp.md"] }),
         );
         ctx
+    }
+
+    #[tokio::test]
+    async fn no_op_materialize_skips_dispatch_without_failing_the_run() {
+        // MaterializeDocNode legitimately stamps an empty `paths` list when
+        // it finds nothing new to write (e.g. re-researching a company
+        // whose opportunity doc is already up to date) — this must be a
+        // soft no-op here too, not a hard failure of the whole run.
+        let stub = Arc::new(StubChannelTransport::succeeding());
+        let node = ResearchIngressDispatchNode::new()
+            .with_transport(stub.clone())
+            .with_enabled(true);
+
+        let mut ctx = base_ctx(json!({}));
+        put_result(&mut ctx, "CompanyResearchNode", research_output());
+        put_result(&mut ctx, materialize_doc::NODE_NAME, json!({ "paths": [] }));
+
+        let ctx = node
+            .process(ctx)
+            .await
+            .expect("a no-op materialize must not fail the run");
+
+        assert!(
+            stub.calls().is_empty(),
+            "no path to derive an envelope_id from should send nothing"
+        );
+        let stored = &ctx.nodes[NODE_NAME];
+        assert_eq!(stored["skipped"], json!(true));
+        assert_eq!(stored["enabled"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn corrupted_resolved_policy_stamp_fails_the_run() {
+        // Unlike a missing stamp (an acceptable, narrow-unit-test fallback),
+        // a stamp that is present but fails to deserialize must propagate,
+        // matching CompanyResearchNode/ProspectingResearchNode's behavior.
+        let stub = Arc::new(StubChannelTransport::succeeding());
+        let node = ResearchIngressDispatchNode::new().with_transport(stub.clone());
+
+        let mut ctx = ctx_with_research_output(json!({}));
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            json!({ "not": "a valid ResearchAgentPolicy" }),
+        );
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("a corrupted resolved-policy stamp must fail the run");
+        assert!(err.message.contains("failed to parse resolved policy"));
+        assert!(stub.calls().is_empty());
     }
 
     #[tokio::test]
