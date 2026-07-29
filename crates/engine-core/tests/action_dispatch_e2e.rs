@@ -64,7 +64,9 @@ use engine_core::node::NodeRegistry;
 use engine_core::nodes::channel_transport::{
     channel_transport_live, ChannelTransport, StubChannelTransport, WorkflowTriggerDispatch,
 };
+use engine_core::nodes::doc_materializer::{MaterializeOutcome, StubDocMaterializer};
 use engine_core::nodes::http_post::StubHttpPost;
+use engine_core::nodes::materialize_doc::MaterializeDocNode;
 use engine_core::workflow::Workflow;
 use engine_core::workflows::content_pipeline::action_dispatch::{ActionDispatchNode, NODE_NAME};
 use engine_core::workflows::content_pipeline::critic_router::CriticRouterNode;
@@ -77,6 +79,7 @@ use engine_core::workflows::content_pipeline::fetch_transcript::{
 };
 use engine_core::workflows::content_pipeline::graph;
 use engine_core::workflows::content_pipeline::increment_critic_iteration::IncrementCriticIterationNode;
+use engine_core::workflows::content_pipeline::learning_artifact::LearningArtifactPayloadNode;
 use engine_core::workflows::content_pipeline::normalize_channel_content::NormalizeChannelContentNode;
 use engine_core::workflows::content_pipeline::persist_to_brain::PersistToBrainNode;
 use engine_core::workflows::content_pipeline::policy::{ContentPipelinePolicy, ModelTier};
@@ -281,6 +284,17 @@ fn build_registry(stubs: &Stubs, transport: Arc<dyn ChannelTransport>) -> NodeRe
         TranslateNode::new().with_transport(stubs.translate.clone()),
     ));
     registry.register(Box::new(DigestRenderNode));
+    // `EN.7.D`'s materialize tail. This suite is about egress, so the seam
+    // is stubbed and the brain root pinned — nothing here touches disk.
+    registry.register(Box::new(LearningArtifactPayloadNode));
+    registry.register(Box::new(
+        MaterializeDocNode::new("learning-artifact")
+            .with_source_node("LearningArtifactPayloadNode")
+            .with_materializer(Arc::new(StubDocMaterializer::succeeding(
+                MaterializeOutcome::default(),
+            )))
+            .with_brain_root("/tmp/brain"),
+    ));
     registry.register(Box::new(
         PersistToBrainNode::new()
             .with_http_post(Arc::new(stubs.http_post.clone()))
