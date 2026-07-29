@@ -105,16 +105,22 @@ None known at initialization.
 ## Build / test / run
 
 ```bash
-# Replace with this project's actual commands.
-# <install>
-# <build>
-# <test>
-# <run>
+cargo build
+cargo test --lib --workspace   # fast — use this, not plain `cargo test`
+cargo run
 ```
 
+> **Always prefer `cargo test --lib --workspace` over plain `cargo test` in this repo.** The
+> full `cargo test` (unit + integration + doctests across the workspace) takes several minutes;
+> `--lib --workspace` runs only the unit tests and is dramatically faster for the same-signal
+> inner loop. This is already wired as the `fastCommand` on the `test` check in
+> `planning/harness.json`, which the SDLC engines use for per-task (`testDepth: "fast"`) runs —
+> but reach for it manually too, any time you're iterating and don't need the full gate (e.g.
+> quick sanity checks between edits, or triage loops outside the harness).
+>
 > The SDLC pipeline reads its validation suite from `planning/harness.json` (not from this
-> block). Keep the `<test>`/`<build>` commands here in sync with that file's
-> `validation.checks[]` so humans and the pipeline run the same thing.
+> block). Keep the commands here in sync with that file's `validation.checks[]` so humans and
+> the pipeline run the same thing.
 
 ## Directory map
 
