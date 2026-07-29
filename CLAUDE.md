@@ -118,6 +118,13 @@ cargo run
 > but reach for it manually too, any time you're iterating and don't need the full gate (e.g.
 > quick sanity checks between edits, or triage loops outside the harness).
 >
+> **Scope even narrower while mid-task.** While iterating inside a single task, prefer
+> `cargo test -p <crate> --lib <module::path>` — just the touched crate and module — over even
+> the workspace-wide fast command. Only the task(s) explicitly designated to own full-suite
+> validation for the spec should run the workspace-wide `fastCommand` or the full
+> `cargo test` / `cargo build --release` gates; every other task should stay scoped to what it
+> touched and defer the broad run.
+>
 > The SDLC pipeline reads its validation suite from `planning/harness.json` (not from this
 > block). Keep the commands here in sync with that file's `validation.checks[]` so humans and
 > the pipeline run the same thing.
