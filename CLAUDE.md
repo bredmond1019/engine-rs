@@ -118,23 +118,36 @@ cargo nextest run --lib --workspace   # fast — use this, not plain `cargo test
 cargo run
 ```
 
-> **Always prefer `cargo nextest run --lib --workspace` over plain `cargo test` in this repo.**
-> The full `cargo test` (unit + integration + doctests across the workspace) takes several
-> minutes — largely link time: `engine-core` alone compiles 25+ integration-test binaries, each
-> statically linking the whole crate + dependency graph. `nextest` runs every test binary as a
-> parallel OS process instead of libtest's serial-per-binary model, which cuts wall-clock
-> dramatically for this shape of workspace (1022 unit tests in ~3.5s). This is wired as the
-> `fastCommand` on the `test` check in `planning/harness.json`, which the SDLC engines use for
-> per-task (`testDepth: "fast"`) runs — but reach for it manually too, any time you're iterating
-> and don't need the full gate (e.g. quick sanity checks between edits, or triage loops outside
-> the harness). Requires `cargo-nextest` on PATH (`brew install cargo-nextest`); `cargo test` is
-> still the authoritative full-suite gate and needs no plugin.
+> **`cargo nextest run`, never plain `cargo test`** (standing rule 7, enforced by a `PreToolUse`
+> hook in `.claude/settings.json`). `nextest` runs each test in its own process in parallel,
+> rather than libtest's serial-per-binary model.
 >
-> **`sccache` is wired in via `.cargo/config.toml`** (`rustc-wrapper = "sccache"`) — it caches
-> compiled object code across builds, so repeated compiles within the same SDLC spec (agent to
-> agent, task to task) reuse work instead of recompiling the same dependency graph from scratch.
-> Requires `sccache` on PATH (`brew install sccache`); no other setup needed, it's transparent to
-> every `cargo` invocation.
+> **The cost in this repo is LINKING, not testing.** Measured 2026-07-29: running the full
+> workspace suite takes ~2s; everything else was compile and link. Three fixes came out of that
+> measurement, and the numbers below are why they must not be casually undone:
+>
+> | | before | after |
+> |---|---|---|
+> | Full suite build (after a one-line `engine-core` edit) | 2m24s | **35s** |
+> | Full suite run | 58s | **2.2s** |
+> | Full suite, nothing changed | minutes | **2.9s** |
+> | Per-task tripwire (`--lib --workspace`, after an `engine-core` edit) | 2m44s | **1m17s** |
+>
+> 1. **One integration-test binary per crate, not one per file.** cargo builds a separate binary
+>    for every `tests/*.rs`, each statically linking the crate plus its ~345-crate dependency
+>    graph — 25 binaries x ~20MB of linking on every full run. All of `engine-core`'s integration
+>    tests are now modules of a single binary: **add a new one at `crates/engine-core/tests/it/<name>.rs`
+>    and declare `mod <name>;` in `crates/engine-core/tests/it/main.rs`.** Do NOT add a new
+>    `crates/engine-core/tests/*.rs` file — that silently reintroduces a second binary. Per-test
+>    isolation is unaffected because nextest forks a process per test regardless; this collapse
+>    would NOT be safe under plain `cargo test`.
+> 2. **No `sccache`.** It was wired in `6ccbcce` and measured doing literally nothing —
+>    `sccache --show-stats` reported 25 compile requests and **0 executed, 0 hits, 0 misses**,
+>    because it refuses to cache incremental compilations and cargo passes `-C incremental` for
+>    the test profile. Incremental compilation is the right trade for a loop that re-edits one
+>    crate 10-30 times; see `.cargo/config.toml` for the full rationale before re-adding it.
+> 3. **`[profile.dev]` link-time settings in `Cargo.toml`** (`debug = "line-tables-only"`,
+>    `split-debuginfo = "unpacked"`) — keep backtraces, drop the expensive DWARF/dsymutil work.
 >
 > **Scope even narrower while mid-task.** While iterating inside a single task, prefer
 > `cargo nextest run -p <crate> <module::path>` — just the touched crate and module — over even
@@ -142,6 +155,14 @@ cargo run
 > validation for the spec should run the workspace-wide `fastCommand` or the full
 > `cargo test` / `cargo build --release` gates; every other task should stay scoped to what it
 > touched and defer the broad run.
+>
+> **A task that cannot break the build should not pay for one.** `tasks.json`'s
+> `validation_commands` is now honoured by `/sdlc-flow` and `/sdlc-task`: a task declaring a
+> non-empty array runs exactly those commands as its per-task tripwire instead of the
+> project-wide gating checks. Use it for docs-only and config-only tasks — a markdown edit does
+> not need a Rust compile. The end review still runs the full harness suite over the integrated
+> tree, so nothing escapes validation; this changes only what the *tripwire* costs. Leave the
+> field `[]` for any task that touches `.rs` files.
 >
 > The SDLC pipeline reads its validation suite from `planning/harness.json` (not from this
 > block). Keep the commands here in sync with that file's `validation.checks[]` so humans and

@@ -1,5 +1,22 @@
-# Compilation cache — reuses object code across builds/tasks in the same SDLC spec instead of
-# recompiling the same dependency graph from scratch every time. No effect on test *behavior*,
-# only on how fast `cargo build`/`cargo test`/`cargo nextest run` get there.
-[build]
-rustc-wrapper = "sccache"
+# Build configuration for local + SDLC-pipeline iteration.
+#
+# NO `rustc-wrapper = "sccache"` HERE — DELIBERATE. sccache was wired in 6ccbcce to speed up the
+# per-task test loop; measurement on 2026-07-29 showed it was doing nothing at all:
+#
+#   $ sccache --show-stats
+#   Compile requests            25
+#   Compile requests executed    0     <-- every request rejected as non-cacheable
+#   Cache hits                   0
+#   Cache misses                 0
+#
+# sccache refuses to cache incremental compilations, and cargo passes `-C incremental=...` for the
+# dev/test profile — so every rustc call fell straight through to plain rustc plus a wrapper hop.
+# The two are mutually exclusive: making sccache work means CARGO_INCREMENTAL=0, which is the wrong
+# trade for this repo's workload (a per-task loop that re-edits ONE crate 10-30 times in a row is
+# exactly what incremental compilation is for). Incremental wins; sccache is gone.
+#
+# If you ever want sccache back (e.g. for cold CI builds, where there is no incremental state to
+# reuse), set it there via the RUSTC_WRAPPER env var together with CARGO_INCREMENTAL=0 — not here.
+#
+# The real cost centre in this repo is LINKING, not compilation: see `[profile.dev]` in Cargo.toml
+# and the single-integration-test-binary layout in crates/engine-core/tests/.

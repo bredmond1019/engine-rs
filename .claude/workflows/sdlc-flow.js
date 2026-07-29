@@ -207,6 +207,24 @@ const ENUMERATE_SCHEMA = {
   properties: {
     hasTasks: { type: 'boolean', description: 'true if tasks.json parses as a non-empty array' },
     allTasks: { type: 'array', items: { type: 'integer' }, description: 'Every task_id in tasks.json, in array order' },
+    // Per-task validation override. `validation_commands` is a real field in orchestrator's SDLCTask
+    // schema that this engine used to ignore entirely. Honouring it lets a spec declare that a
+    // given task needs a CHEAPER (or no) tripwire than the harness-wide gating set — the payoff is
+    // largest in compile-expensive repos, where a docs-only or config-only task otherwise pays a
+    // full build to validate a markdown edit. Empty array => fall back to the harness checks, so
+    // every existing spec behaves exactly as before.
+    taskChecks: {
+      type: 'array',
+      description: "One entry per task that declares a non-empty validation_commands array. Omit tasks whose validation_commands is absent or empty.",
+      items: {
+        type: 'object',
+        required: ['taskId', 'validationCommands'],
+        properties: {
+          taskId:             { type: 'integer' },
+          validationCommands: { type: 'array', items: { type: 'string' } }
+        }
+      }
+    },
     notes:    { type: 'string' }
   }
 }
@@ -937,7 +955,12 @@ STEP 2 — Parse it as JSON. It is a BARE ARRAY (not wrapped in an object — ma
   SDLCTask schema). Collect every task's "task_id" (in array order) into allTasks.
   Set hasTasks=true iff it parsed as an array with at least one entry.
 
-Return via StructuredOutput: hasTasks, allTasks (integers in order), notes.
+STEP 3 — Per-task validation overrides. For each task whose "validation_commands" is present AND a
+  non-empty array, add {taskId, validationCommands} to taskChecks. Skip every task whose
+  "validation_commands" is absent, null, or [] — those fall back to the project-wide harness checks.
+  Copy the command strings VERBATIM; do not normalize, reorder, or invent commands.
+
+Return via StructuredOutput: hasTasks, allTasks (integers in order), taskChecks, notes.
 `, withModel({ label: 'enumerate', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
 
 if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) {
@@ -950,6 +973,19 @@ if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) 
 const allTasks = enumResult.allTasks
 let taskList = selectedTasks ? allTasks.filter(n => selectedTasks.has(n)) : allTasks.slice()
 log(`Tasks in spec: ${allTasks.join(', ')}${selectedTasks ? ` | selected: ${taskList.join(', ')}` : ''}`)
+
+// Per-task validation overrides from tasks.json's `validation_commands` (see ENUMERATE_SCHEMA).
+// Returns null when the task declared none, which means "use the harness gating checks" — the
+// pre-existing behaviour for every task in every existing spec.
+const taskCheckMap = new Map(
+  (enumResult.taskChecks || [])
+    .filter(tc => tc && Number.isInteger(tc.taskId) && Array.isArray(tc.validationCommands) && tc.validationCommands.length)
+    .map(tc => [tc.taskId, tc.validationCommands])
+)
+function taskCommandsFor(taskNum) { return taskCheckMap.get(taskNum) || null }
+if (taskCheckMap.size) {
+  log(`Per-task validation overrides (tasks.json validation_commands): ${[...taskCheckMap.keys()].sort((a, b) => a - b).join(', ')} — these tasks skip the project-wide harness tripwire.`)
+}
 
 // Resume: load the committed state.json to skip already-passed tasks. Also seeds the in-memory
 // `state.tasks` with the FULL prior tasks object — writeFlowState() serializes `state` wholesale on
@@ -1013,14 +1049,31 @@ const BAIL_REASONS = [
 // Test stage helper (shared by per-task tripwire + the review's re-run)
 // gatingOnly=true → fast tripwire (gating checks); false → full authoritative suite.
 // ----------------------------------------------------------------
-async function runTests(label, { gatingOnly }) {
+// Render a per-task validation override (tasks.json `validation_commands`) as a check list in the
+// same shape renderCheckList emits, so the test agent's instructions are identical either way.
+function renderTaskCheckList(commands, cwd) {
+  const cd = cwd ? `cd ${cwd} && ` : ''
+  return commands.map((cmd, i) => {
+    const n = i + 1
+    return `CHECK ${n} — task_validation_${n} (per-task validation_commands override from tasks.json) [GATING — a failure here blocks the verdict]:
+  ${cd}${cmd}
+  echo "CHECK${n}_EXIT:$?"`
+  }).join('\n\n')
+}
+
+async function runTests(label, { gatingOnly, taskCommands = null }) {
+  const usingOverride = Array.isArray(taskCommands) && taskCommands.length > 0
   return tracedAgent(`${W}
 You are the test agent for the /sdlc-flow pipeline. Run the project's validation checks and report.
 
-IMPORTANT — run ONLY the checks enumerated below (from planning/harness.json + the spec). Do NOT invent
+IMPORTANT — run ONLY the checks enumerated below (${usingOverride
+    ? "this task declares its OWN validation_commands in tasks.json, which REPLACE the project-wide harness checks for this task — the full harness suite still runs at the end review"
+    : 'from planning/harness.json + the spec'}). Do NOT invent
 checks. All Bash calls run from the worktree root (prefix each with: cd ${worktreePath} &&).
 
-${renderCheckList(harnessCfg, { gatingOnly, cwd: worktreePath })}
+${usingOverride
+    ? renderTaskCheckList(taskCommands, worktreePath)
+    : renderCheckList(harnessCfg, { gatingOnly, cwd: worktreePath })}
 
 Then run the universal emoji gate (a harness rule, always): scan the files changed on this branch for
 emoji in markdown/docs (excluding the literal "🤖 Generated with Claude Code" PR footer if present).
@@ -1161,10 +1214,15 @@ Return via StructuredOutput:
     if (Array.isArray(stageResult.filesModified)) t.files_changed = [...new Set([...(t.files_changed || []), ...stageResult.filesModified])]
     if (Array.isArray(stageResult.decisions) && stageResult.decisions.length) t.decisions = [...(t.decisions || []), ...stageResult.decisions]
 
-    // 3. Fast test (tripwire) — gating checks only unless testDepth=full.
-    const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast' })
+    // 3. Fast test (tripwire) — gating checks only unless testDepth=full. A task that declares its
+    //    own `validation_commands` in tasks.json runs THOSE instead (the end review still runs the
+    //    full harness suite over the integrated tree, so nothing escapes validation — this only
+    //    changes what the per-task tripwire costs).
+    const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast', taskCommands: taskCommandsFor(taskNum) })
     if (testResult && testResult.allPassed) {
-      t.validated = testDepth === 'fast' ? 'gating checks (fast tripwire)' : 'full gating suite'
+      t.validated = taskCommandsFor(taskNum)
+        ? 'per-task validation_commands (tasks.json override)'
+        : (testDepth === 'fast' ? 'gating checks (fast tripwire)' : 'full gating suite')
       taskPassed = true
       break
     }

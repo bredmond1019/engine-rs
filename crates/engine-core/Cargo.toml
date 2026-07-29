@@ -24,3 +24,13 @@ okf-core = { workspace = true }
 tokio = { workspace = true }
 engine-serve = { path = "../engine-serve" }
 tempfile = { workspace = true }
+
+# ONE integration-test binary, not one per file. cargo builds a separate binary for every
+# `tests/*.rs`, and each statically links this crate plus its ~345-crate dependency graph — at 25
+# files that was ~25 x 20MB of linking per full test run, measured (2026-07-29) as the largest
+# single cost in this repo's SDLC loop. Every integration test now lives in `tests/it/<name>.rs`
+# and is declared as a module in `tests/it/main.rs`. Per-test isolation is unchanged: `cargo
+# nextest run` (CLAUDE.md standing rule 7) runs each test in its own process regardless.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
