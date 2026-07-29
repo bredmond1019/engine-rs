@@ -7,7 +7,7 @@ layer: [engine, factory]
 project: engine-rs
 status: active
 keywords: [opportunity-edit, set-stage, add-action, opportunity-edit-node, doc-materializer, mev, idempotency, E_DOC_BAD_STAGE, ENGINE_BRAIN_ROOT, D53]
-related: [materialize-doc-node, research-agent-workflow, architecture, data-contract, D53-engine-executes-mev-writes-brain-docs]
+related: [materialize-doc-node, research-agent-workflow, architecture, data-contract, D53-engine-executes-mev-writes-brain-docs, harvest-gate]
 ---
 
 # Opportunity Edit Workflows
@@ -186,3 +186,13 @@ intentional, the same "a run now fails loudly rather than silently no-opping" po
   (`EN.4.E`), which is not shipped. Adding a third `OpportunityEdit` variant later is a small
   additive change, not a redesign.
 - The bastion-web trigger UI / BFF that will actually POST these payloads — `BW.7.A`.
+
+## See also — the pattern this block's micro-workflows established
+
+`EN.7.C`'s `HARVEST_APPROVE` micro-workflow (the human-approval completion hop for a deferred
+harvest) copies this block's single-node, both-start-and-terminal, no-router shape verbatim: no
+`policy` module, no `profiles` module, no `harness.json` section — `HarvestApproveNode`, like
+`OpportunityEditNode`, calls no model and reads no policy layer, so `register_harvest_approve`
+resolves no policy and seeds no policy stamp, exactly like `register_opportunity_set_stage` /
+`register_opportunity_add_action` above. See [harvest-gate.md](harvest-gate.md) for the full
+gate and the `HARVEST_APPROVE` hand-off.

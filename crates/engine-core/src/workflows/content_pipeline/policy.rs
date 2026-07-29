@@ -18,11 +18,16 @@
 //! config only — there is no `dispatch` entry in `ModelTiers`, no rewire
 //! branch in `graph::registry_for_policy`, and it is never Local-eligible.
 //!
+//! `EN.7.C` adds a `harvest` knob on the same non-model `persist` stage — it
+//! has no `ModelTier`, never rewires to Local, and its default (`off`)
+//! intentionally differs from the pre-block always-push behavior.
+//!
 //! Built on `EN.5.D`'s derived [`crate::policy::Overlay`] — this module does
 //! not hand-write another `merge_opt`/`merge_local`/`apply_override` trio.
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::nodes::harvest_gate::HarvestMode;
 pub use crate::policy::tier::{LocalConfig, ModelTier, OutputVerbosity};
 pub use crate::policy::PartialLocalConfig;
 use crate::policy::{merge_opt, Overlay};
@@ -100,6 +105,44 @@ impl Overlay for MaterializeConfig {
     }
 }
 
+/// `EN.7.C` harvest knob: whether this run makes an explicit Synapse
+/// ingest POST after materializing the digest.
+///
+/// * `off` (the built-in default) — no explicit POST. The materialized
+///   `.md` is indexed by the existing manifest / `index_brain` freshness
+///   reindex. This is NOT "no indexing"; it is "indexing by the standing
+///   path".
+/// * `in_process` — POST in-run, immediately after the write. For
+///   instant/curated indexing. This is the pre-`EN.7.C` behavior.
+/// * `approval` — no POST in-run; `PersistToBrainNode` stamps a pending
+///   record an operator completes later via the `HARVEST_APPROVE`
+///   workflow, against the SAME endpoint (no second indexing path, D51).
+///
+/// The endpoint address itself is deployment topology, not a policy knob —
+/// see `persist_to_brain::BRAIN_INGEST_URL`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarvestConfig {
+    pub mode: HarvestMode,
+}
+
+/// All-optional mirror of [`HarvestConfig`] for per-field overrides across
+/// the four resolution layers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialHarvestConfig {
+    pub mode: Option<HarvestMode>,
+}
+
+impl Overlay for HarvestConfig {
+    type Partial = PartialHarvestConfig;
+
+    fn overlay(self, over: &Self::Partial) -> Self {
+        HarvestConfig {
+            mode: merge_opt(self.mode, over.mode),
+        }
+    }
+}
+
 /// Hard ceiling on `max_critic_iterations` across every override layer.
 /// A caller-supplied value above this (via `harness.json`, a named
 /// profile, or a per-event override) is rejected by
@@ -159,11 +202,16 @@ pub struct ContentPipelinePolicy {
     /// `PersistToBrainNode`. Built-in default restores the write, at the
     /// runtime-resolved brain root, unconditionally.
     pub materialize: MaterializeConfig,
+    /// `EN.7.C` harvest gate for this workflow's terminal
+    /// `PersistToBrainNode`. Built-in default is `off` — the explicit
+    /// ingest POST is opt-in (see [`HarvestConfig`]).
+    pub harvest: HarvestConfig,
 }
 
 impl Default for ContentPipelinePolicy {
     /// The safe default: normal verbosity, all-Sonnet tiers, prompt-cache
-    /// off, 3 critic iterations max, 0.8 confidence exit threshold.
+    /// off, 3 critic iterations max, 0.8 confidence exit threshold, harvest
+    /// off (freshness reindex).
     fn default() -> Self {
         Self {
             output_verbosity: OutputVerbosity::Normal,
@@ -174,6 +222,7 @@ impl Default for ContentPipelinePolicy {
             critic_confidence_threshold: 0.8,
             dispatch_verbosity: OutputVerbosity::Normal,
             materialize: MaterializeConfig::default(),
+            harvest: HarvestConfig::default(),
         }
     }
 }
@@ -203,6 +252,7 @@ pub struct PartialContentPipelinePolicy {
     pub critic_confidence_threshold: Option<f64>,
     pub dispatch_verbosity: Option<OutputVerbosity>,
     pub materialize: Option<PartialMaterializeConfig>,
+    pub harvest: Option<PartialHarvestConfig>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -251,6 +301,10 @@ impl crate::policy::Policy for ContentPipelinePolicy {
             materialize: match &over.materialize {
                 Some(m) => base.materialize.overlay(m),
                 None => base.materialize,
+            },
+            harvest: match &over.harvest {
+                Some(h) => base.harvest.overlay(h),
+                None => base.harvest,
             },
         }
     }
@@ -668,5 +722,122 @@ mod tests {
             ..ContentPipelinePolicy::default()
         };
         assert!(validate_bounds(&high).is_ok());
+    }
+
+    // -- EN.7.C harvest knob --------------------------------------------
+
+    #[test]
+    fn default_policy_harvest_mode_is_off() {
+        // Deliberate EN.7.C behavior change: failing here means someone
+        // restored the pre-block always-push default silently.
+        assert_eq!(
+            ContentPipelinePolicy::default().harvest.mode,
+            HarvestMode::Off
+        );
+    }
+
+    #[test]
+    fn apply_with_no_harvest_override_leaves_the_base_untouched() {
+        let base = ContentPipelinePolicy {
+            harvest: HarvestConfig {
+                mode: HarvestMode::InProcess,
+            },
+            ..ContentPipelinePolicy::default()
+        };
+        let resolved = crate::policy::Policy::apply(base, &PartialContentPipelinePolicy::default());
+        assert_eq!(resolved.harvest.mode, HarvestMode::InProcess);
+    }
+
+    #[test]
+    fn apply_with_a_harvest_override_wins() {
+        let over = PartialContentPipelinePolicy {
+            harvest: Some(PartialHarvestConfig {
+                mode: Some(HarvestMode::Approval),
+            }),
+            ..Default::default()
+        };
+        let resolved = crate::policy::Policy::apply(ContentPipelinePolicy::default(), &over);
+        assert_eq!(resolved.harvest.mode, HarvestMode::Approval);
+    }
+
+    #[test]
+    fn layering_two_partials_lands_the_higher_precedence_mode() {
+        let profile = PartialContentPipelinePolicy {
+            harvest: Some(PartialHarvestConfig {
+                mode: Some(HarvestMode::InProcess),
+            }),
+            ..Default::default()
+        };
+        let event = PartialContentPipelinePolicy {
+            harvest: Some(PartialHarvestConfig {
+                mode: Some(HarvestMode::Approval),
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ContentPipelinePolicy::default(),
+            None,
+            Some(&profile),
+            Some(&event),
+        );
+        assert_eq!(resolved.harvest.mode, HarvestMode::Approval);
+    }
+
+    #[test]
+    fn full_four_layer_harvest_resolution_lands_the_event_mode() {
+        let harness = PartialContentPipelinePolicy {
+            harvest: Some(PartialHarvestConfig {
+                mode: Some(HarvestMode::Off),
+            }),
+            ..Default::default()
+        };
+        let profile = PartialContentPipelinePolicy {
+            harvest: Some(PartialHarvestConfig {
+                mode: Some(HarvestMode::InProcess),
+            }),
+            ..Default::default()
+        };
+        let event = PartialContentPipelinePolicy {
+            harvest: Some(PartialHarvestConfig {
+                mode: Some(HarvestMode::Approval),
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ContentPipelinePolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        assert_eq!(resolved.harvest.mode, HarvestMode::Approval);
+    }
+
+    #[test]
+    fn partial_harvest_config_deserializes_from_an_absent_key() {
+        let partial: PartialContentPipelinePolicy =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(partial.harvest, None);
+    }
+
+    #[test]
+    fn partial_harvest_config_deserializes_the_three_mode_spellings() {
+        for (spelling, expected) in [
+            ("off", HarvestMode::Off),
+            ("in_process", HarvestMode::InProcess),
+            ("approval", HarvestMode::Approval),
+        ] {
+            let json = serde_json::json!({"harvest": {"mode": spelling}});
+            let partial: PartialContentPipelinePolicy = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                partial.harvest,
+                Some(PartialHarvestConfig {
+                    mode: Some(expected)
+                })
+            );
+        }
+
+        let bad = serde_json::json!({"harvest": {"mode": "sometimes"}});
+        let result: Result<PartialContentPipelinePolicy, _> = serde_json::from_value(bad);
+        assert!(result.is_err());
     }
 }

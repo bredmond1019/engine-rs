@@ -95,7 +95,20 @@ housekeeping. There is no global scheduler.
    - *Where feasible* is a real qualifier: a value fixed by an external contract (a wire format, a
      required header, an interface another repo pins) is not a knob. Say so in a comment rather than
      leaving the next reader to wonder.
-7. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
+7. **Use `cargo nextest run`, never plain `cargo test`, for any test run you invoke yourself
+   during a task** (scoped to a module: `cargo nextest run -p <crate> <module::path>`; workspace-
+   wide fast check: `cargo nextest run --lib --workspace`). A `PreToolUse` hook in
+   `.claude/settings.json` enforces this. Beyond the parallelism, nextest's process-per-test model
+   is what makes the single-integration-test-binary layout (rule 8) safe — the two go together.
+   The one exception is the task explicitly designated to own full-suite validation for a spec —
+   that task runs `planning/harness.json`'s authoritative `command` (`cargo nextest run
+   --workspace` + `cargo build --release`), not `fastCommand`.
+8. **One integration-test binary per crate.** New integration suites go in
+   `crates/engine-core/tests/it/<name>.rs` with a `mod <name>;` line in `tests/it/main.rs` — never
+   a new `crates/engine-core/tests/*.rs` file, which cargo builds as a separate binary that
+   statically re-links the whole ~345-crate graph. See [`docs/testing.md`](docs/testing.md) and
+   "Build / test / run" below.
+9. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
    boundaries, code style, etc.). -->
 
 ## Known bugs
@@ -105,16 +118,66 @@ None known at initialization.
 ## Build / test / run
 
 ```bash
-# Replace with this project's actual commands.
-# <install>
-# <build>
-# <test>
-# <run>
+cargo build
+cargo nextest run --lib --workspace   # fast — use this, not plain `cargo test`
+cargo run
 ```
 
+> **`cargo nextest run`, never plain `cargo test`** (standing rule 7, enforced by a `PreToolUse`
+> hook in `.claude/settings.json`). `nextest` runs each test in its own process in parallel,
+> rather than libtest's serial-per-binary model.
+>
+> **The cost in this repo is LINKING, not testing.** Measured 2026-07-29: running the full
+> workspace suite takes ~2s; everything else was compile and link. Full detail in
+> [`docs/testing.md`](docs/testing.md); the cross-project playbook is
+> `base-template/docs/rust-sdlc-iteration-speed.md` (governed by brain decision **D57**). Three
+> fixes came out of that measurement, and the numbers below are why they must not be casually undone:
+>
+> | | before | after |
+> |---|---|---|
+> | Per-task tripwire (`--lib --workspace`, after an `engine-core` edit) | 2m44s | **6.4s** |
+> | Full suite build (after a one-line `engine-core` edit) | 2m24s | **5.3s** |
+> | Full suite run | 58s | **2.2s** |
+> | Full suite, nothing changed | minutes | **2.8s** |
+>
+> 1. **One integration-test binary per crate, not one per file.** cargo builds a separate binary
+>    for every `tests/*.rs`, each statically linking the crate plus its ~345-crate dependency
+>    graph — 25 binaries x ~20MB of linking on every full run. All of `engine-core`'s integration
+>    tests are now modules of a single binary: **add a new one at `crates/engine-core/tests/it/<name>.rs`
+>    and declare `mod <name>;` in `crates/engine-core/tests/it/main.rs`.** Do NOT add a new
+>    `crates/engine-core/tests/*.rs` file — that silently reintroduces a second binary. Per-test
+>    isolation is unaffected because nextest forks a process per test regardless; this collapse
+>    would NOT be safe under plain `cargo test`.
+> 2. **No `sccache`.** It was wired in `6ccbcce` and measured doing literally nothing —
+>    `sccache --show-stats` reported 25 compile requests and **0 executed, 0 hits, 0 misses**,
+>    because it refuses to cache incremental compilations and cargo passes `-C incremental` for
+>    the test profile. Incremental compilation is the right trade for a loop that re-edits one
+>    crate 10-30 times; see `.cargo/config.toml` for the full rationale before re-adding it.
+> 3. **`[profile.dev]` link-time settings in `Cargo.toml`** (`debug = "line-tables-only"`,
+>    `split-debuginfo = "unpacked"`) — keep backtraces, drop the expensive DWARF/dsymutil work.
+> 4. **Keep `target/` clean.** Cargo never garbage-collects incremental state. This tree had rotted
+>    to **40GB** (930,599 files), and clearing it was the single largest lever of all — a cold
+>    from-scratch build (48.9s) beat the bloated tree's *incremental* build (2m24s) by ~3x. Run
+>    `du -sh target` when the loop feels slow; `cargo clean` when it passes a few GB.
+>
+> **Scope even narrower while mid-task.** While iterating inside a single task, prefer
+> `cargo nextest run -p <crate> <module::path>` — just the touched crate and module — over even
+> the workspace-wide fast command. Only the task(s) explicitly designated to own full-suite
+> validation for the spec should run the workspace-wide `fastCommand` or the full
+> `cargo test` / `cargo build --release` gates; every other task should stay scoped to what it
+> touched and defer the broad run.
+>
+> **A task that cannot break the build should not pay for one.** `tasks.json`'s
+> `validation_commands` is now honoured by `/sdlc-flow` and `/sdlc-task`: a task declaring a
+> non-empty array runs exactly those commands as its per-task tripwire instead of the
+> project-wide gating checks. Use it for docs-only and config-only tasks — a markdown edit does
+> not need a Rust compile. The end review still runs the full harness suite over the integrated
+> tree, so nothing escapes validation; this changes only what the *tripwire* costs. Leave the
+> field `[]` for any task that touches `.rs` files.
+>
 > The SDLC pipeline reads its validation suite from `planning/harness.json` (not from this
-> block). Keep the `<test>`/`<build>` commands here in sync with that file's
-> `validation.checks[]` so humans and the pipeline run the same thing.
+> block). Keep the commands here in sync with that file's `validation.checks[]` so humans and
+> the pipeline run the same thing.
 
 ## Directory map
 

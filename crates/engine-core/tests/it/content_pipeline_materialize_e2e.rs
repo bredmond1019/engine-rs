@@ -25,6 +25,7 @@ use std::sync::Arc;
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::node::NodeRegistry;
+use engine_core::nodes::harvest_gate::{HarvestGate, HarvestMode};
 use engine_core::nodes::http_post::StubHttpPost;
 use engine_core::nodes::materialize_doc::MaterializeDocNode;
 use engine_core::workflow::Workflow;
@@ -160,7 +161,11 @@ fn registry_at(root: &Path, policy: &ContentPipelinePolicy) -> NodeRegistry {
     registry.register(Box::new(
         PersistToBrainNode::new()
             .with_http_post(Arc::new(StubHttpPost::succeeding(json!({"ok": true}))))
-            .with_url(TEST_BRAIN_URL),
+            .with_url(TEST_BRAIN_URL)
+            // `EN.7.C`: this suite's assertions expect the pre-block
+            // always-push behavior, so it opts explicitly into
+            // `in_process` rather than relying on the new `off` default.
+            .with_harvest(HarvestGate::new(HarvestMode::InProcess)),
     ));
     registry.register(Box::new(
         ActionDispatchNode::new().with_transport(Arc::new(StubChannelTransport::succeeding())),
@@ -402,7 +407,11 @@ async fn materialization_runs_before_the_synapse_push() {
     registry.register(Box::new(
         PersistToBrainNode::new()
             .with_http_post(Arc::new(StubHttpPost::failing("brain unreachable")))
-            .with_url(TEST_BRAIN_URL),
+            .with_url(TEST_BRAIN_URL)
+            // `EN.7.C`: an attempted push must still fail loudly, so this
+            // exercises `in_process` explicitly rather than the new `off`
+            // default (which would never attempt a push at all).
+            .with_harvest(HarvestGate::new(HarvestMode::InProcess)),
     ));
 
     let workflow = Workflow::new_validated(registry, graph::schema())

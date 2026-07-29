@@ -26,8 +26,9 @@ use crate::node::NodeError;
 use crate::policy::PolicyConfigSource;
 
 use super::policy::{
-    self, validate_bounds, ContentPipelinePolicy, ModelTier, OutputVerbosity,
-    PartialContentPipelinePolicy, PartialLocalConfig, PartialMaterializeConfig, PartialModelTiers,
+    self, validate_bounds, ContentPipelinePolicy, HarvestMode, ModelTier, OutputVerbosity,
+    PartialContentPipelinePolicy, PartialHarvestConfig, PartialLocalConfig,
+    PartialMaterializeConfig, PartialModelTiers,
 };
 use super::schema::ContentPipelineInput;
 
@@ -64,6 +65,13 @@ pub fn baseline() -> PartialContentPipelinePolicy {
             corpus_root: Some(None),
             write: Some(true),
         }),
+        // EN.7.C: restates the built-in `HarvestConfig::default()`
+        // (`off`) explicitly — a legible no-op that relies on the existing
+        // manifest/`index_brain` freshness reindex rather than an explicit
+        // Synapse ingest POST.
+        harvest: Some(PartialHarvestConfig {
+            mode: Some(HarvestMode::Off),
+        }),
     }
 }
 
@@ -99,6 +107,12 @@ pub fn local_drafting() -> PartialContentPipelinePolicy {
             corpus_root: None,
             write: Some(true),
         }),
+        // EN.7.C: drafting locally is a model-tier trade, not an indexing
+        // one — the freshness reindex still picks the written doc up, so
+        // this stays off, same as baseline.
+        harvest: Some(PartialHarvestConfig {
+            mode: Some(HarvestMode::Off),
+        }),
     }
 }
 
@@ -127,17 +141,47 @@ pub fn fast_summarize() -> PartialContentPipelinePolicy {
             corpus_root: None,
             write: Some(true),
         }),
+        // EN.7.C: a cheaper summarize tier is a quality trade, not a
+        // curation one — no extra network hop on the run's critical path.
+        harvest: Some(PartialHarvestConfig {
+            mode: Some(HarvestMode::Off),
+        }),
+    }
+}
+
+/// Curated-harvest profile: the one built-in bundle that opts into an
+/// explicit, in-process Synapse ingest POST (`HarvestMode::InProcess`)
+/// rather than relying on the existing manifest/`index_brain` freshness
+/// reindex — for deployments that want instant/curated indexing right
+/// after materialization. Every other knob is untouched (falls through to
+/// whatever layer resolves it) so this profile composes with any model-tier
+/// choice (EN.7.C).
+#[must_use]
+pub fn curated_harvest() -> PartialContentPipelinePolicy {
+    PartialContentPipelinePolicy {
+        output_verbosity: None,
+        prompt_cache: None,
+        model_tiers: None,
+        local: None,
+        max_critic_iterations: None,
+        critic_confidence_threshold: None,
+        dispatch_verbosity: None,
+        materialize: None,
+        harvest: Some(PartialHarvestConfig {
+            mode: Some(HarvestMode::InProcess),
+        }),
     }
 }
 
 /// Resolve a built-in profile bundle by its kebab-case name. Returns `None`
-/// for any name that isn't one of the three canonical profiles.
+/// for any name that isn't one of the four canonical profiles.
 #[must_use]
 pub fn profile_by_name(name: &str) -> Option<PartialContentPipelinePolicy> {
     match name {
         "baseline" => Some(baseline()),
         "local-drafting" => Some(local_drafting()),
         "fast-summarize" => Some(fast_summarize()),
+        "curated-harvest" => Some(curated_harvest()),
         _ => None,
     }
 }
@@ -281,10 +325,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_by_name_resolves_all_three_canonical_names() {
+    fn profile_by_name_resolves_all_four_canonical_names() {
         assert_eq!(profile_by_name("baseline"), Some(baseline()));
         assert_eq!(profile_by_name("local-drafting"), Some(local_drafting()));
         assert_eq!(profile_by_name("fast-summarize"), Some(fast_summarize()));
+        assert_eq!(profile_by_name("curated-harvest"), Some(curated_harvest()));
     }
 
     #[test]
@@ -561,6 +606,46 @@ mod tests {
                 "profile '{name}' should state its on-disk write behavior"
             );
         }
+    }
+
+    // EN.7.C task 3 — the `harvest` knob across the named profiles.
+
+    #[test]
+    fn every_named_profile_sets_harvest_explicitly() {
+        for (name, bundle) in [
+            ("baseline", baseline()),
+            ("local-drafting", local_drafting()),
+            ("fast-summarize", fast_summarize()),
+            ("curated-harvest", curated_harvest()),
+        ] {
+            let harvest = bundle
+                .harvest
+                .unwrap_or_else(|| panic!("profile '{name}' must state the harvest knob"));
+            assert!(
+                harvest.mode.is_some(),
+                "profile '{name}' must state an explicit harvest mode"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_local_drafting_and_fast_summarize_resolve_harvest_off() {
+        for bundle in [baseline(), local_drafting(), fast_summarize()] {
+            let resolved =
+                policy::resolve(ContentPipelinePolicy::default(), None, Some(&bundle), None);
+            assert_eq!(resolved.harvest.mode, HarvestMode::Off);
+        }
+    }
+
+    #[test]
+    fn curated_harvest_profile_resolves_harvest_in_process() {
+        let resolved = policy::resolve(
+            ContentPipelinePolicy::default(),
+            None,
+            Some(&curated_harvest()),
+            None,
+        );
+        assert_eq!(resolved.harvest.mode, HarvestMode::InProcess);
     }
 
     #[test]

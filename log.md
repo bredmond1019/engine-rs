@@ -18,6 +18,57 @@ related: [status, context]
 
 ## [run: 2026-07-29]
 
+### `EN.7.C-materialize-harvest-gate` — the materialize→harvest gate; Phase 7 complete
+- **What:** Ran `/sdlc-flow` for `EN.7.C-materialize-harvest-gate` on branch
+  `EN.7.C-materialize-harvest-gate-flow` (built on top of the already-merged `EN.7.D`). All 10
+  tasks passed, PASS review. Added the generic `HarvestMode`/`HarvestGate` primitive
+  (`off`/`in_process`/`approval`, snake_case serde) under `nodes/harvest_gate.rs`, with a
+  deliberate default of `off` — a real behavior change, since `PersistToBrainNode` previously
+  POSTed to Synapse's ingest endpoint unconditionally (task 1). Added a `harvest` policy knob
+  (`HarvestConfig`/`PartialHarvestConfig`) resolved through the standard four-layer `Overlay`
+  merge (task 2), set explicitly in all three existing named `CONTENT_PIPELINE` profiles plus a
+  new `curated-harvest` profile selecting `in_process` (task 3). `PersistToBrainNode` gained
+  `.with_harvest(HarvestGate)`, branching `process()` into Post/Skip/Defer while always building
+  the payload first and stamping one stable `{posted, skipped, harvest_mode, status, artifact_id,
+  response, pending}` key set across all three modes — the Defer branch builds a
+  `pending_harvest_record` from `MaterializeDocNode`'s stamped paths (task 4). The graph now
+  constructs `PersistToBrainNode` via a single `persist_to_brain_node(&HarvestConfig)` site shared
+  by `registry()`/`registry_for_policy()` so the two paths can never drift (task 5). Added
+  `HarvestApproveNode` (a generic `HttpPost` seam over a pending-harvest record) and the
+  single-node `HARVEST_APPROVE` micro-workflow completing the human-approval hand-off — it
+  re-POSTs the same payload to the same URL the in-process path would have, so there is still only
+  one route into the index (task 6), registered in `engine-serve`'s `register_builtin_workflows`
+  as a model-free workflow like the opportunity-edit micro-workflows (task 7). A hermetic
+  `harvest_gate_e2e` suite (a module in the single `engine-core` `tests/it` binary, not a new test
+  binary) drives a real `CONTENT_PIPELINE` run through all three `HarvestMode` paths plus the
+  `HARVEST_APPROVE` hand-off and a failure case, verifying byte-identical POST payloads and
+  identical materialized `.md` output across modes (task 8). `docs/harvest-gate.md` added
+  (OKF-fronted) and cross-referenced from `docs/index.md`/`architecture.md`/
+  `content-pipeline-workflow.md`/`materialize-doc-node.md`/`opportunity-edit-workflows.md` (task
+  9). Full validation green: fmt, clippy `-D warnings`, full `nextest` workspace suite (1226
+  passed), release build, hermetic e2e (tempdir + `StubHttpPost`, no real network), cross-repo
+  bastion consumer check (task 10). Notable decision: the built-in default for the new knob is
+  `off` rather than the usual "behavior-stable" default CLAUDE.md rule 6 calls for — called out
+  explicitly in the spec as a deliberate operator-directed change, not a side effect, since the
+  block's whole point is to stop the unconditional push and rely on the existing manifest/
+  `index_brain` freshness reindex unless a run explicitly opts in. This closes `EN.7.C` and
+  completes Phase 7 (brain-write loop): `EN.7.A`/`EN.7.B`/`EN.7.D`/`EN.7.C` are all Done.
+  Next: open the `EN.7.C` PR / merge the branch, then pick up `EN.5.B1`, `EN.5.C`, `EN.6.C`/`EN.6.D`,
+  or `EN.4.D` per `planning/status.md`'s `next` list.
+
+```
+46051d1 docs: update docs for EN.7.C-materialize-harvest-gate
+c784aeb feat: implement EN.7.C-materialize-harvest-gate-task9
+a2f07fc feat: implement EN.7.C-materialize-harvest-gate-task8
+a1fe70b feat: implement EN.7.C-materialize-harvest-gate-task7
+e7136ba feat: implement EN.7.C-materialize-harvest-gate-task6
+093c3f7 docs: cargo clean measurement — a rotten target/ was the largest lever
+40ae190 docs: testing.md — test layout, commands, hermetic conventions (D57)
+0725c14 perf(harness): cut sdlc-flow iteration cost — one test binary, no sccache, per-task validation
+```
+
+---
+
 ### Traced the per-task/review test-relink slowdown to base-template; wrote its fix as a ticket there; applied a local link-time mitigation here
 - **What:** `/prime` surfaced the still-open `EN.7.D` review/PR handoff plus carryover
   `harness-per-task-relinks-all-test-binaries`. Reviewed that carryover in depth against the real

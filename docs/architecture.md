@@ -131,15 +131,25 @@ I/O:
 
 | Seam | Trait / live impl | Test stub | Used by | Boundary |
 |---|---|---|---|---|
-| `http_post.rs` (`EN.4.C`) | `HttpPost` / `ReqwestHttpPost` (`http_post_live()`) | `StubHttpPost` | `proposal_generator::PersistToBrainNode`, `content_pipeline::PersistToBrainNode` | POSTs a finished artifact to Synapse's brain-ingest endpoint (`OR.Q`) |
+| `http_post.rs` (`EN.4.C`; harvest-gated `EN.7.C`) | `HttpPost` / `ReqwestHttpPost` (`http_post_live()`) | `StubHttpPost` | `proposal_generator::PersistToBrainNode`, `content_pipeline::PersistToBrainNode`, `nodes::harvest_approve::HarvestApproveNode` | POSTs a finished artifact to Synapse's brain-ingest endpoint (`OR.Q`); as of `EN.7.C`, `content_pipeline::PersistToBrainNode`'s push is governed by `nodes::harvest_gate::HarvestGate` (`off`/`in_process`/`approval`, built-in default `off`) — see [harvest-gate.md](harvest-gate.md) |
 | `channel_transport.rs` (`EN.6.A`) | `ChannelTransport` / `channel_transport_live()` | `StubChannelTransport` | `content_pipeline::ActionDispatchNode` | Delivers outbound actions (digest replies, workflow-trigger chaining) back to the channel that originated the run |
 | `doc_materializer.rs` (`EN.7.A`, edit ops `EN.7.B`/`EN.4.E`) | `DocMaterializer` / `MevDocMaterializer` (`doc_materializer_live()`) | `StubDocMaterializer` | `nodes::MaterializeDocNode`, `nodes::OpportunityEditNode` (`EN.7.B`), `nodes::merge_contacts::MergeContactsNode` (`EN.4.E`) | Plans + writes a `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md` document via `mev`/`okf-core` in-process (D53's fourth boundary-test channel); `EN.7.B` extends the seam with `edit_opportunity` (`OpportunityEdit::SetStage`/`AddAction`, over mev's `plan_set_stage`/`plan_add_action`) for editing an already-written opportunity; `EN.4.E` adds a third `OpportunityEdit::MergeContacts` variant (over mev's `plan_merge_contacts`) so `RESEARCH_AGENT`'s terminal `MergeContactsNode` can merge extracted contacts into an already-written opportunity |
 
 See [materialize-doc-node.md](materialize-doc-node.md) for the `DocMaterializer` seam and
 `MaterializeDocNode` in detail, [opportunity-edit-workflows.md](opportunity-edit-workflows.md) for
-the `edit_opportunity` operation and `OpportunityEditNode`, and
+the `edit_opportunity` operation and `OpportunityEditNode`,
 [content-pipeline-workflow.md](content-pipeline-workflow.md) for `HttpPost` and `ChannelTransport`
-in their workflow context.
+in their workflow context, and [harvest-gate.md](harvest-gate.md) for the `HarvestMode`/
+`HarvestGate` gate fronting the `http_post.rs` seam and the `HARVEST_APPROVE` completion
+micro-workflow.
+
+**Materialize -\> harvest ordering guarantee.** In `CONTENT_PIPELINE`, `MaterializeDocNode` always
+runs upstream of `PersistToBrainNode` in the declared graph, and the harvest gate never changes
+that order or `MaterializeDocNode`'s own behavior: the materialized `.md` is written identically
+in every harvest mode (`off`/`in_process`/`approval`). The gate only changes what
+`PersistToBrainNode` does with the finished payload afterward — push now, skip (rely on the
+freshness reindex), or defer to a `pending` record for `HARVEST_APPROVE`. A failed harvest push
+therefore never costs the run its already-written source document (D53).
 
 ## Build & CI
 
@@ -324,8 +334,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `register_opportunity_add_action` (`OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION`, `EN.7.B`
   task 6) are the first `register_builtin_workflows` entries with no policy layer at all —
   `OpportunityEditNode` calls no model, so their `WorkflowFactory`s resolve no
-  `PolicyConfigSource` and seed no policy stamp; `register_builtin_workflows` now populates seven
-  workflow types in total.
+  `PolicyConfigSource` and seed no policy stamp; `register_harvest_approve` (`HARVEST_APPROVE`,
+  `EN.7.C` task 7) follows the same no-policy pattern, since `HarvestApproveNode` is also
+  model-free; `register_builtin_workflows` now populates eight workflow types in total.
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
