@@ -106,17 +106,27 @@ None known at initialization.
 
 ```bash
 cargo build
-cargo test --lib --workspace   # fast — use this, not plain `cargo test`
+cargo nextest run --lib --workspace   # fast — use this, not plain `cargo test`
 cargo run
 ```
 
-> **Always prefer `cargo test --lib --workspace` over plain `cargo test` in this repo.** The
-> full `cargo test` (unit + integration + doctests across the workspace) takes several minutes;
-> `--lib --workspace` runs only the unit tests and is dramatically faster for the same-signal
-> inner loop. This is already wired as the `fastCommand` on the `test` check in
-> `planning/harness.json`, which the SDLC engines use for per-task (`testDepth: "fast"`) runs —
-> but reach for it manually too, any time you're iterating and don't need the full gate (e.g.
-> quick sanity checks between edits, or triage loops outside the harness).
+> **Always prefer `cargo nextest run --lib --workspace` over plain `cargo test` in this repo.**
+> The full `cargo test` (unit + integration + doctests across the workspace) takes several
+> minutes — largely link time: `engine-core` alone compiles 25+ integration-test binaries, each
+> statically linking the whole crate + dependency graph. `nextest` runs every test binary as a
+> parallel OS process instead of libtest's serial-per-binary model, which cuts wall-clock
+> dramatically for this shape of workspace (1022 unit tests in ~3.5s). This is wired as the
+> `fastCommand` on the `test` check in `planning/harness.json`, which the SDLC engines use for
+> per-task (`testDepth: "fast"`) runs — but reach for it manually too, any time you're iterating
+> and don't need the full gate (e.g. quick sanity checks between edits, or triage loops outside
+> the harness). Requires `cargo-nextest` on PATH (`brew install cargo-nextest`); `cargo test` is
+> still the authoritative full-suite gate and needs no plugin.
+>
+> **`sccache` is wired in via `.cargo/config.toml`** (`rustc-wrapper = "sccache"`) — it caches
+> compiled object code across builds, so repeated compiles within the same SDLC spec (agent to
+> agent, task to task) reuse work instead of recompiling the same dependency graph from scratch.
+> Requires `sccache` on PATH (`brew install sccache`); no other setup needed, it's transparent to
+> every `cargo` invocation.
 >
 > **Scope even narrower while mid-task.** While iterating inside a single task, prefer
 > `cargo test -p <crate> --lib <module::path>` — just the touched crate and module — over even

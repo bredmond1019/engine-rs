@@ -1,0 +1,5 @@
+# Compilation cache — reuses object code across builds/tasks in the same SDLC spec instead of
+# recompiling the same dependency graph from scratch every time. No effect on test *behavior*,
+# only on how fast `cargo build`/`cargo test`/`cargo nextest run` get there.
+[build]
+rustc-wrapper = "sccache"
