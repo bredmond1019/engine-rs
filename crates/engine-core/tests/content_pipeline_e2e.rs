@@ -70,6 +70,7 @@ use engine_core::nodes::channel_transport::StubChannelTransport;
 use engine_core::nodes::doc_materializer::{
     MaterializeOutcome, MaterializedFile, StubDocMaterializer,
 };
+use engine_core::nodes::harvest_gate::{HarvestGate, HarvestMode};
 use engine_core::nodes::http_post::StubHttpPost;
 use engine_core::nodes::materialize_doc::MaterializeDocNode;
 use engine_core::policy::{self, PolicyConfigSource};
@@ -374,7 +375,11 @@ fn build_registry(stubs: &Stubs) -> NodeRegistry {
     registry.register(Box::new(
         PersistToBrainNode::new()
             .with_http_post(Arc::new(stubs.http_post.clone()))
-            .with_url(TEST_BRAIN_URL),
+            .with_url(TEST_BRAIN_URL)
+            // `EN.7.C`: this fixture's assertions expect the pre-block
+            // always-push behavior, so it opts explicitly into
+            // `in_process` rather than relying on the new `off` default.
+            .with_harvest(HarvestGate::new(HarvestMode::InProcess)),
     ));
     // `EN.6.A`'s egress terminal node — this EN.5.A fixture only needs the
     // graph to validate and run end-to-end; dispatch behavior itself is
