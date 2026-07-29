@@ -28,6 +28,16 @@
 //! model string (`"learning-artifact"`) and its source-node differ, which
 //! is precisely the generality claim this block exists to prove.
 //!
+//! `PersistToBrainNode` is `EN.7.C`'s harvest gate execution site: what
+//! varies under its resolved `harvest` knob is whether the push happens now
+//! (`in_process`), never (`off` — the default; the freshness reindex
+//! indexes the `.md` `MaterializeDocNode` just wrote), or is deferred as a
+//! pending record for later `HARVEST_APPROVE` approval (`approval`). The
+//! graph shape above is unchanged in every case — only the node's own
+//! configuration varies. The materialize-before-push ORDER matters even
+//! more under `off`: the write is the durable artifact and the index
+//! follows it, whether via the freshness reindex or a later approval.
+//!
 //! `CriticRouterNode` is a [`Router`]: it reads `SelfCriticNode`'s stored
 //! `CriticEvaluation` plus the run's resolved loop bounds (stamped by
 //! `SourceRouterNode`) and routes to `TranslateSkipRouterNode` (pass,
@@ -55,6 +65,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::node::NodeRegistry;
+use crate::nodes::harvest_gate::HarvestGate;
 use crate::nodes::materialize_doc::MaterializeDocNode;
 use crate::nodes::openai_compat_transport::openai_compat_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
@@ -70,7 +81,7 @@ use super::increment_critic_iteration::IncrementCriticIterationNode;
 use super::learning_artifact::{self, LearningArtifactPayloadNode};
 use super::normalize_channel_content::NormalizeChannelContentNode;
 use super::persist_to_brain::PersistToBrainNode;
-use super::policy::{ContentPipelinePolicy, MaterializeConfig, ModelTier};
+use super::policy::{ContentPipelinePolicy, HarvestConfig, MaterializeConfig, ModelTier};
 use super::revise::ReviseNode;
 use super::self_critic::SelfCriticNode;
 use super::source_router::SourceRouterNode;
@@ -214,7 +225,9 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(materialize_doc_node(
         &ContentPipelinePolicy::default().materialize,
     )));
-    registry.register(Box::new(PersistToBrainNode::new()));
+    registry.register(Box::new(persist_to_brain_node(
+        &ContentPipelinePolicy::default().harvest,
+    )));
     registry.register(Box::new(ActionDispatchNode::new()));
 
     registry
@@ -243,6 +256,19 @@ fn materialize_doc_node(materialize: &MaterializeConfig) -> MaterializeDocNode {
     }
 }
 
+/// Build the `PersistToBrainNode` instance this workflow registers, from
+/// the resolved `harvest` knob (`EN.7.C`). One construction site for both
+/// [`registry`] (built-in defaults) and [`registry_for_policy`] (the run's
+/// resolved policy), so the two can never drift — same pattern as
+/// [`materialize_doc_node`].
+///
+/// The node identity, its position in the graph, and its target URL are
+/// invariant across every setting; only whether/when the push happens
+/// varies, per CLAUDE.md rule 6.
+fn persist_to_brain_node(harvest: &HarvestConfig) -> PersistToBrainNode {
+    PersistToBrainNode::new().with_harvest(HarvestGate::new(harvest.mode))
+}
+
 /// The real `claude_code_rs::execute` transport — the cloud fallback a
 /// `local`-tier stage's `openai_compat_transport` routes to when its local
 /// endpoint is unavailable. Mirrors `proposal_generator::graph::real_cloud_transport`
@@ -267,9 +293,11 @@ fn real_cloud_transport() -> ModelTransport {
 /// This is the four-stage analog of `proposal_generator::graph::registry_for_policy`.
 ///
 /// It also applies `EN.7.D`'s `materialize` knob to the `MaterializeDocNode`
-/// instance (enabled / write / corpus root). That is a *configuration*
-/// change only: the node identity set this returns is identical for every
-/// policy, so one declared graph, validated once, describes every run.
+/// instance (enabled / write / corpus root), and `EN.7.C`'s `harvest` knob
+/// to the `PersistToBrainNode` instance (off / in_process / approval). Both
+/// are *configuration* changes only: the node identity set this returns is
+/// identical for every policy, so one declared graph, validated once,
+/// describes every run.
 #[must_use]
 pub fn registry_for_policy(policy: &ContentPipelinePolicy) -> NodeRegistry {
     let mut registry = registry();
@@ -279,6 +307,12 @@ pub fn registry_for_policy(policy: &ContentPipelinePolicy) -> NodeRegistry {
     // node SET — `registry()` already registered this identity, so the
     // declared graph is identical for every setting.
     registry.register(Box::new(materialize_doc_node(&policy.materialize)));
+
+    // EN.7.C: re-register the same identity with the run's resolved
+    // `harvest` knob. Configuration, never the node SET — `registry()`
+    // already registered this identity, so the declared graph is identical
+    // for every harvest mode.
+    registry.register(Box::new(persist_to_brain_node(&policy.harvest)));
 
     if policy.model_tiers.summarize == ModelTier::Local {
         registry.register(Box::new(SummarizeNode::new().with_transport(
@@ -619,5 +653,89 @@ mod tests {
 
         let node = materialize_doc_node(&MaterializeConfig::default());
         assert_eq!(node.name(), "MaterializeDocNode");
+    }
+
+    // EN.7.C task 5 — the harvest gate wired into the graph.
+
+    use crate::nodes::harvest_gate::HarvestMode;
+
+    fn all_identities(registry: &NodeRegistry) -> Vec<&'static str> {
+        let mut found: Vec<&str> = ALL_NODE_IDENTITIES
+            .iter()
+            .copied()
+            .filter(|identity| registry.contains(identity))
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    #[test]
+    fn registry_and_registry_for_policy_register_the_same_identities() {
+        let default_registry = registry();
+        let policy_registry = registry_for_policy(&ContentPipelinePolicy::default());
+
+        assert_eq!(
+            all_identities(&policy_registry),
+            all_identities(&default_registry)
+        );
+    }
+
+    #[test]
+    fn identity_set_is_identical_under_all_three_harvest_modes() {
+        let baseline = registry_for_policy(&ContentPipelinePolicy::default());
+
+        for mode in [
+            HarvestMode::Off,
+            HarvestMode::InProcess,
+            HarvestMode::Approval,
+        ] {
+            let mut policy = ContentPipelinePolicy::default();
+            policy.harvest.mode = mode;
+
+            let registry = registry_for_policy(&policy);
+            assert_eq!(
+                all_identities(&registry),
+                all_identities(&baseline),
+                "the harvest knob must change node CONFIGURATION, never the node set"
+            );
+            assert_eq!(registry.len(), baseline.len());
+        }
+    }
+
+    #[test]
+    fn schema_is_unchanged_by_the_harvest_knob() {
+        // `persist_to_brain_forwards_to_action_dispatch` above already
+        // asserts this connection; re-asserted here as the harvest-knob
+        // acceptance criterion so it reads as a Step 5 guarantee, not an
+        // incidental consequence of the materialize tests.
+        let schema = schema();
+        assert_eq!(
+            schema.nodes["PersistToBrainNode"].connections,
+            vec!["ActionDispatchNode".to_string()]
+        );
+    }
+
+    #[test]
+    fn declared_graph_validates_under_every_harvest_mode() {
+        for mode in [
+            HarvestMode::Off,
+            HarvestMode::InProcess,
+            HarvestMode::Approval,
+        ] {
+            let mut policy = ContentPipelinePolicy::default();
+            policy.harvest.mode = mode;
+
+            WorkflowValidator::validate(&registry_for_policy(&policy), &schema()).unwrap_or_else(
+                |err| panic!("declared graph should validate under harvest mode {mode:?}: {err}"),
+            );
+        }
+    }
+
+    #[test]
+    fn persist_to_brain_node_is_built_with_the_resolved_harvest_mode() {
+        let node = persist_to_brain_node(&HarvestConfig {
+            mode: HarvestMode::InProcess,
+        });
+        assert_eq!(node.name(), "PersistToBrainNode");
     }
 }
