@@ -5,7 +5,7 @@
 //! layer for the run state it owns. Built on the D2 persistence stack (`sqlx::PgPool`).
 
 use chrono::{NaiveDateTime, Utc};
-use engine_contract::EventsRow;
+use engine_contract::{EventsRow, TaskContext};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
 use sqlx::{PgPool, Row};
@@ -78,6 +78,55 @@ pub async fn get_event(pool: &PgPool, id: Uuid) -> Result<EventsRow, sqlx::Error
 /// so callers don't have to import `chrono::Utc` themselves.
 pub fn touch(row: &mut EventsRow) {
     row.updated_at = Utc::now();
+}
+
+/// Idempotent upsert of an `events` row by `id`: inserts if absent, otherwise
+/// updates `workflow_type`, `data`, `task_context`, and `updated_at`.
+///
+/// `created_at` is deliberately **excluded** from the `DO UPDATE` set so it stays
+/// immutable across repeated upserts of the same id — that immutability is what
+/// makes a resumed run's `EventsRow` shape-identical to an uninterrupted run's
+/// across process restarts (a resume happening in a fresh `engine-serve` process
+/// no longer has any per-process "have I inserted this row yet" state to get out
+/// of sync with Postgres; see `durable.rs`'s removal of `seen_runs`).
+pub async fn upsert_event(pool: &PgPool, row: &EventsRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO events (id, workflow_type, data, task_context, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (id) DO UPDATE \
+           SET workflow_type = EXCLUDED.workflow_type, \
+               data          = EXCLUDED.data, \
+               task_context  = EXCLUDED.task_context, \
+               updated_at    = EXCLUDED.updated_at",
+    )
+    .bind(row.id)
+    .bind(&row.workflow_type)
+    .bind(Json(&row.data))
+    .bind(Json(&row.task_context))
+    .bind(row.created_at)
+    .bind(row.updated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Read a single `events` row by id and return just its `task_context`.
+///
+/// A missing id maps to `Ok(None)` rather than an `sqlx::Error::RowNotFound`, so
+/// callers (the resume path's rehydration) don't need to pattern-match sqlx
+/// internals to distinguish "not found" from a real I/O failure. This is also
+/// exactly the read `SourcePayload::TaskContextRef { event_id }` will need;
+/// wiring that node is deliberately out of this spec.
+pub async fn get_task_context(pool: &PgPool, id: Uuid) -> Result<Option<TaskContext>, sqlx::Error> {
+    let row = sqlx::query("SELECT task_context FROM events WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(match row {
+        Some(row) => Some(row.try_get::<Json<TaskContext>, _>("task_context")?.0),
+        None => None,
+    })
 }
 
 #[cfg(test)]
