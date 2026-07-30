@@ -50,16 +50,14 @@ use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use chrono::{DateTime, Utc};
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::{
-    Budget, CancellationToken, OnProgress, RunOptions, BUDGET_METADATA_KEY,
-    CANCELLATION_METADATA_KEY,
+    Budget, CancellationToken, PauseSignal, BUDGET_METADATA_KEY, CANCELLATION_METADATA_KEY,
 };
-use futures::FutureExt;
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::abort::RunRegistry;
 use crate::dispatch::{DispatchError, Dispatcher};
-use crate::durable::{durable_on_progress, DurableHandle};
+use crate::durable::DurableHandle;
 use crate::live_state::LiveStateStore;
 
 /// Shared application state handed to every handler via `web::Data<AppState>`.
@@ -197,7 +195,7 @@ type RunMetadata = (String, DateTime<Utc>);
 /// after minting the id (before spawning) and cleared by the spawned task's
 /// cleanup once the run goes terminal (task 1's retained `RunRecord` takes
 /// over from there).
-fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadata>> {
+pub(crate) fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadata>> {
     static LIVE_RUN_METADATA: OnceLock<RwLock<StdHashMap<Uuid, RunMetadata>>> = OnceLock::new();
     LIVE_RUN_METADATA.get_or_init(|| RwLock::new(StdHashMap::new()))
 }
@@ -218,7 +216,7 @@ fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadata>> {
 /// | none of the above                                                    | `succeeded`     |
 /// An empty `TaskContext`, used as the fallback when a run fails or panics
 /// before `on_progress` ever recorded a snapshot to fall back to.
-fn empty_task_context() -> TaskContext {
+pub(crate) fn empty_task_context() -> TaskContext {
     TaskContext {
         event: serde_json::Value::Null,
         nodes: StdHashMap::new(),
@@ -230,7 +228,7 @@ fn empty_task_context() -> TaskContext {
 /// Stamp `ctx.metadata.failure = { failed: true, error: message }` so
 /// [`derive_terminal_status`] reports `"failed"` instead of falling through
 /// to its `"succeeded"` default.
-fn stamp_failure(ctx: &mut TaskContext, message: &str) {
+pub(crate) fn stamp_failure(ctx: &mut TaskContext, message: &str) {
     let failure = serde_json::json!({ "failed": true, "error": message });
     match ctx.metadata.as_object_mut() {
         Some(metadata) => {
@@ -245,7 +243,7 @@ fn stamp_failure(ctx: &mut TaskContext, message: &str) {
 /// (`&str` for a literal, `String` for a formatted message), falling back to
 /// a placeholder for anything else (a custom payload type via
 /// `std::panic::panic_any`).
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -358,6 +356,13 @@ async fn post_events(
     let token = CancellationToken::new();
     runs.register(run_id, token.clone());
 
+    // Registered alongside the cancellation token so `Workflow::walk`'s
+    // operator-pause check (EN.6.F task 4) has a signal to consult for this
+    // run from the first node boundary onward, and `POST
+    // /events/{run_id}/pause` (task 11) has somewhere to find it.
+    let pause = PauseSignal::new();
+    crate::suspend::register_pause_signal(run_id, pause.clone());
+
     let budget = default_budget_from_env();
 
     let created_at = Utc::now();
@@ -366,77 +371,19 @@ async fn post_events(
         .expect("live run metadata lock poisoned on write")
         .insert(run_id, (workflow_type.clone(), created_at));
 
-    actix_web::rt::spawn(async move {
-        let mut durable_progress =
-            durable_on_progress(durable_handle, run_id, workflow_type.clone(), data.clone());
-        let progress_live = live.clone();
-        let on_progress: OnProgress<'static> = Box::new(move |snapshot| {
-            progress_live.record(run_id, snapshot);
-            durable_progress(snapshot);
-            // Third fan-out alongside live-state and the durable writer —
-            // not a second progress mechanism (task 4).
-            crate::stream::publish(run_id, snapshot);
-        });
-
-        let options = RunOptions {
-            cancellation_token: Some(token),
-            budget: Some(budget),
-            pause_signal: None,
-        };
-
-        // A cancelled or budget-halted run returns `Ok` with the marker
-        // already stamped into `ctx.metadata` (see `RunOptions`'s docs); a
-        // node's own failure is likewise folded into `Ok(ctx)` (the node
-        // run is stamped FAILED, the walk halts, and the accumulated
-        // context is still returned). Only a structural `WorkflowError`
-        // (e.g. an unresolvable node identity) lands in `Err` here. The
-        // response was sent long ago either way, so there is no status code
-        // to map failure to — the readback (task 3) and the terminal SSE
-        // frame (task 4) are how it surfaces.
-        //
-        // `catch_unwind` guards against a node implementation panicking
-        // instead of returning `Err` (an internal `unwrap()`/`expect()`/
-        // index-panic): without it, the panic would abort this spawned
-        // task before reaching the cleanup below, leaking the run in
-        // `live_run_metadata()`/`RunRegistry` forever and leaving any SSE
-        // subscriber hanging with no terminal frame.
-        let run_result =
-            std::panic::AssertUnwindSafe(workflow.run_with(data, on_progress, options))
-                .catch_unwind()
-                .await;
-
-        let final_ctx = match run_result {
-            Ok(Ok(ctx)) => ctx,
-            Ok(Err(err)) => {
-                eprintln!("run {run_id} failed: {err}");
-                let mut ctx = live.get(run_id).unwrap_or_else(empty_task_context);
-                stamp_failure(&mut ctx, &err.to_string());
-                ctx
-            }
-            Err(panic_payload) => {
-                let message = panic_message(&panic_payload);
-                eprintln!("run {run_id} panicked: {message}");
-                let mut ctx = live.get(run_id).unwrap_or_else(empty_task_context);
-                stamp_failure(&mut ctx, &format!("node panicked: {message}"));
-                ctx
-            }
-        };
-
-        let updated_at = Utc::now();
-        // Publish the SSE terminal frame before marking the readback
-        // terminal, so a client racing the two never sees a terminal
-        // readback with no terminal frame having gone out yet.
-        crate::stream::publish_terminal(run_id, &final_ctx);
-        // Order matters: mark terminal *before* deregistering.
-        // Deregistration is the externally-observable "this run is over"
-        // edge (an abort against a deregistered run 404s), so anything a
-        // client can read after that edge must already be in place.
-        live.mark_terminal(run_id, &final_ctx, workflow_type, created_at, updated_at);
-        live_run_metadata()
-            .write()
-            .expect("live run metadata lock poisoned on write")
-            .remove(&run_id);
-        runs.deregister(run_id);
+    crate::suspend::spawn_run(crate::suspend::SpawnedRun {
+        run_id,
+        workflow,
+        workflow_type,
+        data: data.clone(),
+        created_at,
+        start: crate::suspend::RunStart::Fresh(data),
+        live,
+        durable: durable_handle,
+        runs,
+        token,
+        pause,
+        budget,
     });
 
     HttpResponse::Accepted().json(serde_json::json!({
@@ -1374,6 +1321,142 @@ mod tests {
             body.contains("\"status\":\"succeeded\""),
             "expected the terminal frame's status to be succeeded, got: {body}"
         );
+    }
+
+    // -- EN.6.F task 10: spawn_run forks on suspension --------------------
+
+    /// `SuspendNode(enabled: true) -> MarkerNode`: the walk suspends
+    /// immediately after `SuspendNode` finishes, before `MarkerNode` ever
+    /// runs, so `MarkerNode` is the resume pointer.
+    fn suspend_fixture_schema(workflow_type: &str) -> WorkflowSchema {
+        let mut nodes = StdHashMap::new();
+        nodes.insert(
+            "SuspendNode".to_string(),
+            engine_core::NodeConfig::new("SuspendNode", vec!["MarkerNode".to_string()]),
+        );
+        nodes.insert(
+            "MarkerNode".to_string(),
+            engine_core::NodeConfig::new("MarkerNode", vec![]),
+        );
+        WorkflowSchema::new(workflow_type, "SuspendNode", nodes)
+    }
+
+    fn test_app_state_with_suspend_fixture() -> AppState {
+        const WORKFLOW_TYPE: &str = "suspend-fixture";
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            suspend_fixture_schema(WORKFLOW_TYPE),
+            Box::new(|_event: &serde_json::Value| {
+                let mut registry = NodeRegistry::new();
+                registry.register(Box::new(
+                    engine_core::nodes::SuspendNode::new("SuspendNode").with_enabled(true),
+                ));
+                registry.register(Box::new(MarkerNode));
+                Ok(Workflow::new(
+                    registry,
+                    suspend_fixture_schema(WORKFLOW_TYPE),
+                ))
+            }),
+        );
+
+        AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    /// A suspended run's exit path (task 10's fork) diverges from the
+    /// terminal path exactly as documented: it stays in the live map and in
+    /// `live_run_metadata()`, lands in the suspended index with the correct
+    /// `resume_at`, and still deregisters its cancellation token and pause
+    /// signal even though the run itself is not over.
+    #[actix_web::test]
+    async fn a_suspended_run_stays_live_and_lands_in_the_suspended_index() {
+        let state = test_app_state_with_suspend_fixture();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "suspend-fixture", "data": {} }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let run_id = body["run_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("run_id should be a parseable UUID");
+
+        // Poll until the run lands in the suspended index — the spawned
+        // task's fork may not have landed yet right after the 202 response.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let entry = loop {
+            if let Some((_, entry)) = crate::suspend::list_suspended()
+                .into_iter()
+                .find(|(id, _)| *id == run_id)
+            {
+                break entry;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run never landed in the suspended index"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+
+        assert_eq!(entry.workflow_type, "suspend-fixture");
+        assert_eq!(
+            entry.resume_at, "MarkerNode",
+            "resume_at should be the successor of SuspendNode, not re-derived"
+        );
+        assert!(
+            !entry.resuming,
+            "a freshly suspended run must not already be marked resuming"
+        );
+
+        // Still live: `GET /events/{id}` reads "running", not a 404 or a
+        // terminal record — `live_run_metadata()` was kept, not removed.
+        let get_req = test::TestRequest::get()
+            .uri(&format!("/events/{run_id}"))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let get_resp = test::call_service(&app, get_req).await;
+        assert_eq!(get_resp.status(), 200);
+        let get_body: serde_json::Value = test::read_body_json(get_resp).await;
+        assert_eq!(get_body["status"], "running");
+        assert_eq!(get_body["workflow_type"], "suspend-fixture");
+
+        // The pause signal was deregistered even though the run stayed
+        // live — nobody is checking it while suspended.
+        assert!(
+            crate::suspend::get_pause_signal(run_id).is_none(),
+            "pause signal should be removed on the suspended exit path"
+        );
+
+        // The cancellation token was likewise deregistered: an abort against
+        // this run_id now 404s, matching the terminal path's "nobody is
+        // checking the token" behavior.
+        let abort_req = test::TestRequest::post()
+            .uri(&format!("/events/{run_id}/abort"))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let abort_resp = test::call_service(&app, abort_req).await;
+        assert_eq!(
+            abort_resp.status(),
+            404,
+            "the cancellation token should already be deregistered on a suspended exit"
+        );
+
+        crate::suspend::remove_suspended(run_id);
     }
 
     mod derive_terminal_status_tests {

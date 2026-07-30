@@ -28,8 +28,14 @@ use std::sync::{OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use engine_contract::TaskContext;
-use engine_core::PauseSignal;
+use engine_core::workflow::ResumeState;
+use engine_core::{Budget, CancellationToken, PauseSignal, Workflow};
+use futures::FutureExt;
 use uuid::Uuid;
+
+use crate::abort::RunRegistry;
+use crate::durable::{durable_on_progress, DurableHandle};
+use crate::live_state::LiveStateStore;
 
 /// A suspended run's rehydration payload — everything a resume needs to
 /// rebuild the `Workflow` and continue the walk from `snapshot`'s recorded
@@ -219,6 +225,214 @@ pub fn remove_suspended(run_id: Uuid) -> Option<SuspendedEntry> {
     } else {
         None
     }
+}
+
+/// Which of the two starting points a spawned run began from — a fresh
+/// trigger (`POST /events/`) or a rehydrated resume (`POST
+/// /events/{run_id}/resume`, task 11). Kept as a two-variant enum rather
+/// than an `Option` so the dispatch in [`spawn_run`] reads as the two-way
+/// fork it is, not an optional extra.
+pub(crate) enum RunStart {
+    /// A brand-new run: the trigger payload to seed `Workflow::run_with`.
+    Fresh(serde_json::Value),
+    /// A resume: the rehydrated pointer/context/ledger to seed
+    /// `Workflow::run_from`. Not yet constructed anywhere -- the resume
+    /// endpoint (EN.6.F task 11) is this variant's first caller.
+    #[allow(dead_code)]
+    Resume(ResumeState),
+}
+
+/// Everything [`spawn_run`] needs to run a workflow to completion (or
+/// suspension) and fork its exit path accordingly — the trigger and resume
+/// HTTP handlers both build one of these so the two paths can never drift
+/// (EN.6.F task 10).
+pub(crate) struct SpawnedRun {
+    pub run_id: Uuid,
+    pub workflow: Workflow,
+    pub workflow_type: String,
+    /// The ORIGINAL trigger payload, in both the fresh and the resume case
+    /// — needed for the durable writer's `events.data` column and, on a
+    /// suspended exit, for [`SuspendedEntry::data`] (a later resume rebuilds
+    /// the `Workflow` from this, not from `state.ctx`).
+    pub data: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub start: RunStart,
+    pub live: LiveStateStore,
+    pub durable: DurableHandle,
+    pub runs: RunRegistry,
+    pub token: CancellationToken,
+    pub pause: PauseSignal,
+    pub budget: Budget,
+}
+
+/// Runs `spawned.workflow` to completion (or suspension) on
+/// `actix_web::rt::spawn`, then forks the exit path on
+/// `engine_core::suspend::is_suspended(&final_ctx.metadata)`:
+///
+/// | | terminal (unchanged) | suspended |
+/// |---|---|---|
+/// | SSE | `publish_terminal` | `publish_suspended` |
+/// | live state | `mark_terminal` (moves to the completed ring) | stays in the live map; `live.record` |
+/// | `live_run_metadata()` | removed | kept — preserves the original `created_at` |
+/// | suspended index | -- | `insert_suspended`; an eviction is stamped cancelled and `mark_terminal`ed |
+/// | `RunRegistry` | `deregister` | `deregister` (nobody is checking the token) |
+/// | pause signal | `remove_pause_signal` | `remove_pause_signal` |
+///
+/// Both `post_events` (fresh trigger) and the resume handler (task 11) call
+/// this — the terminal-path logic (the three-way `on_progress` fan-out, the
+/// `catch_unwind` guard, and the `Ok(Ok)/Ok(Err)/Err` match) is written
+/// exactly once so the two entry points can never drift.
+pub(crate) fn spawn_run(spawned: SpawnedRun) {
+    let SpawnedRun {
+        run_id,
+        workflow,
+        workflow_type,
+        data,
+        created_at,
+        start,
+        live,
+        durable,
+        runs,
+        token,
+        pause,
+        budget,
+    } = spawned;
+
+    actix_web::rt::spawn(async move {
+        let mut durable_progress =
+            durable_on_progress(durable, run_id, workflow_type.clone(), data.clone());
+        let progress_live = live.clone();
+        let on_progress: engine_core::OnProgress<'static> = Box::new(move |snapshot| {
+            progress_live.record(run_id, snapshot);
+            durable_progress(snapshot);
+            // Third fan-out alongside live-state and the durable writer —
+            // not a second progress mechanism.
+            crate::stream::publish(run_id, snapshot);
+        });
+
+        let options = engine_core::RunOptions {
+            cancellation_token: Some(token),
+            budget: Some(budget),
+            pause_signal: Some(pause.clone()),
+        };
+
+        // A cancelled or budget-halted run returns `Ok` with the marker
+        // already stamped into `ctx.metadata` (see `RunOptions`'s docs); a
+        // node's own failure is likewise folded into `Ok(ctx)` (the node
+        // run is stamped FAILED, the walk halts, and the accumulated
+        // context is still returned). Only a structural `WorkflowError`
+        // (e.g. an unresolvable node identity) lands in `Err` here. The
+        // response was sent long ago either way, so there is no status code
+        // to map failure to — the readback and the terminal SSE frame are
+        // how it surfaces.
+        //
+        // `catch_unwind` guards against a node implementation panicking
+        // instead of returning `Err` (an internal `unwrap()`/`expect()`/
+        // index-panic): without it, the panic would abort this spawned
+        // task before reaching the cleanup below, leaking the run in
+        // `live_run_metadata()`/`RunRegistry` forever and leaving any SSE
+        // subscriber hanging with no terminal frame.
+        let run_result = match start {
+            RunStart::Fresh(event) => {
+                std::panic::AssertUnwindSafe(workflow.run_with(event, on_progress, options))
+                    .catch_unwind()
+                    .await
+            }
+            RunStart::Resume(state) => {
+                std::panic::AssertUnwindSafe(workflow.run_from(state, on_progress, options))
+                    .catch_unwind()
+                    .await
+            }
+        };
+
+        let final_ctx = match run_result {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(err)) => {
+                eprintln!("run {run_id} failed: {err}");
+                let mut ctx = live
+                    .get(run_id)
+                    .unwrap_or_else(crate::http::empty_task_context);
+                crate::http::stamp_failure(&mut ctx, &err.to_string());
+                ctx
+            }
+            Err(panic_payload) => {
+                let message = crate::http::panic_message(&panic_payload);
+                eprintln!("run {run_id} panicked: {message}");
+                let mut ctx = live
+                    .get(run_id)
+                    .unwrap_or_else(crate::http::empty_task_context);
+                crate::http::stamp_failure(&mut ctx, &format!("node panicked: {message}"));
+                ctx
+            }
+        };
+
+        let updated_at = Utc::now();
+
+        if engine_core::suspend::is_suspended(&final_ctx.metadata) {
+            // Suspended exit (EN.6.F): the run is not over, so it stays in
+            // the live map and `live_run_metadata()` -- unlike the terminal
+            // branch below, neither is cleared here.
+            crate::stream::publish_suspended(run_id, &final_ctx);
+            live.record(run_id, &final_ctx);
+
+            let suspension = engine_core::suspend::read_suspension(&final_ctx.metadata);
+            let resume_at = suspension
+                .as_ref()
+                .and_then(|s| s.resume_at.clone())
+                .unwrap_or_default();
+            let reason = suspension
+                .as_ref()
+                .and_then(|s| s.reason)
+                .and_then(|r| serde_json::to_value(r).ok())
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+
+            let entry = SuspendedEntry {
+                workflow_type: workflow_type.clone(),
+                data,
+                snapshot: final_ctx.clone(),
+                created_at,
+                suspended_at: updated_at,
+                resume_at,
+                reason,
+                resuming: false,
+            };
+
+            // If the bounded ring evicted an older suspended run to make
+            // room, that run has nowhere left to resume from -- stamp
+            // cancellation into its retained snapshot and mark it terminal
+            // so it stops looking live/suspended forever (the eviction
+            // backstop documented at the top of this module).
+            if let Some((evicted_id, mut evicted_entry)) = insert_suspended(run_id, entry) {
+                engine_core::stamp_cancelled(&mut evicted_entry.snapshot.metadata);
+                live.mark_terminal(
+                    evicted_id,
+                    &evicted_entry.snapshot,
+                    evicted_entry.workflow_type,
+                    evicted_entry.created_at,
+                    Utc::now(),
+                );
+            }
+        } else {
+            // Publish the SSE terminal frame before marking the readback
+            // terminal, so a client racing the two never sees a terminal
+            // readback with no terminal frame having gone out yet.
+            crate::stream::publish_terminal(run_id, &final_ctx);
+            // Order matters: mark terminal *before* deregistering.
+            // Deregistration is the externally-observable "this run is
+            // over" edge (an abort against a deregistered run 404s), so
+            // anything a client can read after that edge must already be
+            // in place.
+            live.mark_terminal(run_id, &final_ctx, workflow_type, created_at, updated_at);
+            crate::http::live_run_metadata()
+                .write()
+                .expect("live run metadata lock poisoned on write")
+                .remove(&run_id);
+        }
+
+        runs.deregister(run_id);
+        remove_pause_signal(run_id);
+    });
 }
 
 #[cfg(test)]
