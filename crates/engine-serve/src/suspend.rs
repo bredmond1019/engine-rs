@@ -435,6 +435,26 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
     });
 }
 
+/// Serializes tests across this crate that touch the process-global
+/// suspend/pause-signal registries (`suspended_runs()`, `pause_signals()`).
+///
+/// Under `cargo nextest run` each test is its own process, so the
+/// `OnceLock`-backed statics start fresh every time and cross-test
+/// contamination is structurally impossible (CLAUDE.md standing rule 7).
+/// Plain `cargo test` runs every test as a thread in ONE process sharing
+/// those statics, so two registry-touching tests running concurrently can
+/// observe each other's transient inserts (e.g. one test's momentary
+/// suspended entry making another test's `list_suspended().is_empty()`
+/// assertion fail) or starve each other's spawned workflow of CPU past a
+/// polling deadline. Any test in `suspend.rs`, `resume.rs`, or `http.rs`
+/// that inserts into, removes from, or lists the suspended index (or
+/// registers/removes a pause signal) must hold this lock for its duration.
+#[cfg(test)]
+pub(crate) fn registry_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +482,9 @@ mod tests {
 
     #[test]
     fn register_get_remove_pause_signal_round_trips() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         assert!(get_pause_signal(run_id).is_none());
 
@@ -479,6 +502,9 @@ mod tests {
 
     #[test]
     fn get_pause_signal_missing_returns_none() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         assert!(get_pause_signal(run_id).is_none());
     }
@@ -487,6 +513,9 @@ mod tests {
 
     #[test]
     fn insert_suspended_evicts_fifo_at_the_retention_cap() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let ids: Vec<Uuid> = (0..(crate::live_state::COMPLETED_RUN_RETENTION + 1))
             .map(|_| Uuid::new_v4())
             .collect();
@@ -516,6 +545,9 @@ mod tests {
 
     #[test]
     fn take_for_resume_is_ready_once_then_already_resuming() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         insert_suspended(run_id, sample_entry("double-resume-test"));
 
@@ -542,6 +574,9 @@ mod tests {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         insert_suspended(run_id, sample_entry("thread-race-test"));
 
@@ -569,6 +604,9 @@ mod tests {
 
     #[test]
     fn take_for_resume_missing_run_is_not_found() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         match take_for_resume(run_id) {
             TakeForResume::NotFound => {}
@@ -578,6 +616,9 @@ mod tests {
 
     #[test]
     fn clear_resuming_restores_entry_to_ready() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         insert_suspended(run_id, sample_entry("clear-resuming-test"));
 
@@ -600,6 +641,9 @@ mod tests {
 
     #[test]
     fn list_suspended_orders_newest_first() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let id_a = Uuid::new_v4();
         let id_b = Uuid::new_v4();
         let id_c = Uuid::new_v4();
@@ -625,6 +669,9 @@ mod tests {
 
     #[test]
     fn remove_suspended_missing_returns_none() {
+        let _guard = registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         assert!(remove_suspended(run_id).is_none());
     }

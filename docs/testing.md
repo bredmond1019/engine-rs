@@ -71,6 +71,15 @@ process isolation (env vars, CWD, global state). **`cargo nextest run` executes 
 own process regardless of binary packing**, which is exactly what makes this safe here — and why the
 nextest rule is a prerequisite for the layout rather than a stylistic preference.
 
+A concrete case: `engine-serve`'s `suspend.rs`/`resume.rs`/`http.rs` unit and route tests share
+process-global `OnceLock`-backed registries (the suspended-run index and pause signals). Under
+`cargo nextest run` this is inert — each test gets a fresh process, so the statics start empty every
+time. Under plain `cargo test` the same tests run as threads in one process and can race on those
+statics (one test's transient insert flips another's `is_empty()` assertion, or CPU contention pushes
+a polling loop past its deadline). Rather than special-casing the layout, these tests take a
+test-only `crate::suspend::registry_test_lock()` mutex for their duration — visible only when a task
+is explicitly overridden to run plain `cargo test` (`NEXTEST_POLICY_OVERRIDE=1`, see above).
+
 ## Keep `target/` clean
 
 Cargo has no garbage collection: incremental state accumulates across branches, rebases, and

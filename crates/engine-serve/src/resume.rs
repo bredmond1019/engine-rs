@@ -430,6 +430,9 @@ mod tests {
 
     #[actix_web::test]
     async fn pause_a_live_run_is_202_and_idempotent() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         let sig = PauseSignal::new();
         suspend::register_pause_signal(run_id, sig.clone());
@@ -457,6 +460,9 @@ mod tests {
 
     #[actix_web::test]
     async fn pause_an_already_suspended_run_is_409() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = test_app_state_with_suspend_fixture();
         let app = test::init_service(
             App::new()
@@ -483,6 +489,9 @@ mod tests {
 
     #[actix_web::test]
     async fn suspended_route_resolves_as_a_literal_not_an_event_id() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = test_app_state_with_suspend_fixture();
         let app = test::init_service(
             App::new()
@@ -507,6 +516,9 @@ mod tests {
 
     #[actix_web::test]
     async fn suspended_list_contains_a_suspended_run_and_omits_it_after_resume() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = test_app_state_with_suspend_fixture();
         let app = test::init_service(
             App::new()
@@ -585,6 +597,9 @@ mod tests {
 
     #[actix_web::test]
     async fn resume_succeeds_with_no_database_url_and_completes_the_run() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = test_app_state_with_suspend_fixture();
         let app = test::init_service(
             App::new()
@@ -628,6 +643,9 @@ mod tests {
 
     #[actix_web::test]
     async fn a_second_concurrent_resume_is_409_and_the_first_still_succeeds() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = test_app_state_with_suspend_fixture();
         let app = test::init_service(
             App::new()
@@ -665,6 +683,9 @@ mod tests {
 
     #[actix_web::test]
     async fn resume_with_unresolvable_resume_point_is_422_and_clears_resuming() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A workflow whose factory rebuilds a *different* graph (no
         // "MarkerNode") than the one the run suspended in -- simulating
         // schema drift between suspend and resume.

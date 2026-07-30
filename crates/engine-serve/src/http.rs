@@ -1403,6 +1403,9 @@ mod tests {
     /// signal even though the run itself is not over.
     #[actix_web::test]
     async fn a_suspended_run_stays_live_and_lands_in_the_suspended_index() {
+        let _guard = crate::suspend::registry_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = test_app_state_with_suspend_fixture();
         let app = test::init_service(
             App::new()
