@@ -78,7 +78,20 @@ engine-rs/
                          `brain.toml`, typed `BrainRootError`, EN.7.A task 2), locale.rs —
                          `Locale`/`Currency`/`MoneyRange`/`RateSheet`/`RateCard`, the two-sheet,
                          firewalled rate card + language directive threaded through the
-                         diagnostic funnel's event schemas, EN.4.F)
+                         diagnostic funnel's event schemas, EN.4.F), suspend.rs —
+│   │                         `PauseSignal` (a clearable, watch-backed two-way flag,
+│   │                         deliberately not `CancellationToken`) + the
+│   │                         `metadata.suspension` marker (`stamp_suspended`/
+│   │                         `stamp_resumed`/`request_suspension`/`read_suspension`/
+│   │                         `is_suspended`), the convergence point for both
+│   │                         suspension origins (operator pause, `SuspendNode`),
+│   │                         EN.6.F task 1; `nodes/suspend.rs` — `SuspendNode`, the
+│   │                         workflow-authored half of suspend/resume (`enabled`/
+│   │                         `with_predicate`/`with_reason_label`, default-off
+│   │                         in-place no-op patterned on `MaterializeDocNode::
+│   │                         with_enabled`), only *requests* suspension via
+│   │                         `suspend::request_suspension` — finalizing the walk
+│   │                         stop belongs to `Workflow::walk`, EN.6.F task 5)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -109,7 +122,21 @@ engine-rs/
 │   │                         subscribers, EN.5.F), abort.rs
 │   │                         (POST /events/{run_id}/abort, X-API-Key gated, EN.2.B — backed by a
 │   │                         per-run CancellationToken RunRegistry minted/registered/deregistered
-│   │                         around each post_events run_with call)
+│   │                         around each post_events run_with call), suspend.rs (process-global
+│   │                         pause-signal map + bounded FIFO suspended-run index behind
+│   │                         `OnceLock<RwLock<..>>`, `take_for_resume`/`clear_resuming`'s
+│   │                         atomic read-and-set double-resume guard, and `spawn_run` — the one
+│   │                         shared spawn/exit-fork every trigger AND resume handler calls so the
+│   │                         terminal-vs-suspended cleanup logic never drifts between the two
+│   │                         entry points, EN.6.F task 8/9/10), resume.rs (the run-control surface
+│   │                         is now pause/resume/abort rather than abort alone: POST
+│   │                         /events/{run_id}/pause, POST /events/{event_id}/resume — rehydrates
+│   │                         the Workflow from the ORIGINAL trigger payload via
+│   │                         `without_seeded_nodes()`, rebuilds the BudgetLedger from the
+│   │                         marker's snapshot, and continues from the stored `resume_at`
+│   │                         pointer — and GET /events/suspended (registered before
+│   │                         `{event_id}` so the literal path isn't swallowed by the uuid
+│   │                         extractor), EN.6.F task 11)
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
     crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;

@@ -162,6 +162,9 @@ canonical contract's §7, so a caller can target either runtime:
 | `GET` | `/workflows/{type}/graph` | `http::workflow_graph` — `404` for an unregistered type |
 | `POST` | `/events/{run_id}/abort` | `abort::abort_run` (EN.2.B) — same `X-API-Key` gate; `401`/`404`/`202` per the canonical contract §7 |
 | `GET` | `/events/{event_id}` | `http::get_event` (EN.5.F) — `X-API-Key` gated (401); `404` for an unknown or malformed id; `200 {event_id, workflow_type, status, created_at, updated_at, task_context}`, `status` derived server-side |
+| `POST` | `/events/{run_id}/pause` | `suspend::pause_run` (EN.6.F) — engine-rs-only extension, no canonical counterpart; `X-API-Key` gated (401); `404` for an unknown/finished run; `409` if already suspended; otherwise sets the run's `PauseSignal` and returns `202 {run_id, status: "pausing"}` (idempotent against a run that is pausing but not yet suspended) |
+| `POST` | `/events/{event_id}/resume` | `suspend::resume_run` (EN.6.F) — engine-rs-only extension, no canonical counterpart; `X-API-Key` gated (401); `404` for an unknown or non-suspended run; `409` for a concurrent resume already in flight; `422` for a policy-resolution failure or an unresolvable `resume_at`; otherwise `202 {run_id, event_id, status: "resuming", resume_at}` |
+| `GET` | `/events/suspended` | `suspend::list_suspended` (EN.6.F) — engine-rs-only extension, no canonical counterpart; `X-API-Key` gated (401); `200 [{run_id, workflow_type, created_at, suspended_at, resume_at, reason}]`, newest first; registered ahead of `{event_id}` so the literal path isn't swallowed by the uuid extractor |
 
 The canonical contract's v1.2.0 route `GET /events/{event_id}` and the `event_id` field on
 `POST /events/`'s `202` body are now **ported** to `engine-serve` (EN.5.F). `POST /events/` spawns
@@ -223,6 +226,28 @@ now has a live target to POST to instead of its `HttpPost` stub, but still POSTs
 placeholder `BRAIN_INGEST_URL` constant rather than this route — pointing it at the real Synapse
 `/ingest/proposal` endpoint is unfinished follow-on work (see `planning/decisions/D9-engine-brain-boundary.md`).
 
+**`metadata.suspension` (EN.6.F, engine-rs-side).** Mirroring `metadata.cancellation`/
+`metadata.budget`, a suspended run's `TaskContext.metadata` carries a `suspension` key: `{suspended,
+at, resume_at, reason, origin_identity, ledger: {total_tokens, total_cost_usd}, resume_count,
+requested}`. `reason` is `"operator_pause"` or `"suspend_node"` — the two origins (`POST
+/events/{run_id}/pause` and a workflow-authored `SuspendNode`) converge on this one marker and one
+`resume_at` pointer. The key is never deleted on resume (`stamp_resumed` flips `suspended: false`,
+resets `requested`, and increments `resume_count`), so a resumed run's final `EventsRow` round-trips
+identical in shape to an uninterrupted run's. No `engine_contract` Rust type changed shape — like
+`metadata.cancellation`/`metadata.budget`/`metadata.failure`, this lives entirely in the existing
+free-form `TaskContext::metadata: serde_json::Value` field, per D6. See
+[suspend-resume.md](suspend-resume.md) for the full field-by-field shape and both suspension
+origins.
+
+**Semantic change: `durable.rs`'s writer now upserts on a suspend/resume, not just an initial
+insert.** Before EN.6.F, `spawn_durable_writer`'s per-run write path was insert-then-update once,
+ending at one terminal write. A suspended exit is not terminal, so the same run's `events` row can
+now legitimately receive a fresh round of `on_progress` writes after a resume — the existing
+insert-first/update-thereafter logic already handled this correctly (it keyed on `run_id`
+already-seen, not on "not yet terminal"), but it is worth calling out explicitly here: a suspended-
+then-resumed run's durable row is written to more than once across its lifetime in a way no
+pre-EN.6.F run ever was.
+
 The canonical contract's v1.4.0 adds three more routes, `GET /recall`, `GET /walk`, and
 `GET /pulse` (`OR.Q2`) — the read half of the D51 HTTP adapter whose write half (`POST
 /ingest/*`) landed in v1.3.0, implemented only in the orchestrator's own Python API (`app/api/
@@ -263,3 +288,4 @@ shape — no engine-rs workflow calls any of the three today; wiring a hybrid wo
 | 1.3.0 | 2026-07-27 | `EN.5.F` (engine-rs-side; not a canonical re-pin — **Pinned Contract Version stays 1.3.0**, this ports an already-canonical route rather than adding a new one). Ports the canonical v1.2.0 `GET /events/{event_id}` route and the `event_id` field on `POST /events/`'s `202` body into `engine-serve` (§ HTTP surface parity above): `POST /events/` now spawns the run and returns `202 {run_id, event_id}` immediately instead of awaiting it, and no longer returns `500` on a run failure — failure now surfaces through the `GET /events/{event_id}` readback (`status: "failed"`) and the terminal SSE frame. Adds `GET /events/{event_id}/stream`, an engine-rs-only SSE extension with no canonical counterpart. Sets a default HTTP-path `Budget` read from `ENGINE_RUN_MAX_COST_USD` (default `5.0`) / `ENGINE_RUN_MAX_TOKENS` (default unset). `LiveStateStore` now retains the most recent 100 completed runs (`COMPLETED_RUN_RETENTION`) in a bounded ring for the readback. No `engine_contract` Rust type changed shape. |
 | 1.4.0 | 2026-07-27 | Re-pin from 1.3.0 to 1.4.0 (`OR.Q2`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.4.0 additions, orchestrator-only (§ HTTP surface parity above): `GET /recall`, `GET /walk`, `GET /pulse` — the read half of the D51 HTTP adapter whose write half (`POST /ingest/*`) landed in v1.3.0, thin `X-API-Key`-gated adapters over the orchestrator's `app/brain/` read core. No `engine_contract` Rust type changed shape; these are corpus-read routes engine-rs could call as a client, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. No engine-rs workflow calls any of the three today; wiring one (e.g. grounding a proposal draft via `GET /recall` before persisting through `POST /ingest/proposal`) remains open follow-on work. |
 | — | 2026-07-28 | Not a re-pin — **Pinned Contract Version stays 1.4.0.** `EN.4.F` (engine-rs-side) changes the shape of the `roadmap` field `PersistToBrainNode` embeds in its `POST /ingest/proposal` payload (§ HTTP surface parity above): `AutomationRoadmap.recommendation.investment` moves from a model-authored free-text `String` to a structured `{currency, min, max, basis}` object (`locale::MoneyRange`), deterministically populated from the two-sheet, firewalled `RateCard` rather than invented by the model; `AutomationRoadmap` also gains an `authored_locale` field (`"pt-BR"` \| `"en-US"`) stamped from the run's requested locale. **No Pinned Contract Version bump**, for two reasons: (1) `roadmap` is documented in the canonical contract only as opaque `"the full structured AutomationRoadmap"` — its internal shape is engine-rs's own type, not one of the versioned `events`/`task_context`/`NodeRun`/`Usage` shapes this pin tracks, so no `engine_contract` Rust type changes; (2) `PersistToBrainNode` still POSTs to the hardcoded placeholder `BRAIN_INGEST_URL`, not Synapse's live `POST /ingest/proposal` route, so no real wire contract is broken today. The distinction matters for whoever wires the real endpoint next: when that happens, Synapse's ingest handler should expect the new `investment`/`authored_locale` shape, not the old free-text `investment` string — call that out explicitly in whatever change wires the real URL. See [proposal-generator-workflow.md](proposal-generator-workflow.md) for the full shape and the rate-card lookup that produces it. |
+| — | 2026-07-30 | Not a re-pin — **Pinned Contract Version stays 1.4.0.** `EN.6.F` (engine-rs-side) adds three engine-rs-only routes with no canonical counterpart (§ HTTP surface parity above): `POST /events/{run_id}/pause`, `POST /events/{event_id}/resume`, and `GET /events/suspended`, plus the `metadata.suspension` run-level annotation (§ Run-level `metadata` annotations above) recording a suspended run's resume pointer, origin, and pre-suspend budget-ledger snapshot. Mirrors the abort (`EN.2.B`) and stream (`EN.5.F`) precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `suspension` lives entirely in the existing free-form `TaskContext::metadata` field. `durable.rs`'s writer now upserts across a suspend/resume cycle rather than writing a single terminal update (§ above). See [suspend-resume.md](suspend-resume.md) for the full marker shape and both suspension origins. |
