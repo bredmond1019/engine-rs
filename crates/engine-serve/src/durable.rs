@@ -53,6 +53,12 @@ pub struct DurableMessage {
 #[derive(Clone)]
 pub struct DurableHandle {
     sender: mpsc::UnboundedSender<DurableMessage>,
+    /// The same pool [`spawn_durable_writer`] was handed, retained here so a
+    /// synchronous reader (EN.6.F task 11's resume handler) can fall back to
+    /// `engine_store::get_event` for a suspended run this process never saw
+    /// (a restart) without threading a second `Option<PgPool>` through
+    /// `AppState`. `None` when `DATABASE_URL` was unset.
+    pool: Option<PgPool>,
 }
 
 impl DurableHandle {
@@ -63,6 +69,12 @@ impl DurableHandle {
     /// live-state store (task 2); the durable row is a best-effort record.
     pub fn send(&self, message: DurableMessage) {
         let _ = self.sender.send(message);
+    }
+
+    /// The Postgres pool this handle was constructed with, if any —
+    /// `None` when `DATABASE_URL` was unset (the in-memory-only path).
+    pub fn pool(&self) -> Option<&PgPool> {
+        self.pool.as_ref()
     }
 
     /// Record a snapshot for `run_id`, cloning `snapshot` for the channel.
@@ -110,10 +122,11 @@ pub fn message_to_row(
 /// Postgres I/O, self-skipping the durable write.
 pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
     let (sender, mut receiver) = mpsc::unbounded_channel::<DurableMessage>();
+    let writer_pool = pool.clone();
 
     tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
-            let Some(pool) = pool.as_ref() else {
+            let Some(pool) = writer_pool.as_ref() else {
                 // No DATABASE_URL configured: self-skip the Postgres write,
                 // do not fail or panic.
                 continue;
@@ -135,7 +148,7 @@ pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
         }
     });
 
-    DurableHandle { sender }
+    DurableHandle { sender, pool }
 }
 
 /// Build an `on_progress`-compatible closure that forwards every snapshot for
@@ -307,7 +320,7 @@ mod tests {
     #[test]
     fn durable_on_progress_forwards_snapshots_to_the_handle() {
         let (sender, mut receiver) = mpsc::unbounded_channel::<DurableMessage>();
-        let handle = DurableHandle { sender };
+        let handle = DurableHandle { sender, pool: None };
         let run_id = Uuid::new_v4();
 
         let mut on_progress = durable_on_progress(

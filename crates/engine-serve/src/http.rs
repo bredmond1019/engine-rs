@@ -79,10 +79,26 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             web::get().to(workflow_graph),
         )
         .route("/events/", web::post().to(post_events))
+        // MUST be registered before `/events/{event_id}` -- actix-web
+        // resolves routes first-registration-wins, so the literal
+        // "suspended" segment would otherwise be swallowed by the
+        // `{event_id}` uuid extractor.
+        .route(
+            "/events/suspended",
+            web::get().to(crate::resume::list_suspended),
+        )
         .route("/events/{event_id}", web::get().to(get_event))
         .route(
             "/events/{run_id}/abort",
             web::post().to(crate::abort::abort_run),
+        )
+        .route(
+            "/events/{run_id}/pause",
+            web::post().to(crate::resume::pause_run),
+        )
+        .route(
+            "/events/{event_id}/resume",
+            web::post().to(crate::resume::resume_run),
         )
         .route(
             "/events/{event_id}/stream",
@@ -172,7 +188,7 @@ fn budget_from_env_vars(max_cost_usd: Option<&str>, max_total_tokens: Option<&st
 /// cross-repo compile break for no gain. Reading the environment here
 /// delivers the same configurability with a zero-width public surface
 /// change.
-fn default_budget_from_env() -> Budget {
+pub(crate) fn default_budget_from_env() -> Budget {
     static DEFAULT_BUDGET: OnceLock<Budget> = OnceLock::new();
     *DEFAULT_BUDGET.get_or_init(|| {
         budget_from_env_vars(
