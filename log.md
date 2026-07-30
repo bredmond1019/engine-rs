@@ -18,6 +18,41 @@ related: [status, context]
 
 ## [run: 2026-07-30]
 
+### `EN.4.G-needs-further-research` — PASS (all 8 tasks)
+- **What:** Ran `/sdlc-flow EN.4.G-needs-further-research` on branch `EN.4.G-needs-further-research-flow`.
+  `CompanyBrief`/`ProspectLead` gained `needs_further_research: Vec<String>` (`#[serde(default)]`,
+  always serialized, additive to both JSON schemas, never `required`) (task 1). A new `grounding`
+  policy knob (`GroundingDepth::Standard`/`Strict`, deliberately no `off` per Rule 5) was added to
+  `ResearchAgentPolicy`, resolving through all four layers with `baseline`/`cheap-fast` at `standard`
+  and `thorough` at `strict` (task 2). `CompanyResearchNode` now appends a depth-aware
+  `grounding_directive()` (naming FAR/DFARS and Brazilian data-residency examples, kept-not-deleted
+  framing, `strict` adding a per-claim pass over `pain_points`/`outreach_hooks`) and stamps
+  `grounding_depth` plus a derived, never-model-trusted `validation_required` onto its result (task 3);
+  `ProspectingResearchNode` mirrors the directive per-lead and additionally stamps a sweep-level,
+  order-stable, deduped `needs_further_research` union (task 4). `okf-core`'s `Opportunity` gained the
+  same field end to end — always emitted in frontmatter, `validation_required` always re-derived —
+  mapped from both `from_company_brief`/`from_prospecting_result` and recovered by `from_frontmatter`,
+  committed separately in `core/okf-core` (task 5). A hermetic `research_agent_grounding_e2e.rs`
+  proves the flag survives a real `Workflow::run` into the written Opportunity's frontmatter for both
+  company and prospecting modes (task 6). `docs/research-agent-workflow.md`/`docs/index.md` were
+  updated with the grounding contract and the knob (task 7). Full validation (engine-rs fmt/clippy
+  `-D warnings`/nextest/release build, plus okf-core's and mev's own suites) was green with no code
+  changes needed (task 8). Review verdict: PASS, no findings.
+- **Decision:** `validation_required` is derived everywhere (node stamp, `Opportunity` method), never
+  independently model- or user-settable, so a document can never disagree with its own flagged-claims
+  list. This closes the `research-agent-needs-further-research-flag` carryover in `planning/state.json`
+  and unblocks `EN.6.H1` (OUTREACH_DRAFT), which reads the field unconditionally.
+- Next: `EN.5.B1`/`EN.5.C`/`EN.6.C`/`EN.6.D`/`EN.4.D` per `status.md`'s `next` frontmatter list.
+
+```
+e4105a0 feat: implement EN.4.G-needs-further-research-task7
+499fbb4 feat: implement EN.4.G-needs-further-research-task6
+acc9b08 feat: implement EN.4.G-needs-further-research-task4
+6e2da0c feat: implement EN.4.G-needs-further-research-task3
+9c2e121 feat: implement EN.4.G-needs-further-research-task2
+a3a1103 feat: implement EN.4.G-needs-further-research-task1
+```
+
 ### `EN.4.E-contact-enrichment` re-run — PASS (all 11 tasks)
 - **What:** Completed the `/sdlc-flow EN.4.E-contact-enrichment` re-run on branch
   `EN.4.E-contact-enrichment-flow` that had previously bailed at Task 11. Tasks 1, 3–10 remained
