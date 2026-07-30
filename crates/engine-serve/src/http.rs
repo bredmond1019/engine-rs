@@ -307,6 +307,17 @@ pub(crate) fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
     "succeeded"
 }
 
+/// Status for a run that is still in the live map. `derive_terminal_status`
+/// is deliberately NOT extended: a suspended run is not terminal, and that
+/// function is only reached for the completed ring and `publish_terminal`.
+pub(crate) fn derive_live_status(snapshot: &TaskContext) -> &'static str {
+    if engine_core::suspend::is_suspended(&snapshot.metadata) {
+        "suspended"
+    } else {
+        "running"
+    }
+}
+
 /// `POST /events/` — trigger dispatch: 401 on a missing/bad `X-API-Key`, 422
 /// on an unregistered `workflow_type`, otherwise **spawns** the workflow
 /// (feeding the live-state store and the durable writer through
@@ -461,10 +472,11 @@ async fn get_event(
             .get(&event_id)
             .cloned()
             .unwrap_or_else(|| ("unknown".to_string(), Utc::now()));
+        let status = derive_live_status(&snapshot);
         return HttpResponse::Ok().json(serde_json::json!({
             "event_id": event_id,
             "workflow_type": workflow_type,
-            "status": "running",
+            "status": status,
             "created_at": created_at,
             "updated_at": Utc::now(),
             "task_context": snapshot,
@@ -1439,8 +1451,9 @@ mod tests {
             "a freshly suspended run must not already be marked resuming"
         );
 
-        // Still live: `GET /events/{id}` reads "running", not a 404 or a
-        // terminal record — `live_run_metadata()` was kept, not removed.
+        // Still live: `GET /events/{id}` reads "suspended" (task 12's
+        // `derive_live_status`), not a 404 or a terminal record —
+        // `live_run_metadata()` was kept, not removed.
         let get_req = test::TestRequest::get()
             .uri(&format!("/events/{run_id}"))
             .insert_header(("X-API-Key", "test-key"))
@@ -1448,7 +1461,7 @@ mod tests {
         let get_resp = test::call_service(&app, get_req).await;
         assert_eq!(get_resp.status(), 200);
         let get_body: serde_json::Value = test::read_body_json(get_resp).await;
-        assert_eq!(get_body["status"], "running");
+        assert_eq!(get_body["status"], "suspended");
         assert_eq!(get_body["workflow_type"], "suspend-fixture");
 
         // The pause signal was deregistered even though the run stayed
@@ -1544,6 +1557,67 @@ mod tests {
                 "failure": { "failed": true }
             }));
             assert_eq!(derive_terminal_status(&ctx), "cancelled");
+        }
+    }
+
+    mod derive_live_status_tests {
+        use super::derive_live_status;
+        use engine_contract::TaskContext;
+        use std::collections::HashMap as StdHashMap;
+
+        fn empty_context(metadata: serde_json::Value) -> TaskContext {
+            TaskContext {
+                event: serde_json::Value::Null,
+                nodes: StdHashMap::new(),
+                metadata,
+                node_runs: StdHashMap::new(),
+            }
+        }
+
+        #[test]
+        fn suspended_when_suspension_marker_is_set() {
+            let ctx = empty_context(serde_json::json!({
+                "suspension": {
+                    "suspended": true,
+                    "at": "2026-01-01T00:00:00Z",
+                    "resume_at": "MarkerNode",
+                    "reason": "operator_pause",
+                    "origin_identity": null,
+                    "ledger": { "total_tokens": 0, "total_cost_usd": 0.0 },
+                    "resume_count": 0,
+                    "requested": false
+                }
+            }));
+            assert_eq!(derive_live_status(&ctx), "suspended");
+        }
+
+        #[test]
+        fn running_when_suspension_marker_is_resumed() {
+            let ctx = empty_context(serde_json::json!({
+                "suspension": {
+                    "suspended": false,
+                    "at": "2026-01-01T00:00:00Z",
+                    "resume_at": "MarkerNode",
+                    "reason": "operator_pause",
+                    "origin_identity": null,
+                    "ledger": { "total_tokens": 0, "total_cost_usd": 0.0 },
+                    "resume_count": 1,
+                    "requested": false
+                }
+            }));
+            assert_eq!(derive_live_status(&ctx), "running");
+        }
+
+        #[test]
+        fn running_when_metadata_has_no_suspension_marker() {
+            let ctx = empty_context(serde_json::json!({}));
+            assert_eq!(derive_live_status(&ctx), "running");
+        }
+
+        #[test]
+        fn running_when_metadata_is_null() {
+            let ctx = empty_context(serde_json::Value::Null);
+            assert_eq!(derive_live_status(&ctx), "running");
         }
     }
 
