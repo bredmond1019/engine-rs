@@ -18,6 +18,40 @@ related: [status, context]
 
 ## [run: 2026-07-30]
 
+### `EN.4.E-contact-enrichment` re-run — PASS (all 11 tasks)
+- **What:** Completed the `/sdlc-flow EN.4.E-contact-enrichment` re-run on branch
+  `EN.4.E-contact-enrichment-flow` that had previously bailed at Task 11. Tasks 1, 3–10 remained
+  no-ops (already implemented and merged in the spec's original PR #22, `5cfa09e`) — each
+  re-verified against every acceptance criterion with no code changes. Task 2 needed a trivial
+  fmt/import-ordering fix in `suspend_resume_postgres_restart.rs` (`d67354e`, unrelated to EN.4.E's
+  own scope). Task 11 (full-suite validation, the designated owner of `cargo test`/
+  `cargo build --release` per the spec's Validation Commands) hit the same regression that bailed
+  the prior attempt — several `crates/engine-serve` suspend/resume tests failing with "run never
+  landed in the suspended index" plus a body-not-empty assertion. Root-caused this time: those
+  tests race on process-global `OnceLock`-backed registries (the suspended-run index and pause
+  signals from `EN.6.F-suspend-resume`) and only ran safely under `cargo nextest run`'s
+  one-process-per-test isolation — plain `cargo test`'s shared-process threading let concurrent
+  tests interfere. Fixed with a `#[cfg(test)]` shared mutex serializing the affected tests in
+  `suspend.rs`/`resume.rs`/`http.rs` — a test-only change, no production suspend/resume behavior
+  altered. Full validation (fmt, clippy `-D warnings`, workspace `cargo test`/`nextest`,
+  `cargo build --release`, plus okf-core's and mev's own suites) green; review PASS; docs
+  (`docs/testing.md`) updated to note the shared-registry test-isolation caveat.
+- **Decision:** This closes `EN.4.E` for good — the earlier bail was a test-infrastructure gap
+  in an adjacent block (`EN.6.F`), not a defect in this spec's own deliverables, and it is now
+  fixed without touching production code.
+- Next: `EN.5.B1`/`EN.5.C`/`EN.6.C`/`EN.6.D`/`EN.4.D` per `status.md`'s `next` frontmatter list.
+
+```
+5b722e5 docs: update docs for EN.4.E-contact-enrichment
+7eb2a1a fix: fix pass 1 for EN.4.E-contact-enrichment-task11
+11173d4 chore: wrap up EN.4.E-contact-enrichment
+d67354e fix: fix pass 1 for EN.4.E-contact-enrichment-task2
+74ebe29 test: cover corrupt/malformed persisted suspension state
+7c8680a test: cover Postgres restart-durability resume path (rehydrate_from_store)
+b95b4be Merge pull request #26 from bredmond1019/EN.6.F-suspend-resume-flow
+206ee71 chore: wrap up EN.6.F-suspend-resume
+```
+
 ### `EN.4.E-contact-enrichment` re-run — BAILED at Task 11 (resume-module regression)
 - **What:** Ran `/sdlc-flow EN.4.E-contact-enrichment` on branch `EN.4.E-contact-enrichment-flow`
   against a spec that had already fully shipped in a prior session (PR #22, `5cfa09e`, all 11
