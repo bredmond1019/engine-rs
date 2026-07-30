@@ -18,6 +18,43 @@ related: [status, context]
 
 ## [run: 2026-07-30]
 
+### `EN.4.E-contact-enrichment` re-run — BAILED at Task 11 (resume-module regression)
+- **What:** Ran `/sdlc-flow EN.4.E-contact-enrichment` on branch `EN.4.E-contact-enrichment-flow`
+  against a spec that had already fully shipped in a prior session (PR #22, `5cfa09e`, all 11
+  tasks PASS-reviewed 2026-07-28). Tasks 1, 3–10 verified as already-implemented no-ops (working
+  tree clean, every acceptance criterion re-checked against the existing code, no commits made).
+  Task 2 needed a trivial fmt/import-ordering fix in `suspend_resume_postgres_restart.rs`
+  (committed as `d67354e`, unrelated to EN.4.E's own scope). Task 11 (full-suite validation) then
+  hit a real, reproducible failure: `task_validation_3`/`cargo test` fails across multiple
+  resume/suspend tests with the signature "run never landed in the suspended index" plus a
+  body-not-empty assertion, on two consecutive attempts with no evidence of progress between
+  them — a structural bug in the suspend/resume state transition (`EN.6.F-suspend-resume`'s
+  primitive stack), not a flake and not in scope for this spec to fix. The run bailed rather than
+  attempting an unbounded fix inside an unrelated block's territory.
+- **Decision:** Left `EN.4.E`'s own deliverables untouched (they are correct and already merged);
+  did not force a third fix attempt on the resume module from within this spec's flow. The
+  resume/suspend regression needs its own triage against `EN.6.F`'s test suite before any further
+  `EN.4.E`-branch validation can go green.
+- Next: triage the suspend/resume "run never landed in the suspended index" failure directly
+  (likely in `crates/engine-serve` or `engine-core::suspend`) as its own fix pass, independent of
+  `EN.4.E`; once green, either re-run this spec's validation or fold the fix into a follow-on
+  ticket against `EN.6.F`.
+
+```
+d67354e fix: fix pass 1 for EN.4.E-contact-enrichment-task2
+74ebe29 test: cover corrupt/malformed persisted suspension state
+7c8680a test: cover Postgres restart-durability resume path (rehydrate_from_store)
+b95b4be Merge pull request #26 from bredmond1019/EN.6.F-suspend-resume-flow
+206ee71 chore: wrap up EN.6.F-suspend-resume
+90d7d24 feat: implement EN.6.F-suspend-resume-task14
+cc0245c feat: implement EN.6.F-suspend-resume-task13
+908a64f feat: implement EN.6.F-suspend-resume-task12
+```
+
+---
+
+## [run: 2026-07-30]
+
 ### `EN.6.F-suspend-resume` — human-in-the-loop approval gate: run_from, SuspendNode, pause/resume/suspended-list HTTP surface
 - **What:** Ran `/sdlc-flow EN.6.F-suspend-resume` on branch `EN.6.F-suspend-resume-flow`. All 15
   tasks passed, PASS review. Landed the full suspend/resume primitive stack: `PauseSignal` (a
