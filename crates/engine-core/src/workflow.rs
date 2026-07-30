@@ -176,9 +176,27 @@ impl Workflow {
     pub async fn run_with(
         &self,
         event: serde_json::Value,
-        mut on_progress: OnProgress<'_>,
+        on_progress: OnProgress<'_>,
         options: RunOptions,
     ) -> Result<TaskContext, WorkflowError> {
+        let ctx = self.seed_context(event);
+        self.walk(
+            ctx,
+            Some(self.schema.start_node.clone()),
+            BudgetLedger::new(),
+            on_progress,
+            options,
+        )
+        .await
+    }
+
+    /// Build a fresh [`TaskContext`] for a new run: `event` seeds
+    /// `TaskContext::event`, `self.seeded_nodes` seeds `ctx.nodes`, and every
+    /// node declared in the schema is seeded PENDING in `node_runs` before
+    /// anything runs. Extracted from `run_with` verbatim (EN.6.F task 3) so
+    /// `run_from` can rehydrate a stored `TaskContext` instead of building a
+    /// new one, while still sharing the walk loop below.
+    fn seed_context(&self, event: serde_json::Value) -> TaskContext {
         let mut ctx = TaskContext {
             event,
             nodes: self.seeded_nodes.clone(),
@@ -200,10 +218,25 @@ impl Workflow {
                 },
             );
         }
-        on_progress(&ctx);
 
-        let mut current = Some(self.schema.start_node.clone());
-        let mut ledger = BudgetLedger::new();
+        ctx
+    }
+
+    /// The pointer-walk loop itself, extracted from `run_with` verbatim
+    /// (EN.6.F task 3): starts at `current` (rather than always
+    /// `self.schema.start_node`) and drives the given `ctx`/`ledger` forward
+    /// node-by-node. This is the shared core both `run_with` (fresh context,
+    /// fresh ledger, start node) and a future `run_from` (rehydrated context,
+    /// rehydrated ledger, stored pointer) drive.
+    async fn walk(
+        &self,
+        mut ctx: TaskContext,
+        mut current: Option<String>,
+        mut ledger: BudgetLedger,
+        mut on_progress: OnProgress<'_>,
+        options: RunOptions,
+    ) -> Result<TaskContext, WorkflowError> {
+        on_progress(&ctx);
 
         while let Some(identity) = current {
             if let Some(token) = &options.cancellation_token {
