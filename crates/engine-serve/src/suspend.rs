@@ -52,8 +52,11 @@ pub struct SuspendedEntry {
 /// The result of [`take_for_resume`]'s atomic read-and-set.
 pub enum TakeForResume {
     /// The entry was `Ready`; it is now marked `resuming` in place (still
-    /// present in the index) pending the resume outcome.
-    Ready(SuspendedEntry),
+    /// present in the index) pending the resume outcome. Boxed: at 296+
+    /// bytes `SuspendedEntry` would otherwise make every `TakeForResume`
+    /// (including the far smaller `AlreadyResuming`/`NotFound` variants) pay
+    /// its size.
+    Ready(Box<SuspendedEntry>),
     /// A concurrent caller already took this run for resume.
     AlreadyResuming,
     /// No suspended entry exists for this `run_id`.
@@ -155,7 +158,12 @@ pub fn list_suspended() -> Vec<(Uuid, SuspendedEntry)> {
         .order
         .iter()
         .rev()
-        .filter_map(|run_id| guard.entries.get(run_id).map(|entry| (*run_id, entry.clone())))
+        .filter_map(|run_id| {
+            guard
+                .entries
+                .get(run_id)
+                .map(|entry| (*run_id, entry.clone()))
+        })
         .collect()
 }
 
@@ -181,7 +189,7 @@ pub fn take_for_resume(run_id: Uuid) -> TakeForResume {
         Some(entry) if entry.resuming => TakeForResume::AlreadyResuming,
         Some(entry) => {
             entry.resuming = true;
-            TakeForResume::Ready(entry.clone())
+            TakeForResume::Ready(Box::new(entry.clone()))
         }
     }
 }
