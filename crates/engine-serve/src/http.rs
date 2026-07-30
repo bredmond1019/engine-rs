@@ -1471,9 +1471,11 @@ mod tests {
             "pause signal should be removed on the suspended exit path"
         );
 
-        // The cancellation token was likewise deregistered: an abort against
-        // this run_id now 404s, matching the terminal path's "nobody is
-        // checking the token" behavior.
+        // The cancellation token was likewise deregistered -- but a
+        // suspended run must still be killable (EN.6.F task 13's "abort of
+        // a suspended run" coverage), so `abort_run` (`crate::abort`) falls
+        // back to the suspended index instead of 404ing on the missing
+        // token.
         let abort_req = test::TestRequest::post()
             .uri(&format!("/events/{run_id}/abort"))
             .insert_header(("X-API-Key", "test-key"))
@@ -1481,11 +1483,25 @@ mod tests {
         let abort_resp = test::call_service(&app, abort_req).await;
         assert_eq!(
             abort_resp.status(),
-            404,
-            "the cancellation token should already be deregistered on a suspended exit"
+            202,
+            "a suspended run has no live token, but must still be killable via the suspended-index fallback"
         );
 
-        crate::suspend::remove_suspended(run_id);
+        assert!(
+            crate::suspend::list_suspended()
+                .into_iter()
+                .all(|(id, _)| id != run_id),
+            "aborting a suspended run must remove it from the suspended index"
+        );
+
+        let get_after_abort_req = test::TestRequest::get()
+            .uri(&format!("/events/{run_id}"))
+            .insert_header(("X-API-Key", "test-key"))
+            .to_request();
+        let get_after_abort_resp = test::call_service(&app, get_after_abort_req).await;
+        let get_after_abort_body: serde_json::Value =
+            test::read_body_json(get_after_abort_resp).await;
+        assert_eq!(get_after_abort_body["status"], "cancelled");
     }
 
     mod derive_terminal_status_tests {
