@@ -18,6 +18,7 @@ pub mod parallel;
 pub mod policy;
 pub mod routing;
 pub mod schema;
+pub mod suspend;
 pub mod validate;
 pub mod workflow;
 pub mod workflows;
@@ -33,5 +34,10 @@ pub use nodes::ClaudeCodeStep;
 pub use parallel::ParallelNode;
 pub use routing::{dispatch_route, Router};
 pub use schema::{NodeConfig, WorkflowSchema};
+pub use suspend::{
+    is_suspended, read_suspension, request_suspension, stamp_resumed, stamp_suspended,
+    suspension_requested, LedgerSnapshot, PauseSignal, SuspendReason, Suspension, SuspensionState,
+    SUSPENSION_METADATA_KEY,
+};
 pub use validate::{ValidationError, WorkflowValidator};
 pub use workflow::{OnProgress, RunOptions, Workflow, WorkflowError, BUDGET_METADATA_KEY};
