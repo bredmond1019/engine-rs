@@ -381,6 +381,7 @@ async fn post_events(
         let options = RunOptions {
             cancellation_token: Some(token),
             budget: Some(budget),
+            pause_signal: None,
         };
 
         // A cancelled or budget-halted run returns `Ok` with the marker

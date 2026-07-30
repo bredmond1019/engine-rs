@@ -17,6 +17,7 @@ use crate::budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 use crate::cancellation::{stamp_cancelled, CancellationToken};
 use crate::node::NodeRegistry;
 use crate::schema::WorkflowSchema;
+use crate::suspend::{self, stamp_suspended, PauseSignal, SuspendReason, Suspension};
 use crate::validate::{ValidationError, WorkflowValidator};
 
 /// The `TaskContext::metadata` key under which a budget-halted run's reason
@@ -31,6 +32,16 @@ pub const BUDGET_METADATA_KEY: &str = "budget";
 ///
 /// [`policy::telemetry::RunTelemetry`]: crate::policy::telemetry::RunTelemetry
 pub const RUN_TELEMETRY_METADATA_KEY: &str = "run_telemetry";
+
+/// Everything [`Workflow::run_from`] needs to continue a suspended run: the
+/// rehydrated `TaskContext` (already carrying its resolved policy and every
+/// completed `NodeRun`), the identity to resume at, and the budget ledger
+/// snapshot to resume spend-tracking from (rather than zero).
+pub struct ResumeState {
+    pub ctx: TaskContext,
+    pub at_identity: String,
+    pub ledger: BudgetLedger,
+}
 
 /// Optional cancellation/budget wiring for [`Workflow::run_with`]. Every
 /// field defaults to `None`, matching [`Workflow::run`]'s behavior exactly —
@@ -48,6 +59,13 @@ pub struct RunOptions {
     /// final `on_progress` snapshot is emitted. `None` means no gate at all
     /// (existing `run` callers keep their unmodified behavior).
     pub budget: Option<Budget>,
+    /// Checked at the loop top, after cancellation and after the budget gate
+    /// (EN.6.F task 4): a paused signal stops the walk before the next node
+    /// dispatches, exactly like cancellation/budget do, but stamps the
+    /// suspension marker (`suspend::stamp_suspended`) instead. `None` means
+    /// no pause check at all — existing `run`/`run_with` callers keep their
+    /// unmodified behavior.
+    pub pause_signal: Option<PauseSignal>,
 }
 
 /// Stamps `metadata` with the budget-halt marker:
@@ -137,6 +155,47 @@ impl Workflow {
         self
     }
 
+    /// Drops `seeded_nodes` (EN.6.F task 4). The resume path MUST call this:
+    /// a rehydrated `TaskContext` already carries the resolved policy under
+    /// `policy::RESOLVED_POLICY_IDENTITY` (stamped once at the original
+    /// dispatch), and a factory rebuilt for the resume must never
+    /// re-seed/overwrite it — critical for `SDLC_FLOW`, whose factory
+    /// re-resolves policy via `PolicyConfigSource::Worktree(cwd)` and would
+    /// otherwise silently replace the run's original policy with whatever
+    /// the resuming process's cwd resolves today.
+    #[must_use]
+    pub fn without_seeded_nodes(mut self) -> Self {
+        self.seeded_nodes = HashMap::new();
+        self
+    }
+
+    /// Pre-flight check for a resume point: `true` iff `identity` is
+    /// registered in this workflow's node registry. Lets a resume handler
+    /// turn an unresolvable `resume_at` into a 4xx before spawning the walk,
+    /// rather than discovering it as a `WorkflowError` inside a spawned task
+    /// nobody awaits.
+    pub fn has_node(&self, identity: &str) -> bool {
+        self.registry.contains(identity)
+    }
+
+    /// `entry().or_insert` only: adds `Pending` entries for schema nodes the
+    /// rehydrated `ctx` has never heard of (schema drift between suspend and
+    /// resume), and never clobbers an existing `NodeRun` — a resumed run's
+    /// already-completed nodes must keep their original `started_at`/
+    /// `completed_at` timestamps untouched.
+    fn seed_missing_pending(&self, ctx: &mut TaskContext) {
+        for identity in self.schema.nodes.keys() {
+            ctx.node_runs.entry(identity.clone()).or_insert(NodeRun {
+                status: NodeRunStatus::Pending,
+                started_at: None,
+                completed_at: None,
+                error: None,
+                input: None,
+                usage: None,
+            });
+        }
+    }
+
     /// Run the workflow to completion (or first failure).
     ///
     /// `event` seeds `TaskContext::event`; all nodes declared in the schema are
@@ -184,6 +243,32 @@ impl Workflow {
             ctx,
             Some(self.schema.start_node.clone()),
             BudgetLedger::new(),
+            on_progress,
+            options,
+        )
+        .await
+    }
+
+    /// Continue a suspended run (EN.6.F task 4): rehydrates `state.ctx`,
+    /// seeds `Pending` `NodeRun`s for any schema node the rehydrated context
+    /// has never heard of (schema drift), stamps the resumed marker, and
+    /// walks forward from `state.at_identity` — never re-running an
+    /// already-completed node, and never re-seeding `self.seeded_nodes`
+    /// (call [`Workflow::without_seeded_nodes`] first if this workflow was
+    /// rebuilt with a policy resolved for a *different* run).
+    pub async fn run_from(
+        &self,
+        state: ResumeState,
+        on_progress: OnProgress<'_>,
+        options: RunOptions,
+    ) -> Result<TaskContext, WorkflowError> {
+        let mut ctx = state.ctx;
+        self.seed_missing_pending(&mut ctx);
+        suspend::stamp_resumed(&mut ctx.metadata);
+        self.walk(
+            ctx,
+            Some(state.at_identity),
+            state.ledger,
             on_progress,
             options,
         )
@@ -255,6 +340,26 @@ impl Workflow {
                 return Ok(ctx);
             }
 
+            // Checked after cancellation and after the budget gate,
+            // deliberately: a ledger already over cap should halt truthfully
+            // (D6) rather than suspend into an immediate re-halt on resume.
+            // `identity` is the node about to run and has NOT run yet, so it
+            // becomes the resume point verbatim.
+            if let Some(sig) = &options.pause_signal {
+                if sig.is_paused() {
+                    self.finish_suspended(
+                        &mut ctx,
+                        Some(identity.clone()),
+                        SuspendReason::OperatorPause,
+                        None,
+                        &ledger,
+                    );
+                    stamp_run_telemetry(&mut ctx, &self.schema.start_node);
+                    on_progress(&ctx);
+                    return Ok(ctx);
+                }
+            }
+
             let node = self.registry.get(&identity).ok_or_else(|| {
                 WorkflowError::new(format!("no node registered for identity '{identity}'"))
             })?;
@@ -289,14 +394,61 @@ impl Workflow {
                 ledger.record(run.usage.as_ref(), cost_usd);
             }
 
-            current = match router_next {
+            current = match router_next.clone() {
                 Some(next) => next,
                 None => self.schema.next_after(&identity).map(str::to_string),
             };
+
+            // A `SuspendNode` requested suspension from inside `process()`.
+            // The resume pointer is the *successor* of the node that just
+            // ran, already computed above as `current` — guarded so
+            // suspending at the graph's last node simply completes the run
+            // rather than suspending with an unresolvable `None` pointer (in
+            // that case `current` is already `None` and the loop exits
+            // normally below).
+            if suspend::suspension_requested(&ctx.metadata) && current.is_some() {
+                self.finish_suspended(
+                    &mut ctx,
+                    current.clone(),
+                    SuspendReason::SuspendNode,
+                    Some(&identity),
+                    &ledger,
+                );
+                stamp_run_telemetry(&mut ctx, &self.schema.start_node);
+                on_progress(&ctx);
+                return Ok(ctx);
+            }
         }
 
         stamp_run_telemetry(&mut ctx, &self.schema.start_node);
         Ok(ctx)
+    }
+
+    /// The single place that writes the suspension marker — where operator
+    /// pause and `SuspendNode` become one thing (EN.6.F task 4). No-ops
+    /// (leaves the run to complete rather than suspending) when `resume_at`
+    /// is `None`, so a caller that hasn't already guarded for "nothing to
+    /// resume to" stays safe.
+    fn finish_suspended(
+        &self,
+        ctx: &mut TaskContext,
+        resume_at: Option<String>,
+        reason: SuspendReason,
+        origin: Option<&str>,
+        ledger: &BudgetLedger,
+    ) {
+        let Some(resume_at) = resume_at else {
+            return;
+        };
+        stamp_suspended(
+            &mut ctx.metadata,
+            Suspension {
+                resume_at: &resume_at,
+                reason,
+                origin_identity: origin,
+                ledger,
+            },
+        );
     }
 }
 
@@ -793,6 +945,7 @@ mod tests {
         let options = RunOptions {
             cancellation_token: Some(token),
             budget: None,
+            pause_signal: None,
         };
 
         let ctx = workflow
@@ -822,6 +975,7 @@ mod tests {
         let options = RunOptions {
             cancellation_token: None,
             budget: Some(budget),
+            pause_signal: None,
         };
 
         let ctx = workflow
@@ -831,5 +985,243 @@ mod tests {
 
         assert!(ctx.metadata.get(BUDGET_METADATA_KEY).is_some());
         stamped_run_telemetry(&ctx);
+    }
+
+    // -- EN.6.F task 4: run_from, the pause check, finish_suspended -------
+
+    /// A node whose `process()` calls `suspend::request_suspension` on its
+    /// own way out, exercising the post-node `SuspendNode` finalization path
+    /// without depending on the real `SuspendNode` (a later task).
+    struct RequestSuspendNode;
+
+    #[async_trait::async_trait]
+    impl Node for RequestSuspendNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+            crate::suspend::request_suspension(&mut ctx.metadata);
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "RequestSuspendNode"
+        }
+    }
+
+    #[test]
+    fn run_options_default_has_no_pause_signal() {
+        let options = RunOptions::default();
+        assert!(options.pause_signal.is_none());
+    }
+
+    #[tokio::test]
+    async fn paused_signal_stops_the_walk_at_the_loop_top() {
+        let workflow = two_node_workflow();
+
+        let signal = PauseSignal::new();
+        signal.pause();
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: None,
+            budget: None,
+            pause_signal: Some(signal),
+        };
+
+        let ctx = workflow
+            .run_with(serde_json::json!({}), on_progress, options)
+            .await
+            .expect("a paused run returns Ok, not Err");
+
+        // The next node ("start_node") never dispatched -- still Pending.
+        assert_eq!(
+            ctx.node_runs.get("start_node").unwrap().status,
+            NodeRunStatus::Pending
+        );
+        assert_eq!(
+            ctx.node_runs.get("SuccessNode").unwrap().status,
+            NodeRunStatus::Pending
+        );
+
+        let suspension =
+            crate::suspend::read_suspension(&ctx.metadata).expect("suspension marker present");
+        assert!(suspension.suspended);
+        assert_eq!(suspension.resume_at.as_deref(), Some("start_node"));
+        assert_eq!(
+            suspension.reason,
+            Some(crate::suspend::SuspendReason::OperatorPause)
+        );
+    }
+
+    /// `start -> RequestSuspendNode -> SuccessNode` (terminal): the requesting
+    /// node is not the last node, so `resume_at` should be its declared
+    /// successor.
+    fn suspend_then_success_workflow() -> Workflow {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(RequestSuspendNode));
+        registry.register(Box::new(SuccessNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "RequestSuspendNode".to_string(),
+            crate::schema::NodeConfig::new("RequestSuspendNode", vec!["SuccessNode".to_string()]),
+        );
+        nodes.insert(
+            "SuccessNode".to_string(),
+            crate::schema::NodeConfig::new("SuccessNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("linear", "RequestSuspendNode", nodes);
+        Workflow::new(registry, schema)
+    }
+
+    #[tokio::test]
+    async fn suspension_requested_after_a_node_yields_its_successor_as_resume_at() {
+        let workflow = suspend_then_success_workflow();
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let ctx = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .expect("run should return Ok when it suspends");
+
+        assert_eq!(
+            ctx.node_runs.get("RequestSuspendNode").unwrap().status,
+            NodeRunStatus::Success
+        );
+        assert_eq!(
+            ctx.node_runs.get("SuccessNode").unwrap().status,
+            NodeRunStatus::Pending
+        );
+
+        let suspension =
+            crate::suspend::read_suspension(&ctx.metadata).expect("suspension marker present");
+        assert!(suspension.suspended);
+        assert_eq!(suspension.resume_at.as_deref(), Some("SuccessNode"));
+        assert_eq!(
+            suspension.reason,
+            Some(crate::suspend::SuspendReason::SuspendNode)
+        );
+        assert_eq!(
+            suspension.origin_identity.as_deref(),
+            Some("RequestSuspendNode")
+        );
+    }
+
+    #[tokio::test]
+    async fn suspension_requested_at_the_last_node_completes_the_run_instead() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(RequestSuspendNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "RequestSuspendNode".to_string(),
+            crate::schema::NodeConfig::new("RequestSuspendNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "RequestSuspendNode", nodes);
+        let workflow = Workflow::new(registry, schema);
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let ctx = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .expect("run should complete normally");
+
+        assert_eq!(
+            ctx.node_runs.get("RequestSuspendNode").unwrap().status,
+            NodeRunStatus::Success
+        );
+        assert!(
+            !crate::suspend::is_suspended(&ctx.metadata),
+            "suspending at the last node must complete the run, not suspend it"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_from_starts_at_the_given_identity_without_re_seeding_completed_nodes() {
+        let workflow = two_node_workflow();
+
+        // Simulate a rehydrated ctx: `start_node` already completed, its
+        // NodeRun timestamps fixed and distinguishable from "just now".
+        let fixed_completed_at = Utc::now() - chrono::Duration::hours(1);
+        let mut ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.node_runs.insert(
+            "start_node".to_string(),
+            NodeRun {
+                status: NodeRunStatus::Success,
+                started_at: Some(fixed_completed_at),
+                completed_at: Some(fixed_completed_at),
+                error: None,
+                input: None,
+                usage: None,
+            },
+        );
+
+        let state = ResumeState {
+            ctx,
+            at_identity: "SuccessNode".to_string(),
+            ledger: BudgetLedger::new(),
+        };
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let out = workflow
+            .run_from(state, on_progress, RunOptions::default())
+            .await
+            .expect("run_from should complete");
+
+        // The already-completed node's timestamps are untouched -- it was
+        // never re-run.
+        let start_run = out.node_runs.get("start_node").unwrap();
+        assert_eq!(start_run.status, NodeRunStatus::Success);
+        assert_eq!(start_run.completed_at, Some(fixed_completed_at));
+
+        // Resume actually ran the target node.
+        assert_eq!(
+            out.node_runs.get("SuccessNode").unwrap().status,
+            NodeRunStatus::Success
+        );
+        assert!(out.nodes.contains_key("SuccessNode"));
+
+        // `run_from` seeds missing schema nodes as Pending via
+        // `seed_missing_pending` -- here every schema node was already
+        // present, so nothing new was added, but the call must not panic
+        // or clobber the existing entries either.
+        assert_eq!(out.node_runs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_seeded_nodes_clears_seeded_nodes_and_has_node_reports_registry_membership() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(SuccessNode));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "SuccessNode".to_string(),
+            crate::schema::NodeConfig::new("SuccessNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "SuccessNode", nodes);
+
+        let mut seeded = HashMap::new();
+        seeded.insert("X".to_string(), serde_json::json!({ "a": 1 }));
+        let workflow = Workflow::new(registry, schema).with_seeded_nodes(seeded);
+
+        assert!(workflow.has_node("SuccessNode"));
+        assert!(!workflow.has_node("NoSuchNode"));
+
+        let workflow = workflow.without_seeded_nodes();
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let ctx = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .expect("run should succeed");
+
+        // The seeded "X" entry is gone -- without_seeded_nodes took effect.
+        assert!(!ctx.nodes.contains_key("X"));
     }
 }
