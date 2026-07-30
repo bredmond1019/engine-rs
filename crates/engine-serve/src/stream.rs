@@ -177,6 +177,46 @@ pub fn publish_terminal(run_id: RunId, final_context: &TaskContext) {
     guard.live.remove(&run_id);
 }
 
+/// Publish a `status: "suspended"`, `terminal: true` frame and retire the
+/// live sender, so a subscriber parked on a now-suspended run closes cleanly
+/// instead of hanging. Mirrors [`publish_terminal`]: same single write lock,
+/// same terminal-cache insert — a suspended run's stream behaves exactly
+/// like a finished run's until [`clear_terminal`] is called on resume.
+pub fn publish_suspended(run_id: RunId, snapshot: &TaskContext) {
+    let frame = StreamFrame {
+        event_id: run_id,
+        status: "suspended".to_string(),
+        task_context: snapshot.clone(),
+        terminal: true,
+    };
+
+    let mut guard = registry()
+        .write()
+        .expect("stream registry lock poisoned on write");
+    if let Some(sender) = guard.live.get(&run_id) {
+        let _ = sender.send(frame.clone());
+    }
+    guard.terminal.insert(run_id, frame);
+    guard.live.remove(&run_id);
+}
+
+/// Drop `run_id`'s cached terminal frame (and any retired sender) so a
+/// resumed run can stream again: the next [`subscribe`] call falls through
+/// the now-empty terminal-cache check and mints a fresh live channel. A
+/// no-op for a run with no cached frame.
+///
+/// Without this, [`subscribe`]'s terminal-cache short-circuit (`:194`)
+/// would keep handing every post-resume subscriber the stale `suspended`
+/// frame followed by `Closed` — a live run with a dead stream.
+pub fn clear_terminal(run_id: RunId) {
+    let mut guard = registry()
+        .write()
+        .expect("stream registry lock poisoned on write");
+    guard.terminal.entries.remove(&run_id);
+    guard.terminal.order.retain(|id| *id != run_id);
+    guard.live.remove(&run_id);
+}
+
 /// Subscribe to `run_id`'s tee. If the run has already gone terminal,
 /// returns a fresh one-shot channel pre-loaded with the cached terminal
 /// frame (one `Ok`, then `Closed`) instead of a live channel nobody will
@@ -410,6 +450,74 @@ mod tests {
                 task.await.expect("subscriber task should not panic");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn publish_suspended_delivers_one_terminal_frame_then_closes() {
+        let run_id = Uuid::new_v4();
+        let mut receiver = subscribe(run_id);
+
+        publish_suspended(run_id, &fixture_context("paused"));
+
+        let frame = recv_next(&mut receiver)
+            .await
+            .expect("subscriber should get the suspended frame");
+        assert!(frame.terminal);
+        assert_eq!(frame.status, "suspended");
+        assert_eq!(frame.task_context, fixture_context("paused"));
+
+        assert!(
+            recv_next(&mut receiver).await.is_none(),
+            "stream should close after the suspended frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_subscriber_after_publish_suspended_gets_the_cached_frame() {
+        let run_id = Uuid::new_v4();
+        publish_suspended(run_id, &fixture_context("already-suspended"));
+
+        let mut receiver = subscribe(run_id);
+        let frame = recv_next(&mut receiver)
+            .await
+            .expect("late subscriber should still get the suspended frame");
+        assert!(frame.terminal);
+        assert_eq!(frame.status, "suspended");
+
+        assert!(recv_next(&mut receiver).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_terminal_lets_a_resumed_run_stream_fresh_frames() {
+        let run_id = Uuid::new_v4();
+        publish_suspended(run_id, &fixture_context("paused"));
+
+        clear_terminal(run_id);
+
+        // A fresh subscribe must NOT see the stale suspended frame — it
+        // should mint a brand-new live channel instead.
+        let mut receiver = subscribe(run_id);
+        publish(run_id, &fixture_context("resumed"));
+
+        let frame = recv_next(&mut receiver)
+            .await
+            .expect("resumed run should deliver a fresh live frame");
+        assert!(!frame.terminal);
+        assert_eq!(frame.status, "running");
+        assert_eq!(frame.task_context, fixture_context("resumed"));
+    }
+
+    #[tokio::test]
+    async fn clear_terminal_on_unknown_run_is_a_no_op() {
+        let run_id = Uuid::new_v4();
+        // No prior publish/subscribe for this run_id at all.
+        clear_terminal(run_id);
+
+        // Registry should still behave normally afterward.
+        let mut receiver = subscribe(run_id);
+        publish(run_id, &fixture_context("still-works"));
+        let frame = recv_next(&mut receiver).await.expect("frame");
+        assert_eq!(frame.task_context, fixture_context("still-works"));
     }
 
     #[tokio::test]

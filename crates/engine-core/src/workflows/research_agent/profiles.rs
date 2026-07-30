@@ -17,8 +17,8 @@ use crate::node::NodeError;
 use crate::policy::PolicyConfigSource;
 
 use super::policy::{
-    self, ContactDepth, ModelTier, OutputVerbosity, PartialContactEnrichment, PartialModelTiers,
-    PartialResearchAgentPolicy, ResearchAgentPolicy,
+    self, ContactDepth, ModelTier, OutputVerbosity, PartialContactEnrichment,
+    PartialIngressDispatch, PartialModelTiers, PartialResearchAgentPolicy, ResearchAgentPolicy,
 };
 use super::schema::ResearchAgentEventSchema;
 
@@ -28,9 +28,9 @@ use super::schema::ResearchAgentEventSchema;
 const WORKFLOW_KEY: &str = "research_agent";
 
 /// The explicit control profile: Sonnet on both stages, normal verbosity,
-/// prompt cache off. Spelled out explicitly (rather than left all-`None`)
-/// so selecting `profile: "baseline"` is a legible, self-documenting no-op
-/// against the built-in default.
+/// prompt cache off, ingress dispatch off. Spelled out explicitly (rather
+/// than left all-`None`) so selecting `profile: "baseline"` is a legible,
+/// self-documenting no-op against the built-in default.
 #[must_use]
 pub fn baseline() -> PartialResearchAgentPolicy {
     PartialResearchAgentPolicy {
@@ -45,12 +45,17 @@ pub fn baseline() -> PartialResearchAgentPolicy {
             prospect: Some(ContactDepth::Standard),
             max_fetches: Some(4),
         }),
+        ingress_dispatch: Some(PartialIngressDispatch {
+            enabled: Some(false),
+            target_workflow_type: Some("CONTENT_PIPELINE".to_string()),
+        }),
         ..Default::default()
     }
 }
 
 /// Cheapest/fastest profile: `haiku` on both stages, terse output, prompt
-/// caching on.
+/// caching on, ingress dispatch off (a chained `CONTENT_PIPELINE` run is
+/// the single largest cost a research run can incur).
 #[must_use]
 pub fn cheap_fast() -> PartialResearchAgentPolicy {
     PartialResearchAgentPolicy {
@@ -65,11 +70,17 @@ pub fn cheap_fast() -> PartialResearchAgentPolicy {
             prospect: Some(ContactDepth::Off),
             max_fetches: Some(0),
         }),
+        ingress_dispatch: Some(PartialIngressDispatch {
+            enabled: Some(false),
+            target_workflow_type: Some("CONTENT_PIPELINE".to_string()),
+        }),
         ..Default::default()
     }
 }
 
-/// Highest-quality profile: `opus` on both stages, verbose output.
+/// Highest-quality profile: `opus` on both stages, verbose output, ingress
+/// dispatch on (the quality ceiling *is* the closed loop into
+/// `CONTENT_PIPELINE`).
 #[must_use]
 pub fn thorough() -> PartialResearchAgentPolicy {
     PartialResearchAgentPolicy {
@@ -85,6 +96,10 @@ pub fn thorough() -> PartialResearchAgentPolicy {
             research: Some(ContactDepth::Deep),
             prospect: Some(ContactDepth::Standard),
             max_fetches: Some(8),
+        }),
+        ingress_dispatch: Some(PartialIngressDispatch {
+            enabled: Some(true),
+            target_workflow_type: Some("CONTENT_PIPELINE".to_string()),
         }),
         ..Default::default()
     }
@@ -289,6 +304,59 @@ mod tests {
         assert_eq!(ce.research, Some(ContactDepth::Deep));
         assert_eq!(ce.prospect, Some(ContactDepth::Standard));
         assert_eq!(ce.max_fetches, Some(8));
+    }
+
+    #[test]
+    fn baseline_sets_ingress_dispatch_disabled() {
+        let p = baseline();
+        let id = p.ingress_dispatch.expect("ingress_dispatch set");
+        assert_eq!(id.enabled, Some(false));
+        assert_eq!(
+            id.target_workflow_type,
+            Some("CONTENT_PIPELINE".to_string())
+        );
+    }
+
+    #[test]
+    fn cheap_fast_sets_ingress_dispatch_disabled() {
+        let p = cheap_fast();
+        let id = p.ingress_dispatch.expect("ingress_dispatch set");
+        assert_eq!(id.enabled, Some(false));
+        assert_eq!(
+            id.target_workflow_type,
+            Some("CONTENT_PIPELINE".to_string())
+        );
+    }
+
+    #[test]
+    fn thorough_sets_ingress_dispatch_enabled() {
+        let p = thorough();
+        let id = p.ingress_dispatch.expect("ingress_dispatch set");
+        assert_eq!(id.enabled, Some(true));
+        assert_eq!(
+            id.target_workflow_type,
+            Some("CONTENT_PIPELINE".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_policy_for_run_baseline_profile_resolves_ingress_dispatch_disabled() {
+        let worktree = temp_dir();
+        let mut event = base_event();
+        event.profile = Some("baseline".to_string());
+        let ctx = base_ctx(event);
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert!(!resolved.ingress_dispatch.enabled);
+    }
+
+    #[test]
+    fn resolve_policy_for_run_thorough_profile_resolves_ingress_dispatch_enabled() {
+        let worktree = temp_dir();
+        let mut event = base_event();
+        event.profile = Some("thorough".to_string());
+        let ctx = base_ctx(event);
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert!(resolved.ingress_dispatch.enabled);
     }
 
     #[test]

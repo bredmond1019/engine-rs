@@ -72,6 +72,13 @@
 //! byte-identical to what an `in_process` push would have sent. Wired into
 //! the single-node `HARVEST_APPROVE` micro-workflow
 //! (`crate::workflows::harvest_approve`).
+//!
+//! `suspend` (`EN.6.F` task 5) is `SuspendNode` — the workflow-authored half
+//! of suspend/resume. It only *requests* suspension (via
+//! `crate::suspend::request_suspension`); `Workflow::walk` (`EN.6.F` task 4)
+//! is what actually stops the walk and picks the resume pointer.
+//! `enabled: false` (the default) is an in-place no-op, mirroring
+//! `MaterializeDocNode::with_enabled`.
 
 pub mod channel_transport;
 pub mod claude_code_step;
@@ -83,6 +90,7 @@ pub mod materialize_doc;
 pub mod merge_contacts;
 pub mod openai_compat_transport;
 pub mod opportunity_edit;
+pub mod suspend;
 
 pub use channel_transport::{
     ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody, StubChannelTransport,
@@ -104,3 +112,4 @@ pub use openai_compat_transport::{
     openai_compat_transport, openai_compat_transport_live, LocalHttpPost,
 };
 pub use opportunity_edit::{OpportunityEditNode, OpportunityEditOp};
+pub use suspend::{SuspendNode, DEFAULT_IDENTITY as SUSPEND_NODE_DEFAULT_IDENTITY};

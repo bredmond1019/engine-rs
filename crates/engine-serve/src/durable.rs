@@ -10,11 +10,16 @@
 //! drains the channel and awaits the `engine_store` insert/update, keeping
 //! Postgres I/O off the run's hot path.
 //!
-//! The first snapshot for a given `run_id` (all nodes PENDING, emitted by
-//! `Workflow::run` before the first node executes) is persisted via
-//! `engine_store::insert_event`; every subsequent snapshot for that run id is
-//! persisted via `engine_store::update_event` (with `engine_store::touch`
-//! stamping `updated_at`). Node identity (the node's type/class name) is
+//! Every snapshot for a given `run_id` is persisted via
+//! `engine_store::upsert_event` (with `engine_store::touch` stamping
+//! `updated_at`): the first snapshot (all nodes PENDING, emitted by
+//! `Workflow::run` before the first node executes) inserts the row, and every
+//! subsequent snapshot for that run id updates it in place, on conflict, by
+//! `id`. There is deliberately no per-process "have I seen this run before"
+//! state (no `seen_runs` set) — a resume that lands in a fresh `engine-serve`
+//! process must not take an insert path and hit a primary-key conflict; the
+//! upsert makes durability writes idempotent regardless of which process
+//! wrote the row first. Node identity (the node's type/class name) is
 //! preserved as-is from the `TaskContext` snapshot, so it stays the join key
 //! across `nodes`/`node_runs` per the contract.
 //!
@@ -24,11 +29,9 @@
 //! no live database (mirrors `engine-store`'s own `postgres_round_trip.rs`
 //! self-skip pattern).
 
-use std::collections::HashSet;
-
 use chrono::{DateTime, Utc};
 use engine_contract::{EventsRow, TaskContext};
-use engine_store::{insert_event, touch, update_event};
+use engine_store::{touch, upsert_event};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -50,6 +53,12 @@ pub struct DurableMessage {
 #[derive(Clone)]
 pub struct DurableHandle {
     sender: mpsc::UnboundedSender<DurableMessage>,
+    /// The same pool [`spawn_durable_writer`] was handed, retained here so a
+    /// synchronous reader (EN.6.F task 11's resume handler) can fall back to
+    /// `engine_store::get_event` for a suspended run this process never saw
+    /// (a restart) without threading a second `Option<PgPool>` through
+    /// `AppState`. `None` when `DATABASE_URL` was unset.
+    pool: Option<PgPool>,
 }
 
 impl DurableHandle {
@@ -60,6 +69,12 @@ impl DurableHandle {
     /// live-state store (task 2); the durable row is a best-effort record.
     pub fn send(&self, message: DurableMessage) {
         let _ = self.sender.send(message);
+    }
+
+    /// The Postgres pool this handle was constructed with, if any —
+    /// `None` when `DATABASE_URL` was unset (the in-memory-only path).
+    pub fn pool(&self) -> Option<&PgPool> {
+        self.pool.as_ref()
     }
 
     /// Record a snapshot for `run_id`, cloning `snapshot` for the channel.
@@ -107,46 +122,33 @@ pub fn message_to_row(
 /// Postgres I/O, self-skipping the durable write.
 pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
     let (sender, mut receiver) = mpsc::unbounded_channel::<DurableMessage>();
+    let writer_pool = pool.clone();
 
     tokio::spawn(async move {
-        let mut seen_runs: HashSet<Uuid> = HashSet::new();
-
         while let Some(message) = receiver.recv().await {
-            let Some(pool) = pool.as_ref() else {
+            let Some(pool) = writer_pool.as_ref() else {
                 // No DATABASE_URL configured: self-skip the Postgres write,
                 // do not fail or panic.
                 continue;
             };
 
-            let is_first_snapshot_for_run = seen_runs.insert(message.run_id);
+            // `created_at` is immutable once a row exists (`upsert_event`
+            // excludes it from the `DO UPDATE` set), so the value passed here
+            // for an already-existing row is a don't-care; it only matters
+            // for the very first insert of a given run id.
             let now = Utc::now();
-
-            if is_first_snapshot_for_run {
-                let row = message_to_row(&message, now, now);
-                if let Err(err) = insert_event(pool, &row).await {
-                    eprintln!(
-                        "durable write: insert_event failed for run {}: {err}",
-                        message.run_id
-                    );
-                }
-            } else {
-                // `created_at` is immutable once inserted; only `data`,
-                // `task_context`, and `updated_at` are touched by
-                // `update_event`, so the value passed here is a don't-care
-                // (kept as `now` for a well-formed row).
-                let mut row = message_to_row(&message, now, now);
-                touch(&mut row);
-                if let Err(err) = update_event(pool, &row).await {
-                    eprintln!(
-                        "durable write: update_event failed for run {}: {err}",
-                        message.run_id
-                    );
-                }
+            let mut row = message_to_row(&message, now, now);
+            touch(&mut row);
+            if let Err(err) = upsert_event(pool, &row).await {
+                eprintln!(
+                    "durable write: upsert_event failed for run {}: {err}",
+                    message.run_id
+                );
             }
         }
     });
 
-    DurableHandle { sender }
+    DurableHandle { sender, pool }
 }
 
 /// Build an `on_progress`-compatible closure that forwards every snapshot for
@@ -318,7 +320,7 @@ mod tests {
     #[test]
     fn durable_on_progress_forwards_snapshots_to_the_handle() {
         let (sender, mut receiver) = mpsc::unbounded_channel::<DurableMessage>();
-        let handle = DurableHandle { sender };
+        let handle = DurableHandle { sender, pool: None };
         let run_id = Uuid::new_v4();
 
         let mut on_progress = durable_on_progress(

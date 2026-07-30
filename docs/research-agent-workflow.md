@@ -1,13 +1,13 @@
 ---
 type: Reference
 title: Research Agent Workflow
-description: How the RESEARCH_AGENT workflow works — dual-mode graph (company brief vs. prospecting) terminating in a MaterializeDocNode write, event schema, tunable ResearchAgentPolicy, triggering, and reading outputs
+description: How the RESEARCH_AGENT workflow works — dual-mode graph (company brief vs. prospecting) terminating in a ResearchIngressDispatchNode self-feeding trigger into CONTENT_PIPELINE, event schema, tunable ResearchAgentPolicy, triggering, and reading outputs
 doc_id: research-agent-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief, materialize-doc-node, opportunity, contacts, merge-contacts, contact-enrichment, locale, language directive]
-related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, data-contract, materialize-doc-node, opportunity-edit-workflows]
+keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief, materialize-doc-node, opportunity, contacts, merge-contacts, contact-enrichment, locale, language directive, ingress-dispatch, channel-transport, content-pipeline]
+related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, data-contract, materialize-doc-node, opportunity-edit-workflows, content-pipeline-workflow]
 ---
 
 # Research Agent Workflow
@@ -25,19 +25,21 @@ Source: `crates/engine-core/src/workflows/research_agent/` (`mod.rs`, `schema.rs
 ## Graph shape
 
 ```
-ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode -> MergeContactsNode
+ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode -> MergeContactsNode -> ResearchIngressDispatchNode
 ```
 
-Five nodes. `ResearchModeRouterNode` is the start node and a deterministic `Router`
+Six nodes. `ResearchModeRouterNode` is the start node and a deterministic `Router`
 that reads `event.mode` and routes to whichever terminal node matches — a `Router::route` takes
 `&TaskContext` and cannot mutate it, so policy resolution and telemetry live in the two research
 nodes instead, not in the router. Both research branches converge on a single shared
 `MaterializeDocNode` instance (`EN.7.B`), which in turn feeds a single shared `MergeContactsNode`
-instance (`EN.4.E`) — the graph's **only** exit point; neither `CompanyResearchNode` nor
-`ProspectingResearchNode` is terminal, and `MaterializeDocNode` is no longer terminal either. The
-graph shape is **invariant across `contact_enrichment` policy depth** (see
-[Policy: `ResearchAgentPolicy`](#policy-researchagentpolicy) below) — no run ever rewires around
-`MergeContactsNode`; its own empty-contacts-list no-op is the only cost control.
+instance (`EN.4.E`), which in turn feeds a single shared `ResearchIngressDispatchNode` instance
+(`EN.6.E`) — the graph's **only** exit point; neither `CompanyResearchNode` nor
+`ProspectingResearchNode` is terminal, and neither `MaterializeDocNode` nor `MergeContactsNode` is
+terminal either. The graph shape is **invariant across `contact_enrichment`/`ingress_dispatch`
+policy settings** (see [Policy: `ResearchAgentPolicy`](#policy-researchagentpolicy) below) — no run
+ever rewires around `MergeContactsNode` or `ResearchIngressDispatchNode`; each node's own in-place
+no-op is the only cost control.
 
 | Node | Kind | What it does |
 |---|---|---|
@@ -45,7 +47,8 @@ graph shape is **invariant across `contact_enrichment` policy depth** (see
 | `CompanyResearchNode` | **Model** (Sonnet by default, tunable via policy) | Wraps `ClaudeCodeStep` with `WebSearch`/`WebFetch` tools granted and a `CompanyBrief` `json_schema`. Resolves the run's `ResearchAgentPolicy`, applies research-stage tier/prompt-cache/verbosity/contact-acquisition shaping, parses the reply into a `CompanyBrief`, deterministically stamps `company_url` from the trigger event when the model omitted it, stamps it + usage onto `ctx`, and persists `research-agent-state.json`. |
 | `ProspectingResearchNode` | **Model** (Sonnet by default, tunable via policy) | Same shape as `CompanyResearchNode` for the `prospect` stage: resolves policy, applies shaping, runs a `WebSearch`-backed sweep, parses a `ProspectingResult`, stamps `ctx` + usage, and persists `research-agent-state.json`. |
 | `MaterializeDocNode` (`EN.7.B`) | Deterministic writer | Configured with model `"opportunity"` and an ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference — exactly one of the two runs per event, so it reads whichever is present. Writes/updates the resulting `CompanyBrief`/`ProspectingResult` into the Brain corpus as an Opportunity `.md` document via `mev`'s `plan_ingest` (kind auto-detected from the payload shape — no adapter node needed), including the `company_url` -> `url` and `sources[]` -> `links[]` lifting (see [Source-link and contact lifting](#source-link-and-contact-lifting) below). See [materialize-doc-node.md](materialize-doc-node.md). |
-| `MergeContactsNode` (`EN.4.E`) | Deterministic writer | The graph's terminal node. Configured with the same ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference as `MaterializeDocNode` and an unset brain root (resolves the same way). Collects the `contacts[]` the research node surfaced (per-brief for company mode, unioned across every `ProspectLead` for prospecting mode) and, when non-empty, calls the injectable `DocMaterializer::edit_opportunity` seam with `OpportunityEdit::MergeContacts` — routed by `MevDocMaterializer` to `mev::doc::opportunity::plan_merge_contacts`. An empty collected list short-circuits to a stamped no-op result with **no** seam call — see [Contacts: extraction contract and the two-step write](#contacts-extraction-contract-and-the-two-step-write). See [materialize-doc-node.md § `OpportunityEdit`](materialize-doc-node.md#the-docmaterializer-seam). |
+| `MergeContactsNode` (`EN.4.E`) | Deterministic writer | Configured with the same ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference as `MaterializeDocNode` and an unset brain root (resolves the same way). Collects the `contacts[]` the research node surfaced (per-brief for company mode, unioned across every `ProspectLead` for prospecting mode) and, when non-empty, calls the injectable `DocMaterializer::edit_opportunity` seam with `OpportunityEdit::MergeContacts` — routed by `MevDocMaterializer` to `mev::doc::opportunity::plan_merge_contacts`. An empty collected list short-circuits to a stamped no-op result with **no** seam call — see [Contacts: extraction contract and the two-step write](#contacts-extraction-contract-and-the-two-step-write). See [materialize-doc-node.md § `OpportunityEdit`](materialize-doc-node.md#the-docmaterializer-seam). |
+| `ResearchIngressDispatchNode` (`EN.6.E`) | Deterministic dispatcher | **The graph's terminal node.** Gated by the resolved `ingress_dispatch` knob (default `enabled: false`, a behavior-stable no-op that stamps `skipped: true`). When enabled, wraps the run's finished research output (whichever of `CompanyResearchNode`/`ProspectingResearchNode` ran) as an `IngressEnvelope` and sends one `TriggerWorkflow` action through the injectable `ChannelTransport` egress seam (`EN.6.A`) into `dispatch.target_workflow_type` (`"CONTENT_PIPELINE"` by default) — closing the self-feeding research-to-content loop. The `envelope_id` is derived deterministically (`ctx.metadata["envelope_id"]` when present, else `research-agent:{path MaterializeDocNode stamped}` — never `Uuid::new_v4()`), so re-dispatching the same input is idempotent at the correlation-key level. A materialize that legitimately planned zero actions (no path to derive an `envelope_id` from) is treated as a soft skip, not a run failure. A transport error is recorded as a `delivered: false` receipt, never a `NodeError` — this node never fails the run. See [Self-feeding dispatch: `ResearchIngressDispatchNode`](#self-feeding-dispatch-researchingressdispatchnode) below. |
 
 ### Behaviour change: a served run now requires a resolvable brain root
 
@@ -235,6 +238,48 @@ pub enum OpportunityEdit {
 [materialize-doc-node.md](materialize-doc-node.md#the-docmaterializer-seam) for the seam's full
 shape.
 
+## Self-feeding dispatch: `ResearchIngressDispatchNode`
+
+`EN.6.E` closes the loop from finished research into `CONTENT_PIPELINE`: once
+`MergeContactsNode` completes (contacts merged or cleanly no-op'd), the single shared
+`ResearchIngressDispatchNode` instance is the graph's new — and only — terminal node.
+
+- **Default-off.** The resolved `ingress_dispatch.enabled` knob defaults to `false`. A run at
+  the default stamps `ctx.nodes["ResearchIngressDispatchNode"] = { skipped: true, enabled: false,
+  target_workflow_type }` and sends nothing — the node stays registered under the same identity
+  at every setting (never a rewire), so the declared graph shape is invariant.
+- **Modeled on `ActionDispatchNode`.** Same seam (`crate::nodes::channel_transport::ChannelTransport`),
+  same "never fail the run on a transport error" contract (a failed send is recorded as a
+  `delivered: false` receipt via the shared `receipt_from_send_result` helper, not a `NodeError`),
+  and the same live-transport default (`channel_transport_live`, targeting the shared
+  `channel_transport::DEFAULT_EVENTS_URL` placeholder until a deployment's `ENGINE_EVENTS_URL` is
+  wired — see [content-pipeline-workflow.md](content-pipeline-workflow.md) for `ActionDispatchNode`'s
+  identical convention).
+- **Policy resolution.** Reads the same `ctx.nodes[RESOLVED_POLICY_IDENTITY]` stamp the two
+  terminal research nodes read via `crate::policy::resolved_policy_strict`, so a served run's
+  `policy`/`profile` override is honoured even though `RESEARCH_AGENT` has no dedicated setup
+  node. `engine-serve`'s `register_research_agent` additionally re-registers this node with a
+  `channel_transport_live` pointed at the deployment's configured `ENGINE_EVENTS_URL` (mirroring
+  `register_content_pipeline`'s `ActionDispatchNode` override), so the self-POST reaches the right
+  endpoint in any non-default deployment. Only a missing stamp (a narrow unit test driving the
+  node in isolation) falls back to the node's own `enabled`/`target_workflow_type` fields; a
+  stamp that is present but fails to deserialize propagates as a hard error, same as either
+  terminal research node.
+- **Envelope id determinism.** Reuses `ctx.metadata["envelope_id"]` when present, otherwise
+  derives `research-agent:{path}` from the first path `MaterializeDocNode` stamped onto
+  `ctx.nodes` — never `Uuid::new_v4()`, so the same input dispatched twice produces the same
+  `envelope_id`. When neither source is available (a materialize that legitimately planned zero
+  actions — e.g. re-researching a company whose opportunity doc is already up to date), the node
+  stamps a soft skip (`skipped: true, reason: "no_envelope_id_to_derive_from"`) rather than
+  failing the run.
+- **`chain_depth` propagation.** The outbound event carries the parent run's `chain_depth`
+  unchanged; the transport's `WorkflowTriggerDispatch` increments it and enforces the shared
+  8-hop `MAX_CHAIN_DEPTH` cap, refusing rather than recursing past it.
+- **Knob:** `research_agent.policy.ingress_dispatch: { enabled: bool, target_workflow_type: string }`
+  in `harness.json` (see [Policy: `ResearchAgentPolicy`](#policy-researchagentpolicy) below).
+  `target_workflow_type` names the workflow the trigger fires; changing it does not change the
+  emitted event shape.
+
 ## Policy: `ResearchAgentPolicy`
 
 Same four-layer precedence as `SdlcPolicy` — **per-run event `policy` override > per-run event
@@ -257,9 +302,11 @@ Knobs (a strict subset of `SdlcPolicy`'s — only what the two stages need):
 | `local.{endpoint,model,constrained_json}` | string / string / bool | Carried for API-shape parity; not exercised by either stage. |
 | `contact_enrichment.{research,prospect}` | `off` \| `standard` \| `deep` | Per-stage contact-acquisition depth (`EN.4.E`) — see below. |
 | `contact_enrichment.max_fetches` | `u8` | Cap on the EXTRA page loads spent on contact acquisition per run. |
+| `ingress_dispatch.enabled` | `bool` | Whether `ResearchIngressDispatchNode` sends a `TriggerWorkflow` action for this run's output (`EN.6.E`) — see [Self-feeding dispatch](#self-feeding-dispatch-researchingressdispatchnode) above. |
+| `ingress_dispatch.target_workflow_type` | string | The workflow the trigger names — `"CONTENT_PIPELINE"` by default. |
 
 Built-in default: `ResearchAgentPolicy::default()` — normal verbosity, both tiers `sonnet`,
-prompt cache off, `contact_enrichment` `standard`/`standard`/4 fetches.
+prompt cache off, `contact_enrichment` `standard`/`standard`/4 fetches, `ingress_dispatch` off.
 
 ### The `contact_enrichment` knob
 
@@ -296,9 +343,9 @@ Three built-in bundles in `profiles.rs` (`profile_by_name`), looked up first in
 
 | Name | Tradeoff |
 |---|---|
-| `baseline` | Explicit no-op control: Sonnet on both stages, normal verbosity, prompt cache off, `standard`/`standard` contact enrichment at 4 fetches — spelled out for clarity, matches the built-in default. |
-| `cheap-fast` | `haiku` on both stages, terse output, prompt caching on, contact enrichment `off`/`off` at 0 fetches. |
-| `thorough` | `opus` on both stages, verbose output, contact enrichment `deep` for `research`/`standard` for `prospect` at 8 fetches — prospecting deliberately stays `standard` even here so a broad sweep never multiplies deep enrichment across dozens of leads. |
+| `baseline` | Explicit no-op control: Sonnet on both stages, normal verbosity, prompt cache off, `standard`/`standard` contact enrichment at 4 fetches, ingress dispatch off — spelled out for clarity, matches the built-in default. |
+| `cheap-fast` | `haiku` on both stages, terse output, prompt caching on, contact enrichment `off`/`off` at 0 fetches, ingress dispatch off (a chained `CONTENT_PIPELINE` run is the single largest cost a research run can incur). |
+| `thorough` | `opus` on both stages, verbose output, contact enrichment `deep` for `research`/`standard` for `prospect` at 8 fetches — prospecting deliberately stays `standard` even here so a broad sweep never multiplies deep enrichment across dozens of leads — and ingress dispatch **on**: the quality ceiling is the closed loop into `CONTENT_PIPELINE`. |
 
 **The cost story, stated explicitly.** Contact acquisition is extra spend on top of a run's normal
 search/fetch activity: `cheap-fast` turns it off entirely (0 extra fetches, matching its
@@ -356,19 +403,23 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   `{materialized, dry_run, model: "opportunity", paths, warnings}`, naming the Opportunity `.md`
   path written or updated under `business/docs/opportunities/`. See
   [materialize-doc-node.md § Result stamp](materialize-doc-node.md#result-stamp).
-- **`ctx.nodes["MergeContactsNode"]`** — the terminal contact-merge's result stamp, mirroring
+- **`ctx.nodes["MergeContactsNode"]`** — the contact-merge's result stamp, mirroring
   `MaterializeDocNode`'s shape. On the normal zero-contact path this reports a stamped no-op (no
   `DocMaterializer` call made); when contacts were collected, it reports the same
   `{materialized, dry_run, paths, warnings}` shape returned by the `OpportunityEdit::MergeContacts`
   seam call.
+- **`ctx.nodes["ResearchIngressDispatchNode"]`** — the terminal dispatch's result stamp:
+  `{skipped, enabled, target_workflow_type}`, plus `envelope_id` and `receipt` when a send was
+  actually attempted. See [Self-feeding dispatch](#self-feeding-dispatch-researchingressdispatchnode)
+  above.
 
 ## Scope notes
 
-- **Node count is fixed at five** (as of `EN.4.E`) — `ResearchModeRouterNode`,
-  `CompanyResearchNode`, `ProspectingResearchNode`, `MaterializeDocNode`, `MergeContactsNode`.
-  There is no setup/worktree node; each research node resolves its own worktree path from an
-  upstream `SetupWorktreeNode` result if present in `ctx.nodes`, falling back to
-  `std::env::current_dir()` otherwise.
+- **Node count is fixed at six** (as of `EN.6.E`) — `ResearchModeRouterNode`,
+  `CompanyResearchNode`, `ProspectingResearchNode`, `MaterializeDocNode`, `MergeContactsNode`,
+  `ResearchIngressDispatchNode`. There is no setup/worktree node; each research node resolves its
+  own worktree path from an upstream `SetupWorktreeNode` result if present in `ctx.nodes`, falling
+  back to `std::env::current_dir()` otherwise.
 - **Out of scope for this block**: intake extraction (EN.4.B), PDF render (EN.4.D — not yet
   built). Proposal generation (EN.4.C, built) reuses `CompanyResearchNode`, re-exported from
   `workflows::research_agent` — see [proposal-generator-workflow.md](proposal-generator-workflow.md).
@@ -397,3 +448,15 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   same-name/second-channel contact unions rather than duplicating); that a zero-contact run
   writes the doc and skips the merge call entirely; and that a `cheap-fast` (`contact_enrichment`
   `off`) run still writes `url`/`links` and walks `MergeContactsNode` as a clean no-op.
+  `crates/engine-core/tests/it/research_ingress_dispatch_e2e.rs` (`EN.6.E`) extends
+  `research_agent_e2e.rs`'s node-by-node walk (`Node::process` against the same registered
+  instances a real `Workflow` would use, following `WorkflowSchema::next_after` at each hop —
+  `RESEARCH_AGENT` has no setup node to pre-stamp a temp-dir worktree path, so this file cannot
+  drive `Workflow::run` directly) two hops further through `MergeContactsNode` and
+  `ResearchIngressDispatchNode` with a stubbed `ChannelTransport`, proving: the default-off knob
+  makes zero sends; an enabled run sends exactly one `TriggerWorkflow` action carrying the
+  finished research output and a deterministic `envelope_id`; `chain_depth` propagates rather than
+  resets, and a chain at `MAX_CHAIN_DEPTH` is refused by the transport without failing the run; a
+  re-dispatch of the same input reuses that `envelope_id`; a failing transport still leaves the
+  run successful with a `delivered: false` receipt; and the `baseline`/`thorough` named profiles
+  resolve to dispatching nothing/exactly once respectively.

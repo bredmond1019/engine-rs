@@ -78,6 +78,29 @@ impl Default for ContactEnrichment {
     }
 }
 
+/// Whether a finished `RESEARCH_AGENT` run dispatches an ingress-tail
+/// `TriggerWorkflow` (`EN.6.E`) into `target_workflow_type`, and which
+/// workflow type it targets. `enabled: false` is the behavior-stable
+/// baseline — no dispatch happens today and this knob must not change
+/// that until a profile or override turns it on. The node stays in the
+/// declared graph at every setting and no-ops in place when disabled
+/// (never a rewire); see `ingress_dispatch.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngressDispatch {
+    pub enabled: bool,
+    pub target_workflow_type: String,
+}
+
+impl Default for IngressDispatch {
+    /// Behavior-stable baseline: disabled, targeting `CONTENT_PIPELINE`.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_workflow_type: "CONTENT_PIPELINE".to_string(),
+        }
+    }
+}
+
 /// The fully-resolved, per-run Research Agent policy — the merge of
 /// built-in defaults, `harness.json`'s `research_agent.policy` defaults, a
 /// named `profile`, and any per-run event override, high->low precedence in
@@ -92,11 +115,14 @@ pub struct ResearchAgentPolicy {
     pub local: LocalConfig,
     /// Per-stage contact-acquisition depth + fetch cap (`EN.4.E`).
     pub contact_enrichment: ContactEnrichment,
+    /// Terminal ingress-tail dispatch to `CONTENT_PIPELINE` (`EN.6.E`).
+    pub ingress_dispatch: IngressDispatch,
 }
 
 impl Default for ResearchAgentPolicy {
     /// The safe default: normal verbosity, all-Sonnet tiers, prompt-cache
-    /// off, standard contact enrichment on both stages.
+    /// off, standard contact enrichment on both stages, ingress dispatch
+    /// disabled.
     fn default() -> Self {
         Self {
             output_verbosity: OutputVerbosity::Normal,
@@ -104,6 +130,7 @@ impl Default for ResearchAgentPolicy {
             model_tiers: ModelTiers::default(),
             local: LocalConfig::default(),
             contact_enrichment: ContactEnrichment::default(),
+            ingress_dispatch: IngressDispatch::default(),
         }
     }
 }
@@ -128,6 +155,7 @@ pub struct PartialResearchAgentPolicy {
     pub model_tiers: Option<PartialModelTiers>,
     pub local: Option<PartialLocalConfig>,
     pub contact_enrichment: Option<PartialContactEnrichment>,
+    pub ingress_dispatch: Option<PartialIngressDispatch>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -165,6 +193,27 @@ fn merge_contact_enrichment(
     base
 }
 
+/// All-optional mirror of [`IngressDispatch`] for partial overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialIngressDispatch {
+    pub enabled: Option<bool>,
+    pub target_workflow_type: Option<String>,
+}
+
+fn merge_ingress_dispatch(
+    mut base: IngressDispatch,
+    over: &PartialIngressDispatch,
+) -> IngressDispatch {
+    if let Some(v) = over.enabled {
+        base.enabled = v;
+    }
+    if let Some(v) = &over.target_workflow_type {
+        base.target_workflow_type = v.clone();
+    }
+    base
+}
+
 impl crate::policy::Policy for ResearchAgentPolicy {
     type Partial = PartialResearchAgentPolicy;
 
@@ -186,6 +235,10 @@ impl crate::policy::Policy for ResearchAgentPolicy {
             contact_enrichment: match &over.contact_enrichment {
                 Some(ce) => merge_contact_enrichment(base.contact_enrichment, ce),
                 None => base.contact_enrichment,
+            },
+            ingress_dispatch: match &over.ingress_dispatch {
+                Some(id) => merge_ingress_dispatch(base.ingress_dispatch, id),
+                None => base.ingress_dispatch,
             },
         }
     }
@@ -441,5 +494,118 @@ mod tests {
         assert_eq!(ce.research, Some(ContactDepth::Deep));
         assert_eq!(ce.prospect, Some(ContactDepth::Off));
         assert_eq!(ce.max_fetches, Some(8));
+    }
+
+    #[test]
+    fn ingress_dispatch_builtin_default_is_disabled_content_pipeline() {
+        let policy = ResearchAgentPolicy::default();
+        assert!(!policy.ingress_dispatch.enabled);
+        assert_eq!(
+            policy.ingress_dispatch.target_workflow_type,
+            "CONTENT_PIPELINE"
+        );
+    }
+
+    #[test]
+    fn deserializes_partial_ingress_dispatch_from_harness_json_shape() {
+        let json = r#"{
+            "ingress_dispatch": { "enabled": true, "target_workflow_type": "CONTENT_PIPELINE" }
+        }"#;
+        let partial: PartialResearchAgentPolicy =
+            serde_json::from_str(json).expect("valid PartialResearchAgentPolicy JSON");
+        let id = partial.ingress_dispatch.expect("ingress_dispatch set");
+        assert_eq!(id.enabled, Some(true));
+        assert_eq!(
+            id.target_workflow_type,
+            Some("CONTENT_PIPELINE".to_string())
+        );
+    }
+
+    #[test]
+    fn partial_override_of_only_enabled_leaves_target_workflow_type_untouched() {
+        let harness = PartialResearchAgentPolicy {
+            ingress_dispatch: Some(PartialIngressDispatch {
+                target_workflow_type: Some("CUSTOM_PIPELINE".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialResearchAgentPolicy {
+            ingress_dispatch: Some(PartialIngressDispatch {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ResearchAgentPolicy::default(),
+            Some(&harness),
+            None,
+            Some(&event),
+        );
+        assert!(resolved.ingress_dispatch.enabled);
+        assert_eq!(
+            resolved.ingress_dispatch.target_workflow_type,
+            "CUSTOM_PIPELINE"
+        );
+    }
+
+    #[test]
+    fn ingress_dispatch_four_layer_precedence_holds() {
+        let harness = PartialResearchAgentPolicy {
+            ingress_dispatch: Some(PartialIngressDispatch {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let profile = PartialResearchAgentPolicy {
+            ingress_dispatch: Some(PartialIngressDispatch {
+                target_workflow_type: Some("PROFILE_PIPELINE".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialResearchAgentPolicy {
+            ingress_dispatch: Some(PartialIngressDispatch {
+                target_workflow_type: Some("EVENT_PIPELINE".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // harness only.
+        let resolved = resolve(ResearchAgentPolicy::default(), Some(&harness), None, None);
+        assert!(resolved.ingress_dispatch.enabled);
+        assert_eq!(
+            resolved.ingress_dispatch.target_workflow_type,
+            "CONTENT_PIPELINE"
+        );
+
+        // profile beats harness for target_workflow_type; enabled falls through from harness.
+        let resolved = resolve(
+            ResearchAgentPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            None,
+        );
+        assert!(resolved.ingress_dispatch.enabled);
+        assert_eq!(
+            resolved.ingress_dispatch.target_workflow_type,
+            "PROFILE_PIPELINE"
+        );
+
+        // event beats profile beats harness.
+        let resolved = resolve(
+            ResearchAgentPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        assert!(resolved.ingress_dispatch.enabled);
+        assert_eq!(
+            resolved.ingress_dispatch.target_workflow_type,
+            "EVENT_PIPELINE"
+        );
     }
 }

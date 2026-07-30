@@ -13,6 +13,18 @@
 //! `crate::http::check_api_key`), 404 for an unknown/finished run id, 202
 //! Accepted for a live run — after which that run's token is observably
 //! triggered.
+//!
+//! **EN.6.F: a suspended run has no live token to trigger.**
+//! `crate::suspend::spawn_run` deregisters a run's `CancellationToken`
+//! unconditionally on exit — including the suspended branch, since nobody
+//! is polling the token while a run sits parked in the suspended index —
+//! so a suspended run is invisible to [`RunRegistry`]. It must still be
+//! killable (the consumer-facing "Stop" affordance applies at any point,
+//! suspended included), so [`abort_run`] falls back to the suspended index:
+//! it pulls the entry out with [`crate::suspend::remove_suspended`], stamps
+//! cancellation into its retained snapshot the same way
+//! `suspend::spawn_run`'s bounded-ring eviction backstop does, and marks it
+//! terminal.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -73,10 +85,15 @@ impl RunRegistry {
 }
 
 /// `POST /events/{run_id}/abort` — 401 on a missing/bad `X-API-Key`, 404 for
-/// an unknown or already-finished `run_id`, otherwise triggers that run's
-/// `CancellationToken` and returns 202 Accepted (the run loop observes the
-/// cancellation at the next node boundary and stamps the cancelled terminal
-/// state — see `crates/engine-core/src/workflow.rs`).
+/// an unknown or already-finished `run_id`, otherwise 202 Accepted.
+///
+/// A live run is aborted by triggering its `CancellationToken` (the run loop
+/// observes the cancellation at the next node boundary and stamps the
+/// cancelled terminal state — see `crates/engine-core/src/workflow.rs`). A
+/// **suspended** run (EN.6.F) has no live token to trigger, so it falls back
+/// to pulling the entry directly out of `crate::suspend`'s suspended index,
+/// stamping cancellation into its retained snapshot, and marking it terminal
+/// — see this module's docs.
 pub async fn abort_run(
     req: HttpRequest,
     path: web::Path<Uuid>,
@@ -87,16 +104,32 @@ pub async fn abort_run(
     }
 
     let run_id = path.into_inner();
-    match state.runs.get(run_id) {
-        Some(token) => {
-            token.cancel();
-            HttpResponse::Accepted()
-                .json(serde_json::json!({ "run_id": run_id, "status": "aborting" }))
-        }
-        None => {
-            HttpResponse::NotFound().json(serde_json::json!({ "error": "unknown or finished run" }))
-        }
+
+    if let Some(token) = state.runs.get(run_id) {
+        token.cancel();
+        return HttpResponse::Accepted()
+            .json(serde_json::json!({ "run_id": run_id, "status": "aborting" }));
     }
+
+    if let Some(mut entry) = crate::suspend::remove_suspended(run_id) {
+        engine_core::stamp_cancelled(&mut entry.snapshot.metadata);
+        crate::stream::publish_terminal(run_id, &entry.snapshot);
+        state.live.mark_terminal(
+            run_id,
+            &entry.snapshot,
+            entry.workflow_type,
+            entry.created_at,
+            chrono::Utc::now(),
+        );
+        crate::http::live_run_metadata()
+            .write()
+            .expect("live run metadata lock poisoned on write")
+            .remove(&run_id);
+        return HttpResponse::Accepted()
+            .json(serde_json::json!({ "run_id": run_id, "status": "aborting" }));
+    }
+
+    HttpResponse::NotFound().json(serde_json::json!({ "error": "unknown or finished run" }))
 }
 
 #[cfg(test)]

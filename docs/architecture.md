@@ -57,8 +57,10 @@ engine-rs/
                          `HttpPost` trait seam + `reqwest`-backed live impl + `StubHttpPost` test
                          double, EN.4.C, used by `proposal_generator::PersistToBrainNode` to POST
                          a finished artifact to Synapse's brain-ingest endpoint; channel_transport.rs
-                         — the injectable `ChannelTransport` egress seam `ActionDispatchNode` calls
-                         to deliver outbound actions to the channel that originated them, EN.6.A;
+                         — the injectable `ChannelTransport` egress seam `ActionDispatchNode` (EN.6.A)
+                         and `research_agent::ResearchIngressDispatchNode` (EN.6.E) call to deliver
+                         outbound actions to the channel that originated them / self-feed
+                         `CONTENT_PIPELINE`;
                          doc_materializer.rs — the injectable `DocMaterializer` seam
                          `MaterializeDocNode` calls to plan + write a `BrainDocModel`-shaped
                          artifact into the Brain corpus via `mev`/`okf-core` in-process, live impl
@@ -76,7 +78,20 @@ engine-rs/
                          `brain.toml`, typed `BrainRootError`, EN.7.A task 2), locale.rs —
                          `Locale`/`Currency`/`MoneyRange`/`RateSheet`/`RateCard`, the two-sheet,
                          firewalled rate card + language directive threaded through the
-                         diagnostic funnel's event schemas, EN.4.F)
+                         diagnostic funnel's event schemas, EN.4.F), suspend.rs —
+│   │                         `PauseSignal` (a clearable, watch-backed two-way flag,
+│   │                         deliberately not `CancellationToken`) + the
+│   │                         `metadata.suspension` marker (`stamp_suspended`/
+│   │                         `stamp_resumed`/`request_suspension`/`read_suspension`/
+│   │                         `is_suspended`), the convergence point for both
+│   │                         suspension origins (operator pause, `SuspendNode`),
+│   │                         EN.6.F task 1; `nodes/suspend.rs` — `SuspendNode`, the
+│   │                         workflow-authored half of suspend/resume (`enabled`/
+│   │                         `with_predicate`/`with_reason_label`, default-off
+│   │                         in-place no-op patterned on `MaterializeDocNode::
+│   │                         with_enabled`), only *requests* suspension via
+│   │                         `suspend::request_suspension` — finalizing the walk
+│   │                         stop belongs to `Workflow::walk`, EN.6.F task 5)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -107,7 +122,21 @@ engine-rs/
 │   │                         subscribers, EN.5.F), abort.rs
 │   │                         (POST /events/{run_id}/abort, X-API-Key gated, EN.2.B — backed by a
 │   │                         per-run CancellationToken RunRegistry minted/registered/deregistered
-│   │                         around each post_events run_with call)
+│   │                         around each post_events run_with call), suspend.rs (process-global
+│   │                         pause-signal map + bounded FIFO suspended-run index behind
+│   │                         `OnceLock<RwLock<..>>`, `take_for_resume`/`clear_resuming`'s
+│   │                         atomic read-and-set double-resume guard, and `spawn_run` — the one
+│   │                         shared spawn/exit-fork every trigger AND resume handler calls so the
+│   │                         terminal-vs-suspended cleanup logic never drifts between the two
+│   │                         entry points, EN.6.F task 8/9/10), resume.rs (the run-control surface
+│   │                         is now pause/resume/abort rather than abort alone: POST
+│   │                         /events/{run_id}/pause, POST /events/{event_id}/resume — rehydrates
+│   │                         the Workflow from the ORIGINAL trigger payload via
+│   │                         `without_seeded_nodes()`, rebuilds the BudgetLedger from the
+│   │                         marker's snapshot, and continues from the stored `resume_at`
+│   │                         pointer — and GET /events/suspended (registered before
+│   │                         `{event_id}` so the literal path isn't swallowed by the uuid
+│   │                         extractor), EN.6.F task 11)
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
     crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
@@ -132,8 +161,8 @@ I/O:
 | Seam | Trait / live impl | Test stub | Used by | Boundary |
 |---|---|---|---|---|
 | `http_post.rs` (`EN.4.C`; harvest-gated `EN.7.C`) | `HttpPost` / `ReqwestHttpPost` (`http_post_live()`) | `StubHttpPost` | `proposal_generator::PersistToBrainNode`, `content_pipeline::PersistToBrainNode`, `nodes::harvest_approve::HarvestApproveNode` | POSTs a finished artifact to Synapse's brain-ingest endpoint (`OR.Q`); as of `EN.7.C`, `content_pipeline::PersistToBrainNode`'s push is governed by `nodes::harvest_gate::HarvestGate` (`off`/`in_process`/`approval`, built-in default `off`) — see [harvest-gate.md](harvest-gate.md) |
-| `channel_transport.rs` (`EN.6.A`) | `ChannelTransport` / `channel_transport_live()` | `StubChannelTransport` | `content_pipeline::ActionDispatchNode` | Delivers outbound actions (digest replies, workflow-trigger chaining) back to the channel that originated the run |
-| `doc_materializer.rs` (`EN.7.A`, edit ops `EN.7.B`/`EN.4.E`) | `DocMaterializer` / `MevDocMaterializer` (`doc_materializer_live()`) | `StubDocMaterializer` | `nodes::MaterializeDocNode`, `nodes::OpportunityEditNode` (`EN.7.B`), `nodes::merge_contacts::MergeContactsNode` (`EN.4.E`) | Plans + writes a `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md` document via `mev`/`okf-core` in-process (D53's fourth boundary-test channel); `EN.7.B` extends the seam with `edit_opportunity` (`OpportunityEdit::SetStage`/`AddAction`, over mev's `plan_set_stage`/`plan_add_action`) for editing an already-written opportunity; `EN.4.E` adds a third `OpportunityEdit::MergeContacts` variant (over mev's `plan_merge_contacts`) so `RESEARCH_AGENT`'s terminal `MergeContactsNode` can merge extracted contacts into an already-written opportunity |
+| `channel_transport.rs` (`EN.6.A`) | `ChannelTransport` / `channel_transport_live()` | `StubChannelTransport` | `content_pipeline::ActionDispatchNode`, `research_agent::ResearchIngressDispatchNode` (`EN.6.E`) | Delivers outbound actions (digest replies, workflow-trigger chaining) back to the channel that originated the run, or self-feeds a finished `RESEARCH_AGENT` run into `CONTENT_PIPELINE` |
+| `doc_materializer.rs` (`EN.7.A`, edit ops `EN.7.B`/`EN.4.E`) | `DocMaterializer` / `MevDocMaterializer` (`doc_materializer_live()`) | `StubDocMaterializer` | `nodes::MaterializeDocNode`, `nodes::OpportunityEditNode` (`EN.7.B`), `nodes::merge_contacts::MergeContactsNode` (`EN.4.E`) | Plans + writes a `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md` document via `mev`/`okf-core` in-process (D53's fourth boundary-test channel); `EN.7.B` extends the seam with `edit_opportunity` (`OpportunityEdit::SetStage`/`AddAction`, over mev's `plan_set_stage`/`plan_add_action`) for editing an already-written opportunity; `EN.4.E` adds a third `OpportunityEdit::MergeContacts` variant (over mev's `plan_merge_contacts`) so `RESEARCH_AGENT`'s `MergeContactsNode` can merge extracted contacts into an already-written opportunity |
 
 See [materialize-doc-node.md](materialize-doc-node.md) for the `DocMaterializer` seam and
 `MaterializeDocNode` in detail, [opportunity-edit-workflows.md](opportunity-edit-workflows.md) for

@@ -6,7 +6,7 @@
 //! Declared graph shape:
 //!
 //! ```text
-//! ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode -> MergeContactsNode
+//! ResearchModeRouterNode -> { CompanyResearchNode | ProspectingResearchNode } -> MaterializeDocNode -> MergeContactsNode -> ResearchIngressDispatchNode
 //! ```
 //!
 //! `ResearchModeRouterNode` is the start node and a [`Router`]: it reads
@@ -33,7 +33,20 @@
 //! ordered `with_source_nodes` preference and an unset brain root (resolves
 //! the same way at run time). The graph shape here is INVARIANT across
 //! policy depth — no rewire ever branches around `MergeContactsNode`; its
-//! own empty-list short-circuit is the only cost control.
+//! own empty-list short-circuit is the only cost control. `MergeContactsNode`
+//! now feeds a single shared `ResearchIngressDispatchNode` instance (`EN.6.E`
+//! task 4) — the graph's new, and only, terminal identity. That node wraps
+//! the run's finished research output as an `IngressEnvelope` and sends one
+//! `TriggerWorkflow` action through the `ChannelTransport` egress seam
+//! (`EN.6.A`) into `CONTENT_PIPELINE`, gated by the `ingress_dispatch` policy
+//! knob (default `enabled: false`, a behavior-stable no-op). Like the two
+//! nodes before it, the graph shape here is INVARIANT across policy
+//! settings — `registry_for_policy` never rewires around
+//! `ResearchIngressDispatchNode`; it only configures the registered
+//! instance's `enabled`/`target_workflow_type` via `with_enabled` /
+//! `with_target_workflow_type`, so cost control lives entirely in the node's
+//! own in-place no-op (`CLAUDE.md` standing rule 6), never in a conditional
+//! edge.
 
 use std::collections::HashMap;
 
@@ -47,6 +60,7 @@ use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
 use super::company_research::CompanyResearchNode;
+use super::ingress_dispatch::ResearchIngressDispatchNode;
 use super::policy::ResearchAgentPolicy;
 use super::prospecting::ProspectingResearchNode;
 use super::schema::{ResearchAgentEventSchema, ResearchMode};
@@ -124,7 +138,14 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "MergeContactsNode".to_string(),
-        NodeConfig::new("MergeContactsNode", vec![]),
+        NodeConfig::new(
+            "MergeContactsNode",
+            vec!["ResearchIngressDispatchNode".to_string()],
+        ),
+    );
+    nodes.insert(
+        "ResearchIngressDispatchNode".to_string(),
+        NodeConfig::new("ResearchIngressDispatchNode", vec![]),
     );
 
     WorkflowSchema::new(WORKFLOW_TYPE, "ResearchModeRouterNode", nodes)
@@ -148,11 +169,12 @@ pub fn registry() -> NodeRegistry {
         MergeContactsNode::new()
             .with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"]),
     ));
+    registry.register(Box::new(ResearchIngressDispatchNode::new()));
     registry
 }
 
-/// Build a `NodeRegistry` like [`registry`], unchanged, for the given
-/// resolved `policy`. Both `research` and `prospect` are cloud-only,
+/// Build a `NodeRegistry` with [`registry`]'s node set, unchanged, for the
+/// given resolved `policy`. Both `research` and `prospect` are cloud-only,
 /// `WebSearch`-backed stages (per the spec's Context Pointers and Notes) —
 /// a local single-shot endpoint cannot serve `WebSearch`/`WebFetch`, so no
 /// stage is ever rewired to the `Local` transport here. This is the
@@ -160,10 +182,22 @@ pub fn registry() -> NodeRegistry {
 /// no-rewire-`implement` guard, but for `RESEARCH_AGENT` it applies to
 /// *both* terminal research nodes, not just one — `MaterializeDocNode` is
 /// deterministic and carries no `ModelTier` at all, so it is never a
-/// rewrite candidate either way.
+/// rewrite candidate either way. The one node this function does configure
+/// per-policy is `ResearchIngressDispatchNode`: its resolved
+/// `ingress_dispatch.{enabled,target_workflow_type}` is threaded onto the
+/// registered instance via `with_enabled`/`with_target_workflow_type` — the
+/// node stays registered under the same identity at every setting (never a
+/// rewire), so the returned registry's node *set* is identical regardless of
+/// `enabled`.
 #[must_use]
-pub fn registry_for_policy(_policy: &ResearchAgentPolicy) -> NodeRegistry {
-    registry()
+pub fn registry_for_policy(policy: &ResearchAgentPolicy) -> NodeRegistry {
+    let mut registry = registry();
+    registry.register(Box::new(
+        ResearchIngressDispatchNode::new()
+            .with_enabled(policy.ingress_dispatch.enabled)
+            .with_target_workflow_type(policy.ingress_dispatch.target_workflow_type.clone()),
+    ));
+    registry
 }
 
 /// Build the runnable `RESEARCH_AGENT` `Workflow`: [`registry`] paired with
@@ -217,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_five_nodes() {
+    fn registry_contains_all_six_nodes() {
         let registry = registry();
 
         let expected = [
@@ -226,6 +260,7 @@ mod tests {
             "ProspectingResearchNode",
             "MaterializeDocNode",
             "MergeContactsNode",
+            "ResearchIngressDispatchNode",
         ];
 
         for identity in expected {
@@ -238,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_contacts_node_is_the_only_identity_declaring_no_connections() {
+    fn research_ingress_dispatch_node_is_the_only_identity_declaring_no_connections() {
         let schema = schema();
 
         let terminal_identities: Vec<&String> = schema
@@ -250,8 +285,8 @@ mod tests {
 
         assert_eq!(
             terminal_identities,
-            vec!["MergeContactsNode"],
-            "MergeContactsNode should be the only node declaring no forward connection"
+            vec!["ResearchIngressDispatchNode"],
+            "ResearchIngressDispatchNode should be the only node declaring no forward connection"
         );
     }
 
@@ -267,6 +302,21 @@ mod tests {
             config.connections,
             vec!["MergeContactsNode".to_string()],
             "MaterializeDocNode should connect only to MergeContactsNode"
+        );
+    }
+
+    #[test]
+    fn merge_contacts_node_connects_only_to_research_ingress_dispatch_node() {
+        let schema = schema();
+
+        let config = schema
+            .nodes
+            .get("MergeContactsNode")
+            .expect("schema should declare 'MergeContactsNode'");
+        assert_eq!(
+            config.connections,
+            vec!["ResearchIngressDispatchNode".to_string()],
+            "MergeContactsNode should connect only to ResearchIngressDispatchNode"
         );
     }
 
@@ -322,11 +372,40 @@ mod tests {
         assert!(policy_registry.contains("ProspectingResearchNode"));
         assert!(policy_registry.contains("MaterializeDocNode"));
         assert!(policy_registry.contains("MergeContactsNode"));
+        assert!(policy_registry.contains("ResearchIngressDispatchNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_carries_the_new_identity_under_both_enabled_and_disabled() {
+        let default_registry = registry();
+
+        let disabled_policy = ResearchAgentPolicy {
+            ingress_dispatch: super::super::policy::IngressDispatch {
+                enabled: false,
+                target_workflow_type: "CONTENT_PIPELINE".to_string(),
+            },
+            ..ResearchAgentPolicy::default()
+        };
+        let enabled_policy = ResearchAgentPolicy {
+            ingress_dispatch: super::super::policy::IngressDispatch {
+                enabled: true,
+                target_workflow_type: "CONTENT_PIPELINE".to_string(),
+            },
+            ..ResearchAgentPolicy::default()
+        };
+
+        let disabled_registry = registry_for_policy(&disabled_policy);
+        let enabled_registry = registry_for_policy(&enabled_policy);
+
+        assert_eq!(disabled_registry.len(), default_registry.len());
+        assert_eq!(enabled_registry.len(), default_registry.len());
+        assert!(disabled_registry.contains("ResearchIngressDispatchNode"));
+        assert!(enabled_registry.contains("ResearchIngressDispatchNode"));
     }
 
     #[test]
     fn graph_shape_is_identical_under_a_cheap_fast_off_depth_profile() {
-        use super::super::policy::{ContactDepth, ContactEnrichment};
+        use super::super::policy::{ContactDepth, ContactEnrichment, IngressDispatch};
 
         let off_policy = ResearchAgentPolicy {
             contact_enrichment: ContactEnrichment {
@@ -334,30 +413,50 @@ mod tests {
                 prospect: ContactDepth::Off,
                 max_fetches: 0,
             },
+            ingress_dispatch: IngressDispatch {
+                enabled: false,
+                target_workflow_type: "CONTENT_PIPELINE".to_string(),
+            },
             ..ResearchAgentPolicy::default()
+        };
+        let on_policy = ResearchAgentPolicy {
+            ingress_dispatch: IngressDispatch {
+                enabled: true,
+                target_workflow_type: "CONTENT_PIPELINE".to_string(),
+            },
+            ..off_policy.clone()
         };
 
         let default_registry = registry();
         let off_registry = registry_for_policy(&off_policy);
+        let on_registry = registry_for_policy(&on_policy);
 
         assert_eq!(off_registry.len(), default_registry.len());
+        assert_eq!(on_registry.len(), default_registry.len());
         for identity in [
             "ResearchModeRouterNode",
             "CompanyResearchNode",
             "ProspectingResearchNode",
             "MaterializeDocNode",
             "MergeContactsNode",
+            "ResearchIngressDispatchNode",
         ] {
             assert!(
                 off_registry.contains(identity),
                 "expected off-depth registry to still contain '{identity}'"
             );
+            assert!(
+                on_registry.contains(identity),
+                "expected ingress-dispatch-enabled registry to still contain '{identity}'"
+            );
         }
 
         // The declared schema itself carries no policy dependency at all —
-        // reassert it still validates against the off-depth registry.
+        // reassert it still validates against both registries.
         WorkflowValidator::validate(&off_registry, &schema())
             .expect("declared graph should validate under the off-depth registry too");
+        WorkflowValidator::validate(&on_registry, &schema())
+            .expect("declared graph should validate with ingress_dispatch enabled too");
     }
 
     #[test]

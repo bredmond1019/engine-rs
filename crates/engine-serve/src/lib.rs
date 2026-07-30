@@ -9,7 +9,9 @@ pub mod dispatch;
 pub mod durable;
 pub mod http;
 pub mod live_state;
+pub mod resume;
 pub mod stream;
+pub mod suspend;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures;
 pub mod workflows;

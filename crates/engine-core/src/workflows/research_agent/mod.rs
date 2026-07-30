@@ -16,14 +16,20 @@
 //!   terminal node (task 6).
 //! - `graph` — `ResearchModeRouterNode` + the declared `WorkflowSchema` /
 //!   `NodeRegistry` / `Workflow` assembly (task 7).
+//! - `ingress_dispatch` — `ResearchIngressDispatchNode`, the terminal
+//!   ingress-tail node that dispatches a `TriggerWorkflow` into
+//!   `CONTENT_PIPELINE` through the `EN.6.A` `ChannelTransport` seam,
+//!   default-off (`EN.6.E` task 3).
 //!
 //! `WORKFLOW_TYPE` lives in `graph` (mirrors `sdlc_flow::graph`).
 
 pub mod company_research;
 pub mod graph;
+pub mod ingress_dispatch;
 pub mod policy;
 pub mod profiles;
 pub mod prospecting;
 pub mod schema;
 
 pub use company_research::CompanyResearchNode;
+pub use ingress_dispatch::ResearchIngressDispatchNode;
