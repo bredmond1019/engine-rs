@@ -17,8 +17,9 @@ use crate::node::NodeError;
 use crate::policy::PolicyConfigSource;
 
 use super::policy::{
-    self, ContactDepth, ModelTier, OutputVerbosity, PartialContactEnrichment,
-    PartialIngressDispatch, PartialModelTiers, PartialResearchAgentPolicy, ResearchAgentPolicy,
+    self, ContactDepth, GroundingDepth, ModelTier, OutputVerbosity, PartialContactEnrichment,
+    PartialGrounding, PartialIngressDispatch, PartialModelTiers, PartialResearchAgentPolicy,
+    ResearchAgentPolicy,
 };
 use super::schema::ResearchAgentEventSchema;
 
@@ -45,6 +46,11 @@ pub fn baseline() -> PartialResearchAgentPolicy {
             prospect: Some(ContactDepth::Standard),
             max_fetches: Some(4),
         }),
+        // The floor, never `off` — see `GroundingDepth`.
+        grounding: Some(PartialGrounding {
+            research: Some(GroundingDepth::Standard),
+            prospect: Some(GroundingDepth::Standard),
+        }),
         ingress_dispatch: Some(PartialIngressDispatch {
             enabled: Some(false),
             target_workflow_type: Some("CONTENT_PIPELINE".to_string()),
@@ -69,6 +75,11 @@ pub fn cheap_fast() -> PartialResearchAgentPolicy {
             research: Some(ContactDepth::Off),
             prospect: Some(ContactDepth::Off),
             max_fetches: Some(0),
+        }),
+        // The cheapest run still flags — the floor, never below it.
+        grounding: Some(PartialGrounding {
+            research: Some(GroundingDepth::Standard),
+            prospect: Some(GroundingDepth::Standard),
         }),
         ingress_dispatch: Some(PartialIngressDispatch {
             enabled: Some(false),
@@ -96,6 +107,11 @@ pub fn thorough() -> PartialResearchAgentPolicy {
             research: Some(ContactDepth::Deep),
             prospect: Some(ContactDepth::Standard),
             max_fetches: Some(8),
+        }),
+        // The quality ceiling: strict per-claim grounding on both stages.
+        grounding: Some(PartialGrounding {
+            research: Some(GroundingDepth::Strict),
+            prospect: Some(GroundingDepth::Strict),
         }),
         ingress_dispatch: Some(PartialIngressDispatch {
             enabled: Some(true),
@@ -304,6 +320,30 @@ mod tests {
         assert_eq!(ce.research, Some(ContactDepth::Deep));
         assert_eq!(ce.prospect, Some(ContactDepth::Standard));
         assert_eq!(ce.max_fetches, Some(8));
+    }
+
+    #[test]
+    fn baseline_sets_grounding_standard_standard() {
+        let p = baseline();
+        let g = p.grounding.expect("grounding set");
+        assert_eq!(g.research, Some(GroundingDepth::Standard));
+        assert_eq!(g.prospect, Some(GroundingDepth::Standard));
+    }
+
+    #[test]
+    fn cheap_fast_sets_grounding_standard_standard() {
+        let p = cheap_fast();
+        let g = p.grounding.expect("grounding set");
+        assert_eq!(g.research, Some(GroundingDepth::Standard));
+        assert_eq!(g.prospect, Some(GroundingDepth::Standard));
+    }
+
+    #[test]
+    fn thorough_sets_grounding_strict_strict() {
+        let p = thorough();
+        let g = p.grounding.expect("grounding set");
+        assert_eq!(g.research, Some(GroundingDepth::Strict));
+        assert_eq!(g.prospect, Some(GroundingDepth::Strict));
     }
 
     #[test]
