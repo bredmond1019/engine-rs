@@ -16,6 +16,53 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-30]
+
+### `EN.6.F-suspend-resume` — human-in-the-loop approval gate: run_from, SuspendNode, pause/resume/suspended-list HTTP surface
+- **What:** Ran `/sdlc-flow EN.6.F-suspend-resume` on branch `EN.6.F-suspend-resume-flow`. All 15
+  tasks passed, PASS review. Landed the full suspend/resume primitive stack: `PauseSignal` (a
+  two-way, clearable sibling of `CancellationToken`) plus the `metadata.suspension` marker
+  read/write API in `engine-core::suspend` (task 1); `BudgetLedger::from_parts`/`from_context` for
+  ledger rehydration on resume (task 2); `Workflow::run_with` split into `seed_context`/`walk` so a
+  fresh run and a resumed run share one pointer-walk loop (task 3); `Workflow::walk` gained a
+  loop-top `PauseSignal` check and post-node `SuspendNode` finalization, plus
+  `Workflow::run_from`/`ResumeState`/`without_seeded_nodes` for rehydrating a suspended
+  `TaskContext` at its saved pointer (task 4); `SuspendNode` — the workflow-authored suspension
+  request node, default-off, in-place no-op — added (task 5); a 15-test hermetic `engine-core`
+  integration suite covering marker semantics, loop-mid-suspend, and rehydration (task 6);
+  `engine-store` gained `upsert_event` (idempotent) + `get_task_context`, `engine-serve`'s durable
+  writer always upserts (task 7); the suspended-run index (`TakeForResume`,
+  `AlreadyResuming`/`NotFound` semantics, one lint-fix cycle) (task 8); `publish_suspended`/
+  `clear_terminal` on the SSE stream registry so a resumed run streams fresh (task 9);
+  `spawn_run`/`SpawnedRun`/`RunStart` extracted so trigger and resume share one
+  terminal-vs-suspended exit fork (task 10); the HTTP surface — `POST /events/{run_id}/pause`,
+  `POST /events/{event_id}/resume`, `GET /events/suspended` — with full Postgres-fallback
+  rehydration for restart survival (task 11); `GET /events/{event_id}` now reports `status:
+  "suspended"` for a live run with an open marker (task 12); a 13-test hermetic `engine-serve` HTTP
+  suite covering the full pause/resume/list surface, plus a required production fix to `abort_run`
+  so a suspended run stays killable (task 13, logged in the spec's Amendment Log); `docs/
+  suspend-resume.md` added (task 14); full validation gate green — fmt, clippy `-D warnings`,
+  workspace `nextest` (1342/1342, `DATABASE_URL` unset), release build, cross-repo bastion `cargo
+  check` clean (task 15). Two genuine spec deviations, both logged in the spec's Amendment Log:
+  task 11 added a `pool`/`pool()` accessor to `engine-serve`'s `DurableHandle` (outside its
+  declared `files`) because the spec's own Postgres-fallback rehydration algorithm required it;
+  task 13 fixed `abort_run` to fall back to the suspended index when a run has no live
+  `CancellationToken`, because the spec's own coverage bullet ("a suspended run must still be
+  killable") could not pass without it. This closes `EN.6.F`, giving Phase 6 its human-in-the-loop
+  approval gate — `EN.6.H` (OUTREACH workflow) now needs only `EN.6.B` (email adapter) to unblock.
+  Next: `EN.5.B1`/`EN.5.C`/`EN.6.C`/`EN.6.D`/`EN.4.D` per the `next` frontmatter list.
+
+```
+90d7d24 feat: implement EN.6.F-suspend-resume-task14
+cc0245c feat: implement EN.6.F-suspend-resume-task13
+908a64f feat: implement EN.6.F-suspend-resume-task12
+4d02b2f feat: implement EN.6.F-suspend-resume-task11
+6c60370 feat: implement EN.6.F-suspend-resume-task10
+0975429 feat: implement EN.6.F-suspend-resume-task9
+0848926 fix: fix pass 1 for EN.6.F-suspend-resume-task8
+4fe00b4 feat: implement EN.6.F-suspend-resume-task8
+```
+
 ## [run: 2026-07-29]
 
 ### `EN.6.E-research-ingress-dispatch` — self-feeding RESEARCH_AGENT → CONTENT_PIPELINE dispatch, review-fixed, docs patched
