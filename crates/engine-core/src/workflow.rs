@@ -321,7 +321,7 @@ fn stamp_run_telemetry(ctx: &mut TaskContext, start_node_identity: &str) {
 /// or an LLM node whose SDK call reported no cost) — folded into the
 /// [`BudgetLedger`] alongside token usage so `Budget::max_cost_usd` gates a
 /// run the same way `Budget::max_total_tokens` already does.
-fn node_cost_usd(ctx: &TaskContext, identity: &str) -> Option<f64> {
+pub(crate) fn node_cost_usd(ctx: &TaskContext, identity: &str) -> Option<f64> {
     ctx.nodes.get(identity)?.get("cost_usd")?.as_f64()
 }
 

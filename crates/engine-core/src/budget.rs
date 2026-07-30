@@ -14,7 +14,9 @@
 //! cost figure (e.g. `ClaudeCodeStep`'s SDK `Outcome::cost_usd`) pass it
 //! alongside the usage.
 
-use engine_contract::Usage;
+use engine_contract::{TaskContext, Usage};
+
+use crate::workflow::node_cost_usd;
 
 /// Optional per-run spend caps. Any field left `None` is not enforced.
 /// `Budget::default()` (all `None`) means "no gate" — the ledger's
@@ -92,6 +94,50 @@ impl BudgetLedger {
         Self::default()
     }
 
+    /// Exact restore from a `metadata.suspension` ledger snapshot — the
+    /// authoritative resume path. Always prefer this over [`from_context`]
+    /// when a suspension marker actually carries a ledger snapshot.
+    ///
+    /// [`from_context`]: BudgetLedger::from_context
+    pub fn from_parts(total_tokens: u64, total_cost_usd: f64) -> Self {
+        Self {
+            total_tokens,
+            total_cost_usd,
+        }
+    }
+
+    /// Lossy fallback for a context whose suspension marker carries no
+    /// ledger snapshot (a marker written before EN.6.F, or a DB row from an
+    /// older process). Sums `node_runs[*].usage` (tokens) and
+    /// `nodes[*].cost_usd` (dollars, via the same [`node_cost_usd`] reader
+    /// `Workflow::run`'s own fold uses) across every node identity in the
+    /// context.
+    ///
+    /// **LOSSY** — `node_runs` is keyed by node identity, not by
+    /// invocation, so a node that ran `N` times through a loop back-edge
+    /// contributes only its *last* recorded usage/cost, not the sum across
+    /// all `N` runs. This exists so a resume never silently restarts spend
+    /// at zero, not because it reconstructs the true historical total.
+    pub fn from_context(ctx: &TaskContext) -> Self {
+        let total_tokens = ctx
+            .node_runs
+            .values()
+            .filter_map(|run| run.usage.as_ref())
+            .map(|usage| usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0))
+            .sum();
+
+        let total_cost_usd = ctx
+            .nodes
+            .keys()
+            .filter_map(|identity| node_cost_usd(ctx, identity))
+            .sum();
+
+        Self {
+            total_tokens,
+            total_cost_usd,
+        }
+    }
+
     /// Folds a completed node's spend into the ledger.
     ///
     /// `usage: None` (non-LLM nodes, or an LLM node that reported none)
@@ -154,6 +200,8 @@ impl BudgetLedger {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn usage(input: u64, output: u64) -> Usage {
@@ -255,6 +303,104 @@ mod tests {
         ledger.record(Some(&usage(u64::MAX / 2, u64::MAX / 2)), Some(1_000_000.0));
 
         assert_eq!(ledger.check(None), BudgetDecision::Allow);
+    }
+
+    fn node_run_with_usage(input: u64, output: u64) -> engine_contract::NodeRun {
+        engine_contract::NodeRun {
+            status: engine_contract::NodeRunStatus::Success,
+            started_at: None,
+            completed_at: None,
+            error: None,
+            input: None,
+            usage: Some(usage(input, output)),
+        }
+    }
+
+    #[test]
+    fn from_parts_round_trips_through_check() {
+        let ledger = BudgetLedger::from_parts(100, 5.0);
+
+        assert_eq!(ledger.total_tokens(), 100);
+        assert!((ledger.total_cost_usd() - 5.0).abs() < f64::EPSILON);
+
+        let cap_above = Budget {
+            max_total_tokens: Some(200),
+            max_cost_usd: Some(10.0),
+        };
+        assert_eq!(ledger.check(Some(&cap_above)), BudgetDecision::Allow);
+
+        let cap_below = Budget {
+            max_total_tokens: Some(50),
+            max_cost_usd: None,
+        };
+        assert!(matches!(
+            ledger.check(Some(&cap_below)),
+            BudgetDecision::Halt(BudgetHaltReason::TotalTokens { .. })
+        ));
+    }
+
+    #[test]
+    fn from_context_sums_node_runs_usage_and_nodes_cost_usd() {
+        let mut node_runs = HashMap::new();
+        node_runs.insert("NodeA".to_string(), node_run_with_usage(10, 20));
+        node_runs.insert("NodeB".to_string(), node_run_with_usage(5, 15));
+
+        let mut nodes = HashMap::new();
+        nodes.insert("NodeA".to_string(), serde_json::json!({"cost_usd": 0.5}));
+        nodes.insert("NodeB".to_string(), serde_json::json!({"cost_usd": 0.25}));
+
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes,
+            metadata: serde_json::json!({}),
+            node_runs,
+        };
+
+        let ledger = BudgetLedger::from_context(&ctx);
+
+        assert_eq!(ledger.total_tokens(), 50);
+        assert!((ledger.total_cost_usd() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn from_context_on_empty_context_equals_new() {
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+
+        assert_eq!(BudgetLedger::from_context(&ctx), BudgetLedger::new());
+    }
+
+    #[test]
+    fn from_context_looped_node_contributes_once() {
+        // A node that ran twice through a loop back-edge is keyed once in
+        // `node_runs` by identity, so only its last recorded usage/cost is
+        // visible to `from_context` — documenting the known loss.
+        let mut node_runs = HashMap::new();
+        node_runs.insert("LoopedNode".to_string(), node_run_with_usage(100, 100));
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "LoopedNode".to_string(),
+            serde_json::json!({"cost_usd": 2.0}),
+        );
+
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes,
+            metadata: serde_json::json!({}),
+            node_runs,
+        };
+
+        let ledger = BudgetLedger::from_context(&ctx);
+
+        // Only the single stored (last) usage/cost is visible, not a sum
+        // across however many times the loop actually ran.
+        assert_eq!(ledger.total_tokens(), 200);
+        assert!((ledger.total_cost_usd() - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
