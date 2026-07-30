@@ -150,6 +150,18 @@ pub struct CompanyBrief {
     /// carries one (task 4) — this field is not solely model-dependent.
     #[serde(default)]
     pub company_url: Option<String>,
+    /// Domain-specific claims (regulatory/compliance, certification,
+    /// jurisdiction-specific, numeric, or capability claims) the model could
+    /// not tie to a source it actually fetched. **Anti-fabrication contract
+    /// (load-bearing), same voice as [`ResearchContact`]'s.** A flagged claim
+    /// is kept in `pain_points`/`outreach_hooks`/the summary, never deleted —
+    /// flagging it here is not a failure. An empty list is the correct,
+    /// expected answer for a fully-grounded brief; it is always serialized
+    /// (never omitted) so a grounded brief still emits `[]` rather than an
+    /// absent key. Never model-supplied for `validation_required` — that
+    /// flag is always derived from this list, never an independent field.
+    #[serde(default)]
+    pub needs_further_research: Vec<String>,
 }
 
 /// A single prospect discovered during a prospecting sweep, mapped onto one
@@ -174,6 +186,13 @@ pub struct ProspectLead {
     /// [`ResearchContact`]'s anti-fabrication contract.
     #[serde(default)]
     pub contacts: Vec<ResearchContact>,
+    /// Domain-specific claims for this prospect the model could not tie to a
+    /// source it actually fetched — same anti-fabrication contract as
+    /// [`CompanyBrief::needs_further_research`]. Kept, not deleted; an empty
+    /// list is the correct answer for a fully-grounded lead and is always
+    /// serialized.
+    #[serde(default)]
+    pub needs_further_research: Vec<String>,
 }
 
 /// A forum/web sweep distilled into pain points, a four-pillar vertical
@@ -234,6 +253,7 @@ pub fn company_brief_json_schema() -> serde_json::Value {
             "sources": { "type": "array", "items": { "type": "string" } },
             "contacts": { "type": "array", "items": research_contact_json_schema() },
             "company_url": { "type": "string" },
+            "needs_further_research": { "type": "array", "items": { "type": "string" } },
         },
         "required": ["company_name", "summary"],
     })
@@ -259,6 +279,7 @@ pub fn prospecting_result_json_schema() -> serde_json::Value {
                         "outreach_hook": { "type": "string" },
                         "source": { "type": "string" },
                         "contacts": { "type": "array", "items": research_contact_json_schema() },
+                        "needs_further_research": { "type": "array", "items": { "type": "string" } },
                     },
                     "required": ["name", "pillar"],
                 },
@@ -361,9 +382,29 @@ mod tests {
                 note: String::new(),
             }],
             company_url: Some("https://acme.example".to_string()),
+            needs_further_research: vec!["FAR/DFARS compliance status unconfirmed".to_string()],
         };
         let json = serde_json::to_string(&brief).expect("serializes");
         let round_tripped: CompanyBrief = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(brief, round_tripped);
+    }
+
+    #[test]
+    fn company_brief_round_trips_with_empty_needs_further_research() {
+        let brief = CompanyBrief {
+            company_name: "Acme Corp".to_string(),
+            summary: "Widget manufacturer expanding into SaaS.".to_string(),
+            recent_developments: vec![],
+            pain_points: vec![],
+            outreach_hooks: vec![],
+            sources: vec![],
+            contacts: vec![],
+            company_url: None,
+            needs_further_research: vec![],
+        };
+        let json = serde_json::to_value(&brief).expect("serializes");
+        assert_eq!(json["needs_further_research"], serde_json::json!([]));
+        let round_tripped: CompanyBrief = serde_json::from_value(json).expect("deserializes");
         assert_eq!(brief, round_tripped);
     }
 
@@ -378,6 +419,9 @@ mod tests {
                 outreach_hook: Some("Posted about contract delays on r/legaltech".to_string()),
                 source: Some("https://reddit.com/r/legaltech/abc".to_string()),
                 contacts: vec![],
+                needs_further_research: vec![
+                    "Brazilian local-LLM data-residency claim unconfirmed".to_string(),
+                ],
             }],
             common_pain_points: vec!["Manual contract review".to_string()],
             sources: vec!["https://reddit.com/r/legaltech".to_string()],
@@ -385,6 +429,23 @@ mod tests {
         let json = serde_json::to_string(&result).expect("serializes");
         let round_tripped: ProspectingResult = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(result, round_tripped);
+    }
+
+    #[test]
+    fn prospect_lead_round_trips_with_empty_needs_further_research() {
+        let lead = ProspectLead {
+            name: "Jane Doe Legal".to_string(),
+            pain_points: vec![],
+            pillar: "automation".to_string(),
+            outreach_hook: None,
+            source: None,
+            contacts: vec![],
+            needs_further_research: vec![],
+        };
+        let json = serde_json::to_value(&lead).expect("serializes");
+        assert_eq!(json["needs_further_research"], serde_json::json!([]));
+        let round_tripped: ProspectLead = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(lead, round_tripped);
     }
 
     #[test]
@@ -434,6 +495,7 @@ mod tests {
         let brief: CompanyBrief = serde_json::from_value(json).expect("deserializes with defaults");
         assert_eq!(brief.contacts, Vec::new());
         assert_eq!(brief.company_url, None);
+        assert_eq!(brief.needs_further_research, Vec::<String>::new());
     }
 
     #[test]
@@ -444,6 +506,33 @@ mod tests {
         });
         let lead: ProspectLead = serde_json::from_value(json).expect("deserializes with defaults");
         assert_eq!(lead.contacts, Vec::new());
+        assert_eq!(lead.needs_further_research, Vec::<String>::new());
+    }
+
+    #[test]
+    fn company_brief_schema_does_not_require_needs_further_research() {
+        let schema = company_brief_json_schema();
+        let required = schema["required"].as_array().expect("required is an array");
+        assert!(!required.iter().any(|v| v == "needs_further_research"));
+        assert_eq!(
+            schema["properties"]["needs_further_research"],
+            serde_json::json!({ "type": "array", "items": { "type": "string" } })
+        );
+    }
+
+    #[test]
+    fn prospecting_result_schema_does_not_require_needs_further_research() {
+        let schema = prospecting_result_json_schema();
+        let prospect_required = schema["properties"]["prospects"]["items"]["required"]
+            .as_array()
+            .expect("required is an array");
+        assert!(!prospect_required
+            .iter()
+            .any(|v| v == "needs_further_research"));
+        assert_eq!(
+            schema["properties"]["prospects"]["items"]["properties"]["needs_further_research"],
+            serde_json::json!({ "type": "array", "items": { "type": "string" } })
+        );
     }
 
     #[test]
@@ -481,9 +570,12 @@ mod tests {
             sources: vec![],
             contacts: vec![],
             company_url: None,
+            needs_further_research: vec![],
         };
         let brief_json = serde_json::to_value(&brief).expect("serializes");
         assert!(brief_json.get("company_name").is_some());
+        // Additive: needs_further_research must not displace the guard key.
+        assert!(brief_json.get("needs_further_research").is_some());
 
         let result = ProspectingResult {
             vertical: "legal-tech".to_string(),
