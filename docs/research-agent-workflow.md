@@ -6,7 +6,7 @@ doc_id: research-agent-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief, materialize-doc-node, opportunity, contacts, merge-contacts, contact-enrichment, locale, language directive, ingress-dispatch, channel-transport, content-pipeline]
+keywords: [research-agent, workflow, graph, policy, websearch, prospecting, company brief, materialize-doc-node, opportunity, contacts, merge-contacts, contact-enrichment, locale, language directive, ingress-dispatch, channel-transport, content-pipeline, needs-further-research, grounding, validation-required, anti-fabrication]
 related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, data-contract, materialize-doc-node, opportunity-edit-workflows, content-pipeline-workflow]
 ---
 
@@ -112,13 +112,15 @@ serde, enforce that the right fields are present for the chosen mode.
 ## Structured outputs
 
 - **`CompanyBrief`** (`CompanyResearchNode`): `company_name`, `summary`, `recent_developments`,
-  `pain_points`, `outreach_hooks`, `sources`, `contacts` (`Vec<ResearchContact>`), `company_url`.
-  Only `company_name`/`summary` are JSON-schema `required`; the rest tolerate partial model
-  output, including an empty `contacts[]`.
+  `pain_points`, `outreach_hooks`, `sources`, `contacts` (`Vec<ResearchContact>`), `company_url`,
+  `needs_further_research` (`Vec<String>`, `EN.4.G`). Only `company_name`/`summary` are
+  JSON-schema `required`; the rest tolerate partial model output, including an empty
+  `contacts[]`/`needs_further_research[]`.
 - **`ProspectingResult`** (`ProspectingResearchNode`): `vertical`, `prospects` (a list of
-  `ProspectLead { name, pain_points, pillar, outreach_hook, source, contacts }`, mapped onto one
-  of the practice's four service pillars), `common_pain_points`, `sources`. Only `vertical` is
-  JSON-schema `required` at the top level, and only `name`/`pillar` are `required` per prospect.
+  `ProspectLead { name, pain_points, pillar, outreach_hook, source, contacts,
+  needs_further_research }`, mapped onto one of the practice's four service pillars),
+  `common_pain_points`, `sources`. Only `vertical` is JSON-schema `required` at the top level, and
+  only `name`/`pillar` are `required` per prospect.
 
 Both nodes set `Config.json_schema` on the underlying `claude_code_rs::Config` (via
 `company_brief_json_schema()` / `prospecting_result_json_schema()` in `schema.rs`) and prefer the
@@ -141,6 +143,108 @@ Both `company_brief_json_schema()` and `prospecting_result_json_schema()` embed 
 **invariant across `contact_enrichment` policy depth**: only the prompt text varies with depth,
 never the emitted schema, so mev's `detect_kind` and okf-core's mapping stay stable regardless of
 policy.
+
+## Grounding: `needs_further_research` and the derived `validation_required`
+
+`EN.4.G` extends the anti-fabrication contract from *contact channels* to *domain claims*: both
+research nodes already emit highly specific claims (a compliance regime, a data-residency rule, a
+numeric figure) with no basis beyond model inference, and `EN.6.H1` (OUTREACH_DRAFT) drafts
+outreach messages **from those fields**. Without a flag, an unverifiable claim flows straight from
+a research run into a message sent under the operator's name to a stranger — a
+`business/docs/brand.md` Rule 5 violation with an actual recipient. This is the same move `EN.4.E`
+made for contacts, applied to claims: *"only ever report a contact channel that appeared verbatim
+in a fetched source"* becomes *"only ever assert a domain claim you can tie to a source you
+actually fetched — otherwise flag it."*
+
+### What must be flagged
+
+Both `CompanyResearchNode` and `ProspectingResearchNode` carry a `grounding_directive(depth)`
+(`company_research.rs` / `prospecting.rs`, appended in `build_prompt` beside the existing
+`contact_directive`) instructing the model to review every domain-specific claim in its draft
+`summary`/`recent_developments`/`pain_points`/`outreach_hooks` (company mode) or per-prospect
+`pain_points`/`outreach_hook` (prospecting mode) before finishing, and list under
+`needs_further_research` any it cannot tie to a source it actually fetched:
+
+- a regulatory or compliance-regime claim — the directive names FAR/DFARS-style federal
+  compliance obligations as the shape of what to flag (the `research-agent-needs-further-research-flag`
+  carryover's own real example);
+- a certification claim;
+- a jurisdiction-specific rule — the directive names a Brazilian data-residency requirement for
+  local LLM deployment as the other carryover example;
+- a numeric figure;
+- a capability claim.
+
+**Flagging is not failure.** Mirroring the contacts omission-over-guess framing: a flagged claim
+is **kept in place**, not deleted, and "I could not ground this" is the correct, expected answer
+for a fully-grounded brief — an empty `needs_further_research[]` list is exactly what a clean run
+produces, not an omission to be filled in. Prospecting mode phrases the directive per-prospect:
+each lead flags its own ungroundable claims under that lead's own `needs_further_research`, not a
+sweep-wide list (the sweep-level union is derived afterward — see below).
+
+### `validation_required` is always derived, never model-supplied
+
+`validation_required` is **not** a field either the model or `CompanyBrief`/`ProspectLead`/
+`Opportunity` can set independently — it exists only as a computed value, so a document can never
+contradict its own list:
+
+- `CompanyResearchNode` stamps `validation_required` onto its result as
+  `!brief.needs_further_research.is_empty()`, computed after parsing — a stubbed/model reply that
+  itself sets `validation_required: false` alongside a non-empty list is still stamped `true`
+  (asserted by test).
+- `ProspectingResearchNode` stamps a sweep-level `validation_required` that is `true` when *any*
+  lead in the sweep carries a non-empty `needs_further_research`.
+- `Opportunity::validation_required()` (okf-core) is a derived method, never a struct field:
+  `!self.needs_further_research.is_empty()`. `from_frontmatter()` ignores any `validation_required`
+  key present in a source document rather than storing it — a stale `validation_required: true`
+  next to an empty list reads back derived-`false`.
+
+### The sweep-level union (prospecting mode only)
+
+`ProspectingResearchNode` additionally stamps a sweep-level `needs_further_research` onto its
+result: the **order-stable, deduped union** of every parsed lead's own list. This is additive, not
+a replacement — each `ProspectLead.needs_further_research` stays intact on the lead itself; the
+union exists so a sweep-wide reader (and the materialized sweep document's frontmatter) does not
+have to walk every prospect to know whether *any* claim in the run needs validation.
+`Opportunity::from_prospecting_result` (okf-core) performs the identical union, deduped and
+order-stable, when mapping the sweep into the written document — preferring a top-level
+`needs_further_research` key on the result value (which is exactly what
+`ProspectingResearchNode` stamps there) over re-deriving the union from `prospects[]` itself.
+
+### Where it lands in the written document
+
+`Opportunity` (`../okf-core/src/doc/opportunity.rs`) carries `needs_further_research: Vec<String>`
+and the same derive-only pattern as above. `frontmatter()` **always** emits both keys — present,
+not absent, even when nothing was flagged:
+
+```yaml
+needs_further_research: []
+validation_required: "false"
+```
+
+or, with a flagged claim:
+
+```yaml
+needs_further_research:
+  - FAR/DFARS compliance regime claimed but not sourced
+validation_required: "true"
+```
+
+`from_frontmatter()` recovers `needs_further_research` from the block list; a
+write-then-read round-trip is lossless (asserted by test). `Opportunity::from_company_brief` maps
+the brief's list directly (deduped, order-stable, via the existing `json_str_array_deduped`
+helper — the same helper `sources[]`/`links[]` lifting uses); `from_prospecting_result` maps the
+sweep-level union described above. Both leave every previously-mapped field (`title`,
+`description`, `kind`, `stage`, `layer`, `url`, `links`, `research_brief`, `contacts`) unchanged.
+
+### Invariants (same shape as `contact_enrichment`)
+
+The `GroundingDepth` knob (below) changes only the *prompt* text — `company_brief_json_schema()`
+and `prospecting_result_json_schema()` describe `needs_further_research` byte-identically at every
+depth (asserted by test), so `detect_kind` and the okf-core mapping stay stable regardless of
+setting, and `STABLE_SYSTEM_PROMPT` stays byte-identical across depths in both nodes (also asserted
+by test) — the prompt-cache breakpoint never becomes policy-varying. The graph adds no node and
+rewires nothing; this block is a stamp-and-directive change layered onto the existing six-node
+graph (see [Graph shape](#graph-shape)).
 
 ## Contacts: extraction contract and the two-step write
 
@@ -302,11 +406,13 @@ Knobs (a strict subset of `SdlcPolicy`'s — only what the two stages need):
 | `local.{endpoint,model,constrained_json}` | string / string / bool | Carried for API-shape parity; not exercised by either stage. |
 | `contact_enrichment.{research,prospect}` | `off` \| `standard` \| `deep` | Per-stage contact-acquisition depth (`EN.4.E`) — see below. |
 | `contact_enrichment.max_fetches` | `u8` | Cap on the EXTRA page loads spent on contact acquisition per run. |
+| `grounding.{research,prospect}` | `standard` \| `strict` | Per-stage grounding-check depth on `needs_further_research` (`EN.4.G`) — no `off`, see [The `grounding` knob](#the-grounding-knob) below. |
 | `ingress_dispatch.enabled` | `bool` | Whether `ResearchIngressDispatchNode` sends a `TriggerWorkflow` action for this run's output (`EN.6.E`) — see [Self-feeding dispatch](#self-feeding-dispatch-researchingressdispatchnode) above. |
 | `ingress_dispatch.target_workflow_type` | string | The workflow the trigger names — `"CONTENT_PIPELINE"` by default. |
 
 Built-in default: `ResearchAgentPolicy::default()` — normal verbosity, both tiers `sonnet`,
-prompt cache off, `contact_enrichment` `standard`/`standard`/4 fetches, `ingress_dispatch` off.
+prompt cache off, `contact_enrichment` `standard`/`standard`/4 fetches, `grounding`
+`standard`/`standard`, `ingress_dispatch` off.
 
 ### The `contact_enrichment` knob
 
@@ -336,6 +442,41 @@ opportunity with `url`/`links` lifted via `MaterializeDocNode`, and still walks
 `MergeContactsNode` — which finds an empty collected `contacts[]` and no-ops cleanly, making no
 seam call (see [Contacts: extraction contract and the two-step write](#contacts-extraction-contract-and-the-two-step-write)).
 
+### The `grounding` knob
+
+Grounding-check effort costs prompt tokens and model attention — per `CLAUDE.md` standing rule 6
+it resolves through the same four-layer precedence as every other knob on this policy, never a
+constant baked into a prompt string. Unlike `contact_enrichment`, `GroundingDepth` has **exactly
+two variants and deliberately no `off`**:
+
+| Depth | What it does |
+|---|---|
+| `standard` | Asks the model to flag, in `needs_further_research`, every domain-specific claim (regulatory/compliance, certification, jurisdiction-specific, numeric, or capability) it could not tie to a source it actually fetched. |
+| `strict` | Everything `standard` does, plus a dedicated per-claim grounding pass over `pain_points`/`outreach_hooks`, with a stated reason recorded for each flagged claim. |
+
+**Why there is no `off`, stated explicitly.** `CLAUDE.md` standing rule 6's own qualifier is that a
+value fixed by an external contract is not a knob — and `business/docs/brand.md` Rule 5 (never
+send an ungroundable claim to a stranger under the operator's name) is exactly that contract.
+`EN.6.H1` (OUTREACH_DRAFT) reads `needs_further_research`/`validation_required` unconditionally,
+with no per-run way to disable the check; a run that *could* turn grounding off would reopen the
+exact hole this block exists to close. So `standard` — not `off` — is the floor: `cheap-fast`
+resolves to `standard`/`standard` rather than sitting below it, the same way `contact_enrichment`
+would if its own floor were raised to match. What the knob buys is only the *upper* half:
+
+| | `research` (company) | `prospect` |
+|---|---|---|
+| built-in default | `standard` | `standard` |
+| `baseline` profile | `standard` | `standard` |
+| `cheap-fast` profile | `standard` | `standard` |
+| `thorough` profile | `strict` | `strict` |
+
+Like `contact_enrichment`, the depth only ever changes the *prompt* — `needs_further_research`'s
+emitted JSON schema is identical at both depths (see
+[Invariants](#invariants-same-shape-as-contact_enrichment) above), and the resolved depth is
+stamped as `grounding_depth` into each research node's result on `ctx.nodes`, alongside the
+existing `contact_enrichment_depth`/`locale` stamps, so `EN.4.0` telemetry can attribute cost to
+the setting that caused it.
+
 ### Named profiles
 
 Three built-in bundles in `profiles.rs` (`profile_by_name`), looked up first in
@@ -343,9 +484,9 @@ Three built-in bundles in `profiles.rs` (`profile_by_name`), looked up first in
 
 | Name | Tradeoff |
 |---|---|
-| `baseline` | Explicit no-op control: Sonnet on both stages, normal verbosity, prompt cache off, `standard`/`standard` contact enrichment at 4 fetches, ingress dispatch off — spelled out for clarity, matches the built-in default. |
-| `cheap-fast` | `haiku` on both stages, terse output, prompt caching on, contact enrichment `off`/`off` at 0 fetches, ingress dispatch off (a chained `CONTENT_PIPELINE` run is the single largest cost a research run can incur). |
-| `thorough` | `opus` on both stages, verbose output, contact enrichment `deep` for `research`/`standard` for `prospect` at 8 fetches — prospecting deliberately stays `standard` even here so a broad sweep never multiplies deep enrichment across dozens of leads — and ingress dispatch **on**: the quality ceiling is the closed loop into `CONTENT_PIPELINE`. |
+| `baseline` | Explicit no-op control: Sonnet on both stages, normal verbosity, prompt cache off, `standard`/`standard` contact enrichment at 4 fetches, `standard`/`standard` grounding, ingress dispatch off — spelled out for clarity, matches the built-in default. |
+| `cheap-fast` | `haiku` on both stages, terse output, prompt caching on, contact enrichment `off`/`off` at 0 fetches, grounding stays at its `standard`/`standard` floor (there is no lower setting to drop to), ingress dispatch off (a chained `CONTENT_PIPELINE` run is the single largest cost a research run can incur). |
+| `thorough` | `opus` on both stages, verbose output, contact enrichment `deep` for `research`/`standard` for `prospect` at 8 fetches — prospecting deliberately stays `standard` even here so a broad sweep never multiplies deep enrichment across dozens of leads — `strict`/`strict` grounding (the quality ceiling for claim-checking), and ingress dispatch **on**: the quality ceiling is the closed loop into `CONTENT_PIPELINE`. |
 
 **The cost story, stated explicitly.** Contact acquisition is extra spend on top of a run's normal
 search/fetch activity: `cheap-fast` turns it off entirely (0 extra fetches, matching its
@@ -398,7 +539,11 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   [sdlc-flow-policy.md](sdlc-flow-policy.md#aggregating-across-runs) for the aggregator's
   mechanics) to rank named profiles by cost.
 - **`ctx.nodes["CompanyResearchNode"]` / `ctx.nodes["ProspectingResearchNode"]`** — the parsed
-  `CompanyBrief` / `ProspectingResult`, plus usage, on the final `TaskContext`.
+  `CompanyBrief` / `ProspectingResult`, plus usage, on the final `TaskContext`. Also carries the
+  `EN.4.G` grounding stamps: `grounding_depth` (the resolved depth) and the derived
+  `validation_required` on both nodes; `ProspectingResearchNode` additionally stamps a sweep-level
+  `needs_further_research` (the order-stable, deduped union across every parsed lead — see
+  [Grounding](#grounding-needs_further_research-and-the-derived-validation_required) above).
 - **`ctx.nodes["MaterializeDocNode"]`** — the ingest write's result stamp:
   `{materialized, dry_run, model: "opportunity", paths, warnings}`, naming the Opportunity `.md`
   path written or updated under `business/docs/opportunities/`. See
@@ -460,3 +605,14 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   re-dispatch of the same input reuses that `envelope_id`; a failing transport still leaves the
   run successful with a `delivered: false` receipt; and the `baseline`/`thorough` named profiles
   resolve to dispatching nothing/exactly once respectively.
+  `crates/engine-core/tests/it/research_agent_grounding_e2e.rs` (`EN.4.G`, a module of the shared
+  `tests/it/main.rs` integration binary, not a new binary) drives the real `Workflow::run` walk
+  (real `MevDocMaterializer`, real okf-core parsing of the written `.md` back into an
+  `Opportunity`) against a `tempfile::tempdir()` corpus, proving three directions: a company-mode
+  brief carrying an ungroundable claim writes that claim under the document's
+  `needs_further_research:` with `validation_required: true`; a fully-grounded company-mode brief
+  writes an empty `needs_further_research:` with `validation_required: false` — both keys present,
+  never absent; and a prospecting-mode sweep with one flagged lead among several writes the
+  deduped union to the sweep document's frontmatter with `validation_required: true`, while each
+  lead's own list survives verbatim in the embedded `## Research Brief` JSON. Nothing is written
+  outside the tempdir and no test spawns a real `claude`.
