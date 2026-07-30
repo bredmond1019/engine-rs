@@ -406,4 +406,52 @@ mod tests {
         assert!(metadata.is_object());
         assert!(suspension_requested(&metadata));
     }
+
+    // -- corrupt/malformed persisted `suspension` marker ---------------
+    //
+    // `TaskContext::metadata` is an untyped `serde_json::Value` (contract-facing,
+    // not itself schema-checked), so a row a Postgres restart hands back can carry
+    // ANY JSON shape under the "suspension" key -- e.g. a prior process crashing
+    // mid-write, a foreign/older writer, or manual data surgery. `read_suspension`
+    // must degrade to `None` (never panic) whenever that nested value fails typed
+    // deserialization, distinct from the already-covered "no suspension key at
+    // all" / "metadata itself isn't an object" cases above.
+
+    #[test]
+    fn read_suspension_returns_none_when_the_suspension_value_is_not_an_object() {
+        let metadata = serde_json::json!({ "suspension": "not-an-object" });
+        assert!(read_suspension(&metadata).is_none());
+        assert!(!is_suspended(&metadata));
+        assert!(!suspension_requested(&metadata));
+    }
+
+    #[test]
+    fn read_suspension_returns_none_when_a_required_field_has_the_wrong_type() {
+        // `suspended` is a required `bool` on `SuspensionState`; a string here
+        // must fail the typed parse rather than coerce or panic.
+        let metadata = serde_json::json!({
+            "suspension": { "suspended": "yes", "resume_at": "Next" }
+        });
+        assert!(read_suspension(&metadata).is_none());
+        assert!(!is_suspended(&metadata));
+    }
+
+    #[test]
+    fn read_suspension_returns_none_when_the_suspended_field_is_entirely_missing() {
+        // `suspended` has no `#[serde(default)]`, so a marker that dropped it
+        // (e.g. a truncated write) must fail closed, not default to `false` via
+        // partial deserialization of the rest of the object.
+        let metadata = serde_json::json!({
+            "suspension": { "resume_at": "Next", "resume_count": 0, "requested": false }
+        });
+        assert!(read_suspension(&metadata).is_none());
+        assert!(!is_suspended(&metadata));
+    }
+
+    #[test]
+    fn is_suspended_is_false_for_a_null_suspension_value() {
+        let metadata = serde_json::json!({ "suspension": serde_json::Value::Null });
+        assert!(!is_suspended(&metadata));
+        assert!(read_suspension(&metadata).is_none());
+    }
 }

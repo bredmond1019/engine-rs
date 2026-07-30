@@ -1,26 +1,28 @@
-//! Live-Postgres restart-durability test for EN.6.F's `rehydrate_from_store`
-//! fallback (`crates/engine-serve/src/resume.rs`).
+//! Live-Postgres tests for EN.6.F's `rehydrate_from_store` fallback
+//! (`crates/engine-serve/src/resume.rs`) — the resume path a fresh process
+//! (one that never held a run in its in-memory suspended index) falls back
+//! to.
 //!
 //! `suspend_resume_http.rs` proves the in-memory resume path end-to-end but
 //! deliberately runs with no `DATABASE_URL`, so it can never exercise
 //! `rehydrate_from_store` — the branch `resume_run` takes only when
-//! `take_for_resume` returns `TakeForResume::NotFound`, i.e. exactly the
-//! "this process never held the suspended run in memory" case a real
-//! restart produces. `postgres_round_trip.rs` tests `upsert_event`/
-//! `get_task_context` directly but never drives them through the HTTP
-//! resume route.
+//! `take_for_resume` returns `TakeForResume::NotFound`. `postgres_round_trip.rs`
+//! tests `upsert_event`/`get_task_context` directly but never drives them
+//! through the HTTP resume route. Two scenarios live here:
 //!
-//! This test closes that gap: it triggers and pauses a run against a real
-//! `AppState` wired to a live pool (so the durable writer's `upsert_event`
-//! actually lands a suspended row), waits for that row to be durably
-//! readable, then **simulates a process restart** by evicting the run from
-//! the in-memory suspended index (`engine_serve::suspend::remove_suspended`)
-//! before calling `/resume` — forcing `take_for_resume` to miss and
-//! `rehydrate_from_store` to be the only path that can complete the resume.
+//! 1. `resume_after_simulated_restart_rehydrates_from_postgres` — the happy
+//!    path: a run suspends, its durable row lands in Postgres, the in-memory
+//!    index is evicted to simulate a restart, and `/resume` completes purely
+//!    off the Postgres row.
+//! 2. `resume_against_a_row_with_a_malformed_suspension_marker_is_404_not_a_panic`
+//!    — the corrupt-state path: a row is planted directly with a
+//!    malformed `metadata.suspension` shape (`metadata` is an untyped
+//!    `serde_json::Value` in the contract, so Postgres never rejects this),
+//!    and `/resume` must 404 cleanly rather than panic or 500.
 //!
 //! `#[ignore]`d like every other live-Postgres test in this workspace (see
 //! `postgres_round_trip.rs`'s header for the rationale): CI has no live
-//! Postgres, so `cargo nextest run --workspace` reports this as skipped, not
+//! Postgres, so `cargo nextest run --workspace` reports these as skipped, not
 //! passed — an honest signal. Run explicitly with:
 //!
 //! ```sh
@@ -237,6 +239,96 @@ async fn resume_after_simulated_restart_rehydrates_from_postgres() {
     assert_eq!(
         final_body["task_context"]["node_runs"]["MarkerNode"]["status"],
         serde_json::json!("success")
+    );
+
+    // Clean up so repeated local runs don't accumulate rows.
+    sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup delete should succeed");
+}
+
+/// A companion to the restart test above: instead of a genuinely-suspended
+/// row, this plants a row whose `task_context.metadata.suspension` is
+/// malformed (a crash mid-write, a foreign/older writer, or manual data
+/// surgery could all produce this -- `metadata` is an untyped
+/// `serde_json::Value` in the contract, so Postgres itself never rejects it).
+/// `rehydrate_from_store` must degrade this to "not resumable" and 404, not
+/// panic or 500 -- `engine_core::suspend::is_suspended` (unit-tested
+/// directly against malformed shapes in `engine-core::suspend::tests`) is
+/// what makes that degrade-safe, and this test proves the full HTTP resume
+/// route actually goes through it end-to-end against a real Postgres row.
+#[actix_web::test]
+#[ignore = "requires a live Postgres; run with `cargo test -p engine-serve --test suspend_resume_postgres_restart -- --ignored`"]
+async fn resume_against_a_row_with_a_malformed_suspension_marker_is_404_not_a_panic() {
+    const WORKFLOW_TYPE: &str = "postgres-malformed-suspension-resume";
+
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this ignored test (see file header)");
+    let pool = engine_store::connect(&database_url)
+        .await
+        .expect("failed to connect to DATABASE_URL");
+
+    let run_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+
+    // `suspended` is a required `bool` on `SuspensionState` -- a string here
+    // fails the typed parse, exactly like the malformed-metadata unit tests
+    // in `engine-core::suspend::tests`, but reached this time through a real
+    // Postgres row rather than an in-process `serde_json::json!` literal.
+    let malformed_metadata = serde_json::json!({
+        "suspension": {
+            "suspended": "yes",
+            "resume_at": "MarkerNode",
+            "unexpected_field": { "nested": "garbage" }
+        }
+    });
+
+    let row = engine_contract::EventsRow {
+        id: run_id,
+        workflow_type: WORKFLOW_TYPE.to_string(),
+        data: serde_json::json!({}),
+        task_context: TaskContext {
+            event: serde_json::json!({}),
+            nodes: StdHashMap::new(),
+            metadata: malformed_metadata,
+            node_runs: StdHashMap::new(),
+        },
+        created_at: now,
+        updated_at: now,
+    };
+    engine_store::insert_event(&pool, &row)
+        .await
+        .expect("insert_event should succeed even with a malformed suspension shape");
+
+    // A fresh AppState with empty in-memory indexes -- exactly the "process
+    // never held this run" case; the only path that can answer at all is
+    // `rehydrate_from_store`.
+    let dispatcher = dispatcher_with_suspend_fixture(WORKFLOW_TYPE);
+    let state = AppState {
+        dispatcher: Arc::new(dispatcher),
+        live: LiveStateStore::new(),
+        durable: spawn_durable_writer(Some(pool.clone())),
+        runs: RunRegistry::new(),
+        api_key: API_KEY.to_string(),
+    };
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let resume_req = test::TestRequest::post()
+        .uri(&format!("/events/{run_id}/resume"))
+        .insert_header(("X-API-Key", API_KEY))
+        .to_request();
+    let resume_resp = test::call_service(&app, resume_req).await;
+    assert_eq!(
+        resume_resp.status(),
+        404,
+        "a malformed suspension marker must degrade to 'not resumable', never panic or 500"
     );
 
     // Clean up so repeated local runs don't accumulate rows.

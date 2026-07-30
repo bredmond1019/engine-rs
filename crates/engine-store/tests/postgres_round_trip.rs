@@ -214,3 +214,76 @@ async fn upsert_event_is_idempotent_and_leaves_created_at_immutable() {
         .await
         .expect("cleanup delete should succeed");
 }
+
+/// `task_context.metadata` is an untyped `serde_json::Value` in the contract
+/// (never itself schema-checked), so a real row can carry an arbitrary,
+/// malformed `"suspension"` shape under it -- e.g. a crash mid-write, a
+/// foreign/older writer, or manual data surgery. This proves the store layer's
+/// `Json<TaskContext>` decode round-trips such a row byte-for-byte rather than
+/// erroring: `get_event`/`get_task_context` must hand the malformed value back
+/// unchanged so a caller (e.g. `engine-serve`'s resume path via
+/// `engine_core::suspend::is_suspended`, unit-tested directly in
+/// `engine-core::suspend::tests`) can degrade it gracefully instead of the
+/// store layer itself failing the read.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with `cargo test -p engine-store -- --ignored`"]
+async fn get_task_context_round_trips_a_malformed_suspension_marker_without_erroring() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this ignored test (see file header)");
+
+    let pool = connect(&database_url)
+        .await
+        .expect("failed to connect to DATABASE_URL");
+
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+
+    // A deliberately malformed marker: `suspended` (required `bool`) is a
+    // string, and the value carries fields no real writer would ever emit.
+    let malformed_metadata = serde_json::json!({
+        "suspension": {
+            "suspended": "yes",
+            "resume_at": 12345,
+            "unexpected_field": { "nested": "garbage" }
+        }
+    });
+
+    let row = EventsRow {
+        id,
+        workflow_type: "engine-store-malformed-suspension-test".to_string(),
+        data: serde_json::json!({ "ticket_id": "T-malformed" }),
+        task_context: TaskContext {
+            event: serde_json::json!({ "ticket_id": "T-malformed" }),
+            nodes: HashMap::new(),
+            metadata: malformed_metadata.clone(),
+            node_runs: HashMap::new(),
+        },
+        created_at: now,
+        updated_at: now,
+    };
+
+    insert_event(&pool, &row)
+        .await
+        .expect("insert_event should succeed even with a malformed suspension shape");
+
+    let read_back = get_event(&pool, id)
+        .await
+        .expect("get_event must not error on a malformed suspension marker");
+    assert_eq!(
+        read_back.task_context.metadata, malformed_metadata,
+        "the malformed value must round-trip unchanged, not be rejected or altered"
+    );
+
+    let task_context = get_task_context(&pool, id)
+        .await
+        .expect("get_task_context must not error on a malformed suspension marker")
+        .expect("get_task_context should find the row");
+    assert_eq!(task_context.metadata, malformed_metadata);
+
+    // Clean up so repeated local runs don't accumulate rows.
+    sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("cleanup delete should succeed");
+}
