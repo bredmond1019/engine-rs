@@ -78,6 +78,50 @@ impl Default for ContactEnrichment {
     }
 }
 
+/// How hard a research node checks that a domain-specific claim it is about
+/// to emit under `needs_further_research` is actually grounded in a fetched
+/// source. There is deliberately **no `off` variant** — `EN.6.H1` reads
+/// `needs_further_research`/`validation_required` unconditionally, and
+/// `business/docs/brand.md` Rule 5 (never send an ungroundable claim to a
+/// stranger under the operator's name) is an external contract per
+/// `CLAUDE.md` standing rule 6's own qualifier, not a cost/quality knob a run
+/// can dial away. `standard` asks the model to flag, in
+/// `needs_further_research`, every domain-specific claim (regulatory/
+/// compliance, certification, jurisdiction-specific, numeric, or capability)
+/// it could not tie to a source it actually fetched. `strict` additionally
+/// demands a per-claim grounding pass over `pain_points`/`outreach_hooks`
+/// with a stated reason per flagged claim. Grounding depth only ever changes
+/// the *prompt* — the emitted JSON schema always describes
+/// `needs_further_research` identically, so `detect_kind` and the okf-core
+/// mapping are stable across every setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingDepth {
+    Standard,
+    Strict,
+}
+
+/// Per-stage grounding-check depth — mirrors [`ModelTiers`]'s per-stage
+/// shape. The cheapest run still flags (`cheap-fast` resolves to
+/// `standard`/`standard`, the floor, never below it); `thorough` resolves to
+/// `strict`/`strict`, the quality ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grounding {
+    pub research: GroundingDepth,
+    pub prospect: GroundingDepth,
+}
+
+impl Default for Grounding {
+    /// Behavior-stable baseline: `standard` grounding on both stages — the
+    /// floor, never `off`.
+    fn default() -> Self {
+        Self {
+            research: GroundingDepth::Standard,
+            prospect: GroundingDepth::Standard,
+        }
+    }
+}
+
 /// Whether a finished `RESEARCH_AGENT` run dispatches an ingress-tail
 /// `TriggerWorkflow` (`EN.6.E`) into `target_workflow_type`, and which
 /// workflow type it targets. `enabled: false` is the behavior-stable
@@ -115,14 +159,17 @@ pub struct ResearchAgentPolicy {
     pub local: LocalConfig,
     /// Per-stage contact-acquisition depth + fetch cap (`EN.4.E`).
     pub contact_enrichment: ContactEnrichment,
+    /// Per-stage grounding-check depth (`EN.4.G`) — no `off`, see
+    /// [`GroundingDepth`].
+    pub grounding: Grounding,
     /// Terminal ingress-tail dispatch to `CONTENT_PIPELINE` (`EN.6.E`).
     pub ingress_dispatch: IngressDispatch,
 }
 
 impl Default for ResearchAgentPolicy {
     /// The safe default: normal verbosity, all-Sonnet tiers, prompt-cache
-    /// off, standard contact enrichment on both stages, ingress dispatch
-    /// disabled.
+    /// off, standard contact enrichment on both stages, standard grounding
+    /// on both stages, ingress dispatch disabled.
     fn default() -> Self {
         Self {
             output_verbosity: OutputVerbosity::Normal,
@@ -130,6 +177,7 @@ impl Default for ResearchAgentPolicy {
             model_tiers: ModelTiers::default(),
             local: LocalConfig::default(),
             contact_enrichment: ContactEnrichment::default(),
+            grounding: Grounding::default(),
             ingress_dispatch: IngressDispatch::default(),
         }
     }
@@ -155,6 +203,7 @@ pub struct PartialResearchAgentPolicy {
     pub model_tiers: Option<PartialModelTiers>,
     pub local: Option<PartialLocalConfig>,
     pub contact_enrichment: Option<PartialContactEnrichment>,
+    pub grounding: Option<PartialGrounding>,
     pub ingress_dispatch: Option<PartialIngressDispatch>,
 }
 
@@ -189,6 +238,24 @@ fn merge_contact_enrichment(
     }
     if let Some(v) = over.max_fetches {
         base.max_fetches = v;
+    }
+    base
+}
+
+/// All-optional mirror of [`Grounding`] for partial overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialGrounding {
+    pub research: Option<GroundingDepth>,
+    pub prospect: Option<GroundingDepth>,
+}
+
+fn merge_grounding(mut base: Grounding, over: &PartialGrounding) -> Grounding {
+    if let Some(v) = over.research {
+        base.research = v;
+    }
+    if let Some(v) = over.prospect {
+        base.prospect = v;
     }
     base
 }
@@ -235,6 +302,10 @@ impl crate::policy::Policy for ResearchAgentPolicy {
             contact_enrichment: match &over.contact_enrichment {
                 Some(ce) => merge_contact_enrichment(base.contact_enrichment, ce),
                 None => base.contact_enrichment,
+            },
+            grounding: match &over.grounding {
+                Some(g) => merge_grounding(base.grounding, g),
+                None => base.grounding,
             },
             ingress_dispatch: match &over.ingress_dispatch {
                 Some(id) => merge_ingress_dispatch(base.ingress_dispatch, id),
@@ -494,6 +565,154 @@ mod tests {
         assert_eq!(ce.research, Some(ContactDepth::Deep));
         assert_eq!(ce.prospect, Some(ContactDepth::Off));
         assert_eq!(ce.max_fetches, Some(8));
+    }
+
+    #[test]
+    fn grounding_builtin_default_is_standard_standard() {
+        let policy = ResearchAgentPolicy::default();
+        assert_eq!(policy.grounding.research, GroundingDepth::Standard);
+        assert_eq!(policy.grounding.prospect, GroundingDepth::Standard);
+    }
+
+    #[test]
+    fn grounding_depth_serializes_to_documented_snake_case_strings() {
+        assert_eq!(
+            serde_json::to_value(GroundingDepth::Standard).unwrap(),
+            serde_json::json!("standard")
+        );
+        assert_eq!(
+            serde_json::to_value(GroundingDepth::Strict).unwrap(),
+            serde_json::json!("strict")
+        );
+    }
+
+    #[test]
+    fn grounding_depth_has_no_off_variant() {
+        // There is deliberately no "off" string that deserializes.
+        let result: Result<GroundingDepth, _> = serde_json::from_value(serde_json::json!("off"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn harness_default_overrides_builtin_for_grounding() {
+        let harness = PartialResearchAgentPolicy {
+            grounding: Some(PartialGrounding {
+                research: Some(GroundingDepth::Strict),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(ResearchAgentPolicy::default(), Some(&harness), None, None);
+        assert_eq!(resolved.grounding.research, GroundingDepth::Strict);
+        // Untouched fields fall through to builtin.
+        assert_eq!(resolved.grounding.prospect, GroundingDepth::Standard);
+    }
+
+    #[test]
+    fn profile_beats_harness_defaults_for_grounding() {
+        let harness = PartialResearchAgentPolicy {
+            grounding: Some(PartialGrounding {
+                prospect: Some(GroundingDepth::Standard),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let profile = PartialResearchAgentPolicy {
+            grounding: Some(PartialGrounding {
+                prospect: Some(GroundingDepth::Strict),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ResearchAgentPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            None,
+        );
+        assert_eq!(resolved.grounding.prospect, GroundingDepth::Strict);
+    }
+
+    #[test]
+    fn event_override_beats_profile_for_grounding() {
+        let profile = PartialResearchAgentPolicy {
+            grounding: Some(PartialGrounding {
+                research: Some(GroundingDepth::Standard),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialResearchAgentPolicy {
+            grounding: Some(PartialGrounding {
+                research: Some(GroundingDepth::Strict),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            ResearchAgentPolicy::default(),
+            None,
+            Some(&profile),
+            Some(&event),
+        );
+        assert_eq!(resolved.grounding.research, GroundingDepth::Strict);
+    }
+
+    #[test]
+    fn deserializes_partial_grounding_from_harness_json_shape() {
+        let json = r#"{
+            "grounding": { "research": "strict", "prospect": "standard" }
+        }"#;
+        let partial: PartialResearchAgentPolicy =
+            serde_json::from_str(json).expect("valid PartialResearchAgentPolicy JSON");
+        let g = partial.grounding.expect("grounding set");
+        assert_eq!(g.research, Some(GroundingDepth::Strict));
+        assert_eq!(g.prospect, Some(GroundingDepth::Standard));
+    }
+
+    #[test]
+    fn partial_grounding_round_trips_with_fields_absent() {
+        let json = r#"{}"#;
+        let partial: PartialGrounding =
+            serde_json::from_str(json).expect("valid PartialGrounding JSON");
+        assert_eq!(partial, PartialGrounding::default());
+        assert_eq!(partial.research, None);
+        assert_eq!(partial.prospect, None);
+    }
+
+    #[test]
+    fn baseline_and_cheap_fast_profiles_resolve_grounding_to_the_floor() {
+        use super::super::profiles;
+        let baseline = resolve(
+            ResearchAgentPolicy::default(),
+            None,
+            Some(&profiles::baseline()),
+            None,
+        );
+        assert_eq!(baseline.grounding.research, GroundingDepth::Standard);
+        assert_eq!(baseline.grounding.prospect, GroundingDepth::Standard);
+
+        let cheap_fast = resolve(
+            ResearchAgentPolicy::default(),
+            None,
+            Some(&profiles::cheap_fast()),
+            None,
+        );
+        assert_eq!(cheap_fast.grounding.research, GroundingDepth::Standard);
+        assert_eq!(cheap_fast.grounding.prospect, GroundingDepth::Standard);
+    }
+
+    #[test]
+    fn thorough_profile_resolves_grounding_to_strict() {
+        use super::super::profiles;
+        let thorough = resolve(
+            ResearchAgentPolicy::default(),
+            None,
+            Some(&profiles::thorough()),
+            None,
+        );
+        assert_eq!(thorough.grounding.research, GroundingDepth::Strict);
+        assert_eq!(thorough.grounding.prospect, GroundingDepth::Strict);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
-use super::policy::{ContactDepth, ModelTier, ResearchAgentPolicy};
+use super::policy::{ContactDepth, GroundingDepth, ModelTier, ResearchAgentPolicy};
 use super::schema::{company_brief_json_schema, CompanyBrief, ResearchAgentEventSchema};
 
 /// The `Node::name()` identity `CompanyResearchNode` runs its composed
@@ -119,10 +119,64 @@ fn contact_directive(depth: ContactDepth, max_fetches: u8) -> String {
     }
 }
 
+/// Build the grounding directive appended to the base research prompt,
+/// shaped by the resolved `grounding.research` depth (`EN.4.G`). Unlike
+/// [`contact_directive`] there is no `off` case — both variants of
+/// [`GroundingDepth`] always append a directive; `harness.json` documents
+/// why the knob has no floor below `standard` (brand.md Rule 5 is an
+/// external contract, CLAUDE.md rule 6's own qualifier, and `EN.6.H1` reads
+/// `needs_further_research` unconditionally).
+///
+/// Both depths instruct the model to list, under `needs_further_research`,
+/// every domain-specific claim — a regulatory/compliance regime (the
+/// carryover's own FAR/DFARS example), a certification, a jurisdiction-
+/// specific rule (the carryover's own Brazilian local-LLM data-residency
+/// example), a numeric figure, or a capability claim — that it could not
+/// tie to a source it actually fetched. Flagging is not failure: the claim
+/// is kept, not deleted, and "I could not ground this" is a correct,
+/// expected answer for a fully-grounded brief (mirrors the `contacts`
+/// omission-over-guess framing). `strict` additionally demands a per-claim
+/// grounding pass over `pain_points` and `outreach_hooks`, with a stated
+/// reason recorded for each flagged claim.
+fn grounding_directive(depth: GroundingDepth) -> String {
+    match depth {
+        GroundingDepth::Standard => "\n\n\
+             GROUNDING — flag ungrounded domain claims. Before you finish, review every \
+             domain-specific claim in your draft `summary`, `recent_developments`, \
+             `pain_points`, and `outreach_hooks`: a regulatory or compliance-regime claim \
+             (e.g. FAR/DFARS-style federal compliance obligations), a certification claim, a \
+             jurisdiction-specific rule (e.g. a Brazilian data-residency requirement for local \
+             LLM deployment), a numeric figure, or a capability claim. For each one you cannot \
+             tie to a source you actually fetched, add a short description of the claim to \
+             `needs_further_research`. This is not a failure state: keep the claim where it is \
+             and flag it rather than deleting it — an empty `needs_further_research` list is \
+             the correct, expected answer for a fully-grounded brief."
+            .to_string(),
+        GroundingDepth::Strict => "\n\n\
+             GROUNDING — flag ungrounded domain claims (strict). Before you finish, review \
+             every domain-specific claim in your draft `summary`, `recent_developments`, \
+             `pain_points`, and `outreach_hooks`: a regulatory or compliance-regime claim \
+             (e.g. FAR/DFARS-style federal compliance obligations), a certification claim, a \
+             jurisdiction-specific rule (e.g. a Brazilian data-residency requirement for local \
+             LLM deployment), a numeric figure, or a capability claim. For each one you cannot \
+             tie to a source you actually fetched, add a short description of the claim to \
+             `needs_further_research`. This is not a failure state: keep the claim where it is \
+             and flag it rather than deleting it — an empty `needs_further_research` list is \
+             the correct, expected answer for a fully-grounded brief.\n\n\
+             At this depth, additionally run a dedicated per-claim grounding pass over every \
+             item in `pain_points` and `outreach_hooks`: for each one, state internally why you \
+             believe it is grounded (which fetched source supports it) or flag it with a stated \
+             reason in `needs_further_research`. Do not skip this pass for claims that merely \
+             sound plausible."
+            .to_string(),
+    }
+}
+
 /// Build the single-company research-brief prompt from the triggering
 /// event, shaped by the resolved `contact_enrichment.research` depth +
 /// `max_fetches` (task 3's policy knob — resolved once by the caller, never
-/// re-resolved here). Ports `orchestrator`'s RESEARCH_AGENT company-brief
+/// re-resolved here) and the resolved `grounding.research` depth
+/// (`EN.4.G`). Ports `orchestrator`'s RESEARCH_AGENT company-brief
 /// prompt, framed against this practice's own positioning (business/docs
 /// `brand.md`/`services.md`) so the model's pain-point/outreach-hook
 /// suggestions map back onto real, sellable services rather than generic
@@ -131,6 +185,7 @@ fn build_prompt(
     event: &ResearchAgentEventSchema,
     depth: ContactDepth,
     max_fetches: u8,
+    grounding_depth: GroundingDepth,
     locale: Locale,
 ) -> String {
     let company_name = event.company_name.as_deref().unwrap_or("the company");
@@ -157,12 +212,13 @@ fn build_prompt(
          \"pain_points\": [str], \"outreach_hooks\": [str], \"sources\": \
          [str], \"contacts\": [{{\"name\": str, \"role\": str, \"emails\": \
          [str], \"whatsapp\": [str], \"phones\": [str], \"links\": [str], \
-         \"note\": str}}]}}."
+         \"note\": str}}], \"needs_further_research\": [str]}}."
     );
 
     format!(
-        "{base}{}\n\n{}",
+        "{base}{}{}\n\n{}",
         contact_directive(depth, max_fetches),
+        grounding_directive(grounding_depth),
         language_directive(locale)
     )
 }
@@ -268,8 +324,15 @@ impl Node for CompanyResearchNode {
             crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
         let contact_depth = policy.contact_enrichment.research;
         let max_fetches = policy.contact_enrichment.max_fetches;
+        let grounding_depth = policy.grounding.research;
         let prompt = crate::policy::apply_verbosity_directive(
-            build_prompt(&event, contact_depth, max_fetches, event.locale),
+            build_prompt(
+                &event,
+                contact_depth,
+                max_fetches,
+                grounding_depth,
+                event.locale,
+            ),
             policy.output_verbosity,
         );
 
@@ -319,6 +382,21 @@ impl Node for CompanyResearchNode {
             obj.insert(
                 "locale".to_string(),
                 serde_json::to_value(event.locale).unwrap_or_default(),
+            );
+            // Stamp the resolved grounding depth so EN.4.0 telemetry can
+            // attribute cost to the setting that caused it (EN.4.G).
+            obj.insert(
+                "grounding_depth".to_string(),
+                serde_json::to_value(grounding_depth).unwrap_or_default(),
+            );
+            // `validation_required` is derived, never read from the
+            // model's reply — a stubbed or adversarial reply that sets
+            // `validation_required: false` alongside a non-empty
+            // `needs_further_research` list must not be trusted (design
+            // call 1, tasks.md).
+            obj.insert(
+                "validation_required".to_string(),
+                serde_json::Value::Bool(!brief.needs_further_research.is_empty()),
             );
         }
         put_result(&mut ctx, NODE_NAME, brief_value);
@@ -592,14 +670,26 @@ mod tests {
 
     #[test]
     fn off_depth_prompt_has_no_contact_directive() {
-        let prompt = build_prompt(&company_event(), ContactDepth::Off, 4, Locale::PtBr);
+        let prompt = build_prompt(
+            &company_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
         assert!(!prompt.to_lowercase().contains("acquisition"));
         assert!(!prompt.to_lowercase().contains("anti-fabrication"));
     }
 
     #[test]
     fn standard_depth_names_contact_surfaces_and_fetch_budget() {
-        let prompt = build_prompt(&company_event(), ContactDepth::Standard, 4, Locale::PtBr);
+        let prompt = build_prompt(
+            &company_event(),
+            ContactDepth::Standard,
+            4,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
         assert!(prompt.contains("ACQUISITION"));
         assert!(prompt.contains("contact/about/team"));
         assert!(prompt.contains("mailto:"));
@@ -611,7 +701,13 @@ mod tests {
 
     #[test]
     fn deep_depth_adds_social_profiles_and_decision_maker_ask() {
-        let prompt = build_prompt(&company_event(), ContactDepth::Deep, 8, Locale::PtBr);
+        let prompt = build_prompt(
+            &company_event(),
+            ContactDepth::Deep,
+            8,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
         assert!(prompt.contains("LinkedIn"));
         assert!(prompt.contains("Instagram"));
         assert!(prompt.contains("Facebook"));
@@ -625,7 +721,13 @@ mod tests {
     #[test]
     fn non_off_depths_carry_omission_over_guess_directive() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&company_event(), depth, 4, Locale::PtBr);
+            let prompt = build_prompt(
+                &company_event(),
+                depth,
+                4,
+                GroundingDepth::Standard,
+                Locale::PtBr,
+            );
             assert!(
                 prompt.contains("Never construct"),
                 "depth {depth:?} missing the anti-fabrication directive"
@@ -653,7 +755,13 @@ mod tests {
             ContactDepth::Standard,
             ContactDepth::Deep,
         ] {
-            let _ = build_prompt(&company_event(), depth, 4, Locale::PtBr);
+            let _ = build_prompt(
+                &company_event(),
+                depth,
+                4,
+                GroundingDepth::Standard,
+                Locale::PtBr,
+            );
             assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
         }
     }
@@ -662,9 +770,21 @@ mod tests {
 
     #[test]
     fn prompt_body_names_the_event_locale_language() {
-        let pt_prompt = build_prompt(&company_event(), ContactDepth::Off, 4, Locale::PtBr);
+        let pt_prompt = build_prompt(
+            &company_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
         assert!(pt_prompt.contains("Brazilian Portuguese"));
-        let en_prompt = build_prompt(&company_event(), ContactDepth::Off, 4, Locale::EnUs);
+        let en_prompt = build_prompt(
+            &company_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::EnUs,
+        );
         assert!(en_prompt.contains("English (en-US)"));
     }
 
@@ -672,7 +792,13 @@ mod tests {
     fn stable_system_prompt_is_byte_identical_across_locales() {
         let anchor = STABLE_SYSTEM_PROMPT;
         for locale in [Locale::PtBr, Locale::EnUs] {
-            let _ = build_prompt(&company_event(), ContactDepth::Standard, 4, locale);
+            let _ = build_prompt(
+                &company_event(),
+                ContactDepth::Standard,
+                4,
+                GroundingDepth::Standard,
+                locale,
+            );
             assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
         }
     }
@@ -680,7 +806,13 @@ mod tests {
     #[test]
     fn no_prompt_synthesizes_a_contact_channel() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&company_event(), depth, 4, Locale::PtBr);
+            let prompt = build_prompt(
+                &company_event(),
+                depth,
+                4,
+                GroundingDepth::Standard,
+                Locale::PtBr,
+            );
             assert!(!prompt.to_lowercase().contains("info@{domain}"));
             assert!(!prompt.to_lowercase().contains("guess an address"));
         }
@@ -870,5 +1002,152 @@ mod tests {
         let brief: CompanyBrief =
             serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid CompanyBrief");
         assert_eq!(brief.contacts, Vec::new());
+    }
+
+    // --- Task 3 (EN.4.G): grounding directive + derived validation_required ---
+
+    #[test]
+    fn grounding_directive_text_differs_between_depths() {
+        let standard = grounding_directive(GroundingDepth::Standard);
+        let strict = grounding_directive(GroundingDepth::Strict);
+        assert_ne!(standard, strict);
+        assert!(strict.contains("per-claim grounding pass"));
+        assert!(!standard.contains("per-claim grounding pass"));
+    }
+
+    #[test]
+    fn both_grounding_depths_name_the_carryover_examples_and_anti_deletion_framing() {
+        for depth in [GroundingDepth::Standard, GroundingDepth::Strict] {
+            let directive = grounding_directive(depth);
+            assert!(
+                directive.contains("FAR/DFARS"),
+                "depth {depth:?} missing the FAR/DFARS example"
+            );
+            assert!(
+                directive.contains("Brazilian data-residency"),
+                "depth {depth:?} missing the Brazilian data-residency example"
+            );
+            assert!(
+                directive.contains("not a failure state"),
+                "depth {depth:?} missing the anti-deletion framing"
+            );
+            assert!(
+                directive.contains("needs_further_research"),
+                "depth {depth:?} missing the field name"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_grounding_adds_a_dedicated_pass_over_pain_points_and_outreach_hooks() {
+        let strict = grounding_directive(GroundingDepth::Strict);
+        assert!(strict.contains("pain_points"));
+        assert!(strict.contains("outreach_hooks"));
+        assert!(strict.contains("stated reason"));
+    }
+
+    #[test]
+    fn prompt_json_shape_line_carries_needs_further_research() {
+        let prompt = build_prompt(
+            &company_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
+        assert!(prompt.contains("\"needs_further_research\": [str]"));
+    }
+
+    #[test]
+    fn stable_system_prompt_is_byte_identical_across_grounding_depths() {
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for depth in [GroundingDepth::Standard, GroundingDepth::Strict] {
+            let _ = build_prompt(&company_event(), ContactDepth::Off, 4, depth, Locale::PtBr);
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+    }
+
+    fn stub_brief_json_with_flags(flags: Vec<&str>) -> serde_json::Value {
+        let mut value = stub_brief_json();
+        value["needs_further_research"] =
+            json!(flags.into_iter().map(str::to_string).collect::<Vec<_>>());
+        value
+    }
+
+    #[tokio::test]
+    async fn resolved_grounding_depth_is_stamped_into_the_result() {
+        let policy = ResearchAgentPolicy {
+            grounding: super::super::policy::Grounding {
+                research: GroundingDepth::Strict,
+                ..ResearchAgentPolicy::default().grounding
+            },
+            ..ResearchAgentPolicy::default()
+        };
+        let node =
+            CompanyResearchNode::new().with_transport(stub_transport(Some(stub_brief_json())));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["grounding_depth"], json!("strict"));
+    }
+
+    #[tokio::test]
+    async fn validation_required_is_true_when_a_claim_is_flagged() {
+        let brief_json = stub_brief_json_with_flags(vec!["FAR/DFARS compliance unconfirmed"]);
+        let node = CompanyResearchNode::new().with_transport(stub_transport(Some(brief_json)));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["validation_required"], json!(true));
+        assert_eq!(
+            ctx.nodes[NODE_NAME]["needs_further_research"],
+            json!(["FAR/DFARS compliance unconfirmed"])
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_required_is_false_when_no_claim_is_flagged() {
+        let brief_json = stub_brief_json_with_flags(vec![]);
+        let node = CompanyResearchNode::new().with_transport(stub_transport(Some(brief_json)));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["validation_required"], json!(false));
+        assert_eq!(ctx.nodes[NODE_NAME]["needs_further_research"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn validation_required_is_always_derived_never_trusted_from_the_model() {
+        // A stubbed reply that itself claims `validation_required: false`
+        // alongside a non-empty `needs_further_research` list must still be
+        // stamped `true` — the field is computed, never read from the
+        // model's reply (design call 1, tasks.md).
+        let mut brief_json = stub_brief_json_with_flags(vec!["unverified numeric claim"]);
+        brief_json["validation_required"] = json!(false);
+        let node = CompanyResearchNode::new().with_transport(stub_transport(Some(brief_json)));
+        let mut ctx = empty_ctx(company_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["validation_required"], json!(true));
     }
 }

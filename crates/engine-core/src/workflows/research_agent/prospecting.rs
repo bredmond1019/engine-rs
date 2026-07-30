@@ -29,7 +29,7 @@ use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
-use super::policy::{ContactDepth, ModelTier, ResearchAgentPolicy};
+use super::policy::{ContactDepth, GroundingDepth, ModelTier, ResearchAgentPolicy};
 use super::schema::{prospecting_result_json_schema, ProspectingResult, ResearchAgentEventSchema};
 
 /// The `Node::name()` identity `ProspectingResearchNode` runs its composed
@@ -132,10 +132,53 @@ fn contact_directive(depth: ContactDepth, max_fetches: u8) -> String {
     }
 }
 
+/// Build the per-prospect grounding directive appended to the base
+/// prospecting prompt, shaped by the resolved `grounding.prospect` depth
+/// (`EN.4.G`). Mirrors `company_research::grounding_directive` in framing —
+/// no `off` case, same anti-deletion contract, same carryover examples —
+/// but phrased per-prospect: each lead flags its own ungroundable claims
+/// under that lead's own `needs_further_research`.
+fn grounding_directive(depth: GroundingDepth) -> String {
+    match depth {
+        GroundingDepth::Standard => "\n\n\
+             GROUNDING — flag ungrounded domain claims, per prospect. Before you finish, \
+             review every domain-specific claim you drafted for each prospect's \
+             `pain_points` and `outreach_hook`: a regulatory or compliance-regime claim \
+             (e.g. FAR/DFARS-style federal compliance obligations), a certification claim, a \
+             jurisdiction-specific rule (e.g. a Brazilian data-residency requirement for local \
+             LLM deployment), a numeric figure, or a capability claim. For each one you cannot \
+             tie to a source you actually fetched, add a short description of the claim to \
+             that prospect's own `needs_further_research`. This is not a failure state: keep \
+             the claim where it is and flag it rather than deleting it — an empty \
+             `needs_further_research` list is the correct, expected answer for a fully-grounded \
+             prospect."
+            .to_string(),
+        GroundingDepth::Strict => "\n\n\
+             GROUNDING — flag ungrounded domain claims, per prospect (strict). Before you \
+             finish, review every domain-specific claim you drafted for each prospect's \
+             `pain_points` and `outreach_hook`: a regulatory or compliance-regime claim \
+             (e.g. FAR/DFARS-style federal compliance obligations), a certification claim, a \
+             jurisdiction-specific rule (e.g. a Brazilian data-residency requirement for local \
+             LLM deployment), a numeric figure, or a capability claim. For each one you cannot \
+             tie to a source you actually fetched, add a short description of the claim to \
+             that prospect's own `needs_further_research`. This is not a failure state: keep \
+             the claim where it is and flag it rather than deleting it — an empty \
+             `needs_further_research` list is the correct, expected answer for a fully-grounded \
+             prospect.\n\n\
+             At this depth, additionally run a dedicated per-claim grounding pass over every \
+             prospect's `pain_points` and `outreach_hook`: for each one, state internally why \
+             you believe it is grounded (which fetched source supports it) or flag it with a \
+             stated reason in that prospect's `needs_further_research`. Do not skip this pass \
+             for claims that merely sound plausible."
+            .to_string(),
+    }
+}
+
 /// Build the prospecting-sweep prompt from the triggering event, shaped by
 /// the resolved `contact_enrichment.prospect` depth + `max_fetches` (task
-/// 3's policy knob — resolved once by the caller, never re-resolved here).
-/// Ports `orchestrator`'s reddit-prospecting-inspired flow: forum/web sweep
+/// 3's policy knob — resolved once by the caller, never re-resolved here)
+/// and the resolved `grounding.prospect` depth (`EN.4.G`). Ports
+/// `orchestrator`'s reddit-prospecting-inspired flow: forum/web sweep
 /// -> pain points -> four-pillar vertical mapping -> outreach hooks, framed
 /// against this practice's own positioning (business/docs
 /// `brand.md`/`services.md`) so prospects map back onto real, sellable
@@ -144,6 +187,7 @@ fn build_prompt(
     event: &ResearchAgentEventSchema,
     depth: ContactDepth,
     max_fetches: u8,
+    grounding_depth: GroundingDepth,
     locale: Locale,
 ) -> String {
     let vertical = event.vertical.as_deref().unwrap_or("a relevant vertical");
@@ -171,13 +215,15 @@ fn build_prompt(
          \"prospects\": [{{\"name\": str, \"pain_points\": [str], \"pillar\": \
          str, \"outreach_hook\": str, \"source\": str, \"contacts\": \
          [{{\"name\": str, \"role\": str, \"emails\": [str], \"whatsapp\": \
-         [str], \"phones\": [str], \"links\": [str], \"note\": str}}]}}], \
+         [str], \"phones\": [str], \"links\": [str], \"note\": str}}], \
+         \"needs_further_research\": [str]}}], \
          \"common_pain_points\": [str], \"sources\": [str]}}."
     );
 
     format!(
-        "{base}{}\n\n{}",
+        "{base}{}{}\n\n{}",
         contact_directive(depth, max_fetches),
+        grounding_directive(grounding_depth),
         language_directive(locale)
     )
 }
@@ -283,8 +329,15 @@ impl Node for ProspectingResearchNode {
             crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
         let contact_depth = policy.contact_enrichment.prospect;
         let max_fetches = policy.contact_enrichment.max_fetches;
+        let grounding_depth = policy.grounding.prospect;
         let prompt = crate::policy::apply_verbosity_directive(
-            build_prompt(&event, contact_depth, max_fetches, event.locale),
+            build_prompt(
+                &event,
+                contact_depth,
+                max_fetches,
+                grounding_depth,
+                event.locale,
+            ),
             policy.output_verbosity,
         );
 
@@ -310,6 +363,21 @@ impl Node for ProspectingResearchNode {
                 ))
             })?;
 
+        // Sweep-level union of every lead's flagged claims (order-stable,
+        // deduped) and the derived sweep-level validation_required — computed
+        // from the parsed leads, never read from the model's reply (design
+        // call 1, tasks.md). Per-lead lists stay intact on their leads; this
+        // is additive, not a replacement.
+        let mut needs_further_research: Vec<String> = Vec::new();
+        for prospect in &result.prospects {
+            for claim in &prospect.needs_further_research {
+                if !needs_further_research.contains(claim) {
+                    needs_further_research.push(claim.clone());
+                }
+            }
+        }
+        let validation_required = !needs_further_research.is_empty();
+
         let mut result_value = serde_json::to_value(&result).map_err(|err| {
             NodeError::new(format!("failed to serialize ProspectingResult: {err}"))
         })?;
@@ -328,6 +396,24 @@ impl Node for ProspectingResearchNode {
             obj.insert(
                 "locale".to_string(),
                 serde_json::to_value(event.locale).unwrap_or_default(),
+            );
+            // Stamp the resolved grounding depth so EN.4.0 telemetry can
+            // attribute cost to the setting that caused it (EN.4.G).
+            obj.insert(
+                "grounding_depth".to_string(),
+                serde_json::to_value(grounding_depth).unwrap_or_default(),
+            );
+            // The sweep-level union of every lead's flagged claims
+            // (order-stable, deduped) and the derived validation_required —
+            // additive: per-lead lists are unaffected, they remain nested
+            // under `prospects[].needs_further_research`.
+            obj.insert(
+                "needs_further_research".to_string(),
+                serde_json::to_value(&needs_further_research).unwrap_or_default(),
+            );
+            obj.insert(
+                "validation_required".to_string(),
+                serde_json::Value::Bool(validation_required),
             );
         }
         put_result(&mut ctx, NODE_NAME, result_value);
@@ -605,7 +691,13 @@ mod tests {
 
     #[test]
     fn off_depth_prompt_has_no_contact_directive() {
-        let prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4, Locale::PtBr);
+        let prompt = build_prompt(
+            &prospecting_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
         assert!(!prompt.to_lowercase().contains("acquisition"));
         assert!(!prompt.to_lowercase().contains("anti-fabrication"));
     }
@@ -616,6 +708,7 @@ mod tests {
             &prospecting_event(),
             ContactDepth::Standard,
             4,
+            GroundingDepth::Standard,
             Locale::PtBr,
         );
         assert!(prompt.contains("ACQUISITION"));
@@ -629,7 +722,13 @@ mod tests {
 
     #[test]
     fn deep_depth_adds_public_profile_sweep_and_keeps_one_attempt_rule() {
-        let prompt = build_prompt(&prospecting_event(), ContactDepth::Deep, 8, Locale::PtBr);
+        let prompt = build_prompt(
+            &prospecting_event(),
+            ContactDepth::Deep,
+            8,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
         assert!(prompt.contains("LinkedIn"));
         assert!(prompt.contains("Instagram"));
         assert!(prompt.contains("Facebook"));
@@ -641,7 +740,13 @@ mod tests {
     #[test]
     fn non_off_depths_carry_anti_fabrication_directive() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
+            let prompt = build_prompt(
+                &prospecting_event(),
+                depth,
+                4,
+                GroundingDepth::Standard,
+                Locale::PtBr,
+            );
             assert!(
                 prompt.contains("Never construct"),
                 "depth {depth:?} missing the anti-fabrication directive"
@@ -660,7 +765,13 @@ mod tests {
     #[test]
     fn breadth_over_depth_framing_present_at_non_off_depths() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
+            let prompt = build_prompt(
+                &prospecting_event(),
+                depth,
+                4,
+                GroundingDepth::Standard,
+                Locale::PtBr,
+            );
             assert!(prompt.to_lowercase().contains("breadth"));
         }
     }
@@ -673,7 +784,13 @@ mod tests {
             ContactDepth::Standard,
             ContactDepth::Deep,
         ] {
-            let _ = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
+            let _ = build_prompt(
+                &prospecting_event(),
+                depth,
+                4,
+                GroundingDepth::Standard,
+                Locale::PtBr,
+            );
             assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
         }
     }
@@ -682,9 +799,21 @@ mod tests {
 
     #[test]
     fn prompt_body_names_the_event_locale_language() {
-        let pt_prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4, Locale::PtBr);
+        let pt_prompt = build_prompt(
+            &prospecting_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
         assert!(pt_prompt.contains("Brazilian Portuguese"));
-        let en_prompt = build_prompt(&prospecting_event(), ContactDepth::Off, 4, Locale::EnUs);
+        let en_prompt = build_prompt(
+            &prospecting_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::EnUs,
+        );
         assert!(en_prompt.contains("English (en-US)"));
     }
 
@@ -692,7 +821,13 @@ mod tests {
     fn stable_system_prompt_is_byte_identical_across_locales() {
         let anchor = STABLE_SYSTEM_PROMPT;
         for locale in [Locale::PtBr, Locale::EnUs] {
-            let _ = build_prompt(&prospecting_event(), ContactDepth::Standard, 4, locale);
+            let _ = build_prompt(
+                &prospecting_event(),
+                ContactDepth::Standard,
+                4,
+                GroundingDepth::Standard,
+                locale,
+            );
             assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
         }
     }
@@ -700,7 +835,13 @@ mod tests {
     #[test]
     fn no_prompt_synthesizes_a_contact_channel() {
         for depth in [ContactDepth::Standard, ContactDepth::Deep] {
-            let prompt = build_prompt(&prospecting_event(), depth, 4, Locale::PtBr);
+            let prompt = build_prompt(
+                &prospecting_event(),
+                depth,
+                4,
+                GroundingDepth::Standard,
+                Locale::PtBr,
+            );
             assert!(!prompt.to_lowercase().contains("info@{domain}"));
             assert!(!prompt.to_lowercase().contains("guess an address"));
         }
@@ -795,5 +936,192 @@ mod tests {
 
         let ctx = node.process(ctx).await.expect("process should succeed");
         assert_eq!(ctx.nodes[NODE_NAME]["locale"], json!("en-US"));
+    }
+
+    // --- Task 4 (EN.4.G): per-lead grounding directive + sweep-level union ---
+
+    #[test]
+    fn grounding_directive_text_differs_between_depths() {
+        let standard = grounding_directive(GroundingDepth::Standard);
+        let strict = grounding_directive(GroundingDepth::Strict);
+        assert_ne!(standard, strict);
+        assert!(strict.contains("per-claim grounding pass"));
+        assert!(!standard.contains("per-claim grounding pass"));
+    }
+
+    #[test]
+    fn both_grounding_depths_name_the_carryover_examples_and_anti_deletion_framing() {
+        for depth in [GroundingDepth::Standard, GroundingDepth::Strict] {
+            let directive = grounding_directive(depth);
+            assert!(
+                directive.contains("FAR/DFARS"),
+                "depth {depth:?} missing the FAR/DFARS example"
+            );
+            assert!(
+                directive.contains("Brazilian data-residency"),
+                "depth {depth:?} missing the Brazilian data-residency example"
+            );
+            assert!(
+                directive.contains("not a failure state"),
+                "depth {depth:?} missing the anti-deletion framing"
+            );
+            assert!(
+                directive.contains("needs_further_research"),
+                "depth {depth:?} missing the field name"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_grounding_adds_a_dedicated_pass_over_pain_points_and_outreach_hook() {
+        let strict = grounding_directive(GroundingDepth::Strict);
+        assert!(strict.contains("pain_points"));
+        assert!(strict.contains("outreach_hook"));
+        assert!(strict.contains("stated reason"));
+    }
+
+    #[test]
+    fn prompt_json_shape_line_carries_needs_further_research_on_prospects() {
+        let prompt = build_prompt(
+            &prospecting_event(),
+            ContactDepth::Off,
+            4,
+            GroundingDepth::Standard,
+            Locale::PtBr,
+        );
+        assert!(prompt.contains("\"needs_further_research\": [str]"));
+    }
+
+    #[test]
+    fn stable_system_prompt_is_byte_identical_across_grounding_depths() {
+        let anchor = STABLE_SYSTEM_PROMPT;
+        for depth in [GroundingDepth::Standard, GroundingDepth::Strict] {
+            let _ = build_prompt(
+                &prospecting_event(),
+                ContactDepth::Off,
+                4,
+                depth,
+                Locale::PtBr,
+            );
+            assert_eq!(STABLE_SYSTEM_PROMPT, anchor);
+        }
+    }
+
+    fn stub_result_json_with_flags(flags_per_prospect: Vec<Vec<&str>>) -> serde_json::Value {
+        let mut value = stub_result_json();
+        let base_prospect = value["prospects"][0].clone();
+        let prospects: Vec<serde_json::Value> = flags_per_prospect
+            .into_iter()
+            .enumerate()
+            .map(|(i, flags)| {
+                let mut prospect = base_prospect.clone();
+                prospect["name"] = json!(format!("Prospect {i}"));
+                prospect["needs_further_research"] =
+                    json!(flags.into_iter().map(str::to_string).collect::<Vec<_>>());
+                prospect
+            })
+            .collect();
+        value["prospects"] = json!(prospects);
+        value
+    }
+
+    #[tokio::test]
+    async fn resolved_grounding_depth_is_stamped_into_the_result() {
+        let policy = ResearchAgentPolicy {
+            grounding: super::super::policy::Grounding {
+                prospect: GroundingDepth::Strict,
+                ..ResearchAgentPolicy::default().grounding
+            },
+            ..ResearchAgentPolicy::default()
+        };
+        let node =
+            ProspectingResearchNode::new().with_transport(stub_transport(Some(stub_result_json())));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["grounding_depth"], json!("strict"));
+    }
+
+    #[tokio::test]
+    async fn sweep_level_union_is_order_stable_and_deduped_across_leads() {
+        let result_json = stub_result_json_with_flags(vec![
+            vec!["FAR/DFARS compliance unconfirmed", "unverified headcount"],
+            vec!["unverified headcount", "Brazilian data-residency claim"],
+        ]);
+        let node = ProspectingResearchNode::new().with_transport(stub_transport(Some(result_json)));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(
+            ctx.nodes[NODE_NAME]["needs_further_research"],
+            json!([
+                "FAR/DFARS compliance unconfirmed",
+                "unverified headcount",
+                "Brazilian data-residency claim",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_required_is_true_when_any_lead_flags_a_claim() {
+        let result_json =
+            stub_result_json_with_flags(vec![vec![], vec!["unverified certification"], vec![]]);
+        let node = ProspectingResearchNode::new().with_transport(stub_transport(Some(result_json)));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["validation_required"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn validation_required_is_false_when_no_lead_flags_anything() {
+        let result_json = stub_result_json_with_flags(vec![vec![], vec![]]);
+        let node = ProspectingResearchNode::new().with_transport(stub_transport(Some(result_json)));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(ctx.nodes[NODE_NAME]["validation_required"], json!(false));
+        assert_eq!(ctx.nodes[NODE_NAME]["needs_further_research"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn per_lead_lists_survive_intact_on_the_parsed_leads() {
+        let result_json =
+            stub_result_json_with_flags(vec![vec!["claim A"], vec!["claim B", "claim A"]]);
+        let node = ProspectingResearchNode::new().with_transport(stub_transport(Some(result_json)));
+        let mut ctx = empty_ctx(prospecting_event());
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": temp_worktree().to_string_lossy() }),
+        );
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+        let result: ProspectingResult =
+            serde_json::from_value(ctx.nodes[NODE_NAME].clone()).expect("valid ProspectingResult");
+        assert_eq!(result.prospects[0].needs_further_research, vec!["claim A"]);
+        assert_eq!(
+            result.prospects[1].needs_further_research,
+            vec!["claim B", "claim A"]
+        );
     }
 }
