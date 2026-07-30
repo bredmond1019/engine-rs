@@ -1,0 +1,248 @@
+//! Live-Postgres restart-durability test for EN.6.F's `rehydrate_from_store`
+//! fallback (`crates/engine-serve/src/resume.rs`).
+//!
+//! `suspend_resume_http.rs` proves the in-memory resume path end-to-end but
+//! deliberately runs with no `DATABASE_URL`, so it can never exercise
+//! `rehydrate_from_store` — the branch `resume_run` takes only when
+//! `take_for_resume` returns `TakeForResume::NotFound`, i.e. exactly the
+//! "this process never held the suspended run in memory" case a real
+//! restart produces. `postgres_round_trip.rs` tests `upsert_event`/
+//! `get_task_context` directly but never drives them through the HTTP
+//! resume route.
+//!
+//! This test closes that gap: it triggers and pauses a run against a real
+//! `AppState` wired to a live pool (so the durable writer's `upsert_event`
+//! actually lands a suspended row), waits for that row to be durably
+//! readable, then **simulates a process restart** by evicting the run from
+//! the in-memory suspended index (`engine_serve::suspend::remove_suspended`)
+//! before calling `/resume` — forcing `take_for_resume` to miss and
+//! `rehydrate_from_store` to be the only path that can complete the resume.
+//!
+//! `#[ignore]`d like every other live-Postgres test in this workspace (see
+//! `postgres_round_trip.rs`'s header for the rationale): CI has no live
+//! Postgres, so `cargo nextest run --workspace` reports this as skipped, not
+//! passed — an honest signal. Run explicitly with:
+//!
+//! ```sh
+//! DATABASE_URL=postgres://... cargo test -p engine-serve --test suspend_resume_postgres_restart -- --ignored
+//! ```
+
+use std::collections::HashMap as StdHashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use actix_web::{test, web, App};
+use engine_core::dispatch::Dispatcher;
+use engine_core::{Node, NodeConfig, NodeError, NodeRegistry, Workflow, WorkflowSchema};
+use engine_contract::TaskContext;
+use engine_serve::abort::RunRegistry;
+use engine_serve::durable::spawn_durable_writer;
+use engine_serve::http::{configure, AppState};
+use engine_serve::live_state::LiveStateStore;
+use engine_serve::suspend;
+use uuid::Uuid;
+
+const API_KEY: &str = "suspend-resume-postgres-restart-test-key";
+
+/// Completes immediately, stamping `{ "ran": true }` under its own identity.
+struct SuccessNode {
+    identity: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Node for SuccessNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            self.identity.to_string(),
+            serde_json::json!({ "ran": true }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        self.identity
+    }
+}
+
+fn suspend_node_schema(workflow_type: &str) -> WorkflowSchema {
+    let mut nodes = StdHashMap::new();
+    nodes.insert(
+        "SuspendNode".to_string(),
+        NodeConfig::new("SuspendNode", vec!["MarkerNode".to_string()]),
+    );
+    nodes.insert(
+        "MarkerNode".to_string(),
+        NodeConfig::new("MarkerNode", vec![]),
+    );
+    WorkflowSchema::new(workflow_type, "SuspendNode", nodes)
+}
+
+/// A dispatcher with a single `SuspendNode(enabled: true) -> MarkerNode`
+/// workflow — suspends almost immediately after trigger, matching
+/// `suspend_resume_http.rs`'s fixture of choice.
+fn dispatcher_with_suspend_fixture(workflow_type: &str) -> Dispatcher {
+    let mut dispatcher = Dispatcher::new();
+    let wt = workflow_type.to_string();
+    dispatcher.register(
+        suspend_node_schema(workflow_type),
+        Box::new(move |_event: &serde_json::Value| {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(
+                engine_core::nodes::SuspendNode::new("SuspendNode").with_enabled(true),
+            ));
+            registry.register(Box::new(SuccessNode {
+                identity: "MarkerNode",
+            }));
+            Ok(Workflow::new(registry, suspend_node_schema(&wt)))
+        }),
+    );
+    dispatcher
+}
+
+/// Triggers `workflow_type` against `$app` and blocks until the row is
+/// durably readable from Postgres AND marked suspended there — i.e. until
+/// the async durable writer has actually landed the suspension marker, not
+/// just until the in-memory index sees it (the in-memory index lands first;
+/// a restart test must wait for the slower of the two so evicting the
+/// in-memory entry leaves a genuinely resumable Postgres row behind). A
+/// macro (rather than a generic fn) so it works against whatever unnameable
+/// `impl Service<..>` type `test::init_service` produces, matching
+/// `suspend_resume_http.rs`'s `trigger_and_wait_suspended!` precedent.
+macro_rules! trigger_and_wait_durably_suspended {
+    ($app:expr, $pool:expr, $workflow_type:expr) => {{
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", API_KEY))
+            .set_json(serde_json::json!({ "workflow_type": $workflow_type, "data": {} }))
+            .to_request();
+        let resp = test::call_service(&$app, req).await;
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let run_id = body["run_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("run_id should be a parseable UUID");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut landed = false;
+            if let Ok(Some(task_context)) = engine_store::get_task_context($pool, run_id).await {
+                if engine_core::suspend::is_suspended(&task_context.metadata) {
+                    landed = true;
+                }
+            }
+            if landed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "run's suspension marker never landed in Postgres"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        run_id
+    }};
+}
+
+/// The restart scenario: a run suspends, its durable row lands in Postgres,
+/// then the process "restarts" (the in-memory suspended index is evicted,
+/// simulating a fresh `engine-serve` process that never held this run). The
+/// only way `/resume` can complete is `resume_run`'s `rehydrate_from_store`
+/// fallback reading the row straight back out of Postgres.
+#[actix_web::test]
+#[ignore = "requires a live Postgres; run with `cargo test -p engine-serve --test suspend_resume_postgres_restart -- --ignored`"]
+async fn resume_after_simulated_restart_rehydrates_from_postgres() {
+    const WORKFLOW_TYPE: &str = "postgres-restart-resume";
+
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this ignored test (see file header)");
+    let pool = engine_store::connect(&database_url)
+        .await
+        .expect("failed to connect to DATABASE_URL");
+
+    let dispatcher = dispatcher_with_suspend_fixture(WORKFLOW_TYPE);
+    let state = AppState {
+        dispatcher: Arc::new(dispatcher),
+        live: LiveStateStore::new(),
+        durable: spawn_durable_writer(Some(pool.clone())),
+        runs: RunRegistry::new(),
+        api_key: API_KEY.to_string(),
+    };
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let run_id = trigger_and_wait_durably_suspended!(app, &pool, WORKFLOW_TYPE);
+
+    // The in-memory index also saw this run (same process) -- evict it to
+    // simulate the fresh-process case `rehydrate_from_store` exists for.
+    // Also drop the pause signal / registration the in-memory path would
+    // otherwise have left behind, so nothing but the Postgres row is left to
+    // resume from.
+    let evicted = suspend::remove_suspended(run_id);
+    assert!(
+        evicted.is_some(),
+        "run should have been in the in-memory index before eviction"
+    );
+    suspend::remove_pause_signal(run_id);
+
+    // Confirm the eviction actually removed it -- otherwise this test would
+    // silently exercise the in-memory path instead of the Postgres fallback.
+    assert!(
+        !suspend::list_suspended()
+            .into_iter()
+            .any(|(id, _)| id == run_id),
+        "run must be absent from the in-memory index to force the Postgres fallback"
+    );
+
+    let resume_req = test::TestRequest::post()
+        .uri(&format!("/events/{run_id}/resume"))
+        .insert_header(("X-API-Key", API_KEY))
+        .to_request();
+    let resume_resp = test::call_service(&app, resume_req).await;
+    assert_eq!(
+        resume_resp.status(),
+        202,
+        "resume must succeed via rehydrate_from_store even though the in-memory index never held this run"
+    );
+    let resume_body: serde_json::Value = test::read_body_json(resume_resp).await;
+    assert_eq!(resume_body["run_id"], serde_json::json!(run_id));
+    assert_eq!(resume_body["resume_at"], "MarkerNode");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let final_body = loop {
+        let req = test::TestRequest::get()
+            .uri(&format!("/events/{run_id}"))
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        if body["status"] == "succeeded" {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resumed run never reached succeeded, last body: {body:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        final_body["task_context"]["node_runs"]["SuspendNode"]["status"],
+        serde_json::json!("success"),
+        "SuspendNode must not be re-executed after a Postgres-rehydrated resume"
+    );
+    assert_eq!(
+        final_body["task_context"]["node_runs"]["MarkerNode"]["status"],
+        serde_json::json!("success")
+    );
+
+    // Clean up so repeated local runs don't accumulate rows.
+    sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup delete should succeed");
+}
