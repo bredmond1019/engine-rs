@@ -15,6 +15,7 @@ related: [core:engine-rs]
 | Doc | What it covers |
 |---|---|
 | [architecture.md](architecture.md) | Overview, module map, core types, data flow |
+| [deployment-launchd.md](deployment-launchd.md) | The plist `EnvironmentVariables` a permanently-running `bastion serve` under launchd needs (`ENGINE_BRAIN_ROOT` mandatory as of EN.3.K, plus `ENGINE_EVENTS_API_KEY`/`ENGINE_EVENTS_URL`/optional `ENGINE_REPO_ALLOWLIST`), what `WorkingDirectory` still determines (only the absent-`repo` fallback target), the soft-to-loud `ENGINE_BRAIN_ROOT` failure mode, and verifying the installed plist's label/port before trusting `restart_services.sh`'s header comment |
 | [cli.md](cli.md) | Synopsis, subcommands, global flags, exit codes, examples |
 | [testing.md](testing.md) | Which test commands to run, the single-integration-test-binary layout (`tests/it/`) and how to add a suite to it, the hermetic-test conventions (no network, tempdir corpora, assert on-disk bytes), and per-task `validation_commands` in the SDLC loop |
 | [data-contract.md](data-contract.md) | Pinned orchestrator data-contract version, field mappings to `engine_contract` Rust types, HTTP surface parity, re-pin checklist |

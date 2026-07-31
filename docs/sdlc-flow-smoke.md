@@ -22,13 +22,19 @@ at `scripts/sdlc_smoke.sh`.
 None of the following are documented anywhere else, and each produces a confusing failure when
 unmet.
 
-1. **`bastion serve`'s working directory MUST be `core/engine-rs`.** This is the single most
-   important operational fact about the whole system. There is no `repo` field on the `SDLC_FLOW`
-   event; every path `SetupWorktreeNode` touches is relative to the serve process's cwd —
-   including the `planning` symlink resolution and the `git checkout -B ... origin/main` fallback,
-   both run against `Path::new(".")` (`crates/engine-core/src/workflows/sdlc_flow/setup.rs:211-228`).
-   Starting `bastion serve` from any other directory makes every worktree/branch operation resolve
-   against the wrong tree.
+1. **`bastion serve`'s working directory only matters as a fallback now (`EN.3.K`) — send `repo`
+   explicitly instead.** Before `EN.3.K`, there was no `repo` field on the `SDLC_FLOW` event and
+   every path `SetupWorktreeNode` touches was relative to the serve process's cwd — including the
+   `planning` symlink resolution and the `git checkout -B ... origin/main` fallback, both run
+   against `Path::new(".")`. As of `EN.3.K`, the event carries an explicit, registry-resolved
+   `repo` slug (see [sdlc-flow-workflow.md](sdlc-flow-workflow.md)) — **a smoke run should set
+   `"repo": "engine-rs"` in its event body** rather than relying on the serve process's cwd. The
+   cwd requirement is still real for any event that omits `repo` (it resolves to
+   `current_dir()`, byte-identical to before), so starting `bastion serve` from `core/engine-rs`
+   remains the safe default for an absent-`repo` run — but it is now a fallback, not the only
+   answer to "which repo does this server serve." See
+   [deployment-launchd.md](deployment-launchd.md) for the `ENGINE_BRAIN_ROOT` registry
+   prerequisite that makes a `repo`-bearing event resolvable at all.
 2. **`DATABASE_URL` set with Postgres reachable AND `BASTION_ENGINE_API_KEY` non-empty.**
    `decide_engine_mount` (`core/bastion/src/serve/mod.rs:103-133`, called at `mod.rs:257-259`)
    mounts the engine routes only when both hold; otherwise it returns `Skip` and `POST /events/`
