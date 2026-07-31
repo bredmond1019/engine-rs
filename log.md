@@ -18,6 +18,59 @@ related: [status, context]
 
 ## [run: 2026-07-31]
 
+### EN.3.K-dispatch-target-resolution — repo slug registry + dispatch-time 422 validation
+- **What:** `/sdlc-flow` on branch `EN.3.K-dispatch-target-resolution-flow`, all 10 tasks passed,
+  PASS review. `SDLCFlowEventSchema` gained `repo: Option<String>` — a `brain.toml`-backed registry
+  **slug**, never a raw path — and a new `RepoRegistry` (`crates/engine-core/src/repo_registry.rs`)
+  resolves it to an absolute root, rejecting escaping/nonexistent entries and honoring an optional
+  `ENGINE_REPO_ALLOWLIST` narrowing filter (tasks 1-2). `SetupWorktreeNode` anchors `worktree_path`
+  and every git invocation (worktree add/remove, checkout) to the resolved root via an optional
+  injected registry, staying byte-identical when `repo` is absent (task 3). `engine-serve` gained a
+  process-global repo-registry seam (`set_repo_registry`/`repo_registry`/
+  `init_repo_registry_from_env`) plus explicit-registry factory entry points, with bastion's
+  existing one-argument call left untouched (task 4). `post_events` now pre-flight-rejects, with a
+  422 naming the offending value and before minting a `run_id`, both an unknown repo slug and an
+  absent `spec_slug` directory — a spec dir that exists but lacks `tasks.json` still dispatches
+  (202) so `GenerateTasksNode`'s legitimate "author a missing plan" path is untouched (task 5).
+  Hermetic integration coverage: a new `sdlc_flow_repo_resolution.rs` suite proving worktree
+  creation/git cwds/per-run policy anchor to the resolved root (task 6), and 5 new tests extending
+  `engine-serve`'s `dispatch_integration.rs` covering both 422 cases, the tasks.json-absent
+  non-regression, the no-`repo`-field default, and the EN.5.F `run_id`==`event_id`
+  contract (task 7). `planning/ticket-local-policy-harness-file` — the Mac Mini's single-target
+  `ENGINE_HARNESS_PATH` proposal — was confirmed never implemented and marked Superseded by EN.3.K
+  in place, no code change (task 8). Docs: `docs/deployment-launchd.md` added (launchd
+  `EnvironmentVariables` checklist, `ENGINE_BRAIN_ROOT` soft-to-loud failure note), plus updates to
+  `sdlc-flow-workflow.md`, `sdlc-flow-smoke.md`, `architecture.md`, `docs/index.md` (task 9). Full
+  validation gate green — fmt, clippy `-D warnings`, `cargo nextest run --workspace` (1563 passed),
+  release build, cross-repo bastion `cargo check` (task 10, no code changes needed).
+- **Why:** A single always-on `bastion serve` under launchd has exactly one `WorkingDirectory`, so
+  before this block it could only ever drive `SDLC_FLOW` against one of the fleet's 11+ repos, and
+  an unknown `spec_slug` was silently routed to `GenerateTasksNode` instead of rejected — together
+  meaning a network-triggered, `dangerously_skip_permissions: true` agentic run could write in an
+  unintended directory or invent a plan for a spec that does not exist. `repo` is deliberately a
+  registry slug, not a path, so the reachable set stays "the ~20 repos in `brain.toml`" rather than
+  "the filesystem," even if the caller's API key leaks.
+- **Refs:** `planning/EN.3.K-dispatch-target-resolution/`, decision `D8-autonomous-node-write-permission.md`,
+  superseded ticket `planning/ticket-local-policy-harness-file/`.
+- **Next:** Pick up `EN.5.B1` (eval slice runner), `EN.5.C` (EXTERNAL_INTEL), `EN.6.C`/`EN.6.D`
+  (Slack/Telegram-WhatsApp adapter skeletons), `EN.6.G` (schedule source), `EN.6.I` (LEAD_INGEST),
+  or `EN.4.D` (DELIVERABLE_RENDER) per the `next` frontmatter list. `EN.3.J`'s human-in-the-loop
+  smoke run (PR #34) is now fully unblocked on the engine-rs side (`EN.3.D`/`EN.3.E`/`EN.3.G`/`EN.3.K`
+  all Done).
+
+```
+bcf872e feat: implement EN.3.K-dispatch-target-resolution-task9
+b0bcc29 feat: implement EN.3.K-dispatch-target-resolution-task7
+65e93bc feat: implement EN.3.K-dispatch-target-resolution-task6
+a0a2402 feat: implement EN.3.K-dispatch-target-resolution-task5
+ae4b281 feat: implement EN.3.K-dispatch-target-resolution-task4
+1166211 feat: implement EN.3.K-dispatch-target-resolution-task3
+f2b88e7 feat: implement EN.3.K-dispatch-target-resolution-task2
+99d7754 feat: implement EN.3.K-dispatch-target-resolution-task1
+```
+
+---
+
 ### SDLC_FLOW hardening — check-selection parity, final gate, terminal paths, hermetic tests
 - **What:** Merged `EN.3.D` (PR #31), `EN.3.E` (PR #32), `EN.3.G` (PR #33) and
   `EN.ticket.hermetic-test-temp-dirs`. The Rust engine now honours `fastCommand`,
