@@ -33,8 +33,8 @@ use super::schema::{
     CommittedDocs, CommittedFinalValidation, CommittedPr, CommittedReview, RunMeta, RunOutcomes,
     SDLCState, TerminalSignal,
 };
-use super::task_loop::STRUCTURAL_ISSUE_THRESHOLD;
-use super::{get_result, put_result};
+use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
+use super::{commit_state_file, get_result, put_result, CommandRunner};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
 /// under test. Defaults to the real current UTC date
@@ -97,9 +97,11 @@ fn branch_name(ctx: &TaskContext) -> Option<String> {
 /// file (`task_loop::SaveStateNode` already wrote at least once during the
 /// task loop for any run with at least one task). Not hoisted into a shared
 /// helper with `task_loop::existing_started_at` (a byte-identical copy):
-/// this module intentionally stays independent of `task_loop.rs`'s private
-/// seams, matching this file's existing `latest_state`/`worktree_path`
-/// local-copy convention (see `latest_state`'s doc comment).
+/// unlike `latest_state` (EN.3.G task 2 unified that one because the two
+/// copies had silently diverged), this pair of functions is still
+/// byte-identical today, so there is no correctness reason to hoist it —
+/// only do so if a future edit makes them diverge in behavior, not just in
+/// location.
 fn existing_started_at(state_path: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(state_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -183,11 +185,14 @@ fn committed_docs(ctx: &TaskContext) -> Option<CommittedDocs> {
 /// The D31 committed-state `pr` block is always `None` from this call site:
 /// the declared graph runs `WrapUpNode -> PullRequestNode` (see
 /// `graph.rs`'s schema), so `PullRequestNode` has not run — and cannot have
-/// a result in `ctx` — by the time `WrapUpNode::process` executes. This is a
-/// known, documented limitation of this fix (not a regression it
-/// introduces): no node in the current graph re-saves state *after*
-/// `PullRequestNode` runs, so `pr` can never be populated in the on-disk
-/// file today. See `D10-committed-state-path-schema-alignment.md`'s
+/// a result in `ctx` — by the time `WrapUpNode::process` executes. `graph.rs`
+/// is NOT reordered to fix this (the PR must follow docs and wrap-up); the
+/// `pr` block is instead patched into the already-written state file by
+/// `EmitStateNode` (EN.3.G task 6), which runs last in the declared graph
+/// and already holds the `CommandRunner` seam needed to read/rewrite/commit
+/// the file — see `emit_state::patch_pr_into_state`. This function keeps
+/// returning `None`: `WrapUpNode` genuinely still cannot see the PR result
+/// at the time it runs. See `D10-committed-state-path-schema-alignment.md`'s
 /// Consequences section.
 fn committed_pr(_ctx: &TaskContext) -> Option<CommittedPr> {
     None
@@ -218,6 +223,10 @@ fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidat
 /// router's own decision about *whether* this was a structural stop).
 /// `None` on the happy path (every task passed cleanly, or `ctx` has
 /// neither stage's output — e.g. a unit test driving `WrapUpNode` directly).
+///
+/// An explicit `MAJOR_BAIL` / structural review fail is checked first and
+/// wins over an `unrecognized_verdict` where both are somehow present, so a
+/// real bail signal is never masked by the router-fallback bookkeeping.
 fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
     if let Some(triage) = get_result(ctx, "TriageTaskNode") {
         if triage.get("verdict").and_then(|v| v.as_str()) == Some("MAJOR_BAIL") {
@@ -249,6 +258,27 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
                 Some("PARTIAL") => return Some(TerminalSignal::StructuralFail(summary)),
                 _ => {}
             }
+        }
+    }
+
+    // Router-fallback safety net (EN.3.G task 1): an unrecognized verdict
+    // from either model-judgment stage routes straight to `WrapUpNode`
+    // rather than halting the walk (see `TriageRouterNode::route` /
+    // `ReviewRouterNode::route`'s catch-all arms). Surface the exact string
+    // the model produced in the terminal `bail_reason` so it is diagnosable
+    // rather than silently swallowed as a `done` run.
+    if let Some(triage) = get_result(ctx, "TriageTaskNode") {
+        if let Some(verdict) = triage.get("unrecognized_verdict").and_then(|v| v.as_str()) {
+            return Some(TerminalSignal::MajorBail(format!(
+                "unrecognized triage verdict: {verdict}"
+            )));
+        }
+    }
+    if let Some(review) = get_result(ctx, "ConsolidatedReviewNode") {
+        if let Some(verdict) = review.get("unrecognized_verdict").and_then(|v| v.as_str()) {
+            return Some(TerminalSignal::MajorBail(format!(
+                "unrecognized review verdict: {verdict}"
+            )));
         }
     }
 
@@ -377,23 +407,6 @@ pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<S
     .ok()
 }
 
-/// Resolve the most recently mutated `SDLCState`: `UpdateTaskStatusNode`'s
-/// output if the loop has run at least once, else `LoadTaskStateNode`'s
-/// initial load. Mirrors the equivalent helper in `task_loop.rs` (kept as a
-/// local copy since it is not part of the hoisted `mod.rs` seams and this
-/// module must not touch `mod.rs`).
-fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
-    let value = get_result(ctx, "UpdateTaskStatusNode")
-        .or_else(|| get_result(ctx, "LoadTaskStateNode"))
-        .ok_or_else(|| {
-            NodeError::new(
-                "no SDLCState found: neither UpdateTaskStatusNode nor LoadTaskStateNode has run",
-            )
-        })?;
-    serde_json::from_value(value.clone())
-        .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))
-}
-
 /// Read the resolved `SdlcPolicy` stamped by dispatch or by
 /// `SetupWorktreeNode` (`setup::RESOLVED_POLICY_IDENTITY`). Fails loudly —
 /// `Err` — when the stamp is absent or unparsable, rather than silently
@@ -485,9 +498,14 @@ fn finalize_outcomes(
 }
 
 /// Deterministic node: renders the wrap-up artifacts for a completed (or
-/// bailed) SDLC flow run. No model call, no file writes.
+/// bailed) SDLC flow run, and (EN.3.G task 3) git-commits its terminal state
+/// write through the same [`super::commit_state_file`] seam
+/// `task_loop::SaveStateNode` uses — without this, the final `done`/
+/// `blocked` state landed on disk but was never committed, so a
+/// `--worktree` run's PR did not contain it.
 pub struct WrapUpNode {
     clock: ClockFn,
+    runner: CommandRunner,
 }
 
 impl WrapUpNode {
@@ -495,6 +513,7 @@ impl WrapUpNode {
     pub fn new() -> Self {
         Self {
             clock: default_clock(),
+            runner: super::default_command_runner(),
         }
     }
 
@@ -503,6 +522,15 @@ impl WrapUpNode {
     #[must_use]
     pub fn with_clock(mut self, clock: ClockFn) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Override the command runner used for the terminal state's
+    /// git add/commit invocation. Tests use this to stub the subprocess —
+    /// mirrors `task_loop::SaveStateNode::with_runner`.
+    #[must_use]
+    pub fn with_runner(mut self, runner: CommandRunner) -> Self {
+        self.runner = runner;
         self
     }
 }
@@ -607,7 +635,7 @@ impl Node for WrapUpNode {
                 let review = committed_review(&ctx);
                 let docs = committed_docs(&ctx);
                 let pr = committed_pr(&ctx);
-                Some(persist_state(
+                let saved = persist_state(
                     &state_path,
                     &state,
                     &run_meta,
@@ -616,7 +644,9 @@ impl Node for WrapUpNode {
                     pr.as_ref(),
                     final_validation.as_ref(),
                     terminal_signal.as_ref(),
-                )?)
+                )?;
+                commit_state_file(&self.runner, std::path::Path::new(&worktree), &state_path);
+                Some(saved)
             }
             None => None,
         };
@@ -646,6 +676,7 @@ mod tests {
     use super::*;
     use crate::workflows::sdlc_flow::schema::{SDLCState, SDLCTask, SDLCTaskStatus};
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     fn fixed_clock(date: &'static str) -> ClockFn {
         Arc::new(move || date.to_string())
@@ -762,6 +793,175 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         let result = &out.nodes["WrapUpNode"];
         assert!(result["log_entry"].as_str().unwrap().contains("PASS"));
+    }
+
+    /// EN.3.G task 2 (proof test): before the unified `latest_state`,
+    /// `WrapUpNode`'s local copy considered only `UpdateTaskStatusNode` /
+    /// `LoadTaskStateNode` and never `IncrementAttemptNode`, so a
+    /// `MAJOR_BAIL` reached after retries (where `IncrementAttemptNode`
+    /// holds the newest, post-increment state and `UpdateTaskStatusNode`
+    /// holds a stale, pre-retry snapshot) made `WrapUpNode` under-report
+    /// `attempt_count` / `total_retries`. This test fails before the fix
+    /// (it would resolve to the stale `UpdateTaskStatusNode` state) and
+    /// passes after `wrap_up.rs` calls `task_loop::latest_state`.
+    #[tokio::test]
+    async fn wrap_up_uses_post_increment_state_from_increment_attempt_node() {
+        // Stale snapshot: as it looked before the retry that bailed.
+        let mut stale_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        let mut stale_task = SDLCTask::new(1, "One", "d1");
+        stale_task.attempt_count = 1;
+        stale_state.tasks.push(stale_task);
+        stale_state.telemetry.tasks_passed = 0;
+        stale_state.telemetry.tasks_failed = 0;
+        stale_state.telemetry.total_attempts = 3;
+
+        // Newest state: after `IncrementAttemptNode` bumped the retry
+        // counter for a task that then MAJOR_BAILed.
+        let mut incremented_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        let mut incremented_task = SDLCTask::new(1, "One", "d1");
+        incremented_task.attempt_count = 3;
+        incremented_state.tasks.push(incremented_task);
+        incremented_state.telemetry.tasks_passed = 0;
+        incremented_state.telemetry.tasks_failed = 1;
+        incremented_state.telemetry.total_attempts = 5;
+
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": incremented_state.spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "UpdateTaskStatusNode".to_string(),
+            serde_json::to_value(&stale_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&incremented_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-31"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let stamped_state: SDLCState = serde_json::from_value(result["state"].clone())
+            .expect("WrapUpNode output carries a parseable SDLCState");
+
+        let outcomes = stamped_state.outcomes.expect("outcomes block populated");
+        assert_eq!(
+            outcomes.total_attempts, 5,
+            "must report the post-increment total_attempts, not the stale UpdateTaskStatusNode value"
+        );
+        assert_eq!(
+            outcomes.total_retries, 2,
+            "must report the post-increment attempt_count (3 - 1 = 2 retries)"
+        );
+
+        let report = result["report"].as_str().unwrap();
+        assert!(report.contains("Total attempts: 5"));
+    }
+
+    /// Regression guard: when `UpdateTaskStatusNode` genuinely holds the
+    /// newest state (the common happy-path case — no retry back-edge taken
+    /// after it), it must still win.
+    #[tokio::test]
+    async fn wrap_up_still_resolves_to_update_task_status_node_when_newest() {
+        let mut older_increment_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        older_increment_state.telemetry.total_attempts = 2;
+
+        let mut newest_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        newest_state.tasks.push(task);
+        newest_state.telemetry.tasks_passed = 1;
+        newest_state.telemetry.tasks_failed = 0;
+        newest_state.telemetry.total_attempts = 4;
+
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": newest_state.spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&older_increment_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            "UpdateTaskStatusNode".to_string(),
+            serde_json::to_value(&newest_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-31"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let stamped_state: SDLCState = serde_json::from_value(result["state"].clone())
+            .expect("WrapUpNode output carries a parseable SDLCState");
+
+        let outcomes = stamped_state.outcomes.expect("outcomes block populated");
+        assert_eq!(outcomes.total_attempts, 4);
+        assert_eq!(outcomes.tasks_passed, 1);
+    }
+
+    /// `write_terminal_blocked_state` shares the same unified `latest_state`
+    /// helper, so it must resolve the same post-increment counters as
+    /// `WrapUpNode::process` over the same retry-bailed ctx.
+    #[test]
+    fn write_terminal_blocked_state_uses_post_increment_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path();
+        let spec_slug = "EN.3.G-terminal-path-robustness";
+        let state_dir = worktree.join("planning").join(spec_slug).join("sdlc");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+
+        let mut stale_state = SDLCState::new(spec_slug);
+        stale_state.telemetry.total_attempts = 3;
+
+        let mut incremented_state = SDLCState::new(spec_slug);
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.attempt_count = 3;
+        incremented_state.tasks.push(task);
+        incremented_state.telemetry.total_attempts = 5;
+
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy().to_string() }),
+        );
+        ctx.nodes.insert(
+            "UpdateTaskStatusNode".to_string(),
+            serde_json::to_value(&stale_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&incremented_state).unwrap(),
+        );
+
+        let written_path = write_terminal_blocked_state(&ctx, "MAJOR_BAIL: too many retries")
+            .expect("should write a terminal state");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(written_path).unwrap()).unwrap();
+
+        assert_eq!(
+            written["telemetry"]["total_attempts"], 5,
+            "write_terminal_blocked_state must report the post-increment total_attempts"
+        );
+        assert_eq!(
+            written["tasks"]["1"]["attempt_count"], 3,
+            "write_terminal_blocked_state must report the post-increment attempt_count"
+        );
     }
 
     #[tokio::test]
@@ -1114,6 +1314,142 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(value["status"], json!("blocked"));
         assert_eq!(value["bail_reason"], json!("structural issues"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// EN.3.G task 1: a ctx carrying `unrecognized_verdict` (stamped by
+    /// `TriageTaskNode`/`ConsolidatedReviewNode` when the model's reply is
+    /// garbage) still yields a `MajorBail` terminal signal whose message
+    /// names the offending string — the router-fallback safety net's other
+    /// half, proving the run's `bail_reason` on disk is diagnosable rather
+    /// than silently swallowed as `done`.
+    #[tokio::test]
+    async fn wrap_up_populates_bail_reason_on_unrecognized_triage_verdict() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.G-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Failed;
+        state.tasks.push(task);
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({ "verdict": "WAT", "reason": "unclear", "unrecognized_verdict": "WAT" }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        let bail_reason = value["bail_reason"].as_str().unwrap();
+        assert!(bail_reason.contains("WAT"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    // -- EN.3.G task 3: WrapUpNode commits its terminal state write --------
+
+    /// `WrapUpNode` over a real worktree, with a recording stub runner,
+    /// issues exactly the same `git add` then `git commit` invocation
+    /// `task_loop::SaveStateNode` does — proving the terminal `done`/
+    /// `blocked` state is committed, not left dangling in the working tree
+    /// (without this a `--worktree` run's PR would not contain its own
+    /// final state).
+    #[tokio::test]
+    async fn wrap_up_commits_its_terminal_state_write() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.G-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        type RecordedCall = (String, Vec<String>);
+        let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| (*s).to_string()).collect(),
+            ));
+            Ok(crate::workflows::sdlc_flow::CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = WrapUpNode::new()
+            .with_clock(fixed_clock("2026-07-31"))
+            .with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "git");
+        assert_eq!(recorded[0].1[0], "add");
+        assert_eq!(recorded[0].1[1], saved_to);
+        assert_eq!(recorded[1].0, "git");
+        assert_eq!(recorded[1].1[0], "commit");
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// A non-zero `git commit` outcome (e.g. "nothing to commit") must not
+    /// fail the node — mirrors `SaveStateNode`'s non-fatal treatment.
+    #[tokio::test]
+    async fn wrap_up_tolerates_a_non_zero_commit_outcome() {
+        let worktree = temp_worktree();
+
+        let state = SDLCState::new("EN.3.G-fixture");
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            if args.first() == Some(&"commit") {
+                Ok(crate::workflows::sdlc_flow::CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "nothing to commit, working tree clean".to_string(),
+                })
+            } else {
+                Ok(crate::workflows::sdlc_flow::CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        });
+
+        let node = WrapUpNode::new()
+            .with_clock(fixed_clock("2026-07-31"))
+            .with_runner(runner);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("non-zero commit must not fail the node");
+        assert!(out.nodes["WrapUpNode"]["saved_to"].as_str().is_some());
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

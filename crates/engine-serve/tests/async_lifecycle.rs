@@ -691,3 +691,157 @@ async fn a_run_exceeding_the_default_budget_halts_with_the_budget_marker() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+/// **Task 7: the SSE 404 race.** `stream_event` (`stream.rs`) must agree with
+/// `get_event` (`http.rs`) about a run that is registered but hasn't reached
+/// its first `on_progress` snapshot yet: both must report it as known
+/// (`running`), not 404 the stream while the readback succeeds. `WaitNode`
+/// blocks in `process` before ever touching `TaskContext`, so no
+/// `LiveStateStore` snapshot exists for the run until it is released —
+/// exactly the window `live_run_metadata()` is the only tier that knows
+/// about the run.
+#[actix_web::test]
+async fn stream_event_agrees_with_readback_before_the_first_node_boundary() {
+    const WORKFLOW_TYPE: &str = "async-lifecycle-stream-race";
+
+    let release = Arc::new(Notify::new());
+    let release_for_factory = release.clone();
+    let mut dispatcher = Dispatcher::new();
+    dispatcher.register(
+        single_node_schema(WORKFLOW_TYPE, "WaitNode"),
+        Box::new(move |_event: &serde_json::Value| {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(WaitNode::new(release_for_factory.clone())));
+            Ok(Workflow::new(
+                registry,
+                single_node_schema(WORKFLOW_TYPE, "WaitNode"),
+            ))
+        }),
+    );
+    let state = app_state_with(dispatcher);
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let trigger_req = test::TestRequest::post()
+        .uri("/events/")
+        .insert_header(("X-API-Key", API_KEY))
+        .set_json(serde_json::json!({ "workflow_type": WORKFLOW_TYPE, "data": {} }))
+        .to_request();
+    let trigger_resp = test::call_service(&app, trigger_req).await;
+    assert_eq!(trigger_resp.status(), 202);
+    let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+    let event_id = trigger_body["event_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .expect("event_id should be a parseable UUID");
+
+    // `WaitNode` is still blocked on `release` — no `on_progress` snapshot
+    // has landed in `LiveStateStore` yet, so only `live_run_metadata()`
+    // knows about this run. The stream endpoint must still connect.
+    let stream_req = test::TestRequest::get()
+        .uri(&format!("/events/{event_id}/stream"))
+        .insert_header(("X-API-Key", API_KEY))
+        .to_request();
+    let stream_resp = test::call_service(&app, stream_req).await;
+    assert_eq!(
+        stream_resp.status(),
+        200,
+        "stream endpoint must not 404 a run registered but not yet snapshotted"
+    );
+    assert_eq!(
+        stream_resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    // The readback endpoint must agree it's known, reporting "running" for
+    // the same id in the same window.
+    let (status, body) = get_event!(app, event_id);
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "running");
+    assert_eq!(body["event_id"], event_id.to_string());
+
+    // Unblock the node so the spawned task finishes cleanly rather than
+    // leaking a hung task past the end of the test.
+    release.notify_one();
+    let _ = test::read_body(stream_resp).await;
+}
+
+/// A random, well-formed but never-registered UUID still 404s the stream
+/// endpoint — the new `live_run_metadata()` tier must not weaken this.
+#[actix_web::test]
+async fn stream_event_unknown_id_returns_404() {
+    const WORKFLOW_TYPE: &str = "async-lifecycle-stream-unknown";
+
+    let mut dispatcher = Dispatcher::new();
+    dispatcher.register(
+        single_node_schema(WORKFLOW_TYPE, "MarkerNode"),
+        Box::new(|_event: &serde_json::Value| {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(EchoNode));
+            Ok(Workflow::new(
+                registry,
+                single_node_schema(WORKFLOW_TYPE, "MarkerNode"),
+            ))
+        }),
+    );
+    let state = app_state_with(dispatcher);
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let unknown_id = Uuid::new_v4();
+    let stream_req = test::TestRequest::get()
+        .uri(&format!("/events/{unknown_id}/stream"))
+        .insert_header(("X-API-Key", API_KEY))
+        .to_request();
+    let resp = test::call_service(&app, stream_req).await;
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["error"], "unknown or malformed event_id");
+}
+
+/// A malformed, non-UUID path segment still 404s the stream endpoint — the
+/// new `live_run_metadata()` tier must not weaken this either.
+#[actix_web::test]
+async fn stream_event_malformed_id_returns_404() {
+    const WORKFLOW_TYPE: &str = "async-lifecycle-stream-malformed";
+
+    let mut dispatcher = Dispatcher::new();
+    dispatcher.register(
+        single_node_schema(WORKFLOW_TYPE, "MarkerNode"),
+        Box::new(|_event: &serde_json::Value| {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(EchoNode));
+            Ok(Workflow::new(
+                registry,
+                single_node_schema(WORKFLOW_TYPE, "MarkerNode"),
+            ))
+        }),
+    );
+    let state = app_state_with(dispatcher);
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let stream_req = test::TestRequest::get()
+        .uri("/events/not-a-uuid/stream")
+        .insert_header(("X-API-Key", API_KEY))
+        .to_request();
+    let resp = test::call_service(&app, stream_req).await;
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["error"], "unknown or malformed event_id");
+}

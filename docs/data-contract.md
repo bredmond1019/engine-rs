@@ -180,7 +180,11 @@ engine-rs also exposes `GET /events/{event_id}/stream` (`crate::stream::stream_e
 gap in either direction, in either runtime). It is `X-API-Key` gated, nests under the run it
 streams — mirroring the existing `POST /events/{run_id}/abort` convention — and emits
 `text/event-stream` frames over a `tokio::sync::broadcast` tee fed by `on_progress`: one frame per
-node transition plus a terminal frame, after which the stream ends.
+node transition plus a terminal frame, after which the stream ends. Its `known`-id check uses the
+same three-tier lookup as `GET /events/{event_id}` below (live map, then the terminal record ring,
+then `live_run_metadata()`) so a client that opens the stream in the window after `POST /events/`
+registers the run but before the first `on_progress` snapshot lands does not get spuriously 404'd
+(EN.3.G).
 
 **Server-derived `status` (`http::derive_terminal_status`).** A non-terminal run always reads back
 `"running"`. For a terminal run, checked in order against the retained snapshot:
