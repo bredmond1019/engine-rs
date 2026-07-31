@@ -108,6 +108,22 @@ fn default_auto_pr() -> bool {
 pub struct SDLCFlowEventSchema {
     /// Slug identifying the target spec directory.
     pub spec_slug: String,
+    /// Optional target-repository **registry slug** (e.g. `"bastion"`,
+    /// `"mev"`, `"engine-rs"`) — resolved through the process-wide
+    /// `RepoRegistry` (`brain.toml`'s `[[repos]]` entries) into an absolute
+    /// filesystem root. This field is a **slug and never a path**: a path on
+    /// the wire would let anything holding the API key aim an autonomous
+    /// `dangerously_skip_permissions` agent (`graph.rs`'s
+    /// `agentic_write_config`) at any directory on the machine, whereas a
+    /// slug keeps the reachable set a deliberate, reviewable list — the
+    /// blast radius of a leaked `X-API-Key`, a typo, or a compromised caller
+    /// becomes "one of the ~20 repos in `brain.toml`" instead of "the
+    /// filesystem". `None`/absent preserves today's behavior exactly: the
+    /// target root resolves to the serving process's `current_dir()`. Never
+    /// accept, join, or canonicalize a caller-supplied path here or anywhere
+    /// downstream of this field.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Optional task-range filter, e.g. `"1-3,5"` (1-indexed, inclusive).
     #[serde(default)]
     pub task_range: Option<String>,
@@ -858,6 +874,7 @@ mod tests {
         let json = serde_json::json!({ "spec_slug": "EN.3.A" });
         let event: SDLCFlowEventSchema =
             serde_json::from_value(json).expect("deserializes with defaults");
+        assert_eq!(event.repo, None);
         assert_eq!(event.task_range, None);
         assert!(!event.resume);
         assert!(event.auto_pr);
@@ -866,6 +883,17 @@ mod tests {
         assert!(!event.use_worktree);
         assert_eq!(event.policy, None);
         assert_eq!(event.profile, None);
+    }
+
+    #[test]
+    fn sdlc_flow_event_schema_deserializes_repo_slug() {
+        let json = serde_json::json!({
+            "spec_slug": "EN.3.K",
+            "repo": "bastion",
+        });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes with repo slug");
+        assert_eq!(event.repo, Some("bastion".to_string()));
     }
 
     #[test]

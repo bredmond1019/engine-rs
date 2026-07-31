@@ -354,7 +354,10 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   (`engine-serve::workflows::register_{sdlc_flow,research_agent,diagnostic_intake,
   proposal_generator}`) resolves policy against a workflow-appropriate
   `policy::PolicyConfigSource` — `SDLC_FLOW` (which runs embedded in a real repo checkout) uses
-  `PolicyConfigSource::Worktree(current_dir)`; the other three (channel/API-shaped, no repo
+  `PolicyConfigSource::Worktree(current_dir)`; as of `EN.3.K`, that worktree root is resolved per
+  run from the event's `repo` registry slug (falling back to the process's cwd only when `repo` is
+  absent — see `docs/sdlc-flow-workflow.md`) rather than from the process's cwd unconditionally;
+  the other three (channel/API-shaped, no repo
   checkout at dispatch time) use `PolicyConfigSource::Builtin` (builtin + profile + event layers
   only, no filesystem access) — so a worktree-free workflow never falls back to
   `std::env::current_dir()` to resolve its policy. The resolved policy is seeded into the run's

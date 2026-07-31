@@ -2585,6 +2585,10 @@ mod tests {
             "engine-core-sdlc-flow-task-loop-test-{}-{n}",
             std::process::id()
         ));
+        // Guarantee-empty: see `setup.rs`'s `temp_dir_named` doc comment for
+        // why PID-recycling makes this removal necessary, not optional.
+        // Remove the ROOT dir before recreating the `planning` subdir.
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("planning")).unwrap();
         dir
     }
@@ -2897,8 +2901,12 @@ mod tests {
     /// `args = ["-rnE", pattern, ...paths]`), so the forbidden-pattern-scan
     /// tests below need the full argv to assert the pattern lands as its
     /// own unmodified entry rather than being interpolated into a string.
-    fn recording_argv_runner() -> (CommandRunner, Arc<Mutex<Vec<(String, Vec<String>)>>>) {
-        let recorded: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    /// `(program, args)` pairs recorded by [`recording_argv_runner`], shared with the runner
+    /// closure via `Arc<Mutex<_>>` so the test can inspect invocations after the fact.
+    type RecordedArgvCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+    fn recording_argv_runner() -> (CommandRunner, RecordedArgvCalls) {
+        let recorded: RecordedArgvCalls = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
         let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
             recorded_clone.lock().unwrap().push((

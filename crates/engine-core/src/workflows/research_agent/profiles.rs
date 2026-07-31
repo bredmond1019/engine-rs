@@ -243,6 +243,10 @@ mod tests {
             "engine-core-research-agent-profiles-test-{}-{n}",
             std::process::id()
         ));
+        // Guarantee-empty: see `sdlc_flow/setup.rs`'s `temp_dir_named` doc
+        // comment for why PID-recycling makes this removal necessary, not
+        // optional.
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

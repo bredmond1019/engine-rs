@@ -370,6 +370,18 @@ pub(crate) fn derive_live_status(snapshot: &TaskContext) -> &'static str {
 /// `ctx.metadata` before the first node dispatches. That is what makes a
 /// flow's committed `sdlc-flow-state.json` joinable back to the engine run
 /// that produced it.
+///
+/// EN.3.K task 5: for `workflow_type: "SDLC_FLOW"` two additional 422
+/// conditions are checked **before** `run_id` is minted (so a rejection
+/// mints no run id, registers no token, and leaves no live-state entry to
+/// clean up): an unknown `repo` slug (`{"error": "unknown repo", "repo":
+/// ..}`, resolved via the process-global `crate::workflows::repo_registry()`
+/// installed by task 4), and a `spec_slug` whose directory does not exist
+/// under the resolved target root (`{"error": "unknown spec_slug",
+/// "spec_slug": ..}`). A spec directory that exists but has no `tasks.json`
+/// is NOT rejected — that is the legitimate `GenerateTasksNode` path. The
+/// `202 {run_id, event_id}` contract (EN.5.F) is unchanged for every valid
+/// request, `repo`-bearing or not.
 async fn post_events(
     req: HttpRequest,
     body: web::Json<TriggerBody>,
@@ -403,6 +415,70 @@ async fn post_events(
             }));
         }
     };
+
+    // EN.3.K task 5: pre-flight dispatch-target validation for SDLC_FLOW,
+    // run before a run id is minted / spawn_run is called — no run id, no
+    // token, no live-state entry to clean up on rejection. Gated on
+    // workflow_type so it never touches the channel/API-shaped workflows.
+    if body.workflow_type == "SDLC_FLOW" {
+        let repo_slug = body.data.get("repo").and_then(|v| v.as_str());
+
+        // Check 1 — the repo slug names a registry entry (or is absent,
+        // which resolves to current_dir(), exactly as `resolve_target_root`
+        // does for every other SDLC_FLOW node).
+        let resolved_root = match repo_slug {
+            Some(slug) => match crate::workflows::repo_registry() {
+                Some(registry) => match registry.resolve(slug) {
+                    Ok(root) => root,
+                    Err(err) => {
+                        return HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                            "error": "unknown repo",
+                            "repo": slug,
+                            "message": err.to_string(),
+                        }));
+                    }
+                },
+                None => {
+                    return HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                        "error": "unknown repo",
+                        "repo": slug,
+                        "message": format!(
+                            "SDLC_FLOW event named repo slug '{slug}' but no repo registry is \
+                             available to resolve it"
+                        ),
+                    }));
+                }
+            },
+            None => match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    return HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                        "error": "unresolvable target root",
+                        "message": err.to_string(),
+                    }));
+                }
+            },
+        };
+
+        // Check 2 — the spec directory exists under the resolved root.
+        // Deliberately `dir.exists()`, NEVER `dir.join("tasks.json").exists()`
+        // — a spec dir that exists without a `tasks.json` is the legitimate
+        // `GenerateTasksNode` path (SpecExistsRouterNode routes it there);
+        // only an absent directory is the defect this closes.
+        if let Some(spec_slug) = body.data.get("spec_slug").and_then(|v| v.as_str()) {
+            let spec_dir = resolved_root.join("planning").join(spec_slug);
+            if !spec_dir.is_dir() {
+                return HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                    "error": "unknown spec_slug",
+                    "spec_slug": spec_slug,
+                    "message": format!(
+                        "spec directory '{}' does not exist",
+                        spec_dir.display()
+                    ),
+                }));
+            }
+        }
+    }
 
     let run_id = Uuid::new_v4();
     let workflow_type = body.workflow_type.clone();
@@ -543,6 +619,10 @@ async fn get_event(
 }
 
 #[cfg(test)]
+// `registry_test_lock()`'s std `MutexGuard` is held across `.await` points by design — it
+// serializes tests that share the global suspend registry, not data an async task contends
+// over concurrently, so the guard's lifetime spanning the whole test body is intentional.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use actix_web::{test, App};
@@ -647,6 +727,254 @@ mod tests {
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), 422);
+    }
+
+    // --- EN.3.K task 5: pre-flight repo/spec_slug validation on SDLC_FLOW ---
+
+    /// Guards the process-global repo registry (`crate::workflows::set_repo_registry`)
+    /// and `std::env::current_dir()` so these tests never race others in the
+    /// same nextest process (there aren't any today, but this makes the
+    /// intent explicit for future additions to this module).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// An `AppState` whose sole registration is under the real `SDLC_FLOW`
+    /// workflow_type name, so `post_events`'s `body.workflow_type ==
+    /// "SDLC_FLOW"` gate fires. The registered factory is a harmless
+    /// `MarkerNode` fixture — task 5 validates dispatch-target inputs, not
+    /// the real SDLC_FLOW graph.
+    fn test_app_state_with_sdlc_flow() -> AppState {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            fixture_schema("SDLC_FLOW"),
+            Box::new(|_event: &serde_json::Value| {
+                let mut registry = NodeRegistry::new();
+                registry.register(Box::new(MarkerNode));
+                Ok(Workflow::new(registry, fixture_schema("SDLC_FLOW")))
+            }),
+        );
+
+        AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    /// A tempdir "brain root" with a single `alpha` repo entry whose
+    /// `planning/my-spec/` directory exists but — deliberately — carries no
+    /// `tasks.json`, so it exercises the "exists but no tasks.json" carve-out
+    /// as well as the "known repo" success path.
+    fn tempdir_registry_with_alpha_spec_dir_no_tasks_json() -> (
+        tempfile::TempDir,
+        Arc<engine_core::repo_registry::RepoRegistry>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(alpha.join("planning").join("my-spec"))
+            .expect("mkdir alpha planning/my-spec");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n",
+        )
+        .expect("write brain.toml");
+        let registry = Arc::new(
+            engine_core::repo_registry::RepoRegistry::from_brain_root(dir.path())
+                .expect("registry should build"),
+        );
+        (dir, registry)
+    }
+
+    #[actix_web::test]
+    async fn post_events_unknown_repo_slug_returns_422_naming_the_slug() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = crate::workflows::repo_registry();
+        let (_dir, registry) = tempdir_registry_with_alpha_spec_dir_no_tasks_json();
+        crate::workflows::set_repo_registry(registry);
+
+        let state = test_app_state_with_sdlc_flow();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "SDLC_FLOW",
+                "data": { "spec_slug": "my-spec", "repo": "not-a-real-repo" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 422);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["repo"], "not-a-real-repo");
+        assert!(body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not-a-real-repo"));
+
+        if let Some(prev) = previous {
+            crate::workflows::set_repo_registry(prev);
+        } else {
+            crate::workflows::clear_repo_registry();
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_known_repo_absent_spec_dir_returns_422_naming_the_spec_slug() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = crate::workflows::repo_registry();
+        let (_dir, registry) = tempdir_registry_with_alpha_spec_dir_no_tasks_json();
+        crate::workflows::set_repo_registry(registry);
+
+        let state = test_app_state_with_sdlc_flow();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "SDLC_FLOW",
+                "data": { "spec_slug": "does-not-exist", "repo": "alpha" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 422);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["spec_slug"], "does-not-exist");
+
+        if let Some(prev) = previous {
+            crate::workflows::set_repo_registry(prev);
+        } else {
+            crate::workflows::clear_repo_registry();
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_known_repo_spec_dir_without_tasks_json_still_dispatches() {
+        // The non-regression: SpecExistsRouterNode's "generate a plan"
+        // path is legitimate and must not be rejected by this pre-flight.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = crate::workflows::repo_registry();
+        let (_dir, registry) = tempdir_registry_with_alpha_spec_dir_no_tasks_json();
+        crate::workflows::set_repo_registry(registry);
+
+        let state = test_app_state_with_sdlc_flow();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "SDLC_FLOW",
+                "data": { "spec_slug": "my-spec", "repo": "alpha" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body["run_id"].is_string());
+
+        if let Some(prev) = previous {
+            crate::workflows::set_repo_registry(prev);
+        } else {
+            crate::workflows::clear_repo_registry();
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_no_repo_field_behaves_as_before_when_spec_dir_exists() {
+        // No `repo` field at all: the resolved root is `current_dir()`,
+        // exactly as it was before this task. With a real spec dir present
+        // under that cwd, the request dispatches (202) exactly as it did
+        // before this pre-flight existed.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous_registry = crate::workflows::repo_registry();
+        crate::workflows::clear_repo_registry();
+        let previous_cwd = std::env::current_dir().expect("current_dir");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("planning").join("my-spec"))
+            .expect("mkdir planning/my-spec");
+        std::env::set_current_dir(dir.path()).expect("set_current_dir");
+
+        let state = test_app_state_with_sdlc_flow();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "SDLC_FLOW",
+                "data": { "spec_slug": "my-spec" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 202);
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        if let Some(prev) = previous_registry {
+            crate::workflows::set_repo_registry(prev);
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_non_sdlc_flow_workflow_untouched_by_new_validation() {
+        // A `fixture`-type request with a garbage `spec_slug` and an
+        // unknown `repo` must dispatch exactly as it did before this task
+        // — the new pre-flight block is gated on `workflow_type ==
+        // "SDLC_FLOW"` and must never fire for anything else.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = crate::workflows::repo_registry();
+        crate::workflows::clear_repo_registry();
+
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "fixture",
+                "data": { "spec_slug": "totally-bogus-spec", "repo": "totally-bogus-repo" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 202);
+
+        if let Some(prev) = previous {
+            crate::workflows::set_repo_registry(prev);
+        }
     }
 
     #[actix_web::test]
@@ -1671,6 +1999,10 @@ mod tests {
             "engine-serve-sdlc-flow-terminal-write-test-{}-{n}",
             std::process::id()
         ));
+        // Guarantee-empty: see engine-core's `setup.rs` `temp_dir_named` doc
+        // comment for why PID-recycling makes this removal necessary, not
+        // optional.
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

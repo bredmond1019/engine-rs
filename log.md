@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-31T17:00:00Z"
+timestamp: "2026-07-31T21:40:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,122 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-31]
+
+### EN.3.K-dispatch-target-resolution — repo slug registry + dispatch-time 422 validation
+- **What:** `/sdlc-flow` on branch `EN.3.K-dispatch-target-resolution-flow`, all 10 tasks passed,
+  PASS review. `SDLCFlowEventSchema` gained `repo: Option<String>` — a `brain.toml`-backed registry
+  **slug**, never a raw path — and a new `RepoRegistry` (`crates/engine-core/src/repo_registry.rs`)
+  resolves it to an absolute root, rejecting escaping/nonexistent entries and honoring an optional
+  `ENGINE_REPO_ALLOWLIST` narrowing filter (tasks 1-2). `SetupWorktreeNode` anchors `worktree_path`
+  and every git invocation (worktree add/remove, checkout) to the resolved root via an optional
+  injected registry, staying byte-identical when `repo` is absent (task 3). `engine-serve` gained a
+  process-global repo-registry seam (`set_repo_registry`/`repo_registry`/
+  `init_repo_registry_from_env`) plus explicit-registry factory entry points, with bastion's
+  existing one-argument call left untouched (task 4). `post_events` now pre-flight-rejects, with a
+  422 naming the offending value and before minting a `run_id`, both an unknown repo slug and an
+  absent `spec_slug` directory — a spec dir that exists but lacks `tasks.json` still dispatches
+  (202) so `GenerateTasksNode`'s legitimate "author a missing plan" path is untouched (task 5).
+  Hermetic integration coverage: a new `sdlc_flow_repo_resolution.rs` suite proving worktree
+  creation/git cwds/per-run policy anchor to the resolved root (task 6), and 5 new tests extending
+  `engine-serve`'s `dispatch_integration.rs` covering both 422 cases, the tasks.json-absent
+  non-regression, the no-`repo`-field default, and the EN.5.F `run_id`==`event_id`
+  contract (task 7). `planning/ticket-local-policy-harness-file` — the Mac Mini's single-target
+  `ENGINE_HARNESS_PATH` proposal — was confirmed never implemented and marked Superseded by EN.3.K
+  in place, no code change (task 8). Docs: `docs/deployment-launchd.md` added (launchd
+  `EnvironmentVariables` checklist, `ENGINE_BRAIN_ROOT` soft-to-loud failure note), plus updates to
+  `sdlc-flow-workflow.md`, `sdlc-flow-smoke.md`, `architecture.md`, `docs/index.md` (task 9). Full
+  validation gate green — fmt, clippy `-D warnings`, `cargo nextest run --workspace` (1563 passed),
+  release build, cross-repo bastion `cargo check` (task 10, no code changes needed).
+- **Why:** A single always-on `bastion serve` under launchd has exactly one `WorkingDirectory`, so
+  before this block it could only ever drive `SDLC_FLOW` against one of the fleet's 11+ repos, and
+  an unknown `spec_slug` was silently routed to `GenerateTasksNode` instead of rejected — together
+  meaning a network-triggered, `dangerously_skip_permissions: true` agentic run could write in an
+  unintended directory or invent a plan for a spec that does not exist. `repo` is deliberately a
+  registry slug, not a path, so the reachable set stays "the ~20 repos in `brain.toml`" rather than
+  "the filesystem," even if the caller's API key leaks.
+- **Refs:** `planning/EN.3.K-dispatch-target-resolution/`, decision `D8-autonomous-node-write-permission.md`,
+  superseded ticket `planning/ticket-local-policy-harness-file/`.
+- **Next:** Pick up `EN.5.B1` (eval slice runner), `EN.5.C` (EXTERNAL_INTEL), `EN.6.C`/`EN.6.D`
+  (Slack/Telegram-WhatsApp adapter skeletons), `EN.6.G` (schedule source), `EN.6.I` (LEAD_INGEST),
+  or `EN.4.D` (DELIVERABLE_RENDER) per the `next` frontmatter list. `EN.3.J`'s human-in-the-loop
+  smoke run (PR #34) is now fully unblocked on the engine-rs side (`EN.3.D`/`EN.3.E`/`EN.3.G`/`EN.3.K`
+  all Done).
+
+```
+bcf872e feat: implement EN.3.K-dispatch-target-resolution-task9
+b0bcc29 feat: implement EN.3.K-dispatch-target-resolution-task7
+65e93bc feat: implement EN.3.K-dispatch-target-resolution-task6
+a0a2402 feat: implement EN.3.K-dispatch-target-resolution-task5
+ae4b281 feat: implement EN.3.K-dispatch-target-resolution-task4
+1166211 feat: implement EN.3.K-dispatch-target-resolution-task3
+f2b88e7 feat: implement EN.3.K-dispatch-target-resolution-task2
+99d7754 feat: implement EN.3.K-dispatch-target-resolution-task1
+```
+
+---
+
+### SDLC_FLOW hardening — check-selection parity, final gate, terminal paths, hermetic tests
+- **What:** Merged `EN.3.D` (PR #31), `EN.3.E` (PR #32), `EN.3.G` (PR #33) and
+  `EN.ticket.hermetic-test-temp-dirs`. The Rust engine now honours `fastCommand`,
+  `perTask: false` and per-task `validation_commands`; a new unconditional
+  `FinalValidationNode` runs the full suite once on the drain branch; no run can end
+  without a terminal state; and PID-keyed test temp dirs are hermetic (a recycled PID
+  was inheriting a populated dir, producing a false FAIL that bailed `EN.3.J`).
+  Merged the Mac Mini's local-model work into the brain — the D12 collision resolved by
+  renumbering theirs to D13 — amended and promoted `ticket-wire-meta-transport-telemetry`,
+  and specced `EN.3.K` for multi-repo dispatch. `EN.3.J` smoke apparatus is on draft PR #34
+  awaiting a human run.
+- **Why:** Preparing to retire the JS `sdlc-flow.js` engine and run everything through
+  engine-rs, triggered from bastion-web against an always-on `bastion serve`. Every Rust
+  task attempt was paying a full `nextest --workspace` plus a release build (2m44s vs 6.4s
+  per CLAUDE.md), which made the engine impractical for daily use.
+- **Refs:** `planning/EN.3.D-check-selection-parity/`, `EN.3.E-final-validation-node/`,
+  `EN.3.G-terminal-path-robustness/`, `EN.3.K-dispatch-target-resolution/`,
+  decision D12-per-task-vs-final-check-depth
+
+
+### `EN.3.J-sdlc-flow-smoke` — BAILED (tasks 1-5 passed, review FAIL)
+- **What:** Ran `/sdlc-flow EN.3.J-sdlc-flow-smoke` on branch `EN.3.J-sdlc-flow-smoke-flow`, scoped to
+  tasks 1-5. Authored the minimal one-task smoke spec (`planning/smoke-sdlc-flow/tasks.json` +
+  OKF-frontmattered `tasks.md`) whose only job is to make an agentic node write `SMOKE.md` containing
+  `ENGINE-SMOKE` at the worktree root (task 1); added `scripts/sdlc_smoke.sh`, an executable
+  trigger-and-watch harness that POSTs the `SDLC_FLOW` smoke event, extracts `event_id` from the 202,
+  polls `GET /events/{event_id}` printing status transitions, and exits 0/1/2 on
+  succeeded/failed-cancelled-budget_halted/timeout, never touching the SSE stream endpoint (task 2);
+  gave `--clean` its real implementation — removes the smoke worktree, deletes the branch, and
+  `rm -rf`'s the leftover `sdlc-flow-state.json` dir, each step tolerant of the resource being absent,
+  with an inline comment explaining the `SpecExistsRouterNode` resume hazard (task 3); fixed
+  `agentic-portfolio/scripts/health_check.sh --full` (committed in the parent repo) to recognize the
+  real terminal status vocabulary (`succeeded|failed|cancelled|budget_halted`) instead of the
+  nonexistent `"completed"` (task 4); added `docs/sdlc-flow-smoke.md` documenting the six operational
+  prerequisites, the event-flag rationale, the QuickLaunch watch limitation, the run/cleanup
+  procedure, and the real status vocabulary, registered in `docs/index.md` (task 5). All five tasks
+  passed on first attempt. The run then bailed at review: `cargo nextest run --workspace` (a gating
+  check) fails on two pre-existing tests in `sdlc_flow::setup`
+  (`spec_exists_routes_to_generate_when_absent`, `spec_exists_ignores_state_file_at_old_flat_path`) —
+  confirmed via `git diff main..HEAD` to touch zero `.rs` files and to leave `setup.rs` untouched, so
+  the failure predates this branch and is out of scope to fix under EN.3.J, but per review protocol a
+  fresh gating-check failure still blocks PASS regardless of attribution. Separately, task 6 (the
+  human-in-the-loop real-run evidence acceptance criterion) is explicitly forbidden to an agent by the
+  spec's own Notes — "an agent reaching it must stop and hand off" — so it remains unmet by design at
+  this point in the spec, not a defect in tasks 1-5. Both issues require human handoff rather than
+  another automated retry: the setup-test regression needs triage as its own fix (likely from another
+  block or environment drift), and task 6 needs an actual human-triggered run with real evidence
+  recorded in `tasks.md`'s Notes. No production Rust code changed on this branch. Next: triage and fix
+  the two pre-existing `sdlc_flow::setup` test failures (likely as a follow-up chore, not under
+  EN.3.J), then have a human trigger the real smoke run from bastion-web and record the evidence
+  before EN.3.J can close.
+
+```
+808c2be feat: implement EN.3.J-sdlc-flow-smoke-task5
+f315814 feat: implement EN.3.J-sdlc-flow-smoke-task3
+038002b feat: implement EN.3.J-sdlc-flow-smoke-task2
+e10818a Merge pull request #33 from bredmond1019/EN.3.G-terminal-path-robustness-flow
+26f20ff chore: wrap up EN.3.G-terminal-path-robustness
+f03d08c docs: update docs for EN.3.G-terminal-path-robustness
+7bd83c9 feat: implement EN.3.G-terminal-path-robustness-task8
+da808b1 feat: implement EN.3.G-terminal-path-robustness-task7
+```
 
 ### `EN.3.G-terminal-path-robustness` — PASS (all 9 tasks)
 - **What:** Ran `/sdlc-flow EN.3.G-terminal-path-robustness` on branch

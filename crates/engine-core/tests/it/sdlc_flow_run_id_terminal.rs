@@ -50,6 +50,10 @@ fn temp_worktree() -> std::path::PathBuf {
         "engine-core-sdlc-flow-run-id-terminal-it-{}-{n}",
         std::process::id()
     ));
+    // Guarantee-empty: see engine-core src's `sdlc_flow/setup.rs` `temp_dir_named`
+    // doc comment for why PID-recycling makes this removal necessary, not
+    // optional.
+    std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

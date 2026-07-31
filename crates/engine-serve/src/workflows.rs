@@ -19,19 +19,104 @@
 //! actually select the local transport for a served run.
 //!
 //! Config-source choice per workflow: `SDLC_FLOW` runs embedded in
-//! `bastion serve`'s own process, which *is* checked out in a repo, so its
-//! factory reads `harness.json` off the current working directory (a
-//! `PolicyConfigSource::Worktree`); the other three are channel/API-shaped
-//! with no repo checkout at dispatch time, so their factories use
-//! `PolicyConfigSource::Builtin` (builtin + profile + event layers only, no
-//! filesystem access).
+//! `bastion serve`'s own process, which *is* checked out in a repo (or,
+//! since EN.3.K, targets another repo entirely via the event's `repo`
+//! slug), so its factory resolves `harness.json` per run off the event's
+//! resolved target root (a `PolicyConfigSource::Worktree`) — the current
+//! working directory only when `repo` is absent, i.e. today's behavior
+//! verbatim. The other three are channel/API-shaped with no repo checkout
+//! at dispatch time, so their factories use `PolicyConfigSource::Builtin`
+//! (builtin + profile + event layers only, no filesystem access).
+//!
+//! # The repo registry seam (EN.3.K)
+//!
+//! `SDLC_FLOW`'s factory and its `SetupWorktreeNode` need a
+//! [`engine_core::repo_registry::RepoRegistry`] to resolve an event's `repo`
+//! slug. `bastion` calls [`register_builtin_workflows`] with one argument
+//! (`../bastion/src/serve/mod.rs:61`) and constructs `AppState` as a struct
+//! literal (`:278`) — adding a required parameter or field to either breaks
+//! a build this spec cannot edit (a separate git repo). So the registry is
+//! threaded through a **process-global seam**, mirroring this crate's own
+//! established precedent for exactly this shape of problem:
+//! `crate::suspend::register_pause_signal` and `http::live_run_metadata()`
+//! are both already process-global `OnceLock`/`RwLock` singletons. [`set_repo_registry`] /
+//! [`repo_registry`] install and read it; [`init_repo_registry_from_env`]
+//! resolves one from `ENGINE_BRAIN_ROOT` at server startup and
+//! logs-and-leaves-unset on failure, so an engine that cannot find a brain
+//! root still serves absent-`repo` events exactly as before this block.
+//! [`register_builtin_workflows_with_registry`] is the explicit-registry
+//! entry point tests use to install a tempdir registry with no
+//! `ENGINE_BRAIN_ROOT` race; the plain one-argument [`register_builtin_workflows`]
+//! delegates to it using the process-global, so `bastion` compiles
+//! unchanged.
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use engine_contract::TaskContext;
 use engine_core::policy::{PolicyConfigSource, RESOLVED_POLICY_IDENTITY};
+use engine_core::repo_registry::RepoRegistry;
+use engine_core::workflows::sdlc_flow::setup::SetupWorktreeNode;
 use engine_core::Workflow;
 use serde::Serialize;
+
+/// The process-global repo registry (EN.3.K): `set_repo_registry` /
+/// `repo_registry` read and write this singleton, mirroring
+/// `crate::suspend::register_pause_signal` / `http::live_run_metadata()`'s
+/// existing `OnceLock<RwLock<..>>` pattern. `None` (the default) means
+/// today's behavior: an absent-`repo` event still resolves via
+/// `current_dir()`; a `repo`-bearing event with no registry installed
+/// surfaces a named error rather than silently falling back (see
+/// `sdlc_flow::setup::resolve_target_root`).
+fn repo_registry_cell() -> &'static RwLock<Option<Arc<RepoRegistry>>> {
+    static REPO_REGISTRY: OnceLock<RwLock<Option<Arc<RepoRegistry>>>> = OnceLock::new();
+    REPO_REGISTRY.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the process-global repo registry. Overwrites any previously
+/// installed registry — tests that install a tempdir registry must restore
+/// the previous value (typically `None`) on the way out so they don't leak
+/// state into other tests in the same process.
+pub fn set_repo_registry(registry: Arc<RepoRegistry>) {
+    if let Ok(mut guard) = repo_registry_cell().write() {
+        *guard = Some(registry);
+    }
+}
+
+/// Clear the process-global repo registry, restoring the "no registry
+/// installed" default. Test-only cleanup helper alongside
+/// [`set_repo_registry`].
+pub fn clear_repo_registry() {
+    if let Ok(mut guard) = repo_registry_cell().write() {
+        *guard = None;
+    }
+}
+
+/// Read the currently installed process-global repo registry, if any.
+pub fn repo_registry() -> Option<Arc<RepoRegistry>> {
+    repo_registry_cell()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Resolve a repo registry from `ENGINE_BRAIN_ROOT` (via
+/// `RepoRegistry::from_env`) and install it as the process-global registry.
+/// On failure, logs the reason to stderr and leaves the registry unset —
+/// an engine that cannot find a brain root must still serve absent-`repo`
+/// events exactly as before this block, not fail to start.
+pub fn init_repo_registry_from_env() {
+    match RepoRegistry::from_env() {
+        Ok(registry) => set_repo_registry(Arc::new(registry)),
+        Err(err) => {
+            eprintln!(
+                "engine-serve: repo registry not initialized ({err}); \
+                 repo-bearing SDLC_FLOW events will 422 until ENGINE_BRAIN_ROOT \
+                 resolves, absent-repo events are unaffected"
+            );
+        }
+    }
+}
 
 use crate::dispatch::Dispatcher;
 
@@ -67,25 +152,61 @@ fn seed_resolved_policy<P: Serialize>(
 /// Register the `SDLC_FLOW` workflow (`engine_core::workflows::sdlc_flow`)
 /// with `dispatcher`, populating both the `workflow_registry` (via a
 /// policy-aware factory built on `sdlc_flow::graph::registry_for_policy`)
-/// and the `schema_registry` (via `sdlc_flow::graph::schema`).
+/// and the `schema_registry` (via `sdlc_flow::graph::schema`). Delegates to
+/// [`register_sdlc_flow_with_registry`] using whatever repo registry (EN.3.K)
+/// is currently installed via [`set_repo_registry`] — `None` if none has
+/// been installed, which reproduces today's behavior exactly (an absent
+/// `repo` on the event resolves via `current_dir()` regardless).
 pub fn register_sdlc_flow(dispatcher: &mut Dispatcher) {
+    register_sdlc_flow_with_registry(dispatcher, repo_registry());
+}
+
+/// Register the `SDLC_FLOW` workflow with an explicit repo registry (EN.3.K),
+/// bypassing the process-global seam — the entry point tests use to install
+/// a tempdir registry with no `ENGINE_BRAIN_ROOT` race.
+///
+/// Per event: resolves the event's target root via
+/// `sdlc_flow::setup::resolve_target_root` (absent `repo` -> `current_dir()`,
+/// present `repo` -> resolved through `repo_reg`, erroring by name rather
+/// than silently falling back if no registry is available), builds a
+/// `PolicyConfigSource::Worktree` over that root (replacing the old
+/// unconditional `current_dir()` read), and — when a registry is installed —
+/// re-registers `SetupWorktreeNode` with `.with_registry(..)` so the node
+/// itself resolves `event.repo` against the same registry the policy read
+/// used, mirroring exactly how `register_content_pipeline` overrides
+/// `ActionDispatchNode`'s transport and `register_research_agent` overrides
+/// `ResearchIngressDispatchNode`'s transport.
+pub fn register_sdlc_flow_with_registry(
+    dispatcher: &mut Dispatcher,
+    repo_reg: Option<Arc<RepoRegistry>>,
+) {
     dispatcher.register(
         engine_core::workflows::sdlc_flow::graph::schema(),
-        Box::new(|event: &serde_json::Value| {
+        Box::new(move |event: &serde_json::Value| {
             let ctx = event_only_context(event);
-            // SDLC_FLOW's served process is itself checked out in a repo
-            // (bastion serve's cwd), so `harness.json` is read off it —
-            // `SetupWorktreeNode` hasn't run yet at dispatch time, so this
-            // is not the run's eventual worktree, just where this process
-            // lives.
-            let source = PolicyConfigSource::Worktree(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            );
+            let sdlc_event: engine_core::workflows::sdlc_flow::schema::SDLCFlowEventSchema =
+                serde_json::from_value(event.clone())
+                    .map_err(|err| format!("invalid SDLC_FLOW event: {err}"))?;
+            // EN.3.K: the run's target root is resolved once, per event —
+            // absent `repo` reproduces the old unconditional
+            // `current_dir()` read verbatim; a present `repo` resolves
+            // through `repo_reg` (naming the slug on failure, never
+            // silently falling back to `current_dir()`).
+            let root = engine_core::workflows::sdlc_flow::setup::resolve_target_root(
+                &sdlc_event,
+                repo_reg.as_deref(),
+            )
+            .map_err(|err| err.to_string())?;
+            let source = PolicyConfigSource::Worktree(root);
             let policy = engine_core::workflows::sdlc_flow::setup::resolve_policy_for_run_from(
                 &ctx, &source,
             )
             .map_err(|err| err.to_string())?;
-            let registry = engine_core::workflows::sdlc_flow::graph::registry_for_policy(&policy);
+            let mut registry =
+                engine_core::workflows::sdlc_flow::graph::registry_for_policy(&policy);
+            if let Some(reg) = repo_reg.clone() {
+                registry.register(Box::new(SetupWorktreeNode::new().with_registry(reg)));
+            }
             let seeded = seed_resolved_policy(&policy)?;
             Workflow::new_validated(registry, engine_core::workflows::sdlc_flow::graph::schema())
                 .map(|workflow| workflow.with_seeded_nodes(seeded))
@@ -357,8 +478,29 @@ pub fn register_harvest_approve(dispatcher: &mut Dispatcher) {
 /// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`, and
 /// `HARVEST_APPROVE`; future builtins register here too.
+///
+/// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
+/// this with exactly one argument (`../bastion/src/serve/mod.rs:61`) and
+/// this spec cannot edit that separate repo. `SDLC_FLOW`'s repo registry
+/// (EN.3.K) is threaded through the process-global seam ([`repo_registry`])
+/// rather than a new parameter here; see
+/// [`register_builtin_workflows_with_registry`] for the explicit-registry
+/// entry point.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
-    register_sdlc_flow(dispatcher);
+    register_builtin_workflows_with_registry(dispatcher, repo_registry());
+}
+
+/// Register every builtin workflow with an explicit repo registry (EN.3.K)
+/// for `SDLC_FLOW`, bypassing the process-global seam. Every other builtin
+/// workflow is unaffected by `repo` (they resolve `PolicyConfigSource::Builtin`
+/// or no policy at all) and registers exactly as [`register_builtin_workflows`]
+/// does. Test entry point: installs a tempdir registry with no
+/// `ENGINE_BRAIN_ROOT` race instead of relying on the process-global.
+pub fn register_builtin_workflows_with_registry(
+    dispatcher: &mut Dispatcher,
+    repo_reg: Option<Arc<RepoRegistry>>,
+) {
+    register_sdlc_flow_with_registry(dispatcher, repo_reg);
     register_research_agent(dispatcher);
     register_diagnostic_intake(dispatcher);
     register_proposal_generator(dispatcher);
@@ -441,6 +583,108 @@ mod tests {
             }
             Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
             Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    // --- repo registry seam (EN.3.K task 4) ---------------------------------
+
+    /// A tempdir "brain root" with a single `[[repos]]` entry (`alpha`)
+    /// whose `repo_path` holds a `planning/harness.json` with a
+    /// distinguishable `sdlc.policy.max_attempts` value, so a test can
+    /// assert the resolved policy actually came from `alpha`'s root and not
+    /// the builtin default.
+    fn tempdir_registry_with_alpha(max_attempts: u32) -> (tempfile::TempDir, Arc<RepoRegistry>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(alpha.join("planning")).expect("mkdir alpha/planning");
+        std::fs::write(
+            alpha.join("planning").join("harness.json"),
+            serde_json::json!({ "sdlc": { "policy": { "max_attempts": max_attempts } } })
+                .to_string(),
+        )
+        .expect("write harness.json");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n",
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+        (dir, registry)
+    }
+
+    #[test]
+    fn dispatch_with_no_registry_installed_still_dispatches_a_runnable_workflow() {
+        // No registry installed anywhere (explicit `None`) — an
+        // absent-`repo` event must still dispatch exactly as
+        // `dispatch_yields_a_runnable_workflow` asserts for the plain
+        // one-argument `register_sdlc_flow`.
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_flow_with_registry(&mut dispatcher, None);
+
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_FLOW", &serde_json::json!({ "spec_slug": "my-spec" }))
+            .expect("SDLC_FLOW should dispatch to a runnable Workflow with no registry installed");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn dispatch_with_repo_resolves_policy_against_the_repos_own_harness_json() {
+        let (_dir, registry) = tempdir_registry_with_alpha(11);
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_flow_with_registry(&mut dispatcher, Some(registry));
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "SDLC_FLOW",
+                &serde_json::json!({ "spec_slug": "my-spec", "repo": "alpha" }),
+            )
+            .expect("SDLC_FLOW should dispatch when repo resolves via the installed registry");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn dispatch_with_unknown_repo_slug_fails_loudly_naming_the_slug() {
+        let (_dir, registry) = tempdir_registry_with_alpha(11);
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_flow_with_registry(&mut dispatcher, Some(registry));
+
+        let result = dispatcher.dispatch_with_event(
+            "SDLC_FLOW",
+            &serde_json::json!({ "spec_slug": "my-spec", "repo": "not-a-repo" }),
+        );
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("not-a-repo"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn set_repo_registry_and_repo_registry_round_trip() {
+        // Guard the process-global with a coarse lock so this test doesn't
+        // race other tests in this module that also touch it.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        let previous = repo_registry();
+        let (_dir, registry) = tempdir_registry_with_alpha(3);
+        set_repo_registry(registry.clone());
+        assert!(repo_registry().is_some());
+        assert!(repo_registry().unwrap().resolve("alpha").is_ok());
+
+        clear_repo_registry();
+        assert!(repo_registry().is_none());
+
+        // Restore whatever was installed before this test ran, so it
+        // doesn't leak state into other tests in this process.
+        if let Some(prev) = previous {
+            set_repo_registry(prev);
         }
     }
 

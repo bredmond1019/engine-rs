@@ -16,6 +16,7 @@ pub mod node;
 pub mod nodes;
 pub mod parallel;
 pub mod policy;
+pub mod repo_registry;
 pub mod routing;
 pub mod schema;
 pub mod suspend;

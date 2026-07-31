@@ -252,6 +252,10 @@ mod tests {
     fn aggregate_state_files_reads_and_groups_fixtures_from_disk() {
         let dir =
             std::env::temp_dir().join(format!("en4-policy-aggregate-test-{}", std::process::id()));
+        // Guarantee-empty: see `sdlc_flow/setup.rs`'s `temp_dir_named` doc
+        // comment for why PID-recycling makes this removal necessary, not
+        // optional.
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
         let policy = TestPolicy { retries: 3 };

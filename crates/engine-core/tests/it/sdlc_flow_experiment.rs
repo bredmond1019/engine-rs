@@ -134,6 +134,10 @@ fn temp_worktree(tag: &str) -> PathBuf {
         "engine-core-sdlc-flow-experiment-{tag}-{}-{n}",
         std::process::id()
     ));
+    // Guarantee-empty: see engine-core src's `sdlc_flow/setup.rs` `temp_dir_named`
+    // doc comment for why PID-recycling makes this removal necessary, not
+    // optional. Must happen BEFORE the `git init` below, not after.
+    std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(dir.join("planning").join("experiment-spec")).unwrap();
 
     // A real `git init` so `TestTaskNode`'s write-verification guard (which

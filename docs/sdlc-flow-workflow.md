@@ -253,7 +253,46 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
   1-indexed inclusive, rejects `end < start`), `resume` (default `false`), `auto_pr` (default
   **`true`**), `branch_name` (defaults to `sdlc/<spec_slug>`), `llm_triage` (default `false`),
   `policy` (optional per-run override), `profile` (optional named policy-profile bundle — see
-  [sdlc-flow-policy.md](sdlc-flow-policy.md)).
+  [sdlc-flow-policy.md](sdlc-flow-policy.md)), `repo` (optional, `EN.3.K` — see below).
+- **`repo` — the dispatch target, as a registry slug, never a path (`EN.3.K`).** `repo` is an
+  `Option<String>` naming an entry in `brain.toml`'s `[[repos]]` list (e.g. `"bastion"`, `"mev"`,
+  `"engine-rs"`) — **a slug, never a filesystem path.** This is a deliberate security boundary, not
+  a stylistic choice: the `SDLC_FLOW` graph's agentic nodes (`ImplementTaskNode`, `PatchDocsNode`)
+  run with `dangerously_skip_permissions: true` by design
+  (`planning/decisions/D8-autonomous-node-write-permission.md`), so a caller-supplied **path** in
+  the event payload would let anything holding the `X-API-Key` point an autonomous,
+  skip-permissions agent at any directory on the machine. A **slug** bounds the reachable set to a
+  deliberate, reviewable list — the blast radius of a leaked key, a typo, or a compromised caller
+  becomes "one of the repos in `brain.toml`" instead of "the filesystem". No code path anywhere in
+  this workflow accepts, joins, or canonicalizes a caller-supplied path for `repo`.
+  - **Resolution**: the process-global repo registry (`crates/engine-core/src/repo_registry.rs`,
+    installed from `ENGINE_BRAIN_ROOT` at server startup — see
+    [deployment-launchd.md](deployment-launchd.md)) maps `repo` to `brain_root.join(repo_path)`.
+    Every resolvable path is inside the brain root by construction — a `repo_path` that escapes it
+    (e.g. via `..`), does not exist, or is not a directory is a typed resolution error, not a
+    silently accepted path.
+  - **`ENGINE_REPO_ALLOWLIST`** — an optional, comma-separated env var that narrows the registry to
+    a subset of `brain.toml` slugs. Unset (the default, and what the Mac Mini runs) means every
+    `brain.toml` slug is reachable; set, it intersects. It exists so a future
+    internet-exposed deployment can shrink the reachable set (e.g. to `engine-rs,bastion`) without
+    editing the brain.
+  - **Absent `repo` — byte-identical to pre-`EN.3.K` behavior.** An event with no `repo` field
+    resolves its target root to `std::env::current_dir()`, exactly as before this block: the same
+    relative `worktree_path` (`"."` / `trees/{branch}`), the same `Path::new(".")` git cwds, and the
+    same `PolicyConfigSource::Worktree(current_dir())`. No new rejection path is introduced for
+    absent-`repo` events.
+  - **Two new `POST /events/` 422 conditions**, checked before a `run_id` is minted or `spawn_run`
+    is called (so a rejection registers no live-state entry and needs no cleanup): an unknown
+    `repo` slug (`{"error": "unknown repo", "repo": "<slug>", "message": "..."}`), and a
+    `spec_slug` whose directory does not exist under the resolved target root
+    (`{"error": "unknown spec_slug", "spec_slug": "<slug>"}`). **Carve-out:** a spec directory that
+    *exists* but has no `tasks.json` yet is **not** rejected — that is the legitimate
+    `GenerateTasksNode` "author a missing task list" path, and still dispatches `202` and routes
+    accordingly. A valid request otherwise still returns the unchanged `202 {run_id, event_id}`
+    contract (`EN.5.F`), `repo`-bearing or not.
+  - **Not a policy knob.** `repo` selects the run's *target*, not a cost/latency/quality trade —
+    per standing rule 6's own test, it therefore lives as a plain event field, is not part of
+    `SdlcPolicy`, and is not set in any of the three named policy profiles.
 - **Worktree/branch naming**: branch defaults to `sdlc/<spec_slug>`; worktree path is
   `trees/<branch>`. A fresh (non-resume) run does `git worktree add trees/<branch> -b <branch>
   origin/main`.

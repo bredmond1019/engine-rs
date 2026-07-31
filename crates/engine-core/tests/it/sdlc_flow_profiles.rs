@@ -203,6 +203,10 @@ fn resolve_policy_for_run_errors_on_unknown_profile_name() {
         "sdlc_flow_profiles_unknown_profile_{}",
         std::process::id()
     ));
+    // Guarantee-empty: see engine-core src's `sdlc_flow/setup.rs` `temp_dir_named`
+    // doc comment for why PID-recycling makes this removal necessary, not
+    // optional.
+    std::fs::remove_dir_all(&worktree).ok();
     std::fs::create_dir_all(&worktree).expect("temp worktree dir should create");
 
     let ctx = empty_context(serde_json::json!({
@@ -272,6 +276,10 @@ fn temp_worktree(tag: &str) -> PathBuf {
         "engine-core-sdlc-flow-profiles-{tag}-{}-{n}",
         std::process::id()
     ));
+    // Guarantee-empty: see engine-core src's `sdlc_flow/setup.rs` `temp_dir_named`
+    // doc comment for why PID-recycling makes this removal necessary, not
+    // optional. Remove the ROOT dir before recreating the subdirs.
+    std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(dir.join("planning").join("fixture-profiles-spec")).unwrap();
     dir
 }
