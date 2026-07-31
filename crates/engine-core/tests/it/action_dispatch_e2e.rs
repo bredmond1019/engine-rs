@@ -31,10 +31,12 @@
 //! (d) chain depth cap — an event whose `chain_depth` is at or beyond the
 //!     cap is refused rather than posted, so an A -> B -> A trigger cycle
 //!     terminates instead of recursing;
-//! (e) unwired channel — an Email-typed reply against the live composition
-//!     (`channel_transport_live` over a stubbed `HttpPost`) yields a
-//!     `delivered=false` receipt naming the owning `EN.6.x` block, and the
-//!     run does not fail;
+//! (e) uncredentialed email adapter — an Email-typed reply against the live
+//!     composition (`channel_transport_live` over a stubbed `HttpPost`)
+//!     routes to the real `EmailChannelTransport`, which yields a
+//!     `delivered=false` receipt reporting its own missing-credential
+//!     error (not the generic unwired-channel error) without failing the
+//!     run;
 //! (f) send-failure resilience — a failing `StubChannelTransport` still
 //!     lets the run succeed, recording a `delivered=false` receipt;
 //! (g) `EventsRow` round-trip — the final `TaskContext` (including the
@@ -496,7 +498,11 @@ async fn a_chain_at_the_depth_cap_is_refused_rather_than_posted() {
 }
 
 // ---------------------------------------------------------------------------
-// (e) unwired channel: delivered=false naming the owning block, run doesn't fail
+// (e) wired-but-uncredentialed email channel: delivered=false without
+//     failing the run, and the detail comes from the real email adapter
+//     (not the generic "no ChannelTransport adapter wired" unwired path) —
+//     `EN.6.B` wires `ChannelType::Email` to a real `EmailChannelTransport`,
+//     so this no longer exercises `UnwiredChannelTransport` at all.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -504,10 +510,12 @@ async fn unwired_email_channel_yields_delivered_false_naming_the_owning_block_wi
 ) {
     let stubs = Stubs::default_passing();
     // The live composition: TriggerWorkflow -> WorkflowTriggerDispatch,
-    // every other channel -> UnwiredChannelTransport. No adapter exists yet
-    // for Email (EN.6.D), so this exercises the unwired path end-to-end
-    // while staying hermetic (the live transport's HttpPost is never
-    // reached for a non-trigger action).
+    // Email -> the real EmailChannelTransport, every other channel ->
+    // UnwiredChannelTransport. With RESEND_API_KEY unset in the test
+    // environment, the email adapter refuses to send and reports its own
+    // credential error rather than reaching the network — this stays
+    // hermetic (the live transport's HttpPost is never reached for a
+    // non-trigger action).
     let live_transport = channel_transport_live(TEST_EVENTS_URL);
     let workflow = build_workflow(&stubs, live_transport);
 
@@ -516,7 +524,7 @@ async fn unwired_email_channel_yields_delivered_false_naming_the_owning_block_wi
     assert_eq!(
         ctx.node_runs[nn::ACTION_DISPATCH].status,
         NodeRunStatus::Success,
-        "an unwired channel must not fail the run"
+        "a send failure on the email adapter must not fail the run"
     );
 
     let dispatched = dispatched_of(&ctx);
@@ -526,8 +534,12 @@ async fn unwired_email_channel_yields_delivered_false_naming_the_owning_block_wi
         .as_str()
         .expect("detail should be a string");
     assert!(
-        detail.contains("EN.6.D"),
-        "unwired email detail should name EN.6.D, got: {detail}"
+        !detail.contains("no ChannelTransport adapter wired"),
+        "email must not route to UnwiredChannelTransport; detail was: {detail}"
+    );
+    assert!(
+        detail.contains("RESEND_API_KEY"),
+        "expected the email adapter's own credential error, got: {detail}"
     );
 }
 
