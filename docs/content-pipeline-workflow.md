@@ -336,9 +336,10 @@ Both actions are sent through the injectable `crate::nodes::channel_transport::C
 seam (`with_transport`); a transport error is recorded as a `delivered: false` receipt and never
 fails the run. `WorkflowTriggerDispatch` prefers an injected in-process `Dispatcher`
 (fire-and-forget via `spawn_blocking`) over its `POST /events/` HTTP fallback (carrying an
-`X-API-Key` header), and `channel_transport_live()` routes every other channel to
-`UnwiredChannelTransport` (`EN.6.C`/`EN.6.D` — real Telegram/WhatsApp adapters are still open
-follow-on work). `crates/engine-serve/src/workflows.rs` re-registers `ActionDispatchNode` with
+`X-API-Key` header), and `channel_transport_live()` routes `ChannelType::Email` to
+`EmailChannelTransport` (`EN.6.B`, see [email-adapter.md](email-adapter.md)) and every other
+channel to `UnwiredChannelTransport` (`EN.6.C`/`EN.6.D` — real Slack/Telegram/WhatsApp adapters
+are still open follow-on work). `crates/engine-serve/src/workflows.rs` re-registers `ActionDispatchNode` with
 `channel_transport_live` pointed at the deployment-configured `ENGINE_EVENTS_URL` (default
 `http://localhost:8080/events/`) — `register_research_agent` mirrors this same override for
 `ResearchIngressDispatchNode` (`EN.6.E`), so `RESEARCH_AGENT`'s self-feeding trigger into
@@ -413,8 +414,9 @@ This workflow has no dedicated `content-pipeline-state.json` telemetry writer of
   wired into the workspace yet; `UnimplementedTranscriptFetch` errors descriptively rather than
   silently returning empty content. The `with_fetch` seam is where later channel work plugs in a
   real implementation.
-- **Out of scope for this block**: real channel adapters for Slack/Email; Telegram/WhatsApp are
-  routed through `UnwiredChannelTransport` pending `EN.6.C`/`EN.6.D`, and the real Synapse `OR.Q`
+- **Out of scope for this block**: real channel adapters for Slack; Telegram/WhatsApp are
+  routed through `UnwiredChannelTransport` pending `EN.6.C`/`EN.6.D` (Email now has its own real
+  adapter, `EN.6.B`, see [email-adapter.md](email-adapter.md)), and the real Synapse `OR.Q`
   ingest endpoint remains a placeholder URL.
 - **Hermetic test coverage**: `crates/engine-core/tests/content_pipeline_e2e.rs` drives the full
   `Workflow::run` walk loop through every branch (both fetch/normalize converge paths, the
