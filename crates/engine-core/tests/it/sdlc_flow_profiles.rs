@@ -280,6 +280,15 @@ fn temp_worktree(tag: &str) -> PathBuf {
 /// `<worktree>/planning/fixture-profiles-spec/` — mirrors
 /// `sdlc_flow_e2e.rs::write_fixture_files`, reconstructed here since it
 /// isn't exported across the integration-test binary boundary.
+///
+/// **EN.3.D task 5:** also writes a minimal `planning/harness.json` with a
+/// single gating check (its command text is irrelevant since every test in
+/// this module stubs `TestTaskNode`'s runner via `always_pass_runner`).
+/// Before this block, `TestTaskNode` silently auto-passed a worktree with no
+/// harness at all; task 4 made that a gating `harness-missing` failure, so
+/// this fixture needs a harness to keep exercising the trivial-skip /
+/// per-task review routing these tests are actually about, rather than
+/// tripping on the (now-correct) no-harness failure path instead.
 fn write_fixture_tasks(worktree: &Path, max_attempts: u32) {
     let spec_dir = worktree.join("planning").join("fixture-profiles-spec");
     let tasks = json!([
@@ -294,6 +303,19 @@ fn write_fixture_tasks(worktree: &Path, max_attempts: u32) {
     std::fs::write(
         spec_dir.join("tasks.json"),
         serde_json::to_string_pretty(&tasks).unwrap(),
+    )
+    .unwrap();
+
+    let harness = json!({
+        "validation": {
+            "checks": [
+                { "name": "tests", "kind": "command", "command": "does-not-matter", "gates": true }
+            ]
+        }
+    });
+    std::fs::write(
+        worktree.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
     )
     .unwrap();
 }

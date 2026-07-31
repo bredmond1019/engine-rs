@@ -104,7 +104,8 @@ matches the built-in default):
       "generate": "sonnet"
     },
     "llm_triage": false,
-    "max_attempts": 3
+    "max_attempts": 3,
+    "test_depth": "full"
   }
 }
 ```
@@ -183,6 +184,34 @@ then the inline `policy` fields override individual knobs on top of it.
 | `llm_triage` | `bool` | Whether `TriageTaskNode` invokes the LLM classifier for a failing-but-under-budget task (`true`) vs. deterministically calling it `RETRYABLE` (`false`, default). |
 | `max_attempts` | `u32` | Retry budget per task before it's marked `FAILED`. |
 | `close_out.reuse.{validation,review,docs}` | `bool` each | Which `close-out` (EN.2.x) stages are allowed to reuse a prior flow record's result rather than re-running. |
+| `test_depth` | `full` \| `fast` (default `full`) | Which per-task validation checks `TestTaskNode` runs — see [Per-task check selection (`test_depth`)](#per-task-check-selection-test_depth) below. |
+
+### Per-task check selection (`test_depth`)
+
+Added in EN.3.D, bringing the Rust `SDLC_FLOW` to parity with the JS engine's three per-task
+test-selection behaviors (`.claude/workflows/sdlc-flow.js`): `fastCommand` substitution,
+`perTask: false` exclusion, and a task's own `validation_commands` replacing the project-wide
+harness suite. `TestTaskNode` resolves the checks to run via a pure `select_task_checks` function,
+in this precedence order:
+
+| Precedence | Condition | Result |
+|---|---|---|
+| 1 | The current task's own `validation_commands` (in `tasks.json`) is non-empty | Those commands run verbatim, as-is — `test_depth` is ignored entirely. |
+| 2 | Otherwise | `harness.json`'s `validation.checks[]`, minus any `enabled: false` check, minus any `perTask: false` check (excluded at BOTH depths) — and, for the remaining checks, `fastCommand` is substituted for `command` when `test_depth` is `fast` and the check declares a `fastCommand`, falling back to `command` when it doesn't or when `test_depth` is `full`. |
+| — | No `planning/harness.json` present AND the task has no `validation_commands` | A gating `harness-missing` failure — never a silent `all_passed: true`. |
+
+`TestTaskNode`'s result additively stamps `test_depth` (the resolved `full`/`fast` value),
+`check_source` (`"harness"` or `"task_validation_commands"`), and `excluded_checks` (the names skipped via
+`enabled: false` / `perTask: false`) onto its existing result payload, alongside the unchanged
+`all_passed` / `check_results` / `failure_summary` shape — so `RunTelemetry`/`PolicyAggregate` can
+attribute observed cost to the depth that caused it.
+
+This knob exists because per-task check selection is the single largest iteration-speed lever in
+this repo: CLAUDE.md measures the per-task tripwire at **2m44s** (running the full
+`cargo nextest run --workspace` + `cargo build --release` on every task attempt) versus **6.4s**
+(the `fastCommand`-substituted, `perTask: false`-excluded selection) — a ~25x difference for a
+check whose only job is to catch a regression before the next task attempt, not to be the
+authoritative gate (the end-of-run Validate task, and CI, still run the full suite).
 
 ## Structured-output adoption
 

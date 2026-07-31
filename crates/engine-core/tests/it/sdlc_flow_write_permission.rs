@@ -28,9 +28,20 @@ use serde_json::json;
 
 // --- fixtures --------------------------------------------------------------
 
-/// A fresh, empty temp directory, unique per call (no real `git worktree`
+/// A fresh temp directory, unique per call (no real `git worktree`
 /// involved — `TestTaskNode`/`TriageTaskNode` only need a path that exists
 /// so `std::fs`/the stubbed `CommandRunner` don't choke on a missing cwd).
+///
+/// **EN.3.D task 5:** also writes a `planning/harness.json` declaring an
+/// EMPTY `validation.checks` array. Before this block, `TestTaskNode`
+/// silently auto-passed a worktree with no harness *file* at all; task 4
+/// made a genuinely missing harness a gating `harness-missing` failure. An
+/// empty-but-present harness is different: the file exists (so the
+/// gating branch never fires) and it declares zero checks, so
+/// `check_results` stays empty and `all_passed` stays true when nothing
+/// else fails — exactly what these write-verification-guard tests need to
+/// keep isolating the guard's behavior rather than the (now-correct)
+/// no-harness failure path.
 fn temp_worktree() -> std::path::PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -38,7 +49,15 @@ fn temp_worktree() -> std::path::PathBuf {
         "engine-core-sdlc-flow-write-permission-test-{}-{n}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).expect("create temp worktree dir");
+    std::fs::create_dir_all(dir.join("planning")).expect("create temp worktree dir");
+
+    let harness = json!({ "validation": { "checks": [] } });
+    std::fs::write(
+        dir.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+
     dir
 }
 

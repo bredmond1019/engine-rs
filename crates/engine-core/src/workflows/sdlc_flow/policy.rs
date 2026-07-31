@@ -44,6 +44,22 @@ pub enum ReviewMode {
     EndOnly,
 }
 
+/// How much of a task's own check suite `TestTaskNode` runs at a given
+/// per-task tripwire (standing rule 6's cost/latency knob for EN.3.D).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestDepth {
+    /// Today's Rust behavior (the behavior-stable built-in default): run
+    /// every selected check's `command` verbatim.
+    #[default]
+    Full,
+    /// Substitute a check's `fastCommand` for its `command` when the check
+    /// declares one, falling back to `command` when it does not. A task
+    /// carrying its own `validation_commands` ignores this knob entirely
+    /// (see `select_task_checks`'s precedence rule in `task_loop.rs`).
+    Fast,
+}
+
 /// Per-stage model tier assignment. Field names match the stage identities
 /// used across `task_loop.rs`/`graph.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +110,8 @@ pub struct SdlcPolicy {
     pub review_mode: ReviewMode,
     pub review_skip_max_files: u32,
     pub review_skip_max_diff_lines: u32,
+    /// How much of a task's own check suite `TestTaskNode` runs (EN.3.D).
+    pub test_depth: TestDepth,
     pub model_tiers: ModelTiers,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
@@ -106,7 +124,8 @@ pub struct SdlcPolicy {
 impl Default for SdlcPolicy {
     /// The safe default: reproduces today's (pre-EN.3.C) behavior exactly.
     /// Normal verbosity, `per_task` review, all-Sonnet tiers, no close-out
-    /// reuse, prompt-cache off, `llm_triage` false, `max_attempts` 3.
+    /// reuse, prompt-cache off, `llm_triage` false, `max_attempts` 3,
+    /// `test_depth: full`.
     fn default() -> Self {
         Self {
             output_verbosity: OutputVerbosity::Normal,
@@ -114,6 +133,7 @@ impl Default for SdlcPolicy {
             review_mode: ReviewMode::PerTask,
             review_skip_max_files: 2,
             review_skip_max_diff_lines: 40,
+            test_depth: TestDepth::Full,
             model_tiers: ModelTiers::default(),
             local: LocalConfig::default(),
             simple_task_max_files: 2,
@@ -137,6 +157,7 @@ pub struct PartialPolicy {
     pub review_mode: Option<ReviewMode>,
     pub review_skip_max_files: Option<u32>,
     pub review_skip_max_diff_lines: Option<u32>,
+    pub test_depth: Option<TestDepth>,
     pub model_tiers: Option<PartialModelTiers>,
     pub local: Option<PartialLocalConfig>,
     pub simple_task_max_files: Option<u32>,
@@ -230,6 +251,7 @@ impl crate::policy::Policy for SdlcPolicy {
                 base.review_skip_max_diff_lines,
                 over.review_skip_max_diff_lines,
             ),
+            test_depth: merge_opt(base.test_depth, over.test_depth),
             model_tiers: match &over.model_tiers {
                 Some(mt) => merge_model_tiers(base.model_tiers, mt),
                 None => base.model_tiers,
@@ -307,6 +329,83 @@ mod tests {
         assert!(!policy.prompt_cache);
         assert!(!policy.llm_triage);
         assert_eq!(policy.max_attempts, 3);
+    }
+
+    #[test]
+    fn builtin_default_test_depth_is_full() {
+        assert_eq!(SdlcPolicy::default().test_depth, TestDepth::Full);
+    }
+
+    #[test]
+    fn test_depth_serde_wire_contract_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TestDepth::Full).unwrap(),
+            serde_json::json!("full")
+        );
+        assert_eq!(
+            serde_json::to_value(TestDepth::Fast).unwrap(),
+            serde_json::json!("fast")
+        );
+        assert_eq!(
+            serde_json::from_value::<TestDepth>(serde_json::json!("full")).unwrap(),
+            TestDepth::Full
+        );
+        assert_eq!(
+            serde_json::from_value::<TestDepth>(serde_json::json!("fast")).unwrap(),
+            TestDepth::Fast
+        );
+    }
+
+    #[test]
+    fn harness_default_overrides_builtin_for_test_depth() {
+        let harness = PartialPolicy {
+            test_depth: Some(TestDepth::Fast),
+            ..Default::default()
+        };
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, None);
+        assert_eq!(resolved.test_depth, TestDepth::Fast);
+    }
+
+    #[test]
+    fn profile_overrides_harness_default_for_test_depth() {
+        let harness = PartialPolicy {
+            test_depth: Some(TestDepth::Fast),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            test_depth: Some(TestDepth::Full),
+            ..Default::default()
+        };
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), Some(&profile), None);
+        assert_eq!(resolved.test_depth, TestDepth::Full);
+    }
+
+    #[test]
+    fn event_override_beats_profile_for_test_depth() {
+        let profile = PartialPolicy {
+            test_depth: Some(TestDepth::Fast),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            test_depth: Some(TestDepth::Full),
+            ..Default::default()
+        };
+        let resolved = resolve(SdlcPolicy::default(), None, Some(&profile), Some(&event));
+        assert_eq!(resolved.test_depth, TestDepth::Full);
+    }
+
+    #[test]
+    fn partial_policy_with_none_test_depth_leaves_lower_layer_untouched() {
+        let harness = PartialPolicy {
+            test_depth: Some(TestDepth::Fast),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            test_depth: None,
+            ..Default::default()
+        };
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, Some(&event));
+        assert_eq!(resolved.test_depth, TestDepth::Fast);
     }
 
     #[test]
@@ -499,7 +598,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}}}";
 
         assert_eq!(serde_json::to_string(&resolved).unwrap(), expected);
     }

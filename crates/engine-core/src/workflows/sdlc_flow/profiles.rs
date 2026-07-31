@@ -8,12 +8,14 @@
 //! Every field left `None` here falls through to whatever layer is applied
 //! below it (harness defaults, then the built-in default).
 
-use super::policy::{ModelTier, OutputVerbosity, PartialModelTiers, PartialPolicy, ReviewMode};
+use super::policy::{
+    ModelTier, OutputVerbosity, PartialModelTiers, PartialPolicy, ReviewMode, TestDepth,
+};
 
 /// The explicit control profile: Sonnet on every tier, `per_task` review,
-/// `llm_triage` off. Spelled out explicitly (rather than left all-`None`)
-/// so selecting `profile: "baseline"` is a legible, self-documenting no-op
-/// against the built-in default.
+/// `llm_triage` off, `test_depth: full`. Spelled out explicitly (rather than
+/// left all-`None`) so selecting `profile: "baseline"` is a legible,
+/// self-documenting no-op against the built-in default.
 #[must_use]
 pub fn baseline() -> PartialPolicy {
     PartialPolicy {
@@ -26,12 +28,15 @@ pub fn baseline() -> PartialPolicy {
         }),
         review_mode: Some(ReviewMode::PerTask),
         llm_triage: Some(false),
+        test_depth: Some(TestDepth::Full),
         ..Default::default()
     }
 }
 
 /// Cheapest/fastest profile: `haiku` implement, local triage+review, terse
-/// output, trivial-task review skip.
+/// output, trivial-task review skip, `test_depth: fast` (the cost/latency
+/// floor — per-task check selection is the single largest lever in this
+/// repo, per CLAUDE.md's measured 2m44s -> 6.4s).
 #[must_use]
 pub fn cheap_fast() -> PartialPolicy {
     PartialPolicy {
@@ -43,12 +48,13 @@ pub fn cheap_fast() -> PartialPolicy {
         }),
         output_verbosity: Some(OutputVerbosity::Terse),
         review_mode: Some(ReviewMode::TrivialSkip),
+        test_depth: Some(TestDepth::Fast),
         ..Default::default()
     }
 }
 
 /// Balanced profile: `sonnet` implement, local review, prompt caching on,
-/// trivial-task review skip, `llm_triage` on.
+/// trivial-task review skip, `llm_triage` on, `test_depth: fast`.
 #[must_use]
 pub fn pragmatist() -> PartialPolicy {
     PartialPolicy {
@@ -60,12 +66,13 @@ pub fn pragmatist() -> PartialPolicy {
         prompt_cache: Some(true),
         review_mode: Some(ReviewMode::TrivialSkip),
         llm_triage: Some(true),
+        test_depth: Some(TestDepth::Fast),
         ..Default::default()
     }
 }
 
 /// Batch profile: `sonnet` implement, per-task review collapsed into a
-/// single end-of-run review.
+/// single end-of-run review, `test_depth: fast`.
 #[must_use]
 pub fn batch_reviewer() -> PartialPolicy {
     PartialPolicy {
@@ -74,6 +81,7 @@ pub fn batch_reviewer() -> PartialPolicy {
             ..Default::default()
         }),
         review_mode: Some(ReviewMode::EndOnly),
+        test_depth: Some(TestDepth::Fast),
         ..Default::default()
     }
 }
@@ -117,6 +125,7 @@ mod tests {
         assert_eq!(tiers.review, Some(ModelTier::Local));
         assert_eq!(p.output_verbosity, Some(OutputVerbosity::Terse));
         assert_eq!(p.review_mode, Some(ReviewMode::TrivialSkip));
+        assert_eq!(p.test_depth, Some(TestDepth::Fast));
     }
 
     #[test]
@@ -128,6 +137,7 @@ mod tests {
         assert_eq!(p.prompt_cache, Some(true));
         assert_eq!(p.review_mode, Some(ReviewMode::TrivialSkip));
         assert_eq!(p.llm_triage, Some(true));
+        assert_eq!(p.test_depth, Some(TestDepth::Fast));
     }
 
     #[test]
@@ -136,6 +146,7 @@ mod tests {
         let tiers = p.model_tiers.expect("model_tiers set");
         assert_eq!(tiers.implement, Some(ModelTier::Sonnet));
         assert_eq!(p.review_mode, Some(ReviewMode::EndOnly));
+        assert_eq!(p.test_depth, Some(TestDepth::Fast));
     }
 
     #[test]
@@ -148,5 +159,17 @@ mod tests {
         assert_eq!(tiers.generate, Some(ModelTier::Sonnet));
         assert_eq!(p.review_mode, Some(ReviewMode::PerTask));
         assert_eq!(p.llm_triage, Some(false));
+        assert_eq!(p.test_depth, Some(TestDepth::Full));
+    }
+
+    #[test]
+    fn every_named_profile_sets_test_depth() {
+        for name in ["baseline", "cheap-fast", "pragmatist", "batch-reviewer"] {
+            let p = profile_by_name(name).expect("known profile name");
+            assert!(
+                p.test_depth.is_some(),
+                "profile `{name}` must set test_depth explicitly"
+            );
+        }
     }
 }

@@ -57,6 +57,7 @@
     "review_mode": "per_task",
     "review_skip_max_files": 2,
     "review_skip_max_diff_lines": 40,
+    "test_depth": "full",
     "model_tiers": {
       "implement": "sonnet",
       "implement_simple": "sonnet",

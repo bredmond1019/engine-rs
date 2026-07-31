@@ -27,7 +27,7 @@ use crate::routing::Router;
 
 #[cfg(test)]
 use super::policy::{ModelTier, OutputVerbosity};
-use super::policy::{ReviewMode, SdlcPolicy};
+use super::policy::{ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
@@ -917,6 +917,129 @@ impl TestTaskNode {
     }
 }
 
+/// Telemetry record for [`select_task_checks`]: which source produced the
+/// checks that ran and what got dropped. Exists PURELY for standing rule 6's
+/// "stamp the resolved value" requirement — `RunTelemetry`/`PolicyAggregate`
+/// can attribute an observed cost/latency delta to the setting that caused
+/// it. Nothing downstream branches on this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckSelection {
+    /// Exactly one of `"task_validation_commands"` or `"harness"`.
+    source: &'static str,
+    /// The depth this selection was resolved at (recorded even when the
+    /// `task_validation_commands` branch ignored it, so the telemetry
+    /// record always reflects the run's resolved policy).
+    depth: TestDepth,
+    /// Names of harness checks dropped from the run (`enabled: false` or
+    /// `perTask: false`). Always empty on the `task_validation_commands`
+    /// branch, since nothing is dropped there.
+    excluded: Vec<String>,
+}
+
+/// Pure selection of which checks `run_checks` should execute this attempt.
+/// Mirrors `.claude/workflows/sdlc-flow.js` (commit `a21a95e`) exactly:
+///
+/// 1. If `task_validation_commands` is non-empty, it wins VERBATIM and
+///    `depth` is ignored entirely — a self-validating task needs no harness
+///    and no fast/full substitution. Each command is synthesized into a
+///    `command`-kind check (`{"name": "task-validation-<i>", "kind":
+///    "command", "command": "<cmd>", "gates": true}`, 1-indexed) so
+///    `run_checks` needs no new executor branch.
+/// 2. Otherwise, start from `harness_checks`, drop any check with
+///    `enabled: false` (belt-and-braces — `run_checks` also drops these,
+///    but excluding them here too keeps `excluded` a truthful, complete
+///    record) and any check with `perTask: false` (the JS filter at
+///    `sdlc-flow.js:548`). When `depth == TestDepth::Fast` and a surviving
+///    check declares a non-empty string `fastCommand`, return a clone with
+///    `command` replaced by that `fastCommand` (the JS substitution at
+///    `sdlc-flow.js:624`) — falling back to the check's own `command` when
+///    `fastCommand` is absent or not a non-empty string. No other field
+///    (`gates`, `kind`, `purpose`, `baselineCommand`, `compareKeys`,
+///    `_comment`, `fastCommand` itself, ...) is touched, so `run_checks`
+///    and its kind-specific readers see the check otherwise byte-identical.
+///
+/// Pure by design: no runner, no filesystem, no policy stamp — the whole
+/// precedence table is unit-testable by constructing `serde_json::Value`
+/// arrays directly.
+///
+fn select_task_checks(
+    harness_checks: &[serde_json::Value],
+    task_validation_commands: &[String],
+    depth: TestDepth,
+) -> (Vec<serde_json::Value>, CheckSelection) {
+    if !task_validation_commands.is_empty() {
+        let synthesized = task_validation_commands
+            .iter()
+            .enumerate()
+            .map(|(i, cmd)| {
+                json!({
+                    "name": format!("task-validation-{}", i + 1),
+                    "kind": "command",
+                    "command": cmd,
+                    "gates": true,
+                })
+            })
+            .collect();
+        return (
+            synthesized,
+            CheckSelection {
+                source: "task_validation_commands",
+                depth,
+                excluded: Vec::new(),
+            },
+        );
+    }
+
+    let mut selected = Vec::new();
+    let mut excluded = Vec::new();
+
+    for check in harness_checks {
+        let name = check
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        if check.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            excluded.push(name);
+            continue;
+        }
+        if check.get("perTask").and_then(|v| v.as_bool()) == Some(false) {
+            excluded.push(name);
+            continue;
+        }
+
+        if depth == TestDepth::Fast {
+            let fast_command = check
+                .get("fastCommand")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(fast_command) = fast_command {
+                let mut substituted = check.clone();
+                if let Some(obj) = substituted.as_object_mut() {
+                    obj.insert(
+                        "command".to_string(),
+                        serde_json::Value::String(fast_command.to_string()),
+                    );
+                }
+                selected.push(substituted);
+                continue;
+            }
+        }
+
+        selected.push(check.clone());
+    }
+
+    (
+        selected,
+        CheckSelection {
+            source: "harness",
+            depth,
+            excluded,
+        },
+    )
+}
+
 impl Default for TestTaskNode {
     fn default() -> Self {
         Self::new()
@@ -929,30 +1052,91 @@ impl Node for TestTaskNode {
         let worktree = worktree_path(&ctx)?;
         let worktree = Path::new(&worktree);
 
+        // Depth comes from the resolved policy (task 4 makes `TestTaskNode`
+        // policy-strict for the first time — see `resolved_policy`'s doc
+        // comment for why this fails loudly rather than falling back).
+        let policy = resolved_policy(&ctx)?;
+        let depth = policy.test_depth;
+
+        // The CURRENT task's own `validation_commands`, read from the live
+        // durable state by `current_task_id` — copying `TriageTaskNode`'s
+        // exact lookup pattern (and its reason: `TaskQueueRouterNode`'s
+        // output is a snapshot frozen at dispatch time, not the live state).
+        let current = current_task_fields(&ctx)?.clone();
+        let current_task_id = current
+            .get("current_task_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
+            as u32;
+        let state = latest_state(&ctx)?;
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.task_id == current_task_id)
+            .ok_or_else(|| {
+                NodeError::new(format!(
+                    "TestTaskNode: no task with task_id={current_task_id} found in state"
+                ))
+            })?;
+        let task_validation_commands = task.validation_commands.clone();
+
         // Write-verification guard runs before the harness suite so a
         // claimed-but-empty implement never gets a free pass through checks
         // that happen to already be green (e.g. no `harness.json`).
         let write_verification = self.verify_claimed_writes(&ctx, worktree);
 
         let harness_path = worktree.join("planning").join("harness.json");
-        let (mut check_results, mut failed_names) = if harness_path.exists() {
+        let harness_exists = harness_path.exists();
+        let harness_checks: Vec<serde_json::Value> = if harness_exists {
             let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
             })?;
             let harness: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
                 NodeError::new(format!("failed to parse {}: {err}", harness_path.display()))
             })?;
-            let checks: Vec<serde_json::Value> = harness
+            harness
                 .get("validation")
                 .and_then(|v| v.get("checks"))
                 .and_then(|v| v.as_array())
                 .cloned()
-                .unwrap_or_default();
-
-            self.run_checks(&checks, worktree)
+                .unwrap_or_default()
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
+
+        // No harness AND no self-validating `validation_commands`: there is
+        // nothing to check. Previously this silently produced
+        // `all_passed: true` with zero checks; now it is a gating
+        // `harness-missing` failure instead.
+        let (mut check_results, mut failed_names, selection) =
+            if !harness_exists && task_validation_commands.is_empty() {
+                let result = CheckResult {
+                    name: "harness-missing".to_string(),
+                    kind: "harness-missing".to_string(),
+                    passed: false,
+                    output: String::new(),
+                    message: format!(
+                        "no planning/harness.json found at {} and task {current_task_id} \
+                         declares no validation_commands: nothing to validate against, so this \
+                         is a gating failure rather than a silent pass",
+                        harness_path.display()
+                    ),
+                };
+                (
+                    vec![result.clone()],
+                    vec![result.name.clone()],
+                    CheckSelection {
+                        source: "harness",
+                        depth,
+                        excluded: Vec::new(),
+                    },
+                )
+            } else {
+                let (selected_checks, selection) =
+                    select_task_checks(&harness_checks, &task_validation_commands, depth);
+                let (results, failed) = self.run_checks(&selected_checks, worktree);
+                (results, failed, selection)
+            };
 
         if let Some(guard_result) = write_verification {
             failed_names.insert(0, guard_result.name.clone());
@@ -973,6 +1157,10 @@ impl Node for TestTaskNode {
                 "all_passed": all_passed,
                 "check_results": check_results,
                 "failure_summary": failure_summary,
+                "test_depth": serde_json::to_value(selection.depth)
+                    .unwrap_or(serde_json::Value::Null),
+                "check_source": selection.source,
+                "excluded_checks": selection.excluded,
             }),
         );
 
@@ -2257,16 +2445,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_no_harness_json_passes() {
+        // Renamed intent, same coverage: task 4's harness-missing fix means
+        // a worktree with no `planning/harness.json` and a task with no
+        // `validation_commands` is now a GATING failure, not a silent pass
+        // (see the "harness-missing fix" note in tasks.md). This is the
+        // exact behavior the spec's acceptance criteria require.
         let worktree = temp_worktree();
-        let mut ctx = empty_context(json!({}));
-        ctx.nodes.insert(
-            "SetupWorktreeNode".to_string(),
-            json!({ "worktree_path": worktree.to_string_lossy() }),
-        );
+        let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new();
         let out = node.process(ctx).await.expect("process should succeed");
-        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "harness-missing");
     }
 
     #[tokio::test]
@@ -2277,11 +2470,7 @@ mod tests {
             json!([{ "name": "always_fail", "command": "exit 1", "gates": true }]),
         );
 
-        let mut ctx = empty_context(json!({}));
-        ctx.nodes.insert(
-            "SetupWorktreeNode".to_string(),
-            json!({ "worktree_path": worktree.to_string_lossy() }),
-        );
+        let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new();
         let out = node.process(ctx).await.expect("process should succeed");
@@ -2308,11 +2497,7 @@ mod tests {
             })
         });
 
-        let mut ctx = empty_context(json!({}));
-        ctx.nodes.insert(
-            "SetupWorktreeNode".to_string(),
-            json!({ "worktree_path": worktree.to_string_lossy() }),
-        );
+        let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new().with_runner(runner.clone());
         let out = node.process(ctx.clone()).await.unwrap();
@@ -2323,8 +2508,18 @@ mod tests {
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
     }
 
+    /// Builds a `ctx` with a `SetupWorktreeNode` output plus everything
+    /// `TestTaskNode` now needs to reach it (task 4 makes `TestTaskNode`
+    /// policy-strict and reads the CURRENT task's `validation_commands` out
+    /// of the live durable state): a single default task (no
+    /// `validation_commands`), a matching `TaskQueueRouterNode`/
+    /// `LoadTaskStateNode` pair, and the built-in `SdlcPolicy` default
+    /// (behavior-stable per rule 6, so stamping it changes nothing these
+    /// tests assert).
     fn ctx_for_worktree(worktree: &Path) -> TaskContext {
-        let mut ctx = empty_context(json!({}));
+        let task = SDLCTask::new(1, "t", "d");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
         ctx.nodes.insert(
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": worktree.to_string_lossy() }),
@@ -2393,6 +2588,10 @@ mod tests {
     #[tokio::test]
     async fn write_verification_passes_when_claimed_file_changed() {
         let worktree = temp_worktree();
+        // An empty (but present) harness keeps this test isolated to the
+        // write-verification guard: task 4's harness-missing fix only gates
+        // when `planning/harness.json` is absent entirely.
+        write_harness(&worktree, json!([]));
         let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
 
         let node = TestTaskNode::new().with_runner(porcelain_runner(" M src/lib.rs\n"));
@@ -2410,6 +2609,7 @@ mod tests {
     #[tokio::test]
     async fn write_verification_does_not_trip_on_empty_claim() {
         let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
         let ctx = ctx_with_implement_claim(&worktree, &[]);
 
         let node = TestTaskNode::new().with_runner(porcelain_runner(""));
@@ -2427,6 +2627,7 @@ mod tests {
     #[tokio::test]
     async fn write_verification_does_not_trip_when_implement_never_ran() {
         let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
         let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new().with_runner(porcelain_runner(""));
@@ -3669,5 +3870,340 @@ mod tests {
         assert!(value["docs"].is_null());
         assert!(value["pr"].is_null());
         assert!(value["bail_reason"].is_null());
+    }
+
+    // --- select_task_checks --------------------------------------------------
+
+    fn cmd_check(name: &str, command: &str) -> serde_json::Value {
+        json!({ "name": name, "kind": "command", "command": command, "gates": true })
+    }
+
+    fn cmd_check_with_fast(name: &str, command: &str, fast_command: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "kind": "command",
+            "command": command,
+            "fastCommand": fast_command,
+            "gates": true,
+        })
+    }
+
+    #[test]
+    fn select_task_checks_full_depth_keeps_command_even_with_fast_command() {
+        let checks = vec![cmd_check_with_fast(
+            "test",
+            "cargo test --workspace",
+            "cargo test --lib",
+        )];
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Full);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["command"], json!("cargo test --workspace"));
+        assert_eq!(selection.source, "harness");
+        assert_eq!(selection.depth, TestDepth::Full);
+        assert!(selection.excluded.is_empty());
+    }
+
+    #[test]
+    fn select_task_checks_fast_depth_substitutes_fast_command() {
+        let checks = vec![cmd_check_with_fast(
+            "test",
+            "cargo test --workspace",
+            "cargo test --lib",
+        )];
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Fast);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["command"], json!("cargo test --lib"));
+        // No other field is disturbed by the substitution.
+        assert_eq!(selected[0]["fastCommand"], json!("cargo test --lib"));
+        assert_eq!(selected[0]["gates"], json!(true));
+        assert_eq!(selection.source, "harness");
+        assert_eq!(selection.depth, TestDepth::Fast);
+    }
+
+    #[test]
+    fn select_task_checks_fast_depth_falls_back_to_command_when_no_fast_command() {
+        let checks = vec![cmd_check("fmt", "cargo fmt --check")];
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Fast);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["command"], json!("cargo fmt --check"));
+        assert_eq!(selection.source, "harness");
+    }
+
+    #[test]
+    fn select_task_checks_excludes_per_task_false_at_both_depths() {
+        let mut build = cmd_check("build", "cargo build --release");
+        build["perTask"] = json!(false);
+        let checks = vec![build];
+
+        for depth in [TestDepth::Full, TestDepth::Fast] {
+            let (selected, selection) = select_task_checks(&checks, &[], depth);
+            assert!(
+                selected.is_empty(),
+                "depth {depth:?} should exclude perTask:false"
+            );
+            assert_eq!(selection.excluded, vec!["build".to_string()]);
+        }
+    }
+
+    #[test]
+    fn select_task_checks_excludes_enabled_false() {
+        let mut fmt = cmd_check("fmt", "cargo fmt --check");
+        fmt["enabled"] = json!(false);
+        let checks = vec![fmt];
+
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Full);
+        assert!(selected.is_empty());
+        assert_eq!(selection.excluded, vec!["fmt".to_string()]);
+    }
+
+    #[test]
+    fn select_task_checks_task_validation_commands_replaces_everything() {
+        let harness_checks = vec![cmd_check("fmt", "cargo fmt --check")];
+        let task_commands = vec![
+            "test -f docs/foo.md".to_string(),
+            "grep -q bar docs/foo.md".to_string(),
+        ];
+
+        for depth in [TestDepth::Full, TestDepth::Fast] {
+            let (selected, selection) = select_task_checks(&harness_checks, &task_commands, depth);
+            assert_eq!(
+                selected,
+                vec![
+                    json!({
+                        "name": "task-validation-1",
+                        "kind": "command",
+                        "command": "test -f docs/foo.md",
+                        "gates": true,
+                    }),
+                    json!({
+                        "name": "task-validation-2",
+                        "kind": "command",
+                        "command": "grep -q bar docs/foo.md",
+                        "gates": true,
+                    }),
+                ],
+                "depth {depth:?} should not change the synthesized shape"
+            );
+            assert_eq!(selection.source, "task_validation_commands");
+            assert!(selection.excluded.is_empty());
+        }
+    }
+
+    #[test]
+    fn select_task_checks_empty_task_validation_commands_falls_through_to_harness() {
+        let harness_checks = vec![cmd_check("fmt", "cargo fmt --check")];
+        let (selected, selection) = select_task_checks(&harness_checks, &[], TestDepth::Full);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["name"], json!("fmt"));
+        assert_eq!(selection.source, "harness");
+    }
+
+    #[test]
+    fn select_task_checks_source_literal_matches_branch() {
+        let harness_checks = vec![cmd_check("fmt", "cargo fmt --check")];
+        let (_, harness_selection) = select_task_checks(&harness_checks, &[], TestDepth::Full);
+        assert_eq!(harness_selection.source, "harness");
+
+        let (_, override_selection) =
+            select_task_checks(&harness_checks, &["echo hi".to_string()], TestDepth::Full);
+        assert_eq!(override_selection.source, "task_validation_commands");
+    }
+
+    // --- TestTaskNode::process x select_task_checks wiring (task 4) --------
+
+    /// A recording [`CommandRunner`] that always succeeds and records every
+    /// `sh -c <command>` invocation's `<command>` string, in order.
+    fn recording_command_runner() -> (CommandRunner, Arc<Mutex<Vec<String>>>) {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            if let Some(command) = args.get(1) {
+                recorded_clone.lock().unwrap().push((*command).to_string());
+            }
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        (runner, recorded)
+    }
+
+    /// A [`ctx_with_current_task`]-based ctx that also carries a
+    /// `SetupWorktreeNode` output pointing at `worktree`, so `TestTaskNode`
+    /// can resolve both the current task (for `validation_commands`) and the
+    /// worktree path (for `planning/harness.json`).
+    fn ctx_with_current_task_and_worktree(
+        state: &SDLCState,
+        task: &SDLCTask,
+        worktree: &Path,
+    ) -> TaskContext {
+        let mut ctx = ctx_with_current_task(state, task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn test_task_full_depth_runs_command_even_with_fast_command_present() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([cmd_check_with_fast(
+                "test",
+                "cargo nextest run --workspace",
+                "cargo nextest run --lib --workspace"
+            )]),
+        );
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec!["cargo nextest run --workspace"]
+        );
+        assert_eq!(out.nodes["TestTaskNode"]["test_depth"], json!("full"));
+        assert_eq!(out.nodes["TestTaskNode"]["check_source"], json!("harness"));
+    }
+
+    #[tokio::test]
+    async fn test_task_fast_depth_substitutes_fast_command() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([cmd_check_with_fast(
+                "test",
+                "cargo nextest run --workspace",
+                "cargo nextest run --lib --workspace"
+            )]),
+        );
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+        let ctx = ctx_with_policy(
+            ctx,
+            &SdlcPolicy {
+                test_depth: TestDepth::Fast,
+                ..SdlcPolicy::default()
+            },
+        );
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec!["cargo nextest run --lib --workspace"]
+        );
+        assert_eq!(out.nodes["TestTaskNode"]["test_depth"], json!("fast"));
+    }
+
+    #[tokio::test]
+    async fn test_task_uses_task_validation_commands_over_harness() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([cmd_check("fmt", "cargo fmt --check")]));
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.validation_commands = vec!["test -f docs/foo.md".to_string()];
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        assert_eq!(*recorded.lock().unwrap(), vec!["test -f docs/foo.md"]);
+        assert_eq!(
+            out.nodes["TestTaskNode"]["check_source"],
+            json!("task_validation_commands")
+        );
+        assert!(out.nodes["TestTaskNode"]["excluded_checks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_task_result_stamps_test_depth_check_source_excluded_checks() {
+        let worktree = temp_worktree();
+        let mut build = cmd_check("build", "cargo build --release");
+        build["perTask"] = json!(false);
+        write_harness(
+            &worktree,
+            json!([cmd_check("fmt", "cargo fmt --check"), build]),
+        );
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let (runner, _recorded) = recording_command_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        assert_eq!(out.nodes["TestTaskNode"]["test_depth"], json!("full"));
+        assert_eq!(out.nodes["TestTaskNode"]["check_source"], json!("harness"));
+        assert_eq!(
+            out.nodes["TestTaskNode"]["excluded_checks"],
+            json!(["build"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_no_harness_and_no_validation_commands_is_gating_failure() {
+        let worktree = temp_worktree();
+        // No harness.json written — `temp_worktree` only creates the
+        // `planning/` directory, not the file.
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let node = TestTaskNode::new();
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results
+            .iter()
+            .any(|r| r["name"] == json!("harness-missing")));
+        assert!(out.nodes["TestTaskNode"]["failure_summary"]
+            .as_str()
+            .unwrap()
+            .contains("harness-missing"));
+    }
+
+    #[tokio::test]
+    async fn test_task_no_harness_but_with_validation_commands_runs_them_no_harness_missing() {
+        let worktree = temp_worktree();
+        // No harness.json written.
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.validation_commands = vec!["true".to_string()];
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let (runner, recorded) = recording_command_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        assert_eq!(*recorded.lock().unwrap(), vec!["true"]);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(!results
+            .iter()
+            .any(|r| r["name"] == json!("harness-missing")));
     }
 }
