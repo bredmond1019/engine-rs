@@ -197,7 +197,7 @@ in this precedence order:
 | Precedence | Condition | Result |
 |---|---|---|
 | 1 | The current task's own `validation_commands` (in `tasks.json`) is non-empty | Those commands run verbatim, as-is — `test_depth` is ignored entirely. |
-| 2 | Otherwise | `harness.json`'s `validation.checks[]`, minus any `enabled: false` check, minus any `perTask: false` check (excluded at BOTH depths) — and, for the remaining checks, `fastCommand` is substituted for `command` when `test_depth` is `fast` and the check declares a `fastCommand`, falling back to `command` when it doesn't or when `test_depth` is `full`. |
+| 2 | Otherwise | `harness.json`'s `validation.checks[]`, minus any `enabled: false` check, minus any `perTask: false` check (excluded at BOTH depths, for `TestTaskNode` specifically — see the caveat below) — and, for the remaining checks, `fastCommand` is substituted for `command` when `test_depth` is `fast` and the check declares a `fastCommand`, falling back to `command` when it doesn't or when `test_depth` is `full`. |
 | — | No `planning/harness.json` present AND the task has no `validation_commands` | A gating `harness-missing` failure — never a silent `all_passed: true`. |
 
 `TestTaskNode`'s result additively stamps `test_depth` (the resolved `full`/`fast` value),
@@ -211,7 +211,18 @@ this repo: CLAUDE.md measures the per-task tripwire at **2m44s** (running the fu
 `cargo nextest run --workspace` + `cargo build --release` on every task attempt) versus **6.4s**
 (the `fastCommand`-substituted, `perTask: false`-excluded selection) — a ~25x difference for a
 check whose only job is to catch a regression before the next task attempt, not to be the
-authoritative gate (the end-of-run Validate task, and CI, still run the full suite).
+authoritative gate. That gate is `FinalValidationNode` (`EN.3.E`), a second, unconditional
+check-running site on the declared graph's task-loop drain branch that runs the full,
+unfiltered suite (including the `perTask: false` `build` check) exactly once per run — see
+[FinalValidationNode](sdlc-flow-workflow.md#the-two-check-site-model-per-task-tripwire-vs-final-gate)
+and [D12](../planning/decisions/D12-per-task-vs-final-check-depth.md). `test_depth`/`flow.testDepth`
+governs `TestTaskNode` only; it is deliberately never read by `FinalValidationNode`, which is
+pinned to `TestDepth::Full` regardless of policy (a policy knob may tune a per-task tripwire's
+depth, but whether the authoritative suite runs at all is not a cost lever — CLAUDE.md standing
+rule 6, "one graph, validated once, is what makes runs comparable"). The end-of-run "Validate"
+*task* in an SDLC spec (this repo's own `tasks.json` convention) and CI still separately run the
+full suite too, but those are outside the graph — `FinalValidationNode` is what guarantees it
+inside every `SDLC_FLOW` run itself.
 
 ## Structured-output adoption
 
