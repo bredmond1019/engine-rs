@@ -18,6 +18,49 @@ related: [status, context]
 
 ## [run: 2026-07-31]
 
+### `EN.3.J-sdlc-flow-smoke` — BAILED (tasks 1-5 passed, review FAIL)
+- **What:** Ran `/sdlc-flow EN.3.J-sdlc-flow-smoke` on branch `EN.3.J-sdlc-flow-smoke-flow`, scoped to
+  tasks 1-5. Authored the minimal one-task smoke spec (`planning/smoke-sdlc-flow/tasks.json` +
+  OKF-frontmattered `tasks.md`) whose only job is to make an agentic node write `SMOKE.md` containing
+  `ENGINE-SMOKE` at the worktree root (task 1); added `scripts/sdlc_smoke.sh`, an executable
+  trigger-and-watch harness that POSTs the `SDLC_FLOW` smoke event, extracts `event_id` from the 202,
+  polls `GET /events/{event_id}` printing status transitions, and exits 0/1/2 on
+  succeeded/failed-cancelled-budget_halted/timeout, never touching the SSE stream endpoint (task 2);
+  gave `--clean` its real implementation — removes the smoke worktree, deletes the branch, and
+  `rm -rf`'s the leftover `sdlc-flow-state.json` dir, each step tolerant of the resource being absent,
+  with an inline comment explaining the `SpecExistsRouterNode` resume hazard (task 3); fixed
+  `agentic-portfolio/scripts/health_check.sh --full` (committed in the parent repo) to recognize the
+  real terminal status vocabulary (`succeeded|failed|cancelled|budget_halted`) instead of the
+  nonexistent `"completed"` (task 4); added `docs/sdlc-flow-smoke.md` documenting the six operational
+  prerequisites, the event-flag rationale, the QuickLaunch watch limitation, the run/cleanup
+  procedure, and the real status vocabulary, registered in `docs/index.md` (task 5). All five tasks
+  passed on first attempt. The run then bailed at review: `cargo nextest run --workspace` (a gating
+  check) fails on two pre-existing tests in `sdlc_flow::setup`
+  (`spec_exists_routes_to_generate_when_absent`, `spec_exists_ignores_state_file_at_old_flat_path`) —
+  confirmed via `git diff main..HEAD` to touch zero `.rs` files and to leave `setup.rs` untouched, so
+  the failure predates this branch and is out of scope to fix under EN.3.J, but per review protocol a
+  fresh gating-check failure still blocks PASS regardless of attribution. Separately, task 6 (the
+  human-in-the-loop real-run evidence acceptance criterion) is explicitly forbidden to an agent by the
+  spec's own Notes — "an agent reaching it must stop and hand off" — so it remains unmet by design at
+  this point in the spec, not a defect in tasks 1-5. Both issues require human handoff rather than
+  another automated retry: the setup-test regression needs triage as its own fix (likely from another
+  block or environment drift), and task 6 needs an actual human-triggered run with real evidence
+  recorded in `tasks.md`'s Notes. No production Rust code changed on this branch. Next: triage and fix
+  the two pre-existing `sdlc_flow::setup` test failures (likely as a follow-up chore, not under
+  EN.3.J), then have a human trigger the real smoke run from bastion-web and record the evidence
+  before EN.3.J can close.
+
+```
+808c2be feat: implement EN.3.J-sdlc-flow-smoke-task5
+f315814 feat: implement EN.3.J-sdlc-flow-smoke-task3
+038002b feat: implement EN.3.J-sdlc-flow-smoke-task2
+e10818a Merge pull request #33 from bredmond1019/EN.3.G-terminal-path-robustness-flow
+26f20ff chore: wrap up EN.3.G-terminal-path-robustness
+f03d08c docs: update docs for EN.3.G-terminal-path-robustness
+7bd83c9 feat: implement EN.3.G-terminal-path-robustness-task8
+da808b1 feat: implement EN.3.G-terminal-path-robustness-task7
+```
+
 ### `EN.3.G-terminal-path-robustness` — PASS (all 9 tasks)
 - **What:** Ran `/sdlc-flow EN.3.G-terminal-path-robustness` on branch
   `EN.3.G-terminal-path-robustness-flow`. Made it structurally impossible for an `SDLC_FLOW` run to
