@@ -39,6 +39,7 @@ mod sdlc_flow_e2e;
 mod sdlc_flow_experiment;
 mod sdlc_flow_live;
 mod sdlc_flow_profiles;
+mod sdlc_flow_repo_resolution;
 mod sdlc_flow_run_id_terminal;
 mod sdlc_flow_task_loop;
 mod sdlc_flow_terminal_paths;
