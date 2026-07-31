@@ -374,6 +374,14 @@ pub struct SDLCState {
     /// incrementally.
     #[serde(default)]
     pub bail_reason: Option<String>,
+    /// D31-committed-state field (EN.6.J): the engine's `events.id` run UUID
+    /// that produced this write, stamped into `ctx.metadata` by
+    /// `Workflow::run_with`/`run_from` and read back out by each writer's
+    /// `build_run_meta`. `None` for states from before this fix, for any
+    /// state written by base-template's JS `sdlc-flow.js` engine (which never
+    /// sets it), or for a run that had no run_id stamped.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 impl SDLCState {
@@ -394,6 +402,7 @@ impl SDLCState {
             started_at: None,
             updated_at: None,
             bail_reason: None,
+            run_id: None,
         }
     }
 
@@ -451,6 +460,7 @@ impl SDLCState {
             "worktree_path": run_meta.worktree_path,
             "started_at": run_meta.started_at,
             "updated_at": run_meta.updated_at,
+            "run_id": run_meta.run_id,
             "status": status,
             "current_task": current_task,
             "tasks": serde_json::Value::Object(tasks_obj),
@@ -543,6 +553,13 @@ impl SDLCState {
             .get("bail_reason")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // Absent key or explicit JSON `null` both fall through to `None` —
+        // covers both a state written before this fix and base-template's
+        // JS engine's shape, which never emits this key at all.
+        let run_id = value
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let global_status = value
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -563,6 +580,7 @@ impl SDLCState {
             started_at,
             updated_at,
             bail_reason,
+            run_id,
         })
     }
 }
@@ -583,6 +601,12 @@ pub struct RunMeta {
     pub started_at: String,
     /// ISO-8601 timestamp of this specific write. Always recomputed fresh.
     pub updated_at: String,
+    /// The engine's `events.id` run UUID (as a hyphenated string) that
+    /// produced this write, if this run has one. `None` for states written
+    /// by base-template's JS `sdlc-flow.js` engine, which never sets it, and
+    /// for any engine-rs run that (for whatever reason) never had a run_id
+    /// stamped into `ctx.metadata` (see `Workflow::run_with`/`run_from`).
+    pub run_id: Option<String>,
 }
 
 /// The `ConsolidatedReviewNode` verdict block, reshaped into the D31
@@ -958,6 +982,7 @@ mod tests {
             worktree_path: "trees/sdlc/EN.4.1-fixture".to_string(),
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:10:00Z".to_string(),
+            run_id: None,
         }
     }
 
@@ -1005,6 +1030,64 @@ mod tests {
         assert_eq!(json["worktree_path"], serde_json::json!(meta.worktree_path));
         assert_eq!(json["started_at"], serde_json::json!(meta.started_at));
         assert_eq!(json["updated_at"], serde_json::json!(meta.updated_at));
+    }
+
+    #[test]
+    fn to_committed_state_json_carries_a_some_run_id() {
+        let state = SDLCState::new("EN.4.1-fixture");
+        let mut meta = run_meta();
+        meta.run_id = Some("11111111-2222-3333-4444-555555555555".to_string());
+        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        assert_eq!(
+            json["run_id"],
+            serde_json::json!("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn to_committed_state_json_emits_null_run_id_when_absent() {
+        let state = SDLCState::new("EN.4.1-fixture");
+        let meta = run_meta();
+        assert_eq!(meta.run_id, None);
+        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        assert_eq!(json["run_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn run_meta_run_id_round_trips_through_committed_json() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![task(1, SDLCTaskStatus::Done)];
+        let mut meta = run_meta();
+        meta.run_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string());
+
+        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        let round_tripped =
+            SDLCState::from_committed_state_json(&json).expect("round-trip should parse");
+
+        assert_eq!(
+            round_tripped.run_id,
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string())
+        );
+    }
+
+    #[test]
+    fn from_committed_state_json_no_run_id_key_reports_none() {
+        // The exact shape base-template's JS `sdlc-flow.js` engine writes:
+        // no `run_id` key at all.
+        let value = serde_json::json!({
+            "spec_slug": "js-engine-fixture",
+            "branch": "sdlc/js-engine-fixture",
+            "worktree_path": "trees/sdlc/js-engine-fixture",
+            "started_at": "2026-07-25T00:00:00Z",
+            "updated_at": "2026-07-25T00:10:00Z",
+            "status": "running",
+            "current_task": 1,
+            "tasks": {},
+        });
+
+        let state = SDLCState::from_committed_state_json(&value)
+            .expect("state with no run_id key should still parse");
+        assert_eq!(state.run_id, None);
     }
 
     #[test]
@@ -1293,6 +1376,7 @@ mod tests {
             worktree_path: "trees/sdlc/EN.4.1-fixture-golden".to_string(),
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:10:00Z".to_string(),
+            run_id: None,
         };
         let review = CommittedReview {
             verdict: "PASS".to_string(),

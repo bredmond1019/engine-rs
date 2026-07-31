@@ -1667,6 +1667,8 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMe
         worktree_path: worktree.to_string(),
         started_at,
         updated_at: now,
+        // TODO(EN.6.J task 3): populate from `crate::read_run_id(&ctx.metadata)`.
+        run_id: None,
     }
 }
 
