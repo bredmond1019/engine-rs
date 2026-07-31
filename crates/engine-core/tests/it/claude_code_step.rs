@@ -266,6 +266,7 @@ async fn workflow_run_with_mid_flight_cancel_does_not_mark_the_node_failed() {
             cancellation_token: Some(token.clone()),
             budget: None,
             pause_signal: None,
+            run_id: None,
         },
     );
     tokio::pin!(run_fut);

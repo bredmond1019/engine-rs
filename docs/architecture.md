@@ -393,7 +393,12 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   in-request, EN.2.B) — the spawned task marks the run terminal in `LiveStateStore` on every exit
   path and no longer surfaces a run failure as HTTP `500`; a failed run is now only observable
   through the `GET /events/{event_id}` readback (`status: "failed"`) or the SSE terminal frame
-  below. `post_events` mints a `CancellationToken` per run, registers it in `RunRegistry` keyed by
+  below. That same minted `run_id` is now stamped into `TaskContext.metadata` via
+  `RunOptions::run_id` (EN.6.J) before the first node dispatches, so a `SDLC_FLOW` run's
+  `sdlc-flow-state.json` can be joined back to the engine run that produced it; `suspend::spawn_run`
+  also uses the post-walk context to write a terminal `"blocked"` status into that file (via
+  `wrap_up::write_terminal_blocked_state`) when the walk ends in a node failure instead of leaving
+  it `"running"` forever. `post_events` mints a `CancellationToken` per run, registers it in `RunRegistry` keyed by
   `run_id` for the duration of the run, and deregisters it unconditionally after `run_with`
   returns (`Ok` or `Err`) — so a finished run's `run_id` 404s on a later abort call rather than
   staying abort-able forever. Every HTTP-triggered run is seeded with a default `Budget` read from

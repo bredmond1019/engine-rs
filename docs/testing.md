@@ -37,7 +37,7 @@ crates/engine-core/tests/
 │   ├── main.rs                  <- the ONLY test target; mod declarations only
 │   ├── harvest_gate_e2e.rs
 │   ├── content_pipeline_e2e.rs
-│   └── ...                      <- 25 suites, all modules of `it`
+│   └── ...                      <- 29 suites, all modules of `it`
 └── fixtures/
 ```
 

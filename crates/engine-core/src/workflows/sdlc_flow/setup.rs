@@ -695,6 +695,7 @@ mod tests {
             worktree_path: worktree.to_string_lossy().to_string(),
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:00:00Z".to_string(),
+            run_id: None,
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
         std::fs::write(
@@ -724,6 +725,7 @@ mod tests {
             worktree_path: worktree.to_string_lossy().to_string(),
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:00:00Z".to_string(),
+            run_id: None,
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
         std::fs::write(

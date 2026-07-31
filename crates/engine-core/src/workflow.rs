@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use engine_contract::{NodeRun, NodeRunStatus, TaskContext};
+use uuid::Uuid;
 
 use crate::budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 use crate::cancellation::{stamp_cancelled, CancellationToken};
@@ -32,6 +33,13 @@ pub const BUDGET_METADATA_KEY: &str = "budget";
 ///
 /// [`policy::telemetry::RunTelemetry`]: crate::policy::telemetry::RunTelemetry
 pub const RUN_TELEMETRY_METADATA_KEY: &str = "run_telemetry";
+
+/// The `TaskContext::metadata` key under which the engine's run UUID (the
+/// `events.id` that `engine-serve` mints for this dispatch) is stamped — see
+/// [`stamp_run_id`]/[`read_run_id`]. Sibling to `BUDGET_METADATA_KEY`/
+/// `CANCELLATION_METADATA_KEY`. Plumbed so a `sdlc-flow-state.json` artifact
+/// can be joined back to the engine run that produced it (EN.6.J).
+pub const RUN_ID_METADATA_KEY: &str = "run_id";
 
 /// Everything [`Workflow::run_from`] needs to continue a suspended run: the
 /// rehydrated `TaskContext` (already carrying its resolved policy and every
@@ -66,6 +74,14 @@ pub struct RunOptions {
     /// no pause check at all — existing `run`/`run_with` callers keep their
     /// unmodified behavior.
     pub pause_signal: Option<PauseSignal>,
+    /// The engine's run UUID (EN.6.J) — stamped into `ctx.metadata` under
+    /// [`RUN_ID_METADATA_KEY`] before the walk starts (`run_with` after
+    /// `seed_context`, `run_from` after `stamp_resumed`), so every node
+    /// boundary onward carries it and it round-trips into the committed
+    /// `sdlc-flow-state.json`. `None` means no stamp and no metadata
+    /// change at all — existing `run`/`run_with`/`run_from` callers keep
+    /// byte-identical behavior.
+    pub run_id: Option<Uuid>,
 }
 
 /// Stamps `metadata` with the budget-halt marker:
@@ -79,6 +95,27 @@ fn stamp_budget_halt(metadata: &mut serde_json::Value, reason: BudgetHaltReason)
         "halted": true,
         "reason": reason.to_json(),
     });
+}
+
+/// Stamps `metadata` with the run's engine UUID under [`RUN_ID_METADATA_KEY`]
+/// as a hyphenated string. Mirrors `stamp_budget_halt`'s object-guard shape:
+/// a non-object `metadata` (e.g. the default `{}` — always true in practice,
+/// but guarded for safety) is reset to an empty object first.
+fn stamp_run_id(metadata: &mut serde_json::Value, run_id: Uuid) {
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+    metadata[RUN_ID_METADATA_KEY] = serde_json::json!(run_id.to_string());
+}
+
+/// Reads back the run id stamped by [`stamp_run_id`], if any. Returns `None`
+/// for a non-object `metadata`, a missing key, or a non-string value — never
+/// panics.
+pub fn read_run_id(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get(RUN_ID_METADATA_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// The injected persistence seam, invoked with a snapshot of the `TaskContext`
@@ -238,7 +275,10 @@ impl Workflow {
         on_progress: OnProgress<'_>,
         options: RunOptions,
     ) -> Result<TaskContext, WorkflowError> {
-        let ctx = self.seed_context(event);
+        let mut ctx = self.seed_context(event);
+        if let Some(run_id) = options.run_id {
+            stamp_run_id(&mut ctx.metadata, run_id);
+        }
         self.walk(
             ctx,
             Some(self.schema.start_node.clone()),
@@ -265,6 +305,9 @@ impl Workflow {
         let mut ctx = state.ctx;
         self.seed_missing_pending(&mut ctx);
         suspend::stamp_resumed(&mut ctx.metadata);
+        if let Some(run_id) = options.run_id {
+            stamp_run_id(&mut ctx.metadata, run_id);
+        }
         self.walk(
             ctx,
             Some(state.at_identity),
@@ -946,6 +989,7 @@ mod tests {
             cancellation_token: Some(token),
             budget: None,
             pause_signal: None,
+            run_id: None,
         };
 
         let ctx = workflow
@@ -976,6 +1020,7 @@ mod tests {
             cancellation_token: None,
             budget: Some(budget),
             pause_signal: None,
+            run_id: None,
         };
 
         let ctx = workflow
@@ -985,6 +1030,53 @@ mod tests {
 
         assert!(ctx.metadata.get(BUDGET_METADATA_KEY).is_some());
         stamped_run_telemetry(&ctx);
+    }
+
+    // -- EN.6.J task 2: run_id plumbing via RunOptions ---------------------
+
+    #[tokio::test]
+    async fn run_with_stamps_run_id_when_provided() {
+        let workflow = two_node_workflow();
+        let run_id = Uuid::new_v4();
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: None,
+            budget: None,
+            pause_signal: None,
+            run_id: Some(run_id),
+        };
+
+        let ctx = workflow
+            .run_with(serde_json::json!({}), on_progress, options)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(read_run_id(&ctx.metadata), Some(run_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_with_default_options_stamps_no_run_id() {
+        let workflow = two_node_workflow();
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let ctx = workflow
+            .run_with(serde_json::json!({}), on_progress, RunOptions::default())
+            .await
+            .expect("run should succeed");
+
+        // `RunOptions::default()` (no run_id) leaves the run_id key entirely
+        // absent -- existing metadata (e.g. `run_telemetry`, stamped by every
+        // run regardless) is otherwise untouched by this knob.
+        assert!(ctx.metadata.get(RUN_ID_METADATA_KEY).is_none());
+        assert_eq!(read_run_id(&ctx.metadata), None);
+    }
+
+    #[test]
+    fn read_run_id_returns_none_for_empty_or_non_object_metadata() {
+        assert_eq!(read_run_id(&serde_json::json!({})), None);
+        assert_eq!(read_run_id(&serde_json::json!(null)), None);
+        assert_eq!(read_run_id(&serde_json::json!("not an object")), None);
     }
 
     // -- EN.6.F task 4: run_from, the pause check, finish_suspended -------
@@ -1026,6 +1118,7 @@ mod tests {
             cancellation_token: None,
             budget: None,
             pause_signal: Some(signal),
+            run_id: None,
         };
 
         let ctx = workflow
@@ -1192,6 +1285,39 @@ mod tests {
         // present, so nothing new was added, but the call must not panic
         // or clobber the existing entries either.
         assert_eq!(out.node_runs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_from_stamps_run_id_after_stamp_resumed() {
+        let workflow = two_node_workflow();
+        let run_id = Uuid::new_v4();
+
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        };
+
+        let state = ResumeState {
+            ctx,
+            at_identity: "start_node".to_string(),
+            ledger: BudgetLedger::new(),
+        };
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: None,
+            budget: None,
+            pause_signal: None,
+            run_id: Some(run_id),
+        };
+        let out = workflow
+            .run_from(state, on_progress, options)
+            .await
+            .expect("run_from should complete");
+
+        assert_eq!(read_run_id(&out.metadata), Some(run_id.to_string()));
     }
 
     #[tokio::test]

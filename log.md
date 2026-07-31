@@ -16,6 +16,48 @@ related: [status, context]
 
 ---
 
+## [run: 2026-07-31]
+
+### `EN.6.J-flow-state-run-id` — PASS (all 8 tasks)
+- **What:** Ran `/sdlc-flow EN.6.J-flow-state-run-id` on branch `EN.6.J-flow-state-run-id-flow`.
+  `RunMeta`/`SDLCState` gained `run_id: Option<String>`, emitted/round-tripped as a top-level
+  `"run_id"` JSON key in `to_committed_state_json`/`from_committed_state_json`, tolerating both an
+  absent key (the JS `sdlc-flow.js` engine's shape) and explicit null (task 1); `RunOptions` now
+  carries `run_id: Option<Uuid>`, stamped into `ctx.metadata` by both `Workflow::run_with` and
+  `run_from` before the walk starts, with `read_run_id`/`RUN_ID_METADATA_KEY` re-exported from
+  `lib.rs` (task 2); `SaveStateNode`'s per-task `build_run_meta` now reads the run id back off
+  `ctx.metadata` so every intermediate `sdlc-flow-state.json` write carries it (task 3); `WrapUpNode`
+  stamps `run_id` into `RunMeta` on the run's tail write, and a new public
+  `write_terminal_blocked_state(ctx, reason)` writes a `"blocked"` status + `bail_reason` for a
+  failed walk — a safe no-op with no worktree, no loaded state, or no pre-existing `sdlc/` directory
+  (task 4); `suspend::spawn_run` stamps `run_id` into `RunOptions` and, on a failed (non-suspended)
+  `SDLC_FLOW` walk, calls the terminal writer — the run-result match was restructured so a plain
+  `Ok(Ok(ctx))` whose `node_runs` recorded a `Failed` node is treated as a failure too, not just the
+  `Ok(Err)`/panic branches (task 5); a hermetic `sdlc_flow_run_id_terminal.rs` e2e suite (a module of
+  the single `engine-core` `it` binary) covers a forced node error halting a real `Workflow::run_with`
+  walk and the failure-path writer producing `blocked` + `bail_reason` + `run_id`, a clean walk
+  reaching `WrapUpNode` and writing `done` + the same `run_id`, and JS-engine-shape (no `run_id` key)
+  committed JSON parsing to `None` while preserving other D31 fields on rewrite (task 6);
+  `docs/sdlc-flow-workflow.md`/`docs/architecture.md` updated to document the `run_id` key and the
+  failure-path terminal write (task 7); full validation gate green — `fmt`, `clippy -D warnings`,
+  workspace `nextest` (1450 passed, 16 skipped), `build --release`, no code changes needed (task 8).
+  PASS review. This closes the engine-rs half of `EN.6.J`; the `bastion`
+  `WorkflowStateDto`/`docs/serve-api.md` follow-on is explicitly out of scope per the spec's Notes
+  (a separate repo, a separate spec). Next: pick up `EN.5.B1`/`EN.5.C`/`EN.6.C`/`EN.6.D`/`EN.6.I`/
+  `EN.4.D` per the `next` frontmatter list.
+
+```
+58ffe70 docs: document run_id stamp and terminal-blocked failure write (EN.6.J task 7)
+c0f685b feat: implement EN.6.J-flow-state-run-id-task6
+e2aef53 feat: implement EN.6.J-flow-state-run-id-task5
+4681089 feat: implement EN.6.J-flow-state-run-id-task4
+bea9af4 feat: stamp run_id in SaveStateNode per-task writes (EN.6.J task 3)
+3fe5889 feat: implement EN.6.J-flow-state-run-id-task2
+00ef137 feat: implement EN.6.J-flow-state-run-id-task1
+```
+
+---
+
 ## [run: 2026-07-30]
 
 ### `EN.6.B-email-adapter` — PASS (all 8 tasks)

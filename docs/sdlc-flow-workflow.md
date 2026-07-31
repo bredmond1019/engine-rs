@@ -157,6 +157,23 @@ endpoint — it prompts for confirmation and reports 202/404/401/connection-fail
   Contains every task's `status`/`attempt_count`, the run's cumulative `telemetry`, and — once
   the run reaches `WrapUpNode` — the `policy` + `outcomes` (`RunOutcomes`) snapshot. This is the
   first place to check "what happened" for any run, live or finished.
+  - **`run_id`** (top-level key, EN.6.J) — the engine's `events.id` run UUID that produced this
+    file, stamped into `ctx.metadata` via `RunOptions::run_id` at dispatch and read back by both
+    `SaveStateNode` (per-task saves) and `WrapUpNode` (the run tail) so the file can be joined to
+    its engine run. `null` for any state written by base-template's JS `sdlc-flow.js` engine,
+    which never sets it, and for any older file predating this field — both parse cleanly via
+    `SDLCState::from_committed_state_json`, which tolerates an absent key as well as an explicit
+    `null`.
+  - **Terminal status on a failed walk** (EN.6.J) — a node returning `Err` halts the walk before
+    `WrapUpNode` ever runs, which used to leave this file saying `"running"` forever. `engine-serve`
+    now detects that outcome after the walk exits (a failed node run, an `Err` from `run_with`, or
+    a panic) and calls `wrap_up::write_terminal_blocked_state`, which writes `status: "blocked"`
+    plus a `bail_reason` naming the failure directly into the file. This write is file-only — it
+    does **not** `git commit` (unlike `SaveStateNode`'s per-task saves), since it runs from
+    `engine-serve`'s post-walk cleanup outside any node and outside the `CommandRunner` seam; the
+    next `SaveStateNode`/`WrapUpNode` write on a resumed run commits it along with its own changes.
+    It is a no-op (no file, no panic) for a context that isn't an SDLC flow run, or that has no
+    worktree / no loaded state.
 - **PR** — `PullRequestNode` opens one via `gh pr create --base main --head <branch>`, never
   auto-merges (D25). `pr_url` lands in that node's output; skipped with `{pr_url: null, skipped:
   true}` when `auto_pr` was `false`.

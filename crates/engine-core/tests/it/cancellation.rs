@@ -107,6 +107,7 @@ async fn cancellation_mid_run_halts_at_next_boundary_and_stamps_metadata() {
                 cancellation_token: Some(token.clone()),
                 budget: None,
                 pause_signal: None,
+                run_id: None,
             },
         )
         .await

@@ -110,7 +110,11 @@ fn existing_started_at(state_path: &std::path::Path) -> Option<String> {
 /// Build this write's [`RunMeta`]: `branch`/`worktree_path` from
 /// `SetupWorktreeNode`'s output, `started_at` preserved from an existing
 /// on-disk committed file if present (else stamped fresh — a run with zero
-/// tasks never went through `SaveStateNode`), `updated_at` always fresh.
+/// tasks never went through `SaveStateNode`), `updated_at` always fresh, and
+/// `run_id` read back out of `ctx.metadata` via [`crate::read_run_id`] — the
+/// stamp `Workflow::run_with`/`run_from` write before the walk starts
+/// (`None` when the run carried no `RunOptions::run_id`, e.g. any run driven
+/// through base-template's JS engine or a unit test with empty metadata).
 fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Path) -> RunMeta {
     let now = chrono::Utc::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -121,6 +125,7 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Pat
         worktree_path: worktree.to_string(),
         started_at,
         updated_at: now,
+        run_id: crate::read_run_id(&ctx.metadata),
     }
 }
 
@@ -273,6 +278,77 @@ fn persist_state(
         NodeError::new(format!("failed to write {}: {err}", state_path.display()))
     })?;
     Ok(state_path.to_string_lossy().to_string())
+}
+
+/// Best-effort failure-path terminal writer (EN.6.J task 4).
+///
+/// A node returning `Err` halts the workflow walk before `WrapUpNode` ever
+/// runs — that node's own `Err` short-circuits `Workflow::run_with`/
+/// `run_from` before the graph reaches `WrapUpNode`, so nothing normally
+/// writes a terminal status for that run and its
+/// `planning/{spec_slug}/sdlc/sdlc-flow-state.json` rots at whatever
+/// non-terminal `"running"` status the last `SaveStateNode` write left it
+/// at. This function is the failure-path call site: `engine-serve`'s
+/// post-walk cleanup calls it directly over the returned (failed) `ctx`,
+/// outside of any node, once a walk is known to have errored out.
+///
+/// Resolves the worktree and the latest `SDLCState` from `ctx` exactly as
+/// [`WrapUpNode::process`] does, then persists a `MajorBail(reason)`
+/// terminal signal through the same [`persist_state`] seam
+/// [`WrapUpNode`] uses — the on-disk file ends up with `status: "blocked"`
+/// (via `schema::derive_committed_status`) and `bail_reason: reason` (via
+/// `schema::derive_bail_reason`), and carries this run's `run_id` if `ctx`
+/// carries one.
+///
+/// Returns `None` (writes nothing, never panics, never surfaces an error to
+/// the caller) when:
+/// - `ctx` has no `SetupWorktreeNode` stamp (not an SDLC flow run that ever
+///   set up a worktree — e.g. a bare unit-test `ctx`, or a different
+///   workflow entirely);
+/// - `ctx` has no loaded `SDLCState` (neither `UpdateTaskStatusNode` nor
+///   `LoadTaskStateNode` ran before the failure);
+/// - the state file's parent directory does not already exist on disk —
+///   unlike [`state_path_for`] (which `WrapUpNode`'s happy path uses and
+///   which creates that directory), this failure-path writer never creates
+///   directories: a state directory that isn't already there means no
+///   `SaveStateNode`/`LoadTaskStateNode` ever ran for this run against this
+///   worktree, so there is nothing meaningful to terminate.
+///
+/// Writes the file only — it does NOT git-commit (see this spec's
+/// `tasks.md` Notes for the rationale: this runs from `engine-serve`'s
+/// post-walk cleanup, outside any node, where there is no `CommandRunner`
+/// seam).
+#[must_use]
+pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<String> {
+    let worktree = worktree_path(ctx)?;
+    let state = latest_state(ctx).ok()?;
+    let spec_slug = state.spec_slug.clone();
+
+    let state_dir = std::path::Path::new(&worktree)
+        .join("planning")
+        .join(&spec_slug)
+        .join("sdlc");
+    if !state_dir.is_dir() {
+        return None;
+    }
+    let state_path = state_dir.join("sdlc-flow-state.json");
+
+    let run_meta = build_run_meta(ctx, &worktree, &state_path);
+    let review = committed_review(ctx);
+    let docs = committed_docs(ctx);
+    let pr = committed_pr(ctx);
+    let terminal_signal = TerminalSignal::MajorBail(reason.to_string());
+
+    persist_state(
+        &state_path,
+        &state,
+        &run_meta,
+        review.as_ref(),
+        docs.as_ref(),
+        pr.as_ref(),
+        Some(&terminal_signal),
+    )
+    .ok()
 }
 
 /// Resolve the most recently mutated `SDLCState`: `UpdateTaskStatusNode`'s
@@ -1001,6 +1077,159 @@ mod tests {
 
         let result = &out.nodes["WrapUpNode"];
         assert!(result.get("saved_to").is_none());
+    }
+
+    // -- EN.6.J task 4: run_id stamp + failure-path terminal writer --------
+
+    #[tokio::test]
+    async fn wrap_up_stamps_run_id_from_context_metadata() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.6.J-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let run_id = uuid::Uuid::new_v4();
+        let mut ctx = ctx_with_state(&state);
+        ctx.metadata = json!({ crate::RUN_ID_METADATA_KEY: run_id.to_string() });
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["run_id"], json!(run_id.to_string()));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_writes_null_run_id_for_empty_metadata() {
+        let worktree = temp_worktree();
+
+        let state = SDLCState::new("EN.6.J-fixture");
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert!(value["run_id"].is_null());
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// Sets up an on-disk state file the way `SaveStateNode`/`WrapUpNode`
+    /// would (parent `sdlc/` directory already exists) so
+    /// [`write_terminal_blocked_state`] finds it and writes.
+    fn seed_state_file(worktree: &std::path::Path, spec_slug: &str, state: &SDLCState) {
+        let state_dir = worktree.join("planning").join(spec_slug).join("sdlc");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let run_meta = RunMeta {
+            branch: "sdlc/x".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            updated_at: "2026-07-01T00:00:00Z".to_string(),
+            run_id: None,
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        let json = serde_json::to_string_pretty(&committed).unwrap();
+        std::fs::write(state_dir.join("sdlc-flow-state.json"), json).unwrap();
+    }
+
+    #[test]
+    fn write_terminal_blocked_state_writes_blocked_status_and_preserves_started_at() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.6.J-terminal-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Failed;
+        state.tasks.push(task);
+        seed_state_file(&worktree, &state.spec_slug, &state);
+
+        let run_id = uuid::Uuid::new_v4();
+        let mut ctx = ctx_with_state(&state);
+        ctx.metadata = json!({ crate::RUN_ID_METADATA_KEY: run_id.to_string() });
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let saved_to = write_terminal_blocked_state(&ctx, "node ImplementTaskNode failed: boom")
+            .expect("worktree + loaded state present, parent dir exists");
+
+        let on_disk = std::fs::read_to_string(&saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("node ImplementTaskNode failed: boom")
+        );
+        assert_eq!(value["run_id"], json!(run_id.to_string()));
+        // started_at preserved from the file seeded above, not re-stamped.
+        assert_eq!(value["started_at"], json!("2026-07-01T00:00:00Z"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn write_terminal_blocked_state_returns_none_without_a_worktree() {
+        let state = SDLCState::new("EN.6.J-terminal-fixture");
+        let ctx = ctx_with_state(&state);
+
+        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+    }
+
+    #[test]
+    fn write_terminal_blocked_state_returns_none_without_loaded_state() {
+        let worktree = temp_worktree();
+
+        let mut ctx = TaskContext {
+            event: json!({}),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn write_terminal_blocked_state_returns_none_when_state_dir_missing() {
+        // Worktree exists but the `planning/{spec_slug}/sdlc` directory was
+        // never created (no prior SaveStateNode/WrapUpNode write) — the
+        // writer must not create it itself.
+        let worktree = temp_worktree();
+
+        let state = SDLCState::new("EN.6.J-terminal-fixture");
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+
+        let _ = std::fs::remove_dir_all(&worktree);
     }
 
     #[test]

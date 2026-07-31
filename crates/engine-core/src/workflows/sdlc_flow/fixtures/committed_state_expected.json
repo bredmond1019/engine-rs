@@ -4,6 +4,7 @@
   "worktree_path": "trees/sdlc/EN.4.1-fixture-golden",
   "started_at": "2026-07-25T00:00:00Z",
   "updated_at": "2026-07-25T00:10:00Z",
+  "run_id": null,
   "status": "done",
   "current_task": 2,
   "tasks": {

@@ -1656,7 +1656,10 @@ fn existing_started_at(state_path: &Path) -> Option<String> {
 /// from `SetupWorktreeNode`'s output; `started_at` is preserved from an
 /// existing on-disk committed file if one is already there (a resume),
 /// otherwise stamped fresh (this run's first save); `updated_at` is always
-/// stamped fresh.
+/// stamped fresh; `run_id` is read back out of `ctx.metadata` via
+/// [`crate::read_run_id`] — the stamp `Workflow::run_with`/`run_from` write
+/// before the walk starts (`None` when the run carried no `RunOptions::run_id`,
+/// e.g. any run driven by base-template's JS `sdlc-flow.js` engine).
 fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMeta {
     let now = chrono::Utc::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -1667,6 +1670,7 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMe
         worktree_path: worktree.to_string(),
         started_at,
         updated_at: now,
+        run_id: crate::read_run_id(&ctx.metadata),
     }
 }
 
@@ -3598,5 +3602,72 @@ mod tests {
         let content = std::fs::read_to_string(saved_to2).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(value["started_at"].as_str().unwrap(), first_started_at);
+    }
+
+    #[tokio::test]
+    async fn save_state_stamps_run_id_from_context_metadata() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        let run_id = uuid::Uuid::new_v4();
+        ctx.metadata = json!({ crate::RUN_ID_METADATA_KEY: run_id.to_string() });
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = SaveStateNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["SaveStateNode"]["saved_to"].as_str().unwrap();
+
+        let content = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["run_id"], json!(run_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn save_state_writes_null_run_id_for_empty_metadata() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        // Today-path: no `RunOptions::run_id` was ever stamped, so
+        // `ctx.metadata` is the empty object `Workflow::seed_context`
+        // always builds.
+        assert_eq!(ctx.metadata, json!({}));
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = SaveStateNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["SaveStateNode"]["saved_to"].as_str().unwrap();
+
+        let content = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(value["run_id"].is_null());
+        // Otherwise byte-compatible with the pre-task-3 output shape.
+        assert!(value["tasks"].is_object());
+        assert_eq!(value["status"], json!("running"));
+        assert!(value["review"].is_null());
+        assert!(value["docs"].is_null());
+        assert!(value["pr"].is_null());
+        assert!(value["bail_reason"].is_null());
     }
 }
