@@ -185,11 +185,14 @@ fn committed_docs(ctx: &TaskContext) -> Option<CommittedDocs> {
 /// The D31 committed-state `pr` block is always `None` from this call site:
 /// the declared graph runs `WrapUpNode -> PullRequestNode` (see
 /// `graph.rs`'s schema), so `PullRequestNode` has not run — and cannot have
-/// a result in `ctx` — by the time `WrapUpNode::process` executes. This is a
-/// known, documented limitation of this fix (not a regression it
-/// introduces): no node in the current graph re-saves state *after*
-/// `PullRequestNode` runs, so `pr` can never be populated in the on-disk
-/// file today. See `D10-committed-state-path-schema-alignment.md`'s
+/// a result in `ctx` — by the time `WrapUpNode::process` executes. `graph.rs`
+/// is NOT reordered to fix this (the PR must follow docs and wrap-up); the
+/// `pr` block is instead patched into the already-written state file by
+/// `EmitStateNode` (EN.3.G task 6), which runs last in the declared graph
+/// and already holds the `CommandRunner` seam needed to read/rewrite/commit
+/// the file — see `emit_state::patch_pr_into_state`. This function keeps
+/// returning `None`: `WrapUpNode` genuinely still cannot see the PR result
+/// at the time it runs. See `D10-committed-state-path-schema-alignment.md`'s
 /// Consequences section.
 fn committed_pr(_ctx: &TaskContext) -> Option<CommittedPr> {
     None
