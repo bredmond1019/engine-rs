@@ -201,7 +201,7 @@ in this precedence order:
 | — | No `planning/harness.json` present AND the task has no `validation_commands` | A gating `harness-missing` failure — never a silent `all_passed: true`. |
 
 `TestTaskNode`'s result additively stamps `test_depth` (the resolved `full`/`fast` value),
-`check_source` (`"harness"` or `"task_override"`), and `excluded_checks` (the names skipped via
+`check_source` (`"harness"` or `"task_validation_commands"`), and `excluded_checks` (the names skipped via
 `enabled: false` / `perTask: false`) onto its existing result payload, alongside the unchanged
 `all_passed` / `check_results` / `failure_summary` shape — so `RunTelemetry`/`PolicyAggregate` can
 attribute observed cost to the depth that caused it.
