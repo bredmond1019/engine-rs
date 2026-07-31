@@ -18,6 +18,50 @@ related: [status, context]
 
 ## [run: 2026-07-31]
 
+### `EN.3.G-terminal-path-robustness` — PASS (all 9 tasks)
+- **What:** Ran `/sdlc-flow EN.3.G-terminal-path-robustness` on branch
+  `EN.3.G-terminal-path-robustness-flow`. Made it structurally impossible for an `SDLC_FLOW` run to
+  end without a terminal state on disk, plus six correctness defects found alongside that
+  investigation. `TriageRouterNode::route`/`ReviewRouterNode::route` now fall back to `WrapUpNode`
+  instead of `None` on any unrecognized verdict, stamping `unrecognized_verdict` on the upstream
+  node's result and surfacing it into the terminal state's `bail_reason` — closing the one remaining
+  way a run could leave a permanently `running` state file, since a `None` route ends the walk `Ok`
+  with no failed node for `write_terminal_blocked_state`'s net to catch (task 1). Unified the two
+  divergent `latest_state` implementations onto `task_loop.rs`'s (the one that already considers
+  `IncrementAttemptNode`), fixing `WrapUpNode`'s prior under-reporting of `attempt_count`/
+  `total_retries` on a post-retry `MAJOR_BAIL` (task 2). Extracted `SaveStateNode`'s git-add/commit
+  tail into a shared `commit_state_file` helper and gave `WrapUpNode` its own `CommandRunner` so its
+  terminal write is now committed — a `--worktree` run's PR previously did not contain its own final
+  `done`/`blocked` state (task 3). `log_noop_commit` now classifies a non-zero git commit exit as a
+  quiet no-op vs. a genuine `eprintln!` warning via a new pure `is_noop_commit` helper (task 4).
+  `run_forbidden_pattern_scan` now invokes `grep` directly via its own argv entry instead of
+  interpolating into `sh -c`, closing a shell-injection hole, with a documented quote-escaped fallback
+  retained only for glob paths (task 5). `EmitStateNode` patches the committed state's `pr` block
+  (url + number parsed from the PR URL's trailing segment) in place after `PullRequestNode` runs, via
+  `commit_state_file`, as a silent best-effort no-op on any missing precondition and with the declared
+  graph unchanged (task 6). `stream_event` now uses the same three-tier lookup as `get_event` (live
+  map → terminal record ring → `live_run_metadata()`), closing the SSE 404 race for a run registered
+  but not yet snapshotted (task 7). A new hermetic `sdlc_flow_terminal_paths.rs` integration suite
+  proves a garbage triage/review verdict still reaches a terminal on-disk state naming the offending
+  string, `pr` populated only under `auto_pr:true`, and the happy path still reaching `status:"done"`
+  (task 8). Full validation gate green — fmt, clippy `-D warnings`, workspace `nextest`, release
+  build, cross-repo bastion check — with zero code changes needed (task 9). PASS review. This closes
+  `EN.3.G`, unblocking `EN.3.J` (SDLC_FLOW e2e smoke run) on this half of its dependencies. Next: pick
+  up `EN.5.B1`/`EN.5.C`/`EN.6.C`/`EN.6.D`/`EN.6.I`/`EN.4.D`/`EN.ticket.expose-live-run-workflow-type`/
+  `EN.chore.master-plan-hygiene` per the `next` frontmatter list.
+
+```
+f03d08c docs: update docs for EN.3.G-terminal-path-robustness
+7bd83c9 feat: implement EN.3.G-terminal-path-robustness-task8
+da808b1 feat: implement EN.3.G-terminal-path-robustness-task7
+b939e1a feat: implement EN.3.G-terminal-path-robustness-task6
+5333746 feat: implement EN.3.G-terminal-path-robustness-task5
+2f31a5b feat: implement EN.3.G-terminal-path-robustness-task4
+94be7e7 feat: implement EN.3.G-terminal-path-robustness-task3
+295e000 feat: implement EN.3.G-terminal-path-robustness-task2
+39d5b66 feat: implement EN.3.G-terminal-path-robustness-task1
+```
+
 ### `EN.3.E-final-validation-node` — PASS (all 7 tasks)
 - **What:** Ran `/sdlc-flow EN.3.E-final-validation-node` on branch
   `EN.3.E-final-validation-node-flow`. Gave the Rust `SDLC_FLOW` graph a second check-running
