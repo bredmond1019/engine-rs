@@ -103,6 +103,46 @@ pub fn resolve_policy_for_run(ctx: &TaskContext, worktree: &Path) -> Result<Sdlc
 
 pub use super::{default_command_runner, CommandOutput, CommandRunner, ModelTransport};
 
+/// Resolve the filesystem root this run targets.
+///
+/// `event.repo` absent -> `std::env::current_dir()`, i.e. today's behavior
+/// verbatim: byte-identical relative `worktree_path`, `Path::new(".")` git
+/// cwds, `PolicyConfigSource::Worktree(current_dir())`. `event.repo` present
+/// -> resolved through `registry` (a **slug**, never a path — see the
+/// security-property doc comment on [`SDLCFlowEventSchema::repo`]). A
+/// `Some(slug)` with no `registry` available is an error naming the slug: a
+/// run must never quietly retarget the wrong repo by silently falling back
+/// to `current_dir()`.
+pub fn resolve_target_root(
+    event: &SDLCFlowEventSchema,
+    registry: Option<&crate::repo_registry::RepoRegistry>,
+) -> Result<PathBuf, NodeError> {
+    match &event.repo {
+        Some(slug) => {
+            let registry = registry.ok_or_else(|| {
+                NodeError::new(format!(
+                    "SDLC_FLOW event named repo slug '{slug}' but no repo registry is \
+                     available to resolve it"
+                ))
+            })?;
+            registry
+                .resolve(slug)
+                .map_err(|err| NodeError::new(err.to_string()))
+        }
+        None => std::env::current_dir()
+            .map_err(|err| NodeError::new(format!("failed to resolve current_dir(): {err}"))),
+    }
+}
+
+/// `true` when `event.repo` is absent, i.e. this run must produce
+/// byte-identical behavior to today (relative `worktree_path`, `"."` git
+/// cwds, `PolicyConfigSource::Worktree(current_dir())`). One named predicate
+/// so downstream code branches explicitly instead of scattering `is_none()`
+/// checks.
+pub fn target_root_is_default(event: &SDLCFlowEventSchema) -> bool {
+    event.repo.is_none()
+}
+
 /// Deserialize the inbound `SDLC_FLOW` event from `ctx.event`.
 fn parse_event(ctx: &TaskContext) -> Result<SDLCFlowEventSchema, NodeError> {
     serde_json::from_value(ctx.event.clone())
@@ -1356,5 +1396,89 @@ mod tests {
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("failed to parse model output"));
+    }
+
+    // --- resolve_target_root / target_root_is_default (EN.3.K task 2) ------
+
+    fn two_repo_registry() -> (tempfile::TempDir, crate::repo_registry::RepoRegistry) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("alpha")).expect("mkdir alpha");
+        std::fs::create_dir_all(dir.path().join("beta")).expect("mkdir beta");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            r#"
+[[repos]]
+slug = "alpha"
+repo_path = "alpha"
+
+[[repos]]
+slug = "beta"
+repo_path = "beta"
+"#,
+        )
+        .expect("write brain.toml");
+        let registry =
+            crate::repo_registry::RepoRegistry::from_brain_root(dir.path()).expect("registry");
+        (dir, registry)
+    }
+
+    #[test]
+    fn resolve_target_root_with_no_repo_returns_current_dir() {
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json!({ "spec_slug": "my-spec" })).unwrap();
+        assert!(target_root_is_default(&event));
+
+        let resolved = resolve_target_root(&event, None).expect("should resolve to current_dir");
+        assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn resolve_target_root_with_no_repo_ignores_a_present_registry() {
+        // Absent `repo` must resolve to current_dir() regardless of whether a
+        // registry happens to be available — the default path never
+        // consults the registry.
+        let (_dir, registry) = two_repo_registry();
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json!({ "spec_slug": "my-spec" })).unwrap();
+
+        let resolved =
+            resolve_target_root(&event, Some(&registry)).expect("should resolve to current_dir");
+        assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn resolve_target_root_with_known_repo_resolves_via_registry() {
+        let (dir, registry) = two_repo_registry();
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json!({ "spec_slug": "my-spec", "repo": "alpha" })).unwrap();
+        assert!(!target_root_is_default(&event));
+
+        let resolved = resolve_target_root(&event, Some(&registry)).expect("alpha should resolve");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            dir.path().join("alpha").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_target_root_with_unknown_repo_names_the_slug() {
+        let (_dir, registry) = two_repo_registry();
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json!({ "spec_slug": "my-spec", "repo": "not-a-repo" }))
+                .unwrap();
+
+        let err = resolve_target_root(&event, Some(&registry)).expect_err("should fail");
+        assert!(err.message.contains("not-a-repo"));
+    }
+
+    #[test]
+    fn resolve_target_root_with_repo_and_no_registry_errors_rather_than_falling_back() {
+        // A run must never quietly retarget cwd when a `repo` slug was
+        // named but no registry is available to resolve it.
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json!({ "spec_slug": "my-spec", "repo": "alpha" })).unwrap();
+
+        let err = resolve_target_root(&event, None).expect_err("should fail, not fall back");
+        assert!(err.message.contains("alpha"));
     }
 }
