@@ -18,6 +18,49 @@ related: [status, context]
 
 ## [run: 2026-07-31]
 
+### `EN.3.E-final-validation-node` — PASS (all 7 tasks)
+- **What:** Ran `/sdlc-flow EN.3.E-final-validation-node` on branch
+  `EN.3.E-final-validation-node-flow`. Gave the Rust `SDLC_FLOW` graph a second check-running
+  site: `FinalValidationNode`, an unconditional, full-depth, unfiltered harness gate that runs
+  exactly once per run on the task-loop drain branch, restoring `cargo nextest run --workspace`
+  and `cargo build --release` — both of which EN.3.D's cheap per-task tripwire (`fastCommand`
+  substitution + `perTask:false` exclusion) had left unexercised. `FinalValidationNode` shares
+  `TestTaskNode`'s `run_checks`/`select_task_checks` machinery via a widened `pub(crate)` surface
+  and a new `apply_per_task_filter: bool` parameter on `select_task_checks`, so it can select
+  checks without dropping `perTask:false` entries while `TestTaskNode`'s own call site stays
+  byte-identical (task 1). It's wired onto the drain branch —
+  `TaskQueueRouterNode(no pending) -> FinalValidationNode -> PatchDocsNode` — registered
+  unconditionally (no policy gate, per CLAUDE.md standing rule 6) in `registry()`; total node
+  count is now eighteen (task 2). Its outcome folds into `WrapUpNode`'s committed state as a
+  new additive `CommittedFinalValidation` — a sixth transient parameter on
+  `to_committed_state_json`, threaded through every call site including `setup.rs`,
+  `engine-serve/http.rs`, and the golden fixture; a failing gate is reported as a degraded
+  terminal status, not converted into a bail (task 3, one fix cycle for a pre-existing,
+  unrelated `content_pipeline::profiles` test). `sdlc_flow_e2e.rs` gained tail/drain assertions,
+  a "runs exactly once per run" multi-task test, and a failing-gate degraded-result test, plus
+  two `sdlc_flow_task_loop.rs` integration tests were repaired against the new graph identity
+  (task 4). Decision D12 recorded — per-task check depth is a legitimate policy knob, but
+  whether the authoritative suite runs at all is the run's correctness contract and must stay
+  an unconditional node (task 5). Docs updated across `sdlc-flow-workflow.md` (graph diagram,
+  node table, two-check-site subsection), `architecture.md` (pointer note), and
+  `sdlc-flow-policy.md` (corrected a stale claim that only "the end-of-run Validate task and CI"
+  ran the full suite) (task 6). Full authoritative validation gate green — fmt, clippy
+  `-D warnings`, workspace `nextest` (1491 tests passed), release build (task 7). PASS review.
+  This closes `EN.3.E`, completing the EN.3.D/EN.3.E pair that gives Rust `SDLC_FLOW` the same
+  two-check-site model the JS engine has always had. Next: `EN.3.G` (terminal-path robustness),
+  or `EN.5.B1`/`EN.5.C`/`EN.6.C`/`EN.6.D`/`EN.6.I`/`EN.4.D` per the frontmatter `next` list.
+
+```
+e5dff68 feat: implement EN.3.E-final-validation-node-task6
+04965ce feat: implement EN.3.E-final-validation-node-task4
+744d4cd feat: implement EN.3.E-final-validation-node-task3
+a69ea36 feat: implement EN.3.E-final-validation-node-task2
+82fb2b1 feat: implement EN.3.E-final-validation-node-task1
+9cbee4d Merge pull request #31 from bredmond1019/EN.3.D-check-selection-parity-flow
+c96cebb chore: wrap up EN.3.D-check-selection-parity
+4ff8602 fix: review pass 1 for EN.3.D-check-selection-parity
+```
+
 ### `EN.3.D-check-selection-parity` — PASS (all 8 tasks)
 - **What:** Ran `/sdlc-flow EN.3.D-check-selection-parity` on branch
   `EN.3.D-check-selection-parity-flow`. Gave the Rust `SDLC_FLOW` the three per-task
