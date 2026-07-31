@@ -12,6 +12,7 @@
 //!
 //! Source of truth: `planning/EN.5.A-content-pipeline/architecture.md` §3.3.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use engine_contract::envelope::{ChannelType, ReplyContext};
@@ -63,6 +64,49 @@ pub struct OutboundAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_context: Option<ReplyContext>,
     pub body: OutboundBody,
+    /// Per-send key/value metadata an adapter turns into channel-native
+    /// metadata (`EN.6.B`: Resend `tags`). Opaque to the seam itself —
+    /// only the owning `ChannelTransport` gives any key meaning.
+    ///
+    /// `EN.6.B` gives exactly one key meaning: `opportunity_slug`, echoed
+    /// back on Resend's delivery/bounce webhooks so the event can be
+    /// correlated to an opportunity without an address lookup. The sender
+    /// that POPULATES it is `EN.6.H2`; this block only plumbs it.
+    ///
+    /// Defaulted and omitted-when-empty, so an action carrying no metadata
+    /// serializes byte-identically to the pre-`EN.6.B` shape.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl OutboundAction {
+    /// An action with no metadata — the pre-`EN.6.B` three-field shape.
+    #[must_use]
+    pub fn new(
+        channel_type: ChannelType,
+        reply_context: Option<ReplyContext>,
+        body: OutboundBody,
+    ) -> Self {
+        Self {
+            channel_type,
+            reply_context,
+            body,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// Attach one metadata entry (chainable).
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Read one metadata entry.
+    #[must_use]
+    pub fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
 }
 
 /// The result of attempting to send an `OutboundAction`. A failed send is
@@ -407,39 +451,39 @@ mod tests {
     use serde_json::json;
 
     fn digest_action(channel_type: ChannelType) -> OutboundAction {
-        OutboundAction {
+        OutboundAction::new(
             channel_type,
-            reply_context: Some(ReplyContext {
+            Some(ReplyContext {
                 thread_id: Some("t-1".to_string()),
                 conversation_id: None,
                 channel_token: Some("c-1".to_string()),
             }),
-            body: OutboundBody::Digest {
+            OutboundBody::Digest {
                 markdown: "# Digest".to_string(),
                 html: None,
             },
-        }
+        )
     }
 
     #[test]
     fn outbound_action_round_trips_through_serde_for_every_body_kind() {
         let actions = vec![
-            OutboundAction {
-                channel_type: ChannelType::Slack,
-                reply_context: None,
-                body: OutboundBody::Message {
+            OutboundAction::new(
+                ChannelType::Slack,
+                None,
+                OutboundBody::Message {
                     text: "hello".to_string(),
                 },
-            },
+            ),
             digest_action(ChannelType::Email),
-            OutboundAction {
-                channel_type: ChannelType::WorkflowTrigger,
-                reply_context: None,
-                body: OutboundBody::TriggerWorkflow {
+            OutboundAction::new(
+                ChannelType::WorkflowTrigger,
+                None,
+                OutboundBody::TriggerWorkflow {
                     workflow_type: "CONTENT_PIPELINE".to_string(),
                     event: json!({"envelope": {"envelope_id": "e-1"}}),
                 },
-            },
+            ),
         ];
 
         for action in actions {
@@ -460,6 +504,42 @@ mod tests {
         assert_eq!(value["kind"], json!("digest"));
         assert_eq!(value["markdown"], json!("# hi"));
         assert_eq!(value["html"], json!("<h1>hi</h1>"));
+    }
+
+    #[test]
+    fn outbound_action_without_metadata_omits_the_key() {
+        let action = digest_action(ChannelType::Email);
+        let value = serde_json::to_value(&action).expect("serialize OutboundAction");
+        assert!(
+            value.get("metadata").is_none(),
+            "empty metadata must be omitted, not emitted as {{}}: {value:?}"
+        );
+    }
+
+    #[test]
+    fn outbound_action_round_trips_with_metadata() {
+        let action =
+            digest_action(ChannelType::Email).with_metadata("opportunity_slug", "acme-corp");
+        let value = serde_json::to_value(&action).expect("serialize OutboundAction");
+        assert_eq!(value["metadata"]["opportunity_slug"], json!("acme-corp"));
+
+        let deserialized: OutboundAction =
+            serde_json::from_value(value).expect("deserialize OutboundAction");
+        assert_eq!(deserialized, action);
+    }
+
+    #[test]
+    fn pre_en_6_b_outbound_action_json_still_deserializes() {
+        let payload = json!({
+            "channel_type": "slack",
+            "reply_context": null,
+            "body": {"kind": "message", "text": "hello"},
+        });
+
+        let action: OutboundAction =
+            serde_json::from_value(payload).expect("pre-EN.6.B payload should still deserialize");
+
+        assert!(action.metadata.is_empty());
     }
 
     #[tokio::test]
@@ -531,14 +611,14 @@ mod tests {
     }
 
     fn trigger_action(workflow_type: &str, event: Value) -> OutboundAction {
-        OutboundAction {
-            channel_type: ChannelType::WorkflowTrigger,
-            reply_context: None,
-            body: OutboundBody::TriggerWorkflow {
+        OutboundAction::new(
+            ChannelType::WorkflowTrigger,
+            None,
+            OutboundBody::TriggerWorkflow {
                 workflow_type: workflow_type.to_string(),
                 event,
             },
-        }
+        )
     }
 
     #[tokio::test]

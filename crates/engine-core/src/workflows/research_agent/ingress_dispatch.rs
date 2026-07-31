@@ -250,14 +250,14 @@ impl Node for ResearchIngressDispatchNode {
             "chain_depth": chain_depth,
         });
 
-        let action = OutboundAction {
-            channel_type: ChannelType::WorkflowTrigger,
-            reply_context: None,
-            body: OutboundBody::TriggerWorkflow {
+        let action = OutboundAction::new(
+            ChannelType::WorkflowTrigger,
+            None,
+            OutboundBody::TriggerWorkflow {
                 workflow_type: dispatch.target_workflow_type.clone(),
                 event,
             },
-        };
+        );
 
         let receipt = receipt_from_send_result(self.transport.send(&action).await);
 
