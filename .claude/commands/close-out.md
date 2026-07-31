@@ -12,9 +12,6 @@ $ARGUMENTS — optional. Parsed left to right:
     handing off mid-run makes no sense. Preserves all gating and coverage logic.
   - `--skip-coverage` — skip Step 2 (coverage scan + gap fill); use when coverage is
     already known good or was verified by a prior `/review-task`.
-  - `--no-review` — skip Step 2.5 (code review).
-  - `--review-level <level>` — specify the level of code review (`low`, `medium`, `high`)
-    to pass to `/code-review`. Defaults to `low`.
   - `--clean-worktree` — run Step 5 (clean-worktree) at the very end to merge a **worktree** branch
     into `main` and remove the worktree. Default is false (do not clean) to protect the "never
     auto-merge" rule.
@@ -27,18 +24,16 @@ $ARGUMENTS — optional. Parsed left to right:
     omitted, `/handoff` derives context from git history and status.md.
 
 Examples:
-  - (no args) — run all steps (including a low-level code review); `/handoff` derives the narrative
+  - (no args) — run all steps; `/handoff` derives the narrative
   - `--gap-check-only` — run Steps 1–3 only; no handoff (used by automated orchestration)
   - `--clean-worktree` — run all steps, and clean/merge the worktree at the end
   - `--merge-branch` — run all steps, and merge the current plain branch into the base + emit-state at the end
-  - `--no-review --clean-worktree` — skip the code review, run all other steps, and clean the worktree
-  - `--review-level medium` — run all steps, performing a medium-level code review
   - `shipped D36 close-out command` — run all steps; pass note to `/handoff`
   - `--skip-coverage shipped D36` — skip coverage scan; pass note to `/handoff`
 
 ## Execution Model
 
-Run inline — do NOT spawn a subagent. `/update-docs`, `/handoff`, `/code-review`, and `/clean-worktree` are
+Run inline — do NOT spawn a subagent. `/update-docs`, `/handoff`, and `/clean-worktree` are
 invoked as Skill tool calls or commands from the main agent context; they have their own confirmation gates.
 
 ## Instructions
@@ -47,8 +42,6 @@ invoked as Skill tool calls or commands from the main agent context; they have t
 
 Strip `--gap-check-only` if present (record whether it was set — when set, Step 4 is skipped).
 Strip `--skip-coverage` if present (record whether it was set).
-Strip `--no-review` if present (record whether it was set).
-Strip `--review-level <level>` if present (record the `<level>` string; defaults to `low`).
 Strip `--clean-worktree` if present (record whether it was set).
 Strip `--merge-branch` if present (record whether it was set).
 If BOTH `--clean-worktree` and `--merge-branch` were passed, stop and tell the user they are mutually
@@ -128,16 +121,6 @@ pass. If they fail: fix them before proceeding (you wrote them; they are yours t
 
 Record non-blocking gaps for the handoff note (Step 4).
 
-### Step 2.5 — Code review (skip if `--no-review` was passed)
-
-Unless `--no-review` was passed, run the `/code-review` command to review code quality for changes:
-```
-/code-review <level>
-```
-Substitute `<level>` with the value from `--review-level` (defaulting to `low`).
-
-If the code review surfaces any critical errors or issues, stop and do not proceed to subsequent steps.
-
 ### Step 3 — Patch documentation
 
 Invoke the `/update-docs --patch` skill. Wait for it to complete.
@@ -149,7 +132,7 @@ Invoke the `/update-docs --patch` skill. Wait for it to complete.
 
 Otherwise, invoke the `/handoff` skill.
 
-Pass the handoff note (the $ARGUMENTS remainder after stripping `--skip-coverage`, `--gap-check-only`, `--no-review`, `--review-level`, `--clean-worktree`, and `--merge-branch`). If non-blocking coverage gaps were found in Step 2, prepend a brief line to the note:
+Pass the handoff note (the $ARGUMENTS remainder after stripping `--skip-coverage`, `--gap-check-only`, `--clean-worktree`, and `--merge-branch`). If non-blocking coverage gaps were found in Step 2, prepend a brief line to the note:
 
 ```
 Coverage note: <comma-separated list of files with non-blocking gaps> — not blocking.

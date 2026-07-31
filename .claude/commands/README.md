@@ -91,7 +91,7 @@ predictably-named output file.
 | Session Start | `/next` | Briefing on what's up next, blocked, and recommend next action based on goals | chat only |
 | Session End | `/wrap-up [note]` | Log work + commit; clean close without a handoff file | status.md, log.md, git |
 | Session End | `/handoff [note]` | Write handoff + log work + commit; hands off to a fresh session | `planning/handoff.md`, status.md, log.md, git |
-| Session End | `/close-out [--skip-coverage] [--no-review] [--review-level <level>] [--clean-worktree] [note]` | Verify coverage → review code → patch docs → clean worktree (opt.) → hand off; the quality-close pipeline | status.md, log.md, docs/, git |
+| Session End | `/close-out [--skip-coverage] [--clean-worktree] [note]` | Verify coverage → patch docs → clean worktree (opt.) → hand off; the quality-close pipeline | status.md, log.md, docs/, git |
 | Block Setup | `/start-block [name]` | Flip a spec to `In progress` in status.md | status.md |
 | **1 — Roadmap** | `/generate-master-plan [desc]` | Author the full roadmap as canonical block definitions | `planning/master-plan.md` |
 | **1 — Plan** | `/generate-tasks <name>` · `/generate-tasks --from <path>` | Write the full task spec from a master-plan block, **or** from a standalone block file (`--from`) | `planning/<name>/tasks.md` |
@@ -271,19 +271,19 @@ remaining, open questions, first command for the next agent), then invokes `/log
 `/commit`. `/prime` in the next session detects the handoff file and surfaces it first.
 Delete `planning/handoff.md` once the new session has consumed it.
 
-### `/close-out [--gap-check-only] [--skip-coverage] [--no-review] [--review-level <level>] [--clean-worktree | --merge-branch] [note]`
-Quality-close pipeline for the end of an `sdlc-run` or `sdlc-flow` session. Runs five
+### `/close-out [--gap-check-only] [--skip-coverage] [--clean-worktree | --merge-branch] [note]`
+Quality-close pipeline for the end of an `sdlc-run` or `sdlc-flow` session. Runs four
 steps in sequence: **(1)** the full validation suite from `planning/harness.json` — stops
 immediately if any gating check fails; **(2)** coverage gap scan — reads changed source
 files, classifies gaps as adequate/non-blocking/blocking, writes minimal targeted tests for
-blocking gaps and re-runs the suite to confirm; **(2.5)** code review — runs a light,
-low-overhead `/code-review` check (defaults to `low`, overridden via `--review-level <level>`,
-or skipped via `--no-review`); **(3)** `/update-docs --patch`; **(4)** `/handoff` with the
-provided note (skips if `--gap-check-only` is set); **(5)** `/clean-worktree` for the current
-branch to merge and remove the **worktree** (only when explicitly requested via `--clean-worktree`);
-**(5b)** merge the current **plain branch** into the base + `mev emit-state --write` (only via
-`--merge-branch` — the branch-mode `/sdlc-flow` analogue, no worktree to remove; mutually exclusive
-with `--clean-worktree`). Non-blocking gaps/findings do not block the pipeline unless critical errors occur.
+blocking gaps and re-runs the suite to confirm; **(3)** `/update-docs --patch`; **(4)**
+`/handoff` with the provided note (skips if `--gap-check-only` is set); **(5)**
+`/clean-worktree` for the current branch to merge and remove the **worktree** (only when
+explicitly requested via `--clean-worktree`); **(5b)** merge the current **plain branch** into
+the base + `mev emit-state --write` (only via `--merge-branch` — the branch-mode `/sdlc-flow`
+analogue, no worktree to remove; mutually exclusive with `--clean-worktree`). Non-blocking
+gaps do not block the pipeline. Code review is **not** part of this pipeline — `/code-review`
+cannot be invoked from a slash command; run it yourself when you want one.
 
 ### `/session-recap`
 Start-of-session briefing: reads the three most recent Log entries, status.md, the current

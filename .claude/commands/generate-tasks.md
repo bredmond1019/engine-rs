@@ -242,7 +242,16 @@ plus two additive fields (`files`, `dependsOn`) orchestrator ignores harmlessly:
 `task_id` — 1-indexed integers, dependency-ordered, no gaps (the `"N"` above is illustrative — use
 the real next integer). `title`/`description` — required; `description` holds what a `### N.`
 heading's bullets used to hold (bulleted lines in one string are fine). `acceptance_criteria` /
-`validation_commands` — usually `[]`; the spec-level markdown sections stay authoritative.
+`validation_commands` — `[]` for any task that touches source the project's checks compile or lint;
+the spec-level markdown sections stay authoritative for those. **Set it for a task that CANNOT break
+the build** — docs-only, config-only, fixture-only — with the cheap commands that actually verify
+that task (file exists, frontmatter present, index updated). `/sdlc-flow` and `/sdlc-task` run those
+commands INSTEAD of the project-wide gating checks for that task, so a markdown edit stops paying
+for a full compile; the end review still re-runs the full gating suite over the integrated tree, so
+nothing escapes validation. In compile-expensive stacks this is the single cheapest win available
+at authoring time — a docs task in a Rust workspace can otherwise cost minutes per attempt to
+validate a paragraph. Example:
+`"validation_commands": ["test -f docs/thing.md", "grep -q '^type:' docs/thing.md", "grep -q 'thing.md' docs/index.md"]`
 `max_attempts` — defaults to 3, only set per-task to override. `files` — every task but the final
 Validate task needs ≥1 entry. `dependsOn` — ids that must complete first; the final Validate task
 depends on every other id.
