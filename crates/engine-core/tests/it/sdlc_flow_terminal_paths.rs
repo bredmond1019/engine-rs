@@ -104,6 +104,10 @@ fn temp_worktree(tag: &str) -> PathBuf {
         "engine-core-sdlc-flow-terminal-paths-{tag}-{}-{n}",
         std::process::id()
     ));
+    // Guarantee-empty: see engine-core src's `sdlc_flow/setup.rs` `temp_dir_named`
+    // doc comment for why PID-recycling makes this removal necessary, not
+    // optional. Remove the ROOT dir before recreating the subdirs.
+    std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(dir.join("planning").join("fixture-terminal-paths-spec")).unwrap();
     dir
 }
