@@ -107,10 +107,41 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# ── Cleanup-only mode (task 3 owns the actual cleanup logic) ────────────────
+# ── Cleanup-only mode ────────────────────────────────────────────────────────
+#
+# Three best-effort steps, each tolerant of the resource already being absent
+# (the `|| echo ...` guards keep `set -e` from aborting on a missing worktree
+# or branch — `--clean` must exit 0 on a machine where none of these exist).
+# Running `--clean` before a fresh trigger must always leave a state from
+# which the next trigger starts clean.
 
 if [ "$MODE" = "clean" ]; then
-    echo "Cleanup is implemented by task 3 of EN.3.J-sdlc-flow-smoke." >&2
+    echo "Removing worktree trees/sdlc/smoke-sdlc-flow ..."
+    git worktree remove --force trees/sdlc/smoke-sdlc-flow \
+        && echo "  removed." \
+        || echo "  not present (ok)."
+
+    echo "Deleting branch sdlc/smoke-sdlc-flow ..."
+    git branch -D sdlc/smoke-sdlc-flow \
+        && echo "  deleted." \
+        || echo "  not present (ok)."
+
+    # This is the line that matters. SpecExistsRouterNode::route
+    # (crates/engine-core/src/workflows/sdlc_flow/setup.rs:318-327) checks
+    # `dir.join("sdlc").join("sdlc-flow-state.json").exists() ||
+    # dir.join("tasks.json").exists()` and routes to LoadTaskStateNode when
+    # either holds. A leftover sdlc/sdlc-flow-state.json from a previous
+    # smoke therefore makes the NEXT trigger RESUME a run that is already
+    # `done` — it appears to succeed instantly having executed nothing at
+    # all. Deleting the state dir is what makes the next smoke a real one.
+    echo "Removing leftover flow state planning/smoke-sdlc-flow/sdlc ..."
+    if [ -d "planning/smoke-sdlc-flow/sdlc" ]; then
+        rm -rf planning/smoke-sdlc-flow/sdlc
+        echo "  removed."
+    else
+        echo "  not present (ok)."
+    fi
+
     exit 0
 fi
 
