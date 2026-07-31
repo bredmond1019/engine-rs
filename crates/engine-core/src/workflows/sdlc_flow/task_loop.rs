@@ -289,7 +289,9 @@ impl Router for TaskQueueRouterNode {
         if Self::next_pending(&state).is_some() {
             Some("ImplementTaskNode".to_string())
         } else {
-            Some("PatchDocsNode".to_string())
+            // Drain branch: route through the run-level `FinalValidationNode`
+            // gate (EN.3.E) before `PatchDocsNode`, not directly to it.
+            Some("FinalValidationNode".to_string())
         }
     }
 }
@@ -2076,7 +2078,7 @@ mod tests {
         let node = TaskQueueRouterNode;
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(!out.nodes.contains_key("TaskQueueRouterNode"));
-        assert_eq!(node.route(&out), Some("PatchDocsNode".to_string()));
+        assert_eq!(node.route(&out), Some("FinalValidationNode".to_string()));
     }
 
     // --- TriageTaskNode ------------------------------------------------------

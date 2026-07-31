@@ -14,8 +14,8 @@
 //!                                 -> TriageRouterNode -> ConsolidatedReviewNode
 //!                                 -> ReviewRouterNode -> UpdateTaskStatusNode
 //!                                 -> SaveStateNode -> (loop) TaskQueueRouterNode
-//!                             | PatchDocsNode -> WrapUpNode -> PullRequestNode
-//!                                 -> EmitStateNode }
+//!                             | FinalValidationNode -> PatchDocsNode -> WrapUpNode
+//!                                 -> PullRequestNode -> EmitStateNode }
 //!
 //! TriageRouterNode    -> { ConsolidatedReviewNode | IncrementAttemptNode | WrapUpNode }
 //! ReviewRouterNode    -> { UpdateTaskStatusNode | IncrementAttemptNode | WrapUpNode }
@@ -50,6 +50,7 @@ use crate::workflow::Workflow;
 
 use super::docs::PatchDocsNode;
 use super::emit_state::EmitStateNode;
+use super::final_validation::FinalValidationNode;
 use super::policy::{ModelTier, SdlcPolicy};
 use super::pr::PullRequestNode;
 use super::setup::{GenerateTasksNode, LoadTaskStateNode, SetupWorktreeNode, SpecExistsRouterNode};
@@ -99,7 +100,10 @@ pub fn schema() -> WorkflowSchema {
         "TaskQueueRouterNode".to_string(),
         NodeConfig::new(
             "TaskQueueRouterNode",
-            vec!["ImplementTaskNode".to_string(), "PatchDocsNode".to_string()],
+            vec![
+                "ImplementTaskNode".to_string(),
+                "FinalValidationNode".to_string(),
+            ],
         ),
     );
     nodes.insert(
@@ -159,6 +163,10 @@ pub fn schema() -> WorkflowSchema {
         ),
     );
     nodes.insert(
+        "FinalValidationNode".to_string(),
+        NodeConfig::new("FinalValidationNode", vec!["PatchDocsNode".to_string()]),
+    );
+    nodes.insert(
         "PatchDocsNode".to_string(),
         NodeConfig::new("PatchDocsNode", vec!["WrapUpNode".to_string()]),
     );
@@ -207,6 +215,11 @@ pub fn registry() -> NodeRegistry {
     registry.register(Box::new(UpdateTaskStatusNode));
     registry.register(Box::new(SaveStateNode::new()));
     registry.register(Box::new(IncrementAttemptNode));
+    // Unconditional, deterministic run-level gate — not policy-gated (CLAUDE.md
+    // standing rule 6: a policy knob must never change the declared node set).
+    // Its depth is pinned to `TestDepth::Full`; see `planning/decisions/
+    // D12-per-task-vs-final-check-depth.md`.
+    registry.register(Box::new(FinalValidationNode::new()));
     registry.register(Box::new(
         PatchDocsNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
     ));
@@ -266,6 +279,10 @@ fn real_cloud_transport() -> ModelTransport {
 /// Any local-endpoint failure at call time falls back to the real `claude`
 /// CLI transport for that call — `openai_compat_transport`'s own fail-fast
 /// + fallback (EN.3.C task 5), not something this function decides.
+///
+/// `FinalValidationNode` has no branch here, deliberately: it is a pure
+/// `CommandRunner` consumer with no `Config` and no `ModelTransport`, so the
+/// `local` model tier has nothing on it to rewire.
 #[must_use]
 pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
     let mut registry = registry();
@@ -323,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_seventeen_nodes_incl_bottom_half() {
+    fn registry_contains_all_eighteen_nodes_incl_bottom_half() {
         let registry = registry();
 
         let expected = [
@@ -341,6 +358,7 @@ mod tests {
             "UpdateTaskStatusNode",
             "SaveStateNode",
             "IncrementAttemptNode",
+            "FinalValidationNode",
             "PatchDocsNode",
             "WrapUpNode",
             "PullRequestNode",
@@ -354,6 +372,35 @@ mod tests {
             );
         }
         assert_eq!(registry.len(), expected.len());
+    }
+
+    #[test]
+    fn schema_contains_final_validation_node() {
+        let schema = schema();
+        assert!(schema.nodes.contains_key("FinalValidationNode"));
+    }
+
+    #[test]
+    fn final_validation_node_sits_on_the_drain_path() {
+        let schema = schema();
+
+        let router = schema
+            .nodes
+            .get("TaskQueueRouterNode")
+            .expect("TaskQueueRouterNode declared");
+        assert!(router
+            .connections
+            .contains(&"FinalValidationNode".to_string()));
+        assert!(!router.connections.contains(&"PatchDocsNode".to_string()));
+
+        let final_validation = schema
+            .nodes
+            .get("FinalValidationNode")
+            .expect("FinalValidationNode declared");
+        assert_eq!(
+            final_validation.connections,
+            vec!["PatchDocsNode".to_string()]
+        );
     }
 
     #[test]
@@ -469,6 +516,7 @@ mod tests {
             "UpdateTaskStatusNode",
             "SaveStateNode",
             "IncrementAttemptNode",
+            "FinalValidationNode",
             "PatchDocsNode",
             "WrapUpNode",
             "PullRequestNode",
