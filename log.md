@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-29T05:00:00Z"
+timestamp: "2026-07-31T17:00:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,44 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-31]
+
+### `EN.3.D-check-selection-parity` — PASS (all 8 tasks)
+- **What:** Ran `/sdlc-flow EN.3.D-check-selection-parity` on branch
+  `EN.3.D-check-selection-parity-flow`. Gave the Rust `SDLC_FLOW` the three per-task
+  test-selection behaviors the JS engine already had and the Rust engine implemented none of:
+  `fastCommand` substitution, `perTask: false` exclusion, and a task's own `validation_commands`
+  overriding the project-wide harness suite. `SdlcPolicy` gained a `test_depth: TestDepth`
+  (`full`/`fast`, built-in default `full`) knob resolving through all four policy layers (task 1),
+  set explicitly in all four named profiles — `baseline` -> `full`, `cheap-fast`/`pragmatist`/
+  `batch-reviewer` -> `fast` (task 2). A pure `select_task_checks` free function + `CheckSelection`
+  telemetry struct landed in `task_loop.rs`, matching the JS engine's precedence exactly:
+  non-empty `validation_commands` wins verbatim; otherwise harness checks minus `enabled:false`
+  minus `perTask:false`, with `fastCommand` substituted at `fast` depth (task 3). `TestTaskNode`
+  was wired to call it via the strict stamped policy read, additively stamping
+  `test_depth`/`check_source`/`excluded_checks` while leaving `run_checks`/`all_passed`/
+  `check_results`/`failure_summary` unchanged in shape, and fixing the harness-missing auto-pass
+  bug on the same code path into a real gating failure (task 4, one fix cycle for a missing
+  policy stamp in a shared test helper). Task 5 repaired the resulting test churn across two
+  integration fixtures without weakening any assertion. Task 6 added a new hermetic
+  `sdlc_flow_check_selection.rs` integration module driving the real `TestTaskNode` with a
+  recording `CommandRunner`, asserting exact command strings at both depths, the per-task
+  override, and the harness-missing gate. Task 7 documented the knob and precedence table in
+  `planning/harness.json`/`docs/sdlc-flow-policy.md`. Task 8 ran the full validation gate — fmt,
+  clippy `-D warnings`, `cargo nextest run --workspace` (1476 passed), release build — all green
+  with no changes needed. PASS review (2 attempts, no findings survived). This closes `EN.3.D`,
+  unblocking `EN.3.E` (FinalValidationNode). Next: `EN.3.E`, or pick up `EN.5.B1`/`EN.5.C`/
+  `EN.6.C`/`EN.6.D`/`EN.6.I`/`EN.4.D` per the status frontmatter.
+```
+4ff8602 fix: review pass 1 for EN.3.D-check-selection-parity
+5c88235 feat: implement EN.3.D-check-selection-parity-task7
+8912fd9 feat: implement EN.3.D-check-selection-parity-task6
+ccd6df6 feat: implement EN.3.D-check-selection-parity-task5
+56bf8af fix: fix pass 1 for EN.3.D-check-selection-parity-task4
+da1deea feat: implement EN.3.D-check-selection-parity-task4
+cca8e45 feat: implement EN.3.D-check-selection-parity-task3
+db84cce feat: implement EN.3.D-check-selection-parity-task2
+78764e1 feat: implement EN.3.D-check-selection-parity-task1
+```
 
 ### `EN.6.J-flow-state-run-id` — PASS (all 8 tasks)
 - **What:** Ran `/sdlc-flow EN.6.J-flow-state-run-id` on branch `EN.6.J-flow-state-run-id-flow`.
