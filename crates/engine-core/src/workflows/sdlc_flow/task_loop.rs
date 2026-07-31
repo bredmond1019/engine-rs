@@ -193,7 +193,7 @@ fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
     })
 }
 
-fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
+pub(crate) fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
     get_result(ctx, "SetupWorktreeNode")
         .and_then(|value| value.get("worktree_path"))
         .and_then(|value| value.as_str())
@@ -457,8 +457,12 @@ impl Node for ImplementTaskNode {
 // --- TestTaskNode ------------------------------------------------------------
 
 /// Outcome of a single harness check. Mirrors Python's `CheckResult`.
+///
+/// `pub(crate)` so [`super::final_validation::FinalValidationNode`] — which
+/// shares [`TestTaskNode::run_checks`] rather than forking a second
+/// check-kind dispatch — can name the type its stamped result carries.
 #[derive(Debug, Clone, serde::Serialize)]
-struct CheckResult {
+pub(crate) struct CheckResult {
     name: String,
     kind: String,
     passed: bool,
@@ -879,7 +883,12 @@ impl TestTaskNode {
         })
     }
 
-    fn run_checks(
+    /// `pub(crate)` so [`super::final_validation::FinalValidationNode`] can
+    /// share this exact executor (check-kind dispatch, the `enabled: false`
+    /// skip, `gates` semantics) instead of forking a second copy — it
+    /// constructs a throwaway `TestTaskNode` carrying its own runner purely
+    /// as a handle onto this method.
+    pub(crate) fn run_checks(
         &self,
         checks: &[serde_json::Value],
         worktree: &Path,
@@ -923,16 +932,17 @@ impl TestTaskNode {
 /// can attribute an observed cost/latency delta to the setting that caused
 /// it. Nothing downstream branches on this struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CheckSelection {
+pub(crate) struct CheckSelection {
     /// Exactly one of `"task_validation_commands"` or `"harness"`.
     source: &'static str,
     /// The depth this selection was resolved at (recorded even when the
     /// `task_validation_commands` branch ignored it, so the telemetry
     /// record always reflects the run's resolved policy).
     depth: TestDepth,
-    /// Names of harness checks dropped from the run (`enabled: false` or
-    /// `perTask: false`). Always empty on the `task_validation_commands`
-    /// branch, since nothing is dropped there.
+    /// Names of harness checks dropped from the run (`enabled: false`, or
+    /// `perTask: false` when `apply_per_task_filter` is true). Always empty
+    /// on the `task_validation_commands` branch, since nothing is dropped
+    /// there.
     excluded: Vec<String>,
 }
 
@@ -948,24 +958,36 @@ struct CheckSelection {
 /// 2. Otherwise, start from `harness_checks`, drop any check with
 ///    `enabled: false` (belt-and-braces — `run_checks` also drops these,
 ///    but excluding them here too keeps `excluded` a truthful, complete
-///    record) and any check with `perTask: false` (the JS filter at
-///    `sdlc-flow.js:548`). When `depth == TestDepth::Fast` and a surviving
-///    check declares a non-empty string `fastCommand`, return a clone with
-///    `command` replaced by that `fastCommand` (the JS substitution at
-///    `sdlc-flow.js:624`) — falling back to the check's own `command` when
-///    `fastCommand` is absent or not a non-empty string. No other field
-///    (`gates`, `kind`, `purpose`, `baselineCommand`, `compareKeys`,
-///    `_comment`, `fastCommand` itself, ...) is touched, so `run_checks`
-///    and its kind-specific readers see the check otherwise byte-identical.
+///    record) and, when `apply_per_task_filter` is true, any check with
+///    `perTask: false` (the JS filter at `sdlc-flow.js:548`). When
+///    `depth == TestDepth::Fast` and a surviving check declares a non-empty
+///    string `fastCommand`, return a clone with `command` replaced by that
+///    `fastCommand` (the JS substitution at `sdlc-flow.js:624`) — falling
+///    back to the check's own `command` when `fastCommand` is absent or not
+///    a non-empty string. No other field (`gates`, `kind`, `purpose`,
+///    `baselineCommand`, `compareKeys`, `_comment`, `fastCommand` itself,
+///    ...) is touched, so `run_checks` and its kind-specific readers see the
+///    check otherwise byte-identical.
+///
+/// `apply_per_task_filter` is the ONE extra parameter this function carries
+/// for [`super::final_validation::FinalValidationNode`] (`EN.3.E`): rather
+/// than duplicating this whole selection function for the run-level gate,
+/// the run-level gate is expressed as one more boolean input. `TestTaskNode`
+/// passes `true` (today's behavior, byte-identical); `FinalValidationNode`
+/// passes `false` so a `"perTask": false` check — `planning/harness.json`'s
+/// `build` check (`cargo build --release`) — IS included, because the
+/// per-task tripwire's cost-saving exclusion has no bearing on a
+/// once-per-run authoritative gate.
 ///
 /// Pure by design: no runner, no filesystem, no policy stamp — the whole
 /// precedence table is unit-testable by constructing `serde_json::Value`
 /// arrays directly.
 ///
-fn select_task_checks(
+pub(crate) fn select_task_checks(
     harness_checks: &[serde_json::Value],
     task_validation_commands: &[String],
     depth: TestDepth,
+    apply_per_task_filter: bool,
 ) -> (Vec<serde_json::Value>, CheckSelection) {
     if !task_validation_commands.is_empty() {
         let synthesized = task_validation_commands
@@ -1004,7 +1026,7 @@ fn select_task_checks(
             excluded.push(name);
             continue;
         }
-        if check.get("perTask").and_then(|v| v.as_bool()) == Some(false) {
+        if apply_per_task_filter && check.get("perTask").and_then(|v| v.as_bool()) == Some(false) {
             excluded.push(name);
             continue;
         }
@@ -1133,7 +1155,7 @@ impl Node for TestTaskNode {
                 )
             } else {
                 let (selected_checks, selection) =
-                    select_task_checks(&harness_checks, &task_validation_commands, depth);
+                    select_task_checks(&harness_checks, &task_validation_commands, depth, true);
                 let (results, failed) = self.run_checks(&selected_checks, worktree);
                 (results, failed, selection)
             };
@@ -3895,7 +3917,7 @@ mod tests {
             "cargo test --workspace",
             "cargo test --lib",
         )];
-        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Full);
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Full, true);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0]["command"], json!("cargo test --workspace"));
         assert_eq!(selection.source, "harness");
@@ -3910,7 +3932,7 @@ mod tests {
             "cargo test --workspace",
             "cargo test --lib",
         )];
-        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Fast);
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Fast, true);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0]["command"], json!("cargo test --lib"));
         // No other field is disturbed by the substitution.
@@ -3923,7 +3945,7 @@ mod tests {
     #[test]
     fn select_task_checks_fast_depth_falls_back_to_command_when_no_fast_command() {
         let checks = vec![cmd_check("fmt", "cargo fmt --check")];
-        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Fast);
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Fast, true);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0]["command"], json!("cargo fmt --check"));
         assert_eq!(selection.source, "harness");
@@ -3936,12 +3958,33 @@ mod tests {
         let checks = vec![build];
 
         for depth in [TestDepth::Full, TestDepth::Fast] {
-            let (selected, selection) = select_task_checks(&checks, &[], depth);
+            let (selected, selection) = select_task_checks(&checks, &[], depth, true);
             assert!(
                 selected.is_empty(),
-                "depth {depth:?} should exclude perTask:false"
+                "depth {depth:?} should exclude perTask:false when apply_per_task_filter is true"
             );
             assert_eq!(selection.excluded, vec!["build".to_string()]);
+        }
+    }
+
+    /// `EN.3.E` acceptance criterion: `apply_per_task_filter = false` — the
+    /// `FinalValidationNode` branch — keeps a `"perTask": false` check
+    /// instead of dropping it, at both depths.
+    #[test]
+    fn select_task_checks_keeps_per_task_false_when_filter_disabled() {
+        let mut build = cmd_check("build", "cargo build --release");
+        build["perTask"] = json!(false);
+        let checks = vec![build];
+
+        for depth in [TestDepth::Full, TestDepth::Fast] {
+            let (selected, selection) = select_task_checks(&checks, &[], depth, false);
+            assert_eq!(
+                selected.len(),
+                1,
+                "depth {depth:?} should keep perTask:false when apply_per_task_filter is false"
+            );
+            assert_eq!(selected[0]["name"], json!("build"));
+            assert!(selection.excluded.is_empty());
         }
     }
 
@@ -3951,7 +3994,7 @@ mod tests {
         fmt["enabled"] = json!(false);
         let checks = vec![fmt];
 
-        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Full);
+        let (selected, selection) = select_task_checks(&checks, &[], TestDepth::Full, true);
         assert!(selected.is_empty());
         assert_eq!(selection.excluded, vec!["fmt".to_string()]);
     }
@@ -3965,7 +4008,8 @@ mod tests {
         ];
 
         for depth in [TestDepth::Full, TestDepth::Fast] {
-            let (selected, selection) = select_task_checks(&harness_checks, &task_commands, depth);
+            let (selected, selection) =
+                select_task_checks(&harness_checks, &task_commands, depth, true);
             assert_eq!(
                 selected,
                 vec![
@@ -3992,7 +4036,7 @@ mod tests {
     #[test]
     fn select_task_checks_empty_task_validation_commands_falls_through_to_harness() {
         let harness_checks = vec![cmd_check("fmt", "cargo fmt --check")];
-        let (selected, selection) = select_task_checks(&harness_checks, &[], TestDepth::Full);
+        let (selected, selection) = select_task_checks(&harness_checks, &[], TestDepth::Full, true);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0]["name"], json!("fmt"));
         assert_eq!(selection.source, "harness");
@@ -4001,11 +4045,16 @@ mod tests {
     #[test]
     fn select_task_checks_source_literal_matches_branch() {
         let harness_checks = vec![cmd_check("fmt", "cargo fmt --check")];
-        let (_, harness_selection) = select_task_checks(&harness_checks, &[], TestDepth::Full);
+        let (_, harness_selection) =
+            select_task_checks(&harness_checks, &[], TestDepth::Full, true);
         assert_eq!(harness_selection.source, "harness");
 
-        let (_, override_selection) =
-            select_task_checks(&harness_checks, &["echo hi".to_string()], TestDepth::Full);
+        let (_, override_selection) = select_task_checks(
+            &harness_checks,
+            &["echo hi".to_string()],
+            TestDepth::Full,
+            true,
+        );
         assert_eq!(override_selection.source, "task_validation_commands");
     }
 
