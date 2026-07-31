@@ -362,6 +362,14 @@ pub(crate) fn derive_live_status(snapshot: &TaskContext) -> &'static str {
 /// accept it. actix's per-worker arbiter spawn runs on the same
 /// single-threaded runtime this handler is already on and requires only
 /// `'static`.
+///
+/// EN.6.J task 5: the `run_id` minted here now reaches the workflow itself,
+/// not just the surrounding bookkeeping — `spawn_run` passes it through
+/// `engine_core::RunOptions { run_id: Some(run_id), .. }`, and
+/// `Workflow::run_with`/`run_from` (EN.6.J task 2) stamp it into
+/// `ctx.metadata` before the first node dispatches. That is what makes a
+/// flow's committed `sdlc-flow-state.json` joinable back to the engine run
+/// that produced it.
 async fn post_events(
     req: HttpRequest,
     body: web::Json<TriggerBody>,
@@ -1528,6 +1536,355 @@ mod tests {
         let get_after_abort_body: serde_json::Value =
             test::read_body_json(get_after_abort_resp).await;
         assert_eq!(get_after_abort_body["status"], "cancelled");
+    }
+
+    // -- EN.6.J task 5: run_id stamp + failure-path terminal write ---------
+
+    #[actix_web::test]
+    async fn a_completed_run_carries_its_run_id_in_context_metadata() {
+        // `spawn_run` now sets `RunOptions { run_id: Some(run_id), .. }`
+        // (task 5), and `Workflow::run_with` stamps it into `ctx.metadata`
+        // (task 2) before the first node dispatches -- so even the plain
+        // `MarkerNode` fixture (no SDLC-flow machinery at all) should read
+        // back its own run_id once the walk completes.
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({ "workflow_type": "fixture", "data": {} }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let run_id = trigger_body["run_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("run_id should be a parseable UUID");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let poll_req = test::TestRequest::get()
+                .uri(&format!("/events/{run_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let poll_resp = test::call_service(&app, poll_req).await;
+            let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+            if poll_body["status"] != "running" {
+                assert_eq!(poll_body["status"], "succeeded");
+                assert_eq!(
+                    poll_body["task_context"]["metadata"]["run_id"],
+                    serde_json::json!(run_id.to_string()),
+                    "the completed context's metadata should carry the run_id that produced it"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run never left \"running\""
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Stamps the SDLC-flow shape a real `SetupWorktreeNode` /
+    /// `UpdateTaskStatusNode` walk would leave behind (worktree path +
+    /// `SDLCState` + resolved policy), so [`write_terminal_blocked_state`]
+    /// and its `latest_state`/`worktree_path` readers can find something to
+    /// terminate. Mirrors `wrap_up.rs`'s test-only `ctx_with_state` fixture.
+    struct SeedSdlcContextNode {
+        worktree: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl Node for SeedSdlcContextNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            use engine_core::workflows::sdlc_flow::policy::SdlcPolicy;
+            use engine_core::workflows::sdlc_flow::schema::{SDLCState, SDLCTask, SDLCTaskStatus};
+
+            ctx.nodes.insert(
+                "SetupWorktreeNode".to_string(),
+                serde_json::json!({ "worktree_path": self.worktree.to_string_lossy() }),
+            );
+
+            let mut sdlc_state = SDLCState::new("EN.6.J-suspend-fixture");
+            let mut task = SDLCTask::new(1, "One", "d1");
+            task.status = SDLCTaskStatus::Failed;
+            sdlc_state.tasks.push(task);
+            ctx.nodes.insert(
+                "UpdateTaskStatusNode".to_string(),
+                serde_json::to_value(&sdlc_state).expect("SDLCState serializes"),
+            );
+            ctx.nodes.insert(
+                engine_core::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+                serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+            );
+
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "SeedSdlcContextNode"
+        }
+    }
+
+    struct AlwaysFailNode;
+
+    #[async_trait::async_trait]
+    impl Node for AlwaysFailNode {
+        async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            Err(NodeError::new("boom"))
+        }
+
+        fn name(&self) -> &str {
+            "AlwaysFailNode"
+        }
+    }
+
+    fn sdlc_fail_fixture_schema() -> WorkflowSchema {
+        let mut nodes = StdHashMap::new();
+        nodes.insert(
+            "SeedSdlcContextNode".to_string(),
+            engine_core::NodeConfig::new("SeedSdlcContextNode", vec!["AlwaysFailNode".to_string()]),
+        );
+        nodes.insert(
+            "AlwaysFailNode".to_string(),
+            engine_core::NodeConfig::new("AlwaysFailNode", vec![]),
+        );
+        WorkflowSchema::new(
+            engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE,
+            "SeedSdlcContextNode",
+            nodes,
+        )
+    }
+
+    fn temp_worktree_for_terminal_write_test() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-serve-sdlc-flow-terminal-write-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Seeds `<worktree>/planning/<spec_slug>/sdlc/sdlc-flow-state.json`
+    /// exactly as a prior `SaveStateNode`/`WrapUpNode` write would --
+    /// [`write_terminal_blocked_state`]'s state-dir-must-already-exist guard
+    /// requires this before it will write anything.
+    fn seed_sdlc_state_file(worktree: &std::path::Path) {
+        use engine_core::workflows::sdlc_flow::schema::{RunMeta, SDLCState};
+
+        let spec_slug = "EN.6.J-suspend-fixture";
+        let state_dir = worktree.join("planning").join(spec_slug).join("sdlc");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let state = SDLCState::new(spec_slug);
+        let run_meta = RunMeta {
+            branch: "sdlc/x".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            updated_at: "2026-07-01T00:00:00Z".to_string(),
+            run_id: None,
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        let json = serde_json::to_string_pretty(&committed).unwrap();
+        std::fs::write(state_dir.join("sdlc-flow-state.json"), json).unwrap();
+    }
+
+    fn read_sdlc_state_file(worktree: &std::path::Path) -> serde_json::Value {
+        let path = worktree
+            .join("planning")
+            .join("EN.6.J-suspend-fixture")
+            .join("sdlc")
+            .join("sdlc-flow-state.json");
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[actix_web::test]
+    async fn a_failed_sdlc_flow_walk_leaves_a_blocked_terminal_status_on_disk() {
+        let worktree = temp_worktree_for_terminal_write_test();
+        seed_sdlc_state_file(&worktree);
+
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            sdlc_fail_fixture_schema(),
+            Box::new({
+                let worktree = worktree.clone();
+                move |_event: &serde_json::Value| {
+                    let mut registry = NodeRegistry::new();
+                    registry.register(Box::new(SeedSdlcContextNode {
+                        worktree: worktree.clone(),
+                    }));
+                    registry.register(Box::new(AlwaysFailNode));
+                    Ok(Workflow::new(registry, sdlc_fail_fixture_schema()))
+                }
+            }),
+        );
+        let state = AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        };
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE,
+                "data": {},
+            }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let run_id = trigger_body["run_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("run_id should be a parseable UUID");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let poll_req = test::TestRequest::get()
+                .uri(&format!("/events/{run_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let poll_resp = test::call_service(&app, poll_req).await;
+            let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+            if poll_body["status"] != "running" {
+                assert_eq!(poll_body["status"], "failed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run never left \"running\""
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let on_disk = read_sdlc_state_file(&worktree);
+        assert_eq!(on_disk["status"], serde_json::json!("blocked"));
+        assert!(
+            on_disk["bail_reason"]
+                .as_str()
+                .expect("bail_reason should be a string")
+                .contains("boom"),
+            "bail_reason should name the failure: {on_disk}"
+        );
+        assert_eq!(on_disk["run_id"], serde_json::json!(run_id.to_string()));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[actix_web::test]
+    async fn a_clean_sdlc_flow_run_does_not_touch_the_committed_state_file() {
+        // Same SDLC-flow-shaped fixture, but the second node succeeds instead
+        // of failing -- the failure-path writer must be a complete no-op on
+        // this path, leaving whatever a prior `SaveStateNode`/`WrapUpNode`
+        // write left on disk untouched.
+        let worktree = temp_worktree_for_terminal_write_test();
+        seed_sdlc_state_file(&worktree);
+        let before = read_sdlc_state_file(&worktree);
+
+        let mut nodes = StdHashMap::new();
+        nodes.insert(
+            "SeedSdlcContextNode".to_string(),
+            engine_core::NodeConfig::new("SeedSdlcContextNode", vec!["MarkerNode".to_string()]),
+        );
+        nodes.insert(
+            "MarkerNode".to_string(),
+            engine_core::NodeConfig::new("MarkerNode", vec![]),
+        );
+        let schema = WorkflowSchema::new(
+            engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE,
+            "SeedSdlcContextNode",
+            nodes,
+        );
+
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(schema.clone(), {
+            let worktree = worktree.clone();
+            Box::new(move |_event: &serde_json::Value| {
+                let mut registry = NodeRegistry::new();
+                registry.register(Box::new(SeedSdlcContextNode {
+                    worktree: worktree.clone(),
+                }));
+                registry.register(Box::new(MarkerNode));
+                Ok(Workflow::new(registry, schema.clone()))
+            })
+        });
+        let state = AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        };
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE,
+                "data": {},
+            }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let run_id = trigger_body["run_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("run_id should be a parseable UUID");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let poll_req = test::TestRequest::get()
+                .uri(&format!("/events/{run_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let poll_resp = test::call_service(&app, poll_req).await;
+            let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+            if poll_body["status"] != "running" {
+                assert_eq!(poll_body["status"], "succeeded");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run never left \"running\""
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let after = read_sdlc_state_file(&worktree);
+        assert_eq!(
+            after, before,
+            "a clean run must not modify the committed state file via the failure-path writer"
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
     }
 
     mod derive_terminal_status_tests {

@@ -27,7 +27,7 @@ use std::collections::{HashMap as StdHashMap, VecDeque};
 use std::sync::{OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
-use engine_contract::TaskContext;
+use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::workflow::ResumeState;
 use engine_core::{Budget, CancellationToken, PauseSignal, Workflow};
 use futures::FutureExt;
@@ -265,6 +265,31 @@ pub(crate) struct SpawnedRun {
     pub budget: Budget,
 }
 
+/// Scans `ctx.node_runs` for the first node stamped [`NodeRunStatus::Failed`]
+/// and formats a human-readable reason (`"node {name} failed: {error}"`) for
+/// the EN.6.J task 5 failure-path terminal writer. Returns `None` for a
+/// clean run -- the common case, and the only one that matters for the
+/// `Ok(Ok(ctx))` branch of `spawn_run`'s `run_result` match, since a
+/// structural `WorkflowError` and a panic are already `Err`/`catch_unwind`
+/// branches with their own reason. `HashMap` iteration order is
+/// non-deterministic, but that is not a concern here: a node returning
+/// `Err` halts the walk (`Workflow::walk`'s dispatch loop stops advancing
+/// once a node fails), so a failed walk has at most one `Failed` entry in
+/// `node_runs` in practice.
+fn failed_node_reason(ctx: &TaskContext) -> Option<String> {
+    ctx.node_runs.iter().find_map(|(name, run)| {
+        if run.status == NodeRunStatus::Failed {
+            let error = run
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string());
+            Some(format!("node {name} failed: {error}"))
+        } else {
+            None
+        }
+    })
+}
+
 /// Runs `spawned.workflow` to completion (or suspension) on
 /// `actix_web::rt::spawn`, then forks the exit path on
 /// `engine_core::suspend::is_suspended(&final_ctx.metadata)`:
@@ -314,10 +339,12 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
             cancellation_token: Some(token),
             budget: Some(budget),
             pause_signal: Some(pause.clone()),
-            // Wired to `Some(run_id)` in EN.6.J task 5; task 2 only adds the
-            // `RunOptions` field and the `Workflow::run_with`/`run_from`
-            // stamp, so this call site stays `None` for now.
-            run_id: None,
+            // EN.6.J task 5: the minted `run_id` now reaches the workflow
+            // context via `RunOptions`, stamped into `ctx.metadata` by
+            // `Workflow::run_with`/`run_from` (task 2) before the first node
+            // dispatches -- this is what makes a flow-state artifact
+            // joinable back to the engine run that produced it.
+            run_id: Some(run_id),
         };
 
         // A cancelled or budget-halted run returns `Ok` with the marker
@@ -349,15 +376,25 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
             }
         };
 
-        let final_ctx = match run_result {
-            Ok(Ok(ctx)) => ctx,
+        // `failure_reason` names why the walk did not complete cleanly --
+        // `Some` for the `Ok(Err)`/panic branches below and for an
+        // `Ok(Ok(ctx))` whose `node_runs` recorded a node stamped `Failed`
+        // (a node returning its own `Err` halts the walk but still returns
+        // `Ok(ctx)` from `run_with`/`run_from` -- see the comment above this
+        // match). `None` for a clean run.
+        let (final_ctx, failure_reason) = match run_result {
+            Ok(Ok(ctx)) => {
+                let reason = failed_node_reason(&ctx);
+                (ctx, reason)
+            }
             Ok(Err(err)) => {
                 eprintln!("run {run_id} failed: {err}");
                 let mut ctx = live
                     .get(run_id)
                     .unwrap_or_else(crate::http::empty_task_context);
-                crate::http::stamp_failure(&mut ctx, &err.to_string());
-                ctx
+                let reason = err.to_string();
+                crate::http::stamp_failure(&mut ctx, &reason);
+                (ctx, Some(reason))
             }
             Err(panic_payload) => {
                 let message = crate::http::panic_message(&panic_payload);
@@ -365,14 +402,32 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
                 let mut ctx = live
                     .get(run_id)
                     .unwrap_or_else(crate::http::empty_task_context);
-                crate::http::stamp_failure(&mut ctx, &format!("node panicked: {message}"));
-                ctx
+                let reason = format!("node panicked: {message}");
+                crate::http::stamp_failure(&mut ctx, &reason);
+                (ctx, Some(reason))
             }
         };
 
         let updated_at = Utc::now();
+        let suspended = engine_core::suspend::is_suspended(&final_ctx.metadata);
 
-        if engine_core::suspend::is_suspended(&final_ctx.metadata) {
+        // EN.6.J task 5: a failed walk (not a suspended exit -- that run is
+        // not over) leaves a terminal `"blocked"` status in the flow's
+        // committed `sdlc-flow-state.json` instead of rotting at whatever
+        // non-terminal `"running"` the last `SaveStateNode` write left it
+        // at. Guarded on `workflow_type` so no other workflow pays for this
+        // lookup; `write_terminal_blocked_state` is a safe no-op for a
+        // non-SDLC-flow context anyway (see its doc comment), but the guard
+        // makes the intent legible at this call site.
+        if !suspended && workflow_type == engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE {
+            if let Some(reason) = &failure_reason {
+                let _ = engine_core::workflows::sdlc_flow::wrap_up::write_terminal_blocked_state(
+                    &final_ctx, reason,
+                );
+            }
+        }
+
+        if suspended {
             // Suspended exit (EN.6.F): the run is not over, so it stays in
             // the live map and `live_run_metadata()` -- unlike the terminal
             // branch below, neither is cleared here.
