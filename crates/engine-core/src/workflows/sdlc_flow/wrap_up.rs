@@ -218,6 +218,10 @@ fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidat
 /// router's own decision about *whether* this was a structural stop).
 /// `None` on the happy path (every task passed cleanly, or `ctx` has
 /// neither stage's output — e.g. a unit test driving `WrapUpNode` directly).
+///
+/// An explicit `MAJOR_BAIL` / structural review fail is checked first and
+/// wins over an `unrecognized_verdict` where both are somehow present, so a
+/// real bail signal is never masked by the router-fallback bookkeeping.
 fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
     if let Some(triage) = get_result(ctx, "TriageTaskNode") {
         if triage.get("verdict").and_then(|v| v.as_str()) == Some("MAJOR_BAIL") {
@@ -249,6 +253,27 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
                 Some("PARTIAL") => return Some(TerminalSignal::StructuralFail(summary)),
                 _ => {}
             }
+        }
+    }
+
+    // Router-fallback safety net (EN.3.G task 1): an unrecognized verdict
+    // from either model-judgment stage routes straight to `WrapUpNode`
+    // rather than halting the walk (see `TriageRouterNode::route` /
+    // `ReviewRouterNode::route`'s catch-all arms). Surface the exact string
+    // the model produced in the terminal `bail_reason` so it is diagnosable
+    // rather than silently swallowed as a `done` run.
+    if let Some(triage) = get_result(ctx, "TriageTaskNode") {
+        if let Some(verdict) = triage.get("unrecognized_verdict").and_then(|v| v.as_str()) {
+            return Some(TerminalSignal::MajorBail(format!(
+                "unrecognized triage verdict: {verdict}"
+            )));
+        }
+    }
+    if let Some(review) = get_result(ctx, "ConsolidatedReviewNode") {
+        if let Some(verdict) = review.get("unrecognized_verdict").and_then(|v| v.as_str()) {
+            return Some(TerminalSignal::MajorBail(format!(
+                "unrecognized review verdict: {verdict}"
+            )));
         }
     }
 
@@ -1114,6 +1139,45 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(value["status"], json!("blocked"));
         assert_eq!(value["bail_reason"], json!("structural issues"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// EN.3.G task 1: a ctx carrying `unrecognized_verdict` (stamped by
+    /// `TriageTaskNode`/`ConsolidatedReviewNode` when the model's reply is
+    /// garbage) still yields a `MajorBail` terminal signal whose message
+    /// names the offending string — the router-fallback safety net's other
+    /// half, proving the run's `bail_reason` on disk is diagnosable rather
+    /// than silently swallowed as `done`.
+    #[tokio::test]
+    async fn wrap_up_populates_bail_reason_on_unrecognized_triage_verdict() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.G-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Failed;
+        state.tasks.push(task);
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({ "verdict": "WAT", "reason": "unclear", "unrecognized_verdict": "WAT" }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        let bail_reason = value["bail_reason"].as_str().unwrap();
+        assert!(bail_reason.contains("WAT"));
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

@@ -1416,13 +1416,24 @@ impl Node for TriageTaskNode {
                 ))
             })?;
 
-        put_result(
-            &mut ctx,
-            "TriageTaskNode",
+        let normalized_verdict = parsed.verdict.trim().to_uppercase();
+        let mut result = json!({
             // Same normalization as `ConsolidatedReviewNode`'s, and for the
             // same reason — `TriageRouterNode` exact-matches this string.
-            json!({ "verdict": parsed.verdict.trim().to_uppercase(), "reason": parsed.reason }),
-        );
+            // Normalization narrows the hole (see the observed-live `"pass"`
+            // reply that motivated it); it does not close it — an
+            // unrecognized value still needs `TriageRouterNode`'s fallback
+            // arm below to guarantee the walk reaches `WrapUpNode`.
+            "verdict": normalized_verdict,
+            "reason": parsed.reason,
+        });
+        if !matches!(
+            normalized_verdict.as_str(),
+            "PASS" | "RETRYABLE" | "MAJOR_BAIL"
+        ) {
+            result["unrecognized_verdict"] = json!(normalized_verdict);
+        }
+        put_result(&mut ctx, "TriageTaskNode", result);
 
         Ok(ctx)
     }
@@ -1490,7 +1501,14 @@ impl Router for TriageRouterNode {
             // `Router::route` takes `&ctx` and cannot mutate state itself.
             "RETRYABLE" => Some("IncrementAttemptNode".to_string()),
             "MAJOR_BAIL" => Some("WrapUpNode".to_string()),
-            _ => None,
+            // An unrecognized verdict must never silently halt the walk
+            // mid-graph — `WrapUpNode` is already a declared connection from
+            // this router (see `graph.rs`), so routing here is a no-op on
+            // the graph shape. `TriageTaskNode::process` stamps
+            // `unrecognized_verdict` alongside the (unchanged) `verdict` key
+            // so `derive_terminal_signal` can surface the offending string
+            // in the run's `bail_reason`.
+            _ => Some("WrapUpNode".to_string()),
         }
     }
 }
@@ -1627,21 +1645,23 @@ impl Node for ConsolidatedReviewNode {
                 },
             )?;
 
-        put_result(
-            &mut ctx,
-            "ConsolidatedReviewNode",
-            json!({
-                // Normalized to the canonical uppercase form `ReviewRouterNode`
-                // matches on — a real model reply doesn't reliably preserve
-                // the exact casing asked for (observed live: a real Sonnet
-                // reply returned "pass"), and an un-normalized mismatch here
-                // makes the router's exact match fail closed to `None`,
-                // silently halting the whole run at this node.
-                "verdict": parsed.verdict.trim().to_uppercase(),
-                "summary": parsed.summary,
-                "issues": parsed.issues,
-            }),
-        );
+        let normalized_verdict = parsed.verdict.trim().to_uppercase();
+        let mut result = json!({
+            // Normalized to the canonical uppercase form `ReviewRouterNode`
+            // matches on — a real model reply doesn't reliably preserve
+            // the exact casing asked for (observed live: a real Sonnet
+            // reply returned "pass"). Normalization narrows the hole; it
+            // does not close it — an unrecognized value still needs
+            // `ReviewRouterNode`'s fallback arm below to guarantee the walk
+            // reaches `WrapUpNode` instead of silently halting here.
+            "verdict": normalized_verdict,
+            "summary": parsed.summary,
+            "issues": parsed.issues,
+        });
+        if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
+            result["unrecognized_verdict"] = json!(normalized_verdict);
+        }
+        put_result(&mut ctx, "ConsolidatedReviewNode", result);
 
         Ok(ctx)
     }
@@ -1694,7 +1714,13 @@ impl Router for ReviewRouterNode {
                     Some("IncrementAttemptNode".to_string())
                 }
             }
-            _ => None,
+            // An unrecognized verdict must never silently halt the walk
+            // mid-graph — `WrapUpNode` is already a declared connection
+            // from this router (see `graph.rs`). `ConsolidatedReviewNode`
+            // stamps `unrecognized_verdict` alongside the (unchanged)
+            // `verdict` key so `derive_terminal_signal` can surface the
+            // offending string in the run's `bail_reason`.
+            _ => Some("WrapUpNode".to_string()),
         }
     }
 }
@@ -2189,6 +2215,35 @@ mod tests {
 
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+        // A recognized verdict must NOT carry the `unrecognized_verdict` key.
+        assert!(out.nodes["TriageTaskNode"]
+            .get("unrecognized_verdict")
+            .is_none());
+    }
+
+    /// EN.3.G task 1: a garbage model verdict is stamped as
+    /// `unrecognized_verdict` (alongside the byte-identical, unchanged
+    /// `verdict` key the router still matches on) so `derive_terminal_signal`
+    /// can surface it in the run's `bail_reason`.
+    #[tokio::test]
+    async fn triage_llm_branch_stamps_unrecognized_verdict() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome =
+                canned_outcome(json!({ "verdict": "WAT", "reason": "unclear" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = TriageTaskNode::new().with_transport(transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "WAT");
+        assert_eq!(out.nodes["TriageTaskNode"]["unrecognized_verdict"], "WAT");
     }
 
     // --- TriageRouterNode ------------------------------------------------
@@ -2227,6 +2282,31 @@ mod tests {
             );
             assert_eq!(router.route(&ctx), Some(expected.to_string()));
         }
+    }
+
+    /// EN.3.G task 1: an unrecognized verdict string must never silently
+    /// halt the walk mid-graph — it routes to `WrapUpNode`, which is already
+    /// a declared connection from this router (see `graph.rs`).
+    #[test]
+    fn triage_router_unrecognized_verdict_routes_to_wrap_up() {
+        let mut ctx = empty_context(json!({}));
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({ "verdict": "WAT", "reason": "r", "unrecognized_verdict": "WAT" }),
+        );
+        let router = TriageRouterNode;
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    /// A ctx with no upstream `TriageTaskNode` result at all is a different
+    /// condition from an unparseable verdict — the router must still return
+    /// `None` (the walk has literally not reached this router yet), not
+    /// `Some("WrapUpNode")`.
+    #[test]
+    fn triage_router_no_upstream_result_returns_none() {
+        let ctx = empty_context(json!({}));
+        let router = TriageRouterNode;
+        assert_eq!(router.route(&ctx), None);
     }
 
     // --- IncrementAttemptNode / retry-bail (EN.3.B) -------------------------
@@ -2390,6 +2470,30 @@ mod tests {
             router.route(&review_ctx("PARTIAL", 2)),
             Some("IncrementAttemptNode".to_string())
         );
+    }
+
+    /// EN.3.G task 1: an unrecognized review verdict must never silently
+    /// halt the walk mid-graph — it routes to `WrapUpNode`, which is already
+    /// a declared connection from this router (see `graph.rs`).
+    #[test]
+    fn review_router_unrecognized_verdict_routes_to_wrap_up() {
+        let router = ReviewRouterNode;
+        let mut ctx = empty_context(json!({}));
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "WAT", "summary": "s", "issues": [], "unrecognized_verdict": "WAT" }),
+        );
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    /// A ctx with no upstream `ConsolidatedReviewNode` result at all is a
+    /// different condition from an unparseable verdict — the router must
+    /// still return `None`.
+    #[test]
+    fn review_router_no_upstream_result_returns_none() {
+        let ctx = empty_context(json!({}));
+        let router = ReviewRouterNode;
+        assert_eq!(router.route(&ctx), None);
     }
 
     // --- UpdateTaskStatusNode ------------------------------------------------
@@ -3094,6 +3198,49 @@ mod tests {
             .with_transport(transport);
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+        // A recognized verdict must NOT carry the `unrecognized_verdict` key.
+        assert!(out.nodes["ConsolidatedReviewNode"]
+            .get("unrecognized_verdict")
+            .is_none());
+    }
+
+    /// EN.3.G task 1: a garbage model verdict is stamped as
+    /// `unrecognized_verdict` (alongside the byte-identical, unchanged
+    /// `verdict` key `ReviewRouterNode` still matches on) so
+    /// `derive_terminal_signal` can surface it in the run's `bail_reason`.
+    #[tokio::test]
+    async fn review_node_stamps_unrecognized_verdict() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({ "verdict": "WAT", "summary": "unclear", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "WAT");
+        assert_eq!(
+            out.nodes["ConsolidatedReviewNode"]["unrecognized_verdict"],
+            "WAT"
+        );
     }
 
     /// A schema-tagged reply (`structured_output: Some(..)`) is consumed via
