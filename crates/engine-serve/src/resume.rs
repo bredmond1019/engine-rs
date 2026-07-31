@@ -268,6 +268,11 @@ pub async fn resume_run(
 }
 
 #[cfg(test)]
+// These tests hold `registry_test_lock()`'s std `MutexGuard` across `.await` points by
+// design — it exists solely to serialize tests that share the global suspend registry, not
+// to guard data an async task contends over concurrently, so the guard's lifetime spanning
+// the whole test body is intentional rather than a correctness hazard.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use actix_web::{test, App};
