@@ -2,12 +2,15 @@
 //!
 //! `transport` (task 2) is [`transport::EmailChannelTransport`], the
 //! `ChannelTransport` impl that sends outbound mail through the Resend HTTP
-//! API over the injectable `HttpPost` seam. Later tasks in this block add
-//! `inbound` (task 4, `parse_inbound_email`) and `webhook_events` (task 5,
-//! `map_delivery_event`) alongside it.
+//! API over the injectable `HttpPost` seam. `inbound` (task 4) is
+//! [`inbound::parse_inbound_email`], a pure parser from a Resend inbound-mail
+//! webhook payload to an `IngressEnvelope`. A later task in this block adds
+//! `webhook_events` (task 5, `map_delivery_event`) alongside them.
 
+pub mod inbound;
 pub mod transport;
 
+pub use inbound::parse_inbound_email;
 pub use transport::{
     EmailChannelTransport, DEFAULT_EMAIL_FROM, EMAIL_FROM_ENV, RESEND_API_KEY_ENV,
 };
