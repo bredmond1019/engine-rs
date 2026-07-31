@@ -42,6 +42,21 @@
 //!   frame, then closes — including for a run that is already terminal by
 //!   the time the client connects. Engine-rs-only extension, not part of the
 //!   canonical data contract (see `crate::stream`).
+//! - `POST /webhooks/email/inbound` (`EN.6.B`) — requires the same
+//!   `X-API-Key` header (401 without it); parses a Resend inbound-mail
+//!   payload into an `IngressEnvelope` (400 naming the missing field on a
+//!   malformed payload, dispatching nothing) and dispatches one
+//!   `CONTENT_PIPELINE` run carrying it, returning `202 {run_id, event_id,
+//!   envelope_id}`. See `crate::email_webhooks`.
+//! - `POST /webhooks/email/events` (`EN.6.B`) — requires the same
+//!   `X-API-Key` header (401 without it); maps a Resend delivery/bounce
+//!   webhook payload onto `EN.7.B`'s `OPPORTUNITY_ADD_ACTION` workflow via
+//!   the `opportunity_slug` tag echoed back on send. A correlated event
+//!   dispatches one run and returns `202 {run_id, event_id}`; an untagged or
+//!   unrecognized event is explicitly skipped — `202 {skipped: true,
+//!   reason}` — with nothing dispatched; a structurally malformed payload is
+//!   `400`. Both routes defer Svix signature verification — see
+//!   `crate::email_webhooks`'s module doc.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -103,6 +118,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/events/{event_id}/stream",
             web::get().to(crate::stream::stream_event),
+        )
+        .route(
+            "/webhooks/email/inbound",
+            web::post().to(crate::email_webhooks::inbound_email),
+        )
+        .route(
+            "/webhooks/email/events",
+            web::post().to(crate::email_webhooks::email_delivery_events),
         );
 }
 
