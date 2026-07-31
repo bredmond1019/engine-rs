@@ -33,7 +33,7 @@ use super::schema::{
     CommittedDocs, CommittedFinalValidation, CommittedPr, CommittedReview, RunMeta, RunOutcomes,
     SDLCState, TerminalSignal,
 };
-use super::task_loop::STRUCTURAL_ISSUE_THRESHOLD;
+use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
 use super::{get_result, put_result};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
@@ -97,9 +97,11 @@ fn branch_name(ctx: &TaskContext) -> Option<String> {
 /// file (`task_loop::SaveStateNode` already wrote at least once during the
 /// task loop for any run with at least one task). Not hoisted into a shared
 /// helper with `task_loop::existing_started_at` (a byte-identical copy):
-/// this module intentionally stays independent of `task_loop.rs`'s private
-/// seams, matching this file's existing `latest_state`/`worktree_path`
-/// local-copy convention (see `latest_state`'s doc comment).
+/// unlike `latest_state` (EN.3.G task 2 unified that one because the two
+/// copies had silently diverged), this pair of functions is still
+/// byte-identical today, so there is no correctness reason to hoist it —
+/// only do so if a future edit makes them diverge in behavior, not just in
+/// location.
 fn existing_started_at(state_path: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(state_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -400,23 +402,6 @@ pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<S
         Some(&terminal_signal),
     )
     .ok()
-}
-
-/// Resolve the most recently mutated `SDLCState`: `UpdateTaskStatusNode`'s
-/// output if the loop has run at least once, else `LoadTaskStateNode`'s
-/// initial load. Mirrors the equivalent helper in `task_loop.rs` (kept as a
-/// local copy since it is not part of the hoisted `mod.rs` seams and this
-/// module must not touch `mod.rs`).
-fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
-    let value = get_result(ctx, "UpdateTaskStatusNode")
-        .or_else(|| get_result(ctx, "LoadTaskStateNode"))
-        .ok_or_else(|| {
-            NodeError::new(
-                "no SDLCState found: neither UpdateTaskStatusNode nor LoadTaskStateNode has run",
-            )
-        })?;
-    serde_json::from_value(value.clone())
-        .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))
 }
 
 /// Read the resolved `SdlcPolicy` stamped by dispatch or by
@@ -787,6 +772,175 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         let result = &out.nodes["WrapUpNode"];
         assert!(result["log_entry"].as_str().unwrap().contains("PASS"));
+    }
+
+    /// EN.3.G task 2 (proof test): before the unified `latest_state`,
+    /// `WrapUpNode`'s local copy considered only `UpdateTaskStatusNode` /
+    /// `LoadTaskStateNode` and never `IncrementAttemptNode`, so a
+    /// `MAJOR_BAIL` reached after retries (where `IncrementAttemptNode`
+    /// holds the newest, post-increment state and `UpdateTaskStatusNode`
+    /// holds a stale, pre-retry snapshot) made `WrapUpNode` under-report
+    /// `attempt_count` / `total_retries`. This test fails before the fix
+    /// (it would resolve to the stale `UpdateTaskStatusNode` state) and
+    /// passes after `wrap_up.rs` calls `task_loop::latest_state`.
+    #[tokio::test]
+    async fn wrap_up_uses_post_increment_state_from_increment_attempt_node() {
+        // Stale snapshot: as it looked before the retry that bailed.
+        let mut stale_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        let mut stale_task = SDLCTask::new(1, "One", "d1");
+        stale_task.attempt_count = 1;
+        stale_state.tasks.push(stale_task);
+        stale_state.telemetry.tasks_passed = 0;
+        stale_state.telemetry.tasks_failed = 0;
+        stale_state.telemetry.total_attempts = 3;
+
+        // Newest state: after `IncrementAttemptNode` bumped the retry
+        // counter for a task that then MAJOR_BAILed.
+        let mut incremented_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        let mut incremented_task = SDLCTask::new(1, "One", "d1");
+        incremented_task.attempt_count = 3;
+        incremented_state.tasks.push(incremented_task);
+        incremented_state.telemetry.tasks_passed = 0;
+        incremented_state.telemetry.tasks_failed = 1;
+        incremented_state.telemetry.total_attempts = 5;
+
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": incremented_state.spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "UpdateTaskStatusNode".to_string(),
+            serde_json::to_value(&stale_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&incremented_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-31"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let stamped_state: SDLCState = serde_json::from_value(result["state"].clone())
+            .expect("WrapUpNode output carries a parseable SDLCState");
+
+        let outcomes = stamped_state.outcomes.expect("outcomes block populated");
+        assert_eq!(
+            outcomes.total_attempts, 5,
+            "must report the post-increment total_attempts, not the stale UpdateTaskStatusNode value"
+        );
+        assert_eq!(
+            outcomes.total_retries, 2,
+            "must report the post-increment attempt_count (3 - 1 = 2 retries)"
+        );
+
+        let report = result["report"].as_str().unwrap();
+        assert!(report.contains("Total attempts: 5"));
+    }
+
+    /// Regression guard: when `UpdateTaskStatusNode` genuinely holds the
+    /// newest state (the common happy-path case — no retry back-edge taken
+    /// after it), it must still win.
+    #[tokio::test]
+    async fn wrap_up_still_resolves_to_update_task_status_node_when_newest() {
+        let mut older_increment_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        older_increment_state.telemetry.total_attempts = 2;
+
+        let mut newest_state = SDLCState::new("EN.3.G-terminal-path-robustness");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        newest_state.tasks.push(task);
+        newest_state.telemetry.tasks_passed = 1;
+        newest_state.telemetry.tasks_failed = 0;
+        newest_state.telemetry.total_attempts = 4;
+
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": newest_state.spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&older_increment_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            "UpdateTaskStatusNode".to_string(),
+            serde_json::to_value(&newest_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-31"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let stamped_state: SDLCState = serde_json::from_value(result["state"].clone())
+            .expect("WrapUpNode output carries a parseable SDLCState");
+
+        let outcomes = stamped_state.outcomes.expect("outcomes block populated");
+        assert_eq!(outcomes.total_attempts, 4);
+        assert_eq!(outcomes.tasks_passed, 1);
+    }
+
+    /// `write_terminal_blocked_state` shares the same unified `latest_state`
+    /// helper, so it must resolve the same post-increment counters as
+    /// `WrapUpNode::process` over the same retry-bailed ctx.
+    #[test]
+    fn write_terminal_blocked_state_uses_post_increment_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path();
+        let spec_slug = "EN.3.G-terminal-path-robustness";
+        let state_dir = worktree.join("planning").join(spec_slug).join("sdlc");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+
+        let mut stale_state = SDLCState::new(spec_slug);
+        stale_state.telemetry.total_attempts = 3;
+
+        let mut incremented_state = SDLCState::new(spec_slug);
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.attempt_count = 3;
+        incremented_state.tasks.push(task);
+        incremented_state.telemetry.total_attempts = 5;
+
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy().to_string() }),
+        );
+        ctx.nodes.insert(
+            "UpdateTaskStatusNode".to_string(),
+            serde_json::to_value(&stale_state).unwrap(),
+        );
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&incremented_state).unwrap(),
+        );
+
+        let written_path = write_terminal_blocked_state(&ctx, "MAJOR_BAIL: too many retries")
+            .expect("should write a terminal state");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(written_path).unwrap()).unwrap();
+
+        assert_eq!(
+            written["telemetry"]["total_attempts"], 5,
+            "write_terminal_blocked_state must report the post-increment total_attempts"
+        );
+        assert_eq!(
+            written["tasks"]["1"]["attempt_count"], 3,
+            "write_terminal_blocked_state must report the post-increment attempt_count"
+        );
     }
 
     #[tokio::test]

@@ -165,7 +165,15 @@ pub(crate) const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
 /// so it is a monotonically increasing logical clock for the whole run — and
 /// keeps whichever candidate's value is highest. No wall-clock/`node_runs`
 /// dependency needed.
-fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
+///
+/// `pub(crate)` (not private): this is the SINGLE `latest_state`
+/// implementation for the whole `sdlc_flow` module (EN.3.G task 2).
+/// `wrap_up.rs` (`WrapUpNode::process` and `write_terminal_blocked_state`)
+/// calls this one directly rather than keeping a local copy that omits
+/// `IncrementAttemptNode` — that omission under-reported `attempt_count` /
+/// `telemetry.total_attempts` on a `MAJOR_BAIL` reached after retries,
+/// because the retry-incremented state was never considered as a candidate.
+pub(crate) fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
     let mut best: Option<SDLCState> = None;
     for identity in [
         "IncrementAttemptNode",
