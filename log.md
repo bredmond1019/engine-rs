@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-31T17:00:00Z"
+timestamp: "2026-07-31T21:40:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,26 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-31]
+
+### SDLC_FLOW hardening — check-selection parity, final gate, terminal paths, hermetic tests
+- **What:** Merged `EN.3.D` (PR #31), `EN.3.E` (PR #32), `EN.3.G` (PR #33) and
+  `EN.ticket.hermetic-test-temp-dirs`. The Rust engine now honours `fastCommand`,
+  `perTask: false` and per-task `validation_commands`; a new unconditional
+  `FinalValidationNode` runs the full suite once on the drain branch; no run can end
+  without a terminal state; and PID-keyed test temp dirs are hermetic (a recycled PID
+  was inheriting a populated dir, producing a false FAIL that bailed `EN.3.J`).
+  Merged the Mac Mini's local-model work into the brain — the D12 collision resolved by
+  renumbering theirs to D13 — amended and promoted `ticket-wire-meta-transport-telemetry`,
+  and specced `EN.3.K` for multi-repo dispatch. `EN.3.J` smoke apparatus is on draft PR #34
+  awaiting a human run.
+- **Why:** Preparing to retire the JS `sdlc-flow.js` engine and run everything through
+  engine-rs, triggered from bastion-web against an always-on `bastion serve`. Every Rust
+  task attempt was paying a full `nextest --workspace` plus a release build (2m44s vs 6.4s
+  per CLAUDE.md), which made the engine impractical for daily use.
+- **Refs:** `planning/EN.3.D-check-selection-parity/`, `EN.3.E-final-validation-node/`,
+  `EN.3.G-terminal-path-robustness/`, `EN.3.K-dispatch-target-resolution/`,
+  decision D12-per-task-vs-final-check-depth
+
 
 ### `EN.3.J-sdlc-flow-smoke` — BAILED (tasks 1-5 passed, review FAIL)
 - **What:** Ran `/sdlc-flow EN.3.J-sdlc-flow-smoke` on branch `EN.3.J-sdlc-flow-smoke-flow`, scoped to
