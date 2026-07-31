@@ -21,6 +21,13 @@
 //! replies, workflow-trigger chaining) to the channel that originated it —
 //! mirrors `http_post`'s trait + live impl + recording stub shape.
 //!
+//! `email` (`EN.6.B` task 2) is `EmailChannelTransport` — the
+//! `ChannelTransport` impl that sends outbound mail through the Resend
+//! HTTP API over the `http_post` seam, threading replies via `ReplyContext`
+//! and echoing `opportunity_slug` metadata onto Resend `tags` for
+//! bounce/delivery correlation. `EN.6.B` tasks 4-5 extend the module with
+//! inbound-mail parsing and delivery/bounce event mapping.
+//!
 //! `doc_materializer` (`EN.7.A` task 3) is the injectable doc-materialize
 //! seam `MaterializeDocNode` (`EN.7.A` task 4) calls to write a
 //! `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md`
@@ -83,6 +90,7 @@
 pub mod channel_transport;
 pub mod claude_code_step;
 pub mod doc_materializer;
+pub mod email;
 pub mod harvest_approve;
 pub mod harvest_gate;
 pub mod http_post;
@@ -102,6 +110,7 @@ pub use doc_materializer::{
     MaterializedFile, OpportunityEdit, RecordedEditCall, RecordedMaterializeCall,
     StubDocMaterializer,
 };
+pub use email::{EmailChannelTransport, DEFAULT_EMAIL_FROM, EMAIL_FROM_ENV, RESEND_API_KEY_ENV};
 pub use harvest_approve::HarvestApproveNode;
 pub use harvest_gate::{pending_harvest_record, HarvestDecision, HarvestGate, HarvestMode};
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
