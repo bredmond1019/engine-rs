@@ -7,6 +7,7 @@
 pub mod abort;
 pub mod dispatch;
 pub mod durable;
+pub mod email_webhooks;
 pub mod http;
 pub mod live_state;
 pub mod resume;

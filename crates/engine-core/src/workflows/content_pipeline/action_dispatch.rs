@@ -138,14 +138,14 @@ fn build_actions(
     let mut actions = Vec::new();
 
     if let Some(reply_context) = envelope.reply_context.clone() {
-        actions.push(OutboundAction {
-            channel_type: envelope.channel_type,
-            reply_context: Some(reply_context),
-            body: OutboundBody::Digest {
+        actions.push(OutboundAction::new(
+            envelope.channel_type,
+            Some(reply_context),
+            OutboundBody::Digest {
                 markdown: output.digest_markdown.clone(),
                 html: output.digest_html.clone(),
             },
-        });
+        ));
     }
 
     if let Some(TriggerRequest {
@@ -159,14 +159,14 @@ fn build_actions(
         }
         data["envelope_id"] = json!(envelope_id);
 
-        actions.push(OutboundAction {
-            channel_type: ChannelType::WorkflowTrigger,
-            reply_context: None,
-            body: OutboundBody::TriggerWorkflow {
+        actions.push(OutboundAction::new(
+            ChannelType::WorkflowTrigger,
+            None,
+            OutboundBody::TriggerWorkflow {
                 workflow_type,
                 event: data,
             },
-        });
+        ));
     }
 
     actions

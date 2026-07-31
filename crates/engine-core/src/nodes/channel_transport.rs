@@ -7,11 +7,13 @@
 //! production code reaches for a real implementation while tests inject a
 //! stub that records every `OutboundAction` it was handed — no live network
 //! call, no real channel API, in the gated `cargo test` suite. Per THE
-//! BOUNDARY TEST (`CLAUDE.md`), this seam only sends; the real channel
-//! adapters (Slack/Telegram/WhatsApp/Email) land in `EN.6.B`–`EN.6.D`.
+//! BOUNDARY TEST (`CLAUDE.md`), this seam only sends; `EN.6.B` wires the
+//! email adapter, and the remaining human-channel adapters
+//! (Slack/Telegram/WhatsApp) land in `EN.6.C`–`EN.6.D`.
 //!
 //! Source of truth: `planning/EN.5.A-content-pipeline/architecture.md` §3.3.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use engine_contract::envelope::{ChannelType, ReplyContext};
@@ -63,6 +65,49 @@ pub struct OutboundAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_context: Option<ReplyContext>,
     pub body: OutboundBody,
+    /// Per-send key/value metadata an adapter turns into channel-native
+    /// metadata (`EN.6.B`: Resend `tags`). Opaque to the seam itself —
+    /// only the owning `ChannelTransport` gives any key meaning.
+    ///
+    /// `EN.6.B` gives exactly one key meaning: `opportunity_slug`, echoed
+    /// back on Resend's delivery/bounce webhooks so the event can be
+    /// correlated to an opportunity without an address lookup. The sender
+    /// that POPULATES it is `EN.6.H2`; this block only plumbs it.
+    ///
+    /// Defaulted and omitted-when-empty, so an action carrying no metadata
+    /// serializes byte-identically to the pre-`EN.6.B` shape.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl OutboundAction {
+    /// An action with no metadata — the pre-`EN.6.B` three-field shape.
+    #[must_use]
+    pub fn new(
+        channel_type: ChannelType,
+        reply_context: Option<ReplyContext>,
+        body: OutboundBody,
+    ) -> Self {
+        Self {
+            channel_type,
+            reply_context,
+            body,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// Attach one metadata entry (chainable).
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Read one metadata entry.
+    #[must_use]
+    pub fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
 }
 
 /// The result of attempting to send an `OutboundAction`. A failed send is
@@ -75,7 +120,8 @@ pub struct ChannelSendReceipt {
 }
 
 /// Injectable egress seam — the outbound mirror of `HttpPost`. One impl per
-/// channel; adapters land in `EN.6.B`–`EN.6.D`. `send` returns `Err` only
+/// channel; `EN.6.B` lands the email adapter, the rest land in
+/// `EN.6.C`–`EN.6.D`. `send` returns `Err` only
 /// for seam-level failures the caller should treat as unsendable (the
 /// `ActionDispatchNode` still turns that into a `delivered: false` receipt
 /// rather than failing the run).
@@ -286,9 +332,8 @@ impl ChannelTransport for WorkflowTriggerDispatch {
 /// silently no-oping.
 fn unwired_channel_error(channel_type: ChannelType) -> String {
     let owner = match channel_type {
-        ChannelType::Slack => "EN.6.B",
-        ChannelType::Telegram | ChannelType::WhatsApp => "EN.6.C",
-        ChannelType::Email => "EN.6.D",
+        ChannelType::Slack => "EN.6.C",
+        ChannelType::Telegram | ChannelType::WhatsApp => "EN.6.D",
         _ => "a future EN.6.x block",
     };
     format!(
@@ -369,11 +414,13 @@ impl ChannelTransport for UnwiredChannelTransport {
 }
 
 /// The live default `ChannelTransport`: routes on `action.channel_type`,
-/// sending `WorkflowTrigger` actions through `WorkflowTriggerDispatch` and
-/// every other (human) channel through `UnwiredChannelTransport`, since no
+/// sending `WorkflowTrigger` actions through `WorkflowTriggerDispatch`,
+/// `Email` actions through `EmailChannelTransport` (`EN.6.B`), and every
+/// remaining (human) channel through `UnwiredChannelTransport`, since no
 /// real adapter exists for those yet. Built by [`channel_transport_live`].
 pub struct LiveChannelTransport {
     trigger: WorkflowTriggerDispatch,
+    email: super::email::EmailChannelTransport,
     unwired: UnwiredChannelTransport,
 }
 
@@ -382,6 +429,7 @@ impl ChannelTransport for LiveChannelTransport {
     async fn send(&self, action: &OutboundAction) -> Result<ChannelSendReceipt, String> {
         match action.channel_type {
             ChannelType::WorkflowTrigger => self.trigger.send(action).await,
+            ChannelType::Email => self.email.send(action).await,
             _ => self.unwired.send(action).await,
         }
     }
@@ -390,13 +438,14 @@ impl ChannelTransport for LiveChannelTransport {
 /// Build the live default `ChannelTransport` (`ActionDispatchNode`'s
 /// default, `EN.6.A` task 4): `TriggerWorkflow` bodies are posted to
 /// `events_url` via `WorkflowTriggerDispatch` over the real `ReqwestHttpPost`
-/// seam (no engine-core -> engine-serve dependency); every other
-/// `channel_type` routes to `UnwiredChannelTransport` until its `EN.6.B`–`D`
-/// adapter lands.
+/// seam (no engine-core -> engine-serve dependency); `Email` actions route
+/// to `EmailChannelTransport` (`EN.6.B`); every remaining `channel_type`
+/// routes to `UnwiredChannelTransport` until its `EN.6.C`–`D` adapter lands.
 #[must_use]
 pub fn channel_transport_live(events_url: impl Into<String>) -> Arc<dyn ChannelTransport> {
     Arc::new(LiveChannelTransport {
         trigger: WorkflowTriggerDispatch::new(events_url),
+        email: super::email::EmailChannelTransport::new(),
         unwired: UnwiredChannelTransport,
     })
 }
@@ -407,39 +456,39 @@ mod tests {
     use serde_json::json;
 
     fn digest_action(channel_type: ChannelType) -> OutboundAction {
-        OutboundAction {
+        OutboundAction::new(
             channel_type,
-            reply_context: Some(ReplyContext {
+            Some(ReplyContext {
                 thread_id: Some("t-1".to_string()),
                 conversation_id: None,
                 channel_token: Some("c-1".to_string()),
             }),
-            body: OutboundBody::Digest {
+            OutboundBody::Digest {
                 markdown: "# Digest".to_string(),
                 html: None,
             },
-        }
+        )
     }
 
     #[test]
     fn outbound_action_round_trips_through_serde_for_every_body_kind() {
         let actions = vec![
-            OutboundAction {
-                channel_type: ChannelType::Slack,
-                reply_context: None,
-                body: OutboundBody::Message {
+            OutboundAction::new(
+                ChannelType::Slack,
+                None,
+                OutboundBody::Message {
                     text: "hello".to_string(),
                 },
-            },
+            ),
             digest_action(ChannelType::Email),
-            OutboundAction {
-                channel_type: ChannelType::WorkflowTrigger,
-                reply_context: None,
-                body: OutboundBody::TriggerWorkflow {
+            OutboundAction::new(
+                ChannelType::WorkflowTrigger,
+                None,
+                OutboundBody::TriggerWorkflow {
                     workflow_type: "CONTENT_PIPELINE".to_string(),
                     event: json!({"envelope": {"envelope_id": "e-1"}}),
                 },
-            },
+            ),
         ];
 
         for action in actions {
@@ -460,6 +509,42 @@ mod tests {
         assert_eq!(value["kind"], json!("digest"));
         assert_eq!(value["markdown"], json!("# hi"));
         assert_eq!(value["html"], json!("<h1>hi</h1>"));
+    }
+
+    #[test]
+    fn outbound_action_without_metadata_omits_the_key() {
+        let action = digest_action(ChannelType::Email);
+        let value = serde_json::to_value(&action).expect("serialize OutboundAction");
+        assert!(
+            value.get("metadata").is_none(),
+            "empty metadata must be omitted, not emitted as {{}}: {value:?}"
+        );
+    }
+
+    #[test]
+    fn outbound_action_round_trips_with_metadata() {
+        let action =
+            digest_action(ChannelType::Email).with_metadata("opportunity_slug", "acme-corp");
+        let value = serde_json::to_value(&action).expect("serialize OutboundAction");
+        assert_eq!(value["metadata"]["opportunity_slug"], json!("acme-corp"));
+
+        let deserialized: OutboundAction =
+            serde_json::from_value(value).expect("deserialize OutboundAction");
+        assert_eq!(deserialized, action);
+    }
+
+    #[test]
+    fn pre_en_6_b_outbound_action_json_still_deserializes() {
+        let payload = json!({
+            "channel_type": "slack",
+            "reply_context": null,
+            "body": {"kind": "message", "text": "hello"},
+        });
+
+        let action: OutboundAction =
+            serde_json::from_value(payload).expect("pre-EN.6.B payload should still deserialize");
+
+        assert!(action.metadata.is_empty());
     }
 
     #[tokio::test]
@@ -493,14 +578,14 @@ mod tests {
             .send(&digest_action(ChannelType::Slack))
             .await
             .unwrap_err();
-        assert!(slack.contains("EN.6.B"), "slack error was: {slack}");
+        assert!(slack.contains("EN.6.C"), "slack error was: {slack}");
 
         let telegram = transport
             .send(&digest_action(ChannelType::Telegram))
             .await
             .unwrap_err();
         assert!(
-            telegram.contains("EN.6.C"),
+            telegram.contains("EN.6.D"),
             "telegram error was: {telegram}"
         );
 
@@ -509,15 +594,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            whatsapp.contains("EN.6.C"),
+            whatsapp.contains("EN.6.D"),
             "whatsapp error was: {whatsapp}"
         );
-
-        let email = transport
-            .send(&digest_action(ChannelType::Email))
-            .await
-            .unwrap_err();
-        assert!(email.contains("EN.6.D"), "email error was: {email}");
     }
 
     #[test]
@@ -531,14 +610,14 @@ mod tests {
     }
 
     fn trigger_action(workflow_type: &str, event: Value) -> OutboundAction {
-        OutboundAction {
-            channel_type: ChannelType::WorkflowTrigger,
-            reply_context: None,
-            body: OutboundBody::TriggerWorkflow {
+        OutboundAction::new(
+            ChannelType::WorkflowTrigger,
+            None,
+            OutboundBody::TriggerWorkflow {
                 workflow_type: workflow_type.to_string(),
                 event,
             },
-        }
+        )
     }
 
     #[tokio::test]
@@ -692,7 +771,26 @@ mod tests {
         let result = transport.send(&digest_action(ChannelType::Slack)).await;
 
         let err = result.unwrap_err();
-        assert!(err.contains("EN.6.B"), "error was: {err}");
+        assert!(err.contains("EN.6.C"), "error was: {err}");
+    }
+
+    #[tokio::test]
+    async fn channel_transport_live_routes_email_to_the_email_adapter() {
+        // Asserts on WHICH transport handled it, not on a successful send:
+        // with no RESEND_API_KEY in the environment the email adapter's own
+        // env-var error is the signal, and it is distinguishable from the
+        // unwired transport's "no ChannelTransport adapter wired" error.
+        let transport = channel_transport_live("http://127.0.0.1:0/events/");
+
+        let err = transport
+            .send(&digest_action(ChannelType::Email))
+            .await
+            .unwrap_err();
+
+        assert!(
+            !err.contains("no ChannelTransport adapter wired"),
+            "email must not route to UnwiredChannelTransport; error was: {err}"
+        );
     }
 
     struct MarkerNode;

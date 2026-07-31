@@ -18,6 +18,51 @@ related: [status, context]
 
 ## [run: 2026-07-30]
 
+### `EN.6.B-email-adapter` — PASS (all 8 tasks)
+- **What:** Ran `/sdlc-flow EN.6.B-email-adapter` on branch `EN.6.B-email-adapter-flow`. `OutboundAction`
+  gained an additive, defaulted, omit-when-empty `metadata: BTreeMap<String,String>` field, with
+  `new()`/`with_metadata()`/`metadata_value()` helpers and byte-identical serialization for empty
+  metadata (task 1). `EmailChannelTransport` was added as the live `ChannelTransport` impl sending
+  through the Resend HTTP API over the injectable `HttpPost` seam — env-only `RESEND_API_KEY`,
+  `ReplyContext` threaded into `In-Reply-To`/`References`, and `metadata["opportunity_slug"]` echoed
+  as a Resend `tags` entry for bounce correlation (task 2). `LiveChannelTransport` now routes
+  `ChannelType::Email` to it instead of `UnwiredChannelTransport`, and `unwired_channel_error`'s
+  stale block attributions were corrected (Slack → EN.6.C, Telegram/WhatsApp → EN.6.D) (task 3).
+  `parse_inbound_email` was added as a pure, deterministic Resend inbound-mail → `IngressEnvelope`
+  parser (message-id or v5-uuid-derived `envelope_id`, text/html fallback, attachments, reply
+  context, RFC 3339 timestamp fallback) (task 4), and `map_delivery_event` as a pure Resend
+  delivery/bounce webhook → `AddOpportunityActionEvent` mapper that skips untagged/unrecognized
+  events explicitly rather than erroring (task 5). `engine-serve` gained `POST
+  /webhooks/email/inbound` (dispatches `CONTENT_PIPELINE`, returns `202 {run_id, event_id,
+  envelope_id}`) and `POST /webhooks/email/events` (dispatches `OPPORTUNITY_ADD_ACTION` via the tag
+  echo, or `202 {skipped, reason}`), both `X-API-Key` gated, via a self-contained dispatch helper
+  that left `post_events` untouched as the regression gate (task 6). `docs/email-adapter.md` was
+  added (OKF-framed: env vars, tag-echo correlation, both routes, the D51/D53 boundary, the
+  no-policy-surface rationale) and cross-referenced from `docs/index.md`/`harness.json` (task 7).
+  Task 8, the designated full-suite validation task, found and fixed one stale integration-test
+  assertion in `action_dispatch_e2e.rs` left over from task 3's routing change (it still expected
+  email to hit `UnwiredChannelTransport`); all four validation commands (fmt, clippy `-D warnings`,
+  `nextest --workspace` with `RESEND_API_KEY` unset, release build) then passed clean — 1428 tests,
+  16 skipped. Review verdict: PASS, no findings.
+- **Decision:** Bounce → opportunity correlation stays a pure tag echo on the send (no corpus scan,
+  no address index) — this block only plumbs and tests the `metadata` field; the sender that
+  populates `opportunity_slug` is `EN.6.H2`'s work. Svix signature verification on the webhook
+  routes is deliberately deferred, noted alongside the retry/queue durability `EN.6.A` also
+  deferred. This closes `EN.6.B`, giving `EN.6.H` (OUTREACH workflow) its first live channel
+  transport — it previously needed only `EN.6.B` and `EN.7.B` (already Done) to unblock.
+- Next: `EN.5.B1`/`EN.5.C`/`EN.6.C`/`EN.6.D`/`EN.6.G`/`EN.4.D` per `status.md`'s `next` frontmatter
+  list.
+
+```
+a6e1acb docs: update docs for EN.6.B-email-adapter
+e27736e feat: implement EN.6.B-email-adapter-task8
+5bdef47 feat: implement EN.6.B-email-adapter-task7
+077c567 feat: implement EN.6.B-email-adapter-task6
+0a0c0d6 feat: implement EN.6.B-email-adapter-task5
+66f83bd feat: implement EN.6.B-email-adapter-task4
+827da60 feat: implement EN.6.B-email-adapter-task3
+```
+
 ### `EN.4.G-needs-further-research` — PASS (all 8 tasks)
 - **What:** Ran `/sdlc-flow EN.4.G-needs-further-research` on branch `EN.4.G-needs-further-research-flow`.
   `CompanyBrief`/`ProspectLead` gained `needs_further_research: Vec<String>` (`#[serde(default)]`,
