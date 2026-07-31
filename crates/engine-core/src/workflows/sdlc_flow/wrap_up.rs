@@ -34,7 +34,7 @@ use super::schema::{
     SDLCState, TerminalSignal,
 };
 use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
-use super::{get_result, put_result};
+use super::{commit_state_file, get_result, put_result, CommandRunner};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
 /// under test. Defaults to the real current UTC date
@@ -495,9 +495,14 @@ fn finalize_outcomes(
 }
 
 /// Deterministic node: renders the wrap-up artifacts for a completed (or
-/// bailed) SDLC flow run. No model call, no file writes.
+/// bailed) SDLC flow run, and (EN.3.G task 3) git-commits its terminal state
+/// write through the same [`super::commit_state_file`] seam
+/// `task_loop::SaveStateNode` uses — without this, the final `done`/
+/// `blocked` state landed on disk but was never committed, so a
+/// `--worktree` run's PR did not contain it.
 pub struct WrapUpNode {
     clock: ClockFn,
+    runner: CommandRunner,
 }
 
 impl WrapUpNode {
@@ -505,6 +510,7 @@ impl WrapUpNode {
     pub fn new() -> Self {
         Self {
             clock: default_clock(),
+            runner: super::default_command_runner(),
         }
     }
 
@@ -513,6 +519,15 @@ impl WrapUpNode {
     #[must_use]
     pub fn with_clock(mut self, clock: ClockFn) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Override the command runner used for the terminal state's
+    /// git add/commit invocation. Tests use this to stub the subprocess —
+    /// mirrors `task_loop::SaveStateNode::with_runner`.
+    #[must_use]
+    pub fn with_runner(mut self, runner: CommandRunner) -> Self {
+        self.runner = runner;
         self
     }
 }
@@ -617,7 +632,7 @@ impl Node for WrapUpNode {
                 let review = committed_review(&ctx);
                 let docs = committed_docs(&ctx);
                 let pr = committed_pr(&ctx);
-                Some(persist_state(
+                let saved = persist_state(
                     &state_path,
                     &state,
                     &run_meta,
@@ -626,7 +641,9 @@ impl Node for WrapUpNode {
                     pr.as_ref(),
                     final_validation.as_ref(),
                     terminal_signal.as_ref(),
-                )?)
+                )?;
+                commit_state_file(&self.runner, std::path::Path::new(&worktree), &state_path);
+                Some(saved)
             }
             None => None,
         };
@@ -656,6 +673,7 @@ mod tests {
     use super::*;
     use crate::workflows::sdlc_flow::schema::{SDLCState, SDLCTask, SDLCTaskStatus};
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     fn fixed_clock(date: &'static str) -> ClockFn {
         Arc::new(move || date.to_string())
@@ -1332,6 +1350,103 @@ mod tests {
         assert_eq!(value["status"], json!("blocked"));
         let bail_reason = value["bail_reason"].as_str().unwrap();
         assert!(bail_reason.contains("WAT"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    // -- EN.3.G task 3: WrapUpNode commits its terminal state write --------
+
+    /// `WrapUpNode` over a real worktree, with a recording stub runner,
+    /// issues exactly the same `git add` then `git commit` invocation
+    /// `task_loop::SaveStateNode` does — proving the terminal `done`/
+    /// `blocked` state is committed, not left dangling in the working tree
+    /// (without this a `--worktree` run's PR would not contain its own
+    /// final state).
+    #[tokio::test]
+    async fn wrap_up_commits_its_terminal_state_write() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.G-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        type RecordedCall = (String, Vec<String>);
+        let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| (*s).to_string()).collect(),
+            ));
+            Ok(crate::workflows::sdlc_flow::CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = WrapUpNode::new()
+            .with_clock(fixed_clock("2026-07-31"))
+            .with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "git");
+        assert_eq!(recorded[0].1[0], "add");
+        assert_eq!(recorded[0].1[1], saved_to);
+        assert_eq!(recorded[1].0, "git");
+        assert_eq!(recorded[1].1[0], "commit");
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// A non-zero `git commit` outcome (e.g. "nothing to commit") must not
+    /// fail the node — mirrors `SaveStateNode`'s non-fatal treatment.
+    #[tokio::test]
+    async fn wrap_up_tolerates_a_non_zero_commit_outcome() {
+        let worktree = temp_worktree();
+
+        let state = SDLCState::new("EN.3.G-fixture");
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            if args.first() == Some(&"commit") {
+                Ok(crate::workflows::sdlc_flow::CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "nothing to commit, working tree clean".to_string(),
+                })
+            } else {
+                Ok(crate::workflows::sdlc_flow::CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        });
+
+        let node = WrapUpNode::new()
+            .with_clock(fixed_clock("2026-07-31"))
+            .with_runner(runner);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("non-zero commit must not fail the node");
+        assert!(out.nodes["WrapUpNode"]["saved_to"].as_str().is_some());
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

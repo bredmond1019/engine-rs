@@ -91,3 +91,37 @@ pub fn default_command_runner() -> CommandRunner {
         })
     })
 }
+
+/// Git-add + git-commit `state_path` inside `worktree` via `runner`, routing
+/// a non-zero commit outcome through [`log_noop_commit`] rather than
+/// treating it as a node failure (e.g. "nothing to commit" on a re-save of
+/// an unchanged file). Extracted (EN.3.G task 3) out of
+/// `task_loop::SaveStateNode::process`'s formerly-inline tail so
+/// `wrap_up::WrapUpNode` can commit its own terminal state write through the
+/// exact same seam instead of duplicating it — `SaveStateNode`'s observable
+/// behavior (same two subprocess invocations, same argv, same cwd, same
+/// non-fatal treatment of a non-zero commit) is unchanged by the move.
+pub(crate) fn commit_state_file(runner: &CommandRunner, worktree: &Path, state_path: &Path) {
+    let state_path_str = state_path.to_string_lossy().to_string();
+    let _ = runner("git", &["add", &state_path_str], worktree);
+    let commit = runner(
+        "git",
+        &["commit", "-m", "chore: flow state update"],
+        worktree,
+    );
+    if let Ok(output) = &commit {
+        if output.status != 0 {
+            // "nothing to commit" or an equivalent no-op — logged, not
+            // an error, mirroring `save_state_node.py`.
+            log_noop_commit(&output.stderr);
+        }
+    }
+}
+
+/// Best-effort no-op logging hook for a non-fatal `git commit` outcome
+/// (e.g. "nothing to commit, working tree clean"). Kept as a tiny named
+/// function rather than an inline `eprintln!` so its intent — "logged, not
+/// an error" — reads at the call site. Currently a stub (filled in by
+/// EN.3.G task 4 to distinguish a genuine no-op from a real commit
+/// failure).
+fn log_noop_commit(_stderr: &str) {}

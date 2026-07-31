@@ -1994,19 +1994,7 @@ impl Node for SaveStateNode {
         })?;
 
         let state_path_str = state_path.to_string_lossy().to_string();
-        let _ = (self.runner)("git", &["add", &state_path_str], Path::new(&worktree));
-        let commit = (self.runner)(
-            "git",
-            &["commit", "-m", "chore: flow state update"],
-            Path::new(&worktree),
-        );
-        if let Ok(output) = &commit {
-            if output.status != 0 {
-                // "nothing to commit" or an equivalent no-op — logged, not
-                // an error, mirroring `save_state_node.py`.
-                log_noop_commit(&output.stderr);
-            }
-        }
+        super::commit_state_file(&self.runner, Path::new(&worktree), &state_path);
 
         put_result(
             &mut ctx,
@@ -2020,12 +2008,6 @@ impl Node for SaveStateNode {
         "SaveStateNode"
     }
 }
-
-/// Best-effort no-op logging hook for a non-fatal `git commit` outcome
-/// (e.g. "nothing to commit, working tree clean"). Kept as a tiny named
-/// function rather than an inline `eprintln!` so its intent — "logged, not
-/// an error" — reads at the call site.
-fn log_noop_commit(_stderr: &str) {}
 
 #[cfg(test)]
 mod tests {
