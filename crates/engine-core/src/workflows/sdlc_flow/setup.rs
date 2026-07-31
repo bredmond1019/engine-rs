@@ -422,6 +422,12 @@ impl Node for SpecExistsRouterNode {
 }
 
 impl Router for SpecExistsRouterNode {
+    // EN.3.K task 5: no change needed here. `post_events`'s pre-flight
+    // 422 (crates/engine-serve/src/http.rs) already rejects an absent spec
+    // directory before a run is spawned, so a run that reaches this router
+    // provably has an existing spec dir — the `else` branch below only ever
+    // fires for the legitimate "dir exists, no tasks.json yet" case that
+    // routes to `GenerateTasksNode`.
     fn route(&self, ctx: &TaskContext) -> Option<String> {
         let spec_slug = ctx.event.get("spec_slug")?.as_str()?;
         let dir = spec_dir(ctx, spec_slug);
