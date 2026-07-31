@@ -314,6 +314,10 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
             cancellation_token: Some(token),
             budget: Some(budget),
             pause_signal: Some(pause.clone()),
+            // Wired to `Some(run_id)` in EN.6.J task 5; task 2 only adds the
+            // `RunOptions` field and the `Workflow::run_with`/`run_from`
+            // stamp, so this call site stays `None` for now.
+            run_id: None,
         };
 
         // A cancelled or budget-halted run returns `Ok` with the marker

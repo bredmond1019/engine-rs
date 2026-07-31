@@ -141,6 +141,7 @@ async fn low_budget_halts_before_the_node_that_would_exceed_it() {
                 cancellation_token: None,
                 budget: Some(budget),
                 pause_signal: None,
+                run_id: None,
             },
         )
         .await
@@ -219,6 +220,7 @@ async fn cost_cap_halts_once_accumulated_cost_exceeds_max_cost_usd() {
                 cancellation_token: None,
                 budget: Some(budget),
                 pause_signal: None,
+                run_id: None,
             },
         )
         .await

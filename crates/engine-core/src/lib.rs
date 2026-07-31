@@ -40,4 +40,7 @@ pub use suspend::{
     SUSPENSION_METADATA_KEY,
 };
 pub use validate::{ValidationError, WorkflowValidator};
-pub use workflow::{OnProgress, RunOptions, Workflow, WorkflowError, BUDGET_METADATA_KEY};
+pub use workflow::{
+    read_run_id, OnProgress, RunOptions, Workflow, WorkflowError, BUDGET_METADATA_KEY,
+    RUN_ID_METADATA_KEY,
+};

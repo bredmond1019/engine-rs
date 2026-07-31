@@ -449,6 +449,7 @@ async fn operator_pause_stops_at_loop_top_with_next_node_still_pending() {
         cancellation_token: None,
         budget: None,
         pause_signal: Some(signal),
+        run_id: None,
     };
 
     let ctx = workflow
@@ -493,6 +494,7 @@ async fn pause_set_from_inside_a_node_does_not_interrupt_that_node() {
         cancellation_token: None,
         budget: None,
         pause_signal: Some(signal),
+        run_id: None,
     };
     let ctx = workflow
         .run_with(serde_json::json!({}), noop(), options)
@@ -536,6 +538,7 @@ async fn cancel_beats_pause_when_both_are_set() {
         cancellation_token: Some(token),
         budget: None,
         pause_signal: Some(signal),
+        run_id: None,
     };
     let ctx = workflow
         .run_with(serde_json::json!({}), noop(), options)
@@ -573,6 +576,7 @@ async fn budget_halt_beats_pause() {
             max_cost_usd: None,
         }),
         pause_signal: Some(signal),
+        run_id: None,
     };
     let ctx = workflow
         .run_with(serde_json::json!({}), noop(), options)
@@ -712,6 +716,7 @@ async fn resumed_ledger_halts_on_a_cap_already_approached_pre_suspend() {
         cancellation_token: None,
         budget: Some(budget),
         pause_signal: None,
+        run_id: None,
     };
 
     let suspended = workflow
@@ -731,6 +736,7 @@ async fn resumed_ledger_halts_on_a_cap_already_approached_pre_suspend() {
         cancellation_token: None,
         budget: Some(budget),
         pause_signal: None,
+        run_id: None,
     };
     let resumed = workflow
         .run_from(resume_state_from(suspended), noop(), options)
