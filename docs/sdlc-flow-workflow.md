@@ -32,7 +32,7 @@ SetupWorktreeNode -> SpecExistsRouterNode -> { GenerateTasksNode -> LoadTaskStat
                                 -> TriageRouterNode -> ConsolidatedReviewNode
                                 -> ReviewRouterNode -> UpdateTaskStatusNode
                                 -> SaveStateNode -> (loop) TaskQueueRouterNode
-                            | PatchDocsNode -> WrapUpNode -> PullRequestNode
+                            | FinalValidationNode -> PatchDocsNode -> WrapUpNode -> PullRequestNode
                                 -> EmitStateNode }
 
 TriageRouterNode     -> { ConsolidatedReviewNode | IncrementAttemptNode | WrapUpNode }
@@ -53,7 +53,7 @@ are runtime-only — declared but not walked by the graph's acyclic-shape valida
 | `SpecExistsRouterNode` | Deterministic router | Routes to `LoadTaskStateNode` if `sdlc-flow-state.json` or `tasks.json` already exists under `planning/<slug>/`, else to `GenerateTasksNode`. |
 | `GenerateTasksNode` | **Model** (Opus) | Planning-fallback path only — gathers `planning/<slug>/*.md` context and prompts for a task list, writing `tasks.json` + `tasks.md`. Sets `config.json_schema` and prefers the model's structured output (`ctx.nodes["GenerateTasksNode"]["structured"]`) over fence-stripped text parsing, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Hardcoded to Opus; does not read policy. |
 | `LoadTaskStateNode` | Deterministic | Loads `sdlc-flow-state.json` if present (always preferred over `tasks.json`), else bootstraps a fresh `SDLCState` from `tasks.json`. Applies the event's `task_range` filter. |
-| `TaskQueueRouterNode` | Deterministic router | Finds the first `PENDING` task and routes to `ImplementTaskNode`; if none remain, routes to `PatchDocsNode` (task loop exit). |
+| `TaskQueueRouterNode` | Deterministic router | Finds the first `PENDING` task and routes to `ImplementTaskNode`; if none remain, routes to `FinalValidationNode` (task loop exit — the drain branch). |
 | `ImplementTaskNode` | **Model** (Sonnet, tunable via policy) | Drives the model to implement the current task; parses `{summary, modified_files, tests_added}`, preferring the model's structured output (`ctx.nodes["ImplementTaskNode"]["structured"]`) over fence-stripped text parsing and falling back to `strip_json_fence` + `serde_json::from_str` (or a synthesized `ImplementOutput` on parse error) when structured output is absent. Reads policy for model tier, prompt-cache anchor, and verbosity directive — never rewired to the `local` tier regardless of policy. |
 | `TestTaskNode` | Deterministic | Runs the worktree's `planning/harness.json` validation-suite `checks`. Only the `command` check kind is fully supported today — other declared kinds fail closed with a "not yet supported" message rather than silently passing. |
 | `TriageTaskNode` | Deterministic, **conditionally model** | Classifies the test result as `PASS` / `RETRYABLE` / `MAJOR_BAIL`. Deterministic by default; only calls the model (Sonnet, tunable) when `event.llm_triage == true` **and** the task is failing-but-under-budget — that LLM branch sets `config.json_schema` and prefers the model's structured output over fence-stripped text parsing, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Also reads policy on the `PASS` branch for deterministic trivial-diff classification (`review_skip_max_files`/`review_skip_max_diff_lines`), independent of `llm_triage`. |
@@ -63,6 +63,7 @@ are runtime-only — declared but not walked by the graph's acyclic-shape valida
 | `IncrementAttemptNode` | Deterministic | Shared retry back-edge target for `TriageRouterNode`'s `RETRYABLE` and `ReviewRouterNode`'s minor fail. Bumps `task.attempt_count` + telemetry, forwards to `ImplementTaskNode`. |
 | `UpdateTaskStatusNode` | Deterministic | Mutates the durable state: sets the task's status to `Done`/`Failed`, bumps telemetry counters. |
 | `SaveStateNode` | Deterministic | Serializes the latest `SDLCState` to `planning/<slug>/sdlc-flow-state.json` inside the worktree, `git add` + `git commit`. Runs once per completed task-loop iteration, then loops back to `TaskQueueRouterNode`. |
+| `FinalValidationNode` | Deterministic | The run-level authoritative gate (`EN.3.E`). Runs the worktree's `planning/harness.json` `validation.checks[]` at `TestDepth::Full` with NO `perTask` filter (`apply_per_task_filter = false`) and an empty `task_validation_commands` slice — so `cargo build --release` (marked `"perTask": false`) runs here even though `TestTaskNode` skips it. Sits on the task-loop drain branch only (`TaskQueueRouterNode`'s "no pending" edge), so it runs exactly once per run, never per task; the `ImplementTaskNode` branch and both routers' bail edges into `WrapUpNode` do not pass through it. It is unconditional and **not** policy-gated — no `SdlcPolicy` field, profile entry, or `harness.json` key changes whether it runs or at what depth (see [D12](../planning/decisions/D12-per-task-vs-final-check-depth.md) and the [two-check-site model](#the-two-check-site-model-per-task-tripwire-vs-final-gate) below). A failing gate does **not** halt the walk — it stamps `{all_passed, check_results, failure_summary}` (the same shape `TestTaskNode` emits) and returns `Ok`, so the run still reaches `EmitStateNode` and `WrapUpNode` reports a degraded terminal status rather than bailing. |
 | `PatchDocsNode` | **Model** (Sonnet) | Reads the most recent `ImplementTaskNode`'s `modified_files`, asks the model to find and patch stale `docs/` references (the model edits files itself via its own tool use — this node doesn't). Sets `config.json_schema` and prefers the model's structured output (`ctx.nodes["PatchDocsNode"]["structured"]`) over fence-stripped text parsing for its own `{summary, files_patched}` output, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Hardcoded to Sonnet; does not read policy. |
 | `WrapUpNode` | Deterministic | Computes the PASS/PARTIAL-FAIL outcome, renders `log_entry`/`report`/`status_suggestion` text, stamps `policy` + `RunOutcomes` telemetry into `SDLCState`, and persists that stamped state to `sdlc-flow-state.json` — the only point the `policy`/`outcomes` blocks reach disk, since `SaveStateNode` never runs again after the loop exits. Terminal target for both routers' bail branches, and the natural end of a fully-passing run. |
 | `PullRequestNode` | Deterministic | Pushes the branch and opens a PR via `gh pr create` — never auto-merges (human review gate, decision D25). No-op (`{pr_url: null, skipped: true}`) when `event.auto_pr == false` (default `true`). |
@@ -79,6 +80,25 @@ policy was seeded yet — in-tree/CLI-driven runs and unit tests driving this no
 `ConsolidatedReviewNode` get rewired to the local-model transport. Every other node either has a
 hardcoded model choice (`GenerateTasksNode`: Opus, `PatchDocsNode`: Sonnet) or makes no model call
 at all. Full knob-by-knob reference: [sdlc-flow-policy.md](sdlc-flow-policy.md).
+
+### The two-check-site model: per-task tripwire vs. final gate
+
+`SDLC_FLOW` runs the `planning/harness.json` validation suite at two different sites, mirroring
+the shape `.claude/workflows/sdlc-flow.js` has always had (its fast per-task tripwire vs. its full
+end-review suite):
+
+- **`TestTaskNode`** — the per-task tripwire, run on every task attempt. Honors `test_depth`
+  (`fastCommand` substitution, `perTask: false` exclusion at both depths) so the implement-fix loop
+  stays cheap — see [Per-task check selection (`test_depth`)](sdlc-flow-policy.md#per-task-check-selection-test_depth).
+- **`FinalValidationNode`** (`EN.3.E`) — the run-level authoritative gate, run exactly once on the
+  task-loop drain branch. Always `TestDepth::Full`, no `perTask` filter — `cargo build --release`
+  runs here even though the tripwire skips it. Not a knob: `flow.testDepth` from `harness.json`
+  governs `TestTaskNode` only and is deliberately never read here.
+
+Without `FinalValidationNode`, EN.3.D's cheap tripwire would mean the authoritative
+`cargo nextest run --workspace` and `cargo build --release` never ran at all in a Rust
+`SDLC_FLOW` run — trading a cost bug for a correctness bug. See
+[D12](../planning/decisions/D12-per-task-vs-final-check-depth.md) for the full rationale.
 
 ## How to trigger a run
 
@@ -164,6 +184,16 @@ endpoint — it prompts for confirmation and reports 202/404/401/connection-fail
     which never sets it, and for any older file predating this field — both parse cleanly via
     `SDLCState::from_committed_state_json`, which tolerates an absent key as well as an explicit
     `null`.
+  - **`final_validation`** (top-level key, `EN.3.E`) — the `FinalValidationNode` result, folded in
+    by `WrapUpNode` at the same point it stamps `policy`/`outcomes`: `{all_passed, check_results,
+    failure_summary}`, the same shape `TestTaskNode` stamps per task. `null` for any run that
+    didn't reach `WrapUpNode` (a bailed run) and for any state written by base-template's JS
+    `sdlc-flow.js` engine, which never sets it — additive, same precedent as `run_id`/`telemetry`/
+    `policy`/`outcomes`, so an older or JS-engine-written file still parses via
+    `SDLCState::from_committed_state_json` and reports `None`. A `false` `all_passed` here means
+    the run-level authoritative gate failed even though every task passed its own tripwire and
+    review; it degrades the run's terminal status but does not flip it to `"blocked"` (see
+    [D12](../planning/decisions/D12-per-task-vs-final-check-depth.md)).
   - **Terminal status on a failed walk** (EN.6.J) — a node returning `Err` halts the walk before
     `WrapUpNode` ever runs, which used to leave this file saying `"running"` forever. `engine-serve`
     now detects that outcome after the walk exits (a failed node run, an `Err` from `run_with`, or

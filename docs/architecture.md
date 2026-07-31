@@ -301,7 +301,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   default, so existing nodes are unaffected until they opt in.
 - `LoopSpec` / `LoopCluster` / `build_loop` (`engine-core::loop_combinator`, EN.5.E task 2) — a
   reusable builder for the `{guard router, increment node, back-edge}` cluster idiom (generalized
-  from the hand-written `sdlc_flow::graph`/`task_loop` retry loop). `build_loop(LoopSpec) ->
+  from the hand-written `sdlc_flow::graph`/`task_loop` retry loop; the task-loop drain branch now
+  also carries a `FinalValidationNode` run-level validation gate, `EN.3.E` — see
+  [sdlc-flow-workflow.md](sdlc-flow-workflow.md)). `build_loop(LoopSpec) ->
   LoopCluster` returns two boxed nodes (a guard `Router` and an increment node, both identity-
   derived via `with_identity` so distinct-prefix clusters coexist in one registry) plus their
   declared `NodeConfig` connections, ready to merge into a `NodeRegistry`/`WorkflowSchema`. The

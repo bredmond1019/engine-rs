@@ -15,6 +15,8 @@
 //! - `wrap_up` — `WrapUpNode` (bottom-half, EN.3.B).
 //! - `pr` — `PullRequestNode` (bottom-half, EN.3.B).
 //! - `emit_state` — `EmitStateNode` (bottom-half, EN.3.B).
+//! - `final_validation` — `FinalValidationNode`: the unconditional run-level
+//!   full-suite gate on the task-loop drain branch (`EN.3.E`).
 //! - `graph` — assembles the declared `WorkflowSchema` + `NodeRegistry` for
 //!   the whole workflow.
 //! - `aggregate` — the cross-run `(policy -> cost, time, quality)`
@@ -45,6 +47,7 @@ pub(crate) use super::{get_result, parse_structured_or_fenced, put_result, strip
 pub mod aggregate;
 pub mod docs;
 pub mod emit_state;
+pub mod final_validation;
 pub mod graph;
 pub mod policy;
 pub mod pr;

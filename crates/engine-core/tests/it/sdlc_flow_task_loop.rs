@@ -47,6 +47,7 @@ use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
+use engine_core::workflows::sdlc_flow::final_validation::FinalValidationNode;
 use engine_core::workflows::sdlc_flow::graph;
 use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
 use engine_core::workflows::sdlc_flow::setup::{
@@ -245,7 +246,9 @@ fn build_workflow(
         },
     ))));
 
-    registry.register(Box::new(TestTaskNode::new().with_runner(test_runner)));
+    registry.register(Box::new(
+        TestTaskNode::new().with_runner(test_runner.clone()),
+    ));
     registry.register(Box::new(TriageTaskNode::new()));
     registry.register(Box::new(TriageRouterNode));
 
@@ -275,6 +278,11 @@ fn build_workflow(
         },
     ))));
     registry.register(Box::new(IncrementAttemptNode));
+    // Reuses `test_runner` — the same injected `CommandRunner` `TestTaskNode`
+    // uses — so this hermetic test never shells out on the drain branch.
+    registry.register(Box::new(
+        FinalValidationNode::new().with_runner(test_runner),
+    ));
     registry.register(Box::new(WrapUpNode::new()));
     registry.register(Box::new(PullRequestNode::new()));
     registry.register(Box::new(
@@ -462,6 +470,7 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "ReviewRouterNode",
         "UpdateTaskStatusNode",
         "SaveStateNode",
+        "FinalValidationNode",
         "PatchDocsNode",
         "WrapUpNode",
         "PullRequestNode",
@@ -506,6 +515,7 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
         "ReviewRouterNode",
         "UpdateTaskStatusNode",
         "SaveStateNode",
+        "FinalValidationNode",
         "WrapUpNode",
         "PullRequestNode",
         "EmitStateNode",
@@ -587,6 +597,8 @@ async fn workflow_terminal_stub_reachable_when_no_pending_tasks() {
         .expect("workflow run should not error");
 
     assert_eq!(implement_calls.load(Ordering::SeqCst), 0);
+    let final_validation_run = final_ctx.node_runs.get("FinalValidationNode").unwrap();
+    assert_eq!(final_validation_run.status, NodeRunStatus::Success);
     let patch_docs_run = final_ctx.node_runs.get("PatchDocsNode").unwrap();
     assert_eq!(patch_docs_run.status, NodeRunStatus::Success);
     let task_queue_run = final_ctx.node_runs.get("TaskQueueRouterNode").unwrap();

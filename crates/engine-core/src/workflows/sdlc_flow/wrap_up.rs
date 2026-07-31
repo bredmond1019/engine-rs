@@ -30,7 +30,8 @@ use crate::policy::RESOLVED_POLICY_IDENTITY;
 
 use super::policy::SdlcPolicy;
 use super::schema::{
-    CommittedDocs, CommittedPr, CommittedReview, RunMeta, RunOutcomes, SDLCState, TerminalSignal,
+    CommittedDocs, CommittedFinalValidation, CommittedPr, CommittedReview, RunMeta, RunOutcomes,
+    SDLCState, TerminalSignal,
 };
 use super::task_loop::STRUCTURAL_ISSUE_THRESHOLD;
 use super::{get_result, put_result};
@@ -192,6 +193,21 @@ fn committed_pr(_ctx: &TaskContext) -> Option<CommittedPr> {
     None
 }
 
+/// Reshape `FinalValidationNode`'s output (if the run reached the drain
+/// branch's full-suite gate) into the D31 committed-state `final_validation`
+/// block (EN.3.E task 3). The stamped result already carries exactly
+/// `{all_passed, check_results, failure_summary}` — the same shape
+/// [`CommittedFinalValidation`] declares — so a direct `serde_json`
+/// deserialize is all that's needed; no field-by-field reshaping like
+/// [`committed_review`]/[`committed_docs`] requires. `None` when
+/// `FinalValidationNode` never ran this walk (a bailed run routes straight
+/// to `WrapUpNode` from a router and never reaches the drain branch) or if
+/// its stamped result somehow fails to parse as [`CommittedFinalValidation`].
+fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidation> {
+    let result = get_result(ctx, "FinalValidationNode")?;
+    serde_json::from_value(result.clone()).ok()
+}
+
 /// Derive this run's [`TerminalSignal`], if any, by inspecting the two
 /// model-judgment stages that can route straight to `WrapUpNode` rather
 /// than back through a retry loop: `TriageTaskNode`'s `MAJOR_BAIL` verdict,
@@ -269,9 +285,17 @@ fn persist_state(
     review: Option<&CommittedReview>,
     docs: Option<&CommittedDocs>,
     pr: Option<&CommittedPr>,
+    final_validation: Option<&CommittedFinalValidation>,
     terminal_signal: Option<&TerminalSignal>,
 ) -> Result<String, NodeError> {
-    let committed = state.to_committed_state_json(run_meta, review, docs, pr, terminal_signal);
+    let committed = state.to_committed_state_json(
+        run_meta,
+        review,
+        docs,
+        pr,
+        final_validation,
+        terminal_signal,
+    );
     let json = serde_json::to_string_pretty(&committed)
         .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
     std::fs::write(state_path, json).map_err(|err| {
@@ -337,6 +361,7 @@ pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<S
     let review = committed_review(ctx);
     let docs = committed_docs(ctx);
     let pr = committed_pr(ctx);
+    let final_validation = committed_final_validation(ctx);
     let terminal_signal = TerminalSignal::MajorBail(reason.to_string());
 
     persist_state(
@@ -346,6 +371,7 @@ pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<S
         review.as_ref(),
         docs.as_ref(),
         pr.as_ref(),
+        final_validation.as_ref(),
         Some(&terminal_signal),
     )
     .ok()
@@ -503,6 +529,16 @@ impl Node for WrapUpNode {
         state.global_status =
             super::schema::derive_committed_status(&state, terminal_signal.as_ref()).to_string();
 
+        // `FinalValidationNode`'s outcome (if the run reached the drain
+        // branch — a bailed run never does) is reported, never converted
+        // into a bail: the tasks themselves already passed their own
+        // tripwires and reviews, so a failed run-level gate is a degraded
+        // terminal status, not a `TerminalSignal::MajorBail` (see this
+        // spec's `tasks.md` Notes and `D12-per-task-vs-final-check-depth.md`
+        // for why `derive_terminal_signal`/`derive_committed_status` above
+        // deliberately never consult it).
+        let final_validation = committed_final_validation(&ctx);
+
         let spec_slug = &state.spec_slug;
         let tasks_passed = state.telemetry.tasks_passed;
         let tasks_failed = state.telemetry.tasks_failed;
@@ -512,11 +548,17 @@ impl Node for WrapUpNode {
         } else {
             "PARTIAL/FAIL"
         };
+        let gate_failed = final_validation.as_ref().is_some_and(|fv| !fv.all_passed);
+        let gate_note = final_validation
+            .as_ref()
+            .filter(|fv| !fv.all_passed)
+            .map(|fv| format!(" Final validation gate FAILED: {}", fv.failure_summary))
+            .unwrap_or_default();
 
         let log_entry = format!(
             "## {date} — {spec_slug}\n\n\
              Outcome: {outcome}. {tasks_passed} task(s) passed, {tasks_failed} failed, \
-             {total_attempts} total implement/test attempt(s)."
+             {total_attempts} total implement/test attempt(s).{gate_note}"
         );
 
         let report = format!(
@@ -525,14 +567,22 @@ impl Node for WrapUpNode {
              - Outcome: {outcome}\n\
              - Tasks passed: {tasks_passed}\n\
              - Tasks failed: {tasks_failed}\n\
-             - Total attempts: {total_attempts}\n"
+             - Total attempts: {total_attempts}\n\
+             {gate_note}"
         );
 
-        let status_suggestion = if outcome == "PASS" {
+        let status_suggestion = if outcome == "PASS" && !gate_failed {
             format!(
                 "{spec_slug} completed successfully on {date} \
                  ({tasks_passed} task(s) passed, {total_attempts} total attempt(s)). \
                  Ready for review/merge."
+            )
+        } else if gate_failed {
+            format!(
+                "{spec_slug} finished its task loop on {date} \
+                 ({tasks_passed} passed / {tasks_failed} failed, {total_attempts} total \
+                 attempt(s)) but the final validation gate FAILED:{gate_note} \
+                 Needs follow-up before merge."
             )
         } else {
             format!(
@@ -564,6 +614,7 @@ impl Node for WrapUpNode {
                     review.as_ref(),
                     docs.as_ref(),
                     pr.as_ref(),
+                    final_validation.as_ref(),
                     terminal_signal.as_ref(),
                 )?)
             }
@@ -1079,6 +1130,121 @@ mod tests {
         assert!(result.get("saved_to").is_none());
     }
 
+    // -- EN.3.E task 3: `final_validation` folded into wrap-up ------------
+
+    #[tokio::test]
+    async fn wrap_up_writes_passing_final_validation_to_disk() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.E-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "FinalValidationNode".to_string(),
+            json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["final_validation"]["all_passed"], json!(true));
+        assert_eq!(value["status"], json!("done"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_writes_failing_final_validation_with_degraded_wording_but_non_blocked_status()
+    {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.E-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "FinalValidationNode".to_string(),
+            json!({
+                "all_passed": false,
+                "check_results": [
+                    { "name": "build", "kind": "command", "passed": false },
+                ],
+                "failure_summary": "Failed checks: build",
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+
+        // Reported, not converted into a bail: no task itself failed, so
+        // `status` stays out of `"blocked"` even though the run-level gate
+        // failed (see `derive_terminal_signal`/`derive_committed_status`,
+        // which never consult `FinalValidationNode`).
+        let status_suggestion = result["status_suggestion"].as_str().unwrap();
+        assert!(status_suggestion.contains("FAILED"));
+        assert!(status_suggestion.contains("Failed checks: build"));
+
+        let saved_to = result["saved_to"].as_str().unwrap();
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["final_validation"]["all_passed"], json!(false));
+        assert_eq!(
+            value["final_validation"]["failure_summary"],
+            json!("Failed checks: build")
+        );
+        assert_ne!(value["status"], json!("blocked"));
+        assert_eq!(value["status"], json!("done"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[tokio::test]
+    async fn wrap_up_writes_null_final_validation_when_node_never_ran() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.E-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert!(value["final_validation"].is_null());
+        assert_eq!(value["status"], json!("done"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
     // -- EN.6.J task 4: run_id stamp + failure-path terminal writer --------
 
     #[tokio::test]
@@ -1145,7 +1311,7 @@ mod tests {
             updated_at: "2026-07-01T00:00:00Z".to_string(),
             run_id: None,
         };
-        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         let json = serde_json::to_string_pretty(&committed).unwrap();
         std::fs::write(state_dir.join("sdlc-flow-state.json"), json).unwrap();
     }
