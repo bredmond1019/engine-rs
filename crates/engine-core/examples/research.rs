@@ -60,6 +60,11 @@ async fn main() {
 
     // Set up a scratch worktree for state files
     let worktree = std::env::temp_dir().join(format!("research-run-{}", std::process::id()));
+    // Guarantee-empty: see engine-core's `sdlc_flow/setup.rs` `temp_dir_named`
+    // doc comment for why PID-recycling makes this removal necessary, not
+    // optional (this is a scratch worktree, not a test, but the same latent
+    // hazard applies).
+    std::fs::remove_dir_all(&worktree).ok();
     std::fs::create_dir_all(&worktree).unwrap();
     ctx.nodes.insert(
         "SetupWorktreeNode".to_string(),

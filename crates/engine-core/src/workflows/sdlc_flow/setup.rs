@@ -562,17 +562,93 @@ mod tests {
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// A unique scratch directory under the OS temp dir, cleaned up by the
-    /// caller (or left for the OS to reap — tests don't rely on cleanup for
-    /// correctness).
-    fn temp_dir() -> PathBuf {
-        let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "engine-core-sdlc-flow-setup-test-{}-{n}",
-            std::process::id()
-        ));
+    /// A named scratch directory under the OS temp dir, guaranteed EMPTY at
+    /// the moment it is returned.
+    ///
+    /// Under `cargo nextest` every test runs in its own process, so a
+    /// per-process counter (like `TMP_COUNTER` below) restarts at 0 in each
+    /// process and a directory name built from `(pid, counter)` is a pure
+    /// function of those two numbers — not of the test that requested it.
+    /// The OS recycles PIDs (macOS hands them out sequentially and wraps at
+    /// ~99998), so a later test run can be handed a directory name a
+    /// previous run already used and left populated on disk — `create_dir_all`
+    /// on an existing directory succeeds and silently adopts the leftover
+    /// contents. That combination produced a false FAIL on 2026-07-31 (PR
+    /// #34, block EN.3.J-sdlc-flow-smoke): an absence-asserting test was
+    /// handed a directory containing a sibling test's leftover
+    /// `sdlc-flow-state.json` from an earlier process that happened to reuse
+    /// the same PID. Removing the directory immediately before recreating it
+    /// closes that hole for good, independent of what any previous run left
+    /// behind.
+    fn temp_dir_named(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        // `remove_dir_all` returns `Err(NotFound)` on the normal first-use
+        // case (nothing to remove yet) — that is not a failure, hence `.ok()`.
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// A unique scratch directory under the OS temp dir, cleaned up by the
+    /// caller (or left for the OS to reap — tests don't rely on cleanup for
+    /// correctness). Guaranteed empty at return time; see `temp_dir_named`.
+    fn temp_dir() -> PathBuf {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        temp_dir_named(&format!(
+            "engine-core-sdlc-flow-setup-test-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    // --- temp_dir_named hermeticity ---------------------------------------
+
+    #[test]
+    fn temp_dir_named_returns_empty_dir_even_when_name_was_previously_populated() {
+        // Regression guard for the 2026-07-31 false-FAIL (PR #34): a
+        // directory handed out under a name that already existed on disk
+        // (simulating a PID-recycled leftover from a previous test run)
+        // must come back empty, not carrying the old contents.
+        let name = "engine-core-hermetic-temp-dir-regression";
+
+        let first = temp_dir_named(name);
+        std::fs::write(first.join("sentinel.txt"), "leftover").unwrap();
+        let nested = first.join("planning").join("my-spec").join("sdlc");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("sdlc-flow-state.json"), "{}").unwrap();
+
+        let second = temp_dir_named(name);
+        assert_eq!(first, second, "same name must yield the same path");
+
+        let entries: Vec<_> = std::fs::read_dir(&second).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "expected {} to be empty, found: {entries:?}",
+            second.display()
+        );
+        assert!(
+            !nested.join("sdlc-flow-state.json").exists(),
+            "leftover state file must not survive a fresh temp_dir_named call"
+        );
+
+        std::fs::remove_dir_all(&second).ok();
+    }
+
+    #[test]
+    fn temp_dir_named_returns_existing_empty_dir_when_name_never_existed() {
+        // The Err(NotFound) path: remove_dir_all on a name that has never
+        // been used must not fail the helper, and the directory it creates
+        // must exist and be empty.
+        let name = "engine-core-hermetic-temp-dir-regression-fresh";
+        let dir = std::env::temp_dir().join(name);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!dir.exists());
+
+        let result = temp_dir_named(name);
+        assert!(result.is_dir());
+        let entries: Vec<_> = std::fs::read_dir(&result).unwrap().collect();
+        assert!(entries.is_empty());
+
+        std::fs::remove_dir_all(&result).ok();
     }
 
     fn empty_context(event: serde_json::Value) -> TaskContext {
