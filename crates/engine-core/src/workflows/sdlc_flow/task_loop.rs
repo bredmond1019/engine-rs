@@ -2445,16 +2445,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_no_harness_json_passes() {
+        // Renamed intent, same coverage: task 4's harness-missing fix means
+        // a worktree with no `planning/harness.json` and a task with no
+        // `validation_commands` is now a GATING failure, not a silent pass
+        // (see the "harness-missing fix" note in tasks.md). This is the
+        // exact behavior the spec's acceptance criteria require.
         let worktree = temp_worktree();
-        let mut ctx = empty_context(json!({}));
-        ctx.nodes.insert(
-            "SetupWorktreeNode".to_string(),
-            json!({ "worktree_path": worktree.to_string_lossy() }),
-        );
+        let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new();
         let out = node.process(ctx).await.expect("process should succeed");
-        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "harness-missing");
     }
 
     #[tokio::test]
@@ -2465,11 +2470,7 @@ mod tests {
             json!([{ "name": "always_fail", "command": "exit 1", "gates": true }]),
         );
 
-        let mut ctx = empty_context(json!({}));
-        ctx.nodes.insert(
-            "SetupWorktreeNode".to_string(),
-            json!({ "worktree_path": worktree.to_string_lossy() }),
-        );
+        let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new();
         let out = node.process(ctx).await.expect("process should succeed");
@@ -2496,11 +2497,7 @@ mod tests {
             })
         });
 
-        let mut ctx = empty_context(json!({}));
-        ctx.nodes.insert(
-            "SetupWorktreeNode".to_string(),
-            json!({ "worktree_path": worktree.to_string_lossy() }),
-        );
+        let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new().with_runner(runner.clone());
         let out = node.process(ctx.clone()).await.unwrap();
@@ -2511,8 +2508,18 @@ mod tests {
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
     }
 
+    /// Builds a `ctx` with a `SetupWorktreeNode` output plus everything
+    /// `TestTaskNode` now needs to reach it (task 4 makes `TestTaskNode`
+    /// policy-strict and reads the CURRENT task's `validation_commands` out
+    /// of the live durable state): a single default task (no
+    /// `validation_commands`), a matching `TaskQueueRouterNode`/
+    /// `LoadTaskStateNode` pair, and the built-in `SdlcPolicy` default
+    /// (behavior-stable per rule 6, so stamping it changes nothing these
+    /// tests assert).
     fn ctx_for_worktree(worktree: &Path) -> TaskContext {
-        let mut ctx = empty_context(json!({}));
+        let task = SDLCTask::new(1, "t", "d");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
         ctx.nodes.insert(
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": worktree.to_string_lossy() }),
@@ -2581,6 +2588,10 @@ mod tests {
     #[tokio::test]
     async fn write_verification_passes_when_claimed_file_changed() {
         let worktree = temp_worktree();
+        // An empty (but present) harness keeps this test isolated to the
+        // write-verification guard: task 4's harness-missing fix only gates
+        // when `planning/harness.json` is absent entirely.
+        write_harness(&worktree, json!([]));
         let ctx = ctx_with_implement_claim(&worktree, &["src/lib.rs"]);
 
         let node = TestTaskNode::new().with_runner(porcelain_runner(" M src/lib.rs\n"));
@@ -2598,6 +2609,7 @@ mod tests {
     #[tokio::test]
     async fn write_verification_does_not_trip_on_empty_claim() {
         let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
         let ctx = ctx_with_implement_claim(&worktree, &[]);
 
         let node = TestTaskNode::new().with_runner(porcelain_runner(""));
@@ -2615,6 +2627,7 @@ mod tests {
     #[tokio::test]
     async fn write_verification_does_not_trip_when_implement_never_ran() {
         let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
         let ctx = ctx_for_worktree(&worktree);
 
         let node = TestTaskNode::new().with_runner(porcelain_runner(""));
