@@ -291,7 +291,19 @@ pub async fn stream_event(
         }
     };
 
-    let known = state.live.get(event_id).is_some() || state.live.get_record(event_id).is_some();
+    // Three-tier lookup, mirroring `get_event` (`http.rs:465`): live map, then
+    // the terminal record ring, then `live_run_metadata()`. That third tier
+    // covers the window between `post_events` registering the run_id and the
+    // first `on_progress` snapshot landing in `LiveStateStore` — without it,
+    // a client that opens the stream in that window gets 404'd here while
+    // `GET /events/{id}` correctly reports `running` for the same id
+    // (`http.rs:517-540`). Change one, change the other.
+    let known = state.live.get(event_id).is_some()
+        || state.live.get_record(event_id).is_some()
+        || crate::http::live_run_metadata()
+            .read()
+            .expect("live run metadata lock poisoned on read")
+            .contains_key(&event_id);
     if !known {
         return HttpResponse::NotFound()
             .json(serde_json::json!({ "error": "unknown or malformed event_id" }));
