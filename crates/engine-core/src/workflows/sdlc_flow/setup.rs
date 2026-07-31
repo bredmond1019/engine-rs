@@ -12,6 +12,7 @@
 //! never shell out to a real `git` subprocess.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
@@ -20,6 +21,7 @@ use serde_json::json;
 
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
+use crate::repo_registry::RepoRegistry;
 use crate::routing::Router;
 
 use crate::policy::PolicyConfigSource;
@@ -150,15 +152,27 @@ fn parse_event(ctx: &TaskContext) -> Result<SDLCFlowEventSchema, NodeError> {
 }
 
 /// `<worktree_path>/planning/<spec_slug>` — mirrors the Python
-/// `_shared.get_spec_dir` helper. Falls back to `.` for `worktree_path` when
-/// `SetupWorktreeNode` hasn't run yet (e.g. a unit test driving this node in
-/// isolation).
+/// `_shared.get_spec_dir` helper. Falls back to the event's resolved target
+/// root (EN.3.K) for `worktree_path` when `SetupWorktreeNode` hasn't run yet
+/// (e.g. a unit test driving this node in isolation) — a fallback that still
+/// exists, only what it falls back *to* changed: an absent `repo` resolves
+/// to `current_dir()` (byte-identical to the old `"."` fallback in effect),
+/// a `repo`-bearing event without a registry available degrades to `"."`
+/// rather than erroring, since this helper has no `Result` to surface one
+/// through and no registry seam to consult.
 fn spec_dir(ctx: &TaskContext, spec_slug: &str) -> PathBuf {
-    let worktree = get_result(ctx, "SetupWorktreeNode")
+    if let Some(worktree) = get_result(ctx, "SetupWorktreeNode")
         .and_then(|value| value.get("worktree_path"))
         .and_then(|value| value.as_str())
-        .unwrap_or(".");
-    Path::new(worktree).join("planning").join(spec_slug)
+    {
+        return Path::new(worktree).join("planning").join(spec_slug);
+    }
+
+    let root = parse_event(ctx)
+        .ok()
+        .and_then(|event| resolve_target_root(&event, None).ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    root.join("planning").join(spec_slug)
 }
 
 /// Deterministic node: creates or reattaches the spec's git worktree.
@@ -175,6 +189,7 @@ fn spec_dir(ctx: &TaskContext, spec_slug: &str) -> PathBuf {
 /// has no equivalent here.
 pub struct SetupWorktreeNode {
     runner: CommandRunner,
+    registry: Option<Arc<RepoRegistry>>,
 }
 
 impl SetupWorktreeNode {
@@ -182,6 +197,7 @@ impl SetupWorktreeNode {
     pub fn new() -> Self {
         Self {
             runner: default_command_runner(),
+            registry: None,
         }
     }
 
@@ -190,6 +206,18 @@ impl SetupWorktreeNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Install the repo registry (EN.3.K) an `event.repo` slug resolves
+    /// against. Defaults to `None`, so a unit test or a CLI/in-tree run that
+    /// never installs one keeps today's behavior: an absent `repo` resolves
+    /// to `current_dir()` regardless, and a present-but-unresolvable `repo`
+    /// (no registry available) surfaces a named error rather than silently
+    /// falling back.
+    #[must_use]
+    pub fn with_registry(mut self, registry: Arc<RepoRegistry>) -> Self {
+        self.registry = Some(registry);
         self
     }
 }
@@ -208,14 +236,39 @@ impl Node for SetupWorktreeNode {
             .branch_name
             .clone()
             .unwrap_or_else(|| format!("sdlc/{}", event.spec_slug));
-        let worktree_path = if event.use_worktree {
-            format!("trees/{branch}")
+
+        // EN.3.K: every relative path this node produces is anchored to
+        // `root` — `resolve_target_root` returns `current_dir()` verbatim
+        // when `event.repo` is absent, so `is_default_target` gates an
+        // explicit branch back to today's exact relative strings and `"."`
+        // git cwds rather than relying on `PathBuf` join semantics to
+        // happen to reproduce them. `RunMeta.worktree_path` is read by
+        // `bastion`/`bastion-web`/`run-sdlc-flow.sh`, so this is a
+        // behavior-stability guarantee, not a style choice.
+        let is_default_target = target_root_is_default(&event);
+        let root = resolve_target_root(&event, self.registry.as_deref())?;
+
+        let worktree_path_buf: PathBuf = if is_default_target {
+            if event.use_worktree {
+                PathBuf::from(format!("trees/{branch}"))
+            } else {
+                PathBuf::from(".")
+            }
+        } else if event.use_worktree {
+            root.join("trees").join(&branch)
         } else {
-            ".".to_string()
+            root.clone()
+        };
+        let worktree_path = worktree_path_buf.to_string_lossy().to_string();
+
+        let git_cwd: PathBuf = if is_default_target {
+            PathBuf::from(".")
+        } else {
+            root.clone()
         };
 
         if event.use_worktree {
-            let reattaching = event.resume && Path::new(&worktree_path).exists();
+            let reattaching = event.resume && worktree_path_buf.exists();
             if !reattaching {
                 let output = (self.runner)(
                     "git",
@@ -225,9 +278,11 @@ impl Node for SetupWorktreeNode {
                         &worktree_path,
                         "-b",
                         &branch,
+                        // EN.3.K: base ref intentionally unchanged — a
+                        // separate concern from *which repo*.
                         "origin/main",
                     ],
-                    Path::new("."),
+                    &git_cwd,
                 )
                 .map_err(|err| {
                     NodeError::new(format!("failed to spawn git worktree add: {err}"))
@@ -239,7 +294,7 @@ impl Node for SetupWorktreeNode {
                     let _ = (self.runner)(
                         "git",
                         &["worktree", "remove", "--force", &worktree_path],
-                        Path::new("."),
+                        &git_cwd,
                     );
                     return Err(NodeError::new(format!(
                         "git worktree add failed (status {}): {}",
@@ -249,9 +304,14 @@ impl Node for SetupWorktreeNode {
             }
 
             // Ensure the planning symlink exists in the worktree
-            let worktree_planning = Path::new(&worktree_path).join("planning");
+            let worktree_planning = worktree_path_buf.join("planning");
             if !worktree_planning.exists() {
-                if let Ok(canonical_planning) = std::fs::canonicalize("planning") {
+                let planning_source = if is_default_target {
+                    PathBuf::from("planning")
+                } else {
+                    root.join("planning")
+                };
+                if let Ok(canonical_planning) = std::fs::canonicalize(&planning_source) {
                     #[cfg(unix)]
                     let _ = std::os::unix::fs::symlink(canonical_planning, worktree_planning);
                 }
@@ -260,8 +320,15 @@ impl Node for SetupWorktreeNode {
             if !event.resume {
                 let output = (self.runner)(
                     "git",
-                    &["checkout", "-B", &branch, "origin/main"],
-                    Path::new("."),
+                    &[
+                        "checkout",
+                        "-B",
+                        &branch,
+                        // EN.3.K: base ref intentionally unchanged — a
+                        // separate concern from *which repo*.
+                        "origin/main",
+                    ],
+                    &git_cwd,
                 )
                 .map_err(|err| NodeError::new(format!("failed to spawn git checkout: {err}")))?;
 
@@ -272,9 +339,10 @@ impl Node for SetupWorktreeNode {
                     )));
                 }
             } else {
-                let output = (self.runner)("git", &["checkout", &branch], Path::new(".")).map_err(
-                    |err| NodeError::new(format!("failed to spawn git checkout: {err}")),
-                )?;
+                let output =
+                    (self.runner)("git", &["checkout", &branch], &git_cwd).map_err(|err| {
+                        NodeError::new(format!("failed to spawn git checkout: {err}"))
+                    })?;
 
                 if output.status != 0 {
                     return Err(NodeError::new(format!(
@@ -1268,6 +1336,216 @@ mod tests {
             .get(RESOLVED_POLICY_IDENTITY)
             .expect("resolved policy present in ctx after setup");
         assert_eq!(policy["max_attempts"], 99);
+    }
+
+    // --- SetupWorktreeNode + repo registry (EN.3.K) --------------------------
+
+    /// A recording runner: `stub_runner` above discards its inputs, but
+    /// these tests need to assert on the exact `cwd` every git invocation
+    /// received.
+    #[allow(clippy::type_complexity)]
+    fn recording_runner(
+        status: i32,
+    ) -> (
+        CommandRunner,
+        Arc<Mutex<Vec<(String, Vec<String>, PathBuf)>>>,
+    ) {
+        let calls: Arc<Mutex<Vec<(String, Vec<String>, PathBuf)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| (*s).to_string()).collect(),
+                cwd.to_path_buf(),
+            ));
+            Ok(CommandOutput {
+                status,
+                stdout: String::new(),
+                stderr: if status == 0 {
+                    String::new()
+                } else {
+                    "git failed".to_string()
+                },
+            })
+        });
+        (runner, calls)
+    }
+
+    /// Recorded calls minus `git rev-parse HEAD` — that invocation's cwd is
+    /// `worktree_path` (item (g) in tasks.md's inventory, unaffected by this
+    /// task: it already derives from `worktree_path` and follows
+    /// automatically), and in the `use_worktree` case the stub runner never
+    /// actually creates that directory on disk, so it cannot be
+    /// canonicalized. These tests assert on the `worktree add` /
+    /// `remove` / `checkout` cwds, which item (b)-(f) anchor to `root`.
+    fn non_rev_parse_calls(
+        calls: &[(String, Vec<String>, PathBuf)],
+    ) -> Vec<&(String, Vec<String>, PathBuf)> {
+        calls
+            .iter()
+            .filter(|(_, args, _)| args.first().map(String::as_str) != Some("rev-parse"))
+            .collect()
+    }
+
+    /// A tempdir "brain root" with a `brain.toml` naming one repo (`alpha`),
+    /// mirroring `repo_registry.rs`'s own `two_repo_brain` fixture but
+    /// scoped to this module's tests.
+    fn brain_root_with_alpha() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("alpha")).expect("mkdir alpha");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            r#"
+[[repos]]
+slug = "alpha"
+repo_path = "alpha"
+"#,
+        )
+        .expect("write brain.toml");
+        dir
+    }
+
+    #[tokio::test]
+    async fn absent_repo_stamps_relative_worktree_path_and_dot_cwds() {
+        // Byte-identical-to-today assertion: no `repo` field at all.
+        let (runner, calls) = recording_runner(0);
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["worktree_path"], "trees/sdlc/my-spec");
+
+        let recorded = calls.lock().unwrap();
+        let checked = non_rev_parse_calls(&recorded);
+        assert!(!checked.is_empty());
+        for (_, _, cwd) in checked {
+            assert_eq!(
+                cwd,
+                &PathBuf::from("."),
+                "expected every git cwd to stay \".\""
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_repo_no_worktree_stamps_dot_and_dot_cwds() {
+        let (runner, calls) = recording_runner(0);
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["worktree_path"], ".");
+
+        let recorded = calls.lock().unwrap();
+        assert!(!recorded.is_empty());
+        for (_, _, cwd) in recorded.iter() {
+            assert_eq!(cwd, &PathBuf::from("."));
+        }
+    }
+
+    #[tokio::test]
+    async fn known_repo_anchors_worktree_path_and_git_cwds_to_resolved_root() {
+        let brain = brain_root_with_alpha();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+        let alpha_root = registry.resolve("alpha").expect("alpha resolves");
+
+        let (runner, calls) = recording_runner(0);
+        let node = SetupWorktreeNode::new()
+            .with_runner(runner)
+            .with_registry(registry);
+        let ctx =
+            empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        let expected_worktree = alpha_root.join("trees").join("sdlc/my-spec");
+        assert_eq!(
+            result["worktree_path"],
+            expected_worktree.to_string_lossy().to_string()
+        );
+
+        let recorded = calls.lock().unwrap();
+        let checked = non_rev_parse_calls(&recorded);
+        assert!(!checked.is_empty());
+        for (_, _, cwd) in checked {
+            assert_eq!(
+                cwd.canonicalize().unwrap(),
+                alpha_root.canonicalize().unwrap(),
+                "expected every git cwd to be alpha's resolved root"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_repo_no_worktree_anchors_to_resolved_root() {
+        let brain = brain_root_with_alpha();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+        let alpha_root = registry.resolve("alpha").expect("alpha resolves");
+
+        let (runner, calls) = recording_runner(0);
+        let node = SetupWorktreeNode::new()
+            .with_runner(runner)
+            .with_registry(registry);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "repo": "alpha" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(
+            result["worktree_path"],
+            alpha_root.to_string_lossy().to_string()
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert!(!recorded.is_empty());
+        for (_, _, cwd) in recorded.iter() {
+            assert_eq!(
+                cwd.canonicalize().unwrap(),
+                alpha_root.canonicalize().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_repo_slug_errors_and_runs_no_git_command() {
+        let brain = brain_root_with_alpha();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+
+        let (runner, calls) = recording_runner(0);
+        let node = SetupWorktreeNode::new()
+            .with_runner(runner)
+            .with_registry(registry);
+        let ctx = empty_context(
+            json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "not-a-real-slug" }),
+        );
+
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(
+            err.message.contains("not-a-real-slug"),
+            "error should name the offending slug: {}",
+            err.message
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no git command should have run"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_slug_with_no_registry_installed_errors_rather_than_falling_back_to_cwd() {
+        let (runner, calls) = recording_runner(0);
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx =
+            empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" }));
+
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(err.message.contains("alpha"));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     // --- GenerateTasksNode --------------------------------------------------
