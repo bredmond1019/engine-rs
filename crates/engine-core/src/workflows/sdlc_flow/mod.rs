@@ -113,15 +113,93 @@ pub(crate) fn commit_state_file(runner: &CommandRunner, worktree: &Path, state_p
         if output.status != 0 {
             // "nothing to commit" or an equivalent no-op — logged, not
             // an error, mirroring `save_state_node.py`.
-            log_noop_commit(&output.stderr);
+            log_noop_commit(state_path, output);
         }
     }
 }
 
-/// Best-effort no-op logging hook for a non-fatal `git commit` outcome
-/// (e.g. "nothing to commit, working tree clean"). Kept as a tiny named
-/// function rather than an inline `eprintln!` so its intent — "logged, not
-/// an error" — reads at the call site. Currently a stub (filled in by
-/// EN.3.G task 4 to distinguish a genuine no-op from a real commit
-/// failure).
-fn log_noop_commit(_stderr: &str) {}
+/// Pure classifier for a non-zero `git commit` exit: `true` when the
+/// stdout/stderr text describes the ordinary "nothing to commit" outcome
+/// (re-saving an unchanged file), `false` for anything else (a genuine
+/// failure). Split out as a small pure function — rather than folded into
+/// [`log_noop_commit`] — so tests can assert on the classification directly
+/// instead of capturing `eprintln!` output.
+pub(crate) fn is_noop_commit(stderr: &str, stdout: &str) -> bool {
+    let haystack = format!("{stdout}\n{stderr}").to_lowercase();
+    haystack.contains("nothing to commit")
+        || haystack.contains("working tree clean")
+        || haystack.contains("no changes added to commit")
+}
+
+/// Logging hook for a non-zero `git commit` outcome from
+/// [`commit_state_file`], distinguishing the ordinary no-op ("nothing to
+/// commit, working tree clean") from a genuine failure — that distinction is
+/// the entire point of this function; do not collapse it back to a single
+/// branch.
+///
+/// **Why the quiet path matters in THIS repo specifically:** `planning/` is
+/// a gitignored symlink (`.gitignore` line 7 `/planning`, `planning ->
+/// ../_planning/engine-rs`), so every single state commit in this tree is a
+/// no-op. A blanket warn on every non-zero exit would therefore fire on
+/// every task of every run and train the reader to ignore it — hence the
+/// no-op branch is silent by default and only prints when `ENGINE_DEBUG` is
+/// set, while a genuine failure always prints (with the stderr text and the
+/// state path) regardless.
+///
+/// Uses `eprintln!`, not a logging facade: the workspace carries no
+/// `tracing`/`log` dependency in any `crates/*/Cargo.toml` nor the workspace
+/// root (verified during EN.3.G authoring), and adding one for a single call
+/// site is out of scope here.
+fn log_noop_commit(state_path: &Path, output: &CommandOutput) {
+    if is_noop_commit(&output.stderr, &output.stdout) {
+        if std::env::var("ENGINE_DEBUG").is_ok() {
+            eprintln!(
+                "sdlc_flow: state commit no-op ({}): {}",
+                state_path.display(),
+                output.stderr.trim()
+            );
+        }
+    } else {
+        eprintln!(
+            "sdlc_flow: WARNING state commit failed ({}): {}",
+            state_path.display(),
+            output.stderr.trim()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_noop_commit;
+
+    #[test]
+    fn is_noop_commit_classifies_nothing_to_commit_as_a_noop() {
+        assert!(is_noop_commit("nothing to commit, working tree clean", ""));
+    }
+
+    #[test]
+    fn is_noop_commit_classifies_no_changes_added_as_a_noop() {
+        assert!(is_noop_commit(
+            "",
+            "no changes added to commit (use \"git add\" and/or \"git commit -a\")"
+        ));
+    }
+
+    #[test]
+    fn is_noop_commit_classifies_working_tree_clean_as_a_noop_case_insensitively() {
+        assert!(is_noop_commit("Working Tree Clean", ""));
+    }
+
+    #[test]
+    fn is_noop_commit_classifies_a_genuine_failure_as_not_a_noop() {
+        assert!(!is_noop_commit("fatal: unable to write new index file", ""));
+    }
+
+    #[test]
+    fn is_noop_commit_classifies_unrelated_stderr_as_not_a_noop() {
+        assert!(!is_noop_commit(
+            "error: pathspec did not match any files",
+            ""
+        ));
+    }
+}
