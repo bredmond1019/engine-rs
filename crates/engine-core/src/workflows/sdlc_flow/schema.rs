@@ -428,11 +428,15 @@ impl SDLCState {
     /// "not available yet". Passing them as parameters means each call site
     /// supplies exactly what it currently has (or `None`).
     ///
-    /// `telemetry`/`policy`/`outcomes`/`phase_id`/`block_id` ride along as
-    /// additive top-level keys — every real consumer of this file
-    /// (`bastion`'s `flow.rs`, `run-sdlc-flow.sh`'s `jq` queries) ignores
+    /// `telemetry`/`policy`/`outcomes`/`phase_id`/`block_id`/`final_validation`
+    /// ride along as additive top-level keys — every real consumer of this
+    /// file (`bastion`'s `flow.rs`, `run-sdlc-flow.sh`'s `jq` queries) ignores
     /// unknown keys (no `deny_unknown_fields` anywhere in this codebase, and
     /// D37 already set this additive-schema-growth precedent for `tokens`).
+    /// `final_validation` (EN.3.E) follows the exact same precedent:
+    /// base-template's JS `sdlc-flow.js` engine will never emit this key, so
+    /// a file it wrote round-trips through [`Self::from_committed_state_json`]
+    /// reading it back as `None`.
     #[must_use]
     pub fn to_committed_state_json(
         &self,
@@ -440,6 +444,7 @@ impl SDLCState {
         review: Option<&CommittedReview>,
         docs: Option<&CommittedDocs>,
         pr: Option<&CommittedPr>,
+        final_validation: Option<&CommittedFinalValidation>,
         terminal_signal: Option<&TerminalSignal>,
     ) -> serde_json::Value {
         let mut tasks_obj = serde_json::Map::with_capacity(self.tasks.len());
@@ -473,6 +478,7 @@ impl SDLCState {
             "outcomes": self.outcomes,
             "phase_id": self.phase_id,
             "block_id": self.block_id,
+            "final_validation": final_validation,
         })
     }
 
@@ -646,6 +652,32 @@ pub struct CommittedPr {
     pub url: String,
     /// The opened PR's number.
     pub number: u64,
+}
+
+/// The `FinalValidationNode` output, reshaped into the additive D31
+/// committed-state `final_validation` key (EN.3.E task 3):
+/// `{all_passed, failure_summary, check_results}`. Reuses
+/// [`super::task_loop::CheckResult`] verbatim for `check_results` rather than
+/// inventing a parallel shape — `TestTaskNode` and `FinalValidationNode`
+/// stamp the exact same per-check result type into `ctx.nodes`.
+///
+/// Transient like [`CommittedReview`]/[`CommittedDocs`]/[`CommittedPr`]: it
+/// is not stored as an `SDLCState` field, only accepted as a fresh parameter
+/// on each [`SDLCState::to_committed_state_json`] call — `WrapUpNode` is the
+/// only run-level site that ever has a `FinalValidationNode` result to
+/// reshape, so there is nothing to preserve across a resume the way
+/// `telemetry`/`policy`/`outcomes` are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedFinalValidation {
+    /// Whether every gating check in the final-validation run passed.
+    pub all_passed: bool,
+    /// Human-readable summary of the failing check names, empty when
+    /// `all_passed` is `true`.
+    #[serde(default)]
+    pub failure_summary: String,
+    /// Per-check results from the full-depth, unfiltered harness run.
+    #[serde(default)]
+    pub check_results: Vec<super::task_loop::CheckResult>,
 }
 
 /// Why an SDLC Flow run ended before every task completed cleanly — the one
@@ -1000,7 +1032,7 @@ mod tests {
             task(2, SDLCTaskStatus::InProgress),
         ];
 
-        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
         let tasks = json["tasks"].as_object().expect("tasks is an object");
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks["1"]["status"], serde_json::json!("done"));
@@ -1010,7 +1042,7 @@ mod tests {
     #[test]
     fn to_committed_state_json_empty_tasks_round_trip_as_empty_object() {
         let state = SDLCState::new("EN.4.1-fixture");
-        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
         assert_eq!(json["tasks"], serde_json::json!({}));
         assert_eq!(json["status"], serde_json::json!("running"));
         assert_eq!(json["current_task"], serde_json::json!(0));
@@ -1024,7 +1056,7 @@ mod tests {
     fn to_committed_state_json_carries_run_meta_fields() {
         let state = SDLCState::new("EN.4.1-fixture");
         let meta = run_meta();
-        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        let json = state.to_committed_state_json(&meta, None, None, None, None, None);
         assert_eq!(json["spec_slug"], serde_json::json!("EN.4.1-fixture"));
         assert_eq!(json["branch"], serde_json::json!(meta.branch));
         assert_eq!(json["worktree_path"], serde_json::json!(meta.worktree_path));
@@ -1037,7 +1069,7 @@ mod tests {
         let state = SDLCState::new("EN.4.1-fixture");
         let mut meta = run_meta();
         meta.run_id = Some("11111111-2222-3333-4444-555555555555".to_string());
-        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        let json = state.to_committed_state_json(&meta, None, None, None, None, None);
         assert_eq!(
             json["run_id"],
             serde_json::json!("11111111-2222-3333-4444-555555555555")
@@ -1049,7 +1081,7 @@ mod tests {
         let state = SDLCState::new("EN.4.1-fixture");
         let meta = run_meta();
         assert_eq!(meta.run_id, None);
-        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        let json = state.to_committed_state_json(&meta, None, None, None, None, None);
         assert_eq!(json["run_id"], serde_json::Value::Null);
     }
 
@@ -1060,7 +1092,7 @@ mod tests {
         let mut meta = run_meta();
         meta.run_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string());
 
-        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        let json = state.to_committed_state_json(&meta, None, None, None, None, None);
         let round_tripped =
             SDLCState::from_committed_state_json(&json).expect("round-trip should parse");
 
@@ -1107,8 +1139,14 @@ mod tests {
             number: 1,
         };
 
-        let json =
-            state.to_committed_state_json(&run_meta(), Some(&review), Some(&docs), Some(&pr), None);
+        let json = state.to_committed_state_json(
+            &run_meta(),
+            Some(&review),
+            Some(&docs),
+            Some(&pr),
+            None,
+            None,
+        );
         assert_eq!(json["review"]["verdict"], serde_json::json!("PASS"));
         assert_eq!(json["review"]["attempts"], serde_json::json!(1));
         assert_eq!(
@@ -1117,6 +1155,107 @@ mod tests {
         );
         assert_eq!(json["docs"]["created"], serde_json::json!([]));
         assert_eq!(json["pr"]["number"], serde_json::json!(1));
+    }
+
+    // -- EN.3.E task 3: `final_validation` committed-state key -------------
+
+    fn sample_final_validation(all_passed: bool) -> CommittedFinalValidation {
+        let json = serde_json::json!({
+            "all_passed": all_passed,
+            "failure_summary": if all_passed { "" } else { "Failed checks: build" },
+            "check_results": [
+                { "name": "build", "kind": "command", "passed": all_passed },
+            ],
+        });
+        serde_json::from_value(json).expect("CommittedFinalValidation shape parses")
+    }
+
+    #[test]
+    fn to_committed_state_json_carries_a_some_final_validation() {
+        let state = SDLCState::new("EN.3.E-fixture");
+        let final_validation = sample_final_validation(true);
+
+        let json = state.to_committed_state_json(
+            &run_meta(),
+            None,
+            None,
+            None,
+            Some(&final_validation),
+            None,
+        );
+
+        assert_eq!(
+            json["final_validation"]["all_passed"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            json["final_validation"]["failure_summary"],
+            serde_json::json!("")
+        );
+        assert_eq!(
+            json["final_validation"]["check_results"][0]["name"],
+            serde_json::json!("build")
+        );
+    }
+
+    #[test]
+    fn to_committed_state_json_emits_null_final_validation_when_absent() {
+        let state = SDLCState::new("EN.3.E-fixture");
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
+        assert!(json["final_validation"].is_null());
+    }
+
+    #[test]
+    fn final_validation_round_trips_through_from_committed_state_json() {
+        let state = SDLCState::new("EN.3.E-fixture");
+        let final_validation = sample_final_validation(false);
+
+        let json = state.to_committed_state_json(
+            &run_meta(),
+            None,
+            None,
+            None,
+            Some(&final_validation),
+            None,
+        );
+
+        // `from_committed_state_json` must not choke on the new key — it
+        // does not reconstruct `final_validation` onto `SDLCState` (it is a
+        // transient per-write param, same as `review`/`docs`/`pr`), but the
+        // written JSON itself preserves the full shape, which is what
+        // `wrap_up::committed_final_validation` reads back on a resumed
+        // failure-path write.
+        let round_tripped =
+            SDLCState::from_committed_state_json(&json).expect("parses with final_validation set");
+        assert_eq!(round_tripped.spec_slug, "EN.3.E-fixture");
+        assert_eq!(
+            json["final_validation"]["all_passed"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            json["final_validation"]["failure_summary"],
+            serde_json::json!("Failed checks: build")
+        );
+    }
+
+    #[test]
+    fn from_committed_state_json_missing_final_validation_key_still_parses() {
+        // Base-template's JS `sdlc-flow.js` engine's shape: no
+        // `final_validation` key at all (it never emits one).
+        let value = serde_json::json!({
+            "spec_slug": "js-engine-fixture",
+            "branch": "sdlc/js-engine-fixture",
+            "worktree_path": "trees/sdlc/js-engine-fixture",
+            "started_at": "2026-07-25T00:00:00Z",
+            "updated_at": "2026-07-25T00:10:00Z",
+            "status": "running",
+            "current_task": 1,
+            "tasks": {},
+        });
+
+        let state = SDLCState::from_committed_state_json(&value)
+            .expect("state with no final_validation key should still parse");
+        assert_eq!(state.spec_slug, "js-engine-fixture");
     }
 
     #[test]
@@ -1128,7 +1267,7 @@ mod tests {
         state.policy = Some(SdlcPolicy::default());
         state.outcomes = Some(RunOutcomes::default());
 
-        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
         assert_eq!(json["phase_id"], serde_json::json!("EN.4"));
         assert_eq!(json["block_id"], serde_json::json!("EN.4.1"));
         assert_eq!(json["telemetry"]["total_attempts"], serde_json::json!(2));
@@ -1141,7 +1280,7 @@ mod tests {
         let mut state = SDLCState::new("EN.4.1-fixture");
         let meta = run_meta();
         state.started_at = Some(meta.started_at.clone());
-        let json = state.to_committed_state_json(&meta, None, None, None, None);
+        let json = state.to_committed_state_json(&meta, None, None, None, None, None);
 
         let round_tripped = SDLCState::from_committed_state_json(&json).expect("parses");
         assert_eq!(round_tripped.spec_slug, "EN.4.1-fixture");
@@ -1164,7 +1303,7 @@ mod tests {
         state.telemetry.tasks_passed = 1;
         state.telemetry.tasks_failed = 1;
 
-        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
         let round_tripped = SDLCState::from_committed_state_json(&json).expect("parses");
 
         assert_eq!(round_tripped.tasks.len(), 3);
@@ -1220,7 +1359,7 @@ mod tests {
             ..RunOutcomes::default()
         });
 
-        let json = state.to_committed_state_json(&run_meta(), None, None, None, None);
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
         let round_tripped = SDLCState::from_committed_state_json(&json).expect("parses");
 
         assert_eq!(round_tripped.telemetry.total_attempts, 3);
@@ -1393,7 +1532,7 @@ mod tests {
         };
 
         let actual =
-            state.to_committed_state_json(&meta, Some(&review), Some(&docs), Some(&pr), None);
+            state.to_committed_state_json(&meta, Some(&review), Some(&docs), Some(&pr), None, None);
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/committed_state_expected.json"))
                 .expect("golden fixture parses as JSON");

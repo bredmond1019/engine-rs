@@ -460,11 +460,20 @@ impl Node for ImplementTaskNode {
 
 /// Outcome of a single harness check. Mirrors Python's `CheckResult`.
 ///
-/// `pub(crate)` so [`super::final_validation::FinalValidationNode`] — which
-/// shares [`TestTaskNode::run_checks`] rather than forking a second
-/// check-kind dispatch — can name the type its stamped result carries.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct CheckResult {
+/// `pub` (not `pub(crate)`) so [`super::final_validation::FinalValidationNode`]
+/// — which shares [`TestTaskNode::run_checks`] rather than forking a second
+/// check-kind dispatch — can name the type its stamped result carries, and
+/// so [`super::schema::CommittedFinalValidation`] (EN.3.E task 3), itself a
+/// `pub` type, can reuse this exact shape for the committed-state
+/// `final_validation.check_results` array rather than inventing a parallel
+/// one — a `pub(crate)` field type inside a `pub` struct is a
+/// `private_interfaces` warning (denied under `clippy -- -D warnings`).
+/// `Deserialize`/`PartialEq`/`Eq` are needed for that reuse: the
+/// committed-state round trip deserializes `check_results` back out of the
+/// on-disk JSON. Fields stay module-private — nothing outside this crate
+/// constructs one directly; only the *type name* needs to be nameable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckResult {
     name: String,
     kind: String,
     passed: bool,
@@ -1943,7 +1952,7 @@ impl Node for SaveStateNode {
         })?;
         let state_path = state_dir.join("sdlc-flow-state.json");
         let run_meta = build_run_meta(&ctx, &worktree, &state_path);
-        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         let json = serde_json::to_string_pretty(&committed)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
         std::fs::write(&state_path, json).map_err(|err| {

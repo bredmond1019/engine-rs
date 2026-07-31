@@ -69,7 +69,7 @@ fn seed_state_file(worktree: &Path, spec_slug: &str, state: &SDLCState) {
         updated_at: "2026-07-01T00:00:00Z".to_string(),
         run_id: None,
     };
-    let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+    let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
     let json_str = serde_json::to_string_pretty(&committed).unwrap();
     std::fs::write(state_dir.join("sdlc-flow-state.json"), json_str).unwrap();
 }
@@ -316,7 +316,7 @@ fn committed_json_without_run_id_key_parses_as_none_and_preserves_other_d31_fiel
         updated_at: "2026-07-03T00:00:00Z".to_string(),
         run_id: None,
     };
-    let rewritten = parsed.to_committed_state_json(&run_meta, None, None, None, None);
+    let rewritten = parsed.to_committed_state_json(&run_meta, None, None, None, None, None);
     assert_eq!(rewritten["run_id"], serde_json::Value::Null);
     assert_eq!(rewritten["branch"], json!("sdlc/js-engine-fixture"));
     assert_eq!(

@@ -697,7 +697,7 @@ mod tests {
             updated_at: "2026-07-25T00:00:00Z".to_string(),
             run_id: None,
         };
-        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
             sdlc_dir.join("sdlc-flow-state.json"),
             serde_json::to_string(&committed).unwrap(),
@@ -727,7 +727,7 @@ mod tests {
             updated_at: "2026-07-25T00:00:00Z".to_string(),
             run_id: None,
         };
-        let committed = state.to_committed_state_json(&run_meta, None, None, None, None);
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
             sdlc_dir.join("sdlc-flow-state.json"),
             serde_json::to_string(&committed).unwrap(),
