@@ -578,6 +578,15 @@ impl TestTaskNode {
     /// `forbidden-pattern-scan`: grep for each rule's pattern under its
     /// paths, drop matches covered by that rule's `allowlistPattern`, fail
     /// on any match left.
+    ///
+    /// The pattern is passed as its own argv entry to a directly-invoked
+    /// `grep`, never interpolated into an `sh -c` string (EN.3.G task 5) —
+    /// a pattern containing `'`, `"`, `$(...)`, or `;` used to terminate the
+    /// shell quoting or inject a second command. **Glob carve-out:** the
+    /// shell used to expand glob metacharacters (`*`, `?`, `[`) in `paths`;
+    /// a direct `grep` invocation does not, so a rule whose `paths` contains
+    /// one stays on the `sh -c` route for that rule only, with the pattern
+    /// escaped as `'\''` so it still cannot break out of quoting.
     fn run_forbidden_pattern_scan(
         &self,
         check: &serde_json::Value,
@@ -599,8 +608,27 @@ impl TestTaskNode {
         {
             let pattern = rule.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let paths = rule.get("paths").and_then(|v| v.as_str()).unwrap_or("");
-            let grep_command = format!("grep -rnE '{pattern}' {paths}");
-            let stdout = self.shell_out(&grep_command, worktree).stdout;
+            let path_entries: Vec<&str> = paths.split_whitespace().collect();
+            if path_entries.is_empty() {
+                // No path operand would make `grep` read stdin and hang;
+                // skip the rule and record nothing.
+                continue;
+            }
+
+            let stdout = if path_entries.iter().any(|p| p.contains(['*', '?', '['])) {
+                // Glob carve-out: keep the `sh -c` route so the shell still
+                // expands the glob, but escape every `'` in the pattern as
+                // `'\''` so it remains inert as shell syntax.
+                let escaped_pattern = pattern.replace('\'', r"'\''");
+                let grep_command = format!("grep -rnE '{escaped_pattern}' {paths}");
+                self.shell_out(&grep_command, worktree).stdout
+            } else {
+                let mut args: Vec<&str> = vec!["-rnE", pattern];
+                args.extend(path_entries.iter().copied());
+                (self.runner)("grep", &args, worktree)
+                    .map(|out| out.stdout)
+                    .unwrap_or_default()
+            };
 
             let mut matches: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
             if let Some(allowlist) = rule.get("allowlistPattern").and_then(|v| v.as_str()) {
@@ -2860,6 +2888,125 @@ mod tests {
             .await
             .expect("process should succeed");
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// Records every invocation's `(program, args)` pair — unlike
+    /// [`recording_command_runner`], which assumes the `sh -c <command>`
+    /// shape and only ever records `args[1]`. EN.3.G task 5's direct `grep`
+    /// invocation has a different shape (`program = "grep"`,
+    /// `args = ["-rnE", pattern, ...paths]`), so the forbidden-pattern-scan
+    /// tests below need the full argv to assert the pattern lands as its
+    /// own unmodified entry rather than being interpolated into a string.
+    fn recording_argv_runner() -> (CommandRunner, Arc<Mutex<Vec<(String, Vec<String>)>>>) {
+        let recorded: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            recorded_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|a| (*a).to_string()).collect(),
+            ));
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        (runner, recorded)
+    }
+
+    #[tokio::test]
+    async fn forbidden_pattern_scan_passes_pattern_as_its_own_argv_entry() {
+        // Patterns that would break or inject through `sh -c 'grep ... '{pattern}'
+        // ...'` string interpolation must land as a single, unmodified argv
+        // entry to a directly-invoked `grep` — never inside an `sh -c` string.
+        for pattern in ["it's", "say \"hi\"", "$(touch /tmp/pwned)", "foo; rm -rf /"] {
+            let worktree = temp_worktree();
+            write_harness(
+                &worktree,
+                json!([{
+                    "kind": "forbidden-pattern-scan",
+                    "name": "scan",
+                    "gates": true,
+                    "rules": [{ "id": "r1", "pattern": pattern, "paths": "app/" }],
+                }]),
+            );
+
+            let (runner, recorded) = recording_argv_runner();
+            let node = TestTaskNode::new().with_runner(runner);
+            node.process(ctx_for_worktree(&worktree))
+                .await
+                .expect("process should succeed");
+
+            let recorded = recorded.lock().unwrap();
+            assert_eq!(
+                recorded.len(),
+                1,
+                "expected exactly one invocation for pattern {pattern:?}"
+            );
+            let (program, args) = &recorded[0];
+            assert_eq!(
+                program, "grep",
+                "pattern {pattern:?} did not use grep directly"
+            );
+            assert_ne!(
+                program, "sh",
+                "pattern {pattern:?} leaked into an sh -c string"
+            );
+            assert!(
+                args.iter().any(|a| a == pattern),
+                "pattern {pattern:?} was not passed as its own unmodified argv entry: {args:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_pattern_scan_empty_paths_issues_no_invocation() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "forbidden-pattern-scan",
+                "name": "scan",
+                "gates": true,
+                "rules": [{ "id": "r1", "pattern": "open\\(", "paths": "" }],
+            }]),
+        );
+
+        let (runner, recorded) = recording_argv_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node
+            .process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+
+        assert!(recorded.lock().unwrap().is_empty());
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn forbidden_pattern_scan_multi_path_becomes_multiple_argv_entries() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{
+                "kind": "forbidden-pattern-scan",
+                "name": "scan",
+                "gates": true,
+                "rules": [{ "id": "r1", "pattern": "open\\(", "paths": "app/ lib/" }],
+            }]),
+        );
+
+        let (runner, recorded) = recording_argv_runner();
+        let node = TestTaskNode::new().with_runner(runner);
+        node.process(ctx_for_worktree(&worktree))
+            .await
+            .expect("process should succeed");
+
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let (program, args) = &recorded[0];
+        assert_eq!(program, "grep");
+        assert_eq!(args, &vec!["-rnE", "open\\(", "app/", "lib/"]);
     }
 
     #[tokio::test]
