@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-02T20:05:00Z"
+timestamp: "2026-08-02T21:30:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,33 @@ related: [status, context]
 ---
 
 ## [run: 2026-08-02]
+
+### Review routed to cloud, local->cloud fallback bug fixed, handoff written
+- **What:** Following the hardening train, routed `SDLC_FLOW`'s review stage off the unprovisioned
+  `local` tier onto cloud models (`7247f40`) — `cheap-fast*` review+triage -> haiku, `pragmatist*`
+  review -> sonnet — after a live `review_mode: per_task` run died on `qwen2.5:3b` not being pulled.
+  The triage flip is behavior-stable (`TriageTaskNode` returns before any model call when
+  `llm_triage: false`, which both cheap-fast profiles set). Then root-caused and fixed a real bug
+  the tier move exposed (`3b5d33c`): both `openai_compat_transport` and
+  `openai_compat_meta_transport` handed the incoming `Config` to `cloud_fallback` unchanged, but
+  `apply_model_tier` had already written the LOCAL model name into `config.model` — so the cloud
+  `claude` CLI was invoked with `qwen2.5:3b` and 404'd, making the fallback useless for the single
+  most likely local-side failure. Both sites now route through `clear_local_model()`. Verified by
+  mutation: reverting the fix fails exactly the 4 new tests while all 8 pre-existing tests still
+  pass, proving the old suite was blind to it. Deliberately did NOT add a `LocalConfig.fallback_model`
+  knob (disproportionate for an error path) and left the fallback quiet-but-attributable via its
+  existing `tier: "cloud"` stamp. Declined to switch the six opt-in `local-*` profiles to cloud —
+  they are the control group for the planned comparison. Captured
+  `planning/eval-cloud-vs-local/notes.md` recording that the cloud-vs-local comparison maps onto the
+  existing `EN.5.B1`/`EN.5.B2` eval blocks rather than a one-off script.
+- **Why:** The owner is about to run `SDLC_FLOW` regularly on this MacBook Pro, and every
+  `review_mode: per_task` run failed on a model that isn't installed. Fixing the tier exposed that
+  the documented "automatic cloud fallback" had never actually worked — `docs/sdlc-flow-policy.md`
+  was promising resilience the code could not deliver, and a silent-but-broken fallback would also
+  have corrupted the future cloud-vs-local eval by hard-failing runs instead of degrading them.
+- **Refs:** `planning/handoff.md`, `planning/eval-cloud-vs-local/notes.md`,
+  `planning/sdlc-flow-hardening/plan.md`; carryovers `sdlc-live-review-never-observed`,
+  `sdlc-review-routed-to-cloud-pending-local-model`, `eval-cloud-vs-local-comparison`.
 
 ### SDLC_FLOW hardening train executed — 9 tickets + 3 follow-ups merged, smoke re-run
 - **What:** Drove the entire `sdlc-flow-hardening` ticket train to completion as orchestrator,
