@@ -392,6 +392,42 @@ const TRIAGE_FAILURE_HEADER: &str = "\n\n--- FAILING CHECK OUTPUT — CLASSIFY F
 /// Marker appended in place of the characters a `max_chars` bound elides.
 const RETRY_FEEDBACK_TRUNCATED: &str = "…[truncated]";
 
+/// Loud, model-facing banner appended when `ConsolidatedReviewNode`'s diff
+/// is clipped by `policy.review_diff_max_chars`.
+///
+/// Visibility is the whole point. A silently truncated diff would recreate
+/// the exact failure mode this train exists to eliminate — a reviewer
+/// confidently returning `PASS` over code it never saw — only with a subtler
+/// cause than the empty diff that motivated `ticket-commit-task-work-real-diffs`.
+const REVIEW_DIFF_TRUNCATED_NOTICE: &str = "\n\n--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL \
+     DIFF ---\nThe diff above was clipped to this run's `review_diff_max_chars` policy bound. \
+     Changes beyond the cut were NOT shown to you. Do NOT return PASS on the strength of code \
+     you could not see: judge only what is visible, and if the visible excerpt is not enough to \
+     decide the acceptance criteria, say so explicitly in `summary` and return PARTIAL.\n";
+
+/// Clip `diff` to at most `budget` characters for embedding in
+/// `ConsolidatedReviewNode`'s prompt, returning `(text, truncated)`.
+///
+/// Reuses [`truncate_chars`] — the same character-safe (never byte-slicing)
+/// helper the retry-feedback bound uses — and reserves the notice's own
+/// length out of the budget so the whole block still fits, mirroring how
+/// [`render_feedback_block`] reserves its labels.
+///
+/// The notice is non-negotiable and is emitted even when the budget is too
+/// small to hold it (the same precedence `render_feedback_block` gives its
+/// check names): a reviewer told nothing at all is the failure mode; a
+/// reviewer told "you are seeing a partial diff" and nothing else is merely
+/// useless, and it will say so.
+fn bound_review_diff(diff: &str, budget: usize) -> (String, bool) {
+    if diff.chars().count() <= budget {
+        return (diff.to_string(), false);
+    }
+    let notice_len = REVIEW_DIFF_TRUNCATED_NOTICE.chars().count();
+    let mut out = truncate_chars(diff, budget.saturating_sub(notice_len));
+    out.push_str(REVIEW_DIFF_TRUNCATED_NOTICE);
+    (out, true)
+}
+
 /// One unit of prior-attempt evidence. `label` names the failing thing and is
 /// never dropped by truncation; `detail` is the (potentially enormous)
 /// compiler/rustfmt/reviewer text and is what gets trimmed to fit.
@@ -1997,6 +2033,15 @@ impl Node for ConsolidatedReviewNode {
             .map(|output| output.stdout)
             .unwrap_or_default();
 
+        let policy = resolved_policy(&ctx)?;
+        // That real diff is unbounded — it is what makes this prompt's size
+        // (and cost) scale with the task. Bound it, visibly.
+        let diff_budget = policy.review_diff_max_chars;
+        let (diff, diff_truncated) = bound_review_diff(&diff, diff_budget as usize);
+
+        // Policy-varying text lives in the per-run prompt BODY only — never
+        // in a `STABLE_SYSTEM_PROMPT` prefix, whose cache breakpoint must
+        // stay run-invariant (CLAUDE.md standing rule 6).
         let prompt = format!(
             "Review this task's diff against its acceptance criteria. \
              Respond with strict JSON of the shape {{\"verdict\": str, \
@@ -2004,7 +2049,6 @@ impl Node for ConsolidatedReviewNode {
              {acceptance_criteria}\n\nDiff:\n{diff}"
         );
 
-        let policy = resolved_policy(&ctx)?;
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Review);
         // Scope the model's session to the actual worktree, matching
@@ -2051,6 +2095,12 @@ impl Node for ConsolidatedReviewNode {
             "verdict": normalized_verdict,
             "summary": parsed.summary,
             "issues": parsed.issues,
+            // Standing rule 6: stamp the RESOLVED knob value (and whether it
+            // actually bit) so `RunTelemetry`/`PolicyAggregate` can attribute
+            // an observed cost — or a thin verdict — to the setting that
+            // caused it.
+            "review_diff_max_chars": diff_budget,
+            "review_diff_truncated": diff_truncated,
         });
         if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
             result["unrecognized_verdict"] = json!(normalized_verdict);
@@ -4364,6 +4414,190 @@ mod tests {
         assert!(
             prompt.contains(SENTINEL),
             "reviewer prompt must contain the working-tree diff; got:\n{prompt}"
+        );
+    }
+
+    // --- Reviewer diff bound (`review_diff_max_chars`) ---------------------
+
+    #[test]
+    fn bound_review_diff_leaves_a_diff_inside_the_budget_untouched() {
+        let diff = "diff --git a/x b/x\n+one line\n";
+        let (out, truncated) = bound_review_diff(diff, 120_000);
+        assert_eq!(out, diff);
+        assert!(!truncated);
+        assert!(!out.contains("DIFF TRUNCATED"));
+    }
+
+    /// The property this knob exists for: an over-budget diff is CLIPPED,
+    /// not dropped, and the clip is announced to the model. A silent
+    /// truncation would let the reviewer PASS code it never saw — the same
+    /// rubber stamp the empty-diff bug produced.
+    #[test]
+    fn bound_review_diff_marks_truncation_visibly_and_respects_the_budget() {
+        let diff = "x".repeat(50_000);
+        let budget = 1_000;
+        let (out, truncated) = bound_review_diff(&diff, budget);
+
+        assert!(truncated);
+        assert!(
+            out.contains("DIFF TRUNCATED"),
+            "truncation must be visible to the model; got:\n{out}"
+        );
+        assert!(
+            out.contains("PARTIAL DIFF"),
+            "the notice must say the diff is partial; got:\n{out}"
+        );
+        assert!(
+            out.chars().count() <= budget,
+            "bounded diff must fit the budget: {} > {budget}",
+            out.chars().count()
+        );
+        // Clipped, not dropped: the head of the diff still made it through.
+        assert!(out.starts_with("xxxx"));
+    }
+
+    /// A budget too small to hold the notice still emits the notice — the
+    /// same precedence `render_feedback_block` gives its check labels.
+    #[test]
+    fn bound_review_diff_emits_the_notice_even_on_an_absurd_budget() {
+        let (out, truncated) = bound_review_diff(&"x".repeat(500), 5);
+        assert!(truncated);
+        assert!(out.contains("DIFF TRUNCATED"), "got:\n{out}");
+    }
+
+    /// Multi-byte content must not panic (the reason [`truncate_chars`]
+    /// counts characters rather than slicing bytes).
+    #[test]
+    fn bound_review_diff_handles_multibyte_content() {
+        let diff = "é".repeat(5_000);
+        let (out, truncated) = bound_review_diff(&diff, 800);
+        assert!(truncated);
+        assert!(out.chars().count() <= 800);
+    }
+
+    /// End-to-end through the node: the resolved bound clips the prompt's
+    /// diff, the notice reaches the model, and the resolved value + a
+    /// `review_diff_truncated` flag are stamped for telemetry (standing
+    /// rule 6).
+    #[tokio::test]
+    async fn review_node_bounds_the_prompt_diff_and_stamps_the_resolved_value() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        let policy = SdlcPolicy {
+            review_diff_max_chars: 2_000,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            let stdout = if args == ["diff", "HEAD"] {
+                "z".repeat(100_000)
+            } else {
+                String::new()
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        });
+
+        let seen_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_prompt_clone = seen_prompt.clone();
+        let transport: ModelTransport = Arc::new(move |_config, prompt: String| {
+            *seen_prompt_clone.lock().unwrap() = Some(prompt);
+            let outcome = canned_outcome(
+                json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let prompt = seen_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert!(
+            prompt.contains("DIFF TRUNCATED"),
+            "the reviewer must be told its diff was clipped"
+        );
+        assert!(
+            prompt.chars().count() < 100_000,
+            "the 100k-character diff must not have reached the prompt whole"
+        );
+
+        let result = &out.nodes["ConsolidatedReviewNode"];
+        assert_eq!(result["review_diff_max_chars"], json!(2_000));
+        assert_eq!(result["review_diff_truncated"], json!(true));
+        // Shape invariant: the verdict contract the router reads is unchanged.
+        assert_eq!(result["verdict"], "PASS");
+    }
+
+    /// Behavior-stable default: a realistic task diff (well under the
+    /// built-in 120k ceiling) reaches the reviewer intact and unannotated.
+    #[tokio::test]
+    async fn review_node_leaves_a_realistic_diff_untruncated_by_default() {
+        const SENTINEL: &str = "TAIL-OF-THE-DIFF-SENTINEL";
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            let stdout = if args == ["diff", "HEAD"] {
+                // ~40k characters — the fat end of a realistic one-task diff.
+                format!(
+                    "{}\n{SENTINEL}\n",
+                    "+ a line of changed code\n".repeat(1_600)
+                )
+            } else {
+                String::new()
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        });
+
+        let seen_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_prompt_clone = seen_prompt.clone();
+        let transport: ModelTransport = Arc::new(move |_config, prompt: String| {
+            *seen_prompt_clone.lock().unwrap() = Some(prompt);
+            let outcome = canned_outcome(
+                json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let prompt = seen_prompt.lock().unwrap().clone().expect("called");
+        assert!(prompt.contains(SENTINEL), "the diff's tail must survive");
+        assert!(!prompt.contains("DIFF TRUNCATED"));
+        assert_eq!(
+            out.nodes["ConsolidatedReviewNode"]["review_diff_truncated"],
+            json!(false)
+        );
+        assert_eq!(
+            out.nodes["ConsolidatedReviewNode"]["review_diff_max_chars"],
+            json!(120_000)
         );
     }
 
