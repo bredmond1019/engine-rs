@@ -30,6 +30,17 @@
 #
 # Exit codes: 0 succeeded · 1 failed/cancelled/budget_halted · 2 timed out
 # while still live · 3 usage error.
+#
+# KNOWN RESIDUAL (deliberately out of scope — do not "fix" piecemeal):
+# the on-disk state file is resolved under the engine-rs checkout this script
+# lives in (ENGINE_DIR="$SCRIPT_DIR/..") plus the event's spec_slug. That path
+# ignores both the event's own `task_context.event.repo` and the
+# `trees/<branch>/` worktree location SaveStateNode actually writes under, so
+# for `--repo` runs and for any run executing in a worktree the `[state]` line
+# is simply absent (the HTTP status polling below is unaffected and remains
+# authoritative). Resolving the real per-run state path is a separate, larger
+# change. What this script DOES guarantee is that it never attributes another
+# run's state file to the watched run — see the run_id guard in the poll loop.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -158,13 +169,28 @@ except Exception:
 
   # On-disk task-loop state — appears once the first task attempt lands.
   if [ -n "$STATE_FILE" ] && [ -f "$STATE_FILE" ]; then
+    # The path is spec_slug-scoped, NOT run-scoped, so a second run of the same
+    # spec (or a stale corpse from a previous one) lands on the exact same file.
+    # EN.6.J stamps run_id into it precisely so a reader can tell: if it does not
+    # match the run we were asked to watch, say so loudly and display nothing —
+    # attributing another run's task state to this one is worse than silence.
+    # Repeated polls collapse to a single printed warning via LAST_TASK_SUMMARY.
     TASK_SUMMARY=$(python3 -c "
 import json
 try:
     d=json.load(open('$STATE_FILE'))
-    tasks=d.get('tasks', {})
-    print(f\"status={d.get('status')} current_task={d.get('current_task')} tasks=[\" +
-          ','.join(f\"{k}:{v.get('status')}\" for k,v in tasks.items()) + ']')
+    file_run_id=d.get('run_id')
+    watching='$RUN_ID'
+    if not file_run_id:
+        print(f\"STALE (state file carries no run_id — pre-EN.6.J or JS-engine write; \"
+              f\"cannot attribute it to {watching}) — skipping state display\")
+    elif file_run_id != watching:
+        print(f\"STALE (run_id mismatch: file={file_run_id} watching={watching}) \"
+              f\"— skipping state display\")
+    else:
+        tasks=d.get('tasks', {})
+        print(f\"status={d.get('status')} current_task={d.get('current_task')} tasks=[\" +
+              ','.join(f\"{k}:{v.get('status')}\" for k,v in tasks.items()) + ']')
 except Exception:
     pass
 " 2>/dev/null || true)
