@@ -60,6 +60,13 @@ pub(super) enum Stage {
     Triage,
     Review,
     /// `setup::GenerateTasksNode`.
+    ///
+    /// Declared and wired through `stage_model_tier`/`stage_call_timeout`,
+    /// but not yet CONSTRUCTED: onboarding `GenerateTasksNode` itself
+    /// (`setup.rs`) was deferred out of this spec to avoid colliding with a
+    /// concurrent in-flight change to that file — see this spec's Amendment
+    /// Log. Remove this attribute when `setup.rs` starts using it.
+    #[allow(dead_code)]
     Generate,
     /// `docs::PatchDocsNode`.
     Docs,
