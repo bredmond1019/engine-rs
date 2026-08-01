@@ -98,6 +98,10 @@ path, per `EN.3.K`). See tasks 7 and 9 of `planning/EN.3.J-sdlc-flow-smoke/tasks
   checkout** (`crates/engine-core/src/workflows/sdlc_flow/setup.rs:220-228`) — moving HEAD out from
   under you while an agentic node with real write permission edits the real tree. Omitting this
   flag is the most damaging mistake available when running this smoke.
+  `SetupWorktreeNode` does now refuse to start a `use_worktree: false` run against a **dirty**
+  live checkout (`git status --porcelain` guard, aborting with the dirty paths named — see
+  [sdlc-flow-workflow.md](sdlc-flow-workflow.md)), which bounds the damage to a tree that was
+  clean to begin with. That is a backstop, not a substitute: keep setting the flag.
 - **`auto_pr` defaults to `true`** (`default_auto_pr`, `crates/engine-core/src/workflows/sdlc_flow/schema.rs:101-103`;
   the field at `schema.rs:118-119`), so it must be set `false` explicitly. With it false,
   `PullRequestNode` short-circuits cleanly to `{ pr_url: null, skipped: true }`
