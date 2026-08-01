@@ -213,6 +213,21 @@ pub struct SdlcPolicy {
     /// Whether the previous attempt's failure output is fed back into
     /// `ImplementTaskNode`'s retry prompt, and how large that block may get.
     pub retry_feedback: RetryFeedback,
+    /// Upper bound, in **characters**, on the working-tree diff embedded in
+    /// `ConsolidatedReviewNode`'s prompt.
+    ///
+    /// Sibling of [`RetryFeedback::max_chars`] and bounded for the same
+    /// reason: `ticket-commit-task-work-real-diffs` made the reviewer see
+    /// the REAL `git diff HEAD` (before it, the string was always empty),
+    /// which made reviewer prompt size — and therefore context consumption
+    /// and cost — scale with diff size, unbounded. A large task could
+    /// produce a prompt that blows the context window.
+    ///
+    /// Truncation is deliberately **visible** to the model (see
+    /// `task_loop::bound_review_diff`): a silently clipped diff would
+    /// recreate the very rubber-stamp failure the real-diff fix exists to
+    /// eliminate.
+    pub review_diff_max_chars: u32,
 }
 
 impl Default for SdlcPolicy {
@@ -238,6 +253,13 @@ impl Default for SdlcPolicy {
             close_out: CloseOut::default(),
             // NOT behavior-stable, deliberately — see `RetryFeedback`'s docs.
             retry_feedback: RetryFeedback::default(),
+            // Behavior-stable in the sense standing rule 6 asks for: chosen
+            // so realistic task diffs pass through untruncated (a typical
+            // one-task diff is a few hundred lines, ~10-40k characters), yet
+            // it is a real ceiling — 120k characters is roughly 30k tokens,
+            // well inside a 200k-token window even after the acceptance
+            // criteria and the model's own reasoning.
+            review_diff_max_chars: 120_000,
         }
     }
 }
@@ -264,6 +286,7 @@ pub struct PartialPolicy {
     pub max_attempts: Option<u32>,
     pub close_out: Option<PartialCloseOut>,
     pub retry_feedback: Option<PartialRetryFeedback>,
+    pub review_diff_max_chars: Option<u32>,
 }
 
 /// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
@@ -429,6 +452,10 @@ impl crate::policy::Policy for SdlcPolicy {
                 Some(rf) => merge_retry_feedback(base.retry_feedback, rf),
                 None => base.retry_feedback,
             },
+            review_diff_max_chars: merge_opt(
+                base.review_diff_max_chars,
+                over.review_diff_max_chars,
+            ),
         }
     }
 }
@@ -746,6 +773,42 @@ mod tests {
         // Nothing anywhere -> the built-in default.
         let untouched = resolve(SdlcPolicy::default(), None, None, None);
         assert_eq!(untouched.retry_feedback, RetryFeedback::default());
+    }
+
+    /// The reviewer-diff bound resolves through all four layers in the same
+    /// precedence order as every other knob, and falls back to the built-in
+    /// 120k-character ceiling when no layer names it.
+    #[test]
+    fn review_diff_max_chars_resolves_through_all_four_layers_in_precedence_order() {
+        let harness = PartialPolicy {
+            review_diff_max_chars: Some(10_000),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            review_diff_max_chars: Some(20_000),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            review_diff_max_chars: Some(30_000),
+            ..Default::default()
+        };
+
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        assert_eq!(resolved.review_diff_max_chars, 30_000);
+
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), Some(&profile), None);
+        assert_eq!(resolved.review_diff_max_chars, 20_000);
+
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, None);
+        assert_eq!(resolved.review_diff_max_chars, 10_000);
+
+        let untouched = resolve(SdlcPolicy::default(), None, None, None);
+        assert_eq!(untouched.review_diff_max_chars, 120_000);
     }
 
     #[test]
@@ -1171,6 +1234,10 @@ mod tests {
             assert_eq!(
                 t.generate, None,
                 "{name} timeouts.generate must be an explicit null"
+            );
+            assert!(
+                parsed.review_diff_max_chars.is_some(),
+                "{name} must set review_diff_max_chars"
             );
         }
     }

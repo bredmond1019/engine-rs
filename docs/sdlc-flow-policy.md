@@ -185,6 +185,7 @@ then the inline `policy` fields override individual knobs on top of it.
 | `max_attempts` | `u32` | Retry budget per task before it's marked `FAILED`. |
 | `close_out.reuse.{validation,review,docs}` | `bool` each | Which `close-out` (EN.2.x) stages are allowed to reuse a prior flow record's result rather than re-running. |
 | `test_depth` | `full` \| `fast` (default `full`) | Which per-task validation checks `TestTaskNode` runs — see [Per-task check selection (`test_depth`)](#per-task-check-selection-test_depth) below. |
+| `review_diff_max_chars` | `u32` (default `120000`) | Ceiling, in characters, on the working-tree diff embedded in `ConsolidatedReviewNode`'s prompt — the bound on reviewer prompt size, and therefore on the context and cost a large task can spend. Over-budget diffs are **clipped, never dropped**, and the clip is announced to the model in the prompt (`--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL DIFF ---`, instructing it not to `PASS` on code it could not see); a silent clip would recreate the rubber-stamp failure the real-diff fix eliminated. The resolved value and a `review_diff_truncated` flag are stamped into `ConsolidatedReviewNode`'s result for telemetry. Profile values track the **reviewer's own context window**, not just willingness to spend: `cheap-fast*` 20k and `pragmatist*` 40k (both review on the `local` tier), `batch-reviewer` 200k (its single `end_only` Sonnet review sees the whole run's accumulated diff), `baseline` 120k (restates the built-in default). |
 
 ### Per-task check selection (`test_depth`)
 

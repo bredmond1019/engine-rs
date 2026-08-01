@@ -33,6 +33,8 @@ pub fn baseline() -> PartialPolicy {
         review_mode: Some(ReviewMode::PerTask),
         llm_triage: Some(false),
         test_depth: Some(TestDepth::Full),
+        // Restates the built-in default verbatim — baseline's no-op contract.
+        review_diff_max_chars: Some(120_000),
         ..Default::default()
     }
 }
@@ -60,6 +62,10 @@ pub fn cheap_fast() -> PartialPolicy {
         output_verbosity: Some(OutputVerbosity::Terse),
         review_mode: Some(ReviewMode::TrivialSkip),
         test_depth: Some(TestDepth::Fast),
+        // The cost/latency floor for the reviewer prompt. Also the profile
+        // that most needs a floor: `review` runs on the `local` tier, whose
+        // context window is a fraction of a cloud model's.
+        review_diff_max_chars: Some(20_000),
         ..Default::default()
     }
 }
@@ -80,6 +86,10 @@ pub fn pragmatist() -> PartialPolicy {
         review_mode: Some(ReviewMode::TrivialSkip),
         llm_triage: Some(true),
         test_depth: Some(TestDepth::Fast),
+        // Above `cheap-fast`, below the cloud-reviewer ceiling: this profile
+        // also reviews on the `local` tier, so its bound is set by that
+        // model's context window, not by willingness to spend.
+        review_diff_max_chars: Some(40_000),
         ..Default::default()
     }
 }
@@ -97,6 +107,11 @@ pub fn batch_reviewer() -> PartialPolicy {
         }),
         review_mode: Some(ReviewMode::EndOnly),
         test_depth: Some(TestDepth::Fast),
+        // The quality ceiling. `end_only` means the single review call sees
+        // the WHOLE run's accumulated diff rather than one task's, and it
+        // sees it on Sonnet — the profile with both the largest input and
+        // the most room for it.
+        review_diff_max_chars: Some(200_000),
         ..Default::default()
     }
 }
@@ -212,5 +227,32 @@ mod tests {
                 "profile `{name}` must set test_depth explicitly"
             );
         }
+    }
+
+    /// Standing rule 6 again, for the reviewer-diff bound. Pinned with the
+    /// exact ordering the profiles are tuned to — `cheap-fast` at the floor,
+    /// `batch-reviewer` at the ceiling, `baseline` restating the built-in
+    /// default — so a careless edit that flattens them fails here.
+    #[test]
+    fn every_named_profile_sets_review_diff_max_chars() {
+        let expected = [
+            ("baseline", 120_000),
+            ("cheap-fast", 20_000),
+            ("pragmatist", 40_000),
+            ("batch-reviewer", 200_000),
+        ];
+        for (name, chars) in expected {
+            let p = profile_by_name(name).expect("known profile name");
+            assert_eq!(
+                p.review_diff_max_chars,
+                Some(chars),
+                "profile `{name}` must set review_diff_max_chars explicitly"
+            );
+        }
+        assert_eq!(
+            baseline().review_diff_max_chars,
+            Some(super::super::policy::SdlcPolicy::default().review_diff_max_chars),
+            "baseline must restate the built-in default (its no-op contract)"
+        );
     }
 }

@@ -148,6 +148,12 @@ numstat with their real line counts; without it git would ignore them entirely, 
 agents routinely create new files. A binary untracked file numstats as `-\t-\t<path>` and hits the
 classifier's existing conservative non-trivial arm.
 
+**The reviewer's diff is bounded.** Because that diff is real, reviewer prompt size — and therefore
+context consumption and cost — scales with it. `policy.review_diff_max_chars` (default 120 000
+characters) is the ceiling; an over-budget diff is **clipped, not dropped**, and the clip is
+announced to the model in the prompt body so it cannot confidently approve code it never saw. See
+[`review_diff_max_chars`](sdlc-flow-policy.md#available-knobs).
+
 > **Why this is not a commit range.** These diffs used to be taken over `<base_sha>..HEAD`, where
 > `base_sha` is the SHA `SetupWorktreeNode` stamps at setup time. Since nothing in a run ever
 > committed the implementer's code, that range was empty on **every** run: the reviewer was shown
