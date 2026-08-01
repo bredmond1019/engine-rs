@@ -316,6 +316,32 @@ impl Node for SetupWorktreeNode {
                     let _ = std::os::unix::fs::symlink(canonical_planning, worktree_planning);
                 }
             }
+
+            // Symlink each workspace sibling path dependency (declared in the
+            // root Cargo.toml as `../<crate>`) into the worktree's parent
+            // directory. `git worktree add` checks out a copy of Cargo.toml
+            // at the worktree location, but path dependencies resolve
+            // relative to that checked-out Cargo.toml, not the real repo
+            // root — without this, `trees/sdlc/<slug>/../<crate>` doesn't
+            // exist and every cargo invocation inside the worktree fails to
+            // resolve claude-code-rs/mev/okf-core. Best-effort, same
+            // tolerance as the planning symlink above: a failure here
+            // surfaces later as a clear cargo resolution error rather than
+            // aborting the whole worktree setup.
+            for sibling_crate in ["claude-code-rs", "mev", "okf-core"] {
+                let worktree_sibling = worktree_path_buf.join("..").join(sibling_crate);
+                if !worktree_sibling.exists() {
+                    let sibling_source = if is_default_target {
+                        PathBuf::from("..").join(sibling_crate)
+                    } else {
+                        root.join("..").join(sibling_crate)
+                    };
+                    if let Ok(canonical_sibling) = std::fs::canonicalize(&sibling_source) {
+                        #[cfg(unix)]
+                        let _ = std::os::unix::fs::symlink(canonical_sibling, worktree_sibling);
+                    }
+                }
+            }
         } else {
             if !event.resume {
                 let output = (self.runner)(
