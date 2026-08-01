@@ -29,6 +29,7 @@ use crate::policy::PolicyConfigSource;
 use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
+use super::task_loop::{apply_policy, resolved_policy, worktree_path, Stage};
 use super::{get_result, parse_structured_or_fenced, put_result};
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
@@ -719,12 +720,17 @@ fn gather_context(dir: &Path) -> String {
         .join("\n\n")
 }
 
-/// Model node (Opus tier, planning-fallback path only): gathers
+/// Model node (planning-fallback path only): gathers
 /// `planning/{spec_slug}/*.md` context, prompts for a task list, and writes
 /// `tasks.md` + `tasks.json`. Composes a `ClaudeCodeStep` (EN.2.A) under its
 /// own identity rather than being a bare `ClaudeCodeStep` instance, so it
 /// can post-process the model's JSON output into the two files this task's
 /// acceptance criteria require.
+///
+/// The model is **not** hardcoded here: `process` resolves it from the
+/// stamped policy's `model_tiers.generate` (`Stage::Generate`), which
+/// defaults to the Opus tier — byte-identical to the `claude-opus-4-8`
+/// literal this node used to carry in `new()`.
 pub struct GenerateTasksNode {
     config: Config,
     transport: Option<ModelTransport>,
@@ -734,10 +740,12 @@ impl GenerateTasksNode {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            config: Config {
-                model: Some("claude-opus-4-8".to_string()),
-                ..Config::default()
-            },
+            // No `model` here — `process` sets it from the resolved policy's
+            // `model_tiers.generate` via `apply_policy`, which overwrites
+            // `config.model` unconditionally. Leaving the old
+            // `claude-opus-4-8` literal in place would be a second, silently
+            // dead source of truth for the same value (standing rule 6).
+            config: Config::default(),
             transport: None,
         }
     }
@@ -771,7 +779,32 @@ impl Node for GenerateTasksNode {
             event.spec_slug
         );
 
-        let mut config = self.config.clone();
+        // Strict read: an absent/unparsable stamp is an error, never a
+        // silent fall back to `SdlcPolicy::default()`.
+        let policy = resolved_policy(&ctx)?;
+        let (mut config, prompt) =
+            apply_policy(self.config.clone(), prompt, &policy, Stage::Generate);
+
+        // Scope the model's session to the run's worktree instead of letting
+        // it inherit the host process's ambient cwd (under `bastion serve`,
+        // the primary checkout on `main`).
+        //
+        // The severity here is deliberately the *weaker* of the pair this
+        // ticket onboarded. `docs::PatchDocsNode` hard-errors on an absent
+        // stamp because it is registered with `agentic_write_config`
+        // (`dangerously_skip_permissions: true`): a skip-permissions writer
+        // must never run unscoped. `GenerateTasksNode` is registered bare
+        // (`graph.rs`, no write grant) and post-processes the model's JSON
+        // into files itself, via paths derived from `spec_dir(&ctx, ..)`
+        // rather than from the session cwd — so best-effort, matching
+        // `task_loop::ImplementTaskNode`, keeps a directly-driven ctx (a unit
+        // test with no `SetupWorktreeNode` run) working instead of failing
+        // the node. In a real walk the stamp is always present:
+        // `SetupWorktreeNode -> SpecExistsRouterNode -> GenerateTasksNode`.
+        if let Ok(worktree) = worktree_path(&ctx) {
+            config.cwd = Some(PathBuf::from(worktree));
+        }
+
         config.json_schema = Some(generated_tasks_schema());
 
         let mut step = ClaudeCodeStep::new("GenerateTasksNode", config, prompt);
@@ -823,6 +856,11 @@ impl Node for GenerateTasksNode {
                 "tasks_json": tasks_json_path.to_string_lossy(),
                 "tasks_md": tasks_md_path.to_string_lossy(),
                 "task_count": generated.tasks.len(),
+                // Stamp the resolved knob values so `RunTelemetry` /
+                // `PolicyAggregate` can attribute this stage's observed cost
+                // to the settings that caused it (standing rule 6).
+                "model_tier": policy.model_tiers.generate,
+                "call_timeout_secs": policy.timeouts.generate,
             }),
         );
 
@@ -836,6 +874,7 @@ impl Node for GenerateTasksNode {
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy::{CallTimeouts, ModelTier, ModelTiers};
     use super::super::schema::SDLCTaskStatus;
     use super::*;
     use claude_code_rs::Outcome;
@@ -944,10 +983,25 @@ mod tests {
     }
 
     fn ctx_with_worktree(spec_slug: &str, worktree: &Path) -> TaskContext {
+        ctx_with_worktree_and_policy(spec_slug, worktree, &SdlcPolicy::default())
+    }
+
+    /// The shape a real walk hands `GenerateTasksNode`: `SetupWorktreeNode`'s
+    /// `worktree_path` plus a stamped resolved policy (which the node now
+    /// reads strictly).
+    fn ctx_with_worktree_and_policy(
+        spec_slug: &str,
+        worktree: &Path,
+        policy: &SdlcPolicy,
+    ) -> TaskContext {
         let mut ctx = empty_context(json!({ "spec_slug": spec_slug }));
         ctx.nodes.insert(
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(policy).expect("policy serializes"),
         );
         ctx
     }
@@ -2405,6 +2459,113 @@ repo_path = "alpha"
 
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("failed to parse model output"));
+    }
+
+    // --- GenerateTasksNode policy/cwd contract -----------------------------
+
+    /// A transport that records the `Config` and prompt it was handed, then
+    /// replies with a valid `GeneratedTasks` payload.
+    #[allow(clippy::type_complexity)]
+    fn capturing_transport(
+        captured: Arc<Mutex<Option<(Config, String)>>>,
+    ) -> (ModelTransport, PathBuf) {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+        let transport: ModelTransport = Arc::new(move |config, prompt| {
+            *captured.lock().unwrap() = Some((config.clone(), prompt.clone()));
+            let outcome = stub_outcome_with_text(
+                &json!({
+                    "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc" }],
+                    "tasks_markdown": "# Tasks\n\n1. Do it",
+                })
+                .to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        (transport, worktree)
+    }
+
+    #[tokio::test]
+    async fn generate_uses_baseline_tier_model_matching_the_former_hardcode() {
+        let captured = Arc::new(Mutex::new(None));
+        let (transport, worktree) = capturing_transport(Arc::clone(&captured));
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        node.process(ctx).await.expect("generate should succeed");
+
+        let (config, _prompt) = captured.lock().unwrap().clone().expect("transport called");
+        // Behavior stability: the built-in default `model_tiers.generate`
+        // must reproduce the `claude-opus-4-8` literal this node used to
+        // hardcode in `new()`.
+        assert_eq!(config.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[tokio::test]
+    async fn generate_applies_the_resolved_tier_and_timeout_and_stamps_them() {
+        let captured = Arc::new(Mutex::new(None));
+        let (transport, worktree) = capturing_transport(Arc::clone(&captured));
+
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                generate: ModelTier::Haiku,
+                ..SdlcPolicy::default().model_tiers
+            },
+            timeouts: CallTimeouts {
+                generate: Some(42),
+                ..SdlcPolicy::default().timeouts
+            },
+            ..SdlcPolicy::default()
+        };
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+        let out = node.process(ctx).await.expect("generate should succeed");
+
+        let (config, _prompt) = captured.lock().unwrap().clone().expect("transport called");
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(config.timeout, Some(std::time::Duration::from_secs(42)));
+
+        let result = out.nodes.get("GenerateTasksNode").expect("output present");
+        assert_eq!(result["model_tier"], json!("haiku"));
+        assert_eq!(result["call_timeout_secs"], json!(42));
+    }
+
+    #[tokio::test]
+    async fn generate_scopes_cwd_to_the_stamped_worktree() {
+        let captured = Arc::new(Mutex::new(None));
+        let (transport, worktree) = capturing_transport(Arc::clone(&captured));
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        node.process(ctx).await.expect("generate should succeed");
+
+        let (config, _prompt) = captured.lock().unwrap().clone().expect("transport called");
+        assert_eq!(config.cwd.as_deref(), Some(worktree.as_path()));
+    }
+
+    #[tokio::test]
+    async fn generate_hard_errors_when_the_resolved_policy_stamp_is_absent() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text("{}");
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        // No `RESOLVED_POLICY_IDENTITY` stamp — strict read must fail rather
+        // than silently defaulting.
+        let mut ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        node.process(ctx)
+            .await
+            .expect_err("absent policy stamp must be an error");
     }
 
     // --- resolve_target_root / target_root_is_default (EN.3.K task 2) ------
