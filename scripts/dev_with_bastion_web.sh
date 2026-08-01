@@ -27,14 +27,24 @@
 #                                                   foreground, Ctrl-C stops both
 #   scripts/dev_with_bastion_web.sh --check-only   run preflight checks and exit; start nothing
 #   scripts/dev_with_bastion_web.sh --rebuild      force a release rebuild of the bastion binary first
+#   scripts/dev_with_bastion_web.sh --stop         kill any servers this script started (or left
+#                                                   running on its ports), then exit — use this if
+#                                                   Ctrl-C didn't get a chance to run (closed
+#                                                   terminal, crashed shell, `kill -9` on the script)
 #   scripts/dev_with_bastion_web.sh --help
+#
+# Shutdown: Ctrl-C (or a plain `kill` of the script's own PID) stops both
+# servers AND their child processes — `npm run dev` spawns a separate
+# `next-server` process that a plain `kill $NPM_PID` would orphan, so
+# shutdown walks the process tree (see kill_tree below) rather than killing
+# only the top-level PID.
 #
 # Env sourced (core/bastion/.env, then core/bastion-web/.env.local — the
 # second wins on overlap): DATABASE_URL, BASTION_SERVE_TOKEN,
 # BASTION_ENGINE_API_KEY, BASTION_SERVE_URL.
 #
 # Exit codes: 0 clean shutdown · 1 preflight failure · 2 a server failed to
-# become healthy within its timeout.
+# become healthy (or died) within its timeout.
 set -euo pipefail
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -58,21 +68,105 @@ FRONTEND_PIDFILE="$RUN_DIR/bastion-web.pid"
 
 CHECK_ONLY="false"
 REBUILD="false"
+STOP_ONLY="false"
 
 usage() {
-  sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --check-only) CHECK_ONLY="true"; shift ;;
     --rebuild) REBUILD="true"; shift ;;
+    --stop) STOP_ONLY="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unrecognized argument: $1" >&2; usage; exit 1 ;;
   esac
 done
 
 mkdir -p "$RUN_DIR"
+
+# ── Process-tree kill helper ─────────────────────────────────────────────────
+#
+# `npm run dev` spawns npm, which spawns a separate `next-server` (Turbopack)
+# child — killing only npm's PID leaves that child running and the port held.
+# Walks children first (post-order) so a parent doesn't vanish out from under
+# a `pgrep -P` lookup for its own children. `pgrep`/`pkill` are present on
+# macOS by default; no `setsid`/process-group tricks needed.
+kill_tree() {
+  local pid="$1" sig="${2:-TERM}"
+  [ -z "$pid" ] && return 0
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    kill_tree "$child" "$sig"
+  done
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+port_in_use() { lsof -ti ":$1" >/dev/null 2>&1; }
+
+# ── --stop: kill leftovers and exit, no preflight noise ─────────────────────
+#
+# Two independent strategies, both best-effort (a missing pidfile or a port
+# nothing is listening on is not an error): pidfiles from a prior run of
+# THIS script, and a port sweep as the guaranteed fallback for when the
+# trap never ran at all (terminal closed, shell killed, `kill -9`). Mirrors
+# bastion-web's own scripts/dev-stop.sh port-sweep approach.
+if [ "$STOP_ONLY" = "true" ]; then
+  echo "== Stopping dev_with_bastion_web.sh servers =="
+  STOPPED_ANYTHING="false"
+
+  for pidfile_pair in "$BACKEND_PIDFILE:bastion serve" "$FRONTEND_PIDFILE:bastion-web"; do
+    pidfile="${pidfile_pair%%:*}"
+    label="${pidfile_pair#*:}"
+    if [ -f "$pidfile" ]; then
+      pid=$(cat "$pidfile" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping $label (pid $pid, from pidfile)..."
+        kill_tree "$pid" TERM
+        STOPPED_ANYTHING="true"
+      fi
+      rm -f "$pidfile"
+    fi
+  done
+
+  # Best-effort port resolution for the sweep — tolerate missing env files
+  # entirely; --stop must work even if .env/.env.local were never set up.
+  SWEEP_SERVE_PORT=""
+  SWEEP_FRONTEND_PORT="${PORT:-3000}"
+  if [ -f "$WEB_ENV" ]; then
+    SWEEP_URL=$(grep -E '^BASTION_SERVE_URL=' "$WEB_ENV" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' \r')
+    SWEEP_SERVE_PORT="${SWEEP_URL##*:}"
+  fi
+  SWEEP_SERVE_PORT="${SWEEP_SERVE_PORT:-4317}"
+
+  for port in "$SWEEP_SERVE_PORT" "$SWEEP_FRONTEND_PORT"; do
+    if port_in_use "$port"; then
+      echo "Killing lingering process(es) on port $port..."
+      for pid in $(lsof -ti ":$port" 2>/dev/null || true); do
+        kill_tree "$pid" TERM
+      done
+      STOPPED_ANYTHING="true"
+    fi
+  done
+
+  sleep 1
+  for port in "$SWEEP_SERVE_PORT" "$SWEEP_FRONTEND_PORT"; do
+    if port_in_use "$port"; then
+      echo "Port $port still held — force killing..."
+      for pid in $(lsof -ti ":$port" 2>/dev/null || true); do
+        kill_tree "$pid" KILL
+      done
+    fi
+  done
+
+  if [ "$STOPPED_ANYTHING" = "true" ]; then
+    echo "Done."
+  else
+    echo "Nothing appeared to be running."
+  fi
+  exit 0
+fi
 
 FAILED_CHECKS=()
 fail_check() { FAILED_CHECKS+=("$1"); echo "  [FAIL] $1" >&2; }
@@ -188,16 +282,14 @@ fi
 
 echo "== Preflight: ports free =="
 
-port_in_use() { lsof -ti ":$1" >/dev/null 2>&1; }
-
 if port_in_use "$SERVE_PORT"; then
-  fail_check "port $SERVE_PORT (bastion serve) is already in use — stop the existing process first (lsof -ti :$SERVE_PORT | xargs kill), or it may be a stale run from a previous session: $WEB_DIR/scripts/dev-stop.sh"
+  fail_check "port $SERVE_PORT (bastion serve) is already in use — run scripts/dev_with_bastion_web.sh --stop, or: lsof -ti :$SERVE_PORT | xargs kill"
 else
   pass_check "port $SERVE_PORT free"
 fi
 
 if port_in_use "$FRONTEND_PORT"; then
-  fail_check "port $FRONTEND_PORT (bastion-web) is already in use — stop the existing process first (lsof -ti :$FRONTEND_PORT | xargs kill), or: $WEB_DIR/scripts/dev-stop.sh"
+  fail_check "port $FRONTEND_PORT (bastion-web) is already in use — run scripts/dev_with_bastion_web.sh --stop, or: lsof -ti :$FRONTEND_PORT | xargs kill"
 else
   pass_check "port $FRONTEND_PORT free"
 fi
@@ -227,19 +319,37 @@ fi
 
 BACKEND_PID=""
 FRONTEND_PID=""
+TAIL_PID=""
 
 cleanup() {
   trap - INT TERM EXIT
+  echo
+  echo "Shutting down..."
+
+  [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
+
   if [ -n "$FRONTEND_PID" ] && kill -0 "$FRONTEND_PID" 2>/dev/null; then
-    echo "Stopping bastion-web (pid $FRONTEND_PID)..."
-    kill "$FRONTEND_PID" 2>/dev/null || true
+    echo "Stopping bastion-web (pid $FRONTEND_PID, and its child processes)..."
+    kill_tree "$FRONTEND_PID" TERM
   fi
   if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
     echo "Stopping bastion serve (pid $BACKEND_PID)..."
-    kill "$BACKEND_PID" 2>/dev/null || true
+    kill_tree "$BACKEND_PID" TERM
   fi
+
+  # Grace period, then force-kill anything that ignored TERM (e.g. a
+  # Turbopack worker mid-compile) so this never hangs waiting.
+  sleep 1
+  if [ -n "$FRONTEND_PID" ] && kill -0 "$FRONTEND_PID" 2>/dev/null; then
+    kill_tree "$FRONTEND_PID" KILL
+  fi
+  if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
+    kill_tree "$BACKEND_PID" KILL
+  fi
+
   rm -f "$BACKEND_PIDFILE" "$FRONTEND_PIDFILE"
   wait 2>/dev/null || true
+  echo "Stopped."
 }
 trap cleanup INT TERM EXIT
 
@@ -355,7 +465,10 @@ Logs:
   backend  $BACKEND_LOG
   frontend $FRONTEND_LOG
 
-Ctrl-C stops both.
+Stop:
+  Ctrl-C here stops both cleanly (backend, frontend, and its next-server
+  child). If this terminal gets closed instead, run from another shell:
+    $ENGINE_DIR/scripts/dev_with_bastion_web.sh --stop
 ──────────────────────────────────────────────────────────────────────────
 
 EOF
@@ -366,8 +479,6 @@ TAIL_PID=$!
 while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$FRONTEND_PID" 2>/dev/null; do
   sleep 1
 done
-
-kill "$TAIL_PID" 2>/dev/null || true
 
 echo
 echo "One of the servers exited on its own — see logs above."
