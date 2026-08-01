@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-31T23:15:00Z"
+timestamp: "2026-08-01T02:41:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,48 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-31]
+
+### EN.3.J-sdlc-flow-smoke tasks 6-10 — both live runs executed, a real EN.3.K wiring gap found and fixed
+- **What:** Completed the remaining `EN.3.J` tasks: task 6 added the `--repo <slug>` flag to
+  `scripts/sdlc_smoke.sh` (byte-identical default body, `docs/sdlc-flow-smoke.md` updated).
+  Tasks 7-9, normally strictly human-in-the-loop, were executed directly this session with the
+  repo owner's explicit prior agreement (real triggered runs against a live `bastion serve`, real
+  agentic writes, real token spend). Run 1 (engine acceptance, no `repo`, served from
+  `core/engine-rs`) and Run 2 (deployment acceptance, `--repo engine-rs`, served from `$HOME` with
+  `ENGINE_BRAIN_ROOT` exported) both reached `status: "succeeded"` with the marker file written and
+  validated; Run 2's `worktree_path` came back absolute and registry-rooted
+  (`.../core/engine-rs/trees/sdlc/smoke-sdlc-flow`), proving the target no longer depends on the
+  serve process's cwd. Task 8's two 422 pre-flight probes (bogus `repo`, bogus `spec_slug`) both
+  rejected cleanly with no `run_id` minted. Task 10 (Validate) confirmed all evidence recorded, the
+  cross-repo `health_check.sh` fix already committed, and skipped the Rust gate (no `.rs` files in
+  this block's own diff).
+  - **A genuine `EN.3.K` production bug was found and fixed along the way, in the sibling
+    `core/bastion` repo:** `engine_serve::workflows::init_repo_registry_from_env()` was fully
+    implemented but never called anywhere in `bastion serve`'s startup path, so the repo registry
+    stayed empty regardless of `ENGINE_BRAIN_ROOT` — every `repo`-bearing event 422'd with "no
+    registry available," even for a valid slug. This was a hard blocker for Run 2 specifically;
+    without it the deployment-acceptance run could never pass. Fixed with a single call to
+    `init_repo_registry_from_env()` before `build_engine_dispatcher()` registers `SDLC_FLOW`,
+    committed directly to `core/bastion` `main` (`1a5a455`), full `cargo nextest run --lib` green
+    (43/43).
+  - **A second, separate defect was found and left open, out of this block's scope:**
+    `FinalValidationNode` (`EN.3.E`'s always-on run-level gate) fails all four harness checks
+    (`fmt`/`clippy`/`test`/`build`) inside any `--repo`-targeted or `--worktree` `SDLC_FLOW` run —
+    `Cargo.toml`'s `claude-code-rs = { path = "../claude-code-rs" }` can't resolve from a nested
+    worktree (the real sibling checkout is one level up from the *main* repo, not from
+    `trees/sdlc/<branch>`). Doesn't fail the run itself (`WrapUpNode` reports `done` with a "needs
+    follow-up" warning), but affects every real worktree-based run in this repo, not just the
+    smoke. Recommend a follow-up ticket.
+  - **Operational lesson:** the installed `~/.local/bin/bastion` binary doesn't auto-rebuild when
+    `engine-rs` (a path dependency) changes, and carries no staleness check. Testing against a
+    stale pre-`EN.3.K` binary produced two confusing false findings (a spurious task-loop bail,
+    both 422 checks silently no-op'ing) that fully resolved after a fresh `cargo build --release`
+    in `core/bastion`. Rebuild `bastion` immediately before any live verification run.
+- **Why:** `EN.3.J`'s whole purpose is proving the Rust `SDLC_FLOW` works end to end before
+  `.claude/workflows/sdlc-flow.js` is retired — that proof was the only thing left blocking the
+  Mac Mini launchd deployment.
+- **Refs:** `planning/EN.3.J-sdlc-flow-smoke/tasks.md` (Run Evidence + 2026-08-01 Amendment Log
+  entry), `core/bastion` commit `1a5a455`
 
 ### EN.3.K landed; EN.3.J amended to a two-run acceptance
 - **What:** `EN.3.K-dispatch-target-resolution` merged (PR #35) — a `brain.toml`-backed
