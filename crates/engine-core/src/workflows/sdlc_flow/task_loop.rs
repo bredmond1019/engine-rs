@@ -27,7 +27,7 @@ use crate::routing::Router;
 
 #[cfg(test)]
 use super::policy::{ModelTier, OutputVerbosity};
-use super::policy::{ReviewMode, SdlcPolicy, TestDepth};
+use super::policy::{RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
@@ -243,6 +243,187 @@ fn diff_range(ctx: &TaskContext) -> String {
 fn current_task_fields(ctx: &TaskContext) -> Result<&serde_json::Value, NodeError> {
     get_result(ctx, "TaskQueueRouterNode")
         .ok_or_else(|| NodeError::new("TaskQueueRouterNode has not run yet"))
+}
+
+// --- prior-attempt feedback --------------------------------------------------
+
+/// Opening line of the retry-feedback block appended to `ImplementTaskNode`'s
+/// prompt. Deliberately blunt about the worktree already containing the prior
+/// attempt's edits: the failure mode this fixes is a model re-entering its own
+/// half-finished work, concluding the task is already done, and reporting
+/// success without touching anything.
+const RETRY_FEEDBACK_HEADER: &str = "\n\n--- PREVIOUS ATTEMPT FAILED — READ THIS BEFORE DOING \
+     ANYTHING ---\nA previous attempt at this exact task already ran in this worktree and its \
+     validation FAILED. Its edits are still present, so the task is NOT done. Diagnose the \
+     failure below, fix its root cause, and re-verify. Do not report success without addressing \
+     it.\n\n";
+
+/// Marker appended in place of the characters a `max_chars` bound elides.
+const RETRY_FEEDBACK_TRUNCATED: &str = "…[truncated]";
+
+/// One unit of prior-attempt evidence. `label` names the failing thing and is
+/// never dropped by truncation; `detail` is the (potentially enormous)
+/// compiler/rustfmt/reviewer text and is what gets trimmed to fit.
+struct FeedbackEntry {
+    label: String,
+    detail: String,
+}
+
+/// Truncate `text` to at most `max` **characters** (not bytes — the model
+/// output can contain multi-byte characters, and slicing by byte would panic).
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let marker_len = RETRY_FEEDBACK_TRUNCATED.chars().count();
+    if max <= marker_len {
+        return text.chars().take(max).collect();
+    }
+    let mut out: String = text.chars().take(max - marker_len).collect();
+    out.push_str(RETRY_FEEDBACK_TRUNCATED);
+    out
+}
+
+/// The failed entries of the last `TestTaskNode` run, if it recorded a
+/// failure. `None` when the node has not run (first attempt) or when it
+/// explicitly passed.
+fn test_failure_entries(ctx: &TaskContext) -> Option<Vec<FeedbackEntry>> {
+    let result = get_result(ctx, "TestTaskNode")?;
+    // Strictly `false` — an absent/garbled `all_passed` is not evidence of a
+    // failed attempt and must not manufacture a retry block.
+    if result.get("all_passed").and_then(|v| v.as_bool()) != Some(false) {
+        return None;
+    }
+    let checks = result.get("check_results")?.as_array()?;
+    let entries: Vec<FeedbackEntry> = checks
+        .iter()
+        .filter(|check| {
+            !check
+                .get("passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+        .map(|check| {
+            let name = check
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unnamed check");
+            let message = check
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let output = check
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let detail = [message, output]
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            FeedbackEntry {
+                label: format!("FAILED CHECK: {name}"),
+                detail,
+            }
+        })
+        .collect();
+    (!entries.is_empty()).then_some(entries)
+}
+
+/// The last `ConsolidatedReviewNode` verdict's findings, used on the
+/// `ReviewRouterNode -> IncrementAttemptNode` back-edge where the tests
+/// passed but the reviewer did not.
+fn review_failure_entries(ctx: &TaskContext) -> Option<Vec<FeedbackEntry>> {
+    let result = get_result(ctx, "ConsolidatedReviewNode")?;
+    let verdict = result
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if verdict.is_empty() || verdict == "PASS" {
+        return None;
+    }
+    let summary = result
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let mut entries = vec![FeedbackEntry {
+        label: format!("REVIEW VERDICT: {verdict}"),
+        detail: summary.to_string(),
+    }];
+    if let Some(issues) = result.get("issues").and_then(|v| v.as_array()) {
+        for (index, issue) in issues.iter().enumerate() {
+            let text = issue
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| issue.to_string());
+            entries.push(FeedbackEntry {
+                label: format!("REVIEW ISSUE {}:", index + 1),
+                detail: text,
+            });
+        }
+    }
+    Some(entries)
+}
+
+/// Render the immediately-preceding attempt's failure as a prompt block for
+/// `ImplementTaskNode`, or `None` when there is nothing to say.
+///
+/// Pure: reads only `ctx.nodes` and `cfg`, performs no I/O.
+///
+/// **Retry detection deliberately does NOT read `attempt_count`.**
+/// `current_task_fields(ctx)["attempt_count"]` is stamped once by
+/// `TaskQueueRouterNode` when the task is dequeued and is never refreshed on
+/// the retry back-edge — `IncrementAttemptNode` bumps only the durable
+/// `SDLCState` (see [`bump_attempt`]) — so it reads `0` on every retry. The
+/// presence of a *failed* `TestTaskNode`/`ConsolidatedReviewNode` result in
+/// `ctx.nodes` is accurate by construction: `ctx.nodes` accumulates across
+/// the loop, so a recorded failure can only exist if an attempt already ran
+/// and failed.
+// Reachable only from tests until `ImplementTaskNode::process` calls it
+// (this ticket's task 3); the allow comes off there.
+#[allow(dead_code)]
+fn prior_attempt_feedback(ctx: &TaskContext, cfg: &RetryFeedback) -> Option<String> {
+    if !cfg.enabled {
+        return None;
+    }
+    let budget = cfg.max_chars as usize;
+    if budget == 0 {
+        return None;
+    }
+    // Test failure first: it is the immediate cause on the
+    // `TriageRouterNode` back-edge. The review findings are the fallback for
+    // the `ReviewRouterNode` back-edge, where the checks passed.
+    let entries = test_failure_entries(ctx).or_else(|| review_failure_entries(ctx))?;
+
+    // Labels are non-negotiable — a truncated block must still say *which*
+    // checks failed — so only the details compete for the leftover budget.
+    let fixed: usize = RETRY_FEEDBACK_HEADER.chars().count()
+        + entries
+            .iter()
+            .map(|entry| entry.label.chars().count() + 1)
+            .sum::<usize>();
+    let per_entry = budget.saturating_sub(fixed) / entries.len();
+
+    let mut block = String::from(RETRY_FEEDBACK_HEADER);
+    for entry in &entries {
+        block.push_str(&entry.label);
+        block.push('\n');
+        if per_entry > 0 && !entry.detail.is_empty() {
+            block.push_str(&truncate_chars(&entry.detail, per_entry));
+            block.push('\n');
+        }
+    }
+
+    // Belt-and-braces: the per-entry newlines above are not counted in
+    // `fixed`, so clamp the assembled block. Skipped when the labels alone
+    // already exceed the budget — naming the failed checks outranks the
+    // bound, per this knob's contract.
+    if fixed <= budget {
+        block = truncate_chars(&block, budget);
+    }
+
+    (!block.trim().is_empty()).then_some(block)
 }
 
 // --- TaskQueueRouterNode ---------------------------------------------------
@@ -2107,6 +2288,207 @@ mod tests {
         Arc::new(|_config, _prompt| {
             panic!("transport should not be invoked for a deterministic branch")
         })
+    }
+
+    // --- prior_attempt_feedback ---------------------------------------------
+
+    /// A `TestTaskNode` result with one failing check carrying `output`.
+    fn failed_test_result(output: &str) -> serde_json::Value {
+        json!({
+            "all_passed": false,
+            "check_results": [
+                {
+                    "name": "test",
+                    "kind": "test",
+                    "passed": false,
+                    "message": "cargo nextest run --workspace exited 101",
+                    "output": output,
+                },
+                {
+                    "name": "clippy",
+                    "kind": "lint",
+                    "passed": true,
+                    "message": "",
+                    "output": "clean",
+                }
+            ],
+            "failure_summary": "Failed checks: test",
+        })
+    }
+
+    fn ctx_with_node(identity: &str, value: serde_json::Value) -> TaskContext {
+        let mut ctx = empty_context(json!({}));
+        ctx.nodes.insert(identity.to_string(), value);
+        ctx
+    }
+
+    #[test]
+    fn prior_attempt_feedback_is_none_on_the_first_attempt() {
+        // No `TestTaskNode` entry at all == nothing has run yet.
+        let ctx = empty_context(json!({}));
+        assert_eq!(
+            prior_attempt_feedback(&ctx, &RetryFeedback::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn prior_attempt_feedback_is_none_when_the_previous_run_passed() {
+        let ctx = ctx_with_node(
+            "TestTaskNode",
+            json!({
+                "all_passed": true,
+                "check_results": [
+                    { "name": "test", "passed": true, "message": "", "output": "ok" }
+                ],
+                "failure_summary": "",
+            }),
+        );
+        assert_eq!(
+            prior_attempt_feedback(&ctx, &RetryFeedback::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn prior_attempt_feedback_is_none_when_disabled() {
+        let ctx = ctx_with_node("TestTaskNode", failed_test_result("error[E0308]"));
+        let cfg = RetryFeedback {
+            enabled: false,
+            max_chars: 4000,
+        };
+        assert_eq!(prior_attempt_feedback(&ctx, &cfg), None);
+    }
+
+    #[test]
+    fn prior_attempt_feedback_renders_the_failed_check_name_and_output() {
+        let ctx = ctx_with_node(
+            "TestTaskNode",
+            failed_test_result(
+                "error[E0308]: mismatched types\n  --> src/http.rs:682:5\n  \
+                 expected `impl Future`, found `Responder`",
+            ),
+        );
+        let block = prior_attempt_feedback(&ctx, &RetryFeedback::default())
+            .expect("a failed TestTaskNode result yields feedback");
+        // Names the failing check...
+        assert!(block.contains("test"), "block: {block}");
+        // ...carries its message...
+        assert!(block.contains("exited 101"), "block: {block}");
+        // ...and — the whole point — the captured compiler output.
+        assert!(block.contains("error[E0308]"), "block: {block}");
+        assert!(block.contains("src/http.rs:682"), "block: {block}");
+        // The passing check is not noise in the retry prompt.
+        assert!(!block.contains("clippy"), "block: {block}");
+    }
+
+    /// Retry detection must not depend on `attempt_count`: it is stamped
+    /// once at dequeue and reads `0` on every retry (see
+    /// [`prior_attempt_feedback`]'s docs). A ctx whose `attempt_count` is `0`
+    /// but which carries a failed `TestTaskNode` result is a retry, and must
+    /// produce feedback.
+    #[test]
+    fn prior_attempt_feedback_ignores_a_stale_zero_attempt_count() {
+        let mut ctx = ctx_with_node("TestTaskNode", failed_test_result("error[E0308]"));
+        ctx.nodes.insert(
+            "TaskQueueRouterNode".to_string(),
+            json!({ "current_task_id": 1, "attempt_count": 0, "max_attempts": 3 }),
+        );
+        assert!(prior_attempt_feedback(&ctx, &RetryFeedback::default()).is_some());
+    }
+
+    #[test]
+    fn prior_attempt_feedback_is_bounded_by_max_chars_but_keeps_the_check_name() {
+        let huge = "E".repeat(200_000);
+        let ctx = ctx_with_node("TestTaskNode", failed_test_result(&huge));
+        let cfg = RetryFeedback {
+            enabled: true,
+            max_chars: 900,
+        };
+        let block = prior_attempt_feedback(&ctx, &cfg).expect("feedback rendered");
+        assert!(
+            block.chars().count() <= 900,
+            "block was {} chars, expected <= 900",
+            block.chars().count()
+        );
+        // Truncation trims the output, never the identification.
+        assert!(block.contains("FAILED CHECK: test"), "block: {block}");
+        assert!(block.contains(RETRY_FEEDBACK_TRUNCATED), "block: {block}");
+    }
+
+    /// The bound holds across repeated retries: the block is rendered fresh
+    /// from the latest `TestTaskNode` result each time, so its size is a
+    /// function of `max_chars` alone, not of how many attempts have run.
+    #[test]
+    fn prior_attempt_feedback_size_does_not_grow_with_attempts() {
+        let cfg = RetryFeedback {
+            enabled: true,
+            max_chars: 600,
+        };
+        let first = prior_attempt_feedback(
+            &ctx_with_node("TestTaskNode", failed_test_result(&"A".repeat(50_000))),
+            &cfg,
+        )
+        .unwrap();
+        let second = prior_attempt_feedback(
+            &ctx_with_node("TestTaskNode", failed_test_result(&"B".repeat(50_000))),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(first.chars().count(), second.chars().count());
+        assert!(first.chars().count() <= 600);
+    }
+
+    /// The `ReviewRouterNode` back-edge: checks passed, the reviewer did not.
+    #[test]
+    fn prior_attempt_feedback_falls_back_to_the_review_findings() {
+        let mut ctx = ctx_with_node(
+            "ConsolidatedReviewNode",
+            json!({
+                "verdict": "PARTIAL",
+                "summary": "acceptance criterion 2 is unimplemented",
+                "issues": ["missing test for the truncation bound"],
+            }),
+        );
+        // A *passing* TestTaskNode must not suppress the review feedback.
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
+        );
+        let block = prior_attempt_feedback(&ctx, &RetryFeedback::default())
+            .expect("a non-PASS review yields feedback");
+        assert!(block.contains("PARTIAL"), "block: {block}");
+        assert!(
+            block.contains("criterion 2 is unimplemented"),
+            "block: {block}"
+        );
+        assert!(block.contains("truncation bound"), "block: {block}");
+    }
+
+    #[test]
+    fn prior_attempt_feedback_is_none_for_a_passing_review() {
+        let ctx = ctx_with_node(
+            "ConsolidatedReviewNode",
+            json!({ "verdict": "PASS", "summary": "looks good", "issues": [] }),
+        );
+        assert_eq!(
+            prior_attempt_feedback(&ctx, &RetryFeedback::default()),
+            None
+        );
+    }
+
+    /// A failed `TestTaskNode` outranks the review findings — it is the
+    /// immediate cause on the `TriageRouterNode` back-edge.
+    #[test]
+    fn prior_attempt_feedback_prefers_the_test_failure_over_the_review() {
+        let mut ctx = ctx_with_node("TestTaskNode", failed_test_result("error[E0433]"));
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "FAIL", "summary": "stale review", "issues": [] }),
+        );
+        let block = prior_attempt_feedback(&ctx, &RetryFeedback::default()).unwrap();
+        assert!(block.contains("error[E0433]"), "block: {block}");
+        assert!(!block.contains("stale review"), "block: {block}");
     }
 
     // --- apply_policy: per-stage call timeouts ------------------------------
