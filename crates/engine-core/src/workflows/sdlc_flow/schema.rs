@@ -797,6 +797,7 @@ pub fn derive_bail_reason(terminal_signal: Option<&TerminalSignal>) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::test_support::assert_json_subset;
 
     #[test]
     fn task_status_serializes_to_python_strenum_values() {
@@ -1565,6 +1566,11 @@ mod tests {
             serde_json::from_str(include_str!("fixtures/committed_state_expected.json"))
                 .expect("golden fixture parses as JSON");
 
-        assert_eq!(actual, expected);
+        // Additive-tolerant: the fixture embeds a full `SdlcPolicy::default()`
+        // snapshot under `"policy"`, so strict equality made every new policy
+        // knob require a fixture edit. Subset comparison keeps every value the
+        // fixture pins (and still fails on a missing field or a changed list),
+        // while a newly-added knob is simply ignored.
+        assert_json_subset(&expected, &actual);
     }
 }
