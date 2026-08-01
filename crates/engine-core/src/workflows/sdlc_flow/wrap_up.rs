@@ -444,10 +444,28 @@ const COST_BEARING_STAGES: [&str; 4] = [
     "GenerateTasksNode",
 ];
 
-/// The resolved policy's per-stage tier, keyed by `ModelTiers` field name —
-/// "actually used" for this run (`registry_for_policy` wires the stage's
-/// transport from exactly this assignment; a local-endpoint failure falls
-/// back to cloud per-call without changing the resolved policy snapshot).
+/// The resolved policy's per-stage tier, keyed by `ModelTiers` field name.
+///
+/// **What "used" means, per stage.** `triage` and `review` are the two
+/// stages `registry_for_policy` can rewire by tier (a `local` assignment
+/// swaps their transport; a local-endpoint failure falls back to cloud
+/// per-call without changing this snapshot). Every other stage consumes its
+/// tier through `task_loop::apply_policy`/`apply_policy_config`, which sets
+/// `Config.model` from it directly — `implement` (`ImplementTaskNode`) and
+/// `docs` (`PatchDocsNode`).
+///
+/// Two entries here are still reported without a consumer, and are listed
+/// deliberately rather than hidden:
+///   * `generate` — `GenerateTasksNode` has not been onboarded to
+///     `apply_policy` yet, so it runs `ModelTiers::default().generate`'s
+///     model string by hardcode rather than by resolution. The default was
+///     corrected to `Opus` so this line is at least TRUE today; it becomes
+///     load-bearing when that node is onboarded.
+///   * `implement_simple` — belongs to a simple-task path that does not
+///     exist yet; nothing reads it.
+///
+/// (The previous version of this comment claimed `registry_for_policy` wires
+/// EVERY stage's transport from this assignment. It never did.)
 fn model_tier_used(policy: &SdlcPolicy) -> BTreeMap<String, String> {
     let tiers = &policy.model_tiers;
     let tier_str = |tier: super::policy::ModelTier| {
@@ -465,6 +483,7 @@ fn model_tier_used(policy: &SdlcPolicy) -> BTreeMap<String, String> {
         ("triage".to_string(), tier_str(tiers.triage)),
         ("review".to_string(), tier_str(tiers.review)),
         ("generate".to_string(), tier_str(tiers.generate)),
+        ("docs".to_string(), tier_str(tiers.docs)),
     ])
 }
 
@@ -1015,6 +1034,11 @@ mod tests {
         );
         assert_eq!(outcomes.model_tier_used["triage"], "haiku");
         assert_eq!(outcomes.model_tier_used["implement"], "sonnet");
+        // The two stages onboarded to the policy path report the tiers the
+        // nodes actually consume; `generate`'s default is the Opus tier
+        // `GenerateTasksNode` really runs.
+        assert_eq!(outcomes.model_tier_used["docs"], "sonnet");
+        assert_eq!(outcomes.model_tier_used["generate"], "opus");
     }
 
     /// Task 8 deleted the lenient `Default`-fallback read — every `ctx`

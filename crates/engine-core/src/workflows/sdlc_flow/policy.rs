@@ -1132,4 +1132,46 @@ mod tests {
 
         assert_json_subset(&expected, &actual);
     }
+    /// This repo's own `planning/harness.json` must stay parseable as a
+    /// `PartialPolicy` and must carry the two policy-path knobs explicitly
+    /// in every named profile (CLAUDE.md standing rule 6: a knob absent from
+    /// the profile bundles is a knob nobody will find).
+    ///
+    /// `planning/` is a gitignored symlink into the company-brain vault, so
+    /// this SKIPS rather than fails when the vault is not mounted (a bare
+    /// clone) — it is a guard for this working tree, not a hard dependency.
+    #[test]
+    fn repo_harness_json_deserializes_every_sdlc_policy_and_profile() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../planning/harness.json");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present (planning/ vault not mounted)");
+            return;
+        };
+        let root: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let sdlc = &root["sdlc"];
+        let _p: PartialPolicy =
+            serde_json::from_value(sdlc["policy"].clone()).expect("sdlc.policy is a PartialPolicy");
+        for (name, bundle) in sdlc["profiles"].as_object().unwrap() {
+            if name.starts_with('_') {
+                continue;
+            }
+            let parsed: PartialPolicy = serde_json::from_value(bundle.clone())
+                .unwrap_or_else(|e| panic!("profile {name} must be a PartialPolicy: {e}"));
+            let tiers = parsed.model_tiers.expect("model_tiers");
+            assert!(tiers.docs.is_some(), "{name} must set model_tiers.docs");
+            assert!(
+                tiers.generate.is_some(),
+                "{name} must set model_tiers.generate"
+            );
+            let t = parsed.timeouts.expect("timeouts");
+            assert_eq!(
+                t.docs, None,
+                "{name} timeouts.docs must be an explicit null"
+            );
+            assert_eq!(
+                t.generate, None,
+                "{name} timeouts.generate must be an explicit null"
+            );
+        }
+    }
 }
