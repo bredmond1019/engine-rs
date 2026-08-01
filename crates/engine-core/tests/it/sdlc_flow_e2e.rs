@@ -854,14 +854,17 @@ async fn failing_final_validation_gate_still_reaches_emit_state_with_degraded_re
 
 // --- commit topology (ticket-commit-task-work-real-diffs task 6) -----------
 
+/// Shared handle to a recorded `(program, argv)` call log.
+type RecordedCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
 /// A `git`-shaped recording runner for the flow's own git calls. Records
 /// `(program, argv)` for every invocation in order and returns empty success,
 /// so the whole run's commit sequence can be asserted. `git status` is
 /// special-cased the same way [`always_pass_runner`] does — but note this
 /// runner is injected into `SaveStateNode`/`WrapUpNode`/`PullRequestNode`,
 /// not `TestTaskNode`, so it never sees the harness checks.
-fn recording_git_runner() -> (CommandRunner, Arc<Mutex<Vec<(String, Vec<String>)>>>) {
-    let calls: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+fn recording_git_runner() -> (CommandRunner, RecordedCalls) {
+    let calls: RecordedCalls = Arc::new(Mutex::new(Vec::new()));
     let calls_clone = calls.clone();
     let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
         calls_clone.lock().unwrap().push((
