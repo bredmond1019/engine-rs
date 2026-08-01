@@ -84,6 +84,30 @@ impl Default for ModelTiers {
     }
 }
 
+/// Per-stage whole-call timeout, in **seconds**, for the model stages that
+/// run through `task_loop.rs`'s `apply_policy`. Field names match the three
+/// `Stage` variants (`Implement`/`Triage`/`Review`).
+///
+/// `None` — the behavior-stable built-in default for every field — means
+/// "set nothing", leaving `claude_code_rs::Config::timeout` at its own
+/// `None`, which is that crate's unconfigured 300s default. Setting a field
+/// widens (or narrows) only that stage's `execute()` timeout.
+///
+/// Deliberately **not** covering `GenerateTasksNode`/`PatchDocsNode`: those
+/// two nodes construct their `Config` by hand and have no `apply_policy`
+/// path at all today (see this ticket's Description) — giving them one is a
+/// separate piece of work.
+///
+/// Unlike [`ModelTiers`], this derives `Default`: all-`None` is exactly what
+/// `#[derive(Default)]` produces, so hand-writing it would only add a place
+/// to get it wrong.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallTimeouts {
+    pub implement: Option<u64>,
+    pub triage: Option<u64>,
+    pub review: Option<u64>,
+}
+
 /// Which pipeline stages `close-out` (EN.2.x) is allowed to reuse from a
 /// prior flow record rather than re-running (lever #1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -113,6 +137,9 @@ pub struct SdlcPolicy {
     /// How much of a task's own check suite `TestTaskNode` runs (EN.3.D).
     pub test_depth: TestDepth,
     pub model_tiers: ModelTiers,
+    /// Per-stage whole-call timeout in seconds; all-`None` (no override) by
+    /// default, i.e. `claude-code-rs`'s own 300s default applies.
+    pub timeouts: CallTimeouts,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
     pub simple_task_max_files: u32,
@@ -125,7 +152,8 @@ impl Default for SdlcPolicy {
     /// The safe default: reproduces today's (pre-EN.3.C) behavior exactly.
     /// Normal verbosity, `per_task` review, all-Sonnet tiers, no close-out
     /// reuse, prompt-cache off, `llm_triage` false, `max_attempts` 3,
-    /// `test_depth: full`.
+    /// `test_depth: full`, and no per-stage call-timeout overrides (all
+    /// `None` — `claude-code-rs`'s own 300s default applies).
     fn default() -> Self {
         Self {
             output_verbosity: OutputVerbosity::Normal,
@@ -135,6 +163,7 @@ impl Default for SdlcPolicy {
             review_skip_max_diff_lines: 40,
             test_depth: TestDepth::Full,
             model_tiers: ModelTiers::default(),
+            timeouts: CallTimeouts::default(),
             local: LocalConfig::default(),
             simple_task_max_files: 2,
             llm_triage: false,
@@ -159,6 +188,7 @@ pub struct PartialPolicy {
     pub review_skip_max_diff_lines: Option<u32>,
     pub test_depth: Option<TestDepth>,
     pub model_tiers: Option<PartialModelTiers>,
+    pub timeouts: Option<PartialCallTimeouts>,
     pub local: Option<PartialLocalConfig>,
     pub simple_task_max_files: Option<u32>,
     pub llm_triage: Option<bool>,
@@ -175,6 +205,16 @@ pub struct PartialModelTiers {
     pub review: Option<ModelTier>,
     pub triage: Option<ModelTier>,
     pub generate: Option<ModelTier>,
+}
+
+/// All-optional mirror of [`CallTimeouts`] for per-stage partial overrides.
+/// Mirrors [`PartialModelTiers`]' derive set exactly — notably **no** `Copy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialCallTimeouts {
+    pub implement: Option<u64>,
+    pub triage: Option<u64>,
+    pub review: Option<u64>,
 }
 
 /// All-optional mirror of [`CloseOutReuse`].
@@ -208,6 +248,23 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
     }
     if let Some(v) = over.generate {
         base.generate = v;
+    }
+    base
+}
+
+/// Merge one `PartialCallTimeouts` override layer over a `CallTimeouts`
+/// base, field by field. A `None` field in `over` leaves the base value
+/// (itself possibly `None`) untouched — so an absent override never turns a
+/// timeout *off*, it just declines to set one.
+fn merge_call_timeouts(mut base: CallTimeouts, over: &PartialCallTimeouts) -> CallTimeouts {
+    if let Some(v) = over.implement {
+        base.implement = Some(v);
+    }
+    if let Some(v) = over.triage {
+        base.triage = Some(v);
+    }
+    if let Some(v) = over.review {
+        base.review = Some(v);
     }
     base
 }
@@ -255,6 +312,10 @@ impl crate::policy::Policy for SdlcPolicy {
             model_tiers: match &over.model_tiers {
                 Some(mt) => merge_model_tiers(base.model_tiers, mt),
                 None => base.model_tiers,
+            },
+            timeouts: match &over.timeouts {
+                Some(t) => merge_call_timeouts(base.timeouts, t),
+                None => base.timeouts,
             },
             local: match &over.local {
                 Some(l) => base.local.overlay(l),
@@ -334,6 +395,89 @@ mod tests {
     #[test]
     fn builtin_default_test_depth_is_full() {
         assert_eq!(SdlcPolicy::default().test_depth, TestDepth::Full);
+    }
+
+    /// Change-detector: the whole point of this knob is that adding it did
+    /// not change what an existing run does. All-`None` means every stage's
+    /// `Config.timeout` stays `None`, i.e. `claude-code-rs`'s 300s default.
+    #[test]
+    fn builtin_default_timeouts_are_none() {
+        let timeouts = SdlcPolicy::default().timeouts;
+        assert_eq!(timeouts.implement, None);
+        assert_eq!(timeouts.triage, None);
+        assert_eq!(timeouts.review, None);
+        assert_eq!(timeouts, CallTimeouts::default());
+    }
+
+    #[test]
+    fn merge_call_timeouts_overrides_only_the_fields_it_sets() {
+        let base = CallTimeouts {
+            implement: Some(600),
+            triage: Some(120),
+            review: None,
+        };
+        let over = PartialCallTimeouts {
+            implement: Some(900),
+            triage: None,
+            review: Some(300),
+        };
+        let merged = merge_call_timeouts(base, &over);
+        assert_eq!(merged.implement, Some(900));
+        // `None` in the override leaves the base value alone.
+        assert_eq!(merged.triage, Some(120));
+        assert_eq!(merged.review, Some(300));
+    }
+
+    #[test]
+    fn timeouts_resolve_through_all_four_layers_in_precedence_order() {
+        let harness = PartialPolicy {
+            timeouts: Some(PartialCallTimeouts {
+                implement: Some(400),
+                triage: Some(200),
+                review: Some(100),
+            }),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            timeouts: Some(PartialCallTimeouts {
+                implement: Some(800),
+                triage: Some(500),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            timeouts: Some(PartialCallTimeouts {
+                implement: Some(1200),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        // event > profile > harness > builtin(None).
+        assert_eq!(resolved.timeouts.implement, Some(1200));
+        assert_eq!(resolved.timeouts.triage, Some(500));
+        assert_eq!(resolved.timeouts.review, Some(100));
+
+        // Nothing anywhere -> still the built-in all-`None`.
+        let untouched = resolve(SdlcPolicy::default(), None, None, None);
+        assert_eq!(untouched.timeouts, CallTimeouts::default());
+    }
+
+    #[test]
+    fn deserializes_partial_call_timeouts_from_harness_json_shape() {
+        let json = r#"{ "timeouts": { "implement": 900 } }"#;
+        let partial: PartialPolicy = serde_json::from_str(json).expect("valid PartialPolicy JSON");
+        let timeouts = partial.timeouts.as_ref().expect("timeouts present");
+        assert_eq!(timeouts.implement, Some(900));
+        // Absent fields stay `None` and fall through on merge.
+        assert_eq!(timeouts.triage, None);
+        assert_eq!(timeouts.review, None);
     }
 
     #[test]
@@ -579,6 +723,11 @@ mod tests {
     /// to the delegation onto `crate::policy::resolve` can't silently alter
     /// `SdlcPolicy` resolution — the concrete guard that the refactor
     /// changed nothing observable.
+    ///
+    /// The `"timeouts":{...all null}` block was appended to this golden when
+    /// the per-stage call-timeout knob landed. Every value is `null` — the
+    /// new field is present in the serialized shape but carries no override,
+    /// so resolution is unchanged for every pre-existing knob.
     #[test]
     fn resolve_output_is_byte_identical_to_pre_hoist_baseline() {
         let harness = PartialPolicy {
@@ -598,7 +747,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}}}";
 
         assert_eq!(serde_json::to_string(&resolved).unwrap(), expected);
     }
