@@ -1,5 +1,6 @@
 /target
 /trees
+/.dev-bastion-web
 .env
 *.sqlite
 *.db
