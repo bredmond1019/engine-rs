@@ -522,6 +522,11 @@ fn finalize_outcomes(
 /// `task_loop::SaveStateNode` uses — without this, the final `done`/
 /// `blocked` state landed on disk but was never committed, so a
 /// `--worktree` run's PR did not contain it.
+///
+/// Since that seam widened to `git add -A`, this commit is also the one that
+/// lands `PatchDocsNode`'s doc edits (and, on a MAJOR_BAIL, the bailed task's
+/// partial work) on the branch before `PullRequestNode` pushes — see the
+/// comment at the `commit_all` call site.
 pub struct WrapUpNode {
     clock: ClockFn,
     runner: CommandRunner,
@@ -664,10 +669,24 @@ impl Node for WrapUpNode {
                     final_validation.as_ref(),
                     terminal_signal.as_ref(),
                 )?;
+                // The widened staging here is what finally commits
+                // `PatchDocsNode`'s doc edits. The drain order is
+                // `FinalValidationNode → PatchDocsNode → WrapUpNode →
+                // PullRequestNode` (`graph.rs`), and `docs.rs` makes no git
+                // calls of its own, so those edits sit uncommitted in the
+                // working tree until this line — which runs BEFORE
+                // `PullRequestNode`'s `git push`, so they reach the branch.
+                //
+                // On a MAJOR_BAIL this also sweeps up the bailed task's
+                // partial, unvalidated work (that task never reached
+                // `SaveStateNode`). That is deliberate: visible attempted
+                // work on a draft-PR handoff beats silently discarding it.
+                // Do not narrow this back to a file list to "keep the bail
+                // clean" — the discarded-work failure mode is worse.
                 commit_all(
                     &self.runner,
                     std::path::Path::new(&worktree),
-                    "chore: flow state update",
+                    "chore(sdlc): wrap-up — docs patch + terminal state",
                 );
                 Some(saved)
             }
@@ -1441,6 +1460,10 @@ mod tests {
         assert_eq!(recorded[0].1, vec!["add".to_string(), "-A".to_string()]);
         assert_eq!(recorded[1].0, "git");
         assert_eq!(recorded[1].1[0], "commit");
+        assert_eq!(
+            recorded[1].1[2],
+            "chore(sdlc): wrap-up — docs patch + terminal state"
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }
