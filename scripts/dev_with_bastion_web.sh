@@ -43,6 +43,17 @@
 # second wins on overlap): DATABASE_URL, BASTION_SERVE_TOKEN,
 # BASTION_ENGINE_API_KEY, BASTION_SERVE_URL.
 #
+# Env EXPORTED into the serve process by this script: ENGINE_BRAIN_ROOT —
+# defaulted to the brain root two levels above this repo (agentic-portfolio/),
+# overridable by exporting it before invoking this script. It is mandatory as
+# of EN.3.K for any `repo`-bearing SDLC_FLOW event: RepoRegistry::from_env()
+# resolves brain.toml against it, and without it falls back to walking up from
+# the process cwd. Unset, `init_repo_registry_from_env` leaves the registry
+# unset and every `repo`-bearing event 422s with "no repo registry is available
+# to resolve it" — and CONTENT_PIPELINE materialization resolves its write root
+# by cwd-walking instead. See docs/deployment-launchd.md for the deployed
+# (launchd) equivalent of this export.
+#
 # Exit codes: 0 clean shutdown · 1 preflight failure · 2 a server failed to
 # become healthy (or died) within its timeout.
 set -euo pipefail
@@ -57,6 +68,12 @@ WEB_DIR="$CORE_DIR/bastion-web"
 BASTION_ENV="$BASTION_DIR/.env"
 WEB_ENV="$WEB_DIR/.env.local"
 BASTION_BIN="$BASTION_DIR/target/release/bastion"
+
+# The company-brain root (agentic-portfolio/) — where brain.toml lives. Honour
+# a caller-supplied ENGINE_BRAIN_ROOT so an unusual checkout can override it;
+# otherwise derive it from this script's own location.
+BRAIN_DIR="$(cd "$CORE_DIR/.." && pwd)"
+ENGINE_BRAIN_ROOT="${ENGINE_BRAIN_ROOT:-$BRAIN_DIR}"
 
 RUN_DIR="$ENGINE_DIR/.dev-bastion-web"
 BACKEND_LOG="$RUN_DIR/bastion-serve.log"
@@ -171,6 +188,9 @@ fi
 FAILED_CHECKS=()
 fail_check() { FAILED_CHECKS+=("$1"); echo "  [FAIL] $1" >&2; }
 pass_check() { echo "  [ OK ] $1"; }
+# Non-fatal: something is degraded but the servers will still start. Used where
+# a miss disables one capability rather than breaking the dev loop.
+warn_check() { echo "  [WARN] $1" >&2; }
 
 # ── Preflight: repo layout sanity ───────────────────────────────────────────
 
@@ -192,6 +212,14 @@ if [ ! -d "$WEB_DIR" ]; then
   fail_check "sibling repo not found: $WEB_DIR"
 else
   pass_check "bastion-web repo found: $WEB_DIR"
+fi
+
+# ENGINE_BRAIN_ROOT is only useful if brain.toml is actually there — that file
+# is what RepoRegistry::from_env() reads to resolve a `repo` slug to a path.
+if [ ! -f "$ENGINE_BRAIN_ROOT/brain.toml" ]; then
+  warn_check "no brain.toml under ENGINE_BRAIN_ROOT=$ENGINE_BRAIN_ROOT — the repo registry will not load, so every \`repo\`-bearing SDLC_FLOW event will 422 (absent-\`repo\` events are unaffected); export ENGINE_BRAIN_ROOT to the agentic-portfolio root to fix"
+else
+  pass_check "brain root resolved: $ENGINE_BRAIN_ROOT (brain.toml present)"
 fi
 
 if [ ${#FAILED_CHECKS[@]} -gt 0 ]; then
@@ -357,8 +385,14 @@ trap cleanup INT TERM EXIT
 
 echo
 echo "Starting bastion serve — cwd=$ENGINE_DIR, addr=$SERVE_ADDR, log=$BACKEND_LOG"
+echo "  ENGINE_BRAIN_ROOT=$ENGINE_BRAIN_ROOT (repo registry + materialize write root)"
 (
   cd "$ENGINE_DIR"
+  # Mandatory as of EN.3.K — without it every `repo`-bearing SDLC_FLOW event
+  # 422s and CONTENT_PIPELINE materialization cwd-walks for its write root.
+  # Exported here (serve only) rather than script-wide: next dev has no use
+  # for it. See docs/deployment-launchd.md for the plist equivalent.
+  export ENGINE_BRAIN_ROOT
   exec "$BASTION_BIN" serve --addr "$SERVE_ADDR" --token "$BASTION_SERVE_TOKEN"
 ) >"$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
