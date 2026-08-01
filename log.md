@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-01T02:41:00Z"
+timestamp: "2026-08-01T12:15:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,41 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [run: 2026-08-01]
+
+### First real bastion-web-triggered SDLC_FLOW trial, timeout root-caused, two follow-up tickets authored, handoff written
+- **What:** Ran the first real `SDLC_FLOW` trial triggered from `bastion-web`'s QuickLaunch UI
+  against a locally-served `bastion serve` pinned to this repo's cwd (targeting
+  `ticket-expose-live-run-workflow-type`). Built and hardened `scripts/dev_with_bastion_web.sh`
+  (starts both servers with full preflight — repo layout, env files, required vars, Postgres,
+  ports — verifies the engine actually mounted via `GET /workflows` not just `/health`,
+  process-tree-aware shutdown via `kill_tree`, a `--stop` escape hatch) and
+  `scripts/watch_sdlc_flow.sh` (watches an already-triggered run by `run_id` alone, combining
+  `core/scripts/run-sdlc-flow.sh`'s per-node polling with `sdlc_smoke.sh`'s exit-code contract,
+  auto-surfacing the failing node's error on a terminal failure). The trial run itself failed:
+  `ImplementTaskNode` timed out at exactly 300.181s. Root-caused to `claude-code-rs`'s
+  `execute.rs:21` hardcoded `DEFAULT_TIMEOUT` constant with zero override path anywhere in
+  either repo — confirmed by reading the source, not inferred. Found a second, compounding
+  issue while tracing it: a raw `execute()` failure inside `ImplementTaskNode` is not routed
+  through the existing `max_attempts`/`IncrementAttemptNode` retry loop at all — it halts the
+  whole run unconditionally (`workflow.rs`'s `run_halts_walk_on_failure` confirms). Authored two
+  tickets: `CC.ticket.configurable-call-timeout` (claude-code-rs — add `Config.timeout:
+  Option<Duration>`) and `EN.ticket.call-timeout-policy-knob` (this repo — thread it through
+  `SdlcPolicy` as a per-stage knob mirroring the existing `ModelTiers` pattern; depends on the
+  first). Deleted a fully-resolved worktree-sibling-path-deps ticket earlier in the session
+  (implemented, tested, merged) and the previous stale `EN.3.J` handoff. Wrote a fresh handoff
+  for an Opus review pass on both new tickets before implementation.
+- **Why:** Proving the Rust `SDLC_FLOW` works end-to-end from the actual UI a human will use
+  (not just `scripts/sdlc_smoke.sh`'s synthetic harness) surfaced a real, previously-invisible
+  infra ceiling — every prior smoke/trial run happened to finish inside 300s. The retry-loop gap
+  found alongside it is architecturally significant enough (halt semantics, not just a knob) to
+  warrant a deliberate design call rather than folding it into the timeout fix.
+- **Refs:** `planning/handoff.md`, `planning/ticket-call-timeout-policy-knob/tasks.md`,
+  `core/claude-code-rs/planning/ticket-configurable-call-timeout/tasks.md`,
+  `planning/state.json` (carryover: `sdlc-flow-implement-transport-failures-not-retried`)
 
 ---
 
