@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-07-31T21:40:00Z"
+timestamp: "2026-07-31T23:15:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,23 @@ related: [status, context]
 ---
 
 ## [run: 2026-07-31]
+
+### EN.3.K landed; EN.3.J amended to a two-run acceptance
+- **What:** `EN.3.K-dispatch-target-resolution` merged (PR #35) — a `brain.toml`-backed
+  repo-slug registry, `repo` on the event schema, and dispatch-time 422s for an unknown
+  slug or an absent spec dir. Then amended `EN.3.J`'s spec: it predated `EN.3.K` and its
+  script posts no `repo` field, so the smoke exercised only the pre-`EN.3.K` cwd-fallback
+  path. Restructured into a `--repo` flag plus three human-in-the-loop tasks — run 1
+  (engine acceptance, no `repo`), a 422 pre-flight, and run 2 (deployment acceptance,
+  server started outside the brain tree). Tasks 1-5 left byte-untouched so the work
+  already on draft PR #34 still maps.
+- **Why:** The always-on `bastion serve` on the Mac Mini can only serve one repo while the
+  target is the process's working directory. `EN.3.K` fixes that; the smoke had to be
+  updated to actually prove it, otherwise the deployment's core property would ship
+  unverified.
+- **Refs:** `planning/EN.3.K-dispatch-target-resolution/`, `planning/EN.3.J-sdlc-flow-smoke/`
+  (see its Amendment Log), `docs/deployment-launchd.md`
+
 
 ### EN.3.K-dispatch-target-resolution — repo slug registry + dispatch-time 422 validation
 - **What:** `/sdlc-flow` on branch `EN.3.K-dispatch-target-resolution-flow`, all 10 tasks passed,
