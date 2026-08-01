@@ -691,15 +691,37 @@ async fn never_passing_task_bails_at_max_attempts_and_reaches_wrap_up_tail() {
     assert!(wrap_up_result.get("log_entry").is_some());
     assert!(wrap_up_result.get("report").is_some());
     assert!(wrap_up_result.get("status_suggestion").is_some());
-    // NOTE (recorded in the spec's Amendment Log): `WrapUpNode`'s own
-    // `latest_state` helper (wrap_up.rs) only consults
-    // `UpdateTaskStatusNode`/`LoadTaskStateNode`, not `IncrementAttemptNode`
-    // — on this MAJOR_BAIL path (which never reaches `UpdateTaskStatusNode`)
-    // it therefore falls back to the *initial* `LoadTaskStateNode` snapshot,
-    // so the rendered outcome does not reflect the retries that actually
-    // happened. This test only asserts the tail is reached with the three
-    // artifacts present (the task 7 acceptance criterion), not their
-    // specific PASS/PARTIAL content on the bail path.
+
+    // ticket-wrapup-outcome-truth: end-to-end proof that a bailed run is
+    // never recorded as a success. `log_entry` is what gets pasted into a
+    // work log, and `UpdateTaskStatusNode` (asserted above as never having
+    // run) is the only thing that increments `telemetry.tasks_failed` — so
+    // the outcome word MUST come from the terminal signal, not the counter.
+    let log_entry = wrap_up_result["log_entry"]
+        .as_str()
+        .expect("log_entry should be a string");
+    assert!(
+        log_entry.contains("Outcome: BLOCKED"),
+        "a MAJOR_BAIL run must render BLOCKED, got: {log_entry}"
+    );
+    assert!(
+        !log_entry.contains("Outcome: PASS"),
+        "a MAJOR_BAIL run must never render PASS, got: {log_entry}"
+    );
+    assert!(
+        wrap_up_result["report"]
+            .as_str()
+            .expect("report should be a string")
+            .contains("- Outcome: BLOCKED"),
+        "the report must agree with log_entry on the bail path"
+    );
+    assert!(
+        !wrap_up_result["status_suggestion"]
+            .as_str()
+            .expect("status_suggestion should be a string")
+            .contains("completed successfully"),
+        "a blocked run must not suggest a done status"
+    );
 
     // `PatchDocsNode` never runs on the bail path: `TriageRouterNode`'s
     // `MAJOR_BAIL` verdict routes straight to `WrapUpNode`.
