@@ -185,6 +185,21 @@ fn spec_dir(ctx: &TaskContext, spec_slug: &str) -> PathBuf {
 /// exit, attempts a best-effort `git worktree remove --force` cleanup before
 /// surfacing the original failure.
 ///
+/// **Dirty-tree guard (live-checkout runs only).** When `use_worktree` is
+/// false — the default — the run targets a live checkout, and the downstream
+/// tree-wide staging (`commit_all`'s `git add -A`,
+/// `stage_untracked_intent`'s `git add -N -A`) would otherwise sweep the
+/// operator's unrelated dirty files into the run's commits. This node
+/// therefore runs `git status --porcelain` first and aborts, naming the
+/// dirty paths, when anything is uncommitted. Mirrors the JS harness's
+/// branch-mode guard (`.claude/workflows/sdlc-flow.js`). A
+/// `use_worktree: true` run is isolated and is not guarded.
+///
+/// **Base-ref freshness.** Both branch-creation sites base on `origin/main`,
+/// preceded by a best-effort, non-fatal `git fetch origin main` so the base
+/// is not an arbitrarily stale local ref. An offline run degrades to the
+/// previous behavior rather than failing.
+///
 /// Deliberately omits the orchestrator's `.env`-copy step from the Python
 /// source — that step is specific to the orchestrator's own repo layout and
 /// has no equivalent here.
@@ -268,9 +283,62 @@ impl Node for SetupWorktreeNode {
             root.clone()
         };
 
+        // SAFETY GUARD (ticket-setup-rs-closeout item 1). `use_worktree`
+        // defaults to FALSE, and on that path this node checks the run's
+        // branch out in a LIVE checkout — `worktree_path == "."` (the
+        // default target) or the registry-resolved repo root. Everything
+        // downstream then stages tree-wide: `commit_all` (`mod.rs`) runs
+        // `git add -A` per passed task and at wrap-up, and
+        // `stage_untracked_intent` runs `git add -N -A` before each review
+        // diff — so any unrelated dirty file in the operator's repo would be
+        // swept into a `feat(sdlc): ...` commit, and a formerly read-only
+        // seam would write to that repo's real index.
+        //
+        // Mirrors the JS harness's branch-mode guard
+        // (`.claude/workflows/sdlc-flow.js`, setup STEP 3a: `git status
+        // --porcelain`, abort with the dirty paths named) so operators get
+        // the same behavior from both engines. A `use_worktree: true` run is
+        // already isolated and is deliberately NOT guarded — a dirty main
+        // tree cannot leak into a fresh worktree. A CLEAN live-repo run is
+        // unaffected, so this is behavior-stable except in the dirty case.
+        //
+        // Not a policy knob (standing rule 6): this is a safety invariant
+        // protecting the operator's repo, not a cost/latency/quality
+        // tradeoff, so there is no setting a run could reasonably want the
+        // other way. `use_worktree: true` is the supported escape hatch.
+        if !event.use_worktree {
+            let status =
+                (self.runner)("git", &["status", "--porcelain"], &git_cwd).map_err(|err| {
+                    NodeError::new(format!("failed to spawn git status --porcelain: {err}"))
+                })?;
+            if status.status != 0 {
+                return Err(NodeError::new(format!(
+                    "git status --porcelain failed (status {}): {}",
+                    status.status, status.stderr
+                )));
+            }
+            if !status.stdout.trim().is_empty() {
+                return Err(NodeError::new(format!(
+                    "Working tree is not clean — commit or stash your changes, then re-run \
+                     (or set use_worktree: true for an isolated checkout). Dirty paths:\n{}",
+                    status.stdout.trim_end()
+                )));
+            }
+        }
+
         if event.use_worktree {
             let reattaching = event.resume && worktree_path_buf.exists();
             if !reattaching {
+                // 0c (tasks.md task 5): refresh `origin/main` before basing a
+                // branch on it. Best-effort and non-fatal — an offline run
+                // degrades to today's behavior (branching from whatever
+                // `origin/main` the local repo last saw). Deliberately NOT
+                // hoisted above the `use_worktree` fork: the two reattach /
+                // resume paths (`worktree` reattach below, `checkout <branch>`
+                // further down) create no branch from `origin/main`, so a
+                // fetch there would be a pure no-op network call.
+                let _ = (self.runner)("git", &["fetch", "origin", "main"], &git_cwd);
+
                 let output = (self.runner)(
                     "git",
                     &[
@@ -345,6 +413,11 @@ impl Node for SetupWorktreeNode {
             }
         } else {
             if !event.resume {
+                // 0c (tasks.md task 5): same best-effort fetch as the
+                // worktree path above — this is the second branch-creation
+                // site, and it bases the branch on `origin/main` too.
+                let _ = (self.runner)("git", &["fetch", "origin", "main"], &git_cwd);
+
                 let output = (self.runner)(
                     "git",
                     &[
@@ -380,12 +453,24 @@ impl Node for SetupWorktreeNode {
             }
         }
 
-        // Best-effort: capture the base commit SHA so downstream diff/review
-        // steps can pin their diff base to "what existed when this worktree
-        // was set up" rather than a hardcoded `main` that may move mid-run.
-        // A failed `git rev-parse` (or a no-op stub runner in unit tests)
-        // simply omits `base_sha` — downstream readers fall back to
-        // `main..HEAD`.
+        // Best-effort: capture the base commit SHA this run started from.
+        //
+        // This is now **run metadata only**. It used to be the diff base:
+        // `task_loop::diff_range` returned `{base_sha}..HEAD` and both
+        // `ConsolidatedReviewNode` and `classify_trivial` read it. That was
+        // the root of the "review always sees an empty diff" defect — the
+        // range is a COMMIT range, and nothing in the run ever committed the
+        // implementer's code. `ticket-commit-task-work-real-diffs` deleted
+        // both `diff_range` and the `base_sha(ctx)` helper; every diff is now
+        // taken against the working tree instead (`git add -N -A` followed by
+        // `git diff HEAD` for the reviewer, `git diff --numstat HEAD` for the
+        // classifier). There is no `main..HEAD` fallback anywhere any more.
+        //
+        // The stamp is KEPT deliberately: it records the commit the branch
+        // was based on, which is useful forensics on a recorded run. A failed
+        // `git rev-parse` (or a no-op stub runner in unit tests) simply omits
+        // it, and nothing downstream reads it, so its absence changes no
+        // behavior.
         let base_sha = (self.runner)("git", &["rev-parse", "HEAD"], Path::new(&worktree_path))
             .ok()
             .filter(|output| output.status == 0)
@@ -1580,9 +1665,16 @@ mod tests {
         let _ = node.process(ctx).await;
 
         let recorded = calls.lock().unwrap();
-        assert_eq!(recorded.len(), 2, "expected add + cleanup calls");
+        // fetch (best-effort, itself failing here and ignored) + worktree add
+        // + cleanup remove.
         assert_eq!(
-            recorded[1][0..2],
+            recorded.len(),
+            3,
+            "expected fetch + add + cleanup calls, got: {recorded:?}"
+        );
+        assert_eq!(recorded[0][0], "fetch");
+        assert_eq!(
+            recorded[2][0..2],
             ["worktree".to_string(), "remove".to_string()]
         );
     }
@@ -1624,6 +1716,264 @@ mod tests {
         assert!(
             result.get("base_sha").is_none(),
             "base_sha should be absent when rev-parse yields no usable SHA"
+        );
+    }
+
+    // --- dirty-tree guard (ticket-setup-rs-closeout item 1) -----------------
+
+    /// A runner that answers `git status --porcelain` with `porcelain` and
+    /// every other invocation with an empty success, recording all argv.
+    #[allow(clippy::type_complexity)]
+    fn porcelain_runner(porcelain: &'static str) -> (CommandRunner, Arc<Mutex<Vec<Vec<String>>>>) {
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            let is_status = args.first() == Some(&"status");
+            Ok(CommandOutput {
+                status: 0,
+                stdout: if is_status {
+                    porcelain.to_string()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        });
+        (runner, calls)
+    }
+
+    #[tokio::test]
+    async fn live_repo_run_proceeds_when_the_tree_is_clean() {
+        // Behavior-stability guard: the clean live-repo path must be
+        // unchanged by the dirty-tree abort.
+        let (runner, calls) = porcelain_runner("");
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+
+        let out = node.process(ctx).await.expect("clean tree should proceed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["worktree_path"], ".");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.first().map(Vec::as_slice),
+            Some(["status".to_string(), "--porcelain".to_string()].as_slice()),
+            "the guard must run before anything mutating"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("checkout")),
+            "a clean run still creates its branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_repo_run_aborts_on_a_dirty_tree_naming_the_paths() {
+        let (runner, calls) = porcelain_runner(" M src/lib.rs\n?? scratch/notes.txt\n");
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+
+        let err = node.process(ctx).await.expect_err("dirty tree must abort");
+        assert!(
+            err.message.contains("Working tree is not clean"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("src/lib.rs") && err.message.contains("scratch/notes.txt"),
+            "the abort must name the dirty paths: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("use_worktree: true"),
+            "the abort must point at the escape hatch: {}",
+            err.message
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "nothing may run after the guard fires, got: {recorded:?}"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("checkout")),
+            "the branch must not be created on an aborted run"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_tree_does_not_abort_a_use_worktree_run() {
+        // `use_worktree: true` is already isolated: a dirty main tree cannot
+        // leak into a freshly-added worktree, so the guard must not fire and
+        // must not even ask.
+        let (runner, calls) = porcelain_runner(" M src/lib.rs\n");
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("an isolated run is unaffected by a dirty main tree");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["worktree_path"], "trees/sdlc/my-spec");
+
+        let recorded = calls.lock().unwrap();
+        assert!(
+            !recorded
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("status")),
+            "the guard must not run at all under use_worktree: true"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_repo_run_surfaces_a_failing_status_check() {
+        // Cannot prove the tree is clean -> refuse to stage tree-wide.
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            Ok(CommandOutput {
+                status: i32::from(args.first() == Some(&"status")),
+                stdout: String::new(),
+                stderr: "fatal: not a git repository".to_string(),
+            })
+        });
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+
+        let err = node.process(ctx).await.expect_err("must not proceed");
+        assert!(
+            err.message.contains("git status --porcelain failed"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    // --- best-effort fetch before branch creation (0c / tasks.md task 5) ----
+
+    #[tokio::test]
+    async fn fetch_precedes_worktree_branch_creation() {
+        let (runner, calls) = porcelain_runner("");
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        node.process(ctx).await.expect("setup should succeed");
+
+        let recorded = calls.lock().unwrap();
+        let fetch_at = recorded
+            .iter()
+            .position(|args| args.first().map(String::as_str) == Some("fetch"))
+            .expect("fetch must run");
+        assert_eq!(
+            recorded[fetch_at],
+            vec![
+                "fetch".to_string(),
+                "origin".to_string(),
+                "main".to_string()
+            ]
+        );
+        let add_at = recorded
+            .iter()
+            .position(|args| args.first().map(String::as_str) == Some("worktree"))
+            .expect("worktree add must run");
+        assert!(
+            fetch_at < add_at,
+            "fetch must precede branch creation: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_precedes_checkout_branch_creation() {
+        let (runner, calls) = porcelain_runner("");
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+
+        node.process(ctx).await.expect("setup should succeed");
+
+        let recorded = calls.lock().unwrap();
+        let fetch_at = recorded
+            .iter()
+            .position(|args| args.first().map(String::as_str) == Some("fetch"))
+            .expect("fetch must run");
+        let checkout_at = recorded
+            .iter()
+            .position(|args| args.first().map(String::as_str) == Some("checkout"))
+            .expect("checkout must run");
+        assert!(
+            fetch_at < checkout_at,
+            "fetch must precede branch creation: {recorded:?}"
+        );
+        // The base ref is unchanged by this task.
+        assert!(recorded[checkout_at].contains(&"origin/main".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_failing_fetch_does_not_fail_the_node() {
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            if args.first() == Some(&"fetch") {
+                // Offline: the subprocess itself fails to complete.
+                return Err(std::io::Error::other("network unreachable"));
+            }
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("an offline fetch must degrade, not fail the node");
+        assert_eq!(
+            out.nodes.get("SetupWorktreeNode").expect("output present")["worktree_path"],
+            "trees/sdlc/my-spec"
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert!(recorded
+            .iter()
+            .any(|args| args.first().map(String::as_str) == Some("worktree")));
+    }
+
+    #[tokio::test]
+    async fn no_fetch_on_the_reattach_and_resume_paths() {
+        // Neither resume path creates a branch from `origin/main`, so a fetch
+        // there would be a pure no-op network call.
+        let (runner, calls) = porcelain_runner("");
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "resume": true }));
+
+        node.process(ctx).await.expect("setup should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert!(
+            !recorded
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("fetch")),
+            "a resume must not fetch: {recorded:?}"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .find(|args| args.first().map(String::as_str) == Some("checkout"))
+                .expect("checkout must run"),
+            &vec!["checkout".to_string(), "sdlc/my-spec".to_string()]
         );
     }
 

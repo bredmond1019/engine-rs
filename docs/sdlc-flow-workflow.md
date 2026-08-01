@@ -115,15 +115,30 @@ patch on the pushed branch — `docs.rs` makes no git calls of its own.
 work is swept into the wrap-up commit. This is deliberate: visible attempted work on a draft-PR
 handoff beats silently discarding it.
 
-> **Blast radius — `use_worktree` defaults to `false`.** `add -A` and `add -N -A` are TREE-WIDE,
-> and on the default event path (`use_worktree: false`) `SetupWorktreeNode` checks the run's branch
-> out in the **operator's live repository** (`worktree_path == "."`), not under `trees/<branch>`.
-> A run started there will sweep any unrelated dirty file in that checkout into its commits, and
-> the intent-to-add pass writes to that repository's index. There is currently **no dirty-tree
-> guard** on that path, unlike `.claude/workflows/sdlc-flow.js`, whose branch mode aborts setup
-> when `git status --porcelain` prints anything. **Prefer `use_worktree: true`** for any run you do
-> not want touching the ambient tree; adding the guard (and/or flipping the default) is tracked
-> separately.
+> **Blast radius — `use_worktree` defaults to `false`, and the dirty-tree guard is what contains
+> it.** `add -A` and `add -N -A` are TREE-WIDE, and on the default event path
+> (`use_worktree: false`) `SetupWorktreeNode` checks the run's branch out in a **live checkout**
+> (`worktree_path == "."`, or the registry-resolved repo root), not under `trees/<branch>`. Left
+> unguarded, a run started there would sweep any unrelated dirty file in that checkout into its
+> commits, and the intent-to-add pass would write to that repository's real index.
+>
+> `SetupWorktreeNode` therefore runs `git status --porcelain` **before** creating the branch
+> whenever `use_worktree` is false, and aborts the run when the tree is not clean, naming the
+> dirty paths:
+>
+> ```
+> Working tree is not clean — commit or stash your changes, then re-run (or set
+> use_worktree: true for an isolated checkout). Dirty paths:
+>  M src/lib.rs
+> ?? scratch/notes.txt
+> ```
+>
+> This mirrors `.claude/workflows/sdlc-flow.js`'s branch-mode guard (setup STEP 3a), so both
+> engines behave the same way. A **clean** live-repo run is unchanged. A `use_worktree: true` run
+> is already isolated and is deliberately not guarded — the guard command is not even issued. The
+> abort is a safety invariant, not a policy knob: there is no cost/latency/quality tradeoff a run
+> could reasonably want the other way, and `use_worktree: true` is the supported escape hatch.
+> **Prefer `use_worktree: true`** for any run you do not want touching the ambient tree at all.
 
 **What the reviewer and the trivial-skip classifier read.** Both take the working tree against
 `HEAD` — `git add -N -A` (intent-to-add) followed by `git diff HEAD` for `ConsolidatedReviewNode`
@@ -401,7 +416,12 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
     `SdlcPolicy`, and is not set in any of the three named policy profiles.
 - **Worktree/branch naming**: branch defaults to `sdlc/<spec_slug>`; worktree path is
   `trees/<branch>`. A fresh (non-resume) run does `git worktree add trees/<branch> -b <branch>
-  origin/main`.
+  origin/main`. Both branch-creation sites (that one, and the `git checkout -B <branch>
+  origin/main` used when `use_worktree` is false) are preceded by a **best-effort, non-fatal
+  `git fetch origin main`**, so the base ref is not an arbitrarily stale local `origin/main` — run
+  `2d46b140` based itself on a pre-merge SHA for exactly that reason. A failing or unreachable
+  fetch is ignored and the run proceeds off whatever `origin/main` the local repo already had.
+  Neither resume path fetches: they create no branch from `origin/main`.
 - **Bail conditions**: a task bails the whole run (routes to `WrapUpNode`, skipping any remaining
   pending tasks) via either `TriageRouterNode`'s `MAJOR_BAIL` (attempts exhausted — default
   `max_attempts: 3`) or `ReviewRouterNode`'s "structural" review failure (0 issues reported, or

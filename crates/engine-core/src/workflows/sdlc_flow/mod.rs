@@ -129,19 +129,22 @@ pub fn default_command_runner() -> CommandRunner {
 /// # Blast radius — this is tree-wide, and `use_worktree` defaults to FALSE
 ///
 /// `SDLCFlowEventSchema::use_worktree` is `#[serde(default)]` **false**, and
-/// on that path `SetupWorktreeNode` checks the run's branch out **in the
-/// operator's live repository** (`worktree_path == "."`) rather than under
-/// `trees/<branch>`. `add -A` there stages *every* dirty path in that
-/// checkout, including edits the operator made and never intended to hand to
-/// the run. There is currently **no dirty-tree guard** on that path — unlike
-/// `.claude/workflows/sdlc-flow.js`, whose branch mode aborts setup when
-/// `git status --porcelain` prints anything.
+/// on that path `SetupWorktreeNode` checks the run's branch out **in a live
+/// checkout** (`worktree_path == "."`, or the registry-resolved repo root)
+/// rather than under `trees/<branch>`. `add -A` there stages *every* dirty
+/// path in that checkout, including edits the operator made and never
+/// intended to hand to the run.
 ///
-/// Prefer `use_worktree: true` for any run you do not want sweeping the
-/// ambient tree. Closing this properly is a `setup.rs` change (a dirty-tree
-/// guard mirroring the JS harness, and/or flipping the `use_worktree`
-/// default) and is deliberately NOT done here — see this spec's Amendment
-/// Log.
+/// **Guarded since `ticket-setup-rs-closeout`:** on that path
+/// `SetupWorktreeNode` now runs `git status --porcelain` first and aborts the
+/// run — naming the dirty paths — when the tree is not clean, mirroring
+/// `.claude/workflows/sdlc-flow.js`'s branch-mode guard. So `add -A` here can
+/// only ever sweep a tree that was clean when the run started, plus whatever
+/// the run itself produced. A `use_worktree: true` run is isolated and
+/// unguarded by design.
+///
+/// Prefer `use_worktree: true` anyway for any run you do not want touching
+/// the ambient tree at all.
 ///
 /// Returns `true` when the commit actually landed. A `false` means `HEAD` did
 /// **not** advance, which silently breaks the topology invariant for the next
