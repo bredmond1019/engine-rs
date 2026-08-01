@@ -58,7 +58,11 @@ fn baseline_profile_resolves_to_documented_policy() {
             implement_simple: ModelTier::Sonnet,
             review: ModelTier::Sonnet,
             triage: ModelTier::Sonnet,
-            generate: ModelTier::Sonnet,
+            // Opus, not Sonnet: the built-in default for `generate` is the
+            // tier `GenerateTasksNode` actually runs, and `baseline` is a
+            // no-op against the built-in default by contract.
+            generate: ModelTier::Opus,
+            docs: ModelTier::Sonnet,
         }
     );
     assert_eq!(resolved.review_mode, ReviewMode::PerTask);
@@ -79,6 +83,8 @@ fn cheap_fast_profile_resolves_to_documented_policy() {
     assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
     assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
     assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+    assert_eq!(resolved.model_tiers.generate, ModelTier::Haiku);
+    assert_eq!(resolved.model_tiers.docs, ModelTier::Haiku);
     assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
     assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
 }

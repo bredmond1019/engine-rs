@@ -2525,6 +2525,7 @@ mod tests {
                 implement: Some(600),
                 triage: Some(90),
                 review: Some(120),
+                ..Default::default()
             },
             ..SdlcPolicy::default()
         };
