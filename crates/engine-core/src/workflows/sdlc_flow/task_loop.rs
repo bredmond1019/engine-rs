@@ -380,9 +380,6 @@ fn review_failure_entries(ctx: &TaskContext) -> Option<Vec<FeedbackEntry>> {
 /// `ctx.nodes` is accurate by construction: `ctx.nodes` accumulates across
 /// the loop, so a recorded failure can only exist if an attempt already ran
 /// and failed.
-// Reachable only from tests until `ImplementTaskNode::process` calls it
-// (this ticket's task 3); the allow comes off there.
-#[allow(dead_code)]
 fn prior_attempt_feedback(ctx: &TaskContext, cfg: &RetryFeedback) -> Option<String> {
     if !cfg.enabled {
         return None;
@@ -591,14 +588,26 @@ impl Node for ImplementTaskNode {
             .cloned()
             .unwrap_or_else(|| json!([]));
 
-        let prompt = format!(
+        // Resolved once, before the prompt is built — the retry-feedback
+        // knob is read here and the same `policy` is threaded into
+        // `apply_policy` below (no second resolve).
+        let policy = resolved_policy(&ctx)?;
+
+        let mut prompt = format!(
             "Implement the following SDLC task. Respond with strict JSON of \
              the shape {{\"summary\": str, \"modified_files\": [str], \
              \"tests_added\": [str]}}.\n\nTitle: {title}\nDescription: \
              {description}\nAcceptance criteria: {acceptance_criteria}"
         );
 
-        let policy = resolved_policy(&ctx)?;
+        // On a retry, tell the model what the previous attempt broke.
+        // Without this the retry request is byte-identical to the first
+        // attempt and the loop cannot self-correct. `None` on a first
+        // attempt leaves the prompt above untouched, byte for byte.
+        if let Some(feedback) = prior_attempt_feedback(&ctx, &policy.retry_feedback) {
+            prompt.push_str(&feedback);
+        }
+
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Implement);
         // Scope the model's session to the actual worktree so it edits the
@@ -4037,6 +4046,111 @@ mod tests {
             .clone()
             .expect("transport should have been called");
         assert!(prompt.contains("Be terse"));
+    }
+
+    /// Records every prompt the transport is handed, and answers with a
+    /// canned `ImplementOutput` success.
+    fn prompt_recording_transport() -> (Arc<Mutex<Vec<String>>>, ModelTransport) {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let transport: ModelTransport = Arc::new(move |_config, prompt| {
+            seen_clone.lock().unwrap().push(prompt);
+            let outcome = canned_outcome(json!({ "summary": "done" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+        (seen, transport)
+    }
+
+    /// **Change-detector, asserted against the literal text.** With no prior
+    /// failure in `ctx` the first-attempt prompt must be byte-identical to
+    /// pre-ticket behavior — the retry-feedback knob buys a retry block, not
+    /// a rewritten first request. Any future perturbation of this string is
+    /// caught here rather than in production.
+    #[tokio::test]
+    async fn implement_node_first_attempt_prompt_is_byte_identical() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let (seen, transport) = prompt_recording_transport();
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0],
+            "Implement the following SDLC task. Respond with strict JSON of the shape \
+             {\"summary\": str, \"modified_files\": [str], \"tests_added\": [str]}.\n\nTitle: \
+             One\nDescription: d1\nAcceptance criteria: []"
+        );
+    }
+
+    /// The headline behavior: a ctx carrying a failed `TestTaskNode` result
+    /// (i.e. the retry back-edge) puts the previous attempt's captured
+    /// output in front of the model.
+    #[tokio::test]
+    async fn implement_node_retry_prompt_carries_the_prior_failure() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            failed_test_result(
+                "error[E0308]: `main` function has the wrong type\n  --> src/http.rs:682:1",
+            ),
+        );
+
+        let (seen, transport) = prompt_recording_transport();
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        let prompt = &prompts[0];
+        // The base prompt is still there in full...
+        assert!(prompt.starts_with("Implement the following SDLC task."));
+        assert!(prompt.contains("Title: One"));
+        // ...with the prior attempt's failure appended.
+        assert!(
+            prompt.contains("PREVIOUS ATTEMPT FAILED"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("FAILED CHECK: test"), "prompt: {prompt}");
+        assert!(prompt.contains("error[E0308]"), "prompt: {prompt}");
+        assert!(prompt.contains("src/http.rs:682"), "prompt: {prompt}");
+    }
+
+    /// The escape hatch: `retry_feedback.enabled = false` restores the
+    /// byte-identical prompt even on a retry.
+    #[tokio::test]
+    async fn implement_node_retry_prompt_is_unchanged_when_knob_disabled() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            failed_test_result("error[E0308]: mismatched types"),
+        );
+        let policy = SdlcPolicy {
+            retry_feedback: RetryFeedback {
+                enabled: false,
+                max_chars: 4000,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let (seen, transport) = prompt_recording_transport();
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        assert_eq!(
+            prompts[0],
+            "Implement the following SDLC task. Respond with strict JSON of the shape \
+             {\"summary\": str, \"modified_files\": [str], \"tests_added\": [str]}.\n\nTitle: \
+             One\nDescription: d1\nAcceptance criteria: []"
+        );
     }
 
     /// When `SetupWorktreeNode` has stamped a `worktree_path`, the model's
