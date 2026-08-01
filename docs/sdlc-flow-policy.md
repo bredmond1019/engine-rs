@@ -274,9 +274,18 @@ instead of the Claude CLI — for cheap, zero-cost judgment calls on cheap hardw
   `ConsolidatedReviewNode`. `ImplementTaskNode` (the agentic implement stage) is **never** rewired
   to `local`, regardless of what `model_tiers.implement` is set to — the local tier isn't suited to
   multi-turn agentic work (see `planning/local-llm-tier-investigation/notes.md`).
-- **Automatic fallback**: any failure calling the local endpoint (unreachable, error response)
-  falls back to the real Claude CLI transport for that call — a run degrades gracefully rather than
-  hard-failing because a local server was down.
+- **Automatic fallback**: any failure calling the local endpoint (unreachable, error response,
+  malformed body) falls back to the real Claude CLI transport for that call — a run degrades
+  gracefully rather than hard-failing because a local server was down.
+  **Which model the fallback runs on:** the `Config` handed to the fallback has its `model`
+  cleared to `None` first, so the Claude CLI applies its own default model. This is deliberate:
+  resolving a stage to `local` sets `Config.model` to the *local* model name (e.g. `qwen2.5:3b`),
+  and the CLI 404s on it (`There's an issue with the selected model (qwen2.5:3b)`) — forwarding it
+  unchanged made the fallback useless for the most likely local-side failure, the model not being
+  pulled. There is deliberately **no** `local.fallback_model` knob: the stage declared `local`, so
+  no cloud tier was ever specified for it, and the CLI default is the honest stand-in.
+  The fallback is quiet but **not silent** — it is attributable in telemetry (see
+  [Observed vs. intended tier](#telemetry-runoutcomes) below).
 - Wired via `registry_for_policy(&SdlcPolicy)` in `graph.rs`, which builds on the default node
   registry and swaps in the local-routed node only for stages resolved to `local`.
 

@@ -20,7 +20,9 @@
 //! transport this module builds — it silently falls back to the supplied
 //! `cloud_fallback` transport for that same call, so a stage that opts into
 //! `local` never hard-fails a run just because the local server isn't
-//! reachable.
+//! reachable. The `Config` handed to the fallback has its `model` cleared
+//! first ([`clear_local_model`]) — it holds the LOCAL model name, which the
+//! cloud `claude` CLI would reject with a 404.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -165,6 +167,43 @@ fn build_request_body(local: &LocalConfig, prompt: &str) -> Value {
     body
 }
 
+/// Strip the local model name off a `Config` before handing it to the cloud
+/// fallback.
+///
+/// **Why this is necessary.** `policy::shaping::apply_model_tier(config,
+/// ModelTier::Local, local_model)` sets `config.model =
+/// Some("<local model>")` (e.g. `"qwen2.5:3b"`). The cloud fallback is the
+/// `claude` CLI, which has never heard of that model, so forwarding the
+/// `Config` unchanged made the fallback fail with
+/// `claude API error (HTTP 404): There's an issue with the selected model
+/// (qwen2.5:3b)` — i.e. the fallback was useless for the single most likely
+/// local-side failure (the model isn't pulled / the endpoint is unusable).
+/// Setting `model` to `None` lets `claude-code-rs` apply the CLI's own
+/// default model.
+///
+/// **Why clearing is safe.** `openai_compat_transport` /
+/// `openai_compat_meta_transport` are only ever wired when the resolved tier
+/// for that stage is `ModelTier::Local` (see `graph.rs`'s
+/// `registry_for_policy`), so `config.model` here is ALWAYS the local model
+/// string — clearing it cannot affect any non-local path.
+///
+/// **Two deliberate non-choices**, recorded here rather than implemented:
+/// - No `fallback_model` field on [`LocalConfig`]. A configurable fallback
+///   model would be a standing-rule-6 knob, requiring an explicit setting in
+///   every named profile across four workflows — disproportionate for an
+///   error path. `None` (the CLI default) is the honest choice: the stage
+///   declared `local`, so no cloud tier was ever specified for it.
+/// - The fallback stays quiet, not loud/fatal — it is deliberately a
+///   fallback. It is already ATTRIBUTABLE rather than silent:
+///   [`openai_compat_meta_transport`] stamps `{"tier": "cloud", "model":
+///   <the fallback's primary model>, "endpoint": None}`, and
+///   `ClaudeCodeStep`'s plain-transport branch stamps a generic `"cloud"`
+///   tier — so telemetry records what actually ran, not what policy intended.
+fn clear_local_model(mut config: Config) -> Config {
+    config.model = None;
+    config
+}
+
 /// Build an `openai_compat_transport` [`ModelTransport`] for the `local`
 /// model tier: POSTs to `local.endpoint`'s `/v1/chat/completions` via
 /// `http_post` and synthesizes an `Outcome`. On any local-side failure
@@ -196,7 +235,7 @@ pub fn openai_compat_transport(
 
             match local_result {
                 Ok(outcome) => Ok(outcome),
-                Err(_local_err) => (cloud_fallback)(config, prompt).await,
+                Err(_local_err) => (cloud_fallback)(clear_local_model(config), prompt).await,
             }
         })
     })
@@ -257,7 +296,7 @@ pub fn openai_compat_meta_transport(
                     Ok((outcome, info))
                 }
                 Err(_local_err) => {
-                    let outcome = (cloud_fallback)(config, prompt).await?;
+                    let outcome = (cloud_fallback)(clear_local_model(config), prompt).await?;
                     let model = outcome.primary_model().unwrap_or("unknown").to_string();
                     let info = TransportInfo {
                         tier: "cloud".to_string(),
@@ -344,6 +383,36 @@ mod tests {
                 })
             })
         })
+    }
+
+    /// A cloud fallback that RECORDS the `Config` it was handed (the
+    /// `panicking_cloud_fallback` below can only assert the fallback is
+    /// *not* reached; this one asserts what it *receives*).
+    fn capturing_cloud_stub(text: &str) -> (ModelTransport, Arc<std::sync::Mutex<Option<Config>>>) {
+        let seen: Arc<std::sync::Mutex<Option<Config>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen_clone = Arc::clone(&seen);
+        let inner = cloud_stub(text);
+        let transport: ModelTransport = Arc::new(move |config: Config, prompt: String| {
+            *seen_clone.lock().unwrap() = Some(config.clone());
+            (inner)(config, prompt)
+        });
+        (transport, seen)
+    }
+
+    /// A `Config` shaped the way `policy::shaping::apply_model_tier(..,
+    /// ModelTier::Local, ..)` shapes it: `model` holds the LOCAL model name.
+    fn local_tier_config() -> Config {
+        Config {
+            model: Some(test_local_config().model),
+            ..Config::default()
+        }
+    }
+
+    /// Local endpoint returns HTTP-level success but a body that fails
+    /// `outcome_from_chat_completion` parsing — the second local-failure
+    /// shape the code distinguishes.
+    fn malformed_stub_response() -> LocalHttpPost {
+        Arc::new(|_url, _body| Box::pin(async { Ok(json!({ "unexpected": "shape" })) }))
     }
 
     fn panicking_cloud_fallback() -> ModelTransport {
@@ -503,6 +572,88 @@ mod tests {
 
         assert_eq!(info.tier, "cloud");
         assert_eq!(info.endpoint, None);
+    }
+
+    // -- regression: the cloud fallback must not be handed the LOCAL model --
+    //
+    // `apply_model_tier(.., ModelTier::Local, ..)` puts the local model name
+    // in `config.model`. Forwarding that to the `claude` CLI produced
+    // `HTTP 404: There's an issue with the selected model (qwen2.5:3b)`
+    // (observed live, run `bd034156`), making the fallback useless for the
+    // most likely local-side failure. All four tests below drive the failure
+    // through the stubbed `http_post` seam, so they never contact a live
+    // Ollama.
+
+    #[tokio::test]
+    async fn fallback_clears_local_model_when_local_endpoint_errors() {
+        let (cloud, seen) = capturing_cloud_stub("cloud reply");
+        let transport = openai_compat_transport(test_local_config(), down_stub_response(), cloud);
+
+        let outcome = transport(local_tier_config(), "hello".to_string())
+            .await
+            .expect("cloud fallback should succeed");
+        assert_eq!(outcome.text, "cloud reply");
+
+        let config = seen.lock().unwrap().clone().expect("fallback was called");
+        assert_eq!(
+            config.model,
+            None,
+            "the cloud fallback must not be handed the local model name \
+             (`{}`) — the `claude` CLI 404s on it",
+            test_local_config().model
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_clears_local_model_when_local_response_is_malformed() {
+        let (cloud, seen) = capturing_cloud_stub("cloud reply");
+        let transport =
+            openai_compat_transport(test_local_config(), malformed_stub_response(), cloud);
+
+        let _ = transport(local_tier_config(), "hello".to_string())
+            .await
+            .expect("cloud fallback should succeed on malformed local response");
+
+        let config = seen.lock().unwrap().clone().expect("fallback was called");
+        assert_eq!(
+            config.model, None,
+            "a parse failure on the local body must reach the fallback with \
+             the local model cleared, exactly like a transport error"
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_transport_fallback_clears_local_model_when_local_endpoint_errors() {
+        let (cloud, seen) = capturing_cloud_stub("cloud reply");
+        let transport =
+            openai_compat_meta_transport(test_local_config(), down_stub_response(), cloud);
+
+        let (outcome, info) = transport(local_tier_config(), "hello".to_string())
+            .await
+            .expect("cloud fallback should succeed");
+        assert_eq!(outcome.text, "cloud reply");
+        assert_eq!(
+            info.tier, "cloud",
+            "clearing the model must not regress the fallback's tier stamp"
+        );
+
+        let config = seen.lock().unwrap().clone().expect("fallback was called");
+        assert_eq!(config.model, None);
+    }
+
+    #[tokio::test]
+    async fn meta_transport_fallback_clears_local_model_when_local_response_is_malformed() {
+        let (cloud, seen) = capturing_cloud_stub("cloud reply");
+        let transport =
+            openai_compat_meta_transport(test_local_config(), malformed_stub_response(), cloud);
+
+        let (_outcome, info) = transport(local_tier_config(), "hello".to_string())
+            .await
+            .expect("cloud fallback should succeed on malformed local response");
+        assert_eq!(info.tier, "cloud");
+
+        let config = seen.lock().unwrap().clone().expect("fallback was called");
+        assert_eq!(config.model, None);
     }
 
     #[tokio::test]
