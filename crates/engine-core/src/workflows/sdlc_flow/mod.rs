@@ -106,26 +106,60 @@ pub fn default_command_runner() -> CommandRunner {
 /// doc edits (`docs.rs` makes no git calls at all) never reached the branch.
 ///
 /// **The commit topology this establishes** — `HEAD` carries every completed
-/// task's code *and* state; the working tree delta vs `HEAD` is exactly the
-/// current task's in-progress work. `SaveStateNode` runs only on the pass
-/// path, so one passed task is one commit; the retry path never reaches it,
-/// so retries accumulate uncommitted and each attempt's review sees the
+/// task's code; the working tree delta vs `HEAD` is exactly the current
+/// task's in-progress work. `SaveStateNode` runs only on the pass path, so
+/// one passed task is one commit; the retry path never reaches it, so
+/// retries accumulate uncommitted and each attempt's review sees the
 /// cumulative attempt via `git diff HEAD`.
 ///
-/// **Why `add -A` and not an explicit file list:** the run is isolated to
-/// its own branch/worktree, `.gitignore` guards build artifacts, and
-/// `TestTaskNode::changed_files` already treats untracked paths as expected
-/// implementer output — an explicit list would silently drop any file the
-/// agent created but did not "claim".
-pub(crate) fn commit_all(runner: &CommandRunner, worktree: &Path, message: &str) {
+/// Whether the state file rides along in that commit is repo-dependent: in
+/// **this** repo `planning/` is a gitignored symlink into a brain vault
+/// (`.gitignore` `/planning`), so `add -A` cannot stage
+/// `planning/<slug>/sdlc/sdlc-flow-state.json` and every commit here carries
+/// code only. In a repo that tracks `planning/`, the state file is included.
+/// Do not read the doc comments elsewhere in this module as promising the
+/// state file is committed in engine-rs — it is not, and was not before this
+/// helper widened either.
+///
+/// **Why `add -A` and not an explicit file list:** `.gitignore` guards build
+/// artifacts, and `TestTaskNode::changed_files` already treats untracked
+/// paths as expected implementer output — an explicit list would silently
+/// drop any file the agent created but did not "claim".
+///
+/// # Blast radius — this is tree-wide, and `use_worktree` defaults to FALSE
+///
+/// `SDLCFlowEventSchema::use_worktree` is `#[serde(default)]` **false**, and
+/// on that path `SetupWorktreeNode` checks the run's branch out **in the
+/// operator's live repository** (`worktree_path == "."`) rather than under
+/// `trees/<branch>`. `add -A` there stages *every* dirty path in that
+/// checkout, including edits the operator made and never intended to hand to
+/// the run. There is currently **no dirty-tree guard** on that path — unlike
+/// `.claude/workflows/sdlc-flow.js`, whose branch mode aborts setup when
+/// `git status --porcelain` prints anything.
+///
+/// Prefer `use_worktree: true` for any run you do not want sweeping the
+/// ambient tree. Closing this properly is a `setup.rs` change (a dirty-tree
+/// guard mirroring the JS harness, and/or flipping the `use_worktree`
+/// default) and is deliberately NOT done here — see this spec's Amendment
+/// Log.
+///
+/// Returns `true` when the commit actually landed. A `false` means `HEAD` did
+/// **not** advance, which silently breaks the topology invariant for the next
+/// task (its `git diff HEAD` would then include this task's work too), so
+/// callers stamp the outcome where telemetry can see it rather than
+/// discarding it.
+pub(crate) fn commit_all(runner: &CommandRunner, worktree: &Path, message: &str) -> bool {
     let _ = runner("git", &["add", "-A"], worktree);
     let commit = runner("git", &["commit", "-m", message], worktree);
-    if let Ok(output) = &commit {
-        if output.status != 0 {
+    match &commit {
+        Ok(output) if output.status == 0 => true,
+        Ok(output) => {
             // "nothing to commit" or an equivalent no-op — logged, not
             // an error, mirroring `save_state_node.py`.
             log_noop_commit(message, output);
+            false
         }
+        Err(_) => false,
     }
 }
 

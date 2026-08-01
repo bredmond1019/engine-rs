@@ -147,7 +147,7 @@ fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
     if std::fs::write(&state_path, patched).is_err() {
         return;
     }
-    commit_all(runner, Path::new(&worktree), "chore: flow state update");
+    let _ = commit_all(runner, Path::new(&worktree), "chore: flow state update");
 }
 
 /// Deterministic node: runs `mev emit-state --write` in the worktree.

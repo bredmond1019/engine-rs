@@ -288,7 +288,10 @@ pub(crate) fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
 /// Deliberately non-fatal and deliberately not undone afterwards: a leftover
 /// `-N` index entry on the retry path simply keeps the file visible to the
 /// next attempt's diff (desired), and the eventual `git add -A` in
-/// [`super::commit_all`] subsumes it. A binary untracked file numstats as
+/// [`super::commit_all`] subsumes it. Note this makes a formerly read-only
+/// seam a WRITE to the index — and on the `use_worktree: false` path (the
+/// schema default) that index belongs to the operator's live repository. See
+/// [`super::commit_all`]'s "Blast radius" section. A binary untracked file numstats as
 /// `-\t-\t<path>`, which [`classify_trivial`]'s existing conservative arm
 /// already treats as non-trivial — correct behavior for free.
 fn stage_untracked_intent(runner: &CommandRunner, worktree: &Path) {
@@ -2312,7 +2315,11 @@ impl Node for SaveStateNode {
         })?;
 
         let state_path_str = state_path.to_string_lossy().to_string();
-        super::commit_all(
+        // Stamped, not discarded: a `false` here means HEAD did not advance,
+        // so the NEXT task's `git diff HEAD` will include this task's work —
+        // the exact miscount this ticket exists to kill, just quieter. Making
+        // it visible in `ctx.nodes` is what lets telemetry catch it.
+        let committed = super::commit_all(
             &self.runner,
             Path::new(&worktree),
             &save_state_commit_message(&ctx),
@@ -2321,7 +2328,7 @@ impl Node for SaveStateNode {
         put_result(
             &mut ctx,
             "SaveStateNode",
-            json!({ "saved_to": state_path_str }),
+            json!({ "saved_to": state_path_str, "committed": committed }),
         );
         Ok(ctx)
     }

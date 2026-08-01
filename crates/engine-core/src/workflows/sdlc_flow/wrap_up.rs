@@ -683,7 +683,7 @@ impl Node for WrapUpNode {
                 // work on a draft-PR handoff beats silently discarding it.
                 // Do not narrow this back to a file list to "keep the bail
                 // clean" — the discarded-work failure mode is worse.
-                commit_all(
+                let _ = commit_all(
                     &self.runner,
                     std::path::Path::new(&worktree),
                     "chore(sdlc): wrap-up — docs patch + terminal state",

@@ -399,7 +399,14 @@ fn build_workflow_with_docs(
     registry.register(Box::new(
         TestTaskNode::new().with_runner(test_runner.clone()),
     ));
-    registry.register(Box::new(TriageTaskNode::new()));
+    // `TriageTaskNode` calls `classify_trivial` unconditionally on its PASS
+    // branch, which shells out to git (`add -N -A`, then
+    // `diff --numstat HEAD`). Registered un-injected it would carry
+    // `default_command_runner` and really spawn those in the temp worktree —
+    // breaking this suite's hermeticity claim, and now with a MUTATING call.
+    registry.register(Box::new(
+        TriageTaskNode::new().with_runner(git_runner.clone()),
+    ));
     registry.register(Box::new(TriageRouterNode));
 
     registry.register(Box::new(
@@ -981,7 +988,24 @@ async fn wrap_up_stages_after_patch_docs_ran_and_before_the_push() {
     let worktree = temp_worktree("docs-committed");
     write_fixture_files(&worktree, 1, 2);
 
-    let (git_runner, calls) = recording_git_runner();
+    // Records, for each `git add -A`, whether the docs stage's file was
+    // already on disk when that staging ran. That is what actually proves the
+    // wrap-up's staging can see the doc patch — an ordering assertion over
+    // argv alone would pass even if PatchDocsNode wrote nothing.
+    let doc_file = worktree.join("docs").join("patched.md");
+    let doc_present_at_add: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let doc_present_clone = doc_present_at_add.clone();
+    let doc_file_probe = doc_file.clone();
+    let (recorder, calls) = recording_git_runner();
+    let git_runner: CommandRunner = Arc::new(move |program, args, cwd| {
+        if program == "git" && args == ["add", "-A"] {
+            doc_present_clone
+                .lock()
+                .unwrap()
+                .push(doc_file_probe.exists());
+        }
+        recorder(program, args, cwd)
+    });
 
     // A PatchDocsNode whose stubbed transport actually WRITES a doc file into
     // the worktree, exactly as a real docs patch would — so there is genuine
@@ -1032,6 +1056,26 @@ async fn wrap_up_stages_after_patch_docs_ran_and_before_the_push() {
         })
         .expect("the auto_pr run should have pushed");
     assert!(wrap_up_commit < push_index);
+
+    // The doc file really was written, and really was on disk by the time the
+    // LAST `git add -A` (the wrap-up's) ran — so that staging would pick it
+    // up. The per-task staging ran before PatchDocsNode and did not see it.
+    assert!(
+        doc_file.exists(),
+        "the docs stage should have written its file"
+    );
+    let presence = doc_present_at_add.lock().unwrap();
+    assert_eq!(
+        presence.first(),
+        Some(&false),
+        "the per-task staging runs before PatchDocsNode, so the doc must be absent then"
+    );
+    assert_eq!(
+        presence.last(),
+        Some(&true),
+        "the wrap-up staging runs after PatchDocsNode, so the doc must be present then: \
+         {presence:?}"
+    );
 }
 
 /// **Retry-leak check.** The retry path (`TriageRouterNode`/`ReviewRouterNode`
@@ -1095,4 +1139,98 @@ async fn a_failed_attempt_commits_nothing_and_the_pass_commits_once() {
         commit_message(&recorded, commits[1]),
         "chore(sdlc): wrap-up — docs patch + terminal state"
     );
+}
+
+/// **The one test in this suite that runs REAL git**, deliberately.
+///
+/// Every other assertion about the review diff stubs `CommandRunner` and can
+/// therefore only pin argv *shape*. But the load-bearing claim of
+/// `ticket-commit-task-work-real-diffs` is a claim about git SEMANTICS: that
+/// `git add -N -A` followed by `git diff HEAD` surfaces a brand-new untracked
+/// file's content to the reviewer. Plausible-argv-with-empty-semantics is
+/// exactly the failure mode that produced the original defect (the old
+/// `<base_sha>..HEAD` range was perfectly well-formed and always empty), so
+/// asserting argv alone would leave the real bug class unpinned.
+///
+/// Drives the real `ConsolidatedReviewNode` with its DEFAULT command runner
+/// against a throwaway repository, and asserts both a modified tracked file
+/// and a brand-new untracked file reach the reviewer's prompt.
+#[tokio::test]
+async fn real_git_intent_add_surfaces_untracked_content_in_the_review_prompt() {
+    let repo = temp_worktree("real-git");
+
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git should be available on PATH")
+    };
+
+    git(&["init", "--quiet"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("tracked.rs"), "fn original() {}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "base"]);
+
+    // The current "task's" work: one tracked edit + one brand-new file.
+    std::fs::write(repo.join("tracked.rs"), "fn edited() {}\n").unwrap();
+    std::fs::write(repo.join("brand_new.rs"), "fn newly_created() {}\n").unwrap();
+
+    let mut ctx = TaskContext {
+        event: json!({ "spec_slug": "fixture-e2e-spec" }),
+        nodes: std::collections::HashMap::new(),
+        metadata: json!({}),
+        node_runs: std::collections::HashMap::new(),
+    };
+    ctx.nodes.insert(
+        "SetupWorktreeNode".to_string(),
+        json!({ "worktree_path": repo.to_string_lossy() }),
+    );
+    ctx.nodes.insert(
+        "TaskQueueRouterNode".to_string(),
+        json!({ "current_task_id": 1, "title": "One", "acceptance_criteria": ["it works"] }),
+    );
+    let policy = engine_core::workflows::sdlc_flow::policy::SdlcPolicy::default();
+    engine_core::policy::stamp_resolved_policy(&mut ctx, &policy).unwrap();
+
+    let seen_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen_prompt_clone = seen_prompt.clone();
+    let node = ConsolidatedReviewNode::new().with_transport(Arc::new(move |_config, prompt| {
+        *seen_prompt_clone.lock().unwrap() = Some(prompt);
+        let outcome =
+            stub_outcome(&json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string());
+        Box::pin(async move { Ok(outcome) })
+    }));
+
+    node.process(ctx).await.expect("review should succeed");
+
+    let prompt = seen_prompt
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the transport should have been called");
+
+    assert!(
+        prompt.contains("fn edited()"),
+        "the modified tracked file must reach the reviewer:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("fn newly_created()"),
+        "the BRAND-NEW untracked file's content must reach the reviewer — this is what \
+         `git add -N -A` buys, and what a plain `git diff HEAD` would omit:\n{prompt}"
+    );
+    // The pre-existing content appears only as a REMOVED line, never as
+    // context the reviewer might mistake for new work.
+    assert!(
+        prompt.contains("-fn original()"),
+        "the replaced line should show as a deletion:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("+fn original()"),
+        "already-committed content must not be presented as this task's work:\n{prompt}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
 }
