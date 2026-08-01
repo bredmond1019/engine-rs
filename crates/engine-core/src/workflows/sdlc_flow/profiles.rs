@@ -24,7 +24,11 @@ pub fn baseline() -> PartialPolicy {
             implement_simple: Some(ModelTier::Sonnet),
             review: Some(ModelTier::Sonnet),
             triage: Some(ModelTier::Sonnet),
-            generate: Some(ModelTier::Sonnet),
+            // `generate` is Opus in the built-in default (it is what
+            // `GenerateTasksNode` actually runs); baseline must restate that
+            // exactly, or selecting it would silently downgrade the stage.
+            generate: Some(ModelTier::Opus),
+            docs: Some(ModelTier::Sonnet),
         }),
         review_mode: Some(ReviewMode::PerTask),
         llm_triage: Some(false),
@@ -44,6 +48,13 @@ pub fn cheap_fast() -> PartialPolicy {
             implement: Some(ModelTier::Haiku),
             triage: Some(ModelTier::Local),
             review: Some(ModelTier::Local),
+            // Both agentic/task-authoring stages drop to Haiku — the cost
+            // floor. Deliberately NOT `Local`: the local tier is scoped to
+            // single-shot judgment calls, not an agentic docs writer or the
+            // task-generation call (doctrine at `graph.rs`'s
+            // `registry_for_policy`).
+            generate: Some(ModelTier::Haiku),
+            docs: Some(ModelTier::Haiku),
             ..Default::default()
         }),
         output_verbosity: Some(OutputVerbosity::Terse),
@@ -61,6 +72,8 @@ pub fn pragmatist() -> PartialPolicy {
         model_tiers: Some(PartialModelTiers {
             implement: Some(ModelTier::Sonnet),
             review: Some(ModelTier::Local),
+            generate: Some(ModelTier::Opus),
+            docs: Some(ModelTier::Sonnet),
             ..Default::default()
         }),
         prompt_cache: Some(true),
@@ -78,6 +91,8 @@ pub fn batch_reviewer() -> PartialPolicy {
     PartialPolicy {
         model_tiers: Some(PartialModelTiers {
             implement: Some(ModelTier::Sonnet),
+            generate: Some(ModelTier::Opus),
+            docs: Some(ModelTier::Sonnet),
             ..Default::default()
         }),
         review_mode: Some(ReviewMode::EndOnly),
@@ -123,6 +138,8 @@ mod tests {
         assert_eq!(tiers.implement, Some(ModelTier::Haiku));
         assert_eq!(tiers.triage, Some(ModelTier::Local));
         assert_eq!(tiers.review, Some(ModelTier::Local));
+        assert_eq!(tiers.generate, Some(ModelTier::Haiku));
+        assert_eq!(tiers.docs, Some(ModelTier::Haiku));
         assert_eq!(p.output_verbosity, Some(OutputVerbosity::Terse));
         assert_eq!(p.review_mode, Some(ReviewMode::TrivialSkip));
         assert_eq!(p.test_depth, Some(TestDepth::Fast));
@@ -134,6 +151,8 @@ mod tests {
         let tiers = p.model_tiers.expect("model_tiers set");
         assert_eq!(tiers.implement, Some(ModelTier::Sonnet));
         assert_eq!(tiers.review, Some(ModelTier::Local));
+        assert_eq!(tiers.generate, Some(ModelTier::Opus));
+        assert_eq!(tiers.docs, Some(ModelTier::Sonnet));
         assert_eq!(p.prompt_cache, Some(true));
         assert_eq!(p.review_mode, Some(ReviewMode::TrivialSkip));
         assert_eq!(p.llm_triage, Some(true));
@@ -145,6 +164,8 @@ mod tests {
         let p = batch_reviewer();
         let tiers = p.model_tiers.expect("model_tiers set");
         assert_eq!(tiers.implement, Some(ModelTier::Sonnet));
+        assert_eq!(tiers.generate, Some(ModelTier::Opus));
+        assert_eq!(tiers.docs, Some(ModelTier::Sonnet));
         assert_eq!(p.review_mode, Some(ReviewMode::EndOnly));
         assert_eq!(p.test_depth, Some(TestDepth::Fast));
     }
@@ -156,10 +177,30 @@ mod tests {
         assert_eq!(tiers.implement, Some(ModelTier::Sonnet));
         assert_eq!(tiers.review, Some(ModelTier::Sonnet));
         assert_eq!(tiers.triage, Some(ModelTier::Sonnet));
-        assert_eq!(tiers.generate, Some(ModelTier::Sonnet));
+        assert_eq!(tiers.generate, Some(ModelTier::Opus));
+        assert_eq!(tiers.docs, Some(ModelTier::Sonnet));
         assert_eq!(p.review_mode, Some(ReviewMode::PerTask));
         assert_eq!(p.llm_triage, Some(false));
         assert_eq!(p.test_depth, Some(TestDepth::Full));
+    }
+
+    /// CLAUDE.md standing rule 6: a knob absent from the profile bundles is
+    /// a knob nobody will find. Both stages onboarded to the policy path
+    /// must be pinned explicitly in every named bundle.
+    #[test]
+    fn every_named_profile_sets_the_generate_and_docs_tiers() {
+        for name in ["baseline", "cheap-fast", "pragmatist", "batch-reviewer"] {
+            let p = profile_by_name(name).expect("known profile name");
+            let tiers = p.model_tiers.expect("model_tiers set");
+            assert!(
+                tiers.generate.is_some(),
+                "profile `{name}` must set model_tiers.generate explicitly"
+            );
+            assert!(
+                tiers.docs.is_some(),
+                "profile `{name}` must set model_tiers.docs explicitly"
+            );
+        }
     }
 
     #[test]

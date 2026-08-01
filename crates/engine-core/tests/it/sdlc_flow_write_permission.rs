@@ -339,3 +339,90 @@ async fn diff_base_falls_back_to_main_when_absent() {
         .as_deref()
     );
 }
+
+// --- PatchDocsNode cwd scoping (ticket-policy-path-generate-docs-nodes) -----
+
+/// `PatchDocsNode` is the OTHER node `graph.rs::registry()` hands
+/// `agentic_write_config` — `dangerously_skip_permissions: true` plus a full
+/// file-write grant. Until this ticket it set no `Config.cwd` at all, so
+/// under `bastion serve` (whose cwd is the primary checkout, on `main`) it
+/// would have written its doc patches into the wrong tree entirely. These
+/// two tests pin the closure end to end through the same
+/// `agentic_write_config` the registry actually uses.
+#[tokio::test]
+async fn patch_docs_node_with_the_write_grant_is_scoped_to_the_worktree() {
+    use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
+    use engine_core::workflows::sdlc_flow::graph::agentic_write_config;
+    use engine_core::workflows::sdlc_flow::policy::SdlcPolicy;
+
+    let worktree = temp_worktree();
+    let captured: Arc<Mutex<Option<claude_code_rs::Config>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+
+    let transport: engine_core::workflows::sdlc_flow::ModelTransport =
+        Arc::new(move |config: claude_code_rs::Config, _prompt: String| {
+            *captured_clone.lock().unwrap() = Some(config.clone());
+            let outcome = claude_code_rs::Outcome {
+                cost_usd: 0.0,
+                usage: claude_code_rs::parse::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: json!({ "summary": "ok", "files_patched": [] }).to_string(),
+                is_error: false,
+                api_error_status: None,
+                structured_output: None,
+            };
+            Box::pin(async move { Ok(outcome) })
+        });
+
+    let mut ctx = empty_ctx();
+    ctx.nodes.insert(
+        "ResolvedPolicy".to_string(),
+        serde_json::to_value(SdlcPolicy::default()).expect("policy serializes"),
+    );
+    ctx.nodes.insert(
+        "SetupWorktreeNode".to_string(),
+        json!({ "worktree_path": worktree.to_string_lossy() }),
+    );
+
+    let node = PatchDocsNode::new()
+        .with_config(agentic_write_config("claude-sonnet-4-5"))
+        .with_transport(transport);
+    node.process(ctx).await.expect("process should succeed");
+
+    let config = captured.lock().unwrap().clone().expect("transport called");
+    // The write grant survived...
+    assert!(config.dangerously_skip_permissions);
+    assert_eq!(config.disallowed_tools, vec!["Bash".to_string()]);
+    // ...and it is now pointed at the run's worktree, not the process cwd.
+    assert_eq!(config.cwd, Some(worktree));
+}
+
+/// The fail-closed half: with no `SetupWorktreeNode` stamp the node errors
+/// rather than running a skip-permissions session against an ambient cwd.
+#[tokio::test]
+async fn patch_docs_node_refuses_to_run_unscoped() {
+    use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
+    use engine_core::workflows::sdlc_flow::graph::agentic_write_config;
+    use engine_core::workflows::sdlc_flow::policy::SdlcPolicy;
+
+    let mut ctx = empty_ctx();
+    ctx.nodes.insert(
+        "ResolvedPolicy".to_string(),
+        serde_json::to_value(SdlcPolicy::default()).expect("policy serializes"),
+    );
+
+    let node = PatchDocsNode::new().with_config(agentic_write_config("claude-sonnet-4-5"));
+    let err = node
+        .process(ctx)
+        .await
+        .expect_err("an unscoped skip-permissions writer must not run");
+    assert!(
+        err.to_string().contains("worktree_path"),
+        "unexpected error: {err}"
+    );
+}

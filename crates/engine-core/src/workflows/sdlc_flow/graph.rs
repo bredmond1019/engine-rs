@@ -220,6 +220,10 @@ pub fn registry() -> NodeRegistry {
     // Its depth is pinned to `TestDepth::Full`; see `planning/decisions/
     // D12-per-task-vs-final-check-depth.md`.
     registry.register(Box::new(FinalValidationNode::new()));
+    // The model string here is a fallback only: `PatchDocsNode::process`
+    // overwrites it from the resolved `model_tiers.docs` tier (whose
+    // built-in default resolves to this same string). This registration
+    // exists for the write grant.
     registry.register(Box::new(
         PatchDocsNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
     ));
@@ -235,10 +239,12 @@ pub fn registry() -> NodeRegistry {
 /// (`dangerously_skip_permissions: true`, `disallowed_tools: ["Bash"]`,
 /// `isolated: true`): file edits only, no shell/network execution, no
 /// bleed into another interactive session. `model` is the given tier's
-/// resolved model string; for `ImplementTaskNode` this is overwritten again
-/// by `process` per the resolved policy (`with_config`'s own doc comment),
-/// so passing a fixed default here is safe — `PatchDocsNode` has no such
-/// override and uses this `model` as-is.
+/// resolved model string, and for BOTH nodes it is overwritten again by
+/// `process` per the resolved policy — `ImplementTaskNode` via
+/// `apply_policy(.., Stage::Implement)` and `PatchDocsNode` via
+/// `apply_policy_config(.., Stage::Docs)` — so passing a fixed default here
+/// is safe and purely a fallback. What this function actually contributes is
+/// the write grant, not the model.
 ///
 /// See `planning/decisions/D8-autonomous-node-write-permission.md` for the
 /// safety tradeoff this configuration encodes.

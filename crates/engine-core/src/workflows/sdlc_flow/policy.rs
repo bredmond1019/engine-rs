@@ -68,35 +68,56 @@ pub struct ModelTiers {
     pub implement_simple: ModelTier,
     pub review: ModelTier,
     pub triage: ModelTier,
+    /// `GenerateTasksNode`'s tier (`setup.rs`). **`Opus`, not `Sonnet`** —
+    /// see [`ModelTiers::default`]'s note.
     pub generate: ModelTier,
+    /// `PatchDocsNode`'s tier (`docs.rs`). `Sonnet` by default, matching the
+    /// model string that node was hardcoded to before it was onboarded to
+    /// the policy path.
+    pub docs: ModelTier,
 }
 
 impl Default for ModelTiers {
-    /// All-Sonnet — the pre-EN.3.C baseline.
+    /// Sonnet everywhere **except `generate`**, which is `Opus`.
+    ///
+    /// The all-Sonnet default was the pre-EN.3.C baseline, but for
+    /// `generate` it was never behavior-stable: nothing read
+    /// `model_tiers.generate` (it was declared, merged, and reported by
+    /// `wrap_up::model_tier_used`, but no node consumed it), while
+    /// `GenerateTasksNode` itself hardcoded `claude-opus-4-8`. Telemetry
+    /// therefore reported `generate: "sonnet"` for a stage that actually ran
+    /// Opus. Corrected to `Opus` so the declared tier matches what that node
+    /// runs — a prerequisite for onboarding it to `apply_policy` without
+    /// silently downgrading it. `docs` is `Sonnet`, which *is*
+    /// behavior-stable against `PatchDocsNode`'s former `claude-sonnet-4-5`
+    /// hardcode.
     fn default() -> Self {
         Self {
             implement: ModelTier::Sonnet,
             implement_simple: ModelTier::Sonnet,
             review: ModelTier::Sonnet,
             triage: ModelTier::Sonnet,
-            generate: ModelTier::Sonnet,
+            generate: ModelTier::Opus,
+            docs: ModelTier::Sonnet,
         }
     }
 }
 
 /// Per-stage whole-call timeout, in **seconds**, for the model stages that
-/// run through `task_loop.rs`'s `apply_policy`. Field names match the three
-/// `Stage` variants (`Implement`/`Triage`/`Review`).
+/// run through `task_loop.rs`'s `apply_policy`. Field names match the
+/// `Stage` variants (`Implement`/`Triage`/`Review`/`Generate`/`Docs`).
 ///
 /// `None` — the behavior-stable built-in default for every field — means
 /// "set nothing", leaving `claude_code_rs::Config::timeout` at its own
 /// `None`, which is that crate's unconfigured 300s default. Setting a field
 /// widens (or narrows) only that stage's `execute()` timeout.
 ///
-/// Deliberately **not** covering `GenerateTasksNode`/`PatchDocsNode`: those
-/// two nodes construct their `Config` by hand and have no `apply_policy`
-/// path at all today (see this ticket's Description) — giving them one is a
-/// separate piece of work.
+/// `generate` (`GenerateTasksNode`) and `docs` (`PatchDocsNode`) are covered
+/// too. `docs` reaches `PatchDocsNode` through the config half of the
+/// shaping helpers applied directly in `docs.rs` (that node builds its
+/// prompt in a `with_prompt_builder` closure, so it cannot use the combined
+/// `apply_policy`); `generate` is declared here and consumed once
+/// `GenerateTasksNode` is onboarded — see this spec's Amendment Log.
 ///
 /// Unlike [`ModelTiers`], this derives `Default`: all-`None` is exactly what
 /// `#[derive(Default)]` produces, so hand-writing it would only add a place
@@ -106,6 +127,8 @@ pub struct CallTimeouts {
     pub implement: Option<u64>,
     pub triage: Option<u64>,
     pub review: Option<u64>,
+    pub generate: Option<u64>,
+    pub docs: Option<u64>,
 }
 
 /// Whether (and how much of) the previous attempt's failure output is fed
@@ -252,6 +275,7 @@ pub struct PartialModelTiers {
     pub review: Option<ModelTier>,
     pub triage: Option<ModelTier>,
     pub generate: Option<ModelTier>,
+    pub docs: Option<ModelTier>,
 }
 
 /// All-optional mirror of [`CallTimeouts`] for per-stage partial overrides.
@@ -262,6 +286,8 @@ pub struct PartialCallTimeouts {
     pub implement: Option<u64>,
     pub triage: Option<u64>,
     pub review: Option<u64>,
+    pub generate: Option<u64>,
+    pub docs: Option<u64>,
 }
 
 /// All-optional mirror of [`CloseOutReuse`].
@@ -296,6 +322,9 @@ fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTie
     if let Some(v) = over.generate {
         base.generate = v;
     }
+    if let Some(v) = over.docs {
+        base.docs = v;
+    }
     base
 }
 
@@ -312,6 +341,12 @@ fn merge_call_timeouts(mut base: CallTimeouts, over: &PartialCallTimeouts) -> Ca
     }
     if let Some(v) = over.review {
         base.review = Some(v);
+    }
+    if let Some(v) = over.generate {
+        base.generate = Some(v);
+    }
+    if let Some(v) = over.docs {
+        base.docs = Some(v);
     }
     base
 }
@@ -429,6 +464,7 @@ pub fn model_tiers_by_stage(tiers: &ModelTiers) -> BTreeMap<&'static str, ModelT
     map.insert("review", tiers.review);
     map.insert("triage", tiers.triage);
     map.insert("generate", tiers.generate);
+    map.insert("docs", tiers.docs);
     map
 }
 
@@ -447,7 +483,10 @@ mod tests {
         assert_eq!(policy.model_tiers.implement_simple, ModelTier::Sonnet);
         assert_eq!(policy.model_tiers.review, ModelTier::Sonnet);
         assert_eq!(policy.model_tiers.triage, ModelTier::Sonnet);
-        assert_eq!(policy.model_tiers.generate, ModelTier::Sonnet);
+        // NOT Sonnet — see `ModelTiers::default`'s note: `generate` is
+        // `Opus` because that is what `GenerateTasksNode` actually runs.
+        assert_eq!(policy.model_tiers.generate, ModelTier::Opus);
+        assert_eq!(policy.model_tiers.docs, ModelTier::Sonnet);
         assert!(!policy.close_out.reuse.validation);
         assert!(!policy.close_out.reuse.review);
         assert!(!policy.close_out.reuse.docs);
@@ -470,7 +509,157 @@ mod tests {
         assert_eq!(timeouts.implement, None);
         assert_eq!(timeouts.triage, None);
         assert_eq!(timeouts.review, None);
+        assert_eq!(timeouts.generate, None);
+        assert_eq!(timeouts.docs, None);
         assert_eq!(timeouts, CallTimeouts::default());
+    }
+
+    /// Change-detector for the `docs` tier: `Sonnet` is exactly the model
+    /// `PatchDocsNode` was hardcoded to before it consumed this field, so
+    /// onboarding it changed nothing for a run that sets no tier.
+    #[test]
+    fn builtin_default_docs_tier_is_behavior_stable_sonnet() {
+        assert_eq!(SdlcPolicy::default().model_tiers.docs, ModelTier::Sonnet);
+        assert_eq!(
+            crate::policy::tier::model_tier_to_model_string(
+                SdlcPolicy::default().model_tiers.docs,
+                &SdlcPolicy::default().local.model,
+            ),
+            "claude-sonnet-4-5"
+        );
+    }
+
+    /// Change-detector for the corrected `generate` tier: `Opus` maps to
+    /// `claude-opus-4-8`, the model string `GenerateTasksNode` hardcodes —
+    /// so onboarding that node will be behavior-stable too.
+    #[test]
+    fn builtin_default_generate_tier_maps_to_generate_tasks_nodes_model() {
+        assert_eq!(SdlcPolicy::default().model_tiers.generate, ModelTier::Opus);
+        assert_eq!(
+            crate::policy::tier::model_tier_to_model_string(
+                SdlcPolicy::default().model_tiers.generate,
+                &SdlcPolicy::default().local.model,
+            ),
+            "claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn merge_model_tiers_overrides_generate_and_docs_independently() {
+        let base = ModelTiers::default();
+        let over = PartialModelTiers {
+            docs: Some(ModelTier::Haiku),
+            ..Default::default()
+        };
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.docs, ModelTier::Haiku);
+        // `None` in the override leaves every other stage alone.
+        assert_eq!(merged.generate, ModelTier::Opus);
+        assert_eq!(merged.implement, ModelTier::Sonnet);
+
+        let over = PartialModelTiers {
+            generate: Some(ModelTier::Sonnet),
+            ..Default::default()
+        };
+        let merged = merge_model_tiers(base, &over);
+        assert_eq!(merged.generate, ModelTier::Sonnet);
+        assert_eq!(merged.docs, ModelTier::Sonnet);
+    }
+
+    #[test]
+    fn generate_and_docs_tiers_resolve_through_all_four_layers() {
+        let harness = PartialPolicy {
+            model_tiers: Some(PartialModelTiers {
+                generate: Some(ModelTier::Haiku),
+                docs: Some(ModelTier::Haiku),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            model_tiers: Some(PartialModelTiers {
+                docs: Some(ModelTier::Sonnet),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            model_tiers: Some(PartialModelTiers {
+                docs: Some(ModelTier::Opus),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        // event > profile > harness > builtin.
+        assert_eq!(resolved.model_tiers.docs, ModelTier::Opus);
+        // Neither profile nor event touched `generate`, so harness's wins.
+        assert_eq!(resolved.model_tiers.generate, ModelTier::Haiku);
+
+        // Nothing anywhere -> the built-in defaults.
+        let untouched = resolve(SdlcPolicy::default(), None, None, None);
+        assert_eq!(untouched.model_tiers.generate, ModelTier::Opus);
+        assert_eq!(untouched.model_tiers.docs, ModelTier::Sonnet);
+    }
+
+    #[test]
+    fn generate_and_docs_timeouts_resolve_through_all_four_layers() {
+        let harness = PartialPolicy {
+            timeouts: Some(PartialCallTimeouts {
+                generate: Some(400),
+                docs: Some(200),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            timeouts: Some(PartialCallTimeouts {
+                docs: Some(500),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            timeouts: Some(PartialCallTimeouts {
+                docs: Some(900),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        assert_eq!(resolved.timeouts.docs, Some(900));
+        // Only the harness layer set `generate`, so it survives.
+        assert_eq!(resolved.timeouts.generate, Some(400));
+        // Stages nobody touched stay at the built-in `None`.
+        assert_eq!(resolved.timeouts.implement, None);
+    }
+
+    #[test]
+    fn deserializes_generate_and_docs_knobs_from_harness_json_shape() {
+        let json = r#"{
+            "model_tiers": { "docs": "haiku" },
+            "timeouts": { "generate": 1200, "docs": 600 }
+        }"#;
+        let partial: PartialPolicy = serde_json::from_str(json).expect("valid PartialPolicy JSON");
+        assert_eq!(
+            partial.model_tiers.as_ref().unwrap().docs,
+            Some(ModelTier::Haiku)
+        );
+        let timeouts = partial.timeouts.as_ref().expect("timeouts present");
+        assert_eq!(timeouts.generate, Some(1200));
+        assert_eq!(timeouts.docs, Some(600));
+        // Absent fields stay `None` and fall through on merge.
+        assert_eq!(timeouts.implement, None);
     }
 
     /// Change-detector pinning this knob's built-in default. Unlike the
@@ -578,11 +767,13 @@ mod tests {
             implement: Some(600),
             triage: Some(120),
             review: None,
+            ..Default::default()
         };
         let over = PartialCallTimeouts {
             implement: Some(900),
             triage: None,
             review: Some(300),
+            ..Default::default()
         };
         let merged = merge_call_timeouts(base, &over);
         assert_eq!(merged.implement, Some(900));
@@ -598,6 +789,7 @@ mod tests {
                 implement: Some(400),
                 triage: Some(200),
                 review: Some(100),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -841,8 +1033,11 @@ mod tests {
         assert_eq!(resolved.model_tiers.review, ModelTier::Local);
         assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
         assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
+        // `cheap-fast` sets `generate`/`docs` down to Haiku (cost floor).
+        assert_eq!(resolved.model_tiers.generate, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.docs, ModelTier::Haiku);
         // Untouched knobs still fall through to builtin.
-        assert_eq!(resolved.model_tiers.generate, ModelTier::Sonnet);
+        assert_eq!(resolved.model_tiers.implement_simple, ModelTier::Sonnet);
         assert!(!resolved.prompt_cache);
     }
 
@@ -928,7 +1123,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
 
         let expected: serde_json::Value =
             serde_json::from_str(expected).expect("pinned baseline literal parses as JSON");
@@ -936,5 +1131,47 @@ mod tests {
             serde_json::to_value(&resolved).expect("resolved policy serializes to JSON");
 
         assert_json_subset(&expected, &actual);
+    }
+    /// This repo's own `planning/harness.json` must stay parseable as a
+    /// `PartialPolicy` and must carry the two policy-path knobs explicitly
+    /// in every named profile (CLAUDE.md standing rule 6: a knob absent from
+    /// the profile bundles is a knob nobody will find).
+    ///
+    /// `planning/` is a gitignored symlink into the company-brain vault, so
+    /// this SKIPS rather than fails when the vault is not mounted (a bare
+    /// clone) — it is a guard for this working tree, not a hard dependency.
+    #[test]
+    fn repo_harness_json_deserializes_every_sdlc_policy_and_profile() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../planning/harness.json");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present (planning/ vault not mounted)");
+            return;
+        };
+        let root: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let sdlc = &root["sdlc"];
+        let _p: PartialPolicy =
+            serde_json::from_value(sdlc["policy"].clone()).expect("sdlc.policy is a PartialPolicy");
+        for (name, bundle) in sdlc["profiles"].as_object().unwrap() {
+            if name.starts_with('_') {
+                continue;
+            }
+            let parsed: PartialPolicy = serde_json::from_value(bundle.clone())
+                .unwrap_or_else(|e| panic!("profile {name} must be a PartialPolicy: {e}"));
+            let tiers = parsed.model_tiers.expect("model_tiers");
+            assert!(tiers.docs.is_some(), "{name} must set model_tiers.docs");
+            assert!(
+                tiers.generate.is_some(),
+                "{name} must set model_tiers.generate"
+            );
+            let t = parsed.timeouts.expect("timeouts");
+            assert_eq!(
+                t.docs, None,
+                "{name} timeouts.docs must be an explicit null"
+            );
+            assert_eq!(
+                t.generate, None,
+                "{name} timeouts.generate must be an explicit null"
+            );
+        }
     }
 }

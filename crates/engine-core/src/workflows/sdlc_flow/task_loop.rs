@@ -26,8 +26,8 @@ use crate::nodes::ClaudeCodeStep;
 use crate::routing::Router;
 
 #[cfg(test)]
-use super::policy::{ModelTier, OutputVerbosity};
-use super::policy::{RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
+use super::policy::OutputVerbosity;
+use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
@@ -43,17 +43,33 @@ use crate::policy::RESOLVED_POLICY_IDENTITY;
 /// gives the underlying `claude` CLI a stable prefix to cache against,
 /// instead of folding the same boilerplate into the ever-changing per-call
 /// prompt string.
-const STABLE_SYSTEM_PROMPT: &str =
+pub(super) const STABLE_SYSTEM_PROMPT: &str =
     "You are running inside the engine-rs SDLC Flow task loop. This system \
      prompt is held constant across calls so its tokens can be cached.";
 
 /// Stage identity used to look up the resolved policy's per-stage
 /// [`ModelTier`] (`policy::ModelTiers` field names).
+///
+/// `pub(super)` so the sibling `sdlc_flow` modules whose model nodes live
+/// outside this file — `setup::GenerateTasksNode` (`Generate`) and
+/// `docs::PatchDocsNode` (`Docs`) — can name their own stage rather than
+/// re-deriving the tier/timeout lookup by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
+pub(super) enum Stage {
     Implement,
     Triage,
     Review,
+    /// `setup::GenerateTasksNode`.
+    ///
+    /// Declared and wired through `stage_model_tier`/`stage_call_timeout`,
+    /// but not yet CONSTRUCTED: onboarding `GenerateTasksNode` itself
+    /// (`setup.rs`) was deferred out of this spec to avoid colliding with a
+    /// concurrent in-flight change to that file — see this spec's Amendment
+    /// Log. Remove this attribute when `setup.rs` starts using it.
+    #[allow(dead_code)]
+    Generate,
+    /// `docs::PatchDocsNode`.
+    Docs,
 }
 
 /// Read the resolved [`SdlcPolicy`] stamped by dispatch (`engine-serve`'s
@@ -64,7 +80,7 @@ enum Stage {
 /// seed a policy explicitly (`ctx_with_policy`/`ctx_with_current_task`).
 /// Delegates to the generic `crate::policy::resolved_policy_strict::<SdlcPolicy>`
 /// (EN.4.0/EN.5.D).
-fn resolved_policy(ctx: &TaskContext) -> Result<SdlcPolicy, NodeError> {
+pub(super) fn resolved_policy(ctx: &TaskContext) -> Result<SdlcPolicy, NodeError> {
     crate::policy::resolved_policy_strict::<SdlcPolicy>(ctx)
 }
 
@@ -76,29 +92,61 @@ fn resolved_policy(ctx: &TaskContext) -> Result<SdlcPolicy, NodeError> {
 ///
 /// `policy.timeouts` is all-`None` by default, so the `apply_call_timeout`
 /// call is a no-op unless a run explicitly sets a per-stage timeout.
-fn apply_policy(
+pub(super) fn apply_policy(
     config: Config,
     prompt: String,
     policy: &SdlcPolicy,
     stage: Stage,
 ) -> (Config, String) {
-    let tier = match stage {
-        Stage::Implement => policy.model_tiers.implement,
-        Stage::Triage => policy.model_tiers.triage,
-        Stage::Review => policy.model_tiers.review,
-    };
-    let timeout_secs = match stage {
-        Stage::Implement => policy.timeouts.implement,
-        Stage::Triage => policy.timeouts.triage,
-        Stage::Review => policy.timeouts.review,
-    };
+    let (config, prompt) = (
+        apply_policy_config(config, policy, stage),
+        crate::policy::apply_verbosity_directive(prompt, policy.output_verbosity),
+    );
+    (config, prompt)
+}
+
+/// The **config half** of [`apply_policy`] — model tier, prompt cache, and
+/// call timeout — without the prompt half.
+///
+/// Split out for `docs::PatchDocsNode`, which builds its prompt in a
+/// `ClaudeCodeStep::with_prompt_builder` closure at call time and so has no
+/// prompt string to hand [`apply_policy`] up front; it applies this to its
+/// `Config` and `crate::policy::apply_verbosity_directive` inside the
+/// closure. Keeping the two halves in one place is what stops the shaping
+/// order from drifting between call sites.
+#[must_use]
+pub(super) fn apply_policy_config(config: Config, policy: &SdlcPolicy, stage: Stage) -> Config {
+    let tier = stage_model_tier(policy, stage);
+    let timeout_secs = stage_call_timeout(policy, stage);
     let config = crate::policy::apply_model_tier(config, tier, &policy.local.model);
     let config =
         crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
-    let config = crate::policy::apply_call_timeout(config, timeout_secs);
-    let prompt = crate::policy::apply_verbosity_directive(prompt, policy.output_verbosity);
+    crate::policy::apply_call_timeout(config, timeout_secs)
+}
 
-    (config, prompt)
+/// The resolved [`ModelTier`] for `stage`.
+#[must_use]
+pub(super) fn stage_model_tier(policy: &SdlcPolicy, stage: Stage) -> ModelTier {
+    match stage {
+        Stage::Implement => policy.model_tiers.implement,
+        Stage::Triage => policy.model_tiers.triage,
+        Stage::Review => policy.model_tiers.review,
+        Stage::Generate => policy.model_tiers.generate,
+        Stage::Docs => policy.model_tiers.docs,
+    }
+}
+
+/// The resolved whole-call timeout (seconds) for `stage`, `None` when the
+/// run set none.
+#[must_use]
+pub(super) fn stage_call_timeout(policy: &SdlcPolicy, stage: Stage) -> Option<u64> {
+    match stage {
+        Stage::Implement => policy.timeouts.implement,
+        Stage::Triage => policy.timeouts.triage,
+        Stage::Review => policy.timeouts.review,
+        Stage::Generate => policy.timeouts.generate,
+        Stage::Docs => policy.timeouts.docs,
+    }
 }
 
 /// Deterministically classify the current task's diff as "trivial" against
@@ -2509,13 +2557,108 @@ mod tests {
     #[test]
     fn apply_policy_leaves_timeout_none_for_every_stage_by_default() {
         let policy = SdlcPolicy::default();
-        for stage in [Stage::Implement, Stage::Triage, Stage::Review] {
+        for stage in [
+            Stage::Implement,
+            Stage::Triage,
+            Stage::Review,
+            Stage::Generate,
+            Stage::Docs,
+        ] {
             let (config, _) = apply_policy(Config::default(), "p".to_string(), &policy, stage);
             assert_eq!(
                 config.timeout, None,
                 "stage {stage:?} should set no timeout"
             );
         }
+    }
+
+    /// Adding `Stage::Generate`/`Stage::Docs` (and splitting the config half
+    /// out of `apply_policy`) must not have moved the three pre-existing
+    /// stages by a byte. Pins config AND prompt for a non-trivial policy.
+    #[test]
+    fn apply_policy_output_is_unchanged_for_the_three_preexisting_stages() {
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                implement: ModelTier::Haiku,
+                triage: ModelTier::Opus,
+                review: ModelTier::Sonnet,
+                ..ModelTiers::default()
+            },
+            timeouts: crate::workflows::sdlc_flow::policy::CallTimeouts {
+                implement: Some(600),
+                triage: Some(90),
+                review: Some(120),
+                // The two new stages are set, and must not leak into the
+                // three old ones.
+                generate: Some(1),
+                docs: Some(2),
+            },
+            prompt_cache: true,
+            output_verbosity: OutputVerbosity::Terse,
+            ..SdlcPolicy::default()
+        };
+
+        for (stage, model, secs) in [
+            (Stage::Implement, "claude-haiku-4-5", 600),
+            (Stage::Triage, "claude-opus-4-8", 90),
+            (Stage::Review, "claude-sonnet-4-5", 120),
+        ] {
+            let (config, prompt) = apply_policy(Config::default(), "p".to_string(), &policy, stage);
+            assert_eq!(config.model.as_deref(), Some(model), "stage {stage:?}");
+            assert_eq!(
+                config.timeout,
+                Some(std::time::Duration::from_secs(secs)),
+                "stage {stage:?}"
+            );
+            assert_eq!(
+                config.system_prompt.as_deref(),
+                Some(STABLE_SYSTEM_PROMPT),
+                "stage {stage:?}"
+            );
+            assert!(prompt.starts_with("p"), "stage {stage:?}");
+            assert!(prompt.contains("Be terse"), "stage {stage:?}");
+        }
+    }
+
+    /// The two new stages read their own `ModelTiers`/`CallTimeouts` fields.
+    #[test]
+    fn apply_policy_wires_generate_and_docs_to_their_own_policy_fields() {
+        let policy = SdlcPolicy {
+            model_tiers: ModelTiers {
+                generate: ModelTier::Opus,
+                docs: ModelTier::Haiku,
+                ..ModelTiers::default()
+            },
+            timeouts: crate::workflows::sdlc_flow::policy::CallTimeouts {
+                generate: Some(1200),
+                docs: Some(45),
+                ..Default::default()
+            },
+            ..SdlcPolicy::default()
+        };
+
+        let generate = apply_policy_config(Config::default(), &policy, Stage::Generate);
+        assert_eq!(generate.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(generate.timeout, Some(std::time::Duration::from_secs(1200)));
+
+        let docs = apply_policy_config(Config::default(), &policy, Stage::Docs);
+        assert_eq!(docs.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(docs.timeout, Some(std::time::Duration::from_secs(45)));
+    }
+
+    /// Behavior stability for the two newly-onboarded stages: under the
+    /// built-in default they resolve to exactly the model strings the two
+    /// nodes used to hardcode, and set no timeout.
+    #[test]
+    fn default_policy_reproduces_the_generate_and_docs_hardcoded_models() {
+        let policy = SdlcPolicy::default();
+        let generate = apply_policy_config(Config::default(), &policy, Stage::Generate);
+        assert_eq!(generate.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(generate.timeout, None);
+
+        let docs = apply_policy_config(Config::default(), &policy, Stage::Docs);
+        assert_eq!(docs.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(docs.timeout, None);
     }
 
     #[test]
@@ -2525,6 +2668,7 @@ mod tests {
                 implement: Some(600),
                 triage: Some(90),
                 review: Some(120),
+                ..Default::default()
             },
             ..SdlcPolicy::default()
         };
