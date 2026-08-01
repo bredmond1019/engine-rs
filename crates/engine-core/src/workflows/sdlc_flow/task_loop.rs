@@ -300,6 +300,36 @@ fn current_task_fields(ctx: &TaskContext) -> Result<&serde_json::Value, NodeErro
         .ok_or_else(|| NodeError::new("TaskQueueRouterNode has not run yet"))
 }
 
+/// Fallback commit message when `TaskQueueRouterNode` never stamped a
+/// current task (a `SaveStateNode` driven directly by a unit test, or a
+/// graph shape without the router).
+const SAVE_STATE_FALLBACK_MESSAGE: &str = "chore: flow state update";
+
+/// The per-task commit message `SaveStateNode` hands [`super::commit_all`]:
+/// `feat(sdlc): {current_task_id} — {title}`, built from the fields
+/// `TaskQueueRouterNode` stamps when it dispatches a task.
+///
+/// `SaveStateNode` sits only on the pass path
+/// (`UpdateTaskStatusNode → SaveStateNode`), so one message here is one
+/// completed task in `git log` — that is the whole point of carrying the id.
+///
+/// Deliberately does NOT read `attempt_count` off the same stamp: that field
+/// is stale on the retry back-edge (`ticket-restamp-attempt-count`), and a
+/// commit message is not worth propagating a known-wrong number into.
+fn save_state_commit_message(ctx: &TaskContext) -> String {
+    let Some(current) = get_result(ctx, "TaskQueueRouterNode") else {
+        return SAVE_STATE_FALLBACK_MESSAGE.to_string();
+    };
+    let Some(task_id) = current.get("current_task_id").and_then(|v| v.as_i64()) else {
+        return SAVE_STATE_FALLBACK_MESSAGE.to_string();
+    };
+    let title = current
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("untitled");
+    format!("feat(sdlc): {task_id} — {title}")
+}
+
 // --- prior-attempt feedback --------------------------------------------------
 
 /// Opening line of the retry-feedback block appended to `ImplementTaskNode`'s
@@ -2285,7 +2315,7 @@ impl Node for SaveStateNode {
         super::commit_all(
             &self.runner,
             Path::new(&worktree),
-            "chore: flow state update",
+            &save_state_commit_message(&ctx),
         );
 
         put_result(
@@ -4958,8 +4988,13 @@ mod tests {
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[0][0], "add");
+        // `add -A`, not `add <state_path>`: the per-task commit carries the
+        // task's CODE as well as its state file.
+        assert_eq!(recorded[0], vec!["add".to_string(), "-A".to_string()]);
         assert_eq!(recorded[1][0], "commit");
+        // No TaskQueueRouterNode stamp in this ctx -> fallback message.
+        assert_eq!(recorded[1][2], SAVE_STATE_FALLBACK_MESSAGE);
+        drop(recorded);
 
         let content = std::fs::read_to_string(saved_to).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -4971,6 +5006,70 @@ mod tests {
         assert!(value["bail_reason"].is_null());
         assert!(value["started_at"].as_str().is_some());
         assert!(value["updated_at"].as_str().is_some());
+    }
+
+    /// With `TaskQueueRouterNode`'s stamp present, the per-task commit
+    /// message carries the task id — one commit per completed task, greppable
+    /// in `git log`.
+    #[tokio::test]
+    async fn save_state_commit_message_carries_the_current_task_id() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(7, "Widen the commit", "d7")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "TaskQueueRouterNode".to_string(),
+            json!({ "current_task_id": 7, "title": "Widen the commit" }),
+        );
+
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        SaveStateNode::new()
+            .with_runner(runner)
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded[0], vec!["add".to_string(), "-A".to_string()]);
+        assert_eq!(recorded[1][0], "commit");
+        assert_eq!(recorded[1][2], "feat(sdlc): 7 — Widen the commit");
+    }
+
+    /// A router stamp missing `current_task_id` falls back rather than
+    /// emitting a half-built message.
+    #[test]
+    fn save_state_commit_message_falls_back_without_a_router_stamp() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let bare = ctx_with_state(&state);
+        assert_eq!(
+            save_state_commit_message(&bare),
+            SAVE_STATE_FALLBACK_MESSAGE
+        );
+
+        let mut partial = ctx_with_state(&state);
+        partial
+            .nodes
+            .insert("TaskQueueRouterNode".to_string(), json!({ "title": "One" }));
+        assert_eq!(
+            save_state_commit_message(&partial),
+            SAVE_STATE_FALLBACK_MESSAGE
+        );
     }
 
     #[tokio::test]
