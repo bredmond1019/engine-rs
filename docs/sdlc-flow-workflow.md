@@ -52,7 +52,7 @@ are runtime-only — declared but not walked by the graph's acyclic-shape valida
 | `SetupWorktreeNode` | Deterministic | Creates/reattaches the spec's git worktree (`git worktree add`, or reattach if `resume` and it already exists on disk). Resolves the 4-layer `SdlcPolicy` (event `policy` > event `profile` > `harness.json` > built-in default) and stamps it into ctx as `ResolvedPolicy` — see [sdlc-flow-policy.md](sdlc-flow-policy.md). |
 | `SpecExistsRouterNode` | Deterministic router | Routes to `LoadTaskStateNode` if `sdlc-flow-state.json` or `tasks.json` already exists under `planning/<slug>/`, else to `GenerateTasksNode`. |
 | `GenerateTasksNode` | **Model** (Opus) | Planning-fallback path only — gathers `planning/<slug>/*.md` context and prompts for a task list, writing `tasks.json` + `tasks.md`. Sets `config.json_schema` and prefers the model's structured output (`ctx.nodes["GenerateTasksNode"]["structured"]`) over fence-stripped text parsing, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Hardcoded to Opus; does not read policy. |
-| `LoadTaskStateNode` | Deterministic | Loads `sdlc-flow-state.json` if present (always preferred over `tasks.json`), else bootstraps a fresh `SDLCState` from `tasks.json`. Applies the event's `task_range` filter. |
+| `LoadTaskStateNode` | Deterministic | Honours `resume`: with `resume: true` loads `sdlc-flow-state.json` if present, otherwise archives it to `.superseded-<run_id>.bak` and bootstraps a fresh `SDLCState` from `tasks.json`. Applies the event's `task_range` filter. See [Restart vs. resume](#restart-vs-resume--what-resume-actually-does). |
 | `TaskQueueRouterNode` | Deterministic router | Finds the first `PENDING` task and routes to `ImplementTaskNode`; if none remain, routes to `FinalValidationNode` (task loop exit — the drain branch). |
 | `ImplementTaskNode` | **Model** (Sonnet, tunable via policy) | Drives the model to implement the current task; parses `{summary, modified_files, tests_added}`, preferring the model's structured output (`ctx.nodes["ImplementTaskNode"]["structured"]`) over fence-stripped text parsing and falling back to `strip_json_fence` + `serde_json::from_str` (or a synthesized `ImplementOutput` on parse error) when structured output is absent. Reads policy for model tier, prompt-cache anchor, and verbosity directive — never rewired to the `local` tier regardless of policy. |
 | `TestTaskNode` | Deterministic | Runs the worktree's `planning/harness.json` validation-suite `checks`. Only the `command` check kind is fully supported today — other declared kinds fail closed with a "not yet supported" message rather than silently passing. |
@@ -220,6 +220,51 @@ endpoint — it prompts for confirmation and reports 202/404/401/connection-fail
   durable Postgres `events`-row writer (`engine-store`) — the two paths that `bastion-ui`/
   `bastion monitor`-style tooling would read, distinct from the on-disk state file.
 
+## Restart vs. resume — what `resume` actually does
+
+`resume` is the single switch deciding whether a re-triggered spec **continues** its previous run or
+**restarts** it. It is a typed event field (`SDLCFlowEventSchema::resume`, `#[serde(default)]` =
+`false`), read by exactly two nodes:
+
+| `resume` | `SetupWorktreeNode` | `LoadTaskStateNode` |
+|---|---|---|
+| `true` | Reattaches to the existing worktree if it's on disk; `git checkout <branch>` | Loads `sdlc/sdlc-flow-state.json` when present — statuses, attempt counts, telemetry all carry forward |
+| `false` | `git worktree add … -b <branch>` / `git checkout -B <branch>` — recreates the branch | **Archives** any existing state file, then bootstraps fresh from `tasks.json` (every task back to `pending`, `attempt_count` 0) |
+
+**The archive.** A restart never deletes or overwrites the previous run's state — the corpse is
+forensics. The file is renamed beside itself to:
+
+```
+planning/<spec_slug>/sdlc/sdlc-flow-state.json.superseded-<discriminator>.bak
+```
+
+- `<discriminator>` is the **old file's own stamped `run_id`** (the `events.id` UUID written by
+  `EN.6.J`), so the archive names the run whose record it is.
+- States with no `run_id` — written before `EN.6.J`, or by base-template's JS `sdlc-flow.js`
+  engine, which never emits the key — fall back to `<status>-attempts<N>`, where `N` is the summed
+  `attempt_count` across all tasks. The fallback is derived from the file's contents, never from a
+  clock, so archiving is reproducible.
+- A name collision (restarting the same superseded run twice) appends `-2`, `-3`, … rather than
+  clobbering the earlier archive.
+- A state file that fails to parse is **not** archived: the run errors with the parse failure and
+  leaves the file in place, so corruption is reported rather than silently renamed.
+
+**Two edge cases, both pinned deliberately:**
+
+- `resume: true` with **no** state file is a graceful fresh start, not an error. The caller asked to
+  continue and there is nothing to continue from — that's a normal first run.
+- `resume: false` with a state file but **no** `tasks.json` loads the state anyway and archives
+  nothing. There is nothing to bootstrap back from, so continuing beats stranding the spec.
+
+**This is a behavior change (2026-08-02).** Before it, `LoadTaskStateNode` loaded the state file
+whenever it existed and ignored `resume` entirely. A spec that had bailed therefore reloaded its own
+corpse — every task `failed` with attempts exhausted — and re-bailed within seconds without doing
+any work, with no API-level way to re-run it short of moving the state file by hand inside the brain
+vault. If you were relying on a bare re-POST silently continuing a run, add `"resume": true`.
+
+> Not to be confused with **`POST /events/{id}/resume`**, the suspend/resume index — a different
+> mechanism entirely (resuming a *suspended* engine run by its event id), unrelated to this field.
+
 ## Inspecting a stalled or crashed run, and resuming
 
 Since `SaveStateNode` writes `sdlc-flow-state.json` once per **completed** task-loop iteration (not
@@ -240,17 +285,18 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
 
 - `SetupWorktreeNode` sees `resume: true` and an existing worktree path on disk, and reattaches
   instead of re-running `git worktree add`.
-- `LoadTaskStateNode` always prefers `sdlc-flow-state.json` over `tasks.json` when both exist, so
-  it naturally loads wherever the crashed run last saved — task statuses, attempt counts, and
-  telemetry all carry forward. There's no separate "resume" flag this node checks; presence of the
-  state file is sufficient.
+- `LoadTaskStateNode` sees `resume: true` and prefers `sdlc-flow-state.json` over `tasks.json`, so
+  it loads wherever the crashed run last saved — task statuses, attempt counts, and telemetry all
+  carry forward. **`resume: true` is required here**: without it the node archives the state file
+  and restarts the spec from `tasks.json` (see [Restart vs. resume](#restart-vs-resume--what-resume-actually-does)).
 - `TaskQueueRouterNode` then finds the first still-`PENDING` task and continues the loop from
   there — no re-running of already-`Done` tasks.
 
 ## Other operationally-relevant details
 
 - **Event fields** (`SDLCFlowEventSchema`): `spec_slug` (required), `task_range` (e.g. `"1-3,5"`,
-  1-indexed inclusive, rejects `end < start`), `resume` (default `false`), `auto_pr` (default
+  1-indexed inclusive, rejects `end < start`), `resume` (default `false` — continue the previous run
+  vs. archive its state and restart; see [Restart vs. resume](#restart-vs-resume--what-resume-actually-does)), `auto_pr` (default
   **`true`**), `branch_name` (defaults to `sdlc/<spec_slug>`), `llm_triage` (default `false`),
   `policy` (optional per-run override), `profile` (optional named policy-profile bundle — see
   [sdlc-flow-policy.md](sdlc-flow-policy.md)), `repo` (optional, `EN.3.K` — see below).
