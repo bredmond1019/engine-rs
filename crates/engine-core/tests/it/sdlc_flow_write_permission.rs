@@ -1,8 +1,9 @@
 //! Hermetic integration tests for the write-verification guard
 //! (`TestTaskNode`) and the diff-base pin (`TriageTaskNode`'s
-//! trivial-diff classification, which shares the same `<base_sha>..HEAD`
-//! / `main..HEAD` range builder `ConsolidatedReviewNode` uses) — EN ticket
-//! `ticket-sdlc-flow-write-permission` task 7.
+//! trivial-diff classification, which shares the working-tree-vs-`HEAD`
+//! diff basis `ConsolidatedReviewNode` uses) — EN ticket
+//! `ticket-sdlc-flow-write-permission` task 7, re-pinned to `HEAD` by
+//! `ticket-commit-task-work-real-diffs` task 2.
 //!
 //! Every seam that would otherwise spawn a real subprocess or `claude`
 //! session is stubbed: `CommandRunner` closures assert their own `argv` and
@@ -253,91 +254,60 @@ async fn empty_claim_never_trips_the_guard() {
 
 // --- diff-base pin -----------------------------------------------------
 
-/// When `SetupWorktreeNode` stamped a `base_sha` (the SHA captured at
-/// worktree-setup time), `TriageTaskNode`'s trivial-diff classification
-/// (which shares the diff-range builder `ConsolidatedReviewNode` also uses)
-/// diffs `<base_sha>..HEAD`, not `main..HEAD` — so a `main` that advances
-/// mid-run can't misreport unrelated commits as reversions.
+/// The trivial-diff classifier (which shares `ConsolidatedReviewNode`'s
+/// diff basis) diffs the WORKING TREE against `HEAD`, preceded by an
+/// intent-to-add pass so untracked files are counted. A `base_sha` stamped
+/// by `SetupWorktreeNode` is run metadata only and must NOT become a diff
+/// base — nothing in a run commits the implementer's code until
+/// `SaveStateNode` runs on the pass path, so `<base_sha>..HEAD` was empty on
+/// every run and every task classified as trivial.
 #[tokio::test]
-async fn diff_base_pins_to_captured_sha_when_present() {
-    let worktree = temp_worktree();
-    let mut ctx = ctx_with_task(&worktree, Some("abc1234"));
-    // Bypass a real TestTaskNode run: stamp a passing result directly so
-    // TriageTaskNode's PASS branch (the one that calls the trivial-diff
-    // classifier) is reached deterministically.
-    ctx.nodes.insert(
-        "TestTaskNode".to_string(),
-        json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
-    );
+async fn diff_base_is_head_regardless_of_a_stamped_base_sha() {
+    for stamped in [Some("abc1234"), None] {
+        let worktree = temp_worktree();
+        let mut ctx = ctx_with_task(&worktree, stamped);
+        // Bypass a real TestTaskNode run: stamp a passing result directly so
+        // TriageTaskNode's PASS branch (the one that calls the trivial-diff
+        // classifier) is reached deterministically.
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
+        );
 
-    let seen_args: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
-    let seen_args_clone = seen_args.clone();
-    let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
-        *seen_args_clone.lock().unwrap() = Some(args.iter().map(|s| s.to_string()).collect());
-        Ok(CommandOutput {
-            status: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        })
-    });
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            seen_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
 
-    let triage_node = TriageTaskNode::new().with_runner(runner);
-    let ctx = triage_node
-        .process(ctx)
-        .await
-        .expect("TriageTaskNode should not error");
+        let triage_node = TriageTaskNode::new().with_runner(runner);
+        let ctx = triage_node
+            .process(ctx)
+            .await
+            .expect("TriageTaskNode should not error");
 
-    assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "PASS");
-    assert_eq!(
-        seen_args.lock().unwrap().as_deref(),
-        Some(vec![
-            "diff".to_string(),
-            "--numstat".to_string(),
-            "abc1234..HEAD".to_string()
-        ])
-        .as_deref()
-    );
-}
-
-/// With no `base_sha` captured (e.g. `SetupWorktreeNode`'s `git rev-parse`
-/// failed, or a ctx driven directly in a unit test), the diff range falls
-/// back to `main..HEAD`.
-#[tokio::test]
-async fn diff_base_falls_back_to_main_when_absent() {
-    let worktree = temp_worktree();
-    let mut ctx = ctx_with_task(&worktree, None);
-    ctx.nodes.insert(
-        "TestTaskNode".to_string(),
-        json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
-    );
-
-    let seen_args: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
-    let seen_args_clone = seen_args.clone();
-    let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
-        *seen_args_clone.lock().unwrap() = Some(args.iter().map(|s| s.to_string()).collect());
-        Ok(CommandOutput {
-            status: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        })
-    });
-
-    let triage_node = TriageTaskNode::new().with_runner(runner);
-    let ctx = triage_node
-        .process(ctx)
-        .await
-        .expect("TriageTaskNode should not error");
-
-    assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "PASS");
-    assert_eq!(
-        seen_args.lock().unwrap().as_deref(),
-        Some(vec![
-            "diff".to_string(),
-            "--numstat".to_string(),
-            "main..HEAD".to_string()
-        ])
-        .as_deref()
-    );
+        assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "PASS");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                vec!["add".to_string(), "-N".to_string(), "-A".to_string()],
+                vec![
+                    "diff".to_string(),
+                    "--numstat".to_string(),
+                    "HEAD".to_string()
+                ],
+            ],
+            "base_sha stamp = {stamped:?}"
+        );
+    }
 }
 
 // --- PatchDocsNode cwd scoping (ticket-policy-path-generate-docs-nodes) -----
