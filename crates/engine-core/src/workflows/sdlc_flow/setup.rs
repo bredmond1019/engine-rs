@@ -466,11 +466,131 @@ impl Router for SpecExistsRouterNode {
     }
 }
 
-/// Deterministic node: loads `sdlc/sdlc-flow-state.json` (the
-/// D31-committed path/schema) if present, else bootstraps a fresh
-/// `SDLCState` from `tasks.json`; applies the `task_range` filter; writes
-/// the resulting `SDLCState` (`model_dump` shape) to its own output.
+/// Deterministic node: honours `event.resume` when deciding whether to
+/// continue from `sdlc/sdlc-flow-state.json` (the D31-committed path/schema)
+/// or restart the spec from `tasks.json`; applies the `task_range` filter;
+/// writes the resulting `SDLCState` (`model_dump` shape) to its own output.
+///
+/// **Restart-vs-resume contract** (ticket `resume-reset-semantics`). `resume`
+/// is an existing typed event field (`SDLCFlowEventSchema::resume`,
+/// `#[serde(default)]` = `false`) that this node ignored until 2026-08-02 —
+/// the state file was loaded whenever it existed. The consequence was that a
+/// bailed spec reloaded its own corpse (attempts already exhausted) and
+/// re-bailed in seconds, with no API-level way to re-run it short of moving
+/// the state file by hand. The four cases are now:
+///
+/// | `resume` | state file | behavior |
+/// |---|---|---|
+/// | `true` | present | load it — unchanged, byte-for-byte today's path |
+/// | `true` | absent | bootstrap from `tasks.json` (a resume of a never-started spec is a fresh start, not an error) |
+/// | `false` | present + `tasks.json` present | **archive** the state to `sdlc-flow-state.json.superseded-{discriminator}.bak`, then bootstrap fresh |
+/// | `false` | present, no `tasks.json` | load it — there is nothing to restart *from*, so continuing beats erroring |
+/// | either | neither file | `Err` — unchanged |
+///
+/// The old state is never deleted or overwritten: the corpse is forensics.
+/// See [`archive_superseded_state`] for the naming/collision rules.
 pub struct LoadTaskStateNode;
+
+/// Deterministic discriminator naming an archived state file, derived from
+/// the *old file's own* contents so the same file always archives to the same
+/// name (no clock, no RNG — tests must be reproducible).
+///
+/// Prefers the `run_id` stamped by `EN.6.J` (`RunMeta::run_id`), which is the
+/// natural key for "the run whose corpse this is". States written before that
+/// fix — and every state written by base-template's JS `sdlc-flow.js` engine,
+/// which never emits the key — have no `run_id`; those fall back to the
+/// committed `status` plus the summed `attempt_count` across all tasks, which
+/// is stable for a given file and distinguishes successive bails of the same
+/// spec.
+fn superseded_discriminator(value: &serde_json::Value) -> String {
+    if let Some(run_id) = value
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|run_id| !run_id.trim().is_empty())
+    {
+        return sanitize_path_component(run_id);
+    }
+
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let attempts: u64 = value
+        .get("tasks")
+        .and_then(serde_json::Value::as_object)
+        .map(|tasks| {
+            tasks
+                .values()
+                .filter_map(|task| {
+                    task.get("attempt_count")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+    format!("{}-attempts{attempts}", sanitize_path_component(status))
+}
+
+/// Reduce an arbitrary JSON string to something safe to embed in a filename:
+/// ASCII alphanumerics, `-` and `_` survive; everything else becomes `-`.
+fn sanitize_path_component(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Rename `state_path` out of the way so a restart can bootstrap fresh
+/// without destroying the previous run's record.
+///
+/// The archive is `sdlc-flow-state.json.superseded-{discriminator}.bak` beside
+/// the original. If that name is already taken (restarting the same superseded
+/// run twice, or two bails that share a fallback discriminator), a `-2`, `-3`,
+/// … suffix is appended rather than clobbering the earlier archive. Returns
+/// the path actually written.
+fn archive_superseded_state(
+    state_path: &Path,
+    old_state: &serde_json::Value,
+) -> Result<PathBuf, NodeError> {
+    let dir = state_path.parent().unwrap_or_else(|| Path::new("."));
+    let discriminator = superseded_discriminator(old_state);
+    let base = format!("sdlc-flow-state.json.superseded-{discriminator}");
+
+    let mut candidate = dir.join(format!("{base}.bak"));
+    let mut suffix = 2u32;
+    while candidate.exists() {
+        candidate = dir.join(format!("{base}-{suffix}.bak"));
+        suffix += 1;
+        // Defensive: a directory with millions of archives is a bug
+        // elsewhere, but never spin forever on one.
+        if suffix > 10_000 {
+            return Err(NodeError::new(format!(
+                "refusing to archive {}: too many existing .superseded-{discriminator} archives",
+                state_path.display()
+            )));
+        }
+    }
+
+    std::fs::rename(state_path, &candidate).map_err(|err| {
+        NodeError::new(format!(
+            "failed to archive {} to {}: {err}",
+            state_path.display(),
+            candidate.display()
+        ))
+    })?;
+    Ok(candidate)
+}
 
 #[async_trait::async_trait]
 impl Node for LoadTaskStateNode {
@@ -480,13 +600,35 @@ impl Node for LoadTaskStateNode {
         let state_path = dir.join("sdlc").join("sdlc-flow-state.json");
         let tasks_path = dir.join("tasks.json");
 
-        let mut state: SDLCState = if state_path.exists() {
+        // Parse the existing state (if any) up front: both the "resume it"
+        // and the "archive it" paths need its contents, and a corrupt file
+        // should fail loudly either way rather than being silently renamed.
+        let existing_state: Option<serde_json::Value> = if state_path.exists() {
             let raw = std::fs::read_to_string(&state_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", state_path.display()))
             })?;
-            let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+            Some(serde_json::from_str(&raw).map_err(|err| {
                 NodeError::new(format!("failed to parse {}: {err}", state_path.display()))
-            })?;
+            })?)
+        } else {
+            None
+        };
+
+        // A restart (`resume: false`) only makes sense when there is a
+        // `tasks.json` to bootstrap back from; otherwise the state file is
+        // the only description of the spec that exists and continuing from
+        // it beats erroring. See the node's doc comment for the full table.
+        let restarting = !event.resume && existing_state.is_some() && tasks_path.exists();
+        if restarting {
+            let old = existing_state
+                .as_ref()
+                .expect("restarting implies an existing state");
+            archive_superseded_state(&state_path, old)?;
+        }
+
+        let resumed_state = if restarting { None } else { existing_state };
+
+        let mut state: SDLCState = if let Some(value) = resumed_state {
             SDLCState::from_committed_state_json(&value)?
         } else if tasks_path.exists() {
             let raw = std::fs::read_to_string(&tasks_path).map_err(|err| {
@@ -694,6 +836,7 @@ impl Node for GenerateTasksNode {
 
 #[cfg(test)]
 mod tests {
+    use super::super::schema::SDLCTaskStatus;
     use super::*;
     use claude_code_rs::Outcome;
     use std::collections::HashMap;
@@ -898,7 +1041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_prefers_state_file_over_tasks_json() {
+    async fn load_prefers_state_file_over_tasks_json_when_resuming() {
         let worktree = temp_dir();
         let dir = worktree.join("planning").join("my-spec");
         std::fs::create_dir_all(&dir).unwrap();
@@ -920,11 +1063,362 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
         let node = LoadTaskStateNode;
         let out = node.process(ctx).await.expect("load should succeed");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["spec_slug"], "my-spec");
+        assert!(
+            sdlc_dir.join("sdlc-flow-state.json").exists(),
+            "a resume must leave the state file where it is"
+        );
+    }
+
+    // --- resume / restart semantics ---------------------------------------
+
+    /// Seed `planning/<slug>/` with a `tasks.json` holding `task_count`
+    /// pending tasks, plus a committed state file whose tasks are all
+    /// `FAILED` with `attempt_count == max_attempts` (a bailed run's
+    /// corpse). Returns `(spec_dir, sdlc_dir)`.
+    fn seed_bailed_spec(
+        worktree: &Path,
+        slug: &str,
+        task_count: u32,
+        run_id: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let dir = worktree.join("planning").join(slug);
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
+
+        let tasks: Vec<serde_json::Value> = (1..=task_count)
+            .map(|id| json!({ "task_id": id, "title": format!("T{id}"), "description": "d" }))
+            .collect();
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let mut state = SDLCState::new(slug);
+        for id in 1..=task_count {
+            let mut task = SDLCTask::new(id, format!("T{id}"), "d");
+            task.status = SDLCTaskStatus::Failed;
+            task.attempt_count = task.max_attempts;
+            state.tasks.push(task);
+        }
+        let run_meta = super::super::schema::RunMeta {
+            branch: format!("sdlc/{slug}"),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-08-01T00:00:00Z".to_string(),
+            updated_at: "2026-08-01T00:00:00Z".to_string(),
+            run_id: run_id.map(str::to_string),
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
+        std::fs::write(
+            sdlc_dir.join("sdlc-flow-state.json"),
+            serde_json::to_string(&committed).unwrap(),
+        )
+        .unwrap();
+
+        (dir, sdlc_dir)
+    }
+
+    fn archived_names(sdlc_dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(sdlc_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".superseded-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn resume_true_preserves_attempt_counts_from_the_state_file() {
+        let worktree = temp_dir();
+        let (_dir, sdlc_dir) = seed_bailed_spec(&worktree, "my-spec", 2, Some("run-aaaa"));
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+
+        let attempts: Vec<u64> = loaded["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["attempt_count"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            attempts,
+            vec![3, 3],
+            "resume must reload exhausted attempts"
+        );
+        assert!(
+            archived_names(&sdlc_dir).is_empty(),
+            "resume never archives"
+        );
+        assert!(sdlc_dir.join("sdlc-flow-state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn resume_false_archives_the_old_state_and_bootstraps_fresh() {
+        let worktree = temp_dir();
+        let (_dir, sdlc_dir) = seed_bailed_spec(&worktree, "my-spec", 2, Some("run-aaaa"));
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" }); // resume defaults to false
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+
+        let attempts: Vec<u64> = loaded["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["attempt_count"].as_u64().unwrap())
+            .collect();
+        assert_eq!(attempts, vec![0, 0], "a restart bootstraps from tasks.json");
+        for task in loaded["tasks"].as_array().unwrap() {
+            assert_eq!(task["status"], "pending");
+        }
+
+        assert!(
+            !sdlc_dir.join("sdlc-flow-state.json").exists(),
+            "the live state file must have been moved aside"
+        );
+        assert_eq!(
+            archived_names(&sdlc_dir),
+            vec!["sdlc-flow-state.json.superseded-run-aaaa.bak".to_string()],
+            "archive name must carry the old file's stamped run_id"
+        );
+
+        // The corpse is forensics: its contents must survive verbatim.
+        let archived: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(sdlc_dir.join("sdlc-flow-state.json.superseded-run-aaaa.bak"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archived["run_id"], "run-aaaa");
+        assert_eq!(archived["tasks"]["1"]["attempt_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn resume_false_without_a_state_file_bootstraps_unchanged() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tasks.json"),
+            r#"[{"task_id":1,"title":"One","description":"d"}]"#,
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(loaded["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(loaded["tasks"][0]["attempt_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn resume_true_without_a_state_file_is_a_graceful_fresh_start() {
+        // Pinned choice: resuming a spec that was never started is a fresh
+        // start, not an error — the caller asked to continue, and "nothing
+        // to continue from" is a normal first run, not a fault.
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tasks.json"),
+            r#"[{"task_id":1,"title":"One","description":"d"}]"#,
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(loaded["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(loaded["tasks"][0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn repeated_restart_of_the_same_run_id_does_not_clobber_the_first_archive() {
+        let worktree = temp_dir();
+        let (_dir, sdlc_dir) = seed_bailed_spec(&worktree, "my-spec", 1, Some("run-aaaa"));
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
+        LoadTaskStateNode.process(ctx).await.expect("first restart");
+
+        // Re-seed a state file carrying the SAME stamped run_id, then
+        // restart again — the discriminator collides.
+        seed_bailed_spec(&worktree, "my-spec", 1, Some("run-aaaa"));
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
+        LoadTaskStateNode
+            .process(ctx)
+            .await
+            .expect("second restart");
+
+        assert_eq!(
+            archived_names(&sdlc_dir),
+            vec![
+                "sdlc-flow-state.json.superseded-run-aaaa-2.bak".to_string(),
+                "sdlc-flow-state.json.superseded-run-aaaa.bak".to_string(),
+            ],
+            "a colliding archive name gets a numeric suffix, never an overwrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_falls_back_to_a_deterministic_name_when_run_id_is_absent() {
+        // States written before EN.6.J — and every state written by
+        // base-template's JS engine — carry no run_id. The fallback must be
+        // derived from the file's own contents, never from a clock.
+        let worktree = temp_dir();
+        let (_dir, sdlc_dir) = seed_bailed_spec(&worktree, "my-spec", 2, None);
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
+        LoadTaskStateNode.process(ctx).await.expect("restart");
+
+        let names = archived_names(&sdlc_dir);
+        assert_eq!(names.len(), 1, "exactly one archive, got {names:?}");
+        // 2 blocked tasks x 3 attempts each = 6.
+        assert!(
+            names[0].ends_with("-attempts6.bak"),
+            "fallback discriminator must fold in the summed attempt counts: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_without_tasks_json_still_loads_the_state_file() {
+        // Nothing to bootstrap back from: continuing beats erroring, and the
+        // state file must NOT be archived (that would strand the run).
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
+        let mut state = SDLCState::new("my-spec");
+        state.tasks.push(SDLCTask::new(1, "One", "d"));
+        let run_meta = super::super::schema::RunMeta {
+            branch: "sdlc/my-spec".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-08-01T00:00:00Z".to_string(),
+            updated_at: "2026-08-01T00:00:00Z".to_string(),
+            run_id: Some("run-bbbb".to_string()),
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
+        std::fs::write(
+            sdlc_dir.join("sdlc-flow-state.json"),
+            serde_json::to_string(&committed).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        assert_eq!(
+            out.nodes.get("LoadTaskStateNode").unwrap()["spec_slug"],
+            "my-spec"
+        );
+        assert!(sdlc_dir.join("sdlc-flow-state.json").exists());
+        assert!(archived_names(&sdlc_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_the_task_range_filter() {
+        let worktree = temp_dir();
+        let (_dir, _sdlc_dir) = seed_bailed_spec(&worktree, "my-spec", 3, Some("run-cccc"));
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": false, "task_range": "2-3" });
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        let ids: Vec<u64> = loaded["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["task_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn restart_leaves_a_corrupt_state_file_in_place_and_errors() {
+        // A file we cannot parse is not archived — a silent rename would
+        // hide the corruption we want reported.
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+        std::fs::write(sdlc_dir.join("sdlc-flow-state.json"), "{not json").unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
+        let err = LoadTaskStateNode
+            .process(ctx)
+            .await
+            .expect_err("should fail");
+        assert!(err.message.contains("failed to parse"));
+        assert!(sdlc_dir.join("sdlc-flow-state.json").exists());
+        assert!(archived_names(&sdlc_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bailed_spec_re_runs_instead_of_re_bailing() {
+        // The scenario this ticket exists for. Before the fix, a re-POST of
+        // a bailed spec reloaded the corpse — every task FAILED with
+        // attempts exhausted — and the task loop re-bailed without doing any
+        // work. After the fix the same POST yields a state the loop can
+        // actually dispatch: a PENDING task with attempts left.
+        let worktree = temp_dir();
+        let (_dir, sdlc_dir) = seed_bailed_spec(&worktree, "bailed-spec", 2, Some("run-dead"));
+
+        // Sanity: the seeded corpse really is un-runnable.
+        let seeded: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(sdlc_dir.join("sdlc-flow-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(seeded["tasks"]["1"]["status"], "failed");
+        assert_eq!(
+            seeded["tasks"]["1"]["attempt_count"],
+            seeded["tasks"]["1"]["max_attempts"]
+        );
+
+        let mut ctx = ctx_with_worktree("bailed-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "bailed-spec" });
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let state: SDLCState =
+            serde_json::from_value(out.nodes.get("LoadTaskStateNode").unwrap().clone()).unwrap();
+
+        // The predicate the task loop dispatches on: a pending task still
+        // under its attempt budget.
+        let next = state
+            .tasks
+            .iter()
+            .find(|task| task.status == SDLCTaskStatus::Pending)
+            .expect("a restarted spec must offer a dispatchable task");
+        assert_eq!(next.task_id, 1);
+        assert!(next.attempt_count < next.max_attempts);
+        assert!(
+            !archived_names(&sdlc_dir).is_empty(),
+            "the previous run's record must still be on disk"
+        );
+    }
+
+    #[test]
+    fn superseded_discriminator_sanitizes_unsafe_characters() {
+        let value = json!({ "run_id": "../../etc/passwd" });
+        let discriminator = superseded_discriminator(&value);
+        assert!(!discriminator.contains('/'));
+        assert!(!discriminator.contains('.'));
+        assert_eq!(discriminator, "------etc-passwd");
     }
 
     #[tokio::test]
