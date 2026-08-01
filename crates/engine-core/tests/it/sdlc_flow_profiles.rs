@@ -69,7 +69,8 @@ fn baseline_profile_resolves_to_documented_policy() {
     assert!(!resolved.llm_triage);
 }
 
-/// `cheap-fast`: Haiku implement, local triage+review, terse output,
+/// `cheap-fast`: Haiku implement, Haiku triage+review (cloud since
+/// 2026-08-01 — the local tier's model is not provisioned everywhere), terse output,
 /// trivial-task review skip.
 #[test]
 fn cheap_fast_profile_resolves_to_documented_policy() {
@@ -81,15 +82,16 @@ fn cheap_fast_profile_resolves_to_documented_policy() {
     );
 
     assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
-    assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
-    assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+    assert_eq!(resolved.model_tiers.triage, ModelTier::Haiku);
+    assert_eq!(resolved.model_tiers.review, ModelTier::Haiku);
     assert_eq!(resolved.model_tiers.generate, ModelTier::Haiku);
     assert_eq!(resolved.model_tiers.docs, ModelTier::Haiku);
     assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
     assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
 }
 
-/// `pragmatist`: Sonnet implement, local review, prompt caching on,
+/// `pragmatist`: Sonnet implement, Sonnet review (cloud since 2026-08-01),
+/// prompt caching on,
 /// trivial-task review skip, `llm_triage` on.
 #[test]
 fn pragmatist_profile_resolves_to_documented_policy() {
@@ -101,7 +103,7 @@ fn pragmatist_profile_resolves_to_documented_policy() {
     );
 
     assert_eq!(resolved.model_tiers.implement, ModelTier::Sonnet);
-    assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+    assert_eq!(resolved.model_tiers.review, ModelTier::Sonnet);
     assert!(resolved.prompt_cache);
     assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
     assert!(resolved.llm_triage);
@@ -191,8 +193,8 @@ fn event_inline_policy_overrides_profile_field_but_keeps_profile_tiers() {
     // ...but every other cheap-fast knob still comes through from the
     // profile layer, since the inline override left those fields `None`.
     assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
-    assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
-    assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+    assert_eq!(resolved.model_tiers.triage, ModelTier::Haiku);
+    assert_eq!(resolved.model_tiers.review, ModelTier::Haiku);
     assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
     assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
 }

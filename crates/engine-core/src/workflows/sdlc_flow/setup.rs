@@ -2038,11 +2038,11 @@ mod tests {
         );
         assert_eq!(
             resolved.model_tiers.triage,
-            super::super::policy::ModelTier::Local
+            super::super::policy::ModelTier::Haiku
         );
         assert_eq!(
             resolved.model_tiers.review,
-            super::super::policy::ModelTier::Local
+            super::super::policy::ModelTier::Haiku
         );
         assert_eq!(
             resolved.output_verbosity,

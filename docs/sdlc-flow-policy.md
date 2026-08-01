@@ -137,8 +137,18 @@ inline `policy` object:
    | Name | Tradeoff |
    |---|---|
    | `baseline` | Explicit no-op control: Sonnet on every tier, `per_task` review, `llm_triage` off — matches the built-in default, spelled out for clarity. |
-   | `cheap-fast` | `haiku` implement, `local` triage + review, `terse` output, `trivial_skip` review. |
-   | `pragmatist` | `sonnet` implement, `local` review, prompt caching on, `trivial_skip` review, `llm_triage` on. |
+   | `cheap-fast` | `haiku` implement, `haiku` triage + review, `terse` output, `trivial_skip` review. |
+   | `pragmatist` | `sonnet` implement, `sonnet` review, prompt caching on, `trivial_skip` review, `llm_triage` on. |
+
+   > **`triage`/`review` moved off the `local` tier on 2026-08-01.** `cheap-fast*` and
+   > `pragmatist*` used to route those stages to `local`. The local tier's Ollama model is not
+   > pulled on every machine that runs this workflow, and its absence is not a graceful
+   > degradation — a live run died inside `ConsolidatedReviewNode` with
+   > `HTTP 404 ... selected model (qwen2.5:3b) ... may not exist`. Each profile now reviews on the
+   > tier matching its own `implement` setting (`haiku` / `sonnet`), preserving its cost position.
+   > Routing back to `local` is a deliberate future revisit, gated on the local models actually
+   > being provisioned. The `local.*` config and the `-heavy` harness profiles are retained for
+   > that revisit and are inert while no stage resolves to `local`.
    | `batch-reviewer` | `sonnet` implement, per-task review collapsed into a single end-of-run review (`end_only`). |
 
    An `event.profile` name found in neither place is an error (`resolve_profile` returns `Err`,
@@ -185,7 +195,7 @@ then the inline `policy` fields override individual knobs on top of it.
 | `max_attempts` | `u32` | Retry budget per task before it's marked `FAILED`. |
 | `close_out.reuse.{validation,review,docs}` | `bool` each | Which `close-out` (EN.2.x) stages are allowed to reuse a prior flow record's result rather than re-running. |
 | `test_depth` | `full` \| `fast` (default `full`) | Which per-task validation checks `TestTaskNode` runs — see [Per-task check selection (`test_depth`)](#per-task-check-selection-test_depth) below. |
-| `review_diff_max_chars` | `u32` (default `120000`) | Ceiling, in characters, on the working-tree diff embedded in `ConsolidatedReviewNode`'s prompt — the bound on reviewer prompt size, and therefore on the context and cost a large task can spend. Over-budget diffs are **clipped, never dropped**, and the clip is announced to the model in the prompt (`--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL DIFF ---`, instructing it not to `PASS` on code it could not see); a silent clip would recreate the rubber-stamp failure the real-diff fix eliminated. The resolved value and a `review_diff_truncated` flag are stamped into `ConsolidatedReviewNode`'s result for telemetry. Profile values track the **reviewer's own context window**, not just willingness to spend: `cheap-fast*` 20k and `pragmatist*` 40k (both review on the `local` tier), `batch-reviewer` 200k (its single `end_only` Sonnet review sees the whole run's accumulated diff), `baseline` 120k (restates the built-in default). |
+| `review_diff_max_chars` | `u32` (default `120000`) | Ceiling, in characters, on the working-tree diff embedded in `ConsolidatedReviewNode`'s prompt — the bound on reviewer prompt size, and therefore on the context and cost a large task can spend. Over-budget diffs are **clipped, never dropped**, and the clip is announced to the model in the prompt (`--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL DIFF ---`, instructing it not to `PASS` on code it could not see); a silent clip would recreate the rubber-stamp failure the real-diff fix eliminated. The resolved value and a `review_diff_truncated` flag are stamped into `ConsolidatedReviewNode`'s result for telemetry. Profile values are a **cost/latency choice**: `cheap-fast*` 20k (the floor) and `pragmatist*` 40k (the middle setting). Both numbers were originally sized by the *reviewer's own context window*, back when those profiles reviewed on the `local` tier; since the 2026-08-01 move to cloud review they are conservative for the window actually available. They are kept unchanged deliberately — still defensible spend floors — and re-tuning them for a cloud reviewer is a separate follow-up. `batch-reviewer` 200k is a ceiling for an unrelated reason (its single `end_only` Sonnet review sees the whole run's accumulated diff); `baseline` 120k restates the built-in default. |
 
 ### Per-task check selection (`test_depth`)
 
@@ -251,6 +261,10 @@ Claude CLI (schema requested via `Config.json_schema`, always on) and the local 
 endpoint (schema-shaped hint gated by `local.constrained_json`, off by default).
 
 ## The `local` model tier
+
+> **No named profile routes to `local` as of 2026-08-01** — it is opt-in only, via an explicit
+> `model_tiers` override in `harness.json` or an event's inline `policy`. Everything below still
+> describes exactly what happens when you do opt in.
 
 Setting `model_tiers.triage` and/or `model_tiers.review` to `local` routes that stage's calls
 through `openai_compat_transport` to an OpenAI-compatible endpoint (e.g. a local Ollama server)
