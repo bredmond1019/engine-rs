@@ -339,6 +339,22 @@ const RETRY_FEEDBACK_HEADER: &str = "\n\n--- PREVIOUS ATTEMPT FAILED — READ TH
      failure below, fix its root cause, and re-verify. Do not report success without addressing \
      it.\n\n";
 
+/// Opening line of the failure block appended to `TriageTaskNode`'s prompt on
+/// the `llm_triage` branch.
+///
+/// Deliberately **not** [`RETRY_FEEDBACK_HEADER`]: that text addresses the
+/// *implementer* re-entering a worktree that still holds its own half-finished
+/// edits ("the task is NOT done, fix the root cause"). `TriageTaskNode` is a
+/// *classifier* — it edits nothing — so it needs the opposite framing: here is
+/// the evidence, return a verdict. Handing a classifier the implementer's
+/// instructions invites it to reason about fixing the failure instead of
+/// grading it.
+const TRIAGE_FAILURE_HEADER: &str = "\n\n--- FAILING CHECK OUTPUT — CLASSIFY FROM THIS \
+     EVIDENCE ---\nThe checks below failed with the output shown. Base the verdict on what \
+     actually broke, not on the check names: a localized, mechanical, or transient failure the \
+     next attempt can plausibly fix is RETRYABLE; a fundamental mismatch with the task's premise, \
+     or the same failure recurring unchanged across attempts, is MAJOR_BAIL.\n\n";
+
 /// Marker appended in place of the characters a `max_chars` bound elides.
 const RETRY_FEEDBACK_TRUNCATED: &str = "…[truncated]";
 
@@ -465,26 +481,58 @@ fn prior_attempt_feedback(ctx: &TaskContext, cfg: &RetryFeedback) -> Option<Stri
     if !cfg.enabled {
         return None;
     }
-    let budget = cfg.max_chars as usize;
-    if budget == 0 {
-        return None;
-    }
     // Test failure first: it is the immediate cause on the
     // `TriageRouterNode` back-edge. The review findings are the fallback for
     // the `ReviewRouterNode` back-edge, where the checks passed.
     let entries = test_failure_entries(ctx).or_else(|| review_failure_entries(ctx))?;
+    render_feedback_block(RETRY_FEEDBACK_HEADER, &entries, cfg.max_chars as usize)
+}
 
-    // Labels are non-negotiable — a truncated block must still say *which*
-    // checks failed — so only the details compete for the leftover budget.
-    let fixed: usize = RETRY_FEEDBACK_HEADER.chars().count()
+/// Render the failed checks of the run that just failed as a prompt block for
+/// `TriageTaskNode`'s `llm_triage` branch, or `None` when there is nothing to
+/// say.
+///
+/// Pure: reads only `ctx.nodes` and `cfg`, performs no I/O.
+///
+/// Deliberately narrower than [`prior_attempt_feedback`] in two ways:
+/// - **Test failures only, no review fallback.** `TriageTaskNode` is only ever
+///   reached from `TestTaskNode`, and it is classifying *that* run's failure.
+///   A stale `ConsolidatedReviewNode` verdict from a previous attempt is not
+///   the thing under judgement and would be actively misleading evidence.
+/// - **A classifier-facing header** ([`TRIAGE_FAILURE_HEADER`]) rather than the
+///   implementer-facing [`RETRY_FEEDBACK_HEADER`].
+///
+/// Shares `policy.retry_feedback` rather than introducing a knob: this is the
+/// same class of text (captured check output), bounded for the same reason,
+/// and a run that wants failure evidence trimmed or switched off wants it
+/// trimmed or switched off in both places.
+fn triage_failure_feedback(ctx: &TaskContext, cfg: &RetryFeedback) -> Option<String> {
+    if !cfg.enabled {
+        return None;
+    }
+    let entries = test_failure_entries(ctx)?;
+    render_feedback_block(TRIAGE_FAILURE_HEADER, &entries, cfg.max_chars as usize)
+}
+
+/// Assemble `header` + `entries` into a prompt block of at most `budget`
+/// characters. `None` when there is nothing to render (`budget == 0`, no
+/// entries, or an all-whitespace result).
+///
+/// Labels are non-negotiable — a truncated block must still say *which* checks
+/// failed — so only the details compete for the leftover budget.
+fn render_feedback_block(header: &str, entries: &[FeedbackEntry], budget: usize) -> Option<String> {
+    if budget == 0 || entries.is_empty() {
+        return None;
+    }
+    let fixed: usize = header.chars().count()
         + entries
             .iter()
             .map(|entry| entry.label.chars().count() + 1)
             .sum::<usize>();
     let per_entry = budget.saturating_sub(fixed) / entries.len();
 
-    let mut block = String::from(RETRY_FEEDBACK_HEADER);
-    for entry in &entries {
+    let mut block = String::from(header);
+    for entry in entries {
         block.push_str(&entry.label);
         block.push('\n');
         if per_entry > 0 && !entry.detail.is_empty() {
@@ -1698,7 +1746,7 @@ impl Node for TriageTaskNode {
             .unwrap_or_default()
             .to_string();
 
-        let prompt = format!(
+        let mut prompt = format!(
             "Classify this task's test failure as RETRYABLE or MAJOR_BAIL. \
              Respond with strict JSON of the shape {{\"verdict\": str, \
              \"reason\": str}}.\n\nTask: {title}\nAttempt {} of \
@@ -1707,6 +1755,18 @@ impl Node for TriageTaskNode {
         );
 
         let policy = resolved_policy(&ctx)?;
+
+        // `failure_summary` names the failed checks but never says *why* they
+        // failed, so the classifier was judging nearly blind. Append the
+        // captured check output — the same `check_results[]` data
+        // `ImplementTaskNode`'s retry feedback renders, under a
+        // classifier-facing header. Appended to the per-run prompt **body**,
+        // never to `STABLE_SYSTEM_PROMPT`: run-varying text in the cached
+        // prefix would break the cache breakpoint on every call.
+        if let Some(feedback) = triage_failure_feedback(&ctx, &policy.retry_feedback) {
+            prompt.push_str(&feedback);
+        }
+
         let (mut config, prompt) =
             apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
         config.json_schema = Some(triage_output_schema());
@@ -2937,6 +2997,199 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "WAT");
         assert_eq!(out.nodes["TriageTaskNode"]["unrecognized_verdict"], "WAT");
+    }
+
+    // --- TriageTaskNode: failure-output feedback --------------------------
+
+    /// The base triage prompt, exactly as built for a task titled `One` on
+    /// attempt 1 of 3 with an empty `failure_summary`. Held as a literal so
+    /// the enrichment tests below can assert against
+    /// `format!("{TRIAGE_BASE_PROMPT}{block}")` shapes rather than restating
+    /// it, and so the byte-identical pin has something to pin *to*.
+    const TRIAGE_BASE_PROMPT: &str = "Classify this task's test failure as RETRYABLE or \
+         MAJOR_BAIL. Respond with strict JSON of the shape {\"verdict\": str, \"reason\": \
+         str}.\n\nTask: One\nAttempt 1 of 3.\nFailure summary: ";
+
+    /// Records the prompt handed to the transport and answers with a valid
+    /// [`TriageOutput`]. (`prompt_recording_transport` answers with an
+    /// `ImplementOutput`, which `TriageTaskNode` cannot parse.)
+    fn triage_prompt_recording_transport() -> (Arc<Mutex<Vec<String>>>, ModelTransport) {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let transport: ModelTransport = Arc::new(move |_config, prompt| {
+            seen_clone.lock().unwrap().push(prompt);
+            let outcome = canned_outcome(
+                json!({ "verdict": "RETRYABLE", "reason": "try again" }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        (seen, transport)
+    }
+
+    /// A triage ctx whose `TestTaskNode` result carries real failing-check
+    /// detail, with the `llm_triage` gate open.
+    fn triage_ctx_with_failure(task: &SDLCTask, output: &str) -> TaskContext {
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, task);
+        ctx.nodes
+            .insert("TestTaskNode".to_string(), failed_test_result(output));
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+        ctx
+    }
+
+    /// The headline behavior: the classifier sees the actual compiler output,
+    /// not just the check names `failure_summary` lists.
+    #[tokio::test]
+    async fn triage_llm_prompt_carries_the_failed_check_output() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+        let ctx = triage_ctx_with_failure(
+            &task,
+            "error[E0308]: mismatched types\n  --> src/http.rs:682:5",
+        );
+
+        let (seen, transport) = triage_prompt_recording_transport();
+        let node = TriageTaskNode::new().with_transport(transport);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        // The base prompt is intact and still leads...
+        assert!(
+            prompt.starts_with("Classify this task's test failure"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("Failure summary: Failed checks: test"));
+        // ...under a classifier-facing header, NOT the implementer's.
+        assert!(prompt.contains("CLASSIFY FROM THIS EVIDENCE"), "{prompt}");
+        assert!(!prompt.contains("PREVIOUS ATTEMPT FAILED"), "{prompt}");
+        // ...carrying name, message, and — the point of the ticket — output.
+        assert!(prompt.contains("FAILED CHECK: test"), "{prompt}");
+        assert!(prompt.contains("exited 101"), "{prompt}");
+        assert!(prompt.contains("error[E0308]"), "{prompt}");
+        assert!(prompt.contains("src/http.rs:682"), "{prompt}");
+        // The passing check is not noise in the classifier's evidence.
+        assert!(!prompt.contains("clippy"), "{prompt}");
+
+        // The stamped result shape is untouched by the prompt enrichment.
+        let result = &out.nodes["TriageTaskNode"];
+        assert_eq!(result["verdict"], "RETRYABLE");
+        assert_eq!(result["reason"], "try again");
+        assert!(result.get("unrecognized_verdict").is_none());
+    }
+
+    /// The evidence block reuses `retry_feedback.max_chars` — no new knob —
+    /// so an enormous compiler dump cannot blow the prompt up, and the bound
+    /// never costs us the identification of *which* check failed.
+    #[tokio::test]
+    async fn triage_llm_prompt_failure_block_is_bounded_by_max_chars() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+        let huge = "E".repeat(200_000);
+        let ctx = triage_ctx_with_failure(&task, &huge);
+        let policy = SdlcPolicy {
+            retry_feedback: RetryFeedback {
+                enabled: true,
+                max_chars: 900,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let (seen, transport) = triage_prompt_recording_transport();
+        let node = TriageTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        let prompt = &prompts[0];
+        let base_len = TRIAGE_BASE_PROMPT.chars().count() + "Failed checks: test".chars().count();
+        assert!(
+            prompt.chars().count() <= base_len + 900,
+            "prompt was {} chars, expected <= {}",
+            prompt.chars().count(),
+            base_len + 900
+        );
+        assert!(prompt.contains("FAILED CHECK: test"), "{prompt}");
+        assert!(prompt.contains(RETRY_FEEDBACK_TRUNCATED), "{prompt}");
+    }
+
+    /// **Change-detector, asserted against the literal text.** With nothing
+    /// failing in `check_results` there is no evidence to append, and the
+    /// prompt must be byte-identical to pre-ticket behavior — this ticket
+    /// buys an evidence block, not a rewritten request.
+    ///
+    /// Note this is the *reachable* no-evidence path. The spec named the
+    /// `all_passed: true` path for this pin, but that branch returns a `PASS`
+    /// verdict before any prompt exists (covered instead by
+    /// `triage_deterministic_branches`' panicking transport). See the
+    /// Amendment Log.
+    #[tokio::test]
+    async fn triage_llm_prompt_without_failed_checks_is_byte_identical() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let (seen, transport) = triage_prompt_recording_transport();
+        let node = TriageTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0], TRIAGE_BASE_PROMPT);
+    }
+
+    /// The shared knob's off switch covers triage too.
+    #[tokio::test]
+    async fn triage_llm_prompt_is_unchanged_when_the_knob_is_disabled() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+        let ctx = triage_ctx_with_failure(&task, "error[E0308]: mismatched types");
+        let policy = SdlcPolicy {
+            retry_feedback: RetryFeedback {
+                enabled: false,
+                max_chars: 4000,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let (seen, transport) = triage_prompt_recording_transport();
+        let node = TriageTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        assert_eq!(
+            prompts[0],
+            format!("{TRIAGE_BASE_PROMPT}Failed checks: test")
+        );
+    }
+
+    /// Unlike [`prior_attempt_feedback`], the triage block has **no review
+    /// fallback**: a stale `ConsolidatedReviewNode` verdict is not the failure
+    /// under judgement and must not be presented as if it were.
+    #[test]
+    fn triage_failure_feedback_does_not_fall_back_to_review_findings() {
+        let mut ctx = ctx_with_node(
+            "TestTaskNode",
+            json!({ "all_passed": true, "check_results": [], "failure_summary": "" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "FAIL", "summary": "stale finding", "issues": ["nope"] }),
+        );
+        // `prior_attempt_feedback` *does* fall back here...
+        assert!(prior_attempt_feedback(&ctx, &RetryFeedback::default()).is_some());
+        // ...the triage block does not.
+        assert_eq!(
+            triage_failure_feedback(&ctx, &RetryFeedback::default()),
+            None
+        );
     }
 
     // --- TriageRouterNode ------------------------------------------------
