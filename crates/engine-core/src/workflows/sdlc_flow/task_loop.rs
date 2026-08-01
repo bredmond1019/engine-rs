@@ -296,6 +296,38 @@ fn current_task_fields(ctx: &TaskContext) -> Result<&serde_json::Value, NodeErro
         .ok_or_else(|| NodeError::new("TaskQueueRouterNode has not run yet"))
 }
 
+/// The current task as it exists in the *live* durable [`SDLCState`], resolved
+/// by `TaskQueueRouterNode`'s `current_task_id` stamp.
+///
+/// `TaskQueueRouterNode`'s own output is a per-dispatch *snapshot*: the fields
+/// it stamps are copied out of the state at dequeue time. `attempt_count` is
+/// re-stamped on the retry back-edge by [`IncrementAttemptNode`], but nothing
+/// re-stamps the rest — so any node needing a field that a *later* node may
+/// have mutated (statuses, telemetry, per-task `validation_commands`) must read
+/// it from [`latest_state`], not from the stamp.
+///
+/// `caller` is the node identity used in the not-found error so a mis-wired
+/// graph names the node that actually looked. Returns an owned [`SDLCTask`]
+/// because [`latest_state`] deserializes a fresh state each call — there is no
+/// borrow to hand back.
+fn current_task_state(ctx: &TaskContext, caller: &str) -> Result<SDLCTask, NodeError> {
+    let current_task_id = current_task_fields(ctx)?
+        .get("current_task_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
+        as u32;
+    let state = latest_state(ctx)?;
+    state
+        .tasks
+        .into_iter()
+        .find(|task| task.task_id == current_task_id)
+        .ok_or_else(|| {
+            NodeError::new(format!(
+                "{caller}: no task with task_id={current_task_id} found in state"
+            ))
+        })
+}
+
 /// Fallback commit message when `TaskQueueRouterNode` never stamped a
 /// current task (a `SaveStateNode` driven directly by a unit test, or a
 /// graph shape without the router).
@@ -309,9 +341,11 @@ const SAVE_STATE_FALLBACK_MESSAGE: &str = "chore: flow state update";
 /// (`UpdateTaskStatusNode → SaveStateNode`), so one message here is one
 /// completed task in `git log` — that is the whole point of carrying the id.
 ///
-/// Deliberately does NOT read `attempt_count` off the same stamp: that field
-/// is stale on the retry back-edge (`ticket-restamp-attempt-count`), and a
-/// commit message is not worth propagating a known-wrong number into.
+/// Deliberately does NOT read `attempt_count` off the same stamp — not because
+/// the field is wrong (`ticket-restamp-attempt-count` made it accurate on the
+/// retry back-edge) but because `SaveStateNode` only ever runs on the pass
+/// path: the attempt number a task happened to succeed on is run trivia, not
+/// something a permanent `git log` line should carry.
 fn save_state_commit_message(ctx: &TaskContext) -> String {
     let Some(current) = get_result(ctx, "TaskQueueRouterNode") else {
         return SAVE_STATE_FALLBACK_MESSAGE.to_string();
@@ -468,15 +502,15 @@ fn review_failure_entries(ctx: &TaskContext) -> Option<Vec<FeedbackEntry>> {
 ///
 /// Pure: reads only `ctx.nodes` and `cfg`, performs no I/O.
 ///
-/// **Retry detection deliberately does NOT read `attempt_count`.**
-/// `current_task_fields(ctx)["attempt_count"]` is stamped once by
-/// `TaskQueueRouterNode` when the task is dequeued and is never refreshed on
-/// the retry back-edge — `IncrementAttemptNode` bumps only the durable
-/// `SDLCState` (see [`bump_attempt`]) — so it reads `0` on every retry. The
-/// presence of a *failed* `TestTaskNode`/`ConsolidatedReviewNode` result in
-/// `ctx.nodes` is accurate by construction: `ctx.nodes` accumulates across
-/// the loop, so a recorded failure can only exist if an attempt already ran
-/// and failed.
+/// **Retry detection deliberately does NOT read `attempt_count`.** Since
+/// `ticket-restamp-attempt-count` that field *is* accurate on the back-edge
+/// (`IncrementAttemptNode` re-stamps it), so this is no longer a workaround
+/// for a lie — it is the better signal on its own merits. The presence of a
+/// *failed* `TestTaskNode`/`ConsolidatedReviewNode` result in `ctx.nodes` is
+/// accurate by construction (`ctx.nodes` accumulates across the loop, so a
+/// recorded failure can only exist if an attempt already ran and failed) and
+/// it is the very thing being rendered: there is nothing to say without a
+/// failure entry, whatever the counter reads.
 fn prior_attempt_feedback(ctx: &TaskContext, cfg: &RetryFeedback) -> Option<String> {
     if !cfg.enabled {
         return None;
@@ -1456,25 +1490,15 @@ impl Node for TestTaskNode {
         let depth = policy.test_depth;
 
         // The CURRENT task's own `validation_commands`, read from the live
-        // durable state by `current_task_id` — copying `TriageTaskNode`'s
-        // exact lookup pattern (and its reason: `TaskQueueRouterNode`'s
-        // output is a snapshot frozen at dispatch time, not the live state).
-        let current = current_task_fields(&ctx)?.clone();
-        let current_task_id = current
+        // durable state by `current_task_id` via the shared
+        // [`current_task_state`] helper — `TaskQueueRouterNode`'s output is a
+        // per-dispatch snapshot and does not carry `validation_commands` at all.
+        let current_task_id = current_task_fields(&ctx)?
             .get("current_task_id")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
             as u32;
-        let state = latest_state(&ctx)?;
-        let task = state
-            .tasks
-            .iter()
-            .find(|task| task.task_id == current_task_id)
-            .ok_or_else(|| {
-                NodeError::new(format!(
-                    "TestTaskNode: no task with task_id={current_task_id} found in state"
-                ))
-            })?;
+        let task = current_task_state(&ctx, "TestTaskNode")?;
         let task_validation_commands = task.validation_commands.clone();
 
         // Write-verification guard runs before the harness suite so a
@@ -1654,29 +1678,17 @@ impl Node for TriageTaskNode {
             .cloned()
             .ok_or_else(|| NodeError::new("TestTaskNode has not run yet"))?;
         let current = current_task_fields(&ctx)?.clone();
-        let current_task_id = current
-            .get("current_task_id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
-            as u32;
 
-        // `attempt_count`/`max_attempts` must come from the *live* durable
-        // state, not `current` (`TaskQueueRouterNode`'s snapshot, frozen at
-        // task dispatch): `IncrementAttemptNode` mutates the durable state on
-        // every retry back-edge but never re-runs `TaskQueueRouterNode`, so a
-        // read from `current` would see `attempt_count == 0` forever and the
-        // bail gate below would never fire. See this spec's Amendment Log
-        // (EN.3.B retry-bail fix).
-        let state = latest_state(&ctx)?;
-        let task = state
-            .tasks
-            .iter()
-            .find(|task| task.task_id == current_task_id)
-            .ok_or_else(|| {
-                NodeError::new(format!(
-                    "TriageTaskNode: no task with task_id={current_task_id} found in state"
-                ))
-            })?;
+        // `attempt_count`/`max_attempts` come from the *live* durable state via
+        // the shared [`current_task_state`] helper, not from `current`
+        // (`TaskQueueRouterNode`'s per-dispatch snapshot). `attempt_count` on
+        // that snapshot is now re-stamped by `IncrementAttemptNode`
+        // (`ticket-restamp-attempt-count`), so the two agree — but the durable
+        // state stays the single authority for the bail gate: it is what
+        // `bump_attempt` actually mutates, and `max_attempts` is only ever
+        // sourced from there. See this spec's Amendment Log (EN.3.B
+        // retry-bail fix).
+        let task = current_task_state(&ctx, "TriageTaskNode")?;
         let attempt_count = u64::from(task.attempt_count);
         let max_attempts = u64::from(task.max_attempts);
 
@@ -2142,6 +2154,15 @@ fn bump_attempt(state: &mut SDLCState, task_id: u32) -> Result<(), NodeError> {
 /// state, so the increment cannot live in `TriageRouterNode`'s or
 /// `ReviewRouterNode`'s routing logic itself — it must be a real `Node`
 /// sitting on both back-edges, between the router and `ImplementTaskNode`.
+///
+/// It also **re-stamps `attempt_count` onto `TaskQueueRouterNode`'s output**
+/// (`ticket-restamp-attempt-count`). That entry is a snapshot taken once at
+/// dequeue; before this fix nothing refreshed it, so
+/// `current_task_fields(ctx)["attempt_count"]` read `0` on every retry and
+/// three separate call sites had grown comments warning readers off it. The
+/// re-stamp is a read-modify-write of the existing JSON object — every other
+/// field the router stamped (`title`, `description`, `acceptance_criteria`,
+/// `max_attempts`) survives untouched.
 pub struct IncrementAttemptNode;
 
 #[async_trait::async_trait]
@@ -2155,6 +2176,24 @@ impl Node for IncrementAttemptNode {
 
         let mut state = latest_state(&ctx)?;
         bump_attempt(&mut state, current_task_id)?;
+
+        // Re-stamp the router snapshot's `attempt_count` with the value
+        // `bump_attempt` just wrote, so `current_task_fields` stops lying on
+        // the retry back-edge. Read-modify-write: touch only this one key.
+        let bumped = state
+            .tasks
+            .iter()
+            .find(|task| task.task_id == current_task_id)
+            .map(|task| task.attempt_count);
+        if let Some(attempt_count) = bumped {
+            if let Some(entry) = ctx
+                .nodes
+                .get_mut("TaskQueueRouterNode")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                entry.insert("attempt_count".to_string(), json!(attempt_count));
+            }
+        }
 
         let value = serde_json::to_value(&state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
@@ -2546,19 +2585,27 @@ mod tests {
         assert!(!block.contains("clippy"), "block: {block}");
     }
 
-    /// Retry detection must not depend on `attempt_count`: it is stamped
-    /// once at dequeue and reads `0` on every retry (see
-    /// [`prior_attempt_feedback`]'s docs). A ctx whose `attempt_count` is `0`
-    /// but which carries a failed `TestTaskNode` result is a retry, and must
-    /// produce feedback.
+    /// Retry detection keys on the failed result, never on `attempt_count`
+    /// (see [`prior_attempt_feedback`]'s docs). Retired and replaced the
+    /// former `prior_attempt_feedback_ignores_a_stale_zero_attempt_count`,
+    /// which pinned the same behavior but justified it by the router stamp
+    /// being *stale* — a premise `ticket-restamp-attempt-count` made false.
+    /// The behavior is unchanged and still worth pinning: a ctx carrying a
+    /// failed `TestTaskNode` result must produce feedback regardless of what
+    /// the counter reads.
     #[test]
-    fn prior_attempt_feedback_ignores_a_stale_zero_attempt_count() {
-        let mut ctx = ctx_with_node("TestTaskNode", failed_test_result("error[E0308]"));
-        ctx.nodes.insert(
-            "TaskQueueRouterNode".to_string(),
-            json!({ "current_task_id": 1, "attempt_count": 0, "max_attempts": 3 }),
-        );
-        assert!(prior_attempt_feedback(&ctx, &RetryFeedback::default()).is_some());
+    fn prior_attempt_feedback_keys_on_the_failed_result_not_the_attempt_count() {
+        for attempt_count in [0, 1, 7] {
+            let mut ctx = ctx_with_node("TestTaskNode", failed_test_result("error[E0308]"));
+            ctx.nodes.insert(
+                "TaskQueueRouterNode".to_string(),
+                json!({ "current_task_id": 1, "attempt_count": attempt_count, "max_attempts": 3 }),
+            );
+            assert!(
+                prior_attempt_feedback(&ctx, &RetryFeedback::default()).is_some(),
+                "expected feedback at attempt_count={attempt_count}"
+            );
+        }
     }
 
     #[test]
@@ -3292,6 +3339,53 @@ mod tests {
             serde_json::from_value(out.nodes["IncrementAttemptNode"].clone()).unwrap();
         assert_eq!(bumped.tasks[0].attempt_count, 2);
         assert_eq!(bumped.telemetry.total_attempts, 2);
+    }
+
+    /// `ticket-restamp-attempt-count`: the router snapshot's `attempt_count`
+    /// is refreshed on the retry back-edge, so
+    /// `current_task_fields(&ctx)["attempt_count"]` stops reading `0` forever.
+    /// Every other field of that entry must survive verbatim — the fix is a
+    /// read-modify-write, not a rebuild.
+    #[tokio::test]
+    async fn increment_attempt_node_restamps_the_router_attempt_count() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.acceptance_criteria = vec!["ac-1".to_string(), "ac-2".to_string()];
+        task.max_attempts = 5;
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let before = current_task_fields(&ctx).expect("router stamped").clone();
+        assert_eq!(before["attempt_count"], json!(0), "precondition");
+
+        let node = IncrementAttemptNode;
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let after = current_task_fields(&out).expect("router entry still present");
+        assert_eq!(after["attempt_count"], json!(1));
+        for key in [
+            "current_task_id",
+            "title",
+            "description",
+            "acceptance_criteria",
+            "max_attempts",
+        ] {
+            assert_eq!(after[key], before[key], "{key} must survive the re-stamp");
+        }
+        assert_eq!(
+            after.as_object().map(serde_json::Map::len),
+            before.as_object().map(serde_json::Map::len),
+            "the re-stamp must not add or drop keys"
+        );
+
+        // Compounds across back-edges exactly like the durable counter does.
+        let out = node
+            .process(out)
+            .await
+            .expect("second retry should succeed");
+        assert_eq!(
+            current_task_fields(&out).expect("router entry still present")["attempt_count"],
+            json!(2)
+        );
     }
 
     #[tokio::test]

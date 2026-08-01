@@ -378,6 +378,44 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
          retry back-edge re-entering it), got {implement_running_snapshots}"
     );
 
+    // --- Mid-retry, the router stamp tells the truth -----------------------
+    // `ticket-restamp-attempt-count`: `TaskQueueRouterNode`'s output is a
+    // snapshot taken once at dequeue. `IncrementAttemptNode` now re-stamps its
+    // `attempt_count`, so every node downstream of the back-edge reads the
+    // real attempt number instead of a permanent `0`. Assert it through the
+    // live graph, not just the unit fixture.
+    let post_increment_snapshots: Vec<&TaskContext> = snapshots
+        .iter()
+        .filter(|ctx| {
+            ctx.node_runs
+                .get("IncrementAttemptNode")
+                .map(|run| run.status == NodeRunStatus::Success)
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !post_increment_snapshots.is_empty(),
+        "IncrementAttemptNode should have completed at least once"
+    );
+    for ctx in &post_increment_snapshots {
+        let current = ctx
+            .nodes
+            .get("TaskQueueRouterNode")
+            .expect("TaskQueueRouterNode should have stamped the current task");
+        assert_eq!(
+            current["attempt_count"], 1,
+            "post-back-edge snapshots must report the bumped attempt_count, not \
+             the stale dequeue-time 0"
+        );
+        // The re-stamp is a read-modify-write: the dispatch fields survive.
+        assert_eq!(current["current_task_id"], 1);
+        assert_eq!(current["max_attempts"], 2);
+        assert!(
+            current["title"].as_str().is_some_and(|t| !t.is_empty()),
+            "title must survive the re-stamp: {current}"
+        );
+    }
+
     // --- Final task + telemetry state --------------------------------------
     let update_result = final_ctx
         .nodes
