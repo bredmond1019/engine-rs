@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-02T21:30:00Z"
+timestamp: "2026-08-02T22:13:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,35 @@ related: [status, context]
 ---
 
 ## [run: 2026-08-02]
+
+### Live review path verified — carryover cleared, hardening train archived
+- **What:** Consumed the handoff and closed its items. (1) **Verified the live review path**:
+  rebuilt the stale `bastion` release binary (it predated `7247f40`/`3b5d33c`), started `bastion
+  serve` with the engine mount (`DATABASE_URL=…/orchestration_dev`, `ENGINE_BRAIN_ROOT` set), and
+  triggered `SDLC_FLOW` run `049b5fc0` (`smoke-sdlc-flow`, `repo: engine-rs`, `use_worktree`,
+  `profile: cheap-fast`, per-run override `policy.review_mode: per_task`). Run reached `status:
+  done`; `ConsolidatedReviewNode` returned a **live haiku PASS verdict over the real committed
+  diff** — `{"verdict": "PASS", "summary": "SMOKE.md created at root with ENGINE-SMOKE content.
+  Both acceptance criteria met.", "review_diff_truncated": false}` with `ResolvedPolicy` confirming
+  `review_mode: per_task` + `review: haiku`. Evidence pulled from the durable Postgres `events`
+  row. Deleted carryover `sdlc-live-review-never-observed` (its `clears_when` is met); smoke
+  worktree/branch/state cleaned. (2) Committed C1's launchd section in the HQ repo
+  (`docs/infrastructure.md`, `133bb563`). (3) **Archived `planning/sdlc-flow-hardening/`** via
+  /archive: residue distilled to `knowledge.md` (3 entries) + `memory.md` (5 entries) + new
+  decision `D14-dirty-tree-abort-safety-invariant`; graph check net-clean (also fixed 3
+  pre-existing dangling `related:` edges). (4) Deleted the consumed `planning/handoff.md`.
+  **`sdlc-flow.js` retirement is now unblocked but deliberately NOT decided/executed** — the JS
+  harness stays the production driver until an explicit decision is logged.
+- **Why:** The handoff's first item — the last unverified property of the hardening train. Until a
+  live model was observed reviewing a real non-empty diff, "the Rust SDLC_FLOW is proven end to
+  end" could not be claimed for the review path, and the JS engine could not be considered
+  retirable.
+- **Caveat:** the serve process used for the verification was reaped by the session harness
+  (~SIGTERM at turn end) *after* the run completed — the run itself finished cleanly; for
+  longer-lived serves, launch fully detached (`setsid`) rather than as a session background task.
+- **Refs:** `planning/archive/sdlc-flow-hardening/`, `planning/decisions/D14-dirty-tree-abort-safety-invariant.md`,
+  HQ `133bb563`; carryovers remaining: `sdlc-review-routed-to-cloud-pending-local-model`,
+  `eval-cloud-vs-local-comparison`, `en7d-brain-root-not-set-in-deployment` (Mac Mini human step).
 
 ### Review routed to cloud, local->cloud fallback bug fixed, handoff written
 - **What:** Following the hardening train, routed `SDLC_FLOW`'s review stage off the unprovisioned
