@@ -68,11 +68,14 @@ fn resolved_policy(ctx: &TaskContext) -> Result<SdlcPolicy, NodeError> {
     crate::policy::resolved_policy_strict::<SdlcPolicy>(ctx)
 }
 
-/// Apply the resolved policy's model-tier + prompt-cache knobs to a stage's
-/// `Config`, then append the `output_verbosity` directive to `prompt`.
-/// Returns `(config, prompt)`. Delegates to the generic
+/// Apply the resolved policy's model-tier, prompt-cache and call-timeout
+/// knobs to a stage's `Config`, then append the `output_verbosity` directive
+/// to `prompt`. Returns `(config, prompt)`. Delegates to the generic
 /// `crate::policy::shaping::{apply_model_tier, apply_prompt_cache,
-/// apply_verbosity_directive}` (EN.4.0).
+/// apply_call_timeout, apply_verbosity_directive}` (EN.4.0).
+///
+/// `policy.timeouts` is all-`None` by default, so the `apply_call_timeout`
+/// call is a no-op unless a run explicitly sets a per-stage timeout.
 fn apply_policy(
     config: Config,
     prompt: String,
@@ -84,9 +87,15 @@ fn apply_policy(
         Stage::Triage => policy.model_tiers.triage,
         Stage::Review => policy.model_tiers.review,
     };
+    let timeout_secs = match stage {
+        Stage::Implement => policy.timeouts.implement,
+        Stage::Triage => policy.timeouts.triage,
+        Stage::Review => policy.timeouts.review,
+    };
     let config = crate::policy::apply_model_tier(config, tier, &policy.local.model);
     let config =
         crate::policy::apply_prompt_cache(config, policy.prompt_cache, STABLE_SYSTEM_PROMPT);
+    let config = crate::policy::apply_call_timeout(config, timeout_secs);
     let prompt = crate::policy::apply_verbosity_directive(prompt, policy.output_verbosity);
 
     (config, prompt)
@@ -2098,6 +2107,90 @@ mod tests {
         Arc::new(|_config, _prompt| {
             panic!("transport should not be invoked for a deterministic branch")
         })
+    }
+
+    // --- apply_policy: per-stage call timeouts ------------------------------
+
+    /// The behavior-stability guarantee: an unconfigured policy (the built-in
+    /// default) leaves `Config.timeout` at `None` for **every** stage, so a
+    /// run that sets nothing is byte-identical to pre-knob behavior and still
+    /// falls through to `claude-code-rs`'s own 300s default.
+    #[test]
+    fn apply_policy_leaves_timeout_none_for_every_stage_by_default() {
+        let policy = SdlcPolicy::default();
+        for stage in [Stage::Implement, Stage::Triage, Stage::Review] {
+            let (config, _) = apply_policy(Config::default(), "p".to_string(), &policy, stage);
+            assert_eq!(
+                config.timeout, None,
+                "stage {stage:?} should set no timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_policy_sets_the_resolved_per_stage_timeout() {
+        let policy = SdlcPolicy {
+            timeouts: crate::workflows::sdlc_flow::policy::CallTimeouts {
+                implement: Some(600),
+                triage: Some(90),
+                review: Some(120),
+            },
+            ..SdlcPolicy::default()
+        };
+
+        let (implement, _) = apply_policy(
+            Config::default(),
+            "p".to_string(),
+            &policy,
+            Stage::Implement,
+        );
+        assert_eq!(implement.timeout, Some(std::time::Duration::from_secs(600)));
+
+        let (triage, _) = apply_policy(Config::default(), "p".to_string(), &policy, Stage::Triage);
+        assert_eq!(triage.timeout, Some(std::time::Duration::from_secs(90)));
+
+        let (review, _) = apply_policy(Config::default(), "p".to_string(), &policy, Stage::Review);
+        assert_eq!(review.timeout, Some(std::time::Duration::from_secs(120)));
+    }
+
+    /// A per-stage `None` inside an otherwise-configured `timeouts` block is
+    /// still a no-op for that stage — the knob is opt-in stage by stage.
+    #[test]
+    fn apply_policy_timeout_is_per_stage_not_global() {
+        let policy = SdlcPolicy {
+            timeouts: crate::workflows::sdlc_flow::policy::CallTimeouts {
+                implement: Some(600),
+                ..Default::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let (triage, _) = apply_policy(Config::default(), "p".to_string(), &policy, Stage::Triage);
+        assert_eq!(triage.timeout, None);
+        let (review, _) = apply_policy(Config::default(), "p".to_string(), &policy, Stage::Review);
+        assert_eq!(review.timeout, None);
+    }
+
+    /// End-to-end through the real four-layer resolver: an event-level
+    /// `policy.timeouts.implement` override reaches the built `Config`.
+    #[test]
+    fn event_override_timeout_resolves_through_to_config() {
+        use crate::workflows::sdlc_flow::policy::{resolve, PartialCallTimeouts, PartialPolicy};
+
+        let event = PartialPolicy {
+            timeouts: Some(PartialCallTimeouts {
+                implement: Some(1800),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let policy = resolve(SdlcPolicy::default(), None, None, Some(&event));
+        let (config, _) = apply_policy(
+            Config::default(),
+            "p".to_string(),
+            &policy,
+            Stage::Implement,
+        );
+        assert_eq!(config.timeout, Some(std::time::Duration::from_secs(1800)));
     }
 
     // --- TaskQueueRouterNode -----------------------------------------------

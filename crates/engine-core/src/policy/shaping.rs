@@ -5,6 +5,8 @@
 //! workflow's model nodes can reuse them instead of re-deriving the same
 //! three lines of `Config` plumbing.
 
+use std::time::Duration;
+
 use claude_code_rs::Config;
 
 use super::tier::{model_tier_to_model_string, ModelTier, OutputVerbosity};
@@ -26,6 +28,19 @@ pub fn apply_model_tier(mut config: Config, tier: ModelTier, local_model: &str) 
 pub fn apply_prompt_cache(mut config: Config, enabled: bool, stable_system_prompt: &str) -> Config {
     if enabled {
         config.system_prompt = Some(stable_system_prompt.to_string());
+    }
+    config
+}
+
+/// When `timeout_secs` is `Some`, set `config.timeout` to that many seconds
+/// — the whole-call timeout `claude_code_rs`'s `execute()` enforces. A true
+/// no-op when `None`, leaving `config.timeout` at whatever the caller's
+/// `Config` already carried (`None` from `Config::default()`, which is
+/// `claude-code-rs`'s own unconfigured 300s default).
+#[must_use]
+pub fn apply_call_timeout(mut config: Config, timeout_secs: Option<u64>) -> Config {
+    if let Some(secs) = timeout_secs {
+        config.timeout = Some(Duration::from_secs(secs));
     }
     config
 }
@@ -84,6 +99,28 @@ mod tests {
     fn apply_prompt_cache_is_noop_when_disabled() {
         let config = apply_prompt_cache(Config::default(), false, "stable prefix");
         assert_eq!(config.system_prompt, None);
+    }
+
+    #[test]
+    fn apply_call_timeout_is_noop_when_none() {
+        let config = apply_call_timeout(Config::default(), None);
+        assert_eq!(config.timeout, None);
+    }
+
+    #[test]
+    fn apply_call_timeout_sets_duration_when_some() {
+        let config = apply_call_timeout(Config::default(), Some(30));
+        assert_eq!(config.timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn apply_call_timeout_none_leaves_a_preexisting_timeout_alone() {
+        let base = Config {
+            timeout: Some(Duration::from_secs(45)),
+            ..Config::default()
+        };
+        let config = apply_call_timeout(base, None);
+        assert_eq!(config.timeout, Some(Duration::from_secs(45)));
     }
 
     #[test]

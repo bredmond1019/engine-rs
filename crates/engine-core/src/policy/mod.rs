@@ -26,7 +26,9 @@ pub use profiles::{
     stamp_resolved_policy, PolicyConfigSource, RESOLVED_POLICY_IDENTITY,
 };
 pub use resolve::{merge_opt, resolve, Policy};
-pub use shaping::{apply_model_tier, apply_prompt_cache, apply_verbosity_directive};
+pub use shaping::{
+    apply_call_timeout, apply_model_tier, apply_prompt_cache, apply_verbosity_directive,
+};
 pub use telemetry::{
     harvest as harvest_telemetry, observed_model_tiers, RunTelemetry, RunTelemetryInputs,
 };
