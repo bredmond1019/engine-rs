@@ -45,6 +45,7 @@ TIMEOUT_MINUTES="${SDLC_SMOKE_TIMEOUT_MINUTES:-20}"
 
 MODE="trigger"
 WATCH_ID=""
+REPO_SLUG=""
 
 print_help() {
     cat <<'EOF'
@@ -54,7 +55,21 @@ Usage:
   sdlc_smoke.sh              Trigger a fresh SDLC_FLOW run (spec_slug
                               "smoke-sdlc-flow", use_worktree, no auto_pr,
                               profile cheap-fast) and poll it to a terminal
-                              state.
+                              state. The target root falls back to the
+                              serve process's cwd (no "repo" field sent).
+  sdlc_smoke.sh --repo SLUG  Trigger a fresh SDLC_FLOW run with an explicit
+                              "repo": "SLUG" field in the event body, so the
+                              target root is resolved via the registry
+                              (RepoRegistry) instead of the serve process's
+                              cwd. SLUG is a registry slug, never a path
+                              (e.g. "engine-rs", matching
+                              agentic-portfolio/brain.toml). Requires
+                              ENGINE_BRAIN_ROOT to be set on the SERVE
+                              PROCESS (not on this script's process) — see
+                              docs/deployment-launchd.md. Without it, a
+                              repo-bearing event 422s with "no repo
+                              registry is available to resolve it". Cannot
+                              be combined with --watch or --clean.
   sdlc_smoke.sh --watch ID    Skip the trigger; attach to and poll an
                               existing run_id/event_id.
   sdlc_smoke.sh --clean       Cleanup only — no trigger, no watch.
@@ -68,6 +83,8 @@ Environment (scripts/.env, gitignored, or already-exported):
   SDLC_SMOKE_POLL_INTERVAL  Seconds between polls (default: 3)
   SDLC_SMOKE_TIMEOUT_MINUTES  Minutes before giving up on a live run
                              (default: 20)
+  ENGINE_BRAIN_ROOT         Required on the serve process (not here) for a
+                             --repo-bearing event to resolve at all.
 
 Terminal statuses: succeeded | failed | cancelled | budget_halted
 Live statuses:      running | suspended
@@ -95,6 +112,14 @@ while [ $# -gt 0 ]; do
             MODE="clean"
             shift
             ;;
+        --repo)
+            REPO_SLUG="${2:-}"
+            if [ -z "$REPO_SLUG" ]; then
+                echo "error: --repo requires a registry-slug argument" >&2
+                exit 3
+            fi
+            shift 2
+            ;;
         --help|-h)
             print_help
             exit 0
@@ -106,6 +131,11 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if [ -n "$REPO_SLUG" ] && [ "$MODE" != "trigger" ]; then
+    echo "error: --repo cannot be combined with --watch or --clean" >&2
+    exit 3
+fi
 
 # ── Cleanup-only mode ────────────────────────────────────────────────────────
 #
@@ -157,12 +187,23 @@ fi
 EVENT_ID=""
 
 if [ "$MODE" = "trigger" ]; then
-    echo "Triggering SDLC_FLOW (spec_slug=smoke-sdlc-flow, use_worktree=true, auto_pr=false, profile=cheap-fast) at $BASTION_ADDR ..."
+    EVENT_BODY='{"workflow_type":"SDLC_FLOW","data":{"spec_slug":"smoke-sdlc-flow","use_worktree":true,"auto_pr":false,"profile":"cheap-fast"}}'
+    if [ -n "$REPO_SLUG" ]; then
+        EVENT_BODY='{"workflow_type":"SDLC_FLOW","data":{"spec_slug":"smoke-sdlc-flow","repo":"'"$REPO_SLUG"'","use_worktree":true,"auto_pr":false,"profile":"cheap-fast"}}'
+    fi
+
+    if [ -n "$REPO_SLUG" ]; then
+        echo "Triggering SDLC_FLOW (spec_slug=smoke-sdlc-flow, repo=$REPO_SLUG, use_worktree=true, auto_pr=false, profile=cheap-fast) at $BASTION_ADDR ..."
+        echo "Target mode: registry-resolved (repo=$REPO_SLUG; requires ENGINE_BRAIN_ROOT on the serve process)."
+    else
+        echo "Triggering SDLC_FLOW (spec_slug=smoke-sdlc-flow, use_worktree=true, auto_pr=false, profile=cheap-fast) at $BASTION_ADDR ..."
+        echo "Target mode: cwd fallback (no repo field sent; target root is the serve process's current_dir())."
+    fi
 
     TRIGGER=$(curl -sf -X POST "$BASTION_ADDR/events/" \
         -H "X-API-Key: $BASTION_ENGINE_API_KEY" \
         -H "Content-Type: application/json" \
-        -d '{"workflow_type":"SDLC_FLOW","data":{"spec_slug":"smoke-sdlc-flow","use_worktree":true,"auto_pr":false,"profile":"cheap-fast"}}')
+        -d "$EVENT_BODY")
 
     EVENT_ID=$(echo "$TRIGGER" | python3 -c "import json,sys; print(json.load(sys.stdin).get('event_id',''))" 2>/dev/null)
 

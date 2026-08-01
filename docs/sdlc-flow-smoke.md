@@ -50,6 +50,41 @@ unmet.
 6. **`trees/sdlc/smoke-sdlc-flow` must not already exist** — run `scripts/sdlc_smoke.sh --clean`
    first.
 
+## The `scripts/sdlc_smoke.sh --repo` flag
+
+`scripts/sdlc_smoke.sh` (task 6, `EN.3.J`) accepts an optional `--repo <slug>` flag that adds an
+explicit `"repo": "<slug>"` field to the triggered event's `data` object, so the run is targeted
+via the registry (`RepoRegistry`) instead of the serve process's cwd. `<slug>` is a registry slug,
+never a path — e.g. `--repo engine-rs`, matching `agentic-portfolio/brain.toml`'s
+`repo_path = "core/engine-rs"` entry.
+
+**Two event-body variants:**
+
+- **Without `--repo` (cwd fallback, the pre-`EN.3.K` path):**
+  ```json
+  { "workflow_type": "SDLC_FLOW",
+    "data": { "spec_slug": "smoke-sdlc-flow", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
+  ```
+- **With `--repo engine-rs` (registry-resolved, the `EN.3.K` path):**
+  ```json
+  { "workflow_type": "SDLC_FLOW",
+    "data": { "spec_slug": "smoke-sdlc-flow", "repo": "engine-rs", "use_worktree": true, "auto_pr": false, "profile": "cheap-fast" } }
+  ```
+
+**Hard prerequisite for the `--repo` variant:** a `repo`-bearing event requires `ENGINE_BRAIN_ROOT`
+to be set on the **serve process** (not on the script's own process) — without it,
+`RepoRegistry::from_env()` cannot resolve and every `repo`-bearing event 422s with `"no repo
+registry is available to resolve it"` (`crates/engine-serve/src/http.rs:443-450`; see
+[deployment-launchd.md](deployment-launchd.md)).
+
+`--repo` takes a required argument (a missing one is a usage error, exit 3) and cannot be combined
+with `--watch` or `--clean` (also a usage error). The trigger banner names which mode a run is in.
+
+**The two-run procedure** this smoke now follows: run 1 triggers without `--repo` (engine
+acceptance — proves the graph walk against the cwd fallback), run 2 triggers with `--repo
+engine-rs` (deployment acceptance — proves the always-on launchd deployment's registry resolution
+path, per `EN.3.K`). See tasks 7 and 9 of `planning/EN.3.J-sdlc-flow-smoke/tasks.md`.
+
 ## The event body and why every flag is load-bearing
 
 ```json
