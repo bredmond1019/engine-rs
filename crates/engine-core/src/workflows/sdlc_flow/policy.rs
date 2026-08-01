@@ -435,6 +435,7 @@ pub fn model_tiers_by_stage(tiers: &ModelTiers) -> BTreeMap<&'static str, ModelT
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::test_support::assert_json_subset;
     use crate::workflows::sdlc_flow::profiles;
 
     #[test]
@@ -886,18 +887,30 @@ mod tests {
     /// `SdlcPolicy` resolution — the concrete guard that the refactor
     /// changed nothing observable.
     ///
-    /// The `"timeouts":{...all null}` block was appended to this golden when
-    /// the per-stage call-timeout knob landed. Every value is `null` — the
-    /// new field is present in the serialized shape but carries no override,
-    /// so resolution is unchanged for every pre-existing knob.
+    /// **This assertion is additive-tolerant.** The literal below is still
+    /// the pinned expectation, but it is compared with
+    /// [`assert_json_subset`] rather than byte-for-byte: every key/value it
+    /// names must be present and equal in the freshly-resolved output, while
+    /// keys the output has that the literal lacks are ignored. So adding a
+    /// new `SdlcPolicy` knob no longer requires hand-editing this string,
+    /// yet any drift in an *existing* resolved value — or a field
+    /// disappearing, or a list changing length — still fails, naming the
+    /// diverging JSON path. The single property given up versus the old
+    /// `assert_eq!` on the serialized string is field *order* stability,
+    /// which nothing depends on.
     ///
-    /// The trailing `"retry_feedback":{"enabled":true,"max_chars":4000}`
-    /// block was appended when the retry-feedback knob landed. Unlike
-    /// `timeouts`, its default is deliberately NOT a no-op (see
-    /// `RetryFeedback`'s docs); every pre-existing knob's resolved value in
-    /// this golden is nonetheless unchanged.
+    /// (Historically this test was byte-identical and every additive knob
+    /// paid a papercut here: `"timeouts":{...all null}` was appended when
+    /// the per-stage call-timeout knob landed — all-`null`, i.e. present in
+    /// the shape but carrying no override — and
+    /// `"retry_feedback":{"enabled":true,"max_chars":4000}` when the
+    /// retry-feedback knob landed, whose default is deliberately NOT a no-op
+    /// (see `RetryFeedback`'s docs). In both cases every pre-existing knob's
+    /// resolved value was unchanged, which is exactly the property this test
+    /// now checks directly. New knobs need no edit here; if you want one
+    /// pinned, add it to the literal.)
     #[test]
-    fn resolve_output_is_byte_identical_to_pre_hoist_baseline() {
+    fn resolve_output_matches_pre_hoist_baseline_subset() {
         let harness = PartialPolicy {
             max_attempts: Some(4),
             ..Default::default()
@@ -917,6 +930,11 @@ mod tests {
 
         let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
 
-        assert_eq!(serde_json::to_string(&resolved).unwrap(), expected);
+        let expected: serde_json::Value =
+            serde_json::from_str(expected).expect("pinned baseline literal parses as JSON");
+        let actual: serde_json::Value =
+            serde_json::to_value(&resolved).expect("resolved policy serializes to JSON");
+
+        assert_json_subset(&expected, &actual);
     }
 }
