@@ -5,10 +5,12 @@ description: Decomposed task spec for EN.5.F — spawn the run instead of awaiti
 doc_id: en-5-f-async-run-lifecycle-tasks
 layer: [engine]
 project: engine-rs
-status: active
+status: archived
 keywords: [async-lifecycle, sse, run-readback, actix, budget, live-state, data-contract]
 related: [en-5-e-composition-primitives-tasks, en-6-a-egress-dispatch]
 ---
+
+> Archived 2026-08-01 — residue distilled into knowledge.md/memory.md
 
 # Task Spec — Phase 5, Block F
 

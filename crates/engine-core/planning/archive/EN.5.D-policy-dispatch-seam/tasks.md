@@ -5,10 +5,12 @@ description: Decomposed task spec for making the EN.4.0 policy framework reachab
 doc_id: en-5-d-policy-dispatch-seam-tasks
 layer: [engine]
 project: engine-rs
-status: active
+status: archived
 keywords: [policy, dispatch, telemetry, local model tier, overlay, profiles]
 related: [master-plan, D7-shared-policy-framework, D4-claude-code-transport-choice]
 ---
+
+> Archived 2026-08-01 — residue distilled into knowledge.md/memory.md
 
 # Task Spec — Phase 5, Block D — Policy/telemetry productionization
 
