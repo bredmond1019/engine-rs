@@ -1092,8 +1092,8 @@ mod tests {
         let cheap_fast = profiles::cheap_fast();
         let resolved = resolve(SdlcPolicy::default(), None, Some(&cheap_fast), None);
         assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
-        assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
-        assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+        assert_eq!(resolved.model_tiers.triage, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.review, ModelTier::Haiku);
         assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
         assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
         // `cheap-fast` sets `generate`/`docs` down to Haiku (cost floor).
@@ -1116,8 +1116,8 @@ mod tests {
         assert_eq!(resolved.max_attempts, 9);
         // Profile still supplies everything the event didn't touch.
         assert_eq!(resolved.model_tiers.implement, ModelTier::Haiku);
-        assert_eq!(resolved.model_tiers.triage, ModelTier::Local);
-        assert_eq!(resolved.model_tiers.review, ModelTier::Local);
+        assert_eq!(resolved.model_tiers.triage, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.review, ModelTier::Haiku);
         assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
         assert_eq!(resolved.review_mode, ReviewMode::TrivialSkip);
     }
@@ -1186,7 +1186,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"haiku\",\"triage\":\"haiku\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
 
         let expected: serde_json::Value =
             serde_json::from_str(expected).expect("pinned baseline literal parses as JSON");

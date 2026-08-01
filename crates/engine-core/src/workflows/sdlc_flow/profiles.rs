@@ -39,17 +39,26 @@ pub fn baseline() -> PartialPolicy {
     }
 }
 
-/// Cheapest/fastest profile: `haiku` implement, local triage+review, terse
+/// Cheapest/fastest profile: `haiku` on every stage it pins, terse
 /// output, trivial-task review skip, `test_depth: fast` (the cost/latency
 /// floor — per-task check selection is the single largest lever in this
 /// repo, per CLAUDE.md's measured 2m44s -> 6.4s).
+///
+/// `triage` and `review` were `local` until 2026-08-01. They are cloud
+/// (`haiku`) now because the `local` tier's default Ollama model is not
+/// pulled on every machine that runs this workflow, and a missing model is
+/// not a graceful degradation — `ConsolidatedReviewNode` died on a live run
+/// with `HTTP 404 ... selected model (qwen2.5:3b) ... may not exist`.
+/// `haiku` keeps this profile's cost floor intact. Routing these stages back
+/// to `local` is a deliberate future revisit, gated on the local models
+/// actually being provisioned.
 #[must_use]
 pub fn cheap_fast() -> PartialPolicy {
     PartialPolicy {
         model_tiers: Some(PartialModelTiers {
             implement: Some(ModelTier::Haiku),
-            triage: Some(ModelTier::Local),
-            review: Some(ModelTier::Local),
+            triage: Some(ModelTier::Haiku),
+            review: Some(ModelTier::Haiku),
             // Both agentic/task-authoring stages drop to Haiku — the cost
             // floor. Deliberately NOT `Local`: the local tier is scoped to
             // single-shot judgment calls, not an agentic docs writer or the
@@ -62,22 +71,31 @@ pub fn cheap_fast() -> PartialPolicy {
         output_verbosity: Some(OutputVerbosity::Terse),
         review_mode: Some(ReviewMode::TrivialSkip),
         test_depth: Some(TestDepth::Fast),
-        // The cost/latency floor for the reviewer prompt. Also the profile
-        // that most needs a floor: `review` runs on the `local` tier, whose
-        // context window is a fraction of a cloud model's.
+        // The cost/latency floor for the reviewer prompt — a spend choice,
+        // not a capacity limit. This number was originally sized for a
+        // LOCAL reviewer's context window; now that `review` is `haiku`,
+        // 20_000 chars is conservative for the window actually available.
+        // Kept unchanged deliberately: it is still a defensible floor for
+        // the cheapest profile, and re-tuning it is its own follow-up.
         review_diff_max_chars: Some(20_000),
         ..Default::default()
     }
 }
 
-/// Balanced profile: `sonnet` implement, local review, prompt caching on,
+/// Balanced profile: `sonnet` implement, `sonnet` review, prompt caching on,
 /// trivial-task review skip, `llm_triage` on, `test_depth: fast`.
+///
+/// `review` was `local` until 2026-08-01; it is `sonnet` now for the same
+/// reason `cheap-fast` moved to `haiku` (the local tier's model is not
+/// provisioned on every machine, and its absence is a hard HTTP 404 inside
+/// `ConsolidatedReviewNode`, not a degradation). `sonnet` matches this
+/// profile's `implement` tier, keeping its balance intact.
 #[must_use]
 pub fn pragmatist() -> PartialPolicy {
     PartialPolicy {
         model_tiers: Some(PartialModelTiers {
             implement: Some(ModelTier::Sonnet),
-            review: Some(ModelTier::Local),
+            review: Some(ModelTier::Sonnet),
             generate: Some(ModelTier::Opus),
             docs: Some(ModelTier::Sonnet),
             ..Default::default()
@@ -86,9 +104,11 @@ pub fn pragmatist() -> PartialPolicy {
         review_mode: Some(ReviewMode::TrivialSkip),
         llm_triage: Some(true),
         test_depth: Some(TestDepth::Fast),
-        // Above `cheap-fast`, below the cloud-reviewer ceiling: this profile
-        // also reviews on the `local` tier, so its bound is set by that
-        // model's context window, not by willingness to spend.
+        // Above `cheap-fast`, below `batch-reviewer`'s ceiling — a middle
+        // spend/latency setting, not a capacity limit. Like `cheap-fast`'s
+        // 20_000, this number was sized when `review` ran on the `local`
+        // tier and is therefore conservative for the Sonnet window it now
+        // has. Left unchanged on purpose; re-tuning is a separate follow-up.
         review_diff_max_chars: Some(40_000),
         ..Default::default()
     }
@@ -151,8 +171,9 @@ mod tests {
         let p = cheap_fast();
         let tiers = p.model_tiers.expect("model_tiers set");
         assert_eq!(tiers.implement, Some(ModelTier::Haiku));
-        assert_eq!(tiers.triage, Some(ModelTier::Local));
-        assert_eq!(tiers.review, Some(ModelTier::Local));
+        // Cloud, not `Local` — see `cheap_fast`'s doc comment (2026-08-01).
+        assert_eq!(tiers.triage, Some(ModelTier::Haiku));
+        assert_eq!(tiers.review, Some(ModelTier::Haiku));
         assert_eq!(tiers.generate, Some(ModelTier::Haiku));
         assert_eq!(tiers.docs, Some(ModelTier::Haiku));
         assert_eq!(p.output_verbosity, Some(OutputVerbosity::Terse));
@@ -165,7 +186,8 @@ mod tests {
         let p = pragmatist();
         let tiers = p.model_tiers.expect("model_tiers set");
         assert_eq!(tiers.implement, Some(ModelTier::Sonnet));
-        assert_eq!(tiers.review, Some(ModelTier::Local));
+        // Cloud, not `Local` — see `pragmatist`'s doc comment (2026-08-01).
+        assert_eq!(tiers.review, Some(ModelTier::Sonnet));
         assert_eq!(tiers.generate, Some(ModelTier::Opus));
         assert_eq!(tiers.docs, Some(ModelTier::Sonnet));
         assert_eq!(p.prompt_cache, Some(true));
