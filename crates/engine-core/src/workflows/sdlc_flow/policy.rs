@@ -108,6 +108,47 @@ pub struct CallTimeouts {
     pub review: Option<u64>,
 }
 
+/// Whether (and how much of) the previous attempt's failure output is fed
+/// back into `ImplementTaskNode`'s prompt on a retry.
+///
+/// **Deliberate deviation from CLAUDE.md standing rule 6's
+/// "behavior-stable built-in default".** Every other knob in this file
+/// defaults to reproducing today's behavior; this one does not. Feeding the
+/// prior failure back into the retry prompt *is* the fix this knob ships —
+/// a default-off knob would leave the retry loop structurally incapable of
+/// self-correction (the live bail that motivated it: three byte-identical
+/// attempts against two trivial compile errors). What the knob buys is a
+/// cost bound (`max_chars`) and an escape hatch, not opt-in-ness.
+///
+/// Hand-written `Default` (like [`ModelTiers`], unlike [`CallTimeouts`])
+/// because the intended default is NOT the all-zero/all-false derive value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryFeedback {
+    /// Feed the prior attempt's failure output into the retry prompt.
+    pub enabled: bool,
+    /// Upper bound, in characters, on the whole rendered feedback block —
+    /// so repeated retries cannot grow the prompt without limit.
+    pub max_chars: u32,
+}
+
+impl Default for RetryFeedback {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_chars: 4000,
+        }
+    }
+}
+
+/// All-optional mirror of [`RetryFeedback`]. Mirrors [`PartialModelTiers`]'
+/// derive set exactly — notably **no** `Copy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialRetryFeedback {
+    pub enabled: Option<bool>,
+    pub max_chars: Option<u32>,
+}
+
 /// Which pipeline stages `close-out` (EN.2.x) is allowed to reuse from a
 /// prior flow record rather than re-running (lever #1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -146,6 +187,9 @@ pub struct SdlcPolicy {
     pub llm_triage: bool,
     pub max_attempts: u32,
     pub close_out: CloseOut,
+    /// Whether the previous attempt's failure output is fed back into
+    /// `ImplementTaskNode`'s retry prompt, and how large that block may get.
+    pub retry_feedback: RetryFeedback,
 }
 
 impl Default for SdlcPolicy {
@@ -169,6 +213,8 @@ impl Default for SdlcPolicy {
             llm_triage: false,
             max_attempts: 3,
             close_out: CloseOut::default(),
+            // NOT behavior-stable, deliberately — see `RetryFeedback`'s docs.
+            retry_feedback: RetryFeedback::default(),
         }
     }
 }
@@ -194,6 +240,7 @@ pub struct PartialPolicy {
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
     pub close_out: Option<PartialCloseOut>,
+    pub retry_feedback: Option<PartialRetryFeedback>,
 }
 
 /// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
@@ -269,6 +316,18 @@ fn merge_call_timeouts(mut base: CallTimeouts, over: &PartialCallTimeouts) -> Ca
     base
 }
 
+/// Merge one `PartialRetryFeedback` override layer over a `RetryFeedback`
+/// base, field by field. Mirrors [`merge_model_tiers`].
+fn merge_retry_feedback(mut base: RetryFeedback, over: &PartialRetryFeedback) -> RetryFeedback {
+    if let Some(v) = over.enabled {
+        base.enabled = v;
+    }
+    if let Some(v) = over.max_chars {
+        base.max_chars = v;
+    }
+    base
+}
+
 fn merge_close_out_reuse(mut base: CloseOutReuse, over: &PartialCloseOutReuse) -> CloseOutReuse {
     if let Some(v) = over.validation {
         base.validation = v;
@@ -330,6 +389,10 @@ impl crate::policy::Policy for SdlcPolicy {
             close_out: match &over.close_out {
                 Some(co) => merge_close_out(base.close_out, co),
                 None => base.close_out,
+            },
+            retry_feedback: match &over.retry_feedback {
+                Some(rf) => merge_retry_feedback(base.retry_feedback, rf),
+                None => base.retry_feedback,
             },
         }
     }
@@ -407,6 +470,105 @@ mod tests {
         assert_eq!(timeouts.triage, None);
         assert_eq!(timeouts.review, None);
         assert_eq!(timeouts, CallTimeouts::default());
+    }
+
+    /// Change-detector pinning this knob's built-in default. Unlike the
+    /// other change-detectors in this module it does NOT pin "today's
+    /// behavior" — it pins a deliberate behavior change: `enabled: true` is
+    /// the fix (see `RetryFeedback`'s docs for the rule-6 deviation).
+    #[test]
+    fn builtin_default_retry_feedback_is_enabled() {
+        let rf = SdlcPolicy::default().retry_feedback;
+        assert!(rf.enabled);
+        assert_eq!(rf.max_chars, 4000);
+        assert_eq!(
+            rf,
+            RetryFeedback {
+                enabled: true,
+                max_chars: 4000
+            }
+        );
+    }
+
+    #[test]
+    fn merge_retry_feedback_overrides_only_the_fields_it_sets() {
+        let base = RetryFeedback {
+            enabled: true,
+            max_chars: 4000,
+        };
+        let over = PartialRetryFeedback {
+            enabled: None,
+            max_chars: Some(500),
+        };
+        let merged = merge_retry_feedback(base, &over);
+        // `None` in the override leaves the base value alone.
+        assert!(merged.enabled);
+        assert_eq!(merged.max_chars, 500);
+
+        let off = PartialRetryFeedback {
+            enabled: Some(false),
+            max_chars: None,
+        };
+        let merged = merge_retry_feedback(base, &off);
+        assert!(!merged.enabled);
+        assert_eq!(merged.max_chars, 4000);
+    }
+
+    #[test]
+    fn retry_feedback_resolves_through_all_four_layers_in_precedence_order() {
+        let harness = PartialPolicy {
+            retry_feedback: Some(PartialRetryFeedback {
+                enabled: Some(false),
+                max_chars: Some(100),
+            }),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            retry_feedback: Some(PartialRetryFeedback {
+                enabled: Some(true),
+                max_chars: Some(200),
+            }),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            retry_feedback: Some(PartialRetryFeedback {
+                max_chars: Some(300),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        // event > profile > harness > builtin.
+        assert_eq!(resolved.retry_feedback.max_chars, 300);
+        // event left `enabled` unset, so the profile's value survives.
+        assert!(resolved.retry_feedback.enabled);
+
+        // Only harness -> harness wins over builtin.
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, None);
+        assert!(!resolved.retry_feedback.enabled);
+        assert_eq!(resolved.retry_feedback.max_chars, 100);
+
+        // Nothing anywhere -> the built-in default.
+        let untouched = resolve(SdlcPolicy::default(), None, None, None);
+        assert_eq!(untouched.retry_feedback, RetryFeedback::default());
+    }
+
+    #[test]
+    fn deserializes_partial_retry_feedback_from_harness_json_shape() {
+        let json = r#"{ "retry_feedback": { "max_chars": 1500 } }"#;
+        let partial: PartialPolicy = serde_json::from_str(json).expect("valid PartialPolicy JSON");
+        let rf = partial
+            .retry_feedback
+            .as_ref()
+            .expect("retry_feedback present");
+        assert_eq!(rf.max_chars, Some(1500));
+        // Absent fields stay `None` and fall through on merge.
+        assert_eq!(rf.enabled, None);
     }
 
     #[test]
@@ -728,6 +890,12 @@ mod tests {
     /// the per-stage call-timeout knob landed. Every value is `null` — the
     /// new field is present in the serialized shape but carries no override,
     /// so resolution is unchanged for every pre-existing knob.
+    ///
+    /// The trailing `"retry_feedback":{"enabled":true,"max_chars":4000}`
+    /// block was appended when the retry-feedback knob landed. Unlike
+    /// `timeouts`, its default is deliberately NOT a no-op (see
+    /// `RetryFeedback`'s docs); every pre-existing knob's resolved value in
+    /// this golden is nonetheless unchanged.
     #[test]
     fn resolve_output_is_byte_identical_to_pre_hoist_baseline() {
         let harness = PartialPolicy {
@@ -747,7 +915,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"local\",\"triage\":\"local\",\"generate\":\"sonnet\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
 
         assert_eq!(serde_json::to_string(&resolved).unwrap(), expected);
     }
