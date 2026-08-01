@@ -1,12 +1,12 @@
 ---
 type: Reference
 title: SDLC Flow Workflow
-description: How the SDLC_FLOW workflow graph works — node roles, triggering from engine-rs and bastion, stopping a run, reading outputs, and inspecting/resuming state
+description: How the SDLC_FLOW workflow graph works — node roles, the run's commit topology and working-tree review diffs, triggering from engine-rs and bastion, stopping a run, reading outputs, and inspecting/resuming state
 doc_id: sdlc-flow-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [sdlc-flow, workflow, graph, nodes, resume, abort, cancellation, state, bastion, http]
+keywords: [sdlc-flow, workflow, graph, nodes, commit-topology, review-diff, resume, state, bastion]
 related: [sdlc-flow-policy, architecture, cli, data-contract]
 ---
 
@@ -58,16 +58,16 @@ are runtime-only — declared but not walked by the graph's acyclic-shape valida
 | `TestTaskNode` | Deterministic | Runs the worktree's `planning/harness.json` validation-suite `checks`. Only the `command` check kind is fully supported today — other declared kinds fail closed with a "not yet supported" message rather than silently passing. |
 | `TriageTaskNode` | Deterministic, **conditionally model** | Classifies the test result as `PASS` / `RETRYABLE` / `MAJOR_BAIL`. Deterministic by default; only calls the model (Sonnet, tunable) when `event.llm_triage == true` **and** the task is failing-but-under-budget — that LLM branch sets `config.json_schema` and prefers the model's structured output over fence-stripped text parsing, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Also reads policy on the `PASS` branch for deterministic trivial-diff classification (`review_skip_max_files`/`review_skip_max_diff_lines`), independent of `llm_triage`. |
 | `TriageRouterNode` | Deterministic router | On `TriageTaskNode`'s verdict: `PASS` → `ConsolidatedReviewNode` or `UpdateTaskStatusNode` (per policy's `review_mode`); `RETRYABLE` → `IncrementAttemptNode`; `MAJOR_BAIL` → `WrapUpNode`; any other/unrecognized verdict string → `WrapUpNode` (fallback, not `None`) with the offending string stamped as `unrecognized_verdict` on `TriageTaskNode`'s result. |
-| `ConsolidatedReviewNode` | **Model** (Sonnet, tunable via policy) | Reviews the task's `git diff main..HEAD` against acceptance criteria; parses `{verdict, summary, issues}`, preferring the model's structured output (`ctx.nodes["ConsolidatedReviewNode"]["structured"]`) over fence-stripped text parsing and falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Reads policy for model tier/prompt-cache/verbosity; can be rewired to the `local` tier. |
+| `ConsolidatedReviewNode` | **Model** (Sonnet, tunable via policy) | Reviews the task's **working-tree diff against `HEAD`** (`git add -N -A`, then `git diff HEAD` — see [Commit topology and what the reviewer sees](#commit-topology-and-what-the-reviewer-sees)) against acceptance criteria; parses `{verdict, summary, issues}`, preferring the model's structured output (`ctx.nodes["ConsolidatedReviewNode"]["structured"]`) over fence-stripped text parsing and falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Reads policy for model tier/prompt-cache/verbosity; can be rewired to the `local` tier. |
 | `ReviewRouterNode` | Deterministic router | On review verdict: `PASS` → `UpdateTaskStatusNode`; minor `FAIL`/`PARTIAL` (1–5 issues) → `IncrementAttemptNode`; structural `FAIL`/`PARTIAL` (0 or >5 issues) → `WrapUpNode` (bail); any other/unrecognized verdict string → `WrapUpNode` (fallback, not `None`) with the offending string stamped as `unrecognized_verdict` on `ConsolidatedReviewNode`'s result. |
 | `IncrementAttemptNode` | Deterministic | Shared retry back-edge target for `TriageRouterNode`'s `RETRYABLE` and `ReviewRouterNode`'s minor fail. Bumps `task.attempt_count` + telemetry, forwards to `ImplementTaskNode`. |
 | `UpdateTaskStatusNode` | Deterministic | Mutates the durable state: sets the task's status to `Done`/`Failed`, bumps telemetry counters. |
-| `SaveStateNode` | Deterministic | Serializes the latest `SDLCState` to `planning/<slug>/sdlc-flow-state.json` inside the worktree, `git add` + `git commit`. Runs once per completed task-loop iteration, then loops back to `TaskQueueRouterNode`. |
+| `SaveStateNode` | Deterministic | Serializes the latest `SDLCState` to `planning/<slug>/sdlc-flow-state.json` inside the worktree, then `git add -A` + `git commit -m "feat(sdlc): <task_id> — <title>"` — staging the task's **code**, not just the state file (which is gitignored in this repo — see the caveat under [Commit topology](#commit-topology-and-what-the-reviewer-sees)). Runs once per completed task-loop iteration (pass path only), then loops back to `TaskQueueRouterNode`. |
 | `FinalValidationNode` | Deterministic | The run-level authoritative gate (`EN.3.E`). Runs the worktree's `planning/harness.json` `validation.checks[]` at `TestDepth::Full` with NO `perTask` filter (`apply_per_task_filter = false`) and an empty `task_validation_commands` slice — so `cargo build --release` (marked `"perTask": false`) runs here even though `TestTaskNode` skips it. Sits on the task-loop drain branch only (`TaskQueueRouterNode`'s "no pending" edge), so it runs exactly once per run, never per task; the `ImplementTaskNode` branch and both routers' bail edges into `WrapUpNode` do not pass through it. It is unconditional and **not** policy-gated — no `SdlcPolicy` field, profile entry, or `harness.json` key changes whether it runs or at what depth (see [D12](../planning/decisions/D12-per-task-vs-final-check-depth.md) and the [two-check-site model](#the-two-check-site-model-per-task-tripwire-vs-final-gate) below). A failing gate does **not** halt the walk — it stamps `{all_passed, check_results, failure_summary}` (the same shape `TestTaskNode` emits) and returns `Ok`, so the run still reaches `EmitStateNode` and `WrapUpNode` reports a degraded terminal status rather than bailing. |
 | `PatchDocsNode` | **Model** (Sonnet) | Reads the most recent `ImplementTaskNode`'s `modified_files`, asks the model to find and patch stale `docs/` references (the model edits files itself via its own tool use — this node doesn't). Sets `config.json_schema` and prefers the model's structured output (`ctx.nodes["PatchDocsNode"]["structured"]`) over fence-stripped text parsing for its own `{summary, files_patched}` output, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Hardcoded to Sonnet; does not read policy. |
-| `WrapUpNode` | Deterministic | Computes the PASS/PARTIAL-FAIL outcome, renders `log_entry`/`report`/`status_suggestion` text, stamps `policy` + `RunOutcomes` telemetry into `SDLCState`, and persists that stamped state to `sdlc-flow-state.json` — the only point the `policy`/`outcomes` blocks reach disk, since `SaveStateNode` never runs again after the loop exits. Also `git add`/`git commit`s that write itself (via the same shared `commit_state_file` helper `SaveStateNode` uses), so a `--worktree` run's PR now contains its own terminal state (EN.3.G task 3). Terminal target for both routers' bail branches, and the natural end of a fully-passing run. |
+| `WrapUpNode` | Deterministic | Computes the PASS/PARTIAL-FAIL outcome, renders `log_entry`/`report`/`status_suggestion` text, stamps `policy` + `RunOutcomes` telemetry into `SDLCState`, and persists that stamped state to `sdlc-flow-state.json` — the only point the `policy`/`outcomes` blocks reach disk, since `SaveStateNode` never runs again after the loop exits. Also `git add -A` + `git commit -m "chore(sdlc): wrap-up — docs patch + terminal state"` (via the same shared `commit_all` helper `SaveStateNode` uses), so a `--worktree` run's PR contains its own terminal state (EN.3.G task 3) **and** `PatchDocsNode`'s doc edits, which nothing else commits. Terminal target for both routers' bail branches, and the natural end of a fully-passing run. |
 | `PullRequestNode` | Deterministic | Pushes the branch and opens a PR via `gh pr create` — never auto-merges (human review gate, decision D25). No-op (`{pr_url: null, skipped: true}`) when `event.auto_pr == false` (default `true`). |
-| `EmitStateNode` | Deterministic | Runs `mev emit-state --write` in the worktree to refresh the brain freshness spine. Also patches the committed `sdlc-flow-state.json`'s `pr` block (`url`/`number`, parsed from `PullRequestNode`'s PR URL) in place and re-commits it via `commit_state_file`, since `PullRequestNode` runs after `WrapUpNode` and so cannot have populated that block itself (EN.3.G task 6). Infallible best-effort: any failure mode (skipped PR, no worktree, missing/unparsable state file) is a silent no-op. Terminal node. |
+| `EmitStateNode` | Deterministic | Runs `mev emit-state --write` in the worktree to refresh the brain freshness spine. Also patches the committed `sdlc-flow-state.json`'s `pr` block (`url`/`number`, parsed from `PullRequestNode`'s PR URL) in place and re-commits it via `commit_all`, since `PullRequestNode` runs after `WrapUpNode` and so cannot have populated that block itself (EN.3.G task 6). Infallible best-effort: any failure mode (skipped PR, no worktree, missing/unparsable state file) is a silent no-op. Terminal node. |
 
 **Nodes that read the tunable policy:** `SetupWorktreeNode` (resolves it, but idempotently as of
 `EN.5.D` — a served run's dispatch factory, `engine-serve::register_sdlc_flow`, already resolves
@@ -80,6 +80,66 @@ policy was seeded yet — in-tree/CLI-driven runs and unit tests driving this no
 `ConsolidatedReviewNode` get rewired to the local-model transport. Every other node either has a
 hardcoded model choice (`GenerateTasksNode`: Opus, `PatchDocsNode`: Sonnet) or makes no model call
 at all. Full knob-by-knob reference: [sdlc-flow-policy.md](sdlc-flow-policy.md).
+
+### Commit topology and what the reviewer sees
+
+**The invariant:** `HEAD` carries every previously completed task's code; the working tree's delta
+against `HEAD` is exactly the current task's in-progress work.
+
+That falls out of where the commits are:
+
+| Commit | Made by | Message | Contents |
+|---|---|---|---|
+| One per **passed task** | `SaveStateNode` | `feat(sdlc): <task_id> — <title>` | that task's code (plus `sdlc-flow-state.json` where `planning/` is tracked — see the caveat below) |
+| One per **run**, at the end | `WrapUpNode` | `chore(sdlc): wrap-up — docs patch + terminal state` | `PatchDocsNode`'s doc edits (plus the terminal state, same caveat) |
+
+> **Caveat — the state file is NOT committed in engine-rs.** `planning/` here is a gitignored
+> symlink into the brain vault (`.gitignore` `/planning`), so `git add -A` cannot stage
+> `planning/<slug>/sdlc/sdlc-flow-state.json` and these commits carry code only. That was equally
+> true before the staging widened (`git add <ignored-path>` also no-opped), and it is why
+> `log_noop_commit`'s quiet path exists at all. In a repo that tracks `planning/`, the state file
+> does ride along. Do not read EN.3.G's "a `--worktree` run's PR contains its own terminal state"
+> as satisfied in this repo.
+
+`SaveStateNode` sits only on the pass path (`UpdateTaskStatusNode → SaveStateNode`). The retry path
+(`TriageRouterNode`/`ReviewRouterNode → IncrementAttemptNode → ImplementTaskNode`) never reaches it,
+so **a failed attempt commits nothing** — its edits stay in the working tree and the next attempt's
+review sees the cumulative current attempt. Nothing leaks into the *next* task, because the previous
+task's commit moved `HEAD` past it.
+
+The wrap-up commit runs before `PullRequestNode`'s `git push` (drain order is
+`FinalValidationNode → PatchDocsNode → WrapUpNode → PullRequestNode`), which is what puts the docs
+patch on the pushed branch — `docs.rs` makes no git calls of its own.
+
+**On a `MAJOR_BAIL`**, the bailed task never reaches `SaveStateNode`, so its partial, unvalidated
+work is swept into the wrap-up commit. This is deliberate: visible attempted work on a draft-PR
+handoff beats silently discarding it.
+
+> **Blast radius — `use_worktree` defaults to `false`.** `add -A` and `add -N -A` are TREE-WIDE,
+> and on the default event path (`use_worktree: false`) `SetupWorktreeNode` checks the run's branch
+> out in the **operator's live repository** (`worktree_path == "."`), not under `trees/<branch>`.
+> A run started there will sweep any unrelated dirty file in that checkout into its commits, and
+> the intent-to-add pass writes to that repository's index. There is currently **no dirty-tree
+> guard** on that path, unlike `.claude/workflows/sdlc-flow.js`, whose branch mode aborts setup
+> when `git status --porcelain` prints anything. **Prefer `use_worktree: true`** for any run you do
+> not want touching the ambient tree; adding the guard (and/or flipping the default) is tracked
+> separately.
+
+**What the reviewer and the trivial-skip classifier read.** Both take the working tree against
+`HEAD` — `git add -N -A` (intent-to-add) followed by `git diff HEAD` for `ConsolidatedReviewNode`
+and `git diff --numstat HEAD` for `classify_trivial`. The intent-to-add pass is what makes
+brand-new untracked files appear in the diff with their full content (as `+` lines) and in the
+numstat with their real line counts; without it git would ignore them entirely, and implementer
+agents routinely create new files. A binary untracked file numstats as `-\t-\t<path>` and hits the
+classifier's existing conservative non-trivial arm.
+
+> **Why this is not a commit range.** These diffs used to be taken over `<base_sha>..HEAD`, where
+> `base_sha` is the SHA `SetupWorktreeNode` stamps at setup time. Since nothing in a run ever
+> committed the implementer's code, that range was empty on **every** run: the reviewer was shown
+> an empty diff (so every `PASS` verdict was a rubber stamp), `classify_trivial` always counted 0
+> files / 0 lines (so `ReviewMode::TrivialSkip` skipped the review unconditionally), and an
+> `auto_pr` run pushed a branch whose only commits were state files. `SetupWorktreeNode` still
+> stamps `base_sha` as run metadata, but nothing derives a diff from it.
 
 ### The two-check-site model: per-task tripwire vs. final gate
 

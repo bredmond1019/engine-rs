@@ -66,6 +66,11 @@ use uuid::Uuid;
 /// (EN.5.D task 8: downstream task-loop/wrap-up nodes now read the stamp
 /// strictly, no per-node re-resolution or silent `Default` fallback), the
 /// same as the real `SetupWorktreeNode::process` does.
+///
+/// Note it has never stamped `base_sha`. Since
+/// `ticket-commit-task-work-real-diffs` that is not a gap at all: review and
+/// trivial-skip diffs are taken as working-tree-vs-`HEAD`, so no diff base is
+/// derived from the stamp and its absence cannot change what a run reviews.
 struct FixtureSetupNode {
     worktree_path: String,
 }
@@ -322,11 +327,50 @@ fn gh_stub_runner() -> (CommandRunner, Arc<Mutex<Vec<String>>>) {
 /// from [`graph::schema`], paired with a registry where every model/
 /// subprocess node is stubbed and every other identity is the real
 /// implementation.
+/// `git_runner` is shared by EVERY node in the run that shells out to git on
+/// the flow's own behalf — `SaveStateNode`, `WrapUpNode`, and
+/// `PullRequestNode`. Sharing one injected runner is what lets a single
+/// recording stub observe the run's whole git call SEQUENCE in order, which
+/// is how the commit-topology regressions below assert that per-task commits
+/// land before the wrap-up commit and that the wrap-up commit lands before
+/// the push. It also closes a hermeticity hole: `WrapUpNode::new()` used to
+/// be registered un-injected, so it carried `default_command_runner` and
+/// really did spawn `git` from the temp worktree.
 fn build_workflow(
     worktree: &Path,
     test_runner: CommandRunner,
-    pr_runner: CommandRunner,
+    git_runner: CommandRunner,
     emit_state_runner: CommandRunner,
+) -> Workflow {
+    build_workflow_with_docs(
+        worktree,
+        test_runner,
+        git_runner,
+        emit_state_runner,
+        default_docs_node(),
+    )
+}
+
+/// The `PatchDocsNode` stub [`build_workflow`] installs: reports a clean
+/// sweep and writes nothing.
+fn default_docs_node() -> PatchDocsNode {
+    PatchDocsNode::new().with_transport(Arc::new(|_config, _prompt| {
+        let outcome = stub_outcome(
+            &json!({ "summary": "no stale docs found", "files_patched": [] }).to_string(),
+        );
+        Box::pin(async move { Ok(outcome) })
+    }))
+}
+
+/// [`build_workflow`] with the `PatchDocsNode` stub supplied by the caller —
+/// used by the docs-committed regression, which needs a docs stage that
+/// really writes a file into the worktree.
+fn build_workflow_with_docs(
+    worktree: &Path,
+    test_runner: CommandRunner,
+    git_runner: CommandRunner,
+    emit_state_runner: CommandRunner,
+    docs_node: PatchDocsNode,
 ) -> Workflow {
     let mut registry = NodeRegistry::new();
 
@@ -355,7 +399,14 @@ fn build_workflow(
     registry.register(Box::new(
         TestTaskNode::new().with_runner(test_runner.clone()),
     ));
-    registry.register(Box::new(TriageTaskNode::new()));
+    // `TriageTaskNode` calls `classify_trivial` unconditionally on its PASS
+    // branch, which shells out to git (`add -N -A`, then
+    // `diff --numstat HEAD`). Registered un-injected it would carry
+    // `default_command_runner` and really spawn those in the temp worktree —
+    // breaking this suite's hermeticity claim, and now with a MUTATING call.
+    registry.register(Box::new(
+        TriageTaskNode::new().with_runner(git_runner.clone()),
+    ));
     registry.register(Box::new(TriageRouterNode));
 
     registry.register(Box::new(
@@ -373,16 +424,9 @@ fn build_workflow(
     registry.register(Box::new(ReviewRouterNode));
     registry.register(Box::new(UpdateTaskStatusNode));
     registry.register(Box::new(
-        SaveStateNode::new().with_runner(noop_git_runner()),
+        SaveStateNode::new().with_runner(git_runner.clone()),
     ));
-    registry.register(Box::new(PatchDocsNode::new().with_transport(Arc::new(
-        |_config, _prompt| {
-            let outcome = stub_outcome(
-                &json!({ "summary": "no stale docs found", "files_patched": [] }).to_string(),
-            );
-            Box::pin(async move { Ok(outcome) })
-        },
-    ))));
+    registry.register(Box::new(docs_node));
     registry.register(Box::new(IncrementAttemptNode));
     // Reuses `test_runner` (the option `EN.3.E` task 4's spec calls out)
     // rather than adding a fifth `build_workflow` parameter: `TestTaskNode`
@@ -393,8 +437,8 @@ fn build_workflow(
     registry.register(Box::new(
         FinalValidationNode::new().with_runner(test_runner),
     ));
-    registry.register(Box::new(WrapUpNode::new()));
-    registry.register(Box::new(PullRequestNode::new().with_runner(pr_runner)));
+    registry.register(Box::new(WrapUpNode::new().with_runner(git_runner.clone())));
+    registry.register(Box::new(PullRequestNode::new().with_runner(git_runner)));
     registry.register(Box::new(
         EmitStateNode::new().with_runner(emit_state_runner),
     ));
@@ -813,4 +857,380 @@ async fn failing_final_validation_gate_still_reaches_emit_state_with_degraded_re
         .as_str()
         .unwrap()
         .is_empty());
+}
+
+// --- commit topology (ticket-commit-task-work-real-diffs task 6) -----------
+
+/// Shared handle to a recorded `(program, argv)` call log.
+type RecordedCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+/// A `git`-shaped recording runner for the flow's own git calls. Records
+/// `(program, argv)` for every invocation in order and returns empty success,
+/// so the whole run's commit sequence can be asserted. `git status` is
+/// special-cased the same way [`always_pass_runner`] does — but note this
+/// runner is injected into `SaveStateNode`/`WrapUpNode`/`PullRequestNode`,
+/// not `TestTaskNode`, so it never sees the harness checks.
+fn recording_git_runner() -> (CommandRunner, RecordedCalls) {
+    let calls: RecordedCalls = Arc::new(Mutex::new(Vec::new()));
+    let calls_clone = calls.clone();
+    let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+        calls_clone.lock().unwrap().push((
+            program.to_string(),
+            args.iter().map(|s| (*s).to_string()).collect(),
+        ));
+        Ok(CommandOutput {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    });
+    (runner, calls)
+}
+
+/// Index of every `git commit` in a recorded call log.
+fn commit_indices(calls: &[(String, Vec<String>)]) -> Vec<usize> {
+    calls
+        .iter()
+        .enumerate()
+        .filter(|(_, (program, args))| {
+            program == "git" && args.first().map(String::as_str) == Some("commit")
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The commit message of the `git commit` at `index`.
+fn commit_message(calls: &[(String, Vec<String>)], index: usize) -> &str {
+    calls[index].1[2].as_str()
+}
+
+/// **The commit topology this ticket establishes**, asserted end to end over
+/// a real two-task run of the assembled graph:
+///
+/// - each passed task produces exactly one `git add -A` + `git commit` pair,
+///   with the task id in the message (so `HEAD` carries that task's code and
+///   state, and the next task's working-tree diff is only its own work);
+/// - the wrap-up produces exactly one further commit;
+/// - the wrap-up commit strictly PRECEDES `git push` — this is what puts
+///   `PatchDocsNode`'s doc edits (`docs.rs` makes no git calls at all) on the
+///   branch that gets pushed, and what makes an auto-PR contain real code
+///   instead of state files only.
+#[tokio::test]
+async fn per_task_and_wrap_up_commits_land_in_order_before_the_push() {
+    let worktree = temp_worktree("commit-topology");
+    let task_count = 2;
+    write_fixture_files(&worktree, task_count, 2);
+
+    let (git_runner, calls) = recording_git_runner();
+    let workflow = build_workflow(
+        &worktree,
+        always_pass_runner(),
+        git_runner,
+        noop_git_runner(),
+    );
+
+    let event = json!({ "spec_slug": "fixture-e2e-spec", "auto_pr": true });
+    workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let recorded = calls.lock().unwrap();
+    let commits = commit_indices(&recorded);
+    assert_eq!(
+        commits.len(),
+        task_count as usize + 1,
+        "expected one commit per passed task plus one wrap-up commit: {recorded:?}"
+    );
+
+    // Every commit is immediately preceded by `git add -A` — the widened
+    // staging that carries CODE, not just the state file.
+    for &i in &commits {
+        assert!(i > 0, "a commit must be preceded by its add: {recorded:?}");
+        assert_eq!(recorded[i - 1].0, "git");
+        assert_eq!(
+            recorded[i - 1].1,
+            vec!["add".to_string(), "-A".to_string()],
+            "commit at {i} was not preceded by `git add -A`: {recorded:?}"
+        );
+    }
+
+    // The per-task commits carry their task ids, in task order.
+    assert!(commit_message(&recorded, commits[0]).starts_with("feat(sdlc): 1 —"));
+    assert!(commit_message(&recorded, commits[1]).starts_with("feat(sdlc): 2 —"));
+    // ...and the last commit is the wrap-up's.
+    let wrap_up_commit = commits[2];
+    assert_eq!(
+        commit_message(&recorded, wrap_up_commit),
+        "chore(sdlc): wrap-up — docs patch + terminal state"
+    );
+
+    // The wrap-up commit precedes the push, so the pushed branch contains it.
+    let push_index = recorded
+        .iter()
+        .position(|(program, args)| {
+            program == "git" && args.first().map(String::as_str) == Some("push")
+        })
+        .expect("the auto_pr run should have pushed");
+    assert!(
+        wrap_up_commit < push_index,
+        "wrap-up commit (at {wrap_up_commit}) must precede the push (at {push_index}): {recorded:?}"
+    );
+}
+
+/// `PatchDocsNode` runs BEFORE `WrapUpNode` on the drain branch and makes no
+/// git calls of its own, so the wrap-up's `git add -A` is the only thing that
+/// can land a doc patch on the branch. Pins that ordering: the wrap-up's
+/// staging is recorded strictly after `PatchDocsNode` completed, and still
+/// before the push.
+#[tokio::test]
+async fn wrap_up_stages_after_patch_docs_ran_and_before_the_push() {
+    let worktree = temp_worktree("docs-committed");
+    write_fixture_files(&worktree, 1, 2);
+
+    // Records, for each `git add -A`, whether the docs stage's file was
+    // already on disk when that staging ran. That is what actually proves the
+    // wrap-up's staging can see the doc patch — an ordering assertion over
+    // argv alone would pass even if PatchDocsNode wrote nothing.
+    let doc_file = worktree.join("docs").join("patched.md");
+    let doc_present_at_add: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let doc_present_clone = doc_present_at_add.clone();
+    let doc_file_probe = doc_file.clone();
+    let (recorder, calls) = recording_git_runner();
+    let git_runner: CommandRunner = Arc::new(move |program, args, cwd| {
+        if program == "git" && args == ["add", "-A"] {
+            doc_present_clone
+                .lock()
+                .unwrap()
+                .push(doc_file_probe.exists());
+        }
+        recorder(program, args, cwd)
+    });
+
+    // A PatchDocsNode whose stubbed transport actually WRITES a doc file into
+    // the worktree, exactly as a real docs patch would — so there is genuine
+    // uncommitted content for the wrap-up commit to sweep up.
+    let docs_worktree = worktree.clone();
+    let docs_node = PatchDocsNode::new().with_transport(Arc::new(move |_config, _prompt| {
+        let docs_dir = docs_worktree.join("docs");
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("patched.md"), "# patched by the docs stage\n").unwrap();
+        let outcome = stub_outcome(
+            &json!({ "summary": "patched one doc", "files_patched": ["docs/patched.md"] })
+                .to_string(),
+        );
+        Box::pin(async move { Ok(outcome) })
+    }));
+
+    let workflow = build_workflow_with_docs(
+        &worktree,
+        always_pass_runner(),
+        git_runner,
+        noop_git_runner(),
+        docs_node,
+    );
+
+    let event = json!({ "spec_slug": "fixture-e2e-spec", "auto_pr": true });
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    assert_eq!(
+        final_ctx.node_runs["PatchDocsNode"].status,
+        NodeRunStatus::Success
+    );
+
+    let recorded = calls.lock().unwrap();
+    let commits = commit_indices(&recorded);
+    let wrap_up_commit = *commits.last().expect("a wrap-up commit must exist");
+    assert_eq!(
+        commit_message(&recorded, wrap_up_commit),
+        "chore(sdlc): wrap-up — docs patch + terminal state",
+        "the LAST commit must be the wrap-up's, i.e. after PatchDocsNode ran"
+    );
+    let push_index = recorded
+        .iter()
+        .position(|(program, args)| {
+            program == "git" && args.first().map(String::as_str) == Some("push")
+        })
+        .expect("the auto_pr run should have pushed");
+    assert!(wrap_up_commit < push_index);
+
+    // The doc file really was written, and really was on disk by the time the
+    // LAST `git add -A` (the wrap-up's) ran — so that staging would pick it
+    // up. The per-task staging ran before PatchDocsNode and did not see it.
+    assert!(
+        doc_file.exists(),
+        "the docs stage should have written its file"
+    );
+    let presence = doc_present_at_add.lock().unwrap();
+    assert_eq!(
+        presence.first(),
+        Some(&false),
+        "the per-task staging runs before PatchDocsNode, so the doc must be absent then"
+    );
+    assert_eq!(
+        presence.last(),
+        Some(&true),
+        "the wrap-up staging runs after PatchDocsNode, so the doc must be present then: \
+         {presence:?}"
+    );
+}
+
+/// **Retry-leak check.** The retry path (`TriageRouterNode`/`ReviewRouterNode`
+/// → `IncrementAttemptNode` → `ImplementTaskNode`) never touches
+/// `SaveStateNode`, so a failed attempt must produce NO commit — its work
+/// stays in the working tree, where the next attempt's `git diff HEAD` sees
+/// it cumulatively. Only the eventual pass commits, exactly once.
+#[tokio::test]
+async fn a_failed_attempt_commits_nothing_and_the_pass_commits_once() {
+    let worktree = temp_worktree("retry-leak");
+    write_fixture_files(&worktree, 1, 3);
+
+    // Fails the harness check on the first attempt, passes on every attempt
+    // after — the fail-then-pass shape from the retry-feedback suite.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let test_runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+        if program == "git" && args.first() == Some(&"status") {
+            return Ok(CommandOutput {
+                status: 0,
+                stdout: " M src/lib.rs\n".to_string(),
+                stderr: String::new(),
+            });
+        }
+        let n = attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(CommandOutput {
+            status: i32::from(n == 0),
+            stdout: String::new(),
+            stderr: if n == 0 {
+                "first attempt fails".to_string()
+            } else {
+                String::new()
+            },
+        })
+    });
+
+    let (git_runner, calls) = recording_git_runner();
+    let workflow = build_workflow(&worktree, test_runner, git_runner, noop_git_runner());
+
+    let event = json!({ "spec_slug": "fixture-e2e-spec", "auto_pr": false });
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    // The run really did retry.
+    assert!(
+        final_ctx.node_runs.contains_key("IncrementAttemptNode"),
+        "the fixture should have driven at least one retry"
+    );
+
+    let recorded = calls.lock().unwrap();
+    let commits = commit_indices(&recorded);
+    assert_eq!(
+        commits.len(),
+        2,
+        "exactly one per-task commit (after the pass) plus the wrap-up commit — \
+         a retry must not commit: {recorded:?}"
+    );
+    assert!(commit_message(&recorded, commits[0]).starts_with("feat(sdlc): 1 —"));
+    assert_eq!(
+        commit_message(&recorded, commits[1]),
+        "chore(sdlc): wrap-up — docs patch + terminal state"
+    );
+}
+
+/// **The one test in this suite that runs REAL git**, deliberately.
+///
+/// Every other assertion about the review diff stubs `CommandRunner` and can
+/// therefore only pin argv *shape*. But the load-bearing claim of
+/// `ticket-commit-task-work-real-diffs` is a claim about git SEMANTICS: that
+/// `git add -N -A` followed by `git diff HEAD` surfaces a brand-new untracked
+/// file's content to the reviewer. Plausible-argv-with-empty-semantics is
+/// exactly the failure mode that produced the original defect (the old
+/// `<base_sha>..HEAD` range was perfectly well-formed and always empty), so
+/// asserting argv alone would leave the real bug class unpinned.
+///
+/// Drives the real `ConsolidatedReviewNode` with its DEFAULT command runner
+/// against a throwaway repository, and asserts both a modified tracked file
+/// and a brand-new untracked file reach the reviewer's prompt.
+#[tokio::test]
+async fn real_git_intent_add_surfaces_untracked_content_in_the_review_prompt() {
+    let repo = temp_worktree("real-git");
+
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git should be available on PATH")
+    };
+
+    git(&["init", "--quiet"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("tracked.rs"), "fn original() {}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "base"]);
+
+    // The current "task's" work: one tracked edit + one brand-new file.
+    std::fs::write(repo.join("tracked.rs"), "fn edited() {}\n").unwrap();
+    std::fs::write(repo.join("brand_new.rs"), "fn newly_created() {}\n").unwrap();
+
+    let mut ctx = TaskContext {
+        event: json!({ "spec_slug": "fixture-e2e-spec" }),
+        nodes: std::collections::HashMap::new(),
+        metadata: json!({}),
+        node_runs: std::collections::HashMap::new(),
+    };
+    ctx.nodes.insert(
+        "SetupWorktreeNode".to_string(),
+        json!({ "worktree_path": repo.to_string_lossy() }),
+    );
+    ctx.nodes.insert(
+        "TaskQueueRouterNode".to_string(),
+        json!({ "current_task_id": 1, "title": "One", "acceptance_criteria": ["it works"] }),
+    );
+    let policy = engine_core::workflows::sdlc_flow::policy::SdlcPolicy::default();
+    engine_core::policy::stamp_resolved_policy(&mut ctx, &policy).unwrap();
+
+    let seen_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen_prompt_clone = seen_prompt.clone();
+    let node = ConsolidatedReviewNode::new().with_transport(Arc::new(move |_config, prompt| {
+        *seen_prompt_clone.lock().unwrap() = Some(prompt);
+        let outcome =
+            stub_outcome(&json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string());
+        Box::pin(async move { Ok(outcome) })
+    }));
+
+    node.process(ctx).await.expect("review should succeed");
+
+    let prompt = seen_prompt
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the transport should have been called");
+
+    assert!(
+        prompt.contains("fn edited()"),
+        "the modified tracked file must reach the reviewer:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("fn newly_created()"),
+        "the BRAND-NEW untracked file's content must reach the reviewer — this is what \
+         `git add -N -A` buys, and what a plain `git diff HEAD` would omit:\n{prompt}"
+    );
+    // The pre-existing content appears only as a REMOVED line, never as
+    // context the reviewer might mistake for new work.
+    assert!(
+        prompt.contains("-fn original()"),
+        "the replaced line should show as a deletion:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("+fn original()"),
+        "already-committed content must not be presented as this task's work:\n{prompt}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
 }

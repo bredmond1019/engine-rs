@@ -23,7 +23,7 @@ use engine_contract::TaskContext;
 use crate::node::{Node, NodeError};
 use crate::policy::emit_state::{CommandOutputLike, EmitStateNode as GenericEmitStateNode};
 
-use super::{commit_state_file, default_command_runner, get_result, CommandOutput, CommandRunner};
+use super::{commit_all, default_command_runner, get_result, CommandOutput, CommandRunner};
 
 use serde_json::json;
 
@@ -86,7 +86,9 @@ fn spec_slug(ctx: &TaskContext) -> Option<String> {
 /// the key, re-serialize) rather than round-tripping through `SDLCState`,
 /// so no other D31 field can be lost or reordered by an incomplete
 /// round-trip. Re-commits the patched file through the same
-/// [`commit_state_file`] helper every other state write uses.
+/// [`commit_all`] helper every other state write uses. This node runs
+/// LAST (after `PullRequestNode`), so the widened staging has nothing left
+/// to pick up beyond the state patch itself.
 ///
 /// A clean no-op (the file is left byte-for-byte untouched, and is never
 /// even opened) when:
@@ -145,7 +147,7 @@ fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
     if std::fs::write(&state_path, patched).is_err() {
         return;
     }
-    commit_state_file(runner, Path::new(&worktree), &state_path);
+    let _ = commit_all(runner, Path::new(&worktree), "chore: flow state update");
 }
 
 /// Deterministic node: runs `mev emit-state --write` in the worktree.

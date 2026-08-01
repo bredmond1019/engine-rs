@@ -34,7 +34,7 @@ use super::schema::{
     SDLCState, TerminalSignal,
 };
 use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
-use super::{commit_state_file, get_result, put_result, CommandRunner};
+use super::{commit_all, get_result, put_result, CommandRunner};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
 /// under test. Defaults to the real current UTC date
@@ -518,10 +518,15 @@ fn finalize_outcomes(
 
 /// Deterministic node: renders the wrap-up artifacts for a completed (or
 /// bailed) SDLC flow run, and (EN.3.G task 3) git-commits its terminal state
-/// write through the same [`super::commit_state_file`] seam
+/// write through the same [`super::commit_all`] seam
 /// `task_loop::SaveStateNode` uses — without this, the final `done`/
 /// `blocked` state landed on disk but was never committed, so a
 /// `--worktree` run's PR did not contain it.
+///
+/// Since that seam widened to `git add -A`, this commit is also the one that
+/// lands `PatchDocsNode`'s doc edits (and, on a MAJOR_BAIL, the bailed task's
+/// partial work) on the branch before `PullRequestNode` pushes — see the
+/// comment at the `commit_all` call site.
 pub struct WrapUpNode {
     clock: ClockFn,
     runner: CommandRunner,
@@ -664,7 +669,25 @@ impl Node for WrapUpNode {
                     final_validation.as_ref(),
                     terminal_signal.as_ref(),
                 )?;
-                commit_state_file(&self.runner, std::path::Path::new(&worktree), &state_path);
+                // The widened staging here is what finally commits
+                // `PatchDocsNode`'s doc edits. The drain order is
+                // `FinalValidationNode → PatchDocsNode → WrapUpNode →
+                // PullRequestNode` (`graph.rs`), and `docs.rs` makes no git
+                // calls of its own, so those edits sit uncommitted in the
+                // working tree until this line — which runs BEFORE
+                // `PullRequestNode`'s `git push`, so they reach the branch.
+                //
+                // On a MAJOR_BAIL this also sweeps up the bailed task's
+                // partial, unvalidated work (that task never reached
+                // `SaveStateNode`). That is deliberate: visible attempted
+                // work on a draft-PR handoff beats silently discarding it.
+                // Do not narrow this back to a file list to "keep the bail
+                // clean" — the discarded-work failure mode is worse.
+                let _ = commit_all(
+                    &self.runner,
+                    std::path::Path::new(&worktree),
+                    "chore(sdlc): wrap-up — docs patch + terminal state",
+                );
                 Some(saved)
             }
             None => None,
@@ -1427,15 +1450,20 @@ mod tests {
             .with_clock(fixed_clock("2026-07-31"))
             .with_runner(runner);
         let out = node.process(ctx).await.expect("process should succeed");
-        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+        let _saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].0, "git");
-        assert_eq!(recorded[0].1[0], "add");
-        assert_eq!(recorded[0].1[1], saved_to);
+        // `add -A`, not `add <state_path>`: the wrap-up commit is what
+        // finally lands `PatchDocsNode`'s doc edits on the branch.
+        assert_eq!(recorded[0].1, vec!["add".to_string(), "-A".to_string()]);
         assert_eq!(recorded[1].0, "git");
         assert_eq!(recorded[1].1[0], "commit");
+        assert_eq!(
+            recorded[1].1[2],
+            "chore(sdlc): wrap-up — docs patch + terminal state"
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

@@ -145,12 +145,18 @@ pub(super) fn stage_call_timeout(policy: &SdlcPolicy, stage: Stage) -> Option<u6
 /// Deterministically classify the current task's diff as "trivial" against
 /// the resolved policy's `review_skip_max_files`/`review_skip_max_diff_lines`
 /// thresholds (lever #3a, `trivial_skip` mode) — zero model tokens spent.
-/// Reads `git diff --numstat <base_sha>..HEAD` via the injectable
-/// [`CommandRunner`] seam: one line per changed file,
-/// `<added>\t<deleted>\t<path>`. The diff base is the SHA `SetupWorktreeNode`
-/// captured at worktree-setup time (see [`base_sha`]), falling back to
-/// `main..HEAD` when absent (e.g. unit tests with no `SetupWorktreeNode`
-/// output). Any unparsable line (e.g. a binary file's `-\t-\tpath`) is
+/// Reads `git diff --numstat HEAD` — the **working tree** against `HEAD`,
+/// preceded by [`stage_untracked_intent`] so new files are counted — via the
+/// injectable [`CommandRunner`] seam: one line per changed file,
+/// `<added>\t<deleted>\t<path>`.
+///
+/// This used to diff the COMMIT range `<base_sha>..HEAD`. Since nothing in
+/// the run ever committed code, that range was always empty, so every task
+/// classified as trivial (0 files / 0 lines) and `ReviewMode::TrivialSkip`
+/// skipped the review unconditionally. Under the commit topology established
+/// by [`super::commit_all`], `HEAD` holds every previously completed task's
+/// work, so the working-tree delta against it is exactly the current task's
+/// changes. Any unparsable line (e.g. a binary file's `-\t-\tpath`) is
 /// treated conservatively as non-trivial. Falls back to non-trivial
 /// (`false`) when the worktree path or the `git diff` invocation is
 /// unavailable, so this never turns a `process` failure into an error path
@@ -159,8 +165,8 @@ fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPoli
     let Ok(worktree) = worktree_path(ctx) else {
         return false;
     };
-    let range = diff_range(ctx);
-    let Ok(output) = runner("git", &["diff", "--numstat", &range], Path::new(&worktree)) else {
+    stage_untracked_intent(runner, Path::new(&worktree));
+    let Ok(output) = runner("git", &["diff", "--numstat", "HEAD"], Path::new(&worktree)) else {
         return false;
     };
 
@@ -259,31 +265,65 @@ pub(crate) fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
         .ok_or_else(|| NodeError::new("SetupWorktreeNode output missing worktree_path"))
 }
 
-/// Read the base commit SHA captured by `SetupWorktreeNode` at worktree-setup
-/// time, if present. Mirrors [`worktree_path`] but returns `None` rather than
-/// an error when absent (best-effort: `SetupWorktreeNode` omits `base_sha`
-/// when `git rev-parse HEAD` failed or the runner is a no-op stub, and
-/// callers here fall back to `main..HEAD` in that case).
-fn base_sha(ctx: &TaskContext) -> Option<String> {
-    get_result(ctx, "SetupWorktreeNode")
-        .and_then(|value| value.get("base_sha"))
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-}
-
-/// Build the `git diff` range argument (`<base_sha>..HEAD` when a base SHA
-/// was captured at worktree-setup time, `main..HEAD` otherwise) shared by
-/// [`classify_trivial`] and `ConsolidatedReviewNode`.
-fn diff_range(ctx: &TaskContext) -> String {
-    match base_sha(ctx) {
-        Some(sha) => format!("{sha}..HEAD"),
-        None => "main..HEAD".to_string(),
-    }
+/// Best-effort `git add -N -A` ("intent to add") in `worktree`, run
+/// immediately before every diff this module takes against `HEAD`.
+///
+/// Git's `diff` ignores untracked files entirely. Because implementer agents
+/// routinely create brand-new files (see `TestTaskNode::changed_files`, which
+/// already parses untracked paths out of `git status --porcelain` as expected
+/// output), a plain `git diff HEAD` would show the reviewer and the
+/// trivial-skip classifier a diff with those files' content missing. Intent-to-add
+/// records a zero-length blob for each untracked path, which makes the file appear
+/// in `git diff HEAD` with its full content as `+` lines and in
+/// `git diff --numstat HEAD` with its real line count — no custom diff
+/// formatting required.
+///
+/// Deliberately non-fatal and deliberately not undone afterwards: a leftover
+/// `-N` index entry on the retry path simply keeps the file visible to the
+/// next attempt's diff (desired), and the eventual `git add -A` in
+/// [`super::commit_all`] subsumes it. Note this makes a formerly read-only
+/// seam a WRITE to the index — and on the `use_worktree: false` path (the
+/// schema default) that index belongs to the operator's live repository. See
+/// [`super::commit_all`]'s "Blast radius" section. A binary untracked file numstats as
+/// `-\t-\t<path>`, which [`classify_trivial`]'s existing conservative arm
+/// already treats as non-trivial — correct behavior for free.
+fn stage_untracked_intent(runner: &CommandRunner, worktree: &Path) {
+    let _ = runner("git", &["add", "-N", "-A"], worktree);
 }
 
 fn current_task_fields(ctx: &TaskContext) -> Result<&serde_json::Value, NodeError> {
     get_result(ctx, "TaskQueueRouterNode")
         .ok_or_else(|| NodeError::new("TaskQueueRouterNode has not run yet"))
+}
+
+/// Fallback commit message when `TaskQueueRouterNode` never stamped a
+/// current task (a `SaveStateNode` driven directly by a unit test, or a
+/// graph shape without the router).
+const SAVE_STATE_FALLBACK_MESSAGE: &str = "chore: flow state update";
+
+/// The per-task commit message `SaveStateNode` hands [`super::commit_all`]:
+/// `feat(sdlc): {current_task_id} — {title}`, built from the fields
+/// `TaskQueueRouterNode` stamps when it dispatches a task.
+///
+/// `SaveStateNode` sits only on the pass path
+/// (`UpdateTaskStatusNode → SaveStateNode`), so one message here is one
+/// completed task in `git log` — that is the whole point of carrying the id.
+///
+/// Deliberately does NOT read `attempt_count` off the same stamp: that field
+/// is stale on the retry back-edge (`ticket-restamp-attempt-count`), and a
+/// commit message is not worth propagating a known-wrong number into.
+fn save_state_commit_message(ctx: &TaskContext) -> String {
+    let Some(current) = get_result(ctx, "TaskQueueRouterNode") else {
+        return SAVE_STATE_FALLBACK_MESSAGE.to_string();
+    };
+    let Some(task_id) = current.get("current_task_id").and_then(|v| v.as_i64()) else {
+        return SAVE_STATE_FALLBACK_MESSAGE.to_string();
+    };
+    let title = current
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("untitled");
+    format!("feat(sdlc): {task_id} — {title}")
 }
 
 // --- prior-attempt feedback --------------------------------------------------
@@ -1791,9 +1831,9 @@ impl Router for TriageRouterNode {
 
 // --- ConsolidatedReviewNode ----------------------------------------------------
 
-/// Model node (Sonnet): reviews the task's `git diff <base_sha>..HEAD`
-/// (falling back to `main..HEAD` when no `base_sha` was captured) against its
-/// acceptance criteria via a composed `ClaudeCodeStep`.
+/// Model node (Sonnet): reviews the task's working-tree diff against `HEAD`
+/// (`git add -N -A` then `git diff HEAD` — see [`stage_untracked_intent`])
+/// against its acceptance criteria via a composed `ClaudeCodeStep`.
 pub struct ConsolidatedReviewNode {
     config: Config,
     transport: Option<ModelTransport>,
@@ -1874,8 +1914,14 @@ impl Node for ConsolidatedReviewNode {
             .cloned()
             .unwrap_or_else(|| json!([]));
 
-        let range = diff_range(&ctx);
-        let diff = (self.runner)("git", &["diff", &range], Path::new(&worktree))
+        // The reviewer must see the CURRENT task's actual work. Nothing in
+        // this run commits code until `SaveStateNode` runs on the pass path,
+        // so the reviewable delta lives in the working tree, not in a commit
+        // range — `<base_sha>..HEAD` (what this used to diff) was empty on
+        // every run, which is why every past review verdict was a rubber
+        // stamp. Intent-to-add first so brand-new files appear with content.
+        stage_untracked_intent(&self.runner, Path::new(&worktree));
+        let diff = (self.runner)("git", &["diff", "HEAD"], Path::new(&worktree))
             .map(|output| output.stdout)
             .unwrap_or_default();
 
@@ -2262,12 +2308,20 @@ impl Node for SaveStateNode {
         })?;
 
         let state_path_str = state_path.to_string_lossy().to_string();
-        super::commit_state_file(&self.runner, Path::new(&worktree), &state_path);
+        // Stamped, not discarded: a `false` here means HEAD did not advance,
+        // so the NEXT task's `git diff HEAD` will include this task's work —
+        // the exact miscount this ticket exists to kill, just quieter. Making
+        // it visible in `ctx.nodes` is what lets telemetry catch it.
+        let committed = super::commit_all(
+            &self.runner,
+            Path::new(&worktree),
+            &save_state_commit_message(&ctx),
+        );
 
         put_result(
             &mut ctx,
             "SaveStateNode",
-            json!({ "saved_to": state_path_str }),
+            json!({ "saved_to": state_path_str, "committed": committed }),
         );
         Ok(ctx)
     }
@@ -3807,8 +3861,11 @@ mod tests {
         let diff_called = Arc::new(Mutex::new(false));
         let diff_called_clone = diff_called.clone();
         let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
-            *diff_called_clone.lock().unwrap() = true;
-            assert_eq!(args, ["diff", "main..HEAD"]);
+            if args == ["diff", "HEAD"] {
+                *diff_called_clone.lock().unwrap() = true;
+            } else {
+                assert_eq!(args, ["add", "-N", "-A"], "unexpected git argv");
+            }
             Ok(CommandOutput {
                 status: 0,
                 stdout: "diff --git a b".to_string(),
@@ -3844,12 +3901,14 @@ mod tests {
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
     }
 
-    /// When `SetupWorktreeNode` stamped a `base_sha` (the SHA captured at
-    /// worktree-setup time), the review diff pins to `<base_sha>..HEAD`
-    /// instead of `main..HEAD` — so a `main` that advances mid-run doesn't
-    /// misreport unrelated commits as reversions.
+    /// The review diff is the WORKING TREE against `HEAD`, taken after an
+    /// intent-to-add pass — never a commit range. A `base_sha` stamped by
+    /// `SetupWorktreeNode` is run metadata and must NOT be used as a diff
+    /// base: nothing commits the implementer's code until `SaveStateNode`
+    /// runs on the pass path, so `<base_sha>..HEAD` was empty on every run
+    /// and the reviewer reviewed nothing.
     #[tokio::test]
-    async fn review_uses_base_sha_diff_range_when_present() {
+    async fn review_diffs_the_working_tree_against_head_after_intent_add() {
         let task = SDLCTask::new(1, "One", "d1");
         let state = state_with_tasks(vec![task.clone()]);
         let mut ctx = ctx_with_current_task(&state, &task);
@@ -3858,11 +3917,13 @@ mod tests {
             json!({ "worktree_path": ".", "base_sha": "abc1234" }),
         );
 
-        let diff_called = Arc::new(Mutex::new(false));
-        let diff_called_clone = diff_called.clone();
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
         let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
-            *diff_called_clone.lock().unwrap() = true;
-            assert_eq!(args, ["diff", "abc1234..HEAD"]);
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
             Ok(CommandOutput {
                 status: 0,
                 stdout: "diff --git a b".to_string(),
@@ -3881,8 +3942,82 @@ mod tests {
             .with_runner(runner)
             .with_transport(transport);
         let out = node.process(ctx).await.expect("process should succeed");
-        assert!(*diff_called.lock().unwrap());
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            *recorded,
+            vec![
+                vec!["add".to_string(), "-N".to_string(), "-A".to_string()],
+                vec!["diff".to_string(), "HEAD".to_string()],
+            ],
+            "intent-to-add must precede the working-tree diff, and the diff \
+             base must be HEAD — not the stamped base_sha"
+        );
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["verdict"], "PASS");
+    }
+
+    /// **The headline regression for this defect.** Captures the prompt
+    /// `ConsolidatedReviewNode` actually sends and asserts the diff text the
+    /// runner returned is inside it — i.e. the reviewer is shown real code,
+    /// not an empty diff.
+    ///
+    /// Confirmed to fail against pre-ticket code: the node then built its
+    /// argv from `diff_range(ctx)`, so with `base_sha` stamped it invoked
+    /// `["diff", "abc1234..HEAD"]`. This stub returns the sentinel ONLY for
+    /// `["diff", "HEAD"]` and the empty string otherwise, so pre-ticket the
+    /// captured prompt ends in `Diff:\n` and the `contains` assertion fails.
+    /// In the real tree the failure was the same for a different reason:
+    /// nothing ever committed code, so that commit range was genuinely
+    /// empty on every run.
+    #[tokio::test]
+    async fn review_prompt_carries_the_actual_working_tree_diff() {
+        const SENTINEL: &str = "+fn sentinel_reviewed_line()";
+
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": ".", "base_sha": "abc1234" }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            let stdout = if args == ["diff", "HEAD"] {
+                format!("diff --git a/src/lib.rs b/src/lib.rs\n{SENTINEL}\n")
+            } else {
+                String::new()
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        });
+
+        let seen_prompt: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_prompt_clone = seen_prompt.clone();
+        let canned =
+            json!({ "verdict": "PASS", "summary": "looks good", "issues": [] }).to_string();
+        let transport: ModelTransport = Arc::new(move |_config, prompt: String| {
+            *seen_prompt_clone.lock().unwrap() = Some(prompt);
+            let outcome = canned_outcome(canned.clone());
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompt = seen_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("transport should have been called");
+        assert!(
+            prompt.contains(SENTINEL),
+            "reviewer prompt must contain the working-tree diff; got:\n{prompt}"
+        );
     }
 
     /// The model's `Config.cwd` is scoped to the run's worktree — without
@@ -4536,7 +4671,11 @@ mod tests {
     /// `review_skip_max_files`/`review_skip_max_diff_lines` thresholds.
     fn trivial_diff_runner() -> CommandRunner {
         Arc::new(|_program, args, _cwd| {
-            assert_eq!(args, ["diff", "--numstat", "main..HEAD"]);
+            // The classifier intent-adds first so untracked files are
+            // counted; only the numstat call carries the diff base.
+            if args != ["add", "-N", "-A"] {
+                assert_eq!(args, ["diff", "--numstat", "HEAD"]);
+            }
             Ok(CommandOutput {
                 status: 0,
                 stdout: "1\t1\tsrc/lib.rs\n".to_string(),
@@ -4561,14 +4700,6 @@ mod tests {
         ctx.nodes.insert(
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": "." }),
-        );
-        ctx
-    }
-
-    fn ctx_with_worktree_and_base_sha(mut ctx: TaskContext, base_sha: &str) -> TaskContext {
-        ctx.nodes.insert(
-            "SetupWorktreeNode".to_string(),
-            json!({ "worktree_path": ".", "base_sha": base_sha }),
         );
         ctx
     }
@@ -4602,10 +4733,13 @@ mod tests {
         assert_eq!(router.route(&out), Some("UpdateTaskStatusNode".to_string()));
     }
 
-    /// When `SetupWorktreeNode` stamped a `base_sha`, `classify_trivial`
-    /// diffs `<base_sha>..HEAD` instead of `main..HEAD`.
+    /// `classify_trivial` counts the WORKING TREE against `HEAD`, after an
+    /// intent-to-add pass, and ignores any `base_sha` stamp. Before this,
+    /// it diffed the always-empty `<base_sha>..HEAD` commit range, so every
+    /// task classified as trivial (0 files / 0 lines) and `TrivialSkip`
+    /// skipped the review unconditionally.
     #[tokio::test]
-    async fn trivial_classification_uses_base_sha_diff_range_when_present() {
+    async fn trivial_classification_diffs_working_tree_against_head() {
         let mut task = SDLCTask::new(1, "One", "d1");
         task.max_attempts = 3;
         task.attempt_count = 0;
@@ -4615,11 +4749,16 @@ mod tests {
             ..SdlcPolicy::default()
         };
 
-        let ctx = ctx_with_worktree_and_base_sha(ctx_with_test_result(true, &task), "deadbee");
+        let ctx = ctx_with_worktree(ctx_with_test_result(true, &task));
         let ctx = ctx_with_policy(ctx, &policy);
 
-        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
-            assert_eq!(args, ["diff", "--numstat", "deadbee..HEAD"]);
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
             Ok(CommandOutput {
                 status: 0,
                 stdout: "1\t1\tsrc/lib.rs\n".to_string(),
@@ -4632,6 +4771,56 @@ mod tests {
             .with_runner(runner);
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["TriageTaskNode"]["trivial"], true);
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            *recorded,
+            vec![
+                vec!["add".to_string(), "-N".to_string(), "-A".to_string()],
+                vec![
+                    "diff".to_string(),
+                    "--numstat".to_string(),
+                    "HEAD".to_string()
+                ],
+            ],
+            "intent-to-add must precede the numstat, and the base must be HEAD"
+        );
+    }
+
+    /// A real-sized working-tree change (120 added + 3 deleted lines in one
+    /// file) is counted and classified NON-trivial — the counting path the
+    /// always-empty commit range used to short-circuit.
+    #[tokio::test]
+    async fn trivial_classification_counts_real_changed_lines_as_non_trivial() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let policy = SdlcPolicy {
+            review_mode: ReviewMode::TrivialSkip,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree(ctx_with_test_result(true, &task));
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            let stdout = if args == ["add", "-N", "-A"] {
+                String::new()
+            } else {
+                "120\t3\tsrc/lib.rs\n".to_string()
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        });
+
+        let node = TriageTaskNode::new()
+            .with_transport(panicking_transport())
+            .with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["trivial"], false);
     }
 
     /// A non-trivial green task (diff over the thresholds) classifies
@@ -4799,8 +4988,13 @@ mod tests {
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[0][0], "add");
+        // `add -A`, not `add <state_path>`: the per-task commit carries the
+        // task's CODE as well as its state file.
+        assert_eq!(recorded[0], vec!["add".to_string(), "-A".to_string()]);
         assert_eq!(recorded[1][0], "commit");
+        // No TaskQueueRouterNode stamp in this ctx -> fallback message.
+        assert_eq!(recorded[1][2], SAVE_STATE_FALLBACK_MESSAGE);
+        drop(recorded);
 
         let content = std::fs::read_to_string(saved_to).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -4812,6 +5006,70 @@ mod tests {
         assert!(value["bail_reason"].is_null());
         assert!(value["started_at"].as_str().is_some());
         assert!(value["updated_at"].as_str().is_some());
+    }
+
+    /// With `TaskQueueRouterNode`'s stamp present, the per-task commit
+    /// message carries the task id — one commit per completed task, greppable
+    /// in `git log`.
+    #[tokio::test]
+    async fn save_state_commit_message_carries_the_current_task_id() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(7, "Widen the commit", "d7")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "TaskQueueRouterNode".to_string(),
+            json!({ "current_task_id": 7, "title": "Widen the commit" }),
+        );
+
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        SaveStateNode::new()
+            .with_runner(runner)
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded[0], vec!["add".to_string(), "-A".to_string()]);
+        assert_eq!(recorded[1][0], "commit");
+        assert_eq!(recorded[1][2], "feat(sdlc): 7 — Widen the commit");
+    }
+
+    /// A router stamp missing `current_task_id` falls back rather than
+    /// emitting a half-built message.
+    #[test]
+    fn save_state_commit_message_falls_back_without_a_router_stamp() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let bare = ctx_with_state(&state);
+        assert_eq!(
+            save_state_commit_message(&bare),
+            SAVE_STATE_FALLBACK_MESSAGE
+        );
+
+        let mut partial = ctx_with_state(&state);
+        partial
+            .nodes
+            .insert("TaskQueueRouterNode".to_string(), json!({ "title": "One" }));
+        assert_eq!(
+            save_state_commit_message(&partial),
+            SAVE_STATE_FALLBACK_MESSAGE
+        );
     }
 
     #[tokio::test]
