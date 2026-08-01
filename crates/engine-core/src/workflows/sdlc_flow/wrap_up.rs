@@ -2,12 +2,15 @@
 //!
 //! Ported from `orchestrator/app/workflows/sdlc_flow_workflow_nodes/wrap_up_node.py`:
 //! a deterministic `Node` (no model call) that reads the latest durable
-//! `SDLCState`, computes a `PASS`/`PARTIAL/FAIL` outcome from its telemetry,
-//! and renders three text artifacts — `log_entry`, `report`,
-//! `status_suggestion` — from Rust string templates. This node is a
-//! MAJOR_BAIL / structural-fail terminal target of `TriageRouterNode` and
-//! `ReviewRouterNode` as well as the natural end of a fully-passing run, so
-//! it must tolerate being reached with any telemetry shape.
+//! `SDLCState`, computes a `BLOCKED`/`PASS`/`PARTIAL/FAIL` outcome from the
+//! run's terminal signal + telemetry, and renders three text artifacts —
+//! `log_entry`, `report`, `status_suggestion` — from Rust string templates.
+//! This node is a MAJOR_BAIL / structural-fail terminal target of
+//! `TriageRouterNode` and `ReviewRouterNode` as well as the natural end of a
+//! fully-passing run, so it must tolerate being reached with any telemetry
+//! shape — and, critically, must render `BLOCKED` (never `PASS`) whenever a
+//! terminal signal is present, since a bailed run's `tasks_failed` is
+//! structurally 0.
 //!
 //! Renders its three text artifacts for a later step/human (mirrors the
 //! Python node), and additionally persists the resolved-policy + outcomes
@@ -451,18 +454,18 @@ const COST_BEARING_STAGES: [&str; 4] = [
 /// swaps their transport; a local-endpoint failure falls back to cloud
 /// per-call without changing this snapshot). Every other stage consumes its
 /// tier through `task_loop::apply_policy`/`apply_policy_config`, which sets
-/// `Config.model` from it directly — `implement` (`ImplementTaskNode`) and
-/// `docs` (`PatchDocsNode`).
+/// `Config.model` from it directly — `implement` (`ImplementTaskNode`),
+/// `generate` (`GenerateTasksNode`, via `apply_policy(.., Stage::Generate)`
+/// in `setup.rs`) and `docs` (`PatchDocsNode`).
 ///
-/// Two entries here are still reported without a consumer, and are listed
+/// One entry here is still reported without a consumer, and is listed
 /// deliberately rather than hidden:
-///   * `generate` — `GenerateTasksNode` has not been onboarded to
-///     `apply_policy` yet, so it runs `ModelTiers::default().generate`'s
-///     model string by hardcode rather than by resolution. The default was
-///     corrected to `Opus` so this line is at least TRUE today; it becomes
-///     load-bearing when that node is onboarded.
 ///   * `implement_simple` — belongs to a simple-task path that does not
 ///     exist yet; nothing reads it.
+///
+/// (`generate` used to be in that list: `GenerateTasksNode` hardcoded
+/// `claude-opus-4-8` and ignored the resolved tier. It has since been
+/// onboarded to `apply_policy`, so the tier is load-bearing now.)
 ///
 /// (The previous version of this comment claimed `registry_for_policy` wires
 /// EVERY stage's transport from this assignment. It never did.)
@@ -595,7 +598,22 @@ impl Node for WrapUpNode {
         let tasks_passed = state.telemetry.tasks_passed;
         let tasks_failed = state.telemetry.tasks_failed;
         let total_attempts = state.telemetry.total_attempts;
-        let outcome = if tasks_failed == 0 {
+        // Three-way outcome. `BLOCKED` is checked FIRST and is derived from
+        // the terminal signal, never from `tasks_failed` — a bailed run has
+        // `tasks_failed == 0` *structurally*, because `TriageRouterNode`'s
+        // `MAJOR_BAIL` arm and `ReviewRouterNode`'s structural arm both route
+        // straight here, bypassing `UpdateTaskStatusNode` (`task_loop.rs`),
+        // the only place that increments it. Reading `tasks_failed` alone
+        // therefore rendered `Outcome: PASS` for every bail, and `log_entry`
+        // feeds a work log — a blocked run got recorded as a success.
+        //
+        // Deliberately NOT fixed by making bails increment `tasks_failed`:
+        // that counter's semantics ("a task ran and failed its own loop") are
+        // consumed by `RunTelemetry`/`PolicyAggregate` elsewhere. The outcome
+        // *word* is derived from the signal instead; the counters stay honest.
+        let outcome = if terminal_signal.is_some() {
+            "BLOCKED"
+        } else if tasks_failed == 0 {
             "PASS"
         } else {
             "PARTIAL/FAIL"
@@ -606,11 +624,23 @@ impl Node for WrapUpNode {
             .filter(|fv| !fv.all_passed)
             .map(|fv| format!(" Final validation gate FAILED: {}", fv.failure_summary))
             .unwrap_or_default();
+        // `state.bail_reason` was just derived from the same terminal signal
+        // (`:580`), so this is non-empty exactly when `outcome == "BLOCKED"`.
+        let bail_note = state
+            .bail_reason
+            .as_deref()
+            .map(|reason| format!(" Blocked: {reason}"))
+            .unwrap_or_default();
+        let bail_line = state
+            .bail_reason
+            .as_deref()
+            .map(|reason| format!("- Blocked: {reason}\n"))
+            .unwrap_or_default();
 
         let log_entry = format!(
             "## {date} — {spec_slug}\n\n\
              Outcome: {outcome}. {tasks_passed} task(s) passed, {tasks_failed} failed, \
-             {total_attempts} total implement/test attempt(s).{gate_note}"
+             {total_attempts} total implement/test attempt(s).{bail_note}{gate_note}"
         );
 
         let report = format!(
@@ -620,10 +650,18 @@ impl Node for WrapUpNode {
              - Tasks passed: {tasks_passed}\n\
              - Tasks failed: {tasks_failed}\n\
              - Total attempts: {total_attempts}\n\
+             {bail_line}\
              {gate_note}"
         );
 
-        let status_suggestion = if outcome == "PASS" && !gate_failed {
+        let status_suggestion = if outcome == "BLOCKED" {
+            format!(
+                "{spec_slug} is BLOCKED as of {date} — the run ended on a terminal \
+                 signal ({tasks_passed} passed / {tasks_failed} failed, \
+                 {total_attempts} total attempt(s)).{bail_note}{gate_note} \
+                 Needs follow-up before merge."
+            )
+        } else if outcome == "PASS" && !gate_failed {
             format!(
                 "{spec_slug} completed successfully on {date} \
                  ({tasks_passed} task(s) passed, {total_attempts} total attempt(s)). \
@@ -781,6 +819,11 @@ mod tests {
 
         assert!(status_suggestion.contains("completed successfully"));
         assert!(status_suggestion.contains("2026-07-18"));
+
+        // No terminal signal on this ctx, so the BLOCKED arm must not fire
+        // and no bail note may leak into the happy-path wording.
+        assert!(!log_entry.contains("BLOCKED"));
+        assert!(!report.contains("Blocked:"));
     }
 
     #[tokio::test]
@@ -806,6 +849,88 @@ mod tests {
         assert!(report.contains("Total attempts: 5"));
         assert!(status_suggestion.contains("did not complete cleanly"));
         assert!(status_suggestion.contains("Needs follow-up"));
+        // A run with no terminal signal is never BLOCKED.
+        assert!(!log_entry.contains("BLOCKED"));
+    }
+
+    /// The defect this ticket fixes (run `bc1a44be`): a `MAJOR_BAIL` reaches
+    /// `WrapUpNode` with `tasks_failed == 0` — bails route around
+    /// `UpdateTaskStatusNode`, the only incrementer — so the old
+    /// `tasks_failed == 0 => "PASS"` rule rendered `Outcome: PASS` for a run
+    /// that was simultaneously `global_status: "blocked"` with a
+    /// `bail_reason`. `log_entry` feeds a work log, so the bail was recorded
+    /// as a success. Pins BLOCKED + the bail reason in all three artifacts.
+    #[tokio::test]
+    async fn wrap_up_renders_blocked_outcome_on_major_bail() {
+        let mut state = SDLCState::new("EN.3.B-sdlc-flow-docs-wrapup-pr");
+        // The structural shape of a bail: zero passed, zero *failed*.
+        state.telemetry.tasks_passed = 0;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({
+                "verdict": "MAJOR_BAIL",
+                "reason": "Max attempts (3) reached without a passing run.",
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-02"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        let log_entry = result["log_entry"].as_str().unwrap();
+        let report = result["report"].as_str().unwrap();
+        let status_suggestion = result["status_suggestion"].as_str().unwrap();
+
+        assert!(log_entry.contains("Outcome: BLOCKED"));
+        assert!(!log_entry.contains("PASS"));
+        assert!(log_entry.contains("Max attempts (3) reached without a passing run."));
+
+        assert!(report.contains("- Outcome: BLOCKED"));
+        assert!(!report.contains("Outcome: PASS"));
+        assert!(report.contains("Max attempts (3) reached without a passing run."));
+
+        assert!(status_suggestion.contains("BLOCKED"));
+        assert!(!status_suggestion.contains("completed successfully"));
+        assert!(status_suggestion.contains("Max attempts (3) reached without a passing run."));
+
+        // The counters themselves stay honest — the fix derives the outcome
+        // word from the signal, it does not fabricate a failed task.
+        let stamped: SDLCState = serde_json::from_value(result["state"].clone()).unwrap();
+        assert_eq!(stamped.telemetry.tasks_failed, 0);
+        assert_eq!(stamped.global_status, "blocked");
+    }
+
+    /// The other terminal-signal source: a structural `ConsolidatedReviewNode`
+    /// FAIL routed around the task loop entirely, so telemetry is all zeroes.
+    #[tokio::test]
+    async fn wrap_up_renders_blocked_outcome_on_structural_review_fail() {
+        let mut state = SDLCState::new("EN.3.B-sdlc-flow-docs-wrapup-pr");
+        state.telemetry.tasks_passed = 2;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 2;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "FAIL", "summary": "structural issues", "issues": [] }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-02"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["WrapUpNode"];
+        let log_entry = result["log_entry"].as_str().unwrap();
+        assert!(log_entry.contains("Outcome: BLOCKED"));
+        assert!(!log_entry.contains("PASS"));
+        assert!(log_entry.contains("structural issues"));
+        assert!(result["report"]
+            .as_str()
+            .unwrap()
+            .contains("- Outcome: BLOCKED"));
     }
 
     #[tokio::test]
