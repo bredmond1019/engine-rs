@@ -92,28 +92,39 @@ pub fn default_command_runner() -> CommandRunner {
     })
 }
 
-/// Git-add + git-commit `state_path` inside `worktree` via `runner`, routing
-/// a non-zero commit outcome through [`log_noop_commit`] rather than
-/// treating it as a node failure (e.g. "nothing to commit" on a re-save of
-/// an unchanged file). Extracted (EN.3.G task 3) out of
-/// `task_loop::SaveStateNode::process`'s formerly-inline tail so
-/// `wrap_up::WrapUpNode` can commit its own terminal state write through the
-/// exact same seam instead of duplicating it — `SaveStateNode`'s observable
-/// behavior (same two subprocess invocations, same argv, same cwd, same
-/// non-fatal treatment of a non-zero commit) is unchanged by the move.
-pub(crate) fn commit_state_file(runner: &CommandRunner, worktree: &Path, state_path: &Path) {
-    let state_path_str = state_path.to_string_lossy().to_string();
-    let _ = runner("git", &["add", &state_path_str], worktree);
-    let commit = runner(
-        "git",
-        &["commit", "-m", "chore: flow state update"],
-        worktree,
-    );
+/// Stage **everything** in `worktree` (`git add -A`) and commit it with
+/// `message`, routing a non-zero commit outcome through [`log_noop_commit`]
+/// rather than treating it as a node failure (e.g. "nothing to commit" when
+/// the tree is already clean).
+///
+/// Supersedes the former `commit_state_file`, which staged only the state
+/// file's own path. That narrowness was the root cause behind four
+/// independent SDLC_FLOW defects: nothing in the run ever committed the
+/// implementer's CODE, so the consolidated review saw an empty diff, the
+/// trivial-skip classifier always counted zero changed lines, every
+/// auto-PR pushed a branch of state-file-only commits, and `PatchDocsNode`'s
+/// doc edits (`docs.rs` makes no git calls at all) never reached the branch.
+///
+/// **The commit topology this establishes** — `HEAD` carries every completed
+/// task's code *and* state; the working tree delta vs `HEAD` is exactly the
+/// current task's in-progress work. `SaveStateNode` runs only on the pass
+/// path, so one passed task is one commit; the retry path never reaches it,
+/// so retries accumulate uncommitted and each attempt's review sees the
+/// cumulative attempt via `git diff HEAD`.
+///
+/// **Why `add -A` and not an explicit file list:** the run is isolated to
+/// its own branch/worktree, `.gitignore` guards build artifacts, and
+/// `TestTaskNode::changed_files` already treats untracked paths as expected
+/// implementer output — an explicit list would silently drop any file the
+/// agent created but did not "claim".
+pub(crate) fn commit_all(runner: &CommandRunner, worktree: &Path, message: &str) {
+    let _ = runner("git", &["add", "-A"], worktree);
+    let commit = runner("git", &["commit", "-m", message], worktree);
     if let Ok(output) = &commit {
         if output.status != 0 {
             // "nothing to commit" or an equivalent no-op — logged, not
             // an error, mirroring `save_state_node.py`.
-            log_noop_commit(state_path, output);
+            log_noop_commit(message, output);
         }
     }
 }
@@ -132,7 +143,7 @@ pub(crate) fn is_noop_commit(stderr: &str, stdout: &str) -> bool {
 }
 
 /// Logging hook for a non-zero `git commit` outcome from
-/// [`commit_state_file`], distinguishing the ordinary no-op ("nothing to
+/// [`commit_all`], distinguishing the ordinary no-op ("nothing to
 /// commit, working tree clean") from a genuine failure — that distinction is
 /// the entire point of this function; do not collapse it back to a single
 /// branch.
@@ -150,19 +161,20 @@ pub(crate) fn is_noop_commit(stderr: &str, stdout: &str) -> bool {
 /// `tracing`/`log` dependency in any `crates/*/Cargo.toml` nor the workspace
 /// root (verified during EN.3.G authoring), and adding one for a single call
 /// site is out of scope here.
-fn log_noop_commit(state_path: &Path, output: &CommandOutput) {
+/// `label` is a human-readable identifier for the commit that no-opped — the
+/// commit message since the widening to [`commit_all`], the state file's path
+/// before it. It exists only for this diagnostic; nothing parses it.
+fn log_noop_commit(label: &str, output: &CommandOutput) {
     if is_noop_commit(&output.stderr, &output.stdout) {
         if std::env::var("ENGINE_DEBUG").is_ok() {
             eprintln!(
-                "sdlc_flow: state commit no-op ({}): {}",
-                state_path.display(),
+                "sdlc_flow: state commit no-op ({label}): {}",
                 output.stderr.trim()
             );
         }
     } else {
         eprintln!(
-            "sdlc_flow: WARNING state commit failed ({}): {}",
-            state_path.display(),
+            "sdlc_flow: WARNING state commit failed ({label}): {}",
             output.stderr.trim()
         );
     }

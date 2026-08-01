@@ -2269,7 +2269,11 @@ impl Node for SaveStateNode {
         })?;
 
         let state_path_str = state_path.to_string_lossy().to_string();
-        super::commit_state_file(&self.runner, Path::new(&worktree), &state_path);
+        super::commit_all(
+            &self.runner,
+            Path::new(&worktree),
+            "chore: flow state update",
+        );
 
         put_result(
             &mut ctx,

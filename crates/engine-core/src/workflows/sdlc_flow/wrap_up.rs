@@ -34,7 +34,7 @@ use super::schema::{
     SDLCState, TerminalSignal,
 };
 use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
-use super::{commit_state_file, get_result, put_result, CommandRunner};
+use super::{commit_all, get_result, put_result, CommandRunner};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
 /// under test. Defaults to the real current UTC date
@@ -518,7 +518,7 @@ fn finalize_outcomes(
 
 /// Deterministic node: renders the wrap-up artifacts for a completed (or
 /// bailed) SDLC flow run, and (EN.3.G task 3) git-commits its terminal state
-/// write through the same [`super::commit_state_file`] seam
+/// write through the same [`super::commit_all`] seam
 /// `task_loop::SaveStateNode` uses — without this, the final `done`/
 /// `blocked` state landed on disk but was never committed, so a
 /// `--worktree` run's PR did not contain it.
@@ -664,7 +664,11 @@ impl Node for WrapUpNode {
                     final_validation.as_ref(),
                     terminal_signal.as_ref(),
                 )?;
-                commit_state_file(&self.runner, std::path::Path::new(&worktree), &state_path);
+                commit_all(
+                    &self.runner,
+                    std::path::Path::new(&worktree),
+                    "chore: flow state update",
+                );
                 Some(saved)
             }
             None => None,
@@ -1427,13 +1431,14 @@ mod tests {
             .with_clock(fixed_clock("2026-07-31"))
             .with_runner(runner);
         let out = node.process(ctx).await.expect("process should succeed");
-        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+        let _saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].0, "git");
-        assert_eq!(recorded[0].1[0], "add");
-        assert_eq!(recorded[0].1[1], saved_to);
+        // `add -A`, not `add <state_path>`: the wrap-up commit is what
+        // finally lands `PatchDocsNode`'s doc edits on the branch.
+        assert_eq!(recorded[0].1, vec!["add".to_string(), "-A".to_string()]);
         assert_eq!(recorded[1].0, "git");
         assert_eq!(recorded[1].1[0], "commit");
 
