@@ -1580,6 +1580,211 @@ repo_path = "alpha"
         assert!(calls.lock().unwrap().is_empty());
     }
 
+    // --- SetupWorktreeNode + sibling path-dependency symlinks (ticket-worktree-sibling-path-deps) --
+
+    /// A runner whose `git worktree add` arm actually creates the target
+    /// directory on disk (`args[2]`, the worktree path) instead of a no-op —
+    /// the sibling-symlink step needs a real worktree directory to compute
+    /// `worktree_path_buf.join("..")` against and to assert the resulting
+    /// symlinks live at the right place. Every other invocation (`checkout`,
+    /// `remove`, `rev-parse`) is a harmless no-op success, matching
+    /// `stub_runner`'s tolerance.
+    fn worktree_creating_runner(status: i32) -> CommandRunner {
+        Arc::new(move |_program, args, _cwd| {
+            if args.first() == Some(&"worktree") && args.get(1) == Some(&"add") {
+                if let Some(path) = args.get(2) {
+                    std::fs::create_dir_all(path).expect("create worktree dir for test");
+                }
+            }
+            Ok(CommandOutput {
+                status,
+                stdout: String::new(),
+                stderr: if status == 0 {
+                    String::new()
+                } else {
+                    "git failed".to_string()
+                },
+            })
+        })
+    }
+
+    /// A tempdir "brain root" naming one repo (`alpha`) via `brain.toml`,
+    /// with real `claude-code-rs`/`mev`/`okf-core` sibling directories
+    /// created one level above `alpha` — mirroring the real on-disk layout
+    /// the workspace root `Cargo.toml`'s `../<crate>` path deps assume.
+    fn brain_root_with_alpha_and_siblings() -> tempfile::TempDir {
+        let brain = brain_root_with_alpha();
+        for sibling in ["claude-code-rs", "mev", "okf-core"] {
+            std::fs::create_dir_all(brain.path().join(sibling))
+                .unwrap_or_else(|e| panic!("mkdir {sibling}: {e}"));
+        }
+        brain
+    }
+
+    fn assert_sibling_symlinks_resolve(worktree_path: &Path, brain_root: &Path) {
+        for sibling in ["claude-code-rs", "mev", "okf-core"] {
+            let link = worktree_path.join("..").join(sibling);
+            assert!(
+                link.exists(),
+                "expected a symlink for {sibling} to exist at {}",
+                link.display()
+            );
+            let resolved = std::fs::canonicalize(&link)
+                .unwrap_or_else(|e| panic!("canonicalize {sibling} symlink: {e}"));
+            let expected = std::fs::canonicalize(brain_root.join(sibling))
+                .unwrap_or_else(|e| panic!("canonicalize real {sibling} dir: {e}"));
+            assert_eq!(
+                resolved, expected,
+                "{sibling} symlink should resolve to the real sibling directory"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_symlinks_sibling_path_dependencies_into_worktree() {
+        let brain = brain_root_with_alpha_and_siblings();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner(0))
+            .with_registry(registry);
+        let ctx =
+            empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        let worktree_path = PathBuf::from(result["worktree_path"].as_str().unwrap());
+
+        assert_sibling_symlinks_resolve(&worktree_path, brain.path());
+    }
+
+    #[tokio::test]
+    async fn setup_sibling_symlink_step_is_idempotent_on_reattach() {
+        let brain = brain_root_with_alpha_and_siblings();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner(0))
+            .with_registry(registry.clone());
+        let first_ctx =
+            empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" }));
+        let first_out = node
+            .process(first_ctx)
+            .await
+            .expect("first setup should succeed");
+        let worktree_path = PathBuf::from(
+            first_out.nodes.get("SetupWorktreeNode").unwrap()["worktree_path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_sibling_symlinks_resolve(&worktree_path, brain.path());
+
+        // Reattach: the worktree directory (and its symlinks) already exist
+        // on disk from the first run; `resume: true` routes SetupWorktreeNode
+        // past `git worktree add` entirely (`reattaching`), but the symlink
+        // step still runs and must not error or disturb the existing links.
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner(0))
+            .with_registry(registry);
+        let second_ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "use_worktree": true,
+            "repo": "alpha",
+            "resume": true,
+        }));
+        let second_out = node
+            .process(second_ctx)
+            .await
+            .expect("reattach setup should succeed without error");
+        let worktree_path_again = PathBuf::from(
+            second_out.nodes.get("SetupWorktreeNode").unwrap()["worktree_path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_eq!(worktree_path_again, worktree_path);
+        assert_sibling_symlinks_resolve(&worktree_path_again, brain.path());
+    }
+
+    #[tokio::test]
+    async fn setup_planning_symlink_remains_correct_alongside_sibling_symlinks() {
+        // Regression guard: the pre-existing `planning` symlink block
+        // (setup.rs:306-318) must keep working unchanged now that the
+        // sibling-crate symlink step (added immediately after it) is in
+        // place. No prior test in this module exercised the planning
+        // symlink's on-disk effect directly, so this closes that gap.
+        let brain = brain_root_with_alpha_and_siblings();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+        let alpha_root = registry.resolve("alpha").expect("alpha resolves");
+        let real_planning = alpha_root.join("planning");
+        std::fs::create_dir_all(&real_planning).expect("mkdir planning");
+        std::fs::write(real_planning.join("marker.txt"), "hello").expect("write marker");
+
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner(0))
+            .with_registry(registry);
+        let ctx =
+            empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        let worktree_path = PathBuf::from(result["worktree_path"].as_str().unwrap());
+
+        let worktree_planning = worktree_path.join("planning");
+        assert!(
+            worktree_planning.exists(),
+            "expected the planning symlink to exist in the worktree"
+        );
+        let resolved =
+            std::fs::canonicalize(&worktree_planning).expect("planning symlink should resolve");
+        let expected =
+            std::fs::canonicalize(&real_planning).expect("real planning dir canonicalizes");
+        assert_eq!(
+            resolved, expected,
+            "planning symlink should still resolve to the real planning directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree_planning.join("marker.txt")).unwrap(),
+            "hello",
+            "the marker file written through the real planning dir must be visible via the symlink"
+        );
+
+        // The sibling-crate symlinks must also be present alongside the
+        // unaffected planning symlink.
+        assert_sibling_symlinks_resolve(&worktree_path, brain.path());
+    }
+
+    #[tokio::test]
+    async fn setup_sibling_symlink_step_is_skipped_when_use_worktree_false() {
+        let brain = brain_root_with_alpha_and_siblings();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+        let alpha_root = registry.resolve("alpha").expect("alpha resolves");
+
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner(0))
+            .with_registry(registry);
+        // No `use_worktree` -> the non-worktree checkout path (setup.rs:319-354).
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "repo": "alpha" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(
+            result["worktree_path"],
+            alpha_root.to_string_lossy().to_string()
+        );
+
+        for sibling in ["claude-code-rs", "mev", "okf-core"] {
+            assert!(
+                !alpha_root.join(sibling).exists(),
+                "no sibling symlink should be created relative to the checkout root when \
+                 use_worktree is false"
+            );
+        }
+    }
+
     // --- GenerateTasksNode --------------------------------------------------
 
     fn stub_outcome_with_text(text: &str) -> Outcome {
