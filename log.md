@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-01T12:15:00Z"
+timestamp: "2026-08-02T20:05:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,73 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ---
+
+## [run: 2026-08-02]
+
+### SDLC_FLOW hardening train executed — 9 tickets + 3 follow-ups merged, smoke re-run
+- **What:** Drove the entire `sdlc-flow-hardening` ticket train to completion as orchestrator,
+  each ticket run by a subagent through the JS harness in its own worktree, with every merge to
+  `main` serialized and re-validated by me. Landed T0 `additive-tolerant-goldens` (`c2125c8`),
+  T1 `policy-path-generate-docs-nodes` (`6fbf988`, the P0), T1b (T1's deferred task 3, `e2fb496`),
+  T2 `commit-task-work-real-diffs` (`6b5fe23`, the flagship), T2b (T2's deferred task 5 + a
+  safety fix, `ee699d5`), T2c (new, `f9a685c`), T3 `wrapup-outcome-truth` (`52a4711`),
+  T4 `resume-reset-semantics` (`1e3870a`), T5 `triage-failure-output` (`bf6fc5b`),
+  T6 `restamp-attempt-count` (`8caabbf`), T7 `watch-script-run-id-guard` (`cba644d`), and
+  C1 `chore-engine-brain-root-deployment` (`dd52784`, repo half only). Final suite: 1671 passed,
+  0 failed. **Two follow-ups the train itself surfaced, both owner-approved:** (a) T2's tree-wide
+  `git add -A` was a live-repo hazard because `use_worktree` defaults to `false` and that path
+  resolves `worktree_path` to `"."` — a run there would sweep unrelated dirty files into a
+  `feat(sdlc):` commit; T2b added a dirty-tree abort mirroring `sdlc-flow.js` STEP 3a, scoped to
+  the whole `!use_worktree` branch so a `repo`-slug run against a registry-resolved root is
+  covered too, and deliberately NOT made a policy knob (safety invariant, not a cost trade);
+  (b) T2 made the reviewer prompt unbounded, so T2c added `review_diff_max_chars` (default
+  120_000) across all six profiles with a VISIBLE truncation banner telling the reviewer to
+  return `PARTIAL` rather than `PASS` on a partial diff. Cleared the inherited carryover
+  `worktree-uncommitted-run-2d46b140` by committing its 75 lines to
+  `sdlc/ticket-expose-live-run-workflow-type` (`7a82673`) and stopping the stray serve.
+  Ran the post-T2 smoke twice through `bastion serve`, both succeeded.
+- **Why:** The 2026-08-01 live runs proved the Rust `SDLC_FLOW` walked end to end but verified
+  nothing — reviews ran against an empty diff (making every past PASS a rubber stamp), bails
+  recorded as passes, `auto_pr` PRs shipped without code, doc patches never reached the branch,
+  and a served run could aim a skip-permissions writer at the primary checkout. All five are now
+  closed, and the pipeline can be trusted to carry feature work again.
+- **Caveat — one acceptance criterion is NOT met by the smoke.** The smoke spec is a one-line
+  marker write, so `TriageTaskNode` correctly returned `trivial: true` and routed past
+  `ConsolidatedReviewNode` on both runs (a legitimate skip, not defect 0d). A third run forcing
+  `review_mode: per_task` DID reach the review node — proving it is no longer unconditionally
+  skipped — but failed inside it because the `cheap-fast` local review tier (`qwen2.5:3b`) is not
+  pulled in Ollama. "Reviewer sees a non-empty diff" is instead proven deterministically by the
+  hermetic suite, including `real_git_intent_add_surfaces_untracked_content_in_the_review_prompt`
+  which drives real git. **A live model reviewing a real diff has still not been observed**, so
+  retiring `.claude/workflows/sdlc-flow.js` should wait for that.
+- **Refs:** `planning/sdlc-flow-hardening/{plan,notes}.md` (plan carries the full execution record
+  + smoke evidence); smoke runs `b395313a` (cwd-target) and `59f1670a` (registry-resolved, serve
+  outside the brain tree, absolute `worktree_path`).
+
+### SDLC_FLOW hardening — audit, plan, and 9 ticket specs authored
+- **What:** Ran a three-way parallel read-only code audit of the SDLC_FLOW workflow (graph +
+  state, policy + seams, trigger boundary) verifying every 2026-08-01 defect anchor at
+  `533b28e`; found three NEW defects sharing 0b's root (0d TrivialSkip always skips review,
+  0e every auto_pr PR is code-free, 0f doc patches never committed); a dedicated design pass
+  settled commit-per-task + working-tree-vs-HEAD diffs as the fix. Authored
+  `planning/sdlc-flow-hardening/plan.md` (sequenced orchestration: T0 goldens → T1
+  rogue-nodes P0 → T2 commit-the-work → tail) plus nine full spec dirs
+  (`ticket-additive-tolerant-goldens`, `ticket-policy-path-generate-docs-nodes`,
+  `ticket-commit-task-work-real-diffs`, `ticket-wrapup-outcome-truth`,
+  `ticket-resume-reset-semantics`, `ticket-triage-failure-output`,
+  `ticket-restamp-attempt-count`, `ticket-watch-script-run-id-guard`,
+  `chore-engine-brain-root-deployment`). Flipped all notes.md statuses to
+  ticketed/wontfix/done. Coordinated with the brain-quality track (no sequencing gate —
+  everything runs via the JS harness; merge serialization only; amendment written into its
+  runbook). Authored the engine-rs briefing for the upcoming bastion-web architecture review
+  (`core/_planning/bastion-web/architecture-improvement/engine-rs.md`). Deleted both consumed
+  handoffs; wrote a fresh handoff for the orchestrating agent.
+- **Why:** The 2026-08-01 live runs proved the Rust SDLC_FLOW walks but does not verify —
+  review rubber-stamps on an empty diff, and recorded history lies on bails. This session
+  converts that defect tab into an executable, small-diff ticket train before any further
+  feature work rides the pipeline.
+- **Refs:** `planning/sdlc-flow-hardening/{plan,notes}.md`; the nine spec dirs;
+  `core/_planning/orchestrator/brain-quality-orchestration.md` (2026-08-02 amendment).
 
 ## [run: 2026-08-01]
 
