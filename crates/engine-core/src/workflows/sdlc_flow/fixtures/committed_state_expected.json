@@ -63,12 +63,15 @@
       "implement_simple": "sonnet",
       "review": "sonnet",
       "triage": "sonnet",
-      "generate": "sonnet"
+      "generate": "opus",
+      "docs": "sonnet"
     },
     "timeouts": {
       "implement": null,
       "triage": null,
-      "review": null
+      "review": null,
+      "generate": null,
+      "docs": null
     },
     "local": {
       "endpoint": "http://localhost:11434",
