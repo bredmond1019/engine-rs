@@ -65,6 +65,11 @@
       "triage": "sonnet",
       "generate": "sonnet"
     },
+    "timeouts": {
+      "implement": null,
+      "triage": null,
+      "review": null
+    },
     "local": {
       "endpoint": "http://localhost:11434",
       "model": "qwen2.5-coder:7b",
