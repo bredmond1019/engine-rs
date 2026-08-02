@@ -7,7 +7,7 @@ layer: [engine, factory]
 project: engine-rs
 status: active
 keywords: [opportunity-edit, set-stage, add-action, opportunity-edit-node, doc-materializer, mev, idempotency, E_DOC_BAD_STAGE, ENGINE_BRAIN_ROOT, D53]
-related: [materialize-doc-node, research-agent-workflow, architecture, data-contract, D53-engine-executes-mev-writes-brain-docs, harvest-gate]
+related: [materialize-doc-node, research-agent-workflow, architecture, data-contract, brain:D53-engine-executes-mev-writes-brain-docs, harvest-gate]
 ---
 
 # Opportunity Edit Workflows

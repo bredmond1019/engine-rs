@@ -7,7 +7,7 @@ layer: [engine]
 project: engine-rs
 status: active
 keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.6.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse, locale, rate card, investment shape]
-related: [architecture, D6-cancellation-and-budget-semantics, D20-shared-data-contract]
+related: [architecture, D6-cancellation-and-budget-semantics, brain:D20-shared-data-contract]
 ---
 
 # Data Contract (Consumer View)

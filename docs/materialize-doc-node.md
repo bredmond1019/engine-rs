@@ -7,7 +7,7 @@ layer: [engine, factory]
 project: engine-rs
 status: active
 keywords: [materialize-doc-node, doc-materializer, mev, okf-core, brain-root, opportunity, learning-artifact, proposal, dry-run, D53, merge-contacts, opportunity-edit]
-related: [architecture, docs-index, content-pipeline-workflow, proposal-generator-workflow, D53-engine-executes-mev-writes-brain-docs, research-agent-workflow, opportunity-edit-workflows, harvest-gate]
+related: [architecture, docs-index, content-pipeline-workflow, proposal-generator-workflow, brain:D53-engine-executes-mev-writes-brain-docs, research-agent-workflow, opportunity-edit-workflows, harvest-gate]
 ---
 
 # MaterializeDocNode and the `DocMaterializer` Seam

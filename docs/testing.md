@@ -7,7 +7,7 @@ layer: [engine]
 project: engine-rs
 status: active
 keywords: [testing, nextest, integration tests, link time, cargo, harness]
-related: [architecture, rust-sdlc-iteration-speed, d57-rust-sdlc-iteration-speed]
+related: [architecture, base-template:rust-sdlc-iteration-speed, brain:d57-rust-sdlc-iteration-speed]
 ---
 
 # Testing engine-rs

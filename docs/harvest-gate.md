@@ -7,7 +7,7 @@ layer: [engine]
 project: engine-rs
 status: active
 keywords: [harvest-gate, harvest-mode, persist-to-brain, harvest-approve, synapse-ingest, pending-harvest, D51, materialize-doc-node, boundary-test]
-related: [architecture, docs-index, content-pipeline-workflow, materialize-doc-node, opportunity-edit-workflows, D51-python-engine-divestiture, D53-engine-executes-mev-writes-brain-docs]
+related: [architecture, docs-index, content-pipeline-workflow, materialize-doc-node, opportunity-edit-workflows, brain:D51-brain-engine-boundary-and-synapse, brain:D53-engine-executes-mev-writes-brain-docs]
 ---
 
 # The Materialize -> Harvest Gate

@@ -7,7 +7,7 @@ layer: [engine]
 project: engine-rs
 status: active
 keywords: [email, resend, channel transport, inbound webhook, bounce, opportunity action, ingress envelope, tag echo]
-related: [content-pipeline-workflow, opportunity-edit-workflows, en-6-a-egress-dispatch-tasks, en-6-b-email-adapter-tasks]
+related: [content-pipeline-workflow, opportunity-edit-workflows]
 ---
 
 # Email Adapter (`EN.6.B`)
