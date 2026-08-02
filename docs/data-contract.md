@@ -6,13 +6,13 @@ doc_id: data-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.4.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse, locale, rate card, investment shape]
+keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.6.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse, locale, rate card, investment shape]
 related: [architecture, D6-cancellation-and-budget-semantics, D20-shared-data-contract]
 ---
 
 # Data Contract (Consumer View)
 
-**Pinned Contract Version: 1.4.0**
+**Pinned Contract Version: 1.6.0**
 
 The **canonical, authoritative** contract is owned by the orchestrator:
 `orchestrator/docs/data-contract.md`. This file is engine-rs's *consumer* view — it pins the
@@ -264,6 +264,34 @@ shape — no engine-rs workflow calls any of the three today; wiring a hybrid wo
 /recall` (e.g. to ground a proposal draft in existing corpus content before persisting it via
 `POST /ingest/proposal`) remains open follow-on work.
 
+The canonical contract's v1.5.0 adds an optional `authored_at: datetime | null` field to both
+ingest routes, `POST /ingest/proposal` and `POST /ingest/artifact` (`OR.ticket.corpus-reconcile`).
+It is additive and backward-compatible — omitting it, or sending `null`, preserves the pre-existing
+server-side `datetime.now()` fallback exactly, so `PersistToBrainNode`'s current payload stays
+valid unchanged. It sits alongside (and does not contradict) the `EN.4.F` note below about the
+structured `investment` / `authored_locale` shape `PersistToBrainNode` now embeds in `roadmap`:
+whoever wires the real ingest URL should send both — the new `authored_at` stamp *and* the new
+`roadmap` shape.
+
+The canonical contract's v1.6.0 changes `GET /recall`'s response semantics (`OR.K2`), and this is
+the one that matters for **`EN.6.K`** — the Brain read-client seam, engine-rs's *first* real
+`GET /recall` consumer. **`EN.6.K` must be built against 1.6.0 semantics, not 1.4.0:**
+
+- **`score` is a similarity where higher is always better**, on every path — `1.0` for an exact-id
+  match, `1.0 - cosine distance` for semantic, unchanged fused similarity for hybrid. Under 1.4.0
+  the exact-id and semantic paths returned a raw cosine *distance* (`0.0` for an exact-id match,
+  lower-is-better). A `RecallNode` that sorts ascending or thresholds with `score < x` — the
+  1.4.0-correct direction — ranks and filters results **backwards with no error**. Re-verify the
+  comparison direction of every `score` use.
+- **`via` may be any of `exact-id | semantic | hybrid | structural | keyword | memory`.** The
+  vocabulary widened: the hybrid path now reports per-candidate provenance instead of collapsing
+  everything to a bare `"hybrid"` tag. Any Rust type deserializing `via` must tolerate all six (an
+  exhaustive enum built on the 1.4.0 vocabulary will fail to parse a hybrid result).
+
+Field names, types, and the `q`/`limit`/`hybrid` query params are unchanged — the canonical flags
+the change Minor for that reason — and no `engine_contract` Rust type changes shape, since
+`GET /recall` is a route engine-rs *calls* as a client, not one `engine-serve` serves.
+
 ---
 
 ## Re-pin checklist (when the canonical contract bumps)
@@ -293,3 +321,5 @@ shape — no engine-rs workflow calls any of the three today; wiring a hybrid wo
 | 1.4.0 | 2026-07-27 | Re-pin from 1.3.0 to 1.4.0 (`OR.Q2`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.4.0 additions, orchestrator-only (§ HTTP surface parity above): `GET /recall`, `GET /walk`, `GET /pulse` — the read half of the D51 HTTP adapter whose write half (`POST /ingest/*`) landed in v1.3.0, thin `X-API-Key`-gated adapters over the orchestrator's `app/brain/` read core. No `engine_contract` Rust type changed shape; these are corpus-read routes engine-rs could call as a client, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. No engine-rs workflow calls any of the three today; wiring one (e.g. grounding a proposal draft via `GET /recall` before persisting through `POST /ingest/proposal`) remains open follow-on work. |
 | — | 2026-07-28 | Not a re-pin — **Pinned Contract Version stays 1.4.0.** `EN.4.F` (engine-rs-side) changes the shape of the `roadmap` field `PersistToBrainNode` embeds in its `POST /ingest/proposal` payload (§ HTTP surface parity above): `AutomationRoadmap.recommendation.investment` moves from a model-authored free-text `String` to a structured `{currency, min, max, basis}` object (`locale::MoneyRange`), deterministically populated from the two-sheet, firewalled `RateCard` rather than invented by the model; `AutomationRoadmap` also gains an `authored_locale` field (`"pt-BR"` \| `"en-US"`) stamped from the run's requested locale. **No Pinned Contract Version bump**, for two reasons: (1) `roadmap` is documented in the canonical contract only as opaque `"the full structured AutomationRoadmap"` — its internal shape is engine-rs's own type, not one of the versioned `events`/`task_context`/`NodeRun`/`Usage` shapes this pin tracks, so no `engine_contract` Rust type changes; (2) `PersistToBrainNode` still POSTs to the hardcoded placeholder `BRAIN_INGEST_URL`, not Synapse's live `POST /ingest/proposal` route, so no real wire contract is broken today. The distinction matters for whoever wires the real endpoint next: when that happens, Synapse's ingest handler should expect the new `investment`/`authored_locale` shape, not the old free-text `investment` string — call that out explicitly in whatever change wires the real URL. See [proposal-generator-workflow.md](proposal-generator-workflow.md) for the full shape and the rate-card lookup that produces it. |
 | — | 2026-07-30 | Not a re-pin — **Pinned Contract Version stays 1.4.0.** `EN.6.F` (engine-rs-side) adds three engine-rs-only routes with no canonical counterpart (§ HTTP surface parity above): `POST /events/{run_id}/pause`, `POST /events/{event_id}/resume`, and `GET /events/suspended`, plus the `metadata.suspension` run-level annotation (§ Run-level `metadata` annotations above) recording a suspended run's resume pointer, origin, and pre-suspend budget-ledger snapshot. Mirrors the abort (`EN.2.B`) and stream (`EN.5.F`) precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `suspension` lives entirely in the existing free-form `TaskContext::metadata` field. `durable.rs`'s writer now upserts across a suspend/resume cycle rather than writing a single terminal update (§ above). See [suspend-resume.md](suspend-resume.md) for the full marker shape and both suspension origins. |
+| 1.5.0 | 2026-08-01 | Re-pin from 1.4.0 to 1.5.0 (`OR.ticket.corpus-reconcile`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.5.0 addition, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact` gain an optional `authored_at: datetime \| null`, threaded to the written `brain_documents` rows. Additive and backward-compatible — omitted or `null` preserves the server-side `datetime.now()` fallback exactly, so `PersistToBrainNode`'s existing payload stays valid unchanged; sending a real `authored_at` is an opt-in improvement for `EN.6.K`'s ingest-client hardening. Sits alongside the 2026-07-28 `EN.4.F` row below (structured `investment` / `authored_locale` inside `roadmap`) rather than superseding it: whoever wires the real ingest URL should send both. No `engine_contract` Rust type changed shape — these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. |
+| 1.6.0 | 2026-08-01 | Re-pin from 1.5.0 to 1.6.0 (`OR.K2`, orchestrator-side; not an engine-rs block) — **the consequential one for `EN.6.K`**. `GET /recall`'s response semantics change (§ HTTP surface parity above): `score` is now a similarity where **higher is always better** on every path (`1.0` exact-id, `1.0 - cosine distance` semantic, unchanged fused similarity for hybrid), where 1.4.0 returned a raw cosine *distance* on the exact-id/semantic paths (`0.0` exact-id, lower-is-better); and `via`'s vocabulary widens from `exact-id \| semantic \| hybrid` to also include `structural \| keyword \| memory` (per-candidate hybrid provenance, previously collapsed to a bare `"hybrid"`). Field names, types, and the `q`/`limit`/`hybrid` query params are unchanged, and no `engine_contract` Rust type changes shape — `GET /recall` is a route engine-rs calls as a client, not one `engine-serve` serves. **`EN.6.K` (the Brain read-client seam — engine-rs's first `GET /recall` consumer, and therefore the first thing this polarity can bite) must be built against 1.6.0 semantics:** `RecallNode` sorts/thresholds `score` **descending / higher-is-better**, and any type deserializing `via` must tolerate all six values or it will fail to parse a hybrid result. A 1.4.0-era comparison direction ranks results backwards with no error — this re-pin exists specifically to close that window before `EN.6.K` runs. |
