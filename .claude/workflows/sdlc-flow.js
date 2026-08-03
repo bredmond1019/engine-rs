@@ -194,6 +194,7 @@ const SETUP_SCHEMA = {
     specThin:       { type: 'boolean', description: 'D19: true ONLY on a fresh run (wasCreated && specFileExists) with a structurally-valid but substantively-thin spec. false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
     setupError:     { type: 'string', description: 'Non-empty when setup could not proceed safely (e.g. branch mode aborted on a dirty working tree). The engine aborts and reports this. Empty string on success.' },
+    envFilesCopied: { type: 'array', items: { type: 'string' }, description: '--worktree only: repo-root-relative paths of every gitignored env-shaped file seeded into the worktree (from ENV_COPIED: lines); empty array if none existed to copy, or in branch mode.' },
     notes:          { type: 'string' }
   }
 }
@@ -765,8 +766,7 @@ RESUME MODE IS ON — reuse the existing worktree for this spec instead of creat
        git -C trees/${baseBranchName} sparse-checkout init --cone
        git -C trees/${baseBranchName} sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
        git -C trees/${baseBranchName} checkout
-       if [ -f .env ]; then cp .env trees/${baseBranchName}/.env; fi
-       if [ -f .env.local ]; then cp .env.local trees/${baseBranchName}/.env.local; fi
+       git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\\.env(\\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/${baseBranchName}/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
     branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 3.5.
   - Neither exists → fall through to STEP 2/3 and create a fresh worktree as normal.
 ` : ''}
@@ -796,9 +796,15 @@ STEP 3 — Create the worktree (replace [branchName] / [repoRoot] with actual va
   d. # Cone ALL tracked top-level directories — stack-agnostic, no project-layout assumptions (D5/P5).
      git -C trees/[branchName] sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
   e. git -C trees/[branchName] checkout
-  f. if [ -f .env ]; then cp .env trees/[branchName]/.env; fi
-  g. if [ -f .env.local ]; then cp .env.local trees/[branchName]/.env.local; fi
-  h. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
+  f. Discover and copy EVERY gitignored env-shaped file (.env, .env.local, .env.* in any
+     directory) from repoRoot into trees/[branchName], preserving each file's path relative to
+     the repo root (creating parent directories as needed — so app/.env lands at
+     trees/[branchName]/app/.env). Only files git actually ignores; exclude node_modules/,
+     .venv/, venv/, trees/, and vendor/; never overwrite a file that already exists in the
+     worktree. Run:
+       git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/[branchName]/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
+     Record the list of "ENV_COPIED:" lines — report them in STEP 6.
+  g. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
 
 STEP 3.5 — Fix the planning/ symlink for the worktree (run from the MAIN repo root, for ALL paths —
   fresh create, re-attach, or reuse). In brain-vaulted repos the MAIN repo's \`planning\` is a
@@ -897,7 +903,14 @@ STEP 6 — Report pipeline-start inputs (run these from the live checkout):
        - The '## Acceptance Criteria' section has no real '- ' bullet (empty, or only a template seed) → thin.
      Do NOT flag bare 'TODO'/'TBD' prose, do NOT treat '<...>' as a token (legitimate in 'Vec<T>', globs),
      never flag the Amendment Log seed '_No amendments yet._'. Else specThin=false, thinReason="".
-
+${useWorktree ? `  d. Env files seeded — collect the "ENV_COPIED: <path>" lines printed during worktree setup
+     (STEP 3 step f, or the RESUME re-attach path) into envFilesCopied (one path per entry; empty
+     array if none printed — that means no gitignored env-shaped file exists in this repo, not that
+     the copy failed silently). Report this list; a run missing config should say so at setup time
+     rather than surface later as a confusing downstream failure (e.g. a fallback DB connection).
+     Note: the worktree's path is derived from the SPEC SLUG (trees/${baseBranchName}), not any
+     program/block ID — anything discovering it externally must use \`git worktree list\`, not guess.
+` : ''}
 Set setupError="" unless STEP 3 aborted (branch mode, dirty tree). Return your result using the StructuredOutput tool.
 `, withModel({ label: 'setup', schema: SETUP_SCHEMA, phase: 'Setup' }, MODEL.worktreeSetup))
 
@@ -913,6 +926,13 @@ const { branchName, worktreePath } = setupResult
 state.branch = branchName
 state.worktree_path = worktreePath
 log(`${useWorktree ? 'Worktree' : 'Branch'} ready: ${worktreePath} (branch: ${branchName})`)
+if (useWorktree) {
+  const envFilesCopied = setupResult.envFilesCopied || []
+  log(envFilesCopied.length
+    ? `Env files copied into worktree: ${envFilesCopied.join(', ')}`
+    : 'Env files copied into worktree: none found')
+  log(`Worktree path derives from the spec slug (trees/${branchName}), not any block ID — use "git worktree list" to locate it, never guess.`)
+}
 
 // D19 — thin-spec guard for a fresh run.
 if (setupResult.specThin) {
