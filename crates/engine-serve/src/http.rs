@@ -2228,6 +2228,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
+    mod live_run_workflow_type_tests {
+        use super::{live_run_metadata, live_run_workflow_type};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        /// `live_run_workflow_type` returns the `(workflow_type, created_at)`
+        /// pair verbatim for a run inserted via the same path `post_events`
+        /// uses (a direct insert into `live_run_metadata()`), and `None` for
+        /// a `run_id` never inserted. Uses a fresh random `Uuid` for the
+        /// "unknown" case specifically so it cannot collide with an id
+        /// another test in this process-global-backed suite happens to have
+        /// inserted.
+        #[test]
+        fn round_trips_and_is_absent_for_unknown_run() {
+            let run_id = Uuid::new_v4();
+            let created_at = Utc::now();
+            live_run_metadata()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(run_id, ("fixture".to_string(), created_at));
+
+            let found = live_run_workflow_type(run_id);
+            assert_eq!(found, Some(("fixture".to_string(), created_at)));
+
+            let unknown_run_id = Uuid::new_v4();
+            assert_eq!(live_run_workflow_type(unknown_run_id), None);
+        }
+    }
+
     mod derive_terminal_status_tests {
         use super::{derive_terminal_status, NodeRunStatus};
         use engine_contract::{NodeRun, TaskContext};
