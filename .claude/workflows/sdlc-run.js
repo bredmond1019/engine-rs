@@ -216,6 +216,7 @@ const WRAPUP_SCHEMA = {
     commitHash:         { type: 'string' },
     amendments:         { type: 'array', items: { type: 'string' }, description: 'D18: the dated amendment-log lines appended to the spec for genuine deviations this run (empty array if none).' },
     blockStatusFlipped: { type: 'string', description: 'The state.json tracks[].blocks[].id flipped to "closed" this run, or "" if none flipped (spec not fully done, no state.json, or block not found).' },
+    emitStateRan:       { type: 'boolean', description: 'true if `mev emit-state --write` regenerated derived surfaces this run; false when skipped (mev/brain.toml absent).' },
     notes:              { type: 'string' }
   }
 }
@@ -427,16 +428,32 @@ Return your findings using the StructuredOutput tool.
   return result.config
 }
 
+// Hardcoded, project-agnostic parse-time safety gate (mechanism, not policy — see CLAUDE.md standing
+// rule 1). Independent of harness.json/spec checks: any .claude/workflows/ file among the files
+// touched by this run gets an unconditional `node --check`. No-op (renders '') when none match —
+// never emits a check with no target.
+function renderEngineParseChecks(files, startIndex) {
+  if (!files || !files.length) return ''
+  return files.map((f, i) => {
+    const n = startIndex + i
+    return `CHECK ${n} — engine-parse-safety (hardcoded parse-time gate on modified SDLC engine file — mechanism, unconditional on harness.json) [GATING — a failure here blocks the review verdict]:
+  node --check ${f}
+  echo "CHECK${n}_EXIT:$?"`
+  }).join('\n\n')
+}
+
 // Render the inner project-validation check list for the Test stage from harness config.
 // Returns the numbered CHECK blocks the agent runs before the universal emoji gate. When the
 // config is absent (or carries no checks), returns instructions to fall back to the spec's
 // optional `## Validation Commands` section — the engine ships NO stack defaults.
 // Handles all D6 check kinds: command (default), baseline-diff, count-delta, warning-scan,
-// forbidden-pattern-scan. changedPaths is reserved for the deferred conditionalChecks feature.
+// forbidden-pattern-scan. changedPaths (files touched by implement/fix so far this run) feeds the
+// hardcoded engine-parse gate below — additive on top of everything else, unconditional on cfg.
 function renderCheckList(cfg, { changedPaths } = {}) {
   const checks = cfg?.validation?.checks ?? []
+  const engineFiles = (changedPaths || []).filter(p => p.startsWith('.claude/workflows/'))
   if (!checks.length) {
-    return `The project ships no \`planning/harness.json\` validation suite, so derive the checks
+    const fallback = `The project ships no \`planning/harness.json\` validation suite, so derive the checks
 from the spec instead:
   - Read the spec's optional "## Validation Commands" section.
   - Run each command it lists, IN ORDER. Each command is one check — record test_name (a short
@@ -445,8 +462,10 @@ from the spec instead:
   - If the spec has no "## Validation Commands" section, run no project checks — record a single
     informational row (test_name "no_validation_suite", passed true, empty error) noting the
     project declared no validation suite. Then run the universal emoji gate below.`
+    const engineChecks = renderEngineParseChecks(engineFiles, 1)
+    return engineChecks ? `${fallback}\n\n${engineChecks}` : fallback
   }
-  return checks.map((c, i) => {
+  const rendered = checks.map((c, i) => {
     const n = i + 1
     const kind = c.kind || 'command'
     const slug = (c.name || `check${n}`).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
@@ -550,6 +569,8 @@ ${ruleLines}
   ${c.command}
   echo "CHECK${n}_EXIT:$?"`
   }).join('\n\n')
+  const engineChecks = renderEngineParseChecks(engineFiles, checks.length + 1)
+  return engineChecks ? `${rendered}\n\n${engineChecks}` : rendered
 }
 
 // Snapshot baseline artifacts for any `baseline-diff` checks before implement, so the Test stage
@@ -630,6 +651,7 @@ const STATE_WRITE_SCHEMA = {
   properties: {
     written: { type: 'boolean', description: 'true if the state file was written successfully' },
     startedAt: { type: 'string', description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' },
+    updatedAt: { type: 'string', description: 'the updated_at value written in this write' },
     stateFile: { type: 'string' },
     notes: { type: 'string' }
   }
@@ -686,9 +708,18 @@ insert the "tokens" object verbatim as given:
 }
 
 Use the Write tool to write ${stateFile}. Do NOT git add or commit. Then return via StructuredOutput
-(written=true on success, and startedAt set to the started_at value you used).
+(written=true on success, startedAt set to the started_at value you used, and updatedAt set to the
+updated_at value you used).
 `, withModel({ label: `state:${phaseName}${failed ? ':failed' : ''}`, schema: STATE_WRITE_SCHEMA }, MODEL.scout))
   if (result && result.startedAt) cachedStartedAt = result.startedAt
+  // Freeze-detection guard (non-fatal): on a later write, updated_at should never equal
+  // started_at — that is the exact signature of the prompt ambiguity this ticket fixes (though
+  // this template already inlines started_at as a literal, so the ambiguity does not apply here;
+  // the guard is kept for parity/observability). Warn only; never throw, retry, or touch
+  // cachedStartedAt / disk content.
+  if (!firstWrite && result && result.updatedAt && result.updatedAt === result.startedAt) {
+    log(`state:${phaseName}${failed ? ':failed' : ''} WARNING updated_at froze at started_at (${result.updatedAt}) — see ticket-state-write-updated-at-freeze`)
+  }
   if (!result || !result.written) {
     log(`(state) could not persist run state for "${phaseName}"${failed ? ' (failure record)' : ''} — continuing`)
   }
@@ -1220,6 +1251,11 @@ Return your result using the StructuredOutput tool:
     phase('Test')
     log('Running the project validation suite...')
 
+    // Hardcoded engine-parse gate (mechanism, not project policy — see renderCheckList). Union of
+    // every file the implement/fix stages reported as modified so far this run, filtered inside
+    // renderCheckList to .claude/workflows/ paths — unconditional on harness.json.
+    const changedPaths = [...new Set(stageResults.flatMap(r => r.filesModified || []))]
+
     const testResult = await tracedAgent(`
 You are the test agent for the SDLC pipeline. Run the project's validation suite and write a test report.
 
@@ -1234,7 +1270,7 @@ Target:
 Run EVERY check below IN ORDER using the Bash tool. Capture the full output (stdout + stderr) for
 each. Run from the repo root.
 
-${renderCheckList(harnessCfg)}
+${renderCheckList(harnessCfg, { changedPaths })}
 
 For each check record:
   test_name: descriptive name
@@ -1746,17 +1782,52 @@ PART A — Update status.md + log (code/doc changes are already committed by the
       ? `- Only proceed if you flipped the spec's status.md status to "Done" above (i.e. this was the last task). If tasks remain, leave state.json untouched and set blockStatusFlipped to "".`
       : `- The full spec is done, so proceed.`}
     - Resolve the block's canonical ID from the status.md Progress Table row you just edited (the
-      <BlockID> column, or the id that row maps to in state.json). Find that block in state.json
-      tracks[].blocks[] — search EVERY track. If found, set its "status" to "closed" (the only
-      authored close value). If NOT found, report it in notes and do NOT fabricate a block entry.
+      <BlockID> column, or the id that row maps to in state.json). This is the only part of this
+      step that stays your judgment call — the mutation itself is scripted below, not an Edit-tool
+      diff.
+    - Run ONE scripted mutation (never the Edit tool) to perform the write — substitute the id you
+      resolved for <RESOLVED_ID> (keep it as the script's sole argv, quoted):
+        python3 -c "
+import json, sys
+path = 'planning/state.json'
+bid = sys.argv[1]
+data = json.load(open(path))
+found = False
+for track in data.get('tracks', []):
+    for block in track.get('blocks', []):
+        if block.get('id') == bid:
+            block['status'] = 'closed'
+            found = True
+            break
+    if found:
+        break
+if found:
+    with open(path, 'w') as fh:
+        json.dump(data, fh, indent=2)
+        fh.write(chr(10))
+    print('FLIPPED:' + bid)
+else:
+    print('NOT_FOUND')
+" "<RESOLVED_ID>"
+      The script searches EVERY tracks[].blocks[] entry and only ever mutates the one matching
+      block's "status" field; on a miss it prints NOT_FOUND and never opens the file for writing,
+      so it stays byte-unchanged. Read the script's own stdout — do not infer success yourself: on
+      "FLIPPED:<id>" set blockStatusFlipped to that id; on "NOT_FOUND" report it in notes, do NOT
+      fabricate a block entry, and set blockStatusFlipped to "".
     - Validate the file is still valid JSON:
         python3 -c "import json;json.load(open('planning/state.json'))"
-    - Then regenerate the derived surfaces from the authored graph. This run is ON MAIN (not a linked
-      worktree), so emit-state is safe here:
-        mev emit-state --write
-      If \`mev\` or brain.toml is absent (a standalone repo), skip this command silently — the
-      state.json flip still stands. Do NOT hand-reimplement focus/rollup/wave-table derivation.
     - Set blockStatusFlipped to the block id you closed (or "" if none).
+
+5c. Regenerate derived surfaces via \`mev emit-state --write\`. Run this step whenever PART A ran at
+    all — it is NOT conditional on step 5b's block-status flip or on "was this the last task" above:
+    step 5 already edited planning/status.md regardless of whether the spec fully completed this run
+    (a task-subset run still leaves it changed on disk), so the derived surfaces (status.md rollups,
+    /attention boards, wave tables) need resyncing every time, not only on a full close. This run is
+    ON MAIN (not a linked worktree), so emit-state is safe here:
+        mev emit-state --write
+      If \`mev\` or brain.toml is absent (a standalone repo), skip this command silently and set
+      emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup/wave-table
+      derivation.
 
 6. Append a new entry to log.md (prepend at the TOP, newest entries first):
 
@@ -1857,6 +1928,7 @@ Return your result using the StructuredOutput tool:
   commitHash: the 7-character short hash from git log --oneline -1
   amendments: the dated amendment-log lines you appended to the spec in PART A.5 (empty array if none)
   blockStatusFlipped: the state.json block id you flipped to "closed" in PART A step 5b (or "" if none)
+  emitStateRan: whether \`mev emit-state --write\` ran in PART A step 5c
   notes: any follow-up items (settled decisions to add to planning/decisions/, NEEDS_REVIEW doc flags)
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
@@ -1864,7 +1936,8 @@ if (wrapupResult) {
   stageResults.push({ stage: 'wrap-up', ...wrapupResult, success: wrapupResult.statusUpdated && wrapupResult.devlogUpdated })
   if (wrapupResult.notes) log(`Decisions to log: ${wrapupResult.notes}`)
   if (wrapupResult.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended to ${specFile}`)
-  if (wrapupResult.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed; derived surfaces regenerated (mev emit-state --write).`)
+  if (wrapupResult.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed.`)
+  log(`Derived surfaces: ${wrapupResult.emitStateRan ? 'regenerated (mev emit-state --write).' : 'skipped (mev/brain.toml absent).'}`)
   log(`Committed: ${wrapupResult.commitMessage}`)
   log(`Workflow report: ${wrapupResult.workflowReportFile}`)
 } else {

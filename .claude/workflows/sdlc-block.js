@@ -279,7 +279,26 @@ const STATE_LOAD_SCHEMA = {
     blocks:    { type: 'object',  description: 'the per-block status map (slug -> {status,...}), or {} when absent', additionalProperties: true }
   }
 }
-const STATE_WRITE_SCHEMA = { type: 'object', required: ['written'], properties: { written: { type: 'boolean' }, startedAt: { type: 'string', description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' }, commitHash: { type: 'string' } } }
+const STATE_WRITE_SCHEMA = { type: 'object', required: ['written'], properties: { written: { type: 'boolean' }, startedAt: { type: 'string', description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' }, updatedAt: { type: 'string', description: 'the updated_at value written in this write' }, commitHash: { type: 'string' } } }
+
+const GIT_MERGE_VERIFY_SCHEMA = {
+  type: 'object',
+  required: ['results'],
+  properties: {
+    results: {
+      type: 'array',
+      description: 'one entry per slug given, in the same order',
+      items: {
+        type: 'object',
+        required: ['slug', 'mergedInGit'],
+        properties: {
+          slug: { type: 'string' },
+          mergedInGit: { type: 'boolean', description: "true iff the block's ${slug}-flow branch exists AND is an ancestor of the train branch" }
+        }
+      }
+    }
+  }
+}
 
 // Learned from the first successful state write of this process — or, on --resume, seeded from the
 // load-state agent below, which already reads started_at back. Later writes are handed it as a
@@ -462,8 +481,33 @@ function refreshStateTokens() {
 // logs a warning and never aborts — the child commits/PRs remain the authoritative resume signal.
 async function writeBlockState(label) {
   refreshStateTokens()
-  const stateJson = JSON.stringify(state, null, 2)
   const firstWrite = cachedStartedAt === null
+  // On later writes, started_at is already known (cachedStartedAt) — splice it into the
+  // serialized object BEFORE JSON.stringify, immediately after "mode", so the agent is handed
+  // a JSON blob that already carries the correct value and only has to insert "updated_at".
+  // This removes the two-value ambiguity that let the agent stamp both keys from the cached
+  // literal (see ticket-state-write-updated-at-freeze). On a first write the object is
+  // serialized exactly as before — the agent still derives started_at from STEP 1's `cat`
+  // output.
+  const stateJson = firstWrite
+    ? JSON.stringify(state, null, 2)
+    : JSON.stringify((() => {
+        const entries = Object.entries(state)
+        const modeIdx = entries.findIndex(([k]) => k === 'mode')
+        entries.splice(modeIdx + 1, 0, ['started_at', cachedStartedAt])
+        return Object.fromEntries(entries)
+      })(), null, 2)
+  const stepTwoText = firstWrite
+    ? `STEP 2 — write ${stateFile} with EXACTLY this JSON, inserting two extra top-level keys "started_at"
+  (preserved or NOW, per STEP 1) and "updated_at" (NOW) right after "mode". Valid JSON only (double quotes, no
+  trailing commas, no markdown fences). The object to write (verbatim except those two keys):
+${stateJson}`
+    : `STEP 2 — write ${stateFile} with EXACTLY this JSON, inserting exactly one extra top-level
+  key: "updated_at" (NOW), right after "started_at" (already present in the object below,
+  immediately after "mode" — it was set from the value given in STEP 1). Valid JSON only
+  (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except
+  for adding that one timestamp key):
+${stateJson}`
   const r = await agent(`
 You maintain the SDLC orchestrator's committed state breadcrumb. Overwrite ONE JSON file and commit it
 on the current branch — do NOT run checks, edit code, or touch anything else. You run from the MAIN repo root.
@@ -479,10 +523,7 @@ ${firstWrite
   "${cachedStartedAt}". Do NOT read the existing state file and do NOT run mkdir: the directory
   already exists and started_at is already established.`}
 
-STEP 2 — write ${stateFile} with EXACTLY this JSON, inserting two extra top-level keys "started_at"
-  (${firstWrite ? 'preserved or NOW, per STEP 1' : 'the value given in STEP 1'}) and "updated_at" (NOW) right after "mode". Valid JSON only (double quotes, no
-  trailing commas, no markdown fences). The object to write (verbatim except those two keys):
-${stateJson}
+${stepTwoText}
 
 STEP 3 — commit on the current branch (stage explicitly):
   git add ${stateFile}
@@ -490,11 +531,70 @@ STEP 3 — commit on the current branch (stage explicitly):
   git log --oneline -1
 
 Use the Write tool for the file. Return via StructuredOutput: written=true on success, startedAt set to
-the started_at value you used, and commitHash from the final git log line (empty string if nothing was
-committed).
+the started_at value you used, updatedAt set to the updated_at value you used, and commitHash from the
+final git log line (empty string if nothing was committed).
 `, { label: `state:${label}`, schema: STATE_WRITE_SCHEMA, model: 'haiku' })
   if (r && r.startedAt) cachedStartedAt = r.startedAt
   if (!r || !r.written) log(`(state) could not persist orchestration state for "${label}" — continuing`)
+  // Freeze-detection guard (non-fatal): on a later write, updated_at should never equal
+  // started_at — that is the exact signature of the prompt ambiguity this ticket fixes. Warn
+  // only; never throw, retry, or touch cachedStartedAt / disk content.
+  if (!firstWrite && r && r.updatedAt && r.updatedAt === r.startedAt) {
+    log(`state:${label} WARNING updated_at froze at started_at (${r.updatedAt}) — see ticket-state-write-updated-at-freeze`)
+  }
+}
+
+// Independently verify, via git, whether each block's branch is already merged into the train
+// branch — a deterministic cross-check that never trusts the committed state breadcrumb alone (see
+// ticket-sdlc-block-resume-stale-state). Every block's branch is named "${slug}-flow" (sdlc-flow.js
+// always names it that way, and runBlockFlow always passes the slug as blockId), so this is fully
+// reconstructable from the slug list alone — no committed state is required. Batches ALL slugs into
+// ONE agent call (a single shell loop) rather than one call per slug, to keep this cheap on every
+// resume. Returns an array of { slug, mergedInGit } in the same order as `slugs`; a null/failed
+// agent call degrades to mergedInGit=false for every slug (never invented as true).
+async function verifyBlocksMergedViaGit(slugs, trainBranchName) {
+  if (!slugs || !slugs.length) return []
+  const r = await tracedAgent(`
+You independently verify, via git, whether each of a list of block branches is already merged into the
+train branch. You run from the MAIN repo root. Do NOT modify anything — read-only checks only.
+
+Train branch: ${trainBranchName}
+Block slugs (one branch per slug, named "<slug>-flow"): ${JSON.stringify(slugs)}
+
+STEP 1 — run ONE Bash call, a shell loop over the slug list, that for EACH slug checks (in order):
+  1. Whether the branch exists:      git show-ref --verify --quiet refs/heads/<slug>-flow
+  2. If (and only if) it exists, whether it is already merged into the train branch:
+       git merge-base --is-ancestor <slug>-flow ${trainBranchName}
+     (exit code 0 = already an ancestor, i.e. already merged; non-zero = not merged, or the branch
+     is otherwise not reachable from the train branch)
+  Print one line per slug in the form "<slug> <exists 0|1> <ancestor-exit-code or blank if step 2 was
+  skipped>" so you can parse the results deterministically, e.g.:
+    for s in ${slugs.map(s => `"${s}"`).join(' ')}; do
+      if git show-ref --verify --quiet "refs/heads/\${s}-flow"; then
+        if git merge-base --is-ancestor "\${s}-flow" "${trainBranchName}"; then
+          echo "$s 1 0"
+        else
+          echo "$s 1 1"
+        fi
+      else
+        echo "$s 0 -"
+      fi
+    done
+
+STEP 2 — for each slug, mergedInGit = true iff the branch exists (second field = 1) AND the
+  ancestor check exited 0 (third field = 0). Every other case (branch missing, or exists but not an
+  ancestor of the train branch) → mergedInGit = false. A branch merely existing is NOT sufficient —
+  only a confirmed ancestor relationship counts as merged.
+
+Return using StructuredOutput: results = one { slug, mergedInGit } entry per slug given, in the same
+order as the input list.
+`, { label: 'verify-merged-via-git', schema: GIT_MERGE_VERIFY_SCHEMA, phase: 'Enumerate', model: 'haiku' })
+  if (!r || !Array.isArray(r.results)) {
+    log('(git-verify) could not verify block merge status via git — continuing without this cross-check')
+    return slugs.map(slug => ({ slug, mergedInGit: false }))
+  }
+  const bySlug = new Map(r.results.map(x => [x.slug, !!x.mergedInGit]))
+  return slugs.map(slug => ({ slug, mergedInGit: bySlug.get(slug) || false }))
 }
 
 // Flip ONE block's authored status in this repo's planning/state.json (the graph /start-block,
@@ -767,6 +867,23 @@ Return via StructuredOutput: exists, startedAt, blocks.
   } else {
     log('No orchestration state breadcrumb — treating as a first run.')
   }
+
+  // Independent git cross-check — runs unconditionally on every resume, regardless of what (or
+  // whether) the breadcrumb said, so a stale/missing/wrong breadcrumb entry can never cause an
+  // already-merged block to be re-launched (see ticket-sdlc-block-resume-stale-state). This can
+  // only ADD slugs to doneSlugs (OR semantics) — it never removes a slug the breadcrumb already
+  // confirmed, and a block whose branch is not an ancestor of the train branch is never marked
+  // done by this check alone.
+  const allSlugs = blocks.map(b => b.slug)
+  const gitVerified = await verifyBlocksMergedViaGit(allSlugs, trainBranch)
+  for (const { slug, mergedInGit } of gitVerified) {
+    if (!mergedInGit) continue
+    if (doneSlugs.has(slug)) continue // breadcrumb already confirmed this one
+    const newStatus = mode === 'auto-merge' ? 'merged' : 'done'
+    state.blocks[slug] = { ...state.blocks[slug], status: newStatus }
+    doneSlugs.add(slug)
+    log(`Resume: block ${slug} confirmed merged via git (breadcrumb was stale or missing).`)
+  }
 }
 
 await writeBlockState('enumerated')
@@ -855,6 +972,9 @@ tasksFile="${blockTasks}", taskCount, commitHash, notes.
 // returned worktreePath).
 async function runBlockFlow(slug) {
   log(`Block ${slug}: running /sdlc-flow --no-pr --worktree...`)
+  // sdlc-block.js has no renderCheckList() of its own — it delegates ALL per-block verification to
+  // this child /sdlc-flow run, so the unconditional engine-parse (node --check) gate on any touched
+  // .claude/workflows/*.js file is already covered by sdlc-flow.js's own renderCheckList().
   const r = await workflow('sdlc-flow', `${slug} --no-pr --worktree`)
   return r
 }

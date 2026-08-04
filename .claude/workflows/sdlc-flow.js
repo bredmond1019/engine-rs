@@ -226,6 +226,21 @@ const ENUMERATE_SCHEMA = {
         }
       }
     },
+    // Hardcoded engine-parse gate — mechanism, not project policy (see renderCheckList). Captures,
+    // per task, ONLY the entries of that task's "files" array that live under .claude/workflows/ —
+    // never the full files[] list. Omit tasks with no such path.
+    engineFiles: {
+      type: 'array',
+      description: "One entry per task whose 'files' array includes at least one path under .claude/workflows/. 'files' holds ONLY the matching .claude/workflows/ paths (not the task's full files[] list). Omit tasks with no such path.",
+      items: {
+        type: 'object',
+        required: ['taskId', 'files'],
+        properties: {
+          taskId: { type: 'integer' },
+          files:  { type: 'array', items: { type: 'string' } }
+        }
+      }
+    },
     notes:    { type: 'string' }
   }
 }
@@ -266,6 +281,7 @@ const TEST_SCHEMA = {
     failCount:   { type: 'integer' },
     failedTests: { type: 'array', items: { type: 'string' } },
     failBlob:    { type: 'string', description: 'Compact failure output (failing check names + the tail of their output) for triage; empty when allPassed' },
+    stateWritten: { type: 'boolean', description: 'true if the agent ALSO persisted sdlc-flow-state.json + worklog.md this same turn (the per-task pass-path state-write fold); false/omitted when it did not (no onPass instructions given, a check failed, or the write was not attempted/completed)' },
     notes:       { type: 'string' }
   }
 }
@@ -294,7 +310,8 @@ const TRIAGE_SCHEMA = {
     bailReason:          { type: 'string', description: 'When class=MAJOR: a short human-readable reason for the draft-PR handoff; empty when RETRYABLE' },
     sameFailureAsBefore: { type: 'boolean', description: 'true if the SAME failure as the previous attempt (no progress)' },
     evidence:            { type: 'string', description: 'What was actually OBSERVED, quoting the failing check output. No causal claims.' },
-    baseStateChecked:    { type: 'boolean', description: 'true only if the failing check was actually re-run against the base state (main working tree or the task base commit). false means any claim about the base state is a hypothesis.' }
+    baseStateChecked:    { type: 'boolean', description: 'true only if the failing check was actually re-run against the base state (main working tree or the task base commit). false means any claim about the base state is a hypothesis.' },
+    stateWritten:        { type: 'boolean', description: 'true if the agent ALSO persisted sdlc-flow-state.json + worklog.md this same turn (the terminal-bail state-write fold); false/omitted when it did not (no onBail instructions given, the outcome was not terminal, or the write was not attempted/completed)' }
   }
 }
 
@@ -307,6 +324,7 @@ const DOCS_SCHEMA = {
     created:  { type: 'array', items: { type: 'string' }, description: 'doc files created' },
     flagged:  { type: 'array', items: { type: 'string' }, description: 'docs flagged NEEDS_REVIEW (not edited)' },
     commitHash: { type: 'string' },
+    stateWritten: { type: 'boolean', description: 'true if the agent ALSO persisted sdlc-flow-state.json + worklog.md this same turn (the docs-phase state-write fold); false/omitted when it did not (write not attempted/completed)' },
     notes:    { type: 'string' }
   }
 }
@@ -321,6 +339,8 @@ const WRAPUP_SCHEMA = {
     amendments:    { type: 'array', items: { type: 'string' }, description: 'D18 dated amendment-log lines appended to the spec (empty if none)' },
     commitHash:    { type: 'string' },
     blockStatusFlipped: { type: 'string', description: 'The state.json tracks[].blocks[].id flipped to "closed" on the branch this run, or "" if none (spec not fully done, no state.json, or block not found).' },
+    emitStateRan:  { type: 'boolean', description: 'true if `mev emit-state --write` regenerated derived surfaces on the branch itself during this in-place (non-worktree) wrap-up; false when skipped (worktree mode, or mev/brain.toml absent)' },
+    stateWritten:  { type: 'boolean', description: 'true if the agent ALSO persisted sdlc-flow-state.json + worklog.md this same turn (the wrap-up-phase state-write fold); false/omitted when it did not (write not attempted/completed)' },
     notes:         { type: 'string' }
   }
 }
@@ -357,6 +377,7 @@ const STATE_WRITE_SCHEMA = {
   properties: {
     written:   { type: 'boolean', description: 'true if sdlc-flow-state.json (+ worklog.md) were written to disk' },
     startedAt: { type: 'string',  description: 'the started_at value used in this write (preserved from the existing file, or newly stamped)' },
+    updatedAt: { type: 'string',  description: 'the updated_at value written in this write' },
     notes:     { type: 'string' }
   }
 }
@@ -556,23 +577,42 @@ function skipCountRegressionResult(baselineCount, currentCount, dominantReason) 
   return { regressed, message }
 }
 
+// Hardcoded, project-agnostic parse-time safety gate (mechanism, not policy — see CLAUDE.md standing
+// rule 1). Independent of harness.json/spec checks: any .claude/workflows/ file this task's own
+// tasks.json `files[]` names gets an unconditional `node --check`, in BOTH the fast-tripwire and
+// full-suite render paths, even when the project ships no harness.json at all. No-op (renders '')
+// when the task touches no such file — never emits a check with no target.
+function renderEngineParseChecks(files, cd, startIndex) {
+  if (!files || !files.length) return ''
+  return files.map((f, i) => {
+    const n = startIndex + i
+    return `CHECK ${n} — engine-parse-safety (hardcoded parse-time gate on modified SDLC engine file — mechanism, unconditional on harness.json) [GATING — a failure here blocks the verdict]:
+  ${cd}node --check ${f}
+  echo "CHECK${n}_EXIT:$?"`
+  }).join('\n\n')
+}
+
 // Render the inner project-validation check list for a Test stage. When gatingOnly is true (the fast
 // per-task tripwire), emit only the checks with gates:true; the end-review runs the FULL suite. When
 // the config is absent (or carries no checks), fall back to the spec's `## Validation Commands` — the
-// engine ships NO stack defaults. Handles all D6 check kinds.
-function renderCheckList(cfg, { gatingOnly = false, cwd } = {}) {
+// engine ships NO stack defaults. Handles all D6 check kinds. `engineFiles` (the .claude/workflows/
+// paths in scope for this render, if any) is additive on top of everything below — see
+// renderEngineParseChecks.
+function renderCheckList(cfg, { gatingOnly = false, cwd, engineFiles = [] } = {}) {
   let checks = cfg?.validation?.checks ?? []
   if (gatingOnly) checks = checks.filter(c => c.gates && c.perTask !== false)
   const cd = cwd ? `cd ${cwd} && ` : ''
   if (!checks.length) {
-    return `The project ships no matching \`planning/harness.json\` validation ${gatingOnly ? 'GATING ' : ''}checks, so derive the checks from the spec instead:
+    const fallback = `The project ships no matching \`planning/harness.json\` validation ${gatingOnly ? 'GATING ' : ''}checks, so derive the checks from the spec instead:
   - Read the spec's optional "## Validation Commands" section.
   - Run each command it lists, IN ORDER (prefix each Bash call with: ${cd}). Each command is one check —
     record its name, the command, passed (true iff exit code 0), and the output on failure.
   - If the spec has no "## Validation Commands" section, run no project checks — record a single
     informational row (name "no_validation_suite", passed true) noting the project declared none.`
+    const engineChecks = renderEngineParseChecks(engineFiles, cd, 1)
+    return engineChecks ? `${fallback}\n\n${engineChecks}` : fallback
   }
-  return checks.map((c, i) => {
+  const rendered = checks.map((c, i) => {
     const n = i + 1
     const kind = c.kind || 'command'
     const slug = (c.name || `check${n}`).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
@@ -662,6 +702,8 @@ ${ruleLines}
   ${cd}${cmd}
   echo "CHECK${n}_EXIT:$?"`
   }).join('\n\n')
+  const engineChecks = renderEngineParseChecks(engineFiles, cd, checks.length + 1)
+  return engineChecks ? `${rendered}\n\n${engineChecks}` : rendered
 }
 
 // Snapshot baseline artifacts for any baseline-diff / skip-count-regression checks before the first
@@ -741,8 +783,34 @@ let worklogHeaderWritten = false
 // kept in the signature for callers that have not yet been migrated off it; it is ignored here.
 async function writeFlowState(label, worklogEntry, { cwd, extraAdd = [] } = {}) {
   state.tokens = buildTokensBlock()   // Block A — refresh the token roll-up before persisting
-  const stateJson = JSON.stringify(state, null, 2)
   const firstWrite = cachedStartedAt === null
+  // On later writes, started_at is already known (cachedStartedAt) — splice it into the
+  // serialized object BEFORE JSON.stringify, immediately after "branch", so the agent is
+  // handed a JSON blob that already carries the correct value and only has to insert
+  // "updated_at". This removes the two-value ambiguity that let the agent stamp both keys
+  // from the cached literal (see ticket-state-write-updated-at-freeze). On a first write the
+  // object is serialized exactly as before — the agent still derives started_at from STEP 1's
+  // `cat` output.
+  const stateJson = firstWrite
+    ? JSON.stringify(state, null, 2)
+    : JSON.stringify((() => {
+        const entries = Object.entries(state)
+        const branchIdx = entries.findIndex(([k]) => k === 'branch')
+        entries.splice(branchIdx + 1, 0, ['started_at', cachedStartedAt])
+        return Object.fromEntries(entries)
+      })(), null, 2)
+  const stepTwoText = firstWrite
+    ? `STEP 2 — write ${stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
+  "started_at" (preserved or NOW, per STEP 1) and "updated_at" (NOW) right after "branch". Valid JSON only
+  (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except for
+  adding those two timestamp keys):
+${stateJson}`
+    : `STEP 2 — write ${stateFile} with EXACTLY this JSON, but inserting exactly one extra top-level
+  key: "updated_at" (NOW), right after "started_at" (already present in the object below,
+  immediately after "branch" — it was set from the value given in STEP 1). Valid JSON only
+  (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except for
+  adding that one timestamp key):
+${stateJson}`
   const result = await agent(`
 You maintain the run-state for an /sdlc-flow pipeline. You run from the WORKTREE root. Write two
 files to disk — do NOT run git commands, do not run checks, do not edit source, do not touch
@@ -760,11 +828,7 @@ ${firstWrite
   "${cachedStartedAt}". Do NOT read the existing state file and do NOT run mkdir: the directory
   already exists and an earlier write in this run already established started_at.`}
 
-STEP 2 — write ${stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
-  "started_at" (${firstWrite ? 'preserved or NOW, per STEP 1' : 'the value given in STEP 1'}) and "updated_at" (NOW) right after "branch". Valid JSON only
-  (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except for
-  adding those two timestamp keys):
-${stateJson}
+${stepTwoText}
 
 STEP 3 — append to ${worklogFile}. ${worklogHeaderWritten
   ? 'The file already exists — append only, do not write a header. Append'
@@ -773,12 +837,19 @@ ${worklogEntry ? '```\n' + worklogEntry + '\n```' : '(no worklog entry this writ
 
 Use the Write tool for both files. Do not run \`git add\`, \`git commit\`, \`git checkout\`,
 \`git switch\`, or \`git branch\` — this write is disk-only. Return via StructuredOutput: written=true
-once both files are written to disk, and startedAt set to the started_at value you used.
+once both files are written to disk, startedAt set to the started_at value you used, and updatedAt
+set to the updated_at value you used.
 `, withModel({ label: `state:${label}`, schema: STATE_WRITE_SCHEMA }, MODEL.stateWriter))
   if (result && result.startedAt) cachedStartedAt = result.startedAt
   if (result && result.written && worklogEntry) worklogHeaderWritten = true
   if (!result || !result.written) {
     log(`(state) could not persist flow state for "${label}" — continuing`)
+  }
+  // Freeze-detection guard (non-fatal): on a later write, updated_at should never equal
+  // started_at — that is the exact signature of the prompt ambiguity this ticket fixes. Warn
+  // only; never throw, retry, or touch cachedStartedAt / disk content.
+  if (!firstWrite && result && result.updatedAt && result.updatedAt === result.startedAt) {
+    log(`state:${label} WARNING updated_at froze at started_at (${result.updatedAt}) — see ticket-state-write-updated-at-freeze`)
   }
   return result
 }
@@ -1019,7 +1090,12 @@ STEP 3 — Per-task validation overrides. For each task whose "validation_comman
   "validation_commands" is absent, null, or [] — those fall back to the project-wide harness checks.
   Copy the command strings VERBATIM; do not normalize, reorder, or invent commands.
 
-Return via StructuredOutput: hasTasks, allTasks (integers in order), taskChecks, notes.
+STEP 4 — Engine-parse gate scan. For each task, look at its "files" array. If ANY entry is a path
+  under .claude/workflows/ (e.g. ".claude/workflows/sdlc-task.js"), add {taskId, files} to
+  engineFiles, where files is ONLY the matching .claude/workflows/ path(s) from that task (never the
+  task's other files). Skip every task whose "files" has no such path.
+
+Return via StructuredOutput: hasTasks, allTasks (integers in order), taskChecks, engineFiles, notes.
 `, withModel({ label: 'enumerate', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
 
 if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) {
@@ -1044,6 +1120,19 @@ const taskCheckMap = new Map(
 function taskCommandsFor(taskNum) { return taskCheckMap.get(taskNum) || null }
 if (taskCheckMap.size) {
   log(`Per-task validation overrides (tasks.json validation_commands): ${[...taskCheckMap.keys()].sort((a, b) => a - b).join(', ')} — these tasks skip the project-wide harness tripwire.`)
+}
+
+// Hardcoded engine-parse gate (mechanism, not project policy — see renderCheckList). Per-task
+// .claude/workflows/ paths from tasks.json's own "files" array, captured at enumerate-time so the
+// gate is unconditional on harness.json and independent of whatever project checks apply.
+const taskEngineFilesMap = new Map(
+  (enumResult.engineFiles || [])
+    .filter(ef => ef && Number.isInteger(ef.taskId) && Array.isArray(ef.files) && ef.files.length)
+    .map(ef => [ef.taskId, ef.files])
+)
+function engineFilesFor(taskNum) { return taskEngineFilesMap.get(taskNum) || [] }
+if (taskEngineFilesMap.size) {
+  log(`Engine-parse gate (hardcoded, unconditional): task(s) touching .claude/workflows/ → ${[...taskEngineFilesMap.keys()].sort((a, b) => a - b).join(', ')}.`)
 }
 
 // Resume: load the committed state.json to skip already-passed tasks. Also seeds the in-memory
@@ -1120,7 +1209,44 @@ function renderTaskCheckList(commands, cwd) {
   }).join('\n\n')
 }
 
-async function runTests(label, { gatingOnly, taskCommands = null }) {
+// Renders the "if allPassed, ALSO perform this exact state write, in this same turn" instruction
+// block for a passing test agent — the identical STEP 1-4 recipe writeFlowState() uses today (cat
+// for started_at preservation, Write two files, explicit no-git-commands prohibition), inlined here
+// so the fold doesn't need a follow-up dedicated state-writer agent. `onPass` is
+// { stateFile, stateJson, worklogFile, worklogEntry } — all fully computable in JS before the test
+// call is made, from the prior implement/fix stage's result.
+function renderOnPassStateWriteRecipe(onPass) {
+  return `
+IF AND ONLY IF allPassed is true above, ALSO perform this state write as part of THIS SAME turn —
+do NOT do this if any check failed (leave stateWritten unset/false in that case):
+
+STEP W1 — run this as ONE Bash call, exactly as written. Do not split it into several calls:
+  cd ${worktreePath} && mkdir -p ${blockDir}/sdlc && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${onPass.stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise started_at = NOW.
+
+STEP W2 — write ${onPass.stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
+  "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch". Valid
+  JSON only (double quotes, no trailing commas, no markdown fences). The object to write (verbatim
+  except for adding those two timestamp keys):
+${onPass.stateJson}
+
+STEP W3 — append to ${onPass.worklogFile}. If the file does not exist, first write a header line
+  "# Worklog — ${blockId}" then a blank line. Then append this section verbatim (a blank line
+  before it):
+\`\`\`
+${onPass.worklogEntry}
+\`\`\`
+
+STEP W4 — use the Write tool for both files. Do NOT run \`git add\`, \`git commit\`, \`git checkout\`,
+  \`git switch\`, or \`git branch\` — this write is disk-only, exactly like writeFlowState(). Set
+  stateWritten=true in your StructuredOutput once both files are written to disk; leave it
+  false/unset if you skipped this because a check failed.
+`
+}
+
+async function runTests(label, { gatingOnly, taskCommands = null, onPass = null, engineFiles = [] }) {
   const usingOverride = Array.isArray(taskCommands) && taskCommands.length > 0
   return tracedAgent(`${W}
 You are the test agent for the /sdlc-flow pipeline. Run the project's validation checks and report.
@@ -1132,7 +1258,7 @@ checks. All Bash calls run from the worktree root (prefix each with: cd ${worktr
 
 ${usingOverride
     ? renderTaskCheckList(taskCommands, worktreePath)
-    : renderCheckList(harnessCfg, { gatingOnly, cwd: worktreePath })}
+    : renderCheckList(harnessCfg, { gatingOnly, cwd: worktreePath, engineFiles })}
 
 Then run the universal emoji gate (a harness rule, always): scan the files changed on this branch for
 emoji in markdown/docs (excluding the literal "🤖 Generated with Claude Code" PR footer if present).
@@ -1140,15 +1266,97 @@ emoji in markdown/docs (excluding the literal "🤖 Generated with Claude Code" 
   Inspect the changed .md files; a stray emoji in docs FAILS this gate.
 
 For each check record: name, passed (true iff exit code 0), the command, and failure output.
+${onPass ? renderOnPassStateWriteRecipe(onPass) : ''}
 Return via StructuredOutput: allPassed (true only if EVERY check passed), passCount, failCount,
-failedTests (names), failBlob (compact: failing check names + the tail of their output; empty when allPassed).
+failedTests (names), failBlob (compact: failing check names + the tail of their output; empty when allPassed)${onPass ? ', stateWritten (true only if you performed the additional state write above)' : ''}.
 `, withModel({ label, schema: TEST_SCHEMA, phase: 'Tasks' }, MODEL.test))
+}
+
+// Renders the "if this triage call is terminal, ALSO perform this exact state write, in this same
+// turn" instruction block for the triage agent — mirrors renderOnPassStateWriteRecipe's STEP 1-4
+// recipe, with one addition: the bail_reason placeholder in the state JSON must be filled with the
+// SAME formula the JS per-task loop uses for that outcome (MAJOR: bailReason || reason || a
+// precomputed fallback; exhausted-attempts-while-RETRYABLE: a different precomputed fallback,
+// ignoring bailReason/reason entirely) — mirrored exactly here since the effective bail reason is
+// only known once the agent has classified, inside this same turn. `onBail` is
+// { stateFile, stateJson, worklogFile, worklogEntry, majorFallback, exhaustionFallback } —
+// exhaustionFallback is null at call sites that have no attempt-exhaustion bail path (mirrors the
+// asymmetry between the NULL_RESULT and test-failure call sites in the per-task loop today).
+function renderBailStateWriteRecipe(onBail, attempt, maxAttempts) {
+  const esc = s => String(s).replace(/"/g, '\\"')
+  return `
+IF AND ONLY IF your class above is MAJOR${onBail.exhaustionFallback ? `, OR this is the final attempt (attempt ${attempt} of ${maxAttempts})` : ''}, ALSO perform this state
+write as part of THIS SAME turn — do NOT do this ${onBail.exhaustionFallback ? `if class is RETRYABLE and this is NOT the final attempt` : `unless class is MAJOR`} (leave stateWritten unset/false in that case):
+
+First compute the effective bail reason (used in STEP W2/W3 below):
+  - If your class is MAJOR: use your own bailReason field if you set a non-empty value; otherwise
+    your own reason field if non-empty; otherwise this exact fallback text: "${esc(onBail.majorFallback)}"
+${onBail.exhaustionFallback ? `  - If your class is RETRYABLE but this IS the final attempt (attempt ${attempt} of ${maxAttempts}):
+    IGNORE your own bailReason/reason and use this EXACT fallback text instead: "${esc(onBail.exhaustionFallback)}"` : ''}
+
+STEP W1 — run this as ONE Bash call, exactly as written. Do not split it into several calls:
+  cd ${worktreePath} && mkdir -p ${blockDir}/sdlc && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${onBail.stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise started_at = NOW.
+
+STEP W2 — write ${onBail.stateFile} with EXACTLY this JSON, but: (a) inserting two extra top-level
+  keys "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch", and
+  (b) replacing the literal placeholder string "__BAIL_REASON__" (the top-level "bail_reason" field)
+  with the effective bail reason computed above. Valid JSON only (double quotes, no trailing commas,
+  no markdown fences). The object to write (verbatim except for those substitutions):
+${onBail.stateJson}
+
+STEP W3 — append to ${onBail.worklogFile}. If the file does not exist, first write a header line
+  "# Worklog — ${blockId}" then a blank line. Then append this section verbatim (a blank line
+  before it), with one more line appended at the end reading exactly
+  "Bail reason: <the effective bail reason computed above>":
+\`\`\`
+${onBail.worklogEntry}
+\`\`\`
+
+STEP W4 — use the Write tool for both files. Do NOT run \`git add\`, \`git commit\`, \`git checkout\`,
+  \`git switch\`, or \`git branch\` — this write is disk-only, exactly like writeFlowState(). Set
+  stateWritten=true in your StructuredOutput once both files are written to disk; leave it
+  false/unset if you skipped this because the outcome was not terminal.
+`
+}
+
+// Precompute the exact state.json + worklog.md content for the case where THIS triage call turns
+// out to be terminal (class=MAJOR, or — only at call sites that pass exhaustionFallback — this is
+// the final allowed attempt) — content that is fully known BEFORE the triage call is made, except
+// the effective bail reason, which the triage agent itself computes as part of classifying (see
+// renderBailStateWriteRecipe). Handed to triage() as `onBail` so a terminal triage call can write
+// it in its own turn instead of a follow-up dedicated state-writer agent. Does NOT mutate the live
+// `state`/`t` objects — this is a snapshot for the CANDIDATE outcome.
+function buildBailPayload(taskNum, t, attempt, majorFallback, exhaustionFallback = null) {
+  const snapshot = JSON.parse(JSON.stringify(state))
+  snapshot.tasks[String(taskNum)] = { ...t, status: 'failed' }
+  snapshot.status = 'blocked'
+  snapshot.bail_reason = '__BAIL_REASON__'
+  snapshot.tokens = buildTokensBlock()
+  const worklogEntry = [
+    `## Task ${taskNum} — FAILED (${attempt} attempt${attempt === 1 ? '' : 's'})`,
+    t.summary ? `What: ${t.summary}` : '',
+    (t.issues || []).length ? `Issues hit: ${t.issues.join('; ')}` : '',
+    (t.fixes || []).length ? `Fixed via: ${t.fixes.join('; ')}` : '',
+    (t.decisions || []).length ? `Decisions: ${t.decisions.join('; ')}` : '',
+    t.commit ? `Commit: ${t.commit}` : '',
+  ].filter(Boolean).join('\n')
+  return {
+    stateFile,
+    stateJson: JSON.stringify(snapshot, null, 2),
+    worklogFile,
+    worklogEntry,
+    majorFallback,
+    exhaustionFallback,
+  }
 }
 
 // ----------------------------------------------------------------
 // Triage helper (shared by the per-task loop + the review fix loop)
 // ----------------------------------------------------------------
-async function triage(context, attempt, maxAttempts, failBlob, sameContext) {
+async function triage(context, attempt, maxAttempts, failBlob, sameContext, onBail = null) {
   return tracedAgent(`
 You are the failure-triage agent for an /sdlc-flow run. Classify a failure so the pipeline either makes
 a bounded fix or bails to a human NOW. Bailing is cheap; a wasted retry loop is not — when unsure, BAIL.
@@ -1181,11 +1389,39 @@ Otherwise:
               (it is making progress and a bounded fix can plausibly close it).
   MAJOR     — the SAME failure again with no progress, OR structural (one of the bail reasons above).
 
+${onBail ? renderBailStateWriteRecipe(onBail, attempt, maxAttempts) : ''}
 Return via StructuredOutput: class, reason, bailReason (empty when RETRYABLE), sameFailureAsBefore,
 evidence (what was actually OBSERVED, quoting output — no causal claims), baseStateChecked (true only
-if the failing check was actually re-run against the base state).
+if the failing check was actually re-run against the base state)${onBail ? ', stateWritten (true only if you performed the additional state write above)' : ''}.
 ${sameContext ? `(Previous attempt context for the same-failure check: ${sameContext})` : ''}
 `, withModel({ label: `triage:${context}:${attempt}`, schema: TRIAGE_SCHEMA, phase: 'Tasks' }, MODEL.triage))
+}
+
+// Precompute the exact state.json + worklog.md content for the case where task `taskNum` PASSES on
+// this attempt — content that is fully known from the implement/fix stage's result (t.summary,
+// t.commit, t.files_changed, t.decisions) BEFORE the test call is even made; the test call only
+// determines whether this precomputed content actually gets used. Handed to runTests() as `onPass`
+// so a passing test agent can write it in its own turn instead of a follow-up dedicated state-writer
+// agent. Does NOT mutate the live `state`/`t` objects — this is a snapshot for the CANDIDATE outcome.
+function buildPassPayload(taskNum, t, attempt, validatedLabel) {
+  const snapshot = JSON.parse(JSON.stringify(state))
+  snapshot.tasks[String(taskNum)] = { ...t, status: 'passed', validated: validatedLabel }
+  snapshot.tokens = buildTokensBlock()
+  const worklogEntry = [
+    `## Task ${taskNum} — PASSED (${attempt} attempt${attempt === 1 ? '' : 's'})`,
+    t.summary ? `What: ${t.summary}` : '',
+    (t.issues || []).length ? `Issues hit: ${t.issues.join('; ')}` : '',
+    (t.fixes || []).length ? `Fixed via: ${t.fixes.join('; ')}` : '',
+    (t.decisions || []).length ? `Decisions: ${t.decisions.join('; ')}` : '',
+    t.commit ? `Commit: ${t.commit}` : '',
+    `Validated: ${validatedLabel}`,
+  ].filter(Boolean).join('\n')
+  return {
+    stateFile,
+    stateJson: JSON.stringify(snapshot, null, 2),
+    worklogFile,
+    worklogEntry,
+  }
 }
 
 // ================================================================
@@ -1212,6 +1448,7 @@ for (const taskNum of taskList) {
 
   let taskPassed = false
   let prevFailBlob = null
+  let taskStateWritten = false
 
   for (let attempt = 1; attempt <= MAX_TASK_ATTEMPTS && !bailed; attempt++) {
     t.attempts = attempt
@@ -1281,8 +1518,18 @@ Return via StructuredOutput:
 
     if (!stageResult) {
       log(`Task ${taskNum} attempt ${attempt}: agent returned null.`)
-      const tr = await triage(`task ${taskNum} implement`, attempt, MAX_TASK_ATTEMPTS, 'NULL_RESULT — the agent died or returned nothing.', prevFailBlob)
-      if (tr && tr.class === 'MAJOR') { bailed = true; bailReason = tr.bailReason || tr.reason || 'agent returned null'; break }
+      // No attempt-exhaustion bail path exists at this call site today (an exhausted NULL_RESULT
+      // loop just falls out of the `for` naturally without ever setting `bailed` — that pre-existing
+      // asymmetry with the test-failure site below is unchanged by this fold), so exhaustionFallback
+      // is omitted: the folded write only fires when this call classifies MAJOR.
+      const nullBailPayload = buildBailPayload(taskNum, t, attempt, 'agent returned null')
+      const tr = await triage(`task ${taskNum} implement`, attempt, MAX_TASK_ATTEMPTS, 'NULL_RESULT — the agent died or returned nothing.', prevFailBlob, nullBailPayload)
+      if (tr && tr.class === 'MAJOR') {
+        bailed = true
+        bailReason = tr.bailReason || tr.reason || 'agent returned null'
+        if (tr.stateWritten) taskStateWritten = true
+        break
+      }
       continue
     }
     if (stageResult.commit) t.commit = stageResult.commit
@@ -1294,29 +1541,49 @@ Return via StructuredOutput:
     //    own `validation_commands` in tasks.json runs THOSE instead (the end review still runs the
     //    full harness suite over the integrated tree, so nothing escapes validation — this only
     //    changes what the per-task tripwire costs).
-    const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast', taskCommands: taskCommandsFor(taskNum) })
+    const passValidatedLabel = taskCommandsFor(taskNum)
+      ? 'per-task validation_commands (tasks.json override)'
+      : (testDepth === 'fast' ? 'gating checks (fast tripwire)' : 'full gating suite')
+    const passPayload = buildPassPayload(taskNum, t, attempt, passValidatedLabel)
+    const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast', taskCommands: taskCommandsFor(taskNum), onPass: passPayload, engineFiles: engineFilesFor(taskNum) })
     if (testResult && testResult.allPassed) {
-      t.validated = taskCommandsFor(taskNum)
-        ? 'per-task validation_commands (tasks.json override)'
-        : (testDepth === 'fast' ? 'gating checks (fast tripwire)' : 'full gating suite')
+      t.validated = passValidatedLabel
       taskPassed = true
+      if (testResult.stateWritten) {
+        // The folded write went straight to disk (no STATE_WRITE_SCHEMA result to read startedAt
+        // back from), so cachedStartedAt is deliberately left as-is: the next dedicated writeFlowState
+        // call (a later task, or this task's own reliability-net fallback) will just re-`cat` the file
+        // it wrote — which still correctly preserves started_at, just without the caching shortcut.
+        taskStateWritten = true
+        worklogHeaderWritten = true
+      }
       break
     }
 
     // 5. Failure → triage.
     const failBlob = (testResult && testResult.failBlob) || `Test stage failed or returned null (failCount=${testResult?.failCount ?? '?'}, failed=${(testResult?.failedTests || []).join(', ')}).`
     t.issues = [...(t.issues || []), ...((testResult?.failedTests) || [])]
-    const tr = await triage(`task ${taskNum} test`, attempt, MAX_TASK_ATTEMPTS, failBlob, prevFailBlob)
+    // This call site DOES have an attempt-exhaustion bail path (below), with its own fallback text
+    // that ignores the triage agent's own bailReason/reason entirely — pass both fallbacks through so
+    // the folded write mirrors whichever terminal path actually fires, exactly.
+    const majorFallback = `Task ${taskNum}: ${(testResult?.failedTests || []).join(', ')}`
+    const exhaustionFallback = attempt === MAX_TASK_ATTEMPTS
+      ? `Task ${taskNum} still failing after ${MAX_TASK_ATTEMPTS} attempts: ${(testResult?.failedTests || []).join(', ')}`
+      : null
+    const testBailPayload = buildBailPayload(taskNum, t, attempt, majorFallback, exhaustionFallback)
+    const tr = await triage(`task ${taskNum} test`, attempt, MAX_TASK_ATTEMPTS, failBlob, prevFailBlob, testBailPayload)
     prevFailBlob = failBlob
     if (tr && tr.class === 'MAJOR') {
       bailed = true
-      bailReason = tr.bailReason || tr.reason || `Task ${taskNum}: ${(testResult?.failedTests || []).join(', ')}`
+      bailReason = tr.bailReason || tr.reason || majorFallback
+      if (tr.stateWritten) taskStateWritten = true
       log(`Task ${taskNum}: triage → MAJOR — bailing immediately (not burning the remaining attempts). Reason: ${bailReason}`)
       break
     }
     if (attempt === MAX_TASK_ATTEMPTS) {
       bailed = true
-      bailReason = `Task ${taskNum} still failing after ${MAX_TASK_ATTEMPTS} attempts: ${(testResult?.failedTests || []).join(', ')}`
+      bailReason = exhaustionFallback
+      if (tr && tr.stateWritten) taskStateWritten = true
       log(`Task ${taskNum}: exhausted ${MAX_TASK_ATTEMPTS} attempts — bailing to wrap-up.`)
       break
     }
@@ -1336,7 +1603,17 @@ Return via StructuredOutput:
     t.commit ? `Commit: ${t.commit}` : '',
     t.validated ? `Validated: ${t.validated}` : '',
   ].filter(Boolean).join('\n')
-  await writeFlowState(`task ${taskNum} ${t.status}`, worklogEntry, { cwd: worktreePath })
+  // Reliability net: either the pass-path fold (runTests' onPass, task 1) or the terminal-bail fold
+  // (triage's onBail, task 2) already wrote state.json + worklog.md in the SAME turn as the
+  // resolving test/triage call when taskStateWritten is true — skip the dedicated writer in that
+  // case. taskStateWritten is only ever set true alongside taskPassed or bailed (never both), so
+  // checking it alone is sufficient. Any other outcome (stateWritten false/unset, testResult/triage
+  // null) falls through to the dedicated call so no task outcome is ever left unpersisted.
+  if (!taskStateWritten) {
+    await writeFlowState(`task ${taskNum} ${t.status}`, worklogEntry, { cwd: worktreePath })
+  } else {
+    log(`Task ${taskNum}: state write folded into the ${taskPassed ? 'passing test' : 'terminal triage'} agent's own turn — skipped the dedicated state-writer call.`)
+  }
 
   if (bailed) break
 }
@@ -1386,7 +1663,7 @@ but it does NOT replace verifying the criteria against the code:
 3. Run the FRESH AUTHORITATIVE checks (this determines the verdict — NOT the per-task tripwire):
    Re-run the FULL gating suite below in order. A fresh failure of any GATING check ALWAYS prevents PASS.
 
-${renderCheckList(harnessCfg, { gatingOnly: false, cwd: worktreePath })}
+${renderCheckList(harnessCfg, { gatingOnly: false, cwd: worktreePath, engineFiles: [...new Set(taskList.flatMap(n => engineFilesFor(n)))] })}
 
    Plus the universal emoji gate: scan changed .md files for stray emoji (the literal
    "🤖 Generated with Claude Code" footer is allowed only in a PR body, not in docs).
@@ -1457,6 +1734,104 @@ Return via StructuredOutput: reportFile="", success=true if applied, filesModifi
   }
 }
 
+// ----------------------------------------------------------------
+// Task 5 fold: docs-phase and wrap-up-phase state writes.
+//
+// Unlike the per-task pass/bail folds (tasks 1-2), Docs and Wrap-up each run EXACTLY ONCE and
+// UNCONDITIONALLY when reached (no pass/fail branching) — today's code always calls writeFlowState
+// once, right after each agent returns, regardless of outcome. So there is no "only if X" gate in
+// either recipe below; the instruction is simply "also do this, in this same turn, after your other
+// steps." Research finding (ticket Notes has the full writeup): safe to fold both, because (a) the
+// run-state file (stateFile) is deliberately NEVER committed by any agent (see writeFlowState's own
+// comment above) — it lives under planning/<blockId>/sdlc/, so it never collides with either
+// agent's own git commit step (docs' doc-file commit; wrap-up's vault-aware status.md/state.json
+// commit), and (b) --resume only reads stateFile at the TOP of a fresh run, long after either phase
+// would have finished writing it — moving the write from "a follow-up agent spawn" to "the last
+// step of the same agent's turn" changes nothing about what's on disk by the time any reader looks.
+// ----------------------------------------------------------------
+
+// Docs: the state JSON is known in JS EXCEPT the "docs" field (what got patched/created is only
+// known to the agent itself, from its own steps 3-4) -- so the payload carries a placeholder object
+// there, mirroring the bail_reason placeholder substitution triage() already uses for onBail.
+function buildDocsStatePayload() {
+  const snapshot = JSON.parse(JSON.stringify(state))
+  snapshot.docs = { changed: '__DOCS_CHANGED__', created: '__DOCS_CREATED__' }
+  snapshot.tokens = buildTokensBlock()
+  return { stateFile, stateJson: JSON.stringify(snapshot, null, 2), worklogFile }
+}
+
+function renderDocsStateWriteRecipe(onDone) {
+  return `
+AFTER completing steps 1-5 above, in THIS SAME turn, ALSO perform this state write:
+
+STEP W1 — run this as ONE Bash call, exactly as written. Do not split it into several calls:
+  cd ${worktreePath} && mkdir -p ${blockDir}/sdlc && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${onDone.stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise started_at = NOW.
+
+STEP W2 — write ${onDone.stateFile} with EXACTLY this JSON, but: (a) inserting two extra top-level
+  keys "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch", and
+  (b) replacing the placeholder top-level "docs" object — currently
+  {"changed": "__DOCS_CHANGED__", "created": "__DOCS_CREATED__"} — with the doc files you ACTUALLY
+  patched in step 3 (changed[], [] if the "nothing needed changing" branch applied) and created in
+  step 2b's BOOTSTRAP MODE (created[], [] otherwise). Valid JSON only (double quotes, no trailing
+  commas, no markdown fences). The object to write (verbatim except for those substitutions):
+${onDone.stateJson}
+
+STEP W3 — append to ${onDone.worklogFile}. If the file does not exist, first write a header line
+  "# Worklog — ${blockId}" then a blank line. Then append a section formatted exactly like this
+  (a blank line before it) — "changed"/"created" are the SAME lists you just substituted into
+  STEP W2, comma-joined; use "none" if changed is empty; omit the "| Created: ..." clause entirely
+  if created is empty:
+  ## Docs
+  Patched: <changed, comma-joined, or "none">[ | Created: <created, comma-joined>]
+
+STEP W4 — use the Write tool for both files. Do NOT run \`git add\`, \`git commit\`, \`git checkout\`,
+  \`git switch\`, or \`git branch\` — this write is disk-only, exactly like writeFlowState(). Set
+  stateWritten=true in your StructuredOutput once both files are written to disk.
+`
+}
+
+// Wrap-up: the state JSON is FULLY known in JS before this call (state.status derives from
+// bailed/finalVerdict, both already resolved by the time Phase 5 starts) -- no placeholder needed
+// there. Only the worklog entry's "Next: ..." line depends on the agent's own nextFocus.
+function buildWrapupStatePayload() {
+  state.status = bailed ? 'blocked' : 'done'
+  state.tokens = buildTokensBlock()
+  const snapshot = JSON.parse(JSON.stringify(state))
+  return { stateFile, stateJson: JSON.stringify(snapshot, null, 2), worklogFile }
+}
+
+function renderWrapupStateWriteRecipe(onDone) {
+  return `
+AFTER completing steps 1-5 above, in THIS SAME turn, ALSO perform this state write:
+
+STEP W1 — run this as ONE Bash call, exactly as written. Do not split it into several calls:
+  cd ${worktreePath} && mkdir -p ${blockDir}/sdlc && date -u +%Y-%m-%dT%H:%M:%SZ && { cat ${onDone.stateFile} 2>/dev/null || echo "__NO_STATE__"; }
+  The FIRST line of output is NOW. Everything after it is the existing state file, or __NO_STATE__
+  when there is none. If that file exists and has a "started_at" value, REUSE it verbatim for
+  started_at below. Otherwise started_at = NOW.
+
+STEP W2 — write ${onDone.stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
+  "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch". Valid
+  JSON only (double quotes, no trailing commas, no markdown fences). The object to write (verbatim
+  except for adding those two timestamp keys):
+${onDone.stateJson}
+
+STEP W3 — append to ${onDone.worklogFile}. If the file does not exist, first write a header line
+  "# Worklog — ${blockId}" then a blank line. Then append a section formatted exactly like this
+  (a blank line before it), with <next> replaced by your own nextFocus value from step 2 above (or
+  "(see status.md)" if you did not set one):
+  ## Wrap-up — ${finalVerdict}
+  Next: <next>
+
+STEP W4 — use the Write tool for both files. Do NOT run \`git add\`, \`git commit\`, \`git checkout\`,
+  \`git switch\`, or \`git branch\` — this write is disk-only, exactly like writeFlowState(). Set
+  stateWritten=true in your StructuredOutput once both files are written to disk.
+`
+}
+
 // ================================================================
 // PHASE 4: DOCS — surgical /update-docs --patch (gated on PASS)
 // ================================================================
@@ -1465,6 +1840,7 @@ if (!bailed && finalVerdict === 'PASS') {
   state.status = 'docs'
   log('Running docs patch (/update-docs --patch over the changed surface)...')
 
+  const docsStatePayload = buildDocsStatePayload()
   const docResult = await tracedAgent(`${W}
 You are the documentation agent for the /sdlc-flow pipeline — a surgical /update-docs --patch over only
 the surface this run changed. All Bash from the worktree root.
@@ -1504,8 +1880,9 @@ EOF
 )"
      cd ${worktreePath} && git log --oneline -1
    If nothing needed changing, make no commit and report success=true with empty changed/created.
-
-Return via StructuredOutput: success, changed[], created[], flagged[], commitHash, notes.
+${renderDocsStateWriteRecipe(docsStatePayload)}
+Return via StructuredOutput: success, changed[], created[], flagged[], commitHash, stateWritten (true
+only if you performed the additional state write above), notes.
 `, withModel({ label: 'docs', schema: DOCS_SCHEMA, phase: 'Docs' }, MODEL.docs))
 
   if (docResult) {
@@ -1515,7 +1892,14 @@ Return via StructuredOutput: success, changed[], created[], flagged[], commitHas
   } else {
     log('Docs agent returned null — continuing to wrap-up.')
   }
-  await writeFlowState('docs', `## Docs\nPatched: ${(state.docs.changed || []).join(', ') || 'none'}${(state.docs.created || []).length ? ` | Created: ${state.docs.created.join(', ')}` : ''}`, { cwd: worktreePath })
+  // Reliability net: skip the dedicated writer only when the docs agent itself reports the folded
+  // write succeeded; a null result or stateWritten=false falls through so this phase's outcome is
+  // never left unpersisted.
+  if (docResult && docResult.stateWritten) {
+    log('Docs: state write folded into the docs agent\'s own turn — skipped the dedicated state-writer call.')
+  } else {
+    await writeFlowState('docs', `## Docs\nPatched: ${(state.docs.changed || []).join(', ') || 'none'}${(state.docs.created || []).length ? ` | Created: ${state.docs.created.join(', ')}` : ''}`, { cwd: worktreePath })
+  }
 }
 
 // ================================================================
@@ -1540,6 +1924,7 @@ log(`Wrap-up. Verdict: ${finalVerdict} | passed ${passedTasks.length}/${taskList
 // stay staged and committed in the invoking repo exactly as before. detectPlanningVault() resolves
 // which case applies.
 const vault = await detectPlanningVault(worktreePath)
+const wrapupStatePayload = buildWrapupStatePayload()
 const wrapupResult = await tracedAgent(`${W}
 You are the wrap-up agent for an /sdlc-flow run. Write the human-facing status/log + the D18 amendment log
 ON THIS BRANCH (the PR will carry them), then commit. All Bash from the worktree root.
@@ -1573,18 +1958,50 @@ Target:
         ? `- Only proceed if you flipped the spec's status.md status to "Done" above (this was the last task). If tasks remain, leave state.json untouched and set blockStatusFlipped to "".`
         : `- The full spec is done, so proceed.`}
     - Resolve the block's canonical ID from the status.md Progress Table row you just edited (the
-      <BlockID> column, or the id that row maps to in state.json). Find that block in state.json
-      tracks[].blocks[] — search EVERY track. If found, set its "status" to "closed" (the only
-      authored close value). If NOT found, report it in notes and do NOT fabricate a block entry.
+      <BlockID> column, or the id that row maps to in state.json). This is the only part of this
+      step that stays your judgment call — the mutation itself is scripted below, not an Edit-tool
+      diff.
+    - Run ONE scripted mutation (never the Edit tool) to perform the write — substitute the id you
+      resolved for <RESOLVED_ID> (keep it as the script's sole argv, quoted):
+        cd ${worktreePath} && python3 -c "
+import json, sys
+path = 'planning/state.json'
+bid = sys.argv[1]
+data = json.load(open(path))
+found = False
+for track in data.get('tracks', []):
+    for block in track.get('blocks', []):
+        if block.get('id') == bid:
+            block['status'] = 'closed'
+            found = True
+            break
+    if found:
+        break
+if found:
+    with open(path, 'w') as fh:
+        json.dump(data, fh, indent=2)
+        fh.write(chr(10))
+    print('FLIPPED:' + bid)
+else:
+    print('NOT_FOUND')
+" "<RESOLVED_ID>"
+      The script searches EVERY tracks[].blocks[] entry and only ever mutates the one matching
+      block's "status" field; on a miss it prints NOT_FOUND and never opens the file for writing,
+      so it stays byte-unchanged. Read the script's own stdout — do not infer success yourself: on
+      "FLIPPED:<id>" set blockStatusFlipped to that id; on "NOT_FOUND" report it in notes, do NOT
+      fabricate a block entry, and set blockStatusFlipped to "".
     - Validate the file is still valid JSON:
         cd ${worktreePath} && python3 -c "import json;json.load(open('planning/state.json'))"
-    - Do NOT run \`mev emit-state --write\` here. ${useWorktree
-        ? 'This is a linked git worktree, where emit-state refuses to run.'
-        : 'This run is on a feature branch, not the base branch — emit-state must run on the base, and only after the branch merges (deriving from the branch checkout would be wrong).'} The authored flip is
-      committed on the branch below (step 5); the derived surfaces regenerate on the base branch when
-      this branch merges (/clean-worktree, /merge-train, or /close-out --merge-branch run emit-state
-      after integration).
     - Set blockStatusFlipped to the block id you closed (or "" if none).
+
+2c. Regenerate derived surfaces via \`mev emit-state --write\`. Run this step whenever this wrap-up
+    stage runs at all — it is NOT conditional on "was this the last task" / full-spec completion above:
+    step 2 already edited planning/status.md regardless of whether the spec fully completed this run
+    (a task-subset run, or a bail, still leaves it changed on disk), so the derived surfaces (status.md
+    rollups, /attention boards, wave tables) need resyncing every time, not only on a full close.
+    ${useWorktree
+      ? `- Do NOT run \`mev emit-state --write\` here: this is a linked git worktree, where emit-state refuses to run. The authored edits are committed on the branch below (step 5); the derived surfaces regenerate on the base branch when this branch merges (/clean-worktree, /merge-train, or /close-out --merge-branch run emit-state after integration). Set emitStateRan=false.`
+      : `- This run is IN PLACE on branch ${branchName} (in the main repo tree, not an isolated worktree) — emit-state is safe to run right here on the branch, the same way \`git commit\` already lands right here: cd ${worktreePath} && mev emit-state --write . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation. (This is separate from the --auto-merge path's own emit-state call in step 5 below, which re-derives again on ${prBase} after the PR merges — that call is unaffected and still runs unconditionally there.)`}
 
 3. Prepend a new log.md entry (newest first):
    ## [run: date +%Y-%m-%d]
@@ -1632,17 +2049,27 @@ chore: wrap up ${stem}
 EOF
 )"
    cd ${worktreePath} && git log --oneline -1`}
-
+${renderWrapupStateWriteRecipe(wrapupStatePayload)}
 Return via StructuredOutput: statusUpdated, devlogUpdated, nextFocus, amendments[], commitHash,
-blockStatusFlipped (the state.json block id closed in step 2b, or ""), notes.
+blockStatusFlipped (the state.json block id closed in step 2b, or ""), emitStateRan (step 2c),
+stateWritten (true only if you performed the additional state write above), notes.
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
 if (wrapupResult?.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended.`)
 if (wrapupResult?.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch; derived surfaces regenerate on merge (/clean-worktree, /merge-train, or /close-out --merge-branch).`)
+log(`Derived surfaces (in-place, this wrap-up): ${wrapupResult?.emitStateRan ? 'regenerated (mev emit-state --write).' : useWorktree ? 'skipped — worktree mode; regenerate on merge.' : 'skipped (mev/brain.toml absent).'}`)
 
 // Final state write (status reflects the terminal state; PR fields filled after creation).
-state.status = bailed ? 'blocked' : 'done'
-await writeFlowState(`wrap-up (${finalVerdict})`, `## Wrap-up — ${finalVerdict}\nNext: ${wrapupResult?.nextFocus || '(see status.md)'}`, { cwd: worktreePath })
+// state.status was already set by buildWrapupStatePayload() above, before the agent call, so the
+// folded write (when it happened) persisted the correct terminal status.
+// Reliability net: skip the dedicated writer only when the wrap-up agent itself reports the folded
+// write succeeded; a null result or stateWritten=false falls through so wrap-up's outcome is never
+// left unpersisted.
+if (wrapupResult && wrapupResult.stateWritten) {
+  log('Wrap-up: state write folded into the wrap-up agent\'s own turn — skipped the dedicated state-writer call.')
+} else {
+  await writeFlowState(`wrap-up (${finalVerdict})`, `## Wrap-up — ${finalVerdict}\nNext: ${wrapupResult?.nextFocus || '(see status.md)'}`, { cwd: worktreePath })
+}
 
 // ----------------------------------------------------------------
 // PR creation (the terminal step) — default: open a PR and STOP.
