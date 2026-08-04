@@ -1,0 +1,18 @@
+{
+  "policy": {},
+  "outcomes": {
+    "wall_clock_secs": 187.4,
+    "total_attempts": 4,
+    "total_retries": 1,
+    "tasks_passed": 4,
+    "tasks_failed": 0,
+    "review_verdicts": ["ConsolidatedReviewNode:PASS"],
+    "total_input_tokens": 48211,
+    "total_output_tokens": 9032,
+    "total_cost_usd": 1.83,
+    "model_tier_used": {
+      "implement": "sonnet",
+      "review": "sonnet"
+    }
+  }
+}
