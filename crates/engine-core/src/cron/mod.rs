@@ -31,7 +31,8 @@
 //! across DST transitions when expressed as a fixed duration) — use a
 //! `Calendar` schedule instead.
 
-// `record` and `store` submodules land in EN.6.M tasks 2 and 3 respectively.
+// `store` submodule lands in EN.6.M task 3.
+pub mod record;
 
 use std::str::FromStr;
 
