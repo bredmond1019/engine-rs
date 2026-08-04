@@ -31,12 +31,34 @@ git config --get core.hooksPath   # → hooks
 > Note: setting `core.hooksPath` replaces `.git/hooks/` wholesale. The brain repo
 > has no active hooks there, so nothing is lost. To revert: `git config --unset core.hooksPath`.
 
+**Enabled per repo (as of 2026-08-04):** HQ (this repo), `learn-ai/`, `business/bastiel/`,
+`client/brazilianportugui/`, `client/wild-trail-photo/`. Everywhere else, `hooks/pre-push` is
+present on disk (synced by `base-template/scripts/sync_downstream_harness.py`) but inert until
+that repo also runs `git config core.hooksPath hooks` — see `HQ.chore.pre-push-gate-hook` for the
+first four revenue-facing repos this was switched on for; fleet-wide rollout is a follow-up.
+
+**Rollout scope (settled 2026-08-04).** The remaining work is switching hooks on, *not* authoring
+`harness.json` — 15 of 19 real repos already carry one with real gated checks (orchestrator 7,
+learn-ai 6, bastion 5, most others 4). Eleven of those have a working `harness.json` and no hook,
+so stage 2 is one `git config` away for each.
+
+Only one repo still needs a `harness.json`: **`core/okf-core`**, already ticketed as
+`OK.ticket.harness-json-all-targets-clippy`.
+
+These three are **deliberately out of scope** and should not be re-flagged by future sweeps:
+
+| Repo | Why not |
+|---|---|
+| `portfolio/rag-engine-rs` | portfolio piece, not active development |
+| `bastion-os` | pending `HQ.chore.bastion-os-to-portfolio` |
+| `example-repo/qm` | a sample repo, not a real project |
+
 ## Hooks
 
 | Hook | Fires | What it does |
 |---|---|---|
 | `post-commit` | After every commit | If the commit **deleted or renamed** a file: (1) prunes that file's stale rows from the Brain RAG vector store (`brain_documents`), and (2) appends the path(s) to `.brain-moves-pending` for integrity checking. No-op for ordinary edits. |
-| `pre-push` | Before every push | Runs the full 5-flag `validate-brain` suite and **blocks the push** if the corpus-wide error count would exceed the tracked baseline (`hooks/validate-baseline.json`). |
+| `pre-push` | Before every push | Two stages, both run, either can block. **Stage 1:** the full 5-flag `validate-brain` suite — validates the whole corpus, but blocks only on errors **new since this clone's last successful push** (`PREPUSH_STRICT=1` gates on the total instead). **Stage 2:** this repo's own `planning/harness.json` `validation.checks[]` where `gates: true` (lint/types/test/build) — blocks on a real non-zero exit from any of them. |
 
 ### `post-commit` — Brain RAG delete/rename freshness
 
@@ -84,15 +106,15 @@ can be pushed immediately, and the drift is only discovered a day later in a log
 looking at. This hook moves the same check to the push boundary, where it can actually stop a
 regression from landing.
 
-- **Blocks on new errors only, against a tracked baseline** (`hooks/validate-baseline.json`) —
-  never on any error. A block-on-any gate would be red from day one in `core/engine-rs` (it
-  carries committed `E_GRAPH_DANGLING_RELATED` errors as of this writing) and would just get
-  bypassed with `--no-verify` forever.
+- **Blocks on what YOUR push introduced, not on the corpus total** (changed 2026-08-04). The
+  whole corpus is still *validated* — only the *blocking decision* narrows. See
+  [Attribution](#attribution-what-blocks-you) below, which is the most important thing to
+  understand about this gate.
 - **The baseline is corpus-wide and singular, not per-repo.** `validate-brain` resolves the brain
   root by walking *up* from wherever it runs and always validates the **entire corpus** regardless
   of cwd — so a push from `core/engine-rs` and a push from HQ see the identical error set. The
   baseline file lives in HQ only and is read read-only from every sub-repo via the resolved brain
-  root.
+  root. It remains the fallback when no per-clone history exists yet.
 - **The baseline ratchets down, never up.** `scripts/validate_brain.sh` rewrites it lower whenever
   the measured total drops; nothing raises it automatically. A stale-high baseline is merely
   permissive (safe); an auto-raising one would silently absorb exactly the drift this gate exists
@@ -111,6 +133,112 @@ regression from landing.
   must run `git config core.hooksPath hooks` once (see Enabling, above) before its pre-push hook
   actually fires; the sync script prints a per-repo reminder whenever it syncs the hook into a
   repo where this isn't already set.
+
+#### Attribution: what blocks you
+
+The baseline is corpus-wide and singular. A plain `total > baseline` test therefore blocks **every**
+hooked repo whenever any file anywhere is bad — including files that repo never touched, written by
+another session or by an unattended routine. That is precisely how a gate gets muted with
+`--no-verify` forever, so blocking is attributed instead:
+
+| Situation | Result |
+|---|---|
+| Errors **new** since this clone's last successful push | **blocked**, and only the new ones are printed |
+| Errors that were already there | reported, not blocking |
+| `PREPUSH_STRICT=1` set | blocked on the **whole-corpus total** vs the baseline |
+| No `.git/validate-last-good.json` yet (fresh clone) | falls back to the tracked baseline — the pre-2026-08-04 behaviour |
+| That file corrupt or unreadable | falls back to the baseline; never fails open |
+
+**Attribution is by delta, never by path.** This matters more than it looks. Delete `docs/foo.md`
+and the resulting error surfaces on `bar.md` — a file your push never touched. A path-scoped gate
+would wave that straight through; a delta-scoped one still blocks, because the error is new. There
+is a test for exactly this case (`delta: blocks on an error in an untouched file`).
+
+`.git/validate-last-good.json` records the error set present at the last push this clone let
+through. It lives under `.git/` deliberately: untracked, per-clone, never committed, so it cannot
+drift into the corpus or be shared between machines.
+
+**When to use `PREPUSH_STRICT=1`:** before a deploy, after a large merge, when enabling the hook in
+a new repo, or any time the real question is "is *all* of it correct" rather than "did I break
+anything". `scripts/validate_brain.sh` answers the same question outside of a push, and runs nightly.
+
+```bash
+PREPUSH_STRICT=1 git push        # gate on the whole corpus
+./scripts/validate_brain.sh      # same question, no push involved
+```
+
+### `pre-push` — stage 2: repo-native gate (lint/types/test/build)
+
+Stage 1 only ever measures brain-corpus drift — it says nothing about whether the repo's own
+code still works. The solo-operator failure mode this closes is "I forgot to run the gate"
+before pushing: stage 2 re-runs the repo's own `planning/harness.json` at the push boundary, the
+same policy file the SDLC engines (`/test`, `/review-task`) already read for Test/Review. No new
+config format — this is the existing checks manifest, re-run at a new trigger point.
+
+- **Reads `planning/harness.json`** (repo-local, not the brain root) → `validation.checks[]` →
+  runs every entry with `gates: true`, in file order, each as `sh -c "<command>"` from the repo
+  root. Non-gated checks are never run here (`gates` is not implicitly true).
+- **Blocks only on a real non-zero exit** from a gated check — never on a warning-only tool
+  (e.g. ESLint warnings without `--max-warnings 0` still exit 0).
+- **Degrades gracefully**, same spirit as stage 1 and `post-commit`:
+  - no `planning/harness.json` in this repo → skip, notice only (most repos don't carry the
+    harness yet — this is not an error)
+  - `python3` not on PATH (needed to parse the JSON) → skip, warning only
+  - `harness.json` unparseable, or has no `gates: true` checks → skip, warning/notice only
+  - **stack declared but not yet scaffolded** — if `harness.json` names a `stack` (`nextjs`,
+    `rust`, `python`, …) but that stack's marker file isn't present in the repo root
+    (`package.json`, `Cargo.toml`, `pyproject.toml`) → skip, notice only. A placeholder
+    `harness.json` committed ahead of `create-next-app`/`cargo new` is not a real failure.
+  - an individual gated check's command isn't on PATH (e.g. a tool nobody installed on this
+    machine) → that one check is skipped, warning only; the rest still run
+- **Cost is whatever the repo's own gates cost** — measured on the four repos this shipped with:
+  bastiel ~16s (lint+types+test+build), brazilianportugui ~12s, learn-ai ~40s (6 checks incl. a
+  full `next build`), wild-trail-photo currently a no-op (unscaffolded, no `package.json` yet).
+  Same rationale as stage 1 for living at pre-push and not pre-commit.
+- **`--no-verify` skips both stages.** There is no way to skip stage 2 alone short of temporarily
+  removing/editing `planning/harness.json`'s `gates` flags — that's intentional; if a check is
+  genuinely not push-worthy, un-gate it in `harness.json` (the same file the SDLC pipeline reads),
+  don't special-case the hook.
+
+**Enabling stage 2 in a given repo requires two things**, both one-time and manual: the repo must
+already carry a real `planning/harness.json` with `gates: true` checks (the SDLC pipeline's
+`/generate-tasks` scaffolds this, or copy a profile from `planning/harness.examples.md`), and the
+repo's git must be pointed at `hooks/` (`git config core.hooksPath hooks`, same as stage 1 —
+there's only one `pre-push` file, one switch enables both stages together).
+
+### `pre-push` — advisory: is the installed `mev` binary stale?
+
+After both stages, the hook prints a **notice** (never a block) when the `mev` on `PATH` was built
+from a different commit than its source tree's current `HEAD`.
+
+**Why this is worth the noise.** `mev` is the fleet's *writer* — `mev emit-state --write` rewrites
+derived files across every repo in `brain.toml`, and both `/log-work` and `scripts/routine.sh`
+invoke it from `PATH`. A stale install keeps writing with whatever derivation logic it was built
+with, silently.
+
+This is not hypothetical. On 2026-08-04 the append-only revision-history writer
+(`MV.ticket.append-only-emit-state-writer`) shipped, merged, and closed — while `~/.cargo/bin/mev`
+still held a pre-merge build. Every real `emit-state --write` for hours afterward ran *without* the
+safety net the ticket had just added, and nothing surfaced it.
+
+**Why it drifts on the machine doing the work.** `scripts/build_and_install.sh` reinstalls a binary
+only when `git_sync.sh` **pulled** new commits for its repo. Commits **authored** locally never trip
+that condition — so the authoring machine is exactly the one that goes stale, while the Mac Mini
+self-heals on its next cron pull.
+
+Detection is free: mev's own `toolchain-freshness` conformance check already compares its
+compiled-in `MEV_BUILD_GIT_SHA` against the live tree's `HEAD` (~50ms). Nothing was acting on the
+result; this just says it out loud, once per push. The fix it prints:
+
+```bash
+cargo install --path core/mev --force
+```
+
+Advisory only, and it degrades like everything else here: `mev` not installed → silent; `mev`
+present but failing → silent; binary current → silent. It also prints on the **blocked** path, since
+a stale writer is worth knowing about either way. Note this covers `mev` and not `bastion`:
+`~/.local/bin/bastion` is a symlink into `core/bastion/target/release/`, so it auto-tracks every
+release build, and bastion exposes no equivalent self-check.
 
 ## Testing
 
@@ -132,9 +260,25 @@ the underlying `--prune-paths` indexer mode has its own coverage in
 
 `test_pre_push.sh` builds throwaway git repos, installs the real hook, and shadows `bastion`
 with a shim that emits canned `validated <path>: N error(s), M warning(s)` lines — so it needs
-no real `bastion`/`mev` binary, database, or network. It covers under/at/over-baseline,
-`bastion`-absent, no-`brain.toml`, missing-baseline-treated-as-0, and warnings-never-block.
+no real `bastion`/`mev` binary, database, or network. 44 cases total: stage 1 covers
+under/at/over-baseline, `bastion`-absent, no-`brain.toml`, missing-baseline-treated-as-0, and
+warnings-never-block; **attribution** covers a pre-existing error not blocking, a newly
+introduced one blocking, the block report listing only what is new, an error in a file the push
+never touched still blocking (the delete-breaks-another-file case), `PREPUSH_STRICT` blocking
+what delta mode allows, last-good being written after a successful push, and a corrupt last-good
+falling back to the baseline rather than failing open; stage 2 (repo-native gate) covers no-`harness.json`, a passing gated check,
+a failing gated check (with its output surfaced and the block message naming stage 2), an
+unscaffolded stack (marker file missing → skip), a gated check whose command isn't on PATH
+(warn + skip), a `harness.json` with only non-gated checks (skip), and a combined case proving
+stage 1 alone still blocks even when stage 2 would pass (both stages always run and report,
+regardless of the other's outcome).
 
 ```bash
 bash hooks/test_pre_push.sh   # exit 0 = all pass
 ```
+
+The suite `unset`s `PREPUSH_STRICT` at the top. It is itself a gated check in HQ's
+`planning/harness.json`, so `PREPUSH_STRICT=1 git push` runs it with that variable inherited —
+which silently put every non-strict case into strict mode and failed one on 2026-08-04. Cases
+that want strict mode set it per-invocation. Keep it that way: a test suite whose result depends
+on the caller's environment is worse than no suite.

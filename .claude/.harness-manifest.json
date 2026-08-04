@@ -1,5 +1,5 @@
 {
-  "version": "89d19f61aec4ec950c431fea31c5708aba98719b",
+  "version": "0f8fc30a789b3a3d5c19e807c858586c2d2bfe72",
   "generated": "2026-08-04",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
@@ -47,7 +47,7 @@
     ".claude/commands/orchestrate.md": "ca8d17097c5d525ee4503346aef701c3ac04b01eb80cbdfc51889bf6e6ed3af8",
     ".claude/commands/test_auth_gate.md": "57ff94d5033e1e69cbec61d3021a0bc6b08855f0906966971860351cd4b2adfa",
     ".claude/commands/update-state.md": "ea248b14b72c8c858de08c8dc228b8dc0cf8481b50a9316b7c0c658188fb5c5f",
-    ".claude/commands/test.md": "e9ea34dad780022ad6a9c020d94625dc93022b07d301329b85249d816687d0f8",
+    ".claude/commands/test.md": "c4e65b7c3a838b1da6ae48fd42da35bf7d42d8ca45a6f28cb9b7a5597f16d9fa",
     ".claude/commands/handoff.md": "c5f2c2bf96143038d3a96cd39bcdb503929e1aab343a98defcd15b79d299b862",
     ".claude/commands/test_crud_api.md": "ff003bbd7257819431419cd185b6feba042c34d0d452f72c9af4eb4d3afea270",
     ".claude/commands/test_error_handling.md": "c1d727984d9b26da52d4e24cbca842dc7d818ce5758727a91f96f68c2e5fc4e2",
@@ -57,8 +57,8 @@
     ".claude/workflows/sdlc-task.js": "be13471f70ec5bffb99b1d159c0eafe4ee88f5a589e326cfd7a477f5e3e470cd",
     ".claude/workflows/harness.schema.json": "548f6df2553dbddbf03050bc99b7dca063538789095d4a40fbcc4fecf4a72125",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
-    "hooks/pre-push": "bf58ee5f68895619e750fdfa614234684956887d4e68d5cc8a17c1e844eb15a9",
-    "hooks/test_pre_push.sh": "a0616614ee71b91b9cc82c846d21ad5f895ed123f7913c4ff1b408ddab8260e5",
-    "hooks/README.md": "8ed4d2d683b1aaf58fbb22d4b6dff2d3cee933b9321baf00abf34dce5ea5f1e7"
+    "hooks/pre-push": "b95f3320932995fe2fefa9dc4a0341fbff0f630b38c565e0b5528b9fb4da8aaf",
+    "hooks/test_pre_push.sh": "4b899df250f1e1dd33460547ffd02622b2ed8390a7559f9dfb4494522105c797",
+    "hooks/README.md": "8f7e75b5eb43893167290368d2b786f7441131fe033d020f192eaf7058b9e0dd"
   }
 }
