@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::node::NodeRegistry;
-use crate::nodes::openai_compat_transport::openai_compat_transport_live;
+use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 use crate::workflows::ModelTransport;
@@ -65,13 +65,18 @@ fn real_cloud_transport() -> ModelTransport {
 }
 
 /// Build a `NodeRegistry` like [`registry`], but with `IntakeExtractNode`
-/// rewired to route through [`openai_compat_transport_live`] whenever
+/// rewired to route through [`openai_compat_meta_transport_live`] whenever
 /// `policy`'s resolved `extract` tier is [`ModelTier::Local`] — the direct
 /// analog of `sdlc_flow::graph::registry_for_policy`'s triage/review rewire,
 /// but the inverse of `research_agent::graph::registry_for_policy`'s
 /// no-rewire guard: here the sole stage *is* Local-eligible (pure
 /// extraction suits a local coder model), so the rewire fires for the one
 /// and only node in this workflow rather than being permanently absent.
+/// Using the meta-transport sibling (rather than the plain
+/// `openai_compat_transport_live`) lets telemetry stamp the actual tier that
+/// ran — `"local"` on success, `"cloud"` on a fallback — instead of a
+/// generic `"cloud"` regardless of outcome
+/// (`EN.ticket.wire-meta-transport-telemetry`).
 ///
 /// Any local-endpoint failure at call time falls back to the real `claude`
 /// CLI transport for that call — `openai_compat_transport`'s own fail-fast
@@ -81,8 +86,8 @@ pub fn registry_for_policy(policy: &DiagnosticIntakePolicy) -> NodeRegistry {
     let mut registry = NodeRegistry::new();
 
     if policy.model_tiers.extract == ModelTier::Local {
-        registry.register(Box::new(IntakeExtractNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(IntakeExtractNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     } else {
         registry.register(Box::new(IntakeExtractNode::new()));
@@ -184,5 +189,169 @@ mod tests {
     #[test]
     fn workflow_builds_without_panicking() {
         let _workflow = workflow();
+    }
+
+    /// `EN.ticket.wire-meta-transport-telemetry` task 5: the
+    /// `IntakeExtractNode` `registry_for_policy` registers under
+    /// `ModelTier::Local` must stamp the *actual* transport tier onto
+    /// `ctx.nodes["IntakeExtractNode"]["transport"]["tier"]` — `"local"` on
+    /// a stubbed local success, not a generic `"cloud"` regardless of what
+    /// ran (the bug this ticket fixes). First confirms `registry_for_policy`
+    /// actually rewires the node under this policy, then drives an
+    /// equivalent node built the same way
+    /// (`with_meta_transport(openai_compat_meta_transport(...))`) but with
+    /// the HTTP layer stubbed rather than a real Ollama endpoint.
+    #[tokio::test]
+    async fn extract_registry_for_policy_stamps_local_tier_on_stubbed_local_success() {
+        use crate::node::Node;
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::policy::tier::LocalConfig;
+        use engine_contract::TaskContext;
+        use std::collections::HashMap as StdHashMap;
+
+        let mut policy = DiagnosticIntakePolicy::default();
+        policy.model_tiers.extract = ModelTier::Local;
+        policy.local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+
+        assert!(
+            registry_for_policy(&policy).contains("IntakeExtractNode"),
+            "IntakeExtractNode must be registered under an extract=Local policy"
+        );
+
+        let event = super::super::schema::DiagnosticIntakeEventSchema {
+            notes: "Client tracks orders in WhatsApp.".to_string(),
+            locale: crate::locale::Locale::default(),
+            policy: None,
+            profile: None,
+        };
+        let mut ctx = TaskContext {
+            event: serde_json::to_value(&event).unwrap(),
+            nodes: StdHashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: StdHashMap::new(),
+        };
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+
+        let local_http_post: crate::nodes::LocalHttpPost = Arc::new(|_url, _body| {
+            Box::pin(async {
+                Ok(serde_json::json!({
+                    "choices": [{ "message": {
+                        "content": serde_json::json!({
+                            "company_name": "Loja da Ana",
+                            "company_type": "retail SMB",
+                            "team_size": 4,
+                            "primary_channels": [],
+                            "existing_tools": [],
+                            "existing_automations": [],
+                            "top_workflows": [],
+                        }).to_string()
+                    } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+                }))
+            })
+        });
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { panic!("cloud fallback must not be called when local succeeds") })
+        });
+        let meta_transport =
+            openai_compat_meta_transport(policy.local.clone(), local_http_post, cloud_fallback);
+        let stubbed_node = IntakeExtractNode::new().with_meta_transport(meta_transport);
+
+        let out = stubbed_node
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+        assert_eq!(out.nodes["IntakeExtractNode"]["transport"]["tier"], "local");
+        assert_eq!(
+            out.nodes["IntakeExtractNode"]["transport"]["endpoint"],
+            "http://localhost:11434"
+        );
+    }
+
+    /// Same seam, but the local endpoint fails — the resulting telemetry
+    /// must show `"cloud"` (what actually ran, via the fallback), not the
+    /// `"local"` tier the resolved policy intended.
+    #[tokio::test]
+    async fn extract_registry_for_policy_stamps_cloud_tier_on_local_failure_fallback() {
+        use crate::node::Node;
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::policy::tier::LocalConfig;
+        use engine_contract::TaskContext;
+        use futures::FutureExt;
+        use std::collections::HashMap as StdHashMap;
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+
+        let event = super::super::schema::DiagnosticIntakeEventSchema {
+            notes: "Client tracks orders in WhatsApp.".to_string(),
+            locale: crate::locale::Locale::default(),
+            policy: None,
+            profile: None,
+        };
+        let mut ctx = TaskContext {
+            event: serde_json::to_value(&event).unwrap(),
+            nodes: StdHashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: StdHashMap::new(),
+        };
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&DiagnosticIntakePolicy::default()).expect("policy serializes"),
+        );
+
+        let local_http_post: crate::nodes::LocalHttpPost =
+            Arc::new(|_url, _body| Box::pin(async { Err("connection refused".to_string()) }));
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            async move {
+                Ok(claude_code_rs::Outcome {
+                    text: serde_json::json!({
+                        "company_name": "Loja da Ana",
+                        "company_type": "retail SMB",
+                        "team_size": 4,
+                        "primary_channels": [],
+                        "existing_tools": [],
+                        "existing_automations": [],
+                        "top_workflows": [],
+                    })
+                    .to_string(),
+                    cost_usd: 0.0,
+                    usage: claude_code_rs::parse::Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: std::collections::BTreeMap::new(),
+                    structured_output: Some(serde_json::json!({
+                        "company_name": "Loja da Ana",
+                        "company_type": "retail SMB",
+                        "team_size": 4,
+                        "primary_channels": [],
+                        "existing_tools": [],
+                        "existing_automations": [],
+                        "top_workflows": [],
+                    })),
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+        let node = IntakeExtractNode::new().with_meta_transport(meta_transport);
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["IntakeExtractNode"]["transport"]["tier"], "cloud");
     }
 }

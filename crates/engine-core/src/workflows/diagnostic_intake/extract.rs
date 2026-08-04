@@ -27,9 +27,11 @@ use serde_json::json;
 
 use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::{ClaudeCodeStep, MetaTransport};
 use crate::policy::telemetry::RunTelemetryInputs;
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+};
 
 use super::policy::{DiagnosticIntakePolicy, ModelTier};
 use super::schema::{diagnostic_intake_json_schema, DiagnosticIntake, DiagnosticIntakeEventSchema};
@@ -174,7 +176,7 @@ fn persist_state(
 /// start and the terminal node; there is no router.
 pub struct IntakeExtractNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
 }
 
 impl IntakeExtractNode {
@@ -191,18 +193,30 @@ impl IntakeExtractNode {
                 json_schema: Some(diagnostic_intake_json_schema()),
                 ..Config::default()
             },
-            transport: None,
+            transport: TransportSlot::default(),
         }
     }
 
     /// Override the transport used by the composed `ClaudeCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`. The Local-tier rewire
-    /// (`graph::registry_for_policy`) also uses this seam to swap in
-    /// `crate::nodes::openai_compat_transport::openai_compat_transport_live`.
+    /// (`graph::registry_for_policy`) uses [`Self::with_meta_transport`]
+    /// instead to swap in
+    /// `crate::nodes::openai_compat_transport::openai_compat_meta_transport_live`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// whichever call actually executed (e.g. local vs. cloud fallback),
+    /// taking precedence over a plain transport set via
+    /// [`Self::with_transport`].
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 }
@@ -234,10 +248,9 @@ impl Node for IntakeExtractNode {
             policy.output_verbosity,
         );
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        let step = self
+            .transport
+            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -248,6 +261,16 @@ impl Node for IntakeExtractNode {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
+        // `put_result` below replaces this node's whole `ctx.nodes` entry,
+        // which would otherwise silently drop the `"transport"` stamp
+        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name.
+        let transport_stamp = ctx
+            .nodes
+            .get(NODE_NAME)
+            .and_then(|value| value.get("transport"))
+            .cloned();
 
         let intake: DiagnosticIntake = parse_structured_or_fenced(&ctx, NODE_NAME, &content)
             .map_err(|err| {
@@ -268,6 +291,9 @@ impl Node for IntakeExtractNode {
                 "locale".to_string(),
                 serde_json::to_value(event.locale).unwrap_or_default(),
             );
+            if let Some(transport) = transport_stamp {
+                obj.insert("transport".to_string(), transport);
+            }
         }
         put_result(&mut ctx, NODE_NAME, intake_value);
 
