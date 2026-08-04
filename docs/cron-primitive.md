@@ -13,8 +13,8 @@ related: [architecture, docs-index]
 # engine-rs — Durable Cron Primitive (`EN.6.M`)
 
 `crates/engine-core/src/cron/` is a standalone scheduling primitive with no dependency on any
-specific workflow or envelope type, so a future caller (`EN.6.G`'s `schedule.rs`) can fire through
-it instead of hand-rolling cron mechanics. It ports the pure scheduling logic of qm §5's durable
+specific workflow or envelope type, so a caller (`EN.6.G`'s `crates/engine-serve/src/schedule.rs`)
+can fire through it instead of hand-rolling cron mechanics. It ports the pure scheduling logic of qm §5's durable
 cron design (fire log, drift-free catch-up correctness, silence protocol) using the `cron` crate +
 `chrono-tz` in place of qm's Croner/timezone-string dependency, and omits qm's pg-boss job queue,
 `LeaderLease`, and `maxFiresPerTick` — multi-instance machinery a single Mac Mini operator does not
@@ -130,6 +130,12 @@ handling with `Tz` deriving `Serialize`/`Deserialize` for `CronSchedule::Calenda
 
 ## Status
 
-Pure primitive only — no live caller yet. `EN.6.G`'s `schedule.rs` is the intended consumer (see
-the module-level doc comment in `cron/mod.rs`); until that block lands, `CronStore`/`tick()` are
-exercised only by this module's own unit tests.
+`EN.6.G`'s `crates/engine-serve/src/schedule.rs` is now the live caller: `ScheduleRegistry` wraps a
+`CronStore` seeded with one `CronRecord` per `planning/harness.json` `schedule.entries[]` entry,
+and `ScheduleRegistry::tick` polls `engine_core::cron::store::tick` on an interval, dispatching each
+due fire through `dispatch_scheduled_entry` — a `Schedule`-typed `IngressEnvelope` sent through the
+same non-blocking `dispatch_with_event` -> mint `run_id` -> `spawn_run` sequence
+`crate::http::post_events` uses, never a self-directed HTTP call. See
+[architecture.md § Schedule Source](architecture.md#schedule-source-eng6g) for the adapter's shape
+and [content-pipeline-workflow.md](content-pipeline-workflow.md) for how a scheduled fire reaches a
+workflow.

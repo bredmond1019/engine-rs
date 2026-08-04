@@ -91,7 +91,17 @@ engine-rs/
 │   │                         in-place no-op patterned on `MaterializeDocNode::
 │   │                         with_enabled`), only *requests* suspension via
 │   │                         `suspend::request_suspension` — finalizing the walk
-│   │                         stop belongs to `Workflow::walk`, EN.6.F task 5)
+│   │                         stop belongs to `Workflow::walk`, EN.6.F task 5; `nodes/fan_out.rs`
+│   │                         — `FanOutNode` (`EN.6.G` task 1), builds N `with_identity`-wrapped
+│   │                         instances of one node type via a builder closure and runs them
+│   │                         through `ParallelNode`, plus an `impl Node for Box<dyn Node>` (added
+│   │                         here, not `node.rs`) so `NodeExt::with_identity` is callable on the
+│   │                         builder's boxed output; `FanOutNode::branch_identity(base_name, i)` is
+│   │                         the public `"{base_name}[{i}]"` helper `AggregateNode::for_fan_out`
+│   │                         reuses to derive matching identities; `nodes/aggregate.rs` —
+│   │                         `AggregateNode`, joins N `ctx.nodes` entries into one
+│   │                         deterministically-ordered array by declared identity order (not
+│   │                         `HashMap` iteration order))
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -136,7 +146,14 @@ engine-rs/
 │   │                         marker's snapshot, and continues from the stored `resume_at`
 │   │                         pointer — and GET /events/suspended (registered before
 │   │                         `{event_id}` so the literal path isn't swallowed by the uuid
-│   │                         extractor), EN.6.F task 11)
+│   │                         extractor), EN.6.F task 11), schedule.rs (`EN.6.G` task 2 — `ScheduleEntry`/
+│   │                         `ScheduleRegistry`, a thin adapter over `engine_core::cron`'s `tick()`;
+│   │                         `load_schedule_entries` reads `planning/harness.json`'s
+│   │                         `schedule.entries[]`; `dispatch_scheduled_entry` builds a
+│   │                         `Schedule`-typed `IngressEnvelope` per fire and dispatches it in-process
+│   │                         via `dispatch_with_event` + `spawn_run` — no self-directed HTTP call;
+│   │                         see [§ Schedule Source](#schedule-source-en6g) below and
+│   │                         [cron-primitive.md](cron-primitive.md))
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
     crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
@@ -148,7 +165,14 @@ engine-rs/
     `DATABASE_URL` set — an unset `DATABASE_URL` at that point is a hard failure, not a silent skip;
     crates/engine-serve/tests/dispatch_integration.rs — headline EN.1.C integration test: live-state
     read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow,
-    and 422 for an unregistered workflow_type)
+    and 422 for an unregistered workflow_type;
+    crates/engine-core/tests/it/fan_out_aggregate.rs (module of the single `tests/it/main.rs`
+    binary, per CLAUDE.md rule 8) — `EN.6.G` task 3: a real `Workflow::new_validated` + `.run()`
+    graph (FanOut -> Aggregate -> a persist stub node) proving no last-write-wins collision across
+    same-type fan-out branches;
+    crates/engine-serve/tests/schedule.rs — `EN.6.G` task 3: a `ScheduleRegistry.tick()` fire
+    dispatching one persist-shaped payload and one outbound-action-shaped record through the
+    non-blocking `spawn_run` path, over a real tempdir-backed `FileCronStore`)
 ```
 
 ## Injectable Seams
@@ -179,6 +203,39 @@ in every harvest mode (`off`/`in_process`/`approval`). The gate only changes wha
 `PersistToBrainNode` does with the finished payload afterward — push now, skip (rely on the
 freshness reindex), or defer to a `pending` record for `HARVEST_APPROVE`. A failed harvest push
 therefore never costs the run its already-written source document (D53).
+
+## Schedule Source (`EN.6.G`)
+
+`crates/engine-serve/src/schedule.rs` turns a durable cron fire (`engine_core::cron`, `EN.6.M`)
+into a workflow dispatch, without any HTTP self-call:
+
+- `ScheduleEntry` — one registered entry: its normalized `CronSchedule`, target `workflow_type`,
+  optional `profile`, and caller-supplied `data` merged into the dispatched event.
+- `load_schedule_entries(harness_path)` — reads `planning/harness.json`'s `schedule.entries[]`
+  array (a sibling `_comment` key documents the knob, matching the existing
+  `<workflow_key>.profiles` convention), normalizing each entry's `cron_expr`/`timezone`/`every_ms`
+  via `engine_core::cron::normalize_schedule`. A missing file or missing `schedule` key is an empty
+  `Vec`, not an error; a present-but-malformed one is `LoadScheduleError`.
+- `ScheduleRegistry` — wraps a `CronStore` (already seeded with one `CronRecord` per entry via
+  `FileCronStore::upsert`, since the `CronStore` trait itself has no insert/upsert by design) plus
+  the `ScheduleEntry` metadata attached via `register`. `ScheduleRegistry::tick(now, dispatch)`
+  delegates every firing/catch-up mechanic to `engine_core::cron::store::tick`, calling `dispatch`
+  for each due, registered entry (a due record with no matching registration fires
+  `FireOutcome::Silent` defensively rather than panicking).
+- `dispatch_scheduled_entry(state, entry, fired_at)` — builds a `Schedule`-typed `IngressEnvelope`
+  (`SourcePayload::WorkflowTrigger { workflow_type, event }`) and dispatches it through the exact
+  non-blocking sequence `crate::http::post_events` uses: `dispatch_with_event` -> mint `run_id` ->
+  register cancellation token + pause signal -> `crate::suspend::spawn_run` — never a self-directed
+  HTTP call. Always returns `FireOutcome::Reported` (naming the run on success or the dispatch
+  failure otherwise), never `Silent` — a dispatch attempt always has something to report.
+
+`ScheduleRegistry` is deliberately **not** an `AppState` field — it follows the existing
+`default_budget_from_env`/`live_run_metadata` precedent (process-global, not struct fields) to
+avoid an immediate cross-repo compile break for `bastion`, which constructs `AppState` over an
+unpinned path dependency. See [cron-primitive.md](cron-primitive.md) for the underlying
+`CronSchedule`/`CronStore`/`tick()` primitive and `crates/engine-serve/tests/schedule.rs` for the
+end-to-end proof (one `ScheduleRegistry.tick()` fire dispatching one persist-shaped payload and one
+outbound-action-shaped record through `spawn_run`).
 
 ## Build & CI
 
@@ -227,6 +284,19 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   and merges `nodes`/`node_runs` back with deterministic last-write-wins semantics (later branch
   in declared order wins on key collision); the first branch `NodeError` encountered in declared
   order is propagated as the `ParallelNode`'s own error, with no partial merge on branch failure.
+- `FanOutNode` / `AggregateNode` (`engine-core::nodes::fan_out` / `engine-core::nodes::aggregate`,
+  `EN.6.G` task 1) — the fan-out/join pair for running N instances of *one* node type in parallel
+  without a `ParallelNode` same-type collision. `FanOutNode` takes a builder closure and a count,
+  wraps each built instance with `NodeExt::with_identity` under `FanOutNode::branch_identity(base_name,
+  i)` (`"{base_name}[{i}]"`), and runs the set through `ParallelNode` — distinct identities are what
+  make `ParallelNode`'s last-write-wins merge safe here, since each branch's `ctx.nodes` key is
+  unique. `AggregateNode::for_fan_out` derives the same `branch_identity` sequence to read each
+  branch's `ctx.nodes` entry back out, joining them into one array ordered by declared identity
+  order (not `HashMap` iteration order, which is unspecified). An `impl Node for Box<dyn Node>` was
+  added in `fan_out.rs` (not `node.rs`, which the task's scope excluded) so `with_identity` — which
+  requires `Self: Sized` — is callable on the builder closure's `Box<dyn Node>` output. See
+  `crates/engine-core/tests/it/fan_out_aggregate.rs` (listed in the Module Map's `tests/` entry
+  above) for a full `Workflow::run` proving the no-collision property end-to-end.
 - `WorkflowValidator` / `ValidationError` (`engine-core::validate`) — static graph-shape checks
   run before execution: BFS reachability from `start_node`, DFS cycle detection that skips edges
   declared out of router nodes (routers are exempt so runtime back-edges are legal), and a
