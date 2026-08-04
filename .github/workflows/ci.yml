@@ -6,9 +6,9 @@ name: ci
 # and the local actionlint -> act -> push validation loop.
 #
 # engine-rs deviates from the default test gate: its harness.json gates on
-# `cargo nextest run --workspace`, so this caller opts into nextest. It also depends on a path
-# dependency on the sibling claude-code-rs repo (`claude-code-rs = { path = "../claude-code-rs" }`
-# in Cargo.toml), so it opts into the reusable workflow's sibling-repo checkout.
+# `cargo nextest run --workspace`, so this caller opts into nextest. It also path-depends on
+# three sibling repos (claude-code-rs, mev, okf-core — see Cargo.toml), so it opts into the
+# reusable workflow's sibling-repo checkout for all three.
 
 on:
   push:
@@ -20,4 +20,7 @@ jobs:
     with:
       needs-nextest: true
       test-command: "cargo nextest run --workspace"
-      sibling-repo: "bredmond1019/claude-code-rs"
+      sibling-repos: |
+        bredmond1019/claude-code-rs
+        bredmond1019/mev
+        bredmond1019/okf-core
