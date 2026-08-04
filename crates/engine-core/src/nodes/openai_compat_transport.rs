@@ -151,18 +151,41 @@ fn outcome_from_chat_completion(model: &str, response: &Value) -> Result<Outcome
     })
 }
 
+/// The `name` field Ollama's OpenAI-compat `response_format.json_schema`
+/// wrapper requires. `Config.json_schema` (`claude-code-rs`) carries only the
+/// bare JSON Schema value with no name of its own, so this transport supplies
+/// a single stable, run-invariant name for every schema-constrained call —
+/// nothing downstream reads this string back, it only needs to satisfy the
+/// wire format's required field.
+const JSON_SCHEMA_RESPONSE_NAME: &str = "structured_response";
+
 /// Build the `/v1/chat/completions` request body. When
-/// `local.constrained_json` is set, adds a `response_format: {"type":
-/// "json_object"}` hint so the server constrains decoding to valid JSON —
-/// the caller (the stage consuming this transport) is expected to skip its
-/// own JSON-repair retry in that case, per the spec's Context Pointers.
-fn build_request_body(local: &LocalConfig, prompt: &str) -> Value {
+/// `local.constrained_json` is set:
+/// - if `json_schema` is `Some`, sets `response_format` to the OpenAI/Ollama
+///   `json_schema` structured-output shape (`{"type": "json_schema",
+///   "json_schema": {"name": ..., "schema": <json_schema>}}`), confirmed
+///   live against Ollama in this ticket's Task 1 (see the Amendment Log in
+///   `planning/ticket-local-schema-constrained-json/tasks.md`) — this
+///   enforces field *types*, not just syntactic JSON validity.
+/// - if `json_schema` is `None`, falls back to the original generic
+///   `{"type": "json_object"}` hint (valid-JSON-only, no type enforcement) —
+///   unchanged pre-ticket behavior for callers with no schema to offer.
+fn build_request_body(local: &LocalConfig, prompt: &str, json_schema: Option<&Value>) -> Value {
     let mut body = json!({
         "model": local.model,
         "messages": [{ "role": "user", "content": prompt }],
     });
     if local.constrained_json {
-        body["response_format"] = json!({ "type": "json_object" });
+        body["response_format"] = match json_schema {
+            Some(schema) => json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": JSON_SCHEMA_RESPONSE_NAME,
+                    "schema": schema,
+                },
+            }),
+            None => json!({ "type": "json_object" }),
+        };
     }
     body
 }
@@ -226,7 +249,7 @@ pub fn openai_compat_transport(
                 "{}/v1/chat/completions",
                 local.endpoint.trim_end_matches('/')
             );
-            let body = build_request_body(&local, &prompt);
+            let body = build_request_body(&local, &prompt, config.json_schema.as_ref());
 
             let local_result = match (http_post)(url, body).await {
                 Ok(response) => outcome_from_chat_completion(&local.model, &response),
@@ -279,7 +302,7 @@ pub fn openai_compat_meta_transport(
                 "{}/v1/chat/completions",
                 local.endpoint.trim_end_matches('/')
             );
-            let body = build_request_body(&local, &prompt);
+            let body = build_request_body(&local, &prompt, config.json_schema.as_ref());
 
             let local_result = match (http_post)(url, body).await {
                 Ok(response) => outcome_from_chat_completion(&local.model, &response),
