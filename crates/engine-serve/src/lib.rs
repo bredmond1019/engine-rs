@@ -11,6 +11,7 @@ pub mod email_webhooks;
 pub mod http;
 pub mod live_state;
 pub mod resume;
+pub mod schedule;
 pub mod stream;
 pub mod suspend;
 #[cfg(any(test, feature = "test-fixtures"))]
