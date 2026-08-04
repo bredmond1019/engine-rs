@@ -18,6 +18,39 @@ related: [status, context]
 
 ## [run: 2026-08-04]
 
+### `en-5b1-eval-slice-runner` — Eval slice runner (first half of the `OR.U` port) — done via `/sdlc-flow`
+Implemented across 4 tasks, PASS review. Task 1 ported Synapse's deterministic/structural/
+reference-based scorer library into `engine-core` as pure functions over generic
+`serde_json::Value`/`&str` inputs (`evals::scorers::{score_deterministic, score_structural,
+score_reference_based}` returning `ScoreResult`), with no embedding or corpus access — the
+reference-based scorer uses a containment short-circuit then a token-overlap ratio against a fixed
+0.5 pass threshold, and the structural scorer checks key presence plus JSON type match with partial
+credit, deliberately leaving out Synapse's retrieval-specific stopword/sentence-splitting machinery
+as out of scope. Task 2 added `EvalCase` (scorer kind + dot-path selector + expected value) and
+`EvalSlice` (named case collection grouped by domain/model/profile, mirroring `PolicyAggregate`'s
+own grouping shape), producing per-case results and an overall pass-rate; `ScoreResult` gained
+`Serialize` as a minimal, behavior-preserving addition so slice/case reports could serialize it.
+Task 3 landed the eval slice runner itself — `run_slice` imports `EN.4.0`'s
+`aggregate_state_files`/`extract_policy_telemetry` directly (no second aggregation path, true by
+construction) via a field-less `UnitPolicy` that collapses every state file into one
+`PolicyAggregate` row, reduces that to a single JSON record, and scores it against an `EvalSlice`;
+shipped alongside a concrete `coding_slice()` and an integration test proving the runner against a
+real fixture `*-state.json`. Task 4 ran the full validation gate (fmt --check, clippy -D warnings,
+`nextest --workspace`, `build --release`) — 1781/1781 tests green, no warnings, no code changes
+needed. This closes the first half of the `OR.U` port and unblocks `EN.5.B2` (regression history +
+blind judge + keep-if-better/revert-if-worse change gate), which depends on this block's scorer
+library and slice runner. `docs/architecture.md` updated.
+
+```
+440ac5b docs: update docs for en-5b1-eval-slice-runner
+502cd70 feat: implement en-5b1-eval-slice-runner-task3
+d9e792b feat: implement en-5b1-eval-slice-runner-task2
+02fd3e2 feat: implement en-5b1-eval-slice-runner-task1
+```
+
+Next: `EN.5.B2` — regression history + blind judge + keep-if-better/revert-if-worse change gate,
+now unblocked, per the `next` frontmatter list.
+
 ### `EN.ticket.wire-meta-transport-telemetry` — Wire local-eligible stages through `with_meta_transport` — done via `/sdlc-flow`
 - **What:** Closed the D13 follow-up known issue where `model_tier_used` telemetry could never show
   `"local"` for any of the 4 workflows, because `registry_for_policy` wired every local-eligible

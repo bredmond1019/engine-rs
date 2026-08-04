@@ -22,6 +22,7 @@ mod composition;
 mod content_pipeline_e2e;
 mod content_pipeline_materialize_e2e;
 mod diagnostic_intake_e2e;
+mod evals_slice;
 mod fan_out_aggregate;
 mod harvest_gate_e2e;
 mod locale_rate_card;
