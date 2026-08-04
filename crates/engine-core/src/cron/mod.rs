@@ -31,14 +31,15 @@
 //! across DST transitions when expressed as a fixed duration) — use a
 //! `Calendar` schedule instead.
 
-// `store` submodule lands in EN.6.M task 3.
 pub mod record;
+pub mod store;
 
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 use cron::Schedule as CronExpr;
+use serde::{Deserialize, Serialize};
 
 /// Minimum interval schedule period: below this is too fast to be a sane
 /// recurring interval.
@@ -51,7 +52,7 @@ pub const MAX_INTERVAL_MS: i64 = 86_400_000;
 
 /// A normalized, validated schedule — mutually exclusive calendar or
 /// interval variants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CronSchedule {
     /// A wall-clock cron expression evaluated in an IANA timezone.
     Calendar { expr: String, timezone: Tz },

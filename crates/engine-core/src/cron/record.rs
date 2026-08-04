@@ -12,11 +12,12 @@
 //! never produce a log entry carrying a note, by construction.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use super::CronSchedule;
 
 /// The durable state of one scheduled cron entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CronRecord {
     pub id: String,
     pub schedule: CronSchedule,
@@ -31,7 +32,7 @@ pub struct CronRecord {
 /// The silence protocol: a fire that has nothing to report is `Silent` and
 /// must not surface any note or downstream output — this is enforced at the
 /// `CronFireLogEntry` conversion, not left to callers to remember.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FireOutcome {
     /// Something happened; carries a human-readable note describing it.
     Reported(String),
@@ -49,6 +50,59 @@ pub struct CronFireLogEntry {
     /// than re-deriving it from `note`'s presence at every read site.
     pub outcome_kind: &'static str,
     pub note: Option<String>,
+}
+
+/// The serde wire shape for [`CronFireLogEntry`]. `outcome_kind` is `&'static
+/// str` in the in-memory type (a fixed, non-owned tag), which cannot derive
+/// `Deserialize` directly (deserializing would need to borrow from the
+/// input, not `'static`) — so this mirror type carries an owned `String`
+/// on the wire, and [`CronFireLogEntry`]'s manual `Serialize`/`Deserialize`
+/// impls convert through it, mapping back to the fixed `"reported"`/
+/// `"silent"` constants on the way in.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CronFireLogEntryWire {
+    fired_at: DateTime<Utc>,
+    scheduled_at: Option<DateTime<Utc>>,
+    outcome_kind: String,
+    note: Option<String>,
+}
+
+impl serde::Serialize for CronFireLogEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        CronFireLogEntryWire {
+            fired_at: self.fired_at,
+            scheduled_at: self.scheduled_at,
+            outcome_kind: self.outcome_kind.to_string(),
+            note: self.note.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CronFireLogEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CronFireLogEntryWire::deserialize(deserializer)?;
+        let outcome_kind = match wire.outcome_kind.as_str() {
+            "silent" => "silent",
+            // Anything that isn't the exact "silent" tag is treated as
+            // "reported" — this matches `fire_outcome_kind_and_note`'s
+            // closed two-way mapping and keeps the field genuinely
+            // `'static` without leaking or panicking on unexpected input.
+            _ => "reported",
+        };
+        Ok(CronFireLogEntry {
+            fired_at: wire.fired_at,
+            scheduled_at: wire.scheduled_at,
+            outcome_kind,
+            note: wire.note,
+        })
+    }
 }
 
 impl CronFireLogEntry {
