@@ -79,10 +79,28 @@ pub type CommandRunner =
     Arc<dyn Fn(&str, &[&str], &Path) -> std::io::Result<CommandOutput> + Send + Sync>;
 
 /// The default [`CommandRunner`]: shells out to the real subprocess via
-/// `std::process::Command`.
+/// `std::process::Command` — gated by the non-overridable
+/// [`command_floor::evaluate_command`] org-floor denylist. Every consumer of
+/// this seam (git/gh argv from `setup.rs`/`pr.rs`, `sh -c` harness-check
+/// strings from `task_loop.rs`) funnels through here, so gating it here
+/// covers all of them with no per-call-site changes (see
+/// `planning/ticket-sdlc-command-policy-floor/tasks.md`). A denied command
+/// never reaches `std::process::Command`.
 #[must_use]
 pub fn default_command_runner() -> CommandRunner {
     Arc::new(|program, args, cwd| {
+        let joined = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let CommandDecision::Deny { reason, matched } = command_floor::evaluate_command(&joined)
+        {
+            return Ok(CommandOutput {
+                status: 126,
+                stdout: String::new(),
+                stderr: format!("command-policy: blocked ({reason}): {matched}"),
+            });
+        }
         let output = std::process::Command::new(program)
             .args(args)
             .current_dir(cwd)
@@ -222,7 +240,40 @@ fn log_noop_commit(label: &str, output: &CommandOutput) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_noop_commit;
+    use super::{default_command_runner, is_noop_commit};
+
+    #[test]
+    fn default_command_runner_blocks_a_denied_command_without_spawning() {
+        let runner = default_command_runner();
+        // A nonexistent cwd proves no real subprocess ran: if the deny path
+        // fell through to `std::process::Command`, `current_dir` would fail
+        // and this call would return an `Err`, not an `Ok` with status 126.
+        let bogus_cwd = std::path::Path::new("/no/such/directory/for/this/test");
+        let output = runner("git", &["push", "--force"], bogus_cwd)
+            .expect("denied command must short-circuit before spawning, not error");
+        assert_eq!(output.status, 126);
+        assert!(
+            output.stderr.contains("force push"),
+            "stderr should name the deny reason: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("git push --force"),
+            "stderr should include the matched text: {}",
+            output.stderr
+        );
+        assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn default_command_runner_allows_an_ordinary_command_unaffected() {
+        let runner = default_command_runner();
+        let tmp = std::env::temp_dir();
+        let output = runner("echo", &["hi"], &tmp).expect("echo should run normally");
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("hi"));
+        assert!(output.stderr.is_empty());
+    }
 
     #[test]
     fn is_noop_commit_classifies_nothing_to_commit_as_a_noop() {
