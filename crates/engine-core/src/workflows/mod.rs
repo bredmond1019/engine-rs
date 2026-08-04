@@ -25,6 +25,9 @@ pub mod opportunity_edit;
 pub mod proposal_generator;
 pub mod research_agent;
 pub mod sdlc_flow;
+pub mod transport_slot;
+
+pub use transport_slot::TransportSlot;
 
 /// The injectable transport signature for model-calling nodes' composed
 /// `ClaudeCodeStep`s — identical shape to `ClaudeCodeStep`'s own (private)

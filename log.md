@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-02T22:13:00Z"
+timestamp: "2026-08-04T04:30:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,58 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [run: 2026-08-04]
+
+### `EN.ticket.wire-meta-transport-telemetry` — Wire local-eligible stages through `with_meta_transport` — done via `/sdlc-flow`
+- **What:** Closed the D13 follow-up known issue where `model_tier_used` telemetry could never show
+  `"local"` for any of the 4 workflows, because `registry_for_policy` wired every local-eligible
+  node via `ClaudeCodeStep::with_transport` (plain), which always stamps a generic `"cloud"`-tier
+  `TransportInfo` regardless of what actually ran. Task 1 landed the shared `TransportSlot` helper
+  (`workflows/transport_slot.rs`) — a plain-or-meta transport override with meta-wins precedence,
+  matching `ClaudeCodeStep`'s own rule — unit-tested for meta-wins, plain-only, and neither-set.
+  Tasks 2-5 gave all 10 local-eligible nodes across `sdlc_flow` (`TriageTaskNode`,
+  `ConsolidatedReviewNode`), `content_pipeline` (`SummarizeNode`, `SelfCriticNode`, `ReviseNode`,
+  `TranslateNode`), `proposal_generator` (`OpportunityIdentifierNode`, `ProposalReviewNode`,
+  `ProposalReviseNode`), and `diagnostic_intake` (`IntakeExtractNode`) a `with_meta_transport`
+  passthrough onto `TransportSlot`, and rewired every corresponding `registry_for_policy` call site
+  from `openai_compat_transport_live` to `openai_compat_meta_transport_live`, one workflow per task
+  with tests proving `"local"` on a successful local call and `"cloud"` on a simulated local-call
+  failure. Along the way, each task discovered and fixed the same adjacent defect: every node's
+  final `put_result` call was silently overwriting the whole `ctx.nodes[identity]` entry and
+  dropping the `"transport"` key `ClaudeCodeStep::process` had just stamped — exactly what
+  `RunTelemetry`'s `observed_model_tiers` reads back — so the `TransportSlot` wiring alone would not
+  have been sufficient without also preserving that stamp through each node's own result-building
+  step. Task 6 ran the full validation gate (fmt, clippy `-D warnings`, `nextest run --workspace`,
+  `build --release`) — all green — fixed 2 pre-existing clippy lints uncovered only under
+  `-D warnings`, fixed a real e2e regression in `proposal_generator_e2e.rs` caused by the transport
+  stamp now appearing in `ReviseNode`'s output, and grep-confirmed exactly 10 production
+  `with_meta_transport(openai_compat_meta_transport_live(...))` call sites with zero remaining
+  plain rewires. PASS review. Docs updated: `docs/sdlc-flow-policy.md`,
+  `docs/diagnostic-intake-workflow.md`, `docs/proposal-generator-workflow.md`,
+  `docs/content-pipeline-workflow.md`.
+- **Why:** `model_tier_used` telemetry drives cost-tracking and the planned cloud-vs-local
+  comparison (`EN.5.B1`/`EN.5.B2`); until this landed it silently reported a generic cloud stamp for
+  every run regardless of whether a stage actually ran locally, fell back to cloud, or was never
+  local-eligible in the first place — corrupting that data source unnoticed since each workflow's
+  local-rewire first shipped.
+- Next: `EN.6.I` — LEAD_INGEST (write an inbound form lead to the brain as an opportunity),
+  `EN.5.B1` — Eval slice runner (scorers + EvalCase/EvalSlice on EN.4.0 telemetry, first half of the
+  OR.U port).
+
+```
+2c98017 docs: update docs for ticket-wire-meta-transport-telemetry
+c7d1ef6 feat: implement ticket-wire-meta-transport-telemetry-task6
+dbb2af5 feat: implement ticket-wire-meta-transport-telemetry-task5
+5d33093 feat: implement ticket-wire-meta-transport-telemetry-task4
+c886a91 feat: implement ticket-wire-meta-transport-telemetry-task3
+5b76898 feat: implement ticket-wire-meta-transport-telemetry-task2
+e8b806f feat: implement ticket-wire-meta-transport-telemetry-task1
+6d2cff0 feat: implement ticket-local-schema-constrained-json-task3
+88d0fc8 feat: implement ticket-local-schema-constrained-json-task2
+```
 
 ---
 

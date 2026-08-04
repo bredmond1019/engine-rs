@@ -239,6 +239,24 @@ pub(crate) fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadat
     LIVE_RUN_METADATA.get_or_init(|| RwLock::new(StdHashMap::new()))
 }
 
+/// Public read accessor onto [`live_run_metadata`] for embedded consumers
+/// (e.g. `bastion serve`, mounted in-process per D48) that need a live
+/// (non-terminal) run's `workflow_type`/`created_at` without reaching into
+/// `engine-serve`-private internals. Returns `None` for a run that is not
+/// currently tracked as live (unknown `run_id`, or a run that has already
+/// gone terminal and been cleared from this side table).
+///
+/// `GET /events/{event_id}` (see [`get_event`]) consumes this same accessor
+/// rather than reading [`live_run_metadata`] inline, so there is exactly one
+/// code path producing this data.
+pub fn live_run_workflow_type(run_id: Uuid) -> Option<(String, DateTime<Utc>)> {
+    live_run_metadata()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&run_id)
+        .cloned()
+}
+
 /// The server-derived `status` string for the `GET /events/{event_id}`
 /// readback (contract: `{event_id, workflow_type, status, created_at,
 /// updated_at, task_context}`, `status` derived server-side).
@@ -573,12 +591,8 @@ async fn get_event(
     }
 
     if let Some(snapshot) = state.live.get(event_id) {
-        let (workflow_type, created_at) = live_run_metadata()
-            .read()
-            .expect("live run metadata lock poisoned on read")
-            .get(&event_id)
-            .cloned()
-            .unwrap_or_else(|| ("unknown".to_string(), Utc::now()));
+        let (workflow_type, created_at) =
+            live_run_workflow_type(event_id).unwrap_or_else(|| ("unknown".to_string(), Utc::now()));
         let status = derive_live_status(&snapshot);
         return HttpResponse::Ok().json(serde_json::json!({
             "event_id": event_id,
@@ -594,12 +608,7 @@ async fn get_event(
     // only gets its first `LiveStateStore` snapshot once `on_progress` fires
     // at the first node boundary — a poll landing in that window must still
     // read back "running", not 404 a run_id the client was just handed.
-    if let Some((workflow_type, created_at)) = live_run_metadata()
-        .read()
-        .expect("live run metadata lock poisoned on read")
-        .get(&event_id)
-        .cloned()
-    {
+    if let Some((workflow_type, created_at)) = live_run_workflow_type(event_id) {
         return HttpResponse::Ok().json(serde_json::json!({
             "event_id": event_id,
             "workflow_type": workflow_type,
@@ -2217,6 +2226,35 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    mod live_run_workflow_type_tests {
+        use super::{live_run_metadata, live_run_workflow_type};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        /// `live_run_workflow_type` returns the `(workflow_type, created_at)`
+        /// pair verbatim for a run inserted via the same path `post_events`
+        /// uses (a direct insert into `live_run_metadata()`), and `None` for
+        /// a `run_id` never inserted. Uses a fresh random `Uuid` for the
+        /// "unknown" case specifically so it cannot collide with an id
+        /// another test in this process-global-backed suite happens to have
+        /// inserted.
+        #[test]
+        fn round_trips_and_is_absent_for_unknown_run() {
+            let run_id = Uuid::new_v4();
+            let created_at = Utc::now();
+            live_run_metadata()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(run_id, ("fixture".to_string(), created_at));
+
+            let found = live_run_workflow_type(run_id);
+            assert_eq!(found, Some(("fixture".to_string(), created_at)));
+
+            let unknown_run_id = Uuid::new_v4();
+            assert_eq!(live_run_workflow_type(unknown_run_id), None);
+        }
     }
 
     mod derive_terminal_status_tests {

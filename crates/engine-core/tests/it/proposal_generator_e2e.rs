@@ -542,8 +542,20 @@ async fn revise_verdict_routes_through_revise_node_before_persist_and_round_trip
     assert!(final_ctx.nodes.contains_key("ProposalReviseNode"));
     let (url, roadmap_value) = persisted_roadmap(&stubs.http_post);
     assert_eq!(url, TEST_BRAIN_URL);
-    assert_eq!(roadmap_value, final_ctx.nodes["ProposalReviseNode"]);
+    // ProposalReviseNode is local-eligible, so (per this ticket) its node
+    // output carries an extra "transport" telemetry stamp that the posted
+    // payload — built from the parsed AutomationRoadmap schema — does not.
+    // Compare the schema content with that stamp stripped, and assert the
+    // stamp itself is present separately.
+    let mut revise_output = final_ctx.nodes["ProposalReviseNode"].clone();
+    let transport_stamp = revise_output
+        .as_object_mut()
+        .expect("ProposalReviseNode output is an object")
+        .remove("transport")
+        .expect("local-eligible ProposalReviseNode stamps a transport tier");
+    assert_eq!(roadmap_value, revise_output);
     assert_ne!(roadmap_value, final_ctx.nodes["ProposalWriterNode"]);
+    assert!(transport_stamp.get("tier").is_some());
     let roadmap: AutomationRoadmap =
         serde_json::from_value(roadmap_value).expect("valid AutomationRoadmap");
     assert!(schema::validate_automation_roadmap(&roadmap).is_ok());

@@ -97,9 +97,12 @@ non-router connection.
 
 `registry_for_policy(&ContentPipelinePolicy)` in `graph.rs` rewires whichever of the four
 Local-eligible stages — `summarize`, `critic`, `revise`, `translate` — the policy resolves to
-`ModelTier::Local`, routing through `openai_compat_transport_live` (falling back to the real
-`claude` CLI transport on any local-endpoint failure). It never rewires the fetch/normalize/
-render/persist stages — they carry no `ModelTier` field and are not model nodes at all.
+`ModelTier::Local`, routing through `openai_compat_meta_transport_live` via each node's shared
+`TransportSlot`/`with_meta_transport` (falling back to the real `claude` CLI transport on any
+local-endpoint failure) so `model_tier_used` telemetry reflects the tier that actually ran, not
+just the resolved policy's intent (`EN.ticket.wire-meta-transport-telemetry` task 3). It never
+rewires the fetch/normalize/render/persist stages — they carry no `ModelTier` field and are not
+model nodes at all.
 
 ## The bounded self-critic loop
 

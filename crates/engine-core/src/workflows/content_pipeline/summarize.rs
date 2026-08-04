@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+};
 
 use super::policy::ContentPipelinePolicy;
 use super::{fetch_article, fetch_transcript, normalize_channel_content, source_router};
@@ -149,7 +151,7 @@ fn build_prompt(content: &ConvergedContent) -> String {
 /// The `summarize`-stage model node. Forwards to `SelfCriticNode`.
 pub struct SummarizeNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
 }
 
 impl SummarizeNode {
@@ -162,7 +164,7 @@ impl SummarizeNode {
                 json_schema: Some(summary_json_schema()),
                 ..Config::default()
             },
-            transport: None,
+            transport: TransportSlot::default(),
         }
     }
 
@@ -171,7 +173,18 @@ impl SummarizeNode {
     /// the gated suite never spawns a real `claude`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// whichever call actually executed (e.g. local vs. cloud fallback),
+    /// taking precedence over a plain transport set via
+    /// [`Self::with_transport`].
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 }
@@ -201,10 +214,9 @@ impl Node for SummarizeNode {
             policy.output_verbosity,
         );
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        let step = self
+            .transport
+            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -215,6 +227,16 @@ impl Node for SummarizeNode {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
+        // `put_result` below replaces this node's whole `ctx.nodes` entry,
+        // which would otherwise silently drop the `"transport"` stamp
+        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name.
+        let transport_stamp = ctx
+            .nodes
+            .get(NODE_NAME)
+            .and_then(|value| value.get("transport"))
+            .cloned();
 
         let summary: SummaryResult = parse_structured_or_fenced(&ctx, NODE_NAME, &response_content)
             .map_err(|err| {
@@ -223,13 +245,12 @@ impl Node for SummarizeNode {
                 ))
             })?;
 
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            serde_json::to_value(&summary).map_err(|err| {
-                NodeError::new(format!("failed to serialize SummaryResult: {err}"))
-            })?,
-        );
+        let mut result = serde_json::to_value(&summary)
+            .map_err(|err| NodeError::new(format!("failed to serialize SummaryResult: {err}")))?;
+        if let Some(transport) = transport_stamp {
+            result["transport"] = transport;
+        }
+        put_result(&mut ctx, NODE_NAME, result);
 
         Ok(ctx)
     }
@@ -316,6 +337,79 @@ mod tests {
             }
             .boxed()
         })
+    }
+
+    /// `EN.ticket.wire-meta-transport-telemetry` task 3: a
+    /// `with_meta_transport` override on `SummarizeNode` must stamp the
+    /// *actual* transport tier onto
+    /// `ctx.nodes["SummarizeNode"]["transport"]["tier"]` — `"local"` on a
+    /// stubbed local success, not a generic `"cloud"` regardless of what
+    /// ran (the bug this ticket fixes).
+    #[tokio::test]
+    async fn summarize_meta_transport_stamps_local_tier_on_stubbed_local_success() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::policy::tier::LocalConfig;
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost = std::sync::Arc::new(|_url, _body| {
+            Box::pin(async {
+                Ok(json!({
+                    "choices": [{ "message": {
+                        "content": stub_summary_json().to_string()
+                    } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+                }))
+            })
+        });
+        let cloud_fallback: ModelTransport = std::sync::Arc::new(|_config, _prompt| {
+            Box::pin(async { panic!("cloud fallback must not be called when local succeeds") })
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = SummarizeNode::new().with_meta_transport(meta_transport);
+        let ctx = ctx_with_content(fetch_article::NODE_NAME, article_content());
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes[NODE_NAME]["transport"]["tier"], "local");
+        assert_eq!(
+            out.nodes[NODE_NAME]["transport"]["endpoint"],
+            "http://localhost:11434"
+        );
+    }
+
+    /// Same seam, but the local endpoint fails — the resulting telemetry
+    /// must show `"cloud"` (what actually ran, via the fallback), not the
+    /// `"local"` tier the resolved policy intended.
+    #[tokio::test]
+    async fn summarize_meta_transport_stamps_cloud_tier_on_local_failure_fallback() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::policy::tier::LocalConfig;
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost = std::sync::Arc::new(|_url, _body| {
+            Box::pin(async { Err("connection refused".to_string()) })
+        });
+        let cloud_fallback: ModelTransport = stub_transport(Some(stub_summary_json()));
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = SummarizeNode::new().with_meta_transport(meta_transport);
+        let ctx = ctx_with_content(fetch_article::NODE_NAME, article_content());
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(
+            out.nodes[NODE_NAME]["transport"]["tier"], "cloud",
+            "a down local endpoint must stamp the cloud fallback's actual tier, \
+             not the resolved policy's intended `local` tier"
+        );
+        assert!(out.nodes[NODE_NAME]["transport"]["endpoint"].is_null());
     }
 
     #[tokio::test]

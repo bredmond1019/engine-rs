@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::{ClaudeCodeStep, MetaTransport};
 use crate::routing::Router;
 
 #[cfg(test)]
@@ -31,7 +31,7 @@ use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth}
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
-    ModelTransport,
+    ModelTransport, TransportSlot,
 };
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
@@ -1638,7 +1638,7 @@ impl Node for TestTaskNode {
 /// `ClaudeCodeStep` (Sonnet) only when `event.llm_triage` is true.
 pub struct TriageTaskNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
     runner: CommandRunner,
 }
 
@@ -1668,7 +1668,7 @@ impl TriageTaskNode {
                 model: Some("claude-sonnet-4-5".to_string()),
                 ..Config::default()
             },
-            transport: None,
+            transport: TransportSlot::default(),
             runner: super::default_command_runner(),
         }
     }
@@ -1678,7 +1678,17 @@ impl TriageTaskNode {
     /// invoked.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`TransportInfo`] of whichever call actually executed
+    /// (e.g. local vs. cloud fallback), taking precedence over a plain
+    /// transport set via [`Self::with_transport`].
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 
@@ -1819,10 +1829,9 @@ impl Node for TriageTaskNode {
             apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
         config.json_schema = Some(triage_output_schema());
 
-        let mut step = ClaudeCodeStep::new("TriageTaskNode", config, prompt);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        let step = self
+            .transport
+            .apply(ClaudeCodeStep::new("TriageTaskNode", config, prompt));
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -1832,6 +1841,16 @@ impl Node for TriageTaskNode {
             .and_then(|value| value.as_str())
             .ok_or_else(|| NodeError::new("TriageTaskNode: model returned no content"))?
             .to_string();
+        // Carried forward below: `put_result` replaces this node's whole
+        // `ctx.nodes` entry, which would otherwise silently drop the
+        // `"transport"` stamp `ClaudeCodeStep::process` just wrote — the
+        // exact tier-telemetry `RunTelemetry`/`observed_model_tiers`
+        // (`policy/telemetry.rs`) reads back out by this same node name.
+        let transport_stamp = ctx
+            .nodes
+            .get("TriageTaskNode")
+            .and_then(|value| value.get("transport"))
+            .cloned();
 
         let parsed: TriageOutput = parse_structured_or_fenced(&ctx, "TriageTaskNode", &content)
             .map_err(|err| {
@@ -1856,6 +1875,9 @@ impl Node for TriageTaskNode {
             "PASS" | "RETRYABLE" | "MAJOR_BAIL"
         ) {
             result["unrecognized_verdict"] = json!(normalized_verdict);
+        }
+        if let Some(transport) = transport_stamp {
+            result["transport"] = transport;
         }
         put_result(&mut ctx, "TriageTaskNode", result);
 
@@ -1944,7 +1966,7 @@ impl Router for TriageRouterNode {
 /// against its acceptance criteria via a composed `ClaudeCodeStep`.
 pub struct ConsolidatedReviewNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
     runner: CommandRunner,
 }
 
@@ -1977,7 +1999,7 @@ impl ConsolidatedReviewNode {
                 model: Some("claude-sonnet-4-5".to_string()),
                 ..Config::default()
             },
-            transport: None,
+            transport: TransportSlot::default(),
             runner: super::default_command_runner(),
         }
     }
@@ -1985,7 +2007,17 @@ impl ConsolidatedReviewNode {
     /// Override the transport used by the composed `ClaudeCodeStep`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`TransportInfo`] of whichever call actually executed
+    /// (e.g. local vs. cloud fallback), taking precedence over a plain
+    /// transport set via [`Self::with_transport`].
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 
@@ -2060,10 +2092,11 @@ impl Node for ConsolidatedReviewNode {
         config.cwd = Some(std::path::PathBuf::from(&worktree));
         config.json_schema = Some(review_output_schema());
 
-        let mut step = ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        let step = self.transport.apply(ClaudeCodeStep::new(
+            "ConsolidatedReviewNode",
+            config,
+            prompt,
+        ));
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -2073,6 +2106,16 @@ impl Node for ConsolidatedReviewNode {
             .and_then(|value| value.as_str())
             .ok_or_else(|| NodeError::new("ConsolidatedReviewNode: model returned no content"))?
             .to_string();
+        // Carried forward below: `put_result` replaces this node's whole
+        // `ctx.nodes` entry, which would otherwise silently drop the
+        // `"transport"` stamp `ClaudeCodeStep::process` just wrote — the
+        // exact tier-telemetry `RunTelemetry`/`observed_model_tiers`
+        // (`policy/telemetry.rs`) reads back out by this same node name.
+        let transport_stamp = ctx
+            .nodes
+            .get("ConsolidatedReviewNode")
+            .and_then(|value| value.get("transport"))
+            .cloned();
 
         let parsed: ReviewOutput =
             parse_structured_or_fenced(&ctx, "ConsolidatedReviewNode", &content).map_err(
@@ -2104,6 +2147,9 @@ impl Node for ConsolidatedReviewNode {
         });
         if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
             result["unrecognized_verdict"] = json!(normalized_verdict);
+        }
+        if let Some(transport) = transport_stamp {
+            result["transport"] = transport;
         }
         put_result(&mut ctx, "ConsolidatedReviewNode", result);
 
@@ -3040,6 +3086,94 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(*called.lock().unwrap());
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+    }
+
+    /// `EN.ticket.wire-meta-transport-telemetry` task 2: a `with_meta_transport`
+    /// override on `TriageTaskNode` must stamp the *actual* transport tier
+    /// onto `ctx.nodes["TriageTaskNode"]["transport"]["tier"]` — `"local"` on
+    /// a stubbed local success, not a generic `"cloud"` regardless of what
+    /// ran (the bug this ticket fixes).
+    #[tokio::test]
+    async fn triage_meta_transport_stamps_local_tier_on_stubbed_local_success() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::workflows::sdlc_flow::policy::LocalConfig;
+
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost = Arc::new(|_url, _body| {
+            Box::pin(async {
+                Ok(json!({
+                    "choices": [{ "message": {
+                        "content": json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string()
+                    } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+                }))
+            })
+        });
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { panic!("cloud fallback must not be called when local succeeds") })
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = TriageTaskNode::new().with_meta_transport(meta_transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+        assert_eq!(out.nodes["TriageTaskNode"]["transport"]["tier"], "local");
+        assert_eq!(
+            out.nodes["TriageTaskNode"]["transport"]["endpoint"],
+            "http://localhost:11434"
+        );
+    }
+
+    /// Same seam, but the local endpoint fails — the resulting telemetry
+    /// must show `"cloud"` (what actually ran, via the fallback), not the
+    /// `"local"` tier the resolved policy intended.
+    #[tokio::test]
+    async fn triage_meta_transport_stamps_cloud_tier_on_local_failure_fallback() {
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::workflows::sdlc_flow::policy::LocalConfig;
+
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+        let local_http_post: crate::nodes::LocalHttpPost =
+            Arc::new(|_url, _body| Box::pin(async { Err("connection refused".to_string()) }));
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({ "verdict": "RETRYABLE", "reason": "cloud fallback ran" }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+
+        let node = TriageTaskNode::new().with_meta_transport(meta_transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+        assert_eq!(
+            out.nodes["TriageTaskNode"]["transport"]["tier"], "cloud",
+            "a down local endpoint must stamp the cloud fallback's actual tier, \
+             not the resolved policy's intended `local` tier"
+        );
+        assert!(out.nodes["TriageTaskNode"]["transport"]["endpoint"].is_null());
     }
 
     /// A real model reply's casing isn't guaranteed to match the prompt's
