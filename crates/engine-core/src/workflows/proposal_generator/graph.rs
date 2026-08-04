@@ -49,7 +49,7 @@ use engine_contract::TaskContext;
 
 use crate::loop_combinator::{build_loop, ExitPredicate, LoopCluster, LoopSpec};
 use crate::node::NodeRegistry;
-use crate::nodes::openai_compat_transport::openai_compat_transport_live;
+use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 use crate::workflows::ModelTransport;
@@ -195,7 +195,7 @@ fn real_cloud_transport() -> ModelTransport {
 /// Local-eligible stages — `opportunity` (`OpportunityIdentifierNode`),
 /// `review` (`ProposalReviewNode`), `revise` (`ProposalReviseNode`) —
 /// `policy` resolves to [`ModelTier::Local`] rewired to route through
-/// [`openai_compat_transport_live`] (falling back to the real `claude` CLI
+/// [`openai_compat_meta_transport_live`] (falling back to the real `claude` CLI
 /// transport on any local-endpoint failure). **Never** rewires `research`
 /// (`ProposalCompanyResearchNode`) — it wraps `ClaudeCodeStep` with
 /// WebSearch/WebFetch tools granted, which a local single-shot endpoint
@@ -208,20 +208,22 @@ pub fn registry_for_policy(policy: &ProposalGeneratorPolicy) -> NodeRegistry {
     let mut registry = registry();
 
     if policy.model_tiers.opportunity == ModelTier::Local {
-        registry.register(Box::new(OpportunityIdentifierNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
-        )));
+        registry.register(Box::new(
+            OpportunityIdentifierNode::new().with_meta_transport(
+                openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
+            ),
+        ));
     }
 
     if policy.model_tiers.review == ModelTier::Local {
-        registry.register(Box::new(ProposalReviewNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(ProposalReviewNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 
     if policy.model_tiers.revise == ModelTier::Local {
-        registry.register(Box::new(ProposalReviseNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(ProposalReviseNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 
@@ -397,6 +399,153 @@ mod tests {
         let registry = registry_for_policy(&policy);
         assert!(registry.contains("ProposalCompanyResearchNode"));
         assert_eq!(registry.len(), super::registry().len());
+    }
+
+    /// `EN.ticket.wire-meta-transport-telemetry` task 4: the
+    /// `OpportunityIdentifierNode` `registry_for_policy` registers under
+    /// `ModelTier::Local` must stamp the *actual* transport tier onto
+    /// `ctx.nodes["OpportunityIdentifierNode"]["transport"]["tier"]` —
+    /// `"local"` on a stubbed local success, not a generic `"cloud"`
+    /// regardless of what ran (the bug this ticket fixes). First confirms
+    /// `registry_for_policy` actually rewires the node under this policy,
+    /// then drives an equivalent node built the same way
+    /// (`with_meta_transport(openai_compat_meta_transport(...))`) but with
+    /// the HTTP layer stubbed rather than a real Ollama endpoint.
+    #[tokio::test]
+    async fn opportunity_registry_for_policy_stamps_local_tier_on_stubbed_local_success() {
+        use crate::node::Node;
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::policy::tier::LocalConfig;
+
+        let mut policy = ProposalGeneratorPolicy::default();
+        policy.model_tiers.opportunity = ModelTier::Local;
+        policy.local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+
+        assert!(
+            registry_for_policy(&policy).contains("OpportunityIdentifierNode"),
+            "OpportunityIdentifierNode must be registered under an opportunity=Local policy"
+        );
+
+        let event = super::super::schema::ProposalGeneratorEventSchema {
+            company_name: "Loja da Ana".to_string(),
+            company_url: None,
+            diagnostic_intake: None,
+            locale: crate::locale::Locale::default(),
+            policy: None,
+            profile: None,
+        };
+        let mut ctx = TaskContext {
+            event: serde_json::to_value(&event).unwrap(),
+            nodes: StdHashMap::new(),
+            metadata: json!({}),
+            node_runs: StdHashMap::new(),
+        };
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).expect("policy serializes"),
+        );
+
+        let local_http_post: crate::nodes::LocalHttpPost = Arc::new(|_url, _body| {
+            Box::pin(async {
+                Ok(json!({
+                    "choices": [{ "message": {
+                        "content": json!({ "candidates": [] }).to_string()
+                    } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+                }))
+            })
+        });
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { panic!("cloud fallback must not be called when local succeeds") })
+        });
+        let meta_transport =
+            openai_compat_meta_transport(policy.local.clone(), local_http_post, cloud_fallback);
+        let stubbed_node = OpportunityIdentifierNode::new().with_meta_transport(meta_transport);
+
+        let out = stubbed_node
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+        assert_eq!(
+            out.nodes["OpportunityIdentifierNode"]["transport"]["tier"],
+            "local"
+        );
+        assert_eq!(
+            out.nodes["OpportunityIdentifierNode"]["transport"]["endpoint"],
+            "http://localhost:11434"
+        );
+    }
+
+    /// Same seam, but the local endpoint fails — the resulting telemetry
+    /// must show `"cloud"` (what actually ran, via the fallback), not the
+    /// `"local"` tier the resolved policy intended.
+    #[tokio::test]
+    async fn opportunity_registry_for_policy_stamps_cloud_tier_on_local_failure_fallback() {
+        use crate::node::Node;
+        use crate::nodes::openai_compat_meta_transport;
+        use crate::policy::tier::LocalConfig;
+        use futures::FutureExt;
+
+        let local = LocalConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            constrained_json: false,
+        };
+
+        let event = super::super::schema::ProposalGeneratorEventSchema {
+            company_name: "Loja da Ana".to_string(),
+            company_url: None,
+            diagnostic_intake: None,
+            locale: crate::locale::Locale::default(),
+            policy: None,
+            profile: None,
+        };
+        let mut ctx = TaskContext {
+            event: serde_json::to_value(&event).unwrap(),
+            nodes: StdHashMap::new(),
+            metadata: json!({}),
+            node_runs: StdHashMap::new(),
+        };
+        ctx.nodes.insert(
+            crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&ProposalGeneratorPolicy::default()).expect("policy serializes"),
+        );
+
+        let local_http_post: crate::nodes::LocalHttpPost =
+            Arc::new(|_url, _body| Box::pin(async { Err("connection refused".to_string()) }));
+        let cloud_fallback: ModelTransport = Arc::new(|_config, _prompt| {
+            async move {
+                Ok(claude_code_rs::Outcome {
+                    text: json!({ "candidates": [] }).to_string(),
+                    cost_usd: 0.0,
+                    usage: claude_code_rs::parse::Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    model_usage: std::collections::BTreeMap::new(),
+                    structured_output: Some(json!({ "candidates": [] })),
+                    is_error: false,
+                    api_error_status: None,
+                })
+            }
+            .boxed()
+        });
+        let meta_transport = openai_compat_meta_transport(local, local_http_post, cloud_fallback);
+        let node = OpportunityIdentifierNode::new().with_meta_transport(meta_transport);
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(
+            out.nodes["OpportunityIdentifierNode"]["transport"]["tier"], "cloud",
+            "a down local endpoint must stamp the cloud fallback's actual tier, \
+             not the resolved policy's intended `local` tier"
+        );
+        assert!(out.nodes["OpportunityIdentifierNode"]["transport"]["endpoint"].is_null());
     }
 
     #[test]

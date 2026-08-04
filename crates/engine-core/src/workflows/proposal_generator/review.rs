@@ -23,8 +23,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+};
 
 use super::policy::{ProposalGeneratorPolicy, ReviewMode};
 use super::schema::ProposalGeneratorEventSchema;
@@ -125,7 +127,7 @@ fn build_prompt(ctx: &TaskContext, event: &ProposalGeneratorEventSchema) -> Stri
 /// `ProposalReviewRouterNode`, which reads this node's stored verdict.
 pub struct ProposalReviewNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
 }
 
 impl ProposalReviewNode {
@@ -138,7 +140,7 @@ impl ProposalReviewNode {
                 json_schema: Some(review_output_json_schema()),
                 ..Config::default()
             },
-            transport: None,
+            transport: TransportSlot::default(),
         }
     }
 
@@ -147,7 +149,18 @@ impl ProposalReviewNode {
     /// the gated suite never spawns a real `claude`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// whichever call actually executed (e.g. local vs. cloud fallback),
+    /// taking precedence over a plain transport set via
+    /// [`Self::with_transport`].
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 }
@@ -189,10 +202,9 @@ impl Node for ProposalReviewNode {
             policy.output_verbosity,
         );
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        let step = self
+            .transport
+            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -203,6 +215,16 @@ impl Node for ProposalReviewNode {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
+        // `put_result` below replaces this node's whole `ctx.nodes` entry,
+        // which would otherwise silently drop the `"transport"` stamp
+        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name.
+        let transport_stamp = ctx
+            .nodes
+            .get(NODE_NAME)
+            .and_then(|value| value.get("transport"))
+            .cloned();
 
         let parsed: ReviewOutput =
             parse_structured_or_fenced(&ctx, NODE_NAME, &content).map_err(|err| {
@@ -213,14 +235,14 @@ impl Node for ProposalReviewNode {
 
         let verdict = Verdict::from_model_text(&parsed.verdict);
 
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            json!({
-                "verdict": verdict.as_str(),
-                "notes": parsed.notes,
-            }),
-        );
+        let mut result = json!({
+            "verdict": verdict.as_str(),
+            "notes": parsed.notes,
+        });
+        if let Some(transport) = transport_stamp {
+            result["transport"] = transport;
+        }
+        put_result(&mut ctx, NODE_NAME, result);
 
         Ok(ctx)
     }
