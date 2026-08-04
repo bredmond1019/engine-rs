@@ -18,6 +18,45 @@ related: [status, context]
 
 ## [run: 2026-08-03]
 
+### `EN.6.G` schedule source + fan-out/aggregate — done via `/sdlc-flow`
+- **What:** Shipped the two primitives a scheduled multi-source digest needs. Task 1 landed
+  `FanOutNode` (`crates/engine-core/src/nodes/fan_out.rs`) — builds N `with_identity`-wrapped
+  instances of one node type via a builder closure and runs them through `ParallelNode` — and
+  `AggregateNode` (`aggregate.rs`) — joins N `ctx.nodes` entries into one deterministically-ordered
+  array by declared identity order, not `HashMap` iteration order; a reproducing test confirmed
+  `EN.5.E`'s `with_identity`/`Identified` wrapper already prevents `ParallelNode`'s last-write-wins
+  collision for same-type branches, so `parallel.rs` needed no change, per the ticket's
+  investigate-first guidance. Task 2 landed `crates/engine-serve/src/schedule.rs` —
+  `ScheduleEntry`/`ScheduleRegistry` as a thin adapter over `engine_core::cron`'s `tick()`, a
+  `harness.json` `schedule.entries` loader/normalizer, and `dispatch_scheduled_entry` building a
+  `Schedule`-typed `IngressEnvelope` dispatched in-process via `dispatch_with_event` + `spawn_run`
+  (no self-directed HTTP call), covered by 10 unit tests. Task 3 added end-to-end integration tests
+  proving `FanOutNode`/`AggregateNode` survive a real `Workflow::run` with no last-write-wins
+  collision, and a single `ScheduleRegistry.tick()` fire dispatching one `PersistToBrainNode`-shaped
+  digest payload plus one `OutboundAction`-shaped record through the non-blocking `spawn_run` path.
+  Task 4 ran the full validation gate — fmt, clippy `-D warnings`, `nextest run --workspace` (1726
+  passed, 16 skipped), `build --release` — all green, no code changes needed.
+- **Why:** Completes the omni-channel ingress story with a cron-fired `Schedule` source and the
+  generic fan-out/aggregate pair a multi-source digest run needs, built on `EN.6.M`'s durable cron
+  substrate per the `D2` stacking decision.
+- **Decisions:** `ScheduleRegistry` is deliberately not an `AppState` field — follows the existing
+  `default_budget_from_env`/`live_run_metadata` process-global precedent in `http.rs` to avoid an
+  immediate cross-repo compile break for bastion, which constructs `AppState` with a literal over an
+  unpinned path dependency. `planning/harness.json`'s new knob is `schedule.entries` (an array with
+  a sibling `_comment`), matching the file's existing `<workflow_key>.policy`/`.profiles`
+  sibling-`_comment` convention. `dispatch_scheduled_entry` always returns `FireOutcome::Reported`
+  (never `Silent`) since a dispatch attempt always has something to report.
+- **Verdict:** PASS. This closes `EN.6.G`.
+- Next: `EN.5.B1` (eval slice runner), `EN.5.C` (EXTERNAL_INTEL), `EN.6.C/D` (Slack,
+  Telegram/WhatsApp adapters), `EN.6.I` (LEAD_INGEST), `EN.4.D` (DELIVERABLE_RENDER).
+
+```
+c7eff3c docs: update docs for en-6g-schedule-source-fan-out-aggregate
+5a82e44 feat: implement en-6g-schedule-source-fan-out-aggregate-task3
+ff8b6f2 feat: implement en-6g-schedule-source-fan-out-aggregate-task2
+8d57267 feat: implement en-6g-schedule-source-fan-out-aggregate-task1
+```
+
 ### `EN.6.M` durable background/cron primitive — done via `/sdlc-flow`
 - **What:** Ported qm §5's durable Cron primitive as a standalone module with no dependency on any
   specific workflow or envelope type. Task 1 (`crates/engine-core/src/cron/mod.rs`): `CronSchedule`

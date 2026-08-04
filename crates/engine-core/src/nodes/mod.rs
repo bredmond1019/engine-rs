@@ -86,11 +86,26 @@
 //! is what actually stops the walk and picks the resume pointer.
 //! `enabled: false` (the default) is an in-place no-op, mirroring
 //! `MaterializeDocNode::with_enabled`.
+//!
+//! `fan_out` (`EN.6.G` task 1) is `FanOutNode` — constructs N
+//! `with_identity`-wrapped instances of the same underlying node type from
+//! one builder closure and delegates to `crate::parallel::ParallelNode` to
+//! run them concurrently with no last-write-wins collision. Also carries
+//! the `impl Node for Box<dyn Node>` forwarding impl that makes
+//! `.with_identity()` callable on a boxed, type-erased node.
+//!
+//! `aggregate` (`EN.6.G` task 1) is `AggregateNode` — joins the N
+//! `ctx.nodes` entries a `FanOutNode` produced into one
+//! deterministically-ordered `Vec<serde_json::Value>`, ordered by the
+//! caller's declared source-identity list rather than `HashMap` iteration
+//! order.
 
+pub mod aggregate;
 pub mod channel_transport;
 pub mod claude_code_step;
 pub mod doc_materializer;
 pub mod email;
+pub mod fan_out;
 pub mod harvest_approve;
 pub mod harvest_gate;
 pub mod http_post;
@@ -100,6 +115,7 @@ pub mod openai_compat_transport;
 pub mod opportunity_edit;
 pub mod suspend;
 
+pub use aggregate::AggregateNode;
 pub use channel_transport::{
     ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody, StubChannelTransport,
     UnwiredChannelTransport, WorkflowTriggerDispatch,
@@ -111,6 +127,7 @@ pub use doc_materializer::{
     StubDocMaterializer,
 };
 pub use email::{EmailChannelTransport, DEFAULT_EMAIL_FROM, EMAIL_FROM_ENV, RESEND_API_KEY_ENV};
+pub use fan_out::FanOutNode;
 pub use harvest_approve::HarvestApproveNode;
 pub use harvest_gate::{pending_harvest_record, HarvestDecision, HarvestGate, HarvestMode};
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
