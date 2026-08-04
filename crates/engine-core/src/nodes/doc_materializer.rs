@@ -605,10 +605,24 @@ mod tests {
     /// Sets up a tempdir corpus with one written `acme-corp` opportunity
     /// (via the live `materialize` path) — the shared fixture every
     /// `edit_opportunity` live-impl test builds on.
+    /// The stage vocabulary `resolve_stage_vocabulary` (`mev::doc::opportunity`, D58)
+    /// parses via [`mev::doc::opportunity::parse_stages`] — mirrors the content
+    /// mev's own `parse_stages_reads_real_vocabulary_in_order` test uses.
+    const PIPELINE_MD_FIXTURE: &str = "# Pipeline\n\n## Stages\n\n`identified` → `researching` → \
+`contacted` → `conversation` → `proposal-sent` → `closed-won` → `closed-lost`\n\n---\n\n## Active Leads\n";
+
     async fn write_acme_corp_opportunity() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("business/docs/opportunities"))
             .expect("create opportunities dir");
+        // D58: plan_set_stage resolves the stage vocabulary from
+        // business/docs/pipeline.md via a brain.toml-rooted lookup.
+        std::fs::write(dir.path().join("brain.toml"), "").expect("write brain.toml marker");
+        std::fs::write(
+            dir.path().join("business/docs/pipeline.md"),
+            PIPELINE_MD_FIXTURE,
+        )
+        .expect("write pipeline.md fixture");
 
         let live = MevDocMaterializer;
         let outcome = live
@@ -703,9 +717,9 @@ mod tests {
             .iter()
             .find(|d| d.code == "E_DOC_BAD_STAGE")
             .expect("checked above");
-        for stage in mev::doc::opportunity::VALID_STAGES {
+        for stage in mev::doc::opportunity::parse_stages(PIPELINE_MD_FIXTURE) {
             assert!(
-                bad_stage_diag.message.contains(stage),
+                bad_stage_diag.message.contains(&stage),
                 "expected error message to name valid stage '{stage}': {}",
                 bad_stage_diag.message
             );
