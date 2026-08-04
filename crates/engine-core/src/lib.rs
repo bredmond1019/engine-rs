@@ -11,6 +11,7 @@ pub mod budget;
 pub mod cancellation;
 pub mod cron;
 pub mod dispatch;
+pub mod evals;
 pub mod locale;
 pub mod loop_combinator;
 pub mod node;
