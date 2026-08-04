@@ -591,12 +591,8 @@ async fn get_event(
     }
 
     if let Some(snapshot) = state.live.get(event_id) {
-        let (workflow_type, created_at) = live_run_metadata()
-            .read()
-            .expect("live run metadata lock poisoned on read")
-            .get(&event_id)
-            .cloned()
-            .unwrap_or_else(|| ("unknown".to_string(), Utc::now()));
+        let (workflow_type, created_at) =
+            live_run_workflow_type(event_id).unwrap_or_else(|| ("unknown".to_string(), Utc::now()));
         let status = derive_live_status(&snapshot);
         return HttpResponse::Ok().json(serde_json::json!({
             "event_id": event_id,
@@ -612,12 +608,7 @@ async fn get_event(
     // only gets its first `LiveStateStore` snapshot once `on_progress` fires
     // at the first node boundary — a poll landing in that window must still
     // read back "running", not 404 a run_id the client was just handed.
-    if let Some((workflow_type, created_at)) = live_run_metadata()
-        .read()
-        .expect("live run metadata lock poisoned on read")
-        .get(&event_id)
-        .cloned()
-    {
+    if let Some((workflow_type, created_at)) = live_run_workflow_type(event_id) {
         return HttpResponse::Ok().json(serde_json::json!({
             "event_id": event_id,
             "workflow_type": workflow_type,
