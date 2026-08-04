@@ -40,9 +40,9 @@ use std::sync::Arc;
 // `parse_structured_or_fenced` (also re-exported here) is the sole caller,
 // but it stays re-exported for back-compat — any `super::strip_json_fence`
 // import site elsewhere in the crate must keep resolving unchanged.
-pub use super::ModelTransport;
 #[allow(unused_imports)]
 pub(crate) use super::{get_result, parse_structured_or_fenced, put_result, strip_json_fence};
+pub use super::{ModelTransport, TransportSlot};
 #[allow(unused_imports)]
 pub use command_floor::{evaluate_command, CommandDecision};
 

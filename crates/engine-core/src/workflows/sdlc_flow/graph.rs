@@ -44,7 +44,7 @@ use std::sync::Arc;
 use claude_code_rs::Config;
 
 use crate::node::NodeRegistry;
-use crate::nodes::openai_compat_transport::openai_compat_transport_live;
+use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
@@ -274,7 +274,7 @@ fn real_cloud_transport() -> ModelTransport {
 /// Build a `NodeRegistry` like [`registry`], but with the single-shot
 /// judgment stages the `local` model tier is scoped to — `TriageTaskNode`'s
 /// `llm_triage` model branch and `ConsolidatedReviewNode` — wired to route
-/// through [`openai_compat_transport_live`] whenever `policy`'s resolved
+/// through [`openai_compat_meta_transport_live`] whenever `policy`'s resolved
 /// tier for that stage is [`ModelTier::Local`]. **Never** rewires
 /// `ImplementTaskNode`: the local tier is scoped to single-shot judgment
 /// calls, not the agentic `implement` stage (spec Context Pointers,
@@ -294,14 +294,14 @@ pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
     let mut registry = registry();
 
     if policy.model_tiers.triage == ModelTier::Local {
-        registry.register(Box::new(TriageTaskNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(TriageTaskNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 
     if policy.model_tiers.review == ModelTier::Local {
-        registry.register(Box::new(ConsolidatedReviewNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(ConsolidatedReviewNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 
