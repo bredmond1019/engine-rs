@@ -307,7 +307,7 @@ mod tests {
         };
         ctx.nodes.insert(
             crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
-            serde_json::to_value(&DiagnosticIntakePolicy::default()).expect("policy serializes"),
+            serde_json::to_value(DiagnosticIntakePolicy::default()).expect("policy serializes"),
         );
 
         let local_http_post: crate::nodes::LocalHttpPost =
