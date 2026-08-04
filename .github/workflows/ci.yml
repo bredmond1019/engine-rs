@@ -1,0 +1,20 @@
+name: ci
+
+# Thin caller — invokes base-template's reusable Rust gate workflow, which
+# mirrors this repo's planning/harness.json checks in declared order (fmt,
+# clippy, test, build). See base-template/docs/ci.md for the opt-in model
+# and the local actionlint -> act -> push validation loop.
+#
+# engine-rs deviates from the default test gate: its harness.json gates on
+# `cargo nextest run --workspace`, so this caller opts into nextest.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    uses: bredmond1019/agentic-base-template/.github/workflows/gate-rust.yml@main
+    with:
+      needs-nextest: true
+      test-command: "cargo nextest run --workspace"
