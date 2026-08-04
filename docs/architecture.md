@@ -101,7 +101,22 @@ engine-rs/
 │   │                         reuses to derive matching identities; `nodes/aggregate.rs` —
 │   │                         `AggregateNode`, joins N `ctx.nodes` entries into one
 │   │                         deterministically-ordered array by declared identity order (not
-│   │                         `HashMap` iteration order))
+│   │                         `HashMap` iteration order); evals/ (`EN.5.B` tasks 1-3) — pure,
+│   │                         corpus-free eval scoring generalized from Synapse's OR.K2 scorer
+│   │                         library: scorers.rs (`score_deterministic`/`score_structural`/
+│   │                         `score_reference_based`, free functions over `serde_json::Value`/
+│   │                         `&str` returning `ScoreResult`), case.rs (`EvalCase` — `ScorerKind`
+│   │                         + dot-path selector + expected value), slice.rs (`EvalSlice` —
+│   │                         named `EvalCase` collection grouped by domain/model/profile
+│   │                         mirroring `PolicyAggregate`'s grouping shape; `EvalSlice::score`
+│   │                         produces per-case `CaseReport`s and an overall pass-rate in
+│   │                         `SliceReport`), runner.rs (`run_slice` — scores an `EvalSlice`
+│   │                         against real captured SDLC-flow telemetry by importing `EN.4.0`'s
+│   │                         `aggregate_state_files`/`extract_policy_telemetry` directly, no
+│   │                         second aggregation path; reduces the resulting `PolicyAggregate`
+│   │                         rows to one JSON record via a field-less `UnitPolicy` grouping
+│   │                         key; `coding_slice()` — a concrete slice scoring
+│   │                         `PolicyAggregate`'s own serialized fields))
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -172,7 +187,11 @@ engine-rs/
     same-type fan-out branches;
     crates/engine-serve/tests/schedule.rs — `EN.6.G` task 3: a `ScheduleRegistry.tick()` fire
     dispatching one persist-shaped payload and one outbound-action-shaped record through the
-    non-blocking `spawn_run` path, over a real tempdir-backed `FileCronStore`)
+    non-blocking `spawn_run` path, over a real tempdir-backed `FileCronStore`;
+    crates/engine-core/tests/it/evals_slice.rs (module of the single `tests/it/main.rs` binary,
+    per CLAUDE.md rule 8) — `EN.5.B` task 3: proves `run_slice` against a fixture
+    `tests/fixtures/eval_coding_state.json` SDLC-flow state file, scoring `coding_slice()`
+    through the real `aggregate_state_files` path end-to-end)
 ```
 
 ## Injectable Seams
