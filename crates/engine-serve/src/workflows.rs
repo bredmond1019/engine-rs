@@ -474,10 +474,34 @@ pub fn register_harvest_approve(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `LEAD_INGEST` workflow (`engine_core::workflows::lead_ingest`)
+/// with `dispatcher`, populating both the `workflow_registry` and the
+/// `schema_registry`. See `planning/en-6i-lead-ingest/tasks.md`, Task 2.
+///
+/// A **fourth model-free workflow** registered in this module, alongside
+/// [`register_opportunity_set_stage`] / [`register_opportunity_add_action`] /
+/// [`register_harvest_approve`]: neither `MaterializeDocNode` nor
+/// `MergeContactsNode` calls a model or reads a `harness.json` policy
+/// section (see `lead_ingest`'s module doc), so this factory resolves no
+/// policy and seeds no policy stamp — there is no `resolve_policy_for_run_from`
+/// call and no `seed_resolved_policy` call. Do not "restore" that hop; it
+/// was never dropped, it was never needed.
+pub fn register_lead_ingest(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::lead_ingest::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::lead_ingest::registry(),
+                engine_core::workflows::lead_ingest::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
-/// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`, and
-/// `HARVEST_APPROVE`; future builtins register here too.
+/// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`,
+/// `HARVEST_APPROVE`, and `LEAD_INGEST`; future builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
 /// this with exactly one argument (`../bastion/src/serve/mod.rs:61`) and
@@ -508,6 +532,7 @@ pub fn register_builtin_workflows_with_registry(
     register_opportunity_set_stage(dispatcher);
     register_opportunity_add_action(dispatcher);
     register_harvest_approve(dispatcher);
+    register_lead_ingest(dispatcher);
 }
 
 #[cfg(test)]
@@ -1290,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_workflows_registers_all_eight_workflow_types() {
+    fn register_builtin_workflows_registers_all_nine_workflow_types() {
         let mut dispatcher = Dispatcher::new();
 
         register_builtin_workflows(&mut dispatcher);
@@ -1304,11 +1329,112 @@ mod tests {
             "OPPORTUNITY_SET_STAGE",
             "OPPORTUNITY_ADD_ACTION",
             "HARVEST_APPROVE",
+            "LEAD_INGEST",
         ] {
             assert!(
                 dispatcher.is_registered(workflow_type),
                 "expected {workflow_type} to be registered"
             );
         }
+    }
+
+    #[test]
+    fn register_lead_ingest_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_lead_ingest(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("LEAD_INGEST"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_lead_ingest_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_lead_ingest(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("LEAD_INGEST")
+            .expect("LEAD_INGEST schema should resolve");
+
+        assert_eq!(schema.start_node, "MaterializeDocNode");
+    }
+
+    #[test]
+    fn dispatch_lead_ingest_builds_a_runnable_workflow_with_no_policy_stamp() {
+        let mut dispatcher = Dispatcher::new();
+        register_lead_ingest(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "LEAD_INGEST",
+                &serde_json::json!({
+                    "company_name": "Acme Corp",
+                    "contacts": [{"name": "Jane Doe", "emails": ["jane@acme.com"]}],
+                }),
+            )
+            .expect("LEAD_INGEST should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_lead_ingest() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("LEAD_INGEST"));
+    }
+
+    /// `MaterializeDocNode` resolves its brain root before it ever inspects
+    /// `company_name` (`resolve_root()` runs ahead of `read_input()` in
+    /// `MaterializeDocNode::process`), so this test pins `ENGINE_BRAIN_ROOT`
+    /// to a scratch tempdir rather than letting resolution fall through to
+    /// this workstation's real `brain.toml` — a malformed-payload test must
+    /// never risk touching the real Brain corpus. Safe to mutate the env var
+    /// directly (no guard/restore): `cargo nextest run` forks one process per
+    /// test (CLAUDE.md standing rule 7), so this test owns the process for
+    /// its whole lifetime and there is no other test in the same process to
+    /// race or leak into.
+    #[tokio::test]
+    async fn dispatch_lead_ingest_with_missing_company_name_fails_loudly_when_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("business/docs/opportunities"))
+            .expect("create opportunities dir");
+        std::env::set_var("ENGINE_BRAIN_ROOT", dir.path());
+
+        let mut dispatcher = Dispatcher::new();
+        register_lead_ingest(&mut dispatcher);
+
+        let malformed_payload = serde_json::json!({
+            "summary": "No company_name on this payload.",
+            "contacts": [{"name": "Jane Doe", "emails": ["jane@acme.com"]}],
+        });
+
+        let workflow = dispatcher
+            .dispatch_with_event("LEAD_INGEST", &malformed_payload)
+            .expect("dispatch itself should still yield a runnable Workflow");
+
+        let ctx = workflow
+            .run(malformed_payload, Box::new(|_ctx| {}))
+            .await
+            .expect("run itself should not error — the failure is a stamped NodeRun");
+
+        assert_eq!(
+            ctx.node_runs["MaterializeDocNode"].status,
+            engine_contract::NodeRunStatus::Failed,
+            "a payload missing company_name must fail loudly, not silently no-op"
+        );
+        assert!(
+            !ctx.node_runs.contains_key("MergeContactsNode")
+                || ctx.node_runs["MergeContactsNode"].status
+                    == engine_contract::NodeRunStatus::Pending,
+            "MergeContactsNode must never run after MaterializeDocNode fails loudly"
+        );
+
+        let entries = std::fs::read_dir(dir.path().join("business/docs/opportunities"))
+            .expect("read opportunities dir")
+            .count();
+        assert_eq!(entries, 0, "malformed payload must write no file");
     }
 }
