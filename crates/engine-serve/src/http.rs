@@ -239,6 +239,24 @@ pub(crate) fn live_run_metadata() -> &'static RwLock<StdHashMap<Uuid, RunMetadat
     LIVE_RUN_METADATA.get_or_init(|| RwLock::new(StdHashMap::new()))
 }
 
+/// Public read accessor onto [`live_run_metadata`] for embedded consumers
+/// (e.g. `bastion serve`, mounted in-process per D48) that need a live
+/// (non-terminal) run's `workflow_type`/`created_at` without reaching into
+/// `engine-serve`-private internals. Returns `None` for a run that is not
+/// currently tracked as live (unknown `run_id`, or a run that has already
+/// gone terminal and been cleared from this side table).
+///
+/// `GET /events/{event_id}` (see [`get_event`]) consumes this same accessor
+/// rather than reading [`live_run_metadata`] inline, so there is exactly one
+/// code path producing this data.
+pub fn live_run_workflow_type(run_id: Uuid) -> Option<(String, DateTime<Utc>)> {
+    live_run_metadata()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&run_id)
+        .cloned()
+}
+
 /// The server-derived `status` string for the `GET /events/{event_id}`
 /// readback (contract: `{event_id, workflow_type, status, created_at,
 /// updated_at, task_context}`, `status` derived server-side).
