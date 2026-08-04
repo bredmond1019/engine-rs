@@ -267,8 +267,13 @@ endpoint (schema-shaped hint gated by `local.constrained_json`, off by default).
 > describes exactly what happens when you do opt in.
 
 Setting `model_tiers.triage` and/or `model_tiers.review` to `local` routes that stage's calls
-through `openai_compat_transport` to an OpenAI-compatible endpoint (e.g. a local Ollama server)
-instead of the Claude CLI — for cheap, zero-cost judgment calls on cheap hardware.
+through `openai_compat_meta_transport_live` (a `MetaTransport`, `openai_compat_transport.rs`) to
+an OpenAI-compatible endpoint (e.g. a local Ollama server) instead of the Claude CLI — for cheap,
+zero-cost judgment calls on cheap hardware. Both `TriageTaskNode` and `ConsolidatedReviewNode` hold
+a `TransportSlot` (`workflows/transport_slot.rs`) so this meta-reporting override, not just a plain
+`ModelTransport`, is what `registry_for_policy` wires in (`EN.ticket.wire-meta-transport-telemetry`
+task 2) — see [Observed vs. intended tier](#telemetry-runoutcomes) below for why that distinction
+matters to `model_tier_used`.
 
 - **Scoped to single-shot judgment stages only** — `TriageTaskNode`'s LLM-triage branch and
   `ConsolidatedReviewNode`. `ImplementTaskNode` (the agentic implement stage) is **never** rewired
@@ -303,19 +308,24 @@ instead of the Claude CLI — for cheap, zero-cost judgment calls on cheap hardw
 - `model_tier_used` — per-stage tier actually **called**, not the resolved policy's intent (see
   below).
 
-**Observed vs. intended tier (`EN.5.D`).** `openai_compat_transport`'s `local` tier fails fast and
-silently falls back to the real cloud transport when its endpoint is unreachable — deliberately, so
-a down local server never hard-fails a run. That fallback is invisible to intent-derived telemetry:
-if `model_tier_used` just echoed the resolved policy, a run whose `local`-tier review stage silently
-fell back to cloud would still report `"review": "local"`. `RunTelemetry` instead harvests each
-stage's tier from what the transport actually stamped —
+**Observed vs. intended tier (`EN.5.D`).** `openai_compat_meta_transport`'s `local` tier fails fast
+and silently falls back to the real cloud transport when its endpoint is unreachable — deliberately,
+so a down local server never hard-fails a run. That fallback is invisible to intent-derived
+telemetry: if `model_tier_used` just echoed the resolved policy, a run whose `local`-tier review
+stage silently fell back to cloud would still report `"review": "local"`. `RunTelemetry` instead
+harvests each stage's tier from what the transport actually stamped —
 `ctx.nodes[stage]["transport"]["tier"]`/`["model"]`/`["endpoint"]` (a `MetaTransport`, EN.5.D task 9;
 `openai_compat_meta_transport` stamps `{"tier": "local", ...}` on a successful local call and
 `{"tier": "cloud", ...}` on the fallback) — and this **observed** value overrides any
-caller-supplied `model_tier_used` entry for that same stage. A stage that ran no model this run (or
-whose node only exposes the plain, non-meta `with_transport` seam — still generic `"cloud"`-tier,
-per `ClaudeCodeStep`'s doc comment) simply has no observed entry, leaving the caller-supplied value,
-if any, as the only source for that key.
+caller-supplied `model_tier_used` entry for that same stage. A stage that ran no model this run
+simply has no observed entry, leaving the caller-supplied value, if any, as the only source for
+that key. Before `EN.ticket.wire-meta-transport-telemetry`, a node that only exposed the plain,
+non-meta `with_transport` seam would stamp a generic `"cloud"`-tier `TransportInfo` regardless of
+which transport actually ran (per `ClaudeCodeStep`'s doc comment); every `registry_for_policy`
+call site across `sdlc_flow`/`content_pipeline`/`proposal_generator`/`diagnostic_intake` (10 in
+total) now composes its `ClaudeCodeStep` via the shared `TransportSlot` and exposes
+`with_meta_transport`, so this generic-stamp caveat no longer applies to any wired Local-eligible
+stage.
 
 `Workflow::run_with` (`crates/engine-core/src/workflow.rs`) now stamps this generic
 `policy::telemetry::RunTelemetry` snapshot into every completed run's

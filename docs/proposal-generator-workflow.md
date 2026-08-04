@@ -66,8 +66,11 @@ terminal node — no forward connection.
 
 `registry_for_policy(&ProposalGeneratorPolicy)` in `graph.rs` rewires whichever of the three
 Local-eligible stages — `opportunity`, `review`, `revise` — the policy resolves to
-`ModelTier::Local`, routing through `openai_compat_transport_live` (falling back to the real
-`claude` CLI transport on any local-endpoint failure). It **never** rewires `research`
+`ModelTier::Local`, routing through `openai_compat_meta_transport_live` via each node's shared
+`TransportSlot`/`with_meta_transport` (falling back to the real `claude` CLI transport on any
+local-endpoint failure) so `model_tier_used` telemetry reflects the tier that actually ran, not
+just the resolved policy's intent (`EN.ticket.wire-meta-transport-telemetry` task 4). It **never**
+rewires `research`
 (`ProposalCompanyResearchNode` wraps `ClaudeCodeStep` with `WebSearch`/`WebFetch` tools
 granted, which a local single-shot endpoint cannot serve) or `writer` (cloud-default, no
 `Local` dispatch branch exists for it at all) — this holds even if a policy sets every tier,

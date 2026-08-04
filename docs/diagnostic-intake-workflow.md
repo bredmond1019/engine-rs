@@ -111,11 +111,15 @@ prompt cache off.
 **Unlike `RESEARCH_AGENT`'s two cloud-only stages, this workflow's single `extract` stage is
 Local-eligible** — pure structured extraction suits a local coder model, so `ModelTier::Local` is
 a valid resolved value here. `graph::registry_for_policy(&DiagnosticIntakePolicy)` rewires
-`IntakeExtractNode` to route through `openai_compat_transport_live` whenever the resolved
-`extract` tier is `Local`, falling back to the real `claude` CLI transport at call time if the
-local endpoint is unavailable — the direct analog of `sdlc_flow::graph::registry_for_policy`'s
-triage/review rewire, and the inverse of `research_agent::graph::registry_for_policy`'s
-permanent no-rewire guard.
+`IntakeExtractNode` to route through `openai_compat_meta_transport_live` (via
+`IntakeExtractNode::with_meta_transport` / the shared `TransportSlot`,
+`EN.ticket.wire-meta-transport-telemetry` task 5) whenever the resolved `extract` tier is `Local`,
+falling back to the real `claude` CLI transport at call time if the local endpoint is unavailable —
+the direct analog of `sdlc_flow::graph::registry_for_policy`'s triage/review rewire, and the inverse
+of `research_agent::graph::registry_for_policy`'s permanent no-rewire guard. Because the rewire uses
+the *meta*-reporting transport, `IntakeExtractNode`'s final result carries the actual tier called
+(local vs. cloud-fallback) rather than a generic `"cloud"` stamp — see
+[sdlc-flow-policy.md § Observed vs. intended tier](sdlc-flow-policy.md#telemetry-runoutcomes).
 
 ### Named profiles
 
