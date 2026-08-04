@@ -43,8 +43,11 @@ use std::sync::Arc;
 pub use super::ModelTransport;
 #[allow(unused_imports)]
 pub(crate) use super::{get_result, parse_structured_or_fenced, put_result, strip_json_fence};
+#[allow(unused_imports)]
+pub use command_floor::{evaluate_command, CommandDecision};
 
 pub mod aggregate;
+pub mod command_floor;
 pub mod docs;
 pub mod emit_state;
 pub mod final_validation;
