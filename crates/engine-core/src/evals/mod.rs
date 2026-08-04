@@ -15,6 +15,10 @@
 //! `policy::aggregate::aggregate_state_files` (task 3) land in later tasks
 //! of this spec.
 
+pub mod case;
 pub mod scorers;
+pub mod slice;
 
+pub use case::{EvalCase, ScorerKind};
 pub use scorers::{score_deterministic, score_reference_based, score_structural, ScoreResult};
+pub use slice::{CaseReport, EvalSlice, SliceReport};

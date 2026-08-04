@@ -21,7 +21,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 /// The uniform result shape every scorer in this module returns.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ScoreResult {
     /// Whether this case is considered a pass.
     pub passed: bool,
