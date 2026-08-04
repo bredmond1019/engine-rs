@@ -67,7 +67,7 @@ use std::sync::Arc;
 use crate::node::NodeRegistry;
 use crate::nodes::harvest_gate::HarvestGate;
 use crate::nodes::materialize_doc::MaterializeDocNode;
-use crate::nodes::openai_compat_transport::openai_compat_transport_live;
+use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 use crate::workflows::ModelTransport;
@@ -283,7 +283,7 @@ fn real_cloud_transport() -> ModelTransport {
 /// Local-eligible stages — `summarize` (`SummarizeNode`), `critic`
 /// (`SelfCriticNode`), `revise` (`ReviseNode`), `translate`
 /// (`TranslateNode`) — `policy` resolves to [`ModelTier::Local`] rewired to
-/// route through [`openai_compat_transport_live`] (falling back to the real
+/// route through [`openai_compat_meta_transport_live`] (falling back to the real
 /// `claude` CLI transport on any local-endpoint failure). **Never**
 /// rewires the fetch/normalize/render/persist/dispatch stages — they carry
 /// no `ModelTier` field and are not model nodes at all (architecture.md
@@ -315,26 +315,26 @@ pub fn registry_for_policy(policy: &ContentPipelinePolicy) -> NodeRegistry {
     registry.register(Box::new(persist_to_brain_node(&policy.harvest)));
 
     if policy.model_tiers.summarize == ModelTier::Local {
-        registry.register(Box::new(SummarizeNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(SummarizeNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 
     if policy.model_tiers.critic == ModelTier::Local {
-        registry.register(Box::new(SelfCriticNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(SelfCriticNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 
     if policy.model_tiers.revise == ModelTier::Local {
-        registry.register(Box::new(ReviseNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(ReviseNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 
     if policy.model_tiers.translate == ModelTier::Local {
-        registry.register(Box::new(TranslateNode::new().with_transport(
-            openai_compat_transport_live(policy.local.clone(), real_cloud_transport()),
+        registry.register(Box::new(TranslateNode::new().with_meta_transport(
+            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
         )));
     }
 

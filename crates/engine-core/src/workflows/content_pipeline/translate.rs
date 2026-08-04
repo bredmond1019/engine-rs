@@ -45,9 +45,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::node::{InputBinding, Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::{ClaudeCodeStep, MetaTransport};
 use crate::routing::Router;
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+};
 
 use super::policy::ContentPipelinePolicy;
 use super::revise;
@@ -216,7 +218,7 @@ fn build_prompt(summary: &str, target_lang: &str) -> String {
 /// The `translate`-stage model node. Forwards to `DigestRenderNode`.
 pub struct TranslateNode {
     config: Config,
-    transport: Option<ModelTransport>,
+    transport: TransportSlot,
     summary_input: InputBinding,
 }
 
@@ -233,7 +235,7 @@ impl TranslateNode {
                 json_schema: Some(translation_json_schema()),
                 ..Config::default()
             },
-            transport: None,
+            transport: TransportSlot::default(),
             summary_input: InputBinding::default(),
         }
     }
@@ -243,7 +245,18 @@ impl TranslateNode {
     /// the gated suite never spawns a real `claude`.
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
-        self.transport = Some(transport);
+        self.transport.set_plain(transport);
+        self
+    }
+
+    /// Override the transport with a tier-aware [`MetaTransport`] that
+    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// whichever call actually executed (e.g. local vs. cloud fallback),
+    /// taking precedence over a plain transport set via
+    /// [`Self::with_transport`].
+    #[must_use]
+    pub fn with_meta_transport(mut self, transport: MetaTransport) -> Self {
+        self.transport.set_meta(transport);
         self
     }
 
@@ -283,10 +296,9 @@ impl Node for TranslateNode {
             policy.output_verbosity,
         );
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
-        if let Some(transport) = self.transport.clone() {
-            step = step.with_transport(move |config, prompt| (transport)(config, prompt));
-        }
+        let step = self
+            .transport
+            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -297,6 +309,16 @@ impl Node for TranslateNode {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
+        // `put_result` below replaces this node's whole `ctx.nodes` entry,
+        // which would otherwise silently drop the `"transport"` stamp
+        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name.
+        let transport_stamp = ctx
+            .nodes
+            .get(NODE_NAME)
+            .and_then(|value| value.get("transport"))
+            .cloned();
 
         let translation: TranslationResult = parse_structured_or_fenced(&ctx, NODE_NAME, &content)
             .map_err(|err| {
@@ -306,13 +328,13 @@ impl Node for TranslateNode {
                 ))
             })?;
 
-        put_result(
-            &mut ctx,
-            NODE_NAME,
-            serde_json::to_value(&translation).map_err(|err| {
-                NodeError::new(format!("failed to serialize TranslationResult: {err}"))
-            })?,
-        );
+        let mut result = serde_json::to_value(&translation).map_err(|err| {
+            NodeError::new(format!("failed to serialize TranslationResult: {err}"))
+        })?;
+        if let Some(transport) = transport_stamp {
+            result["transport"] = transport;
+        }
+        put_result(&mut ctx, NODE_NAME, result);
 
         Ok(ctx)
     }
