@@ -47,6 +47,10 @@ Each of these exists because it has already caused a real failure in this fleet.
 5. **Verify every state write.** The engines' status bookkeeping is known-unreliable
    (`base-template:BT.ticket.sdlc-state-write-reliability` — agent-prompt-driven, skipped in
    worktree mode). Trust nothing; check it (step 8).
+6. **Check downstream consumers after any block touching a shared crate's public surface** (step
+   9). No lane can see a sibling lane running in a different repo — this is the only thing in this
+   command that looks outside its own repo, and it exists because the alternative (nothing looked)
+   has already broken two other repos mid-run.
 
 ---
 
@@ -170,10 +174,52 @@ If any is wrong: set `status` to `closed`, then run **`mev emit-state --write`**
 **`mev validate-brain --state`** (expect 0 errors). **Record every repair** — a pattern of them is
 evidence for that open ticket.
 
-### 9. Re-check the next block's dependencies, then launch it
+### 9. Check downstream consumers — only for blocks that touched a shared crate's public types
+
+A lane cannot see the sibling lanes running in other repos. Twice now that has caused a real
+cross-repo break mid-run: okf-core's `OK.3.B` added a non-`Option` field to six shared structs and
+broke both `mev` (101 sites) and `bastion` (31 sites) in test code that `cargo build` cannot see;
+mev's D58 removed a public constant and broke `engine-rs`'s workspace compile. This step exists to
+catch that class **before** the next block in a *different* lane hits it, not to police every
+block in this one.
+
+**Fires only when** the block just integrated changed a public type, field, or removed/renamed a
+public symbol in a crate other repos depend on via a `path = "../..."` Cargo dependency (e.g.
+`okf-core`, `mev`, `engine-rs`'s `engine-contract`, `claude-code-rs`). Skip silently for
+non-Rust blocks, blocks with no public-surface change, and blocks in a repo nothing else path-depends
+on — the cost is a cold build per consumer, so do not run it for every block.
+
+Find consumers by grepping the fleet for `path = "../<this-repo>"` (or the specific crate name) in
+every other repo's `Cargo.toml`. For each one found:
+
+```
+git -C <consumer> status --porcelain          # non-empty → SKIP, report SKIPPED-DIRTY
+CARGO_TARGET_DIR=$(mktemp -d) cargo test --no-run --locked \
+    --manifest-path <consumer>/Cargo.toml
+```
+
+Each flag earns its place — do not simplify this away:
+- **`--locked`** — refuses to rewrite the consumer's `Cargo.lock`, turning a silent mutation into a
+  useful error instead of leaving an uncommitted diff in a repo you don't own. This exact mutation
+  happened during manual verification on 2026-08-04.
+- **`CARGO_TARGET_DIR=$(mktemp -d)`** — no `target/` lock contention with whatever else might be
+  building in that repo, no incremental-cache churn. Costs a cold build; that is the price of not
+  interfering.
+- **dirty check first** — never blame your shared-crate change for someone else's half-written
+  code; a dirty consumer is not evidence of anything.
+- **`cargo test --no-run`, never `cargo build`** — the entire `E0063` class (missing struct fields)
+  is invisible to `build`; only test code constructs the affected literals.
+
+**Report only. Never fix another lane's repo** and never run this against a repo with an active
+worktree lane of its own — a plain `cargo build`/`cargo test` in a repo mid-chain can mutate its
+`Cargo.lock` out from under that lane. If a consumer fails, add it to the final report as a new
+**BROKEN DOWNSTREAM** line (repo, error class, one-line fix estimate) — do not open a fix block for
+it yourself; that is the operator's call, same as a `HELD` block.
+
+### 10. Re-check the next block's dependencies, then launch it
 Cheap, and it catches anything that changed outside the chain. Then return to step 6.
 
-### 10. Repeat until the chain is done or stopped.
+### 11. Repeat until the chain is done or stopped.
 
 ---
 
@@ -186,6 +232,9 @@ Then explicitly:
 - **HELD** blocks and what each waits on.
 - **State repairs** you made, and where.
 - **Merge conflicts** you resolved, and how.
+- **BROKEN DOWNSTREAM** — any consumer repo step 9 found broken by this chain's changes (repo,
+  error class, one-line fix estimate). Empty is the expected case; say so rather than omitting
+  the line.
 - **The remaining chain** if you stopped early — as a paste-ready `/orchestrate` invocation.
 - A reminder to run **`/log-work`**: `sdlc-task`'s bookkeep is deliberately lean and writes no
   `log.md` entry, so a chain of tasks leaves no narrative history without it.
