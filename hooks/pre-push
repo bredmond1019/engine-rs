@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# pre-push — validate-brain drift gate.
+#
+# Why this exists: the full 5-flag `validate-brain` suite already runs nightly on the
+# Mac Mini (scripts/validate_brain.sh, wired from scripts/routine.sh) and exits non-zero
+# on failure — but that is detection only: nightly, remote, log-only, and it gates
+# nothing. A bad commit made on any machine can be pushed immediately, and the drift is
+# only discovered a day later in a log file nobody is looking at. This hook moves the
+# same check to the push boundary, where it can actually stop a regression from landing.
+#
+# Failure mode: block on NEW errors only, against a tracked baseline
+# (hooks/validate-baseline.json) — never on any error. `core/engine-rs` alone currently
+# carries 9 committed E_GRAPH_DANGLING_RELATED errors; a block-on-any gate would be red
+# from day one there and would just get bypassed with --no-verify forever. The baseline
+# ratchets DOWN only (see scripts/validate_brain.sh) — it is safe to be stale-high, and
+# must never silently absorb an increase.
+#
+# Scope: the baseline is corpus-wide and singular, not per-repo. `validate-brain`
+# resolves the brain root by walking UP from wherever it runs and always validates the
+# ENTIRE corpus regardless of cwd — so a push from core/engine-rs and a push from HQ see
+# the identical error set. hooks/validate-baseline.json lives in HQ only and is read
+# read-only from every sub-repo via the resolved brain root.
+#
+# Known constraint: validate-brain's check flags do NOT compose (main.rs:665-678 is an
+# if/else-if chain — the first flag present wins). --sync --graph --state --links
+# --structure therefore need five separate invocations, same as
+# scripts/validate_brain.sh. Do not try to pass multiple flags in one call.
+#
+# Degrades gracefully by construction, same spirit as hooks/post-commit:
+#   - no brain.toml found walking up (standalone checkout)  -> exit 0, notice only
+#   - `bastion` not on PATH                                  -> exit 0, warning only
+#   - validate-brain output for a flag doesn't parse          -> that flag contributes 0,
+#                                                                 warning only (never blocks)
+# Warnings never block a push. Only a measured, parsed error total that exceeds the
+# tracked baseline blocks.
+#
+# ~8s total cost (5 invocations x ~1.6s, measured). This lives at pre-push, not
+# pre-commit, on purpose — that cost is fine once per push, not once per commit.
+#
+# Escape hatch: `git push --no-verify` skips this hook entirely. This is a speed bump
+# against silent drift, not a security control — it is not meant to be unbypassable.
+#
+set -uo pipefail
+
+# --- 1. Resolve the brain root by walking up for brain.toml. ---------------------------
+find_brain_root() {
+  local d="$1"
+  while [ "$d" != "/" ] && [ -n "$d" ]; do
+    if [ -f "$d/brain.toml" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+start_dir="$(pwd)"
+brain_root="$(find_brain_root "$start_dir")"
+if [ -z "$brain_root" ]; then
+  echo "pre-push: no brain.toml found walking up from $start_dir — skipping validate-brain gate (standalone checkout)" >&2
+  exit 0
+fi
+
+# --- 2. Degrade gracefully if `bastion` isn't installed. --------------------------------
+if ! command -v bastion >/dev/null 2>&1; then
+  echo "pre-push: warning: 'bastion' not found on PATH — skipping validate-brain gate. Install bastion to enable it." >&2
+  exit 0
+fi
+
+# --- 3. Run the 5-flag suite (they do not compose — see header note). -------------------
+FLAGS=(--sync --graph --state --links --structure)
+total=0
+diagnostics=""
+
+echo "pre-push: running validate-brain gate (${#FLAGS[@]} checks, corpus root: $brain_root)..." >&2
+
+for flag in "${FLAGS[@]}"; do
+  printf 'pre-push:   %s ... ' "$flag" >&2
+  start_ts=$(date +%s 2>/dev/null || echo 0)
+  out="$(bastion validate-brain "$flag" 2>&1)"
+  end_ts=$(date +%s 2>/dev/null || echo 0)
+  elapsed=$((end_ts - start_ts))
+  summary_line="$(printf '%s\n' "$out" | grep -E '^validated .*: [0-9]+ error\(s\), [0-9]+ warning\(s\)$' | tail -1)"
+  if [ -z "$summary_line" ]; then
+    echo "unparseable output (${elapsed}s) — treating as 0 errors" >&2
+    continue
+  fi
+  n="$(printf '%s\n' "$summary_line" | sed -E 's/^validated .*: ([0-9]+) error\(s\).*/\1/')"
+  case "$n" in
+    ''|*[!0-9]*)
+      echo "unparseable error count (${elapsed}s) — treating as 0 errors" >&2
+      continue
+      ;;
+  esac
+  echo "$summary_line (${elapsed}s)" >&2
+  total=$((total + n))
+  if [ "$n" -gt 0 ]; then
+    flag_diagnostics="$(printf '%s\n' "$out" | grep -E '^error \[' || true)"
+    [ -n "$flag_diagnostics" ] && diagnostics="${diagnostics}${flag_diagnostics}
+"
+  fi
+done
+
+echo "pre-push: validate-brain gate finished — $total total error(s) (baseline check next)" >&2
+
+# --- 4. Read the tracked baseline (missing/unparseable -> 0). ---------------------------
+baseline_file="$brain_root/hooks/validate-baseline.json"
+baseline=0
+if [ -f "$baseline_file" ]; then
+  parsed="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    print(int(d.get("errors", 0)))
+except Exception:
+    print(0)
+' "$baseline_file" 2>/dev/null)"
+  case "$parsed" in
+    ''|*[!0-9]*) baseline=0 ;;
+    *) baseline="$parsed" ;;
+  esac
+fi
+
+# --- 5/6. Compare and decide. ------------------------------------------------------------
+if [ "$total" -gt "$baseline" ]; then
+  echo "" >&2
+  echo "pre-push: BLOCKED — validate-brain error count increased." >&2
+  echo "" >&2
+  if [ -n "$diagnostics" ]; then
+    printf '%s' "$diagnostics" >&2
+  fi
+  echo "" >&2
+  echo "pre-push: baseline is $baseline error(s); this push would leave the corpus at $total error(s)." >&2
+  echo "pre-push: fix the new error(s) above, or bypass this check with 'git push --no-verify'." >&2
+  echo "" >&2
+  exit 1
+fi
+
+exit 0

@@ -194,6 +194,7 @@ const SETUP_SCHEMA = {
     specThin:       { type: 'boolean', description: 'D19: true ONLY on a fresh run (wasCreated && specFileExists) with a structurally-valid but substantively-thin spec. false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
     setupError:     { type: 'string', description: 'Non-empty when setup could not proceed safely (e.g. branch mode aborted on a dirty working tree). The engine aborts and reports this. Empty string on success.' },
+    envFilesCopied: { type: 'array', items: { type: 'string' }, description: '--worktree only: repo-root-relative paths of every gitignored env-shaped file seeded into the worktree (from ENV_COPIED: lines); empty array if none existed to copy, or in branch mode.' },
     notes:          { type: 'string' }
   }
 }
@@ -291,7 +292,9 @@ const TRIAGE_SCHEMA = {
     class:               { type: 'string', enum: ['RETRYABLE', 'MAJOR'] },
     reason:              { type: 'string', description: 'One sentence: why retryable (transient/changed/progressing) or major (one of the immediate-bail reasons, stuck, or structural)' },
     bailReason:          { type: 'string', description: 'When class=MAJOR: a short human-readable reason for the draft-PR handoff; empty when RETRYABLE' },
-    sameFailureAsBefore: { type: 'boolean', description: 'true if the SAME failure as the previous attempt (no progress)' }
+    sameFailureAsBefore: { type: 'boolean', description: 'true if the SAME failure as the previous attempt (no progress)' },
+    evidence:            { type: 'string', description: 'What was actually OBSERVED, quoting the failing check output. No causal claims.' },
+    baseStateChecked:    { type: 'boolean', description: 'true only if the failing check was actually re-run against the base state (main working tree or the task base commit). false means any claim about the base state is a hypothesis.' }
   }
 }
 
@@ -469,7 +472,7 @@ const HARNESS_CONFIG_SCHEMA = {
               items: {
                 type: 'object',
                 properties: {
-                  kind:    { type: 'string', description: 'command (default) | baseline-diff | count-delta | warning-scan | forbidden-pattern-scan' },
+                  kind:    { type: 'string', description: 'command (default) | baseline-diff | count-delta | warning-scan | forbidden-pattern-scan | skip-count-regression' },
                   name:    { type: 'string' },
                   command: { type: 'string' },
                   purpose: { type: 'string' },
@@ -477,6 +480,7 @@ const HARNESS_CONFIG_SCHEMA = {
                   perTask:     { type: 'boolean' },
                   fastCommand: { type: 'string' },
                   baselineCommand: { type: 'string' },
+                  reasonCommand:   { type: 'string' },
                   compareKeys:     { type: 'array', items: { type: 'string' } },
                   countPattern:    { type: 'string' },
                   failOn:          { type: 'string' },
@@ -527,16 +531,29 @@ STEP 2 — Decide:
   - File printed but NOT valid JSON → present=false, notes="harness.json present but invalid JSON: <reason>".
   - File printed and valid JSON → present=true, and copy the parsed object into "config", keeping ONLY
     these fields when present: stack; validation.checks[] (each: {kind, name, command, purpose, gates,
-    perTask, fastCommand} plus any kind-specific fields present — baselineCommand, compareKeys[],
-    countPattern, failOn, warningPatterns[], rules[] ({id, pattern, paths, allowlistPattern})); flow
-    ({autoMerge, testDepth, prBase, bailReasons[]}). Preserve kind-specific fields verbatim; ignore any
-    other fields.
+    perTask, fastCommand} plus any kind-specific fields present — baselineCommand, reasonCommand,
+    compareKeys[], countPattern, failOn, warningPatterns[], rules[] ({id, pattern, paths,
+    allowlistPattern})); flow ({autoMerge, testDepth, prBase, bailReasons[]}). Preserve kind-specific
+    fields verbatim; ignore any other fields.
 
 Return your findings using the StructuredOutput tool.
 `, { label: 'harness-config', schema: HARNESS_CONFIG_SCHEMA, model: 'sonnet' })
 
   if (!result || !result.present || !result.config) return null
   return result.config
+}
+
+// Pure delta-evaluation for the skip-count-regression kind: fail ONLY when currentCount exceeds
+// baselineCount (coverage silently switched off), never on a nonzero absolute count. Kept as a
+// standalone pure function (no I/O) — exercised directly in unit tests without running a suite —
+// and mirrored verbatim into the rendered shell snippet's comparison so the two never drift.
+function skipCountRegressionResult(baselineCount, currentCount, dominantReason) {
+  const regressed = currentCount > baselineCount
+  const delta = currentCount - baselineCount
+  const message = regressed
+    ? `SKIP COUNT REGRESSED: baseline=${baselineCount} current=${currentCount} (rose by ${delta})${dominantReason ? ` — dominant reason: ${dominantReason}` : ''}`
+    : `skip count did not rise (baseline=${baselineCount}, current=${currentCount})`
+  return { regressed, message }
 }
 
 // Render the inner project-validation check list for a Test stage. When gatingOnly is true (the fast
@@ -593,6 +610,25 @@ PYEOF
   echo "CHECK${n}_EXIT:$?"`
     }
 
+    if (kind === 'skip-count-regression') {
+      const baselinePath = `${reportsDir}/${slug}-skip-baseline.txt`
+      const reasonStep = c.reasonCommand
+        ? `\n    DOMINANT_REASON=$(${cd}${c.reasonCommand} 2>/dev/null | head -1)`
+        : ''
+      const reasonSuffix = c.reasonCommand ? ' — dominant reason: $DOMINANT_REASON' : ''
+      return `${header} — skip-count-regression (fail ONLY when the current skip count EXCEEDS the baseline — coverage silently switched off; never fail on a nonzero absolute count):
+  BASELINE_SKIPS=$(cat ${baselinePath} 2>/dev/null || echo 0)
+  CURRENT_SKIPS=$(${cd}${c.command} 2>/dev/null | tail -1)
+  echo "BASELINE_SKIPS=$BASELINE_SKIPS CURRENT_SKIPS=$CURRENT_SKIPS"
+  if [ "$CURRENT_SKIPS" -gt "$BASELINE_SKIPS" ] 2>/dev/null; then${reasonStep}
+    echo "SKIP COUNT REGRESSED: baseline=$BASELINE_SKIPS current=$CURRENT_SKIPS (rose by $((CURRENT_SKIPS - BASELINE_SKIPS)))${reasonSuffix}"
+    echo "CHECK${n}_EXIT:1"
+  else
+    echo "CHECK${n} PASSED: skip count did not rise (baseline=$BASELINE_SKIPS, current=$CURRENT_SKIPS)"
+    echo "CHECK${n}_EXIT:0"
+  fi`
+    }
+
     if (kind === 'warning-scan') {
       const outPath = `/tmp/${blockId}-flow-${slug}.out`
       const alternation = (c.warningPatterns || []).map(p => `(${p})`).join('|')
@@ -628,23 +664,27 @@ ${ruleLines}
   }).join('\n\n')
 }
 
-// Snapshot baseline artifacts for any baseline-diff checks before the first task, so the test stages
-// can diff current output vs the pre-run state and fail only on net-new items. Resume-safe: only
-// writes a baseline that does not already exist. No-op when no baseline-diff checks are configured.
+// Snapshot baseline artifacts for any baseline-diff / skip-count-regression checks before the first
+// task, so the test stages can diff current output vs the pre-run state and fail only on regressions.
+// Resume-safe: only writes a baseline that does not already exist. No-op when no such checks are
+// configured. skip-count-regression writes a bare-integer count file (not JSON) at a sibling path.
 async function snapshotBaselines(cfg, cwd) {
-  const checks = (cfg?.validation?.checks || []).filter(c => c.kind === 'baseline-diff' && c.baselineCommand)
+  const checks = (cfg?.validation?.checks || [])
+    .filter(c => (c.kind === 'baseline-diff' || c.kind === 'skip-count-regression') && c.baselineCommand)
   if (!checks.length) return
   const steps = checks.map(c => {
     const slug = (c.name || 'check').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-    const path = `${reportsDir}/${slug}-baseline.json`
+    const path = c.kind === 'skip-count-regression'
+      ? `${reportsDir}/${slug}-skip-baseline.txt`
+      : `${reportsDir}/${slug}-baseline.json`
     return `Baseline "${c.name}" -> ${path}:
   cd ${cwd} && mkdir -p ${reportsDir}
   cd ${cwd} && { [ -f ${path} ] && echo "BASELINE EXISTS (kept): ${path}" || { ${c.baselineCommand} > ${path} 2>/dev/null; echo "BASELINE WRITTEN: ${path}"; } ; }`
   }).join('\n\n')
   await agent(`
 You are the baseline-snapshot agent for the SDLC pipeline. Capture the pre-run baseline for each
-baseline-diff validation check BEFORE any implementation runs. Run each block exactly as written.
-Do NOT modify source. Existing baselines are kept (resume-safe).
+baseline-diff / skip-count-regression validation check BEFORE any implementation runs. Run each block
+exactly as written. Do NOT modify source. Existing baselines are kept (resume-safe).
 
 ${steps}
 
@@ -765,8 +805,7 @@ RESUME MODE IS ON — reuse the existing worktree for this spec instead of creat
        git -C trees/${baseBranchName} sparse-checkout init --cone
        git -C trees/${baseBranchName} sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
        git -C trees/${baseBranchName} checkout
-       if [ -f .env ]; then cp .env trees/${baseBranchName}/.env; fi
-       if [ -f .env.local ]; then cp .env.local trees/${baseBranchName}/.env.local; fi
+       git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\\.env(\\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/${baseBranchName}/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
     branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 3.5.
   - Neither exists → fall through to STEP 2/3 and create a fresh worktree as normal.
 ` : ''}
@@ -796,9 +835,15 @@ STEP 3 — Create the worktree (replace [branchName] / [repoRoot] with actual va
   d. # Cone ALL tracked top-level directories — stack-agnostic, no project-layout assumptions (D5/P5).
      git -C trees/[branchName] sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
   e. git -C trees/[branchName] checkout
-  f. if [ -f .env ]; then cp .env trees/[branchName]/.env; fi
-  g. if [ -f .env.local ]; then cp .env.local trees/[branchName]/.env.local; fi
-  h. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
+  f. Discover and copy EVERY gitignored env-shaped file (.env, .env.local, .env.* in any
+     directory) from repoRoot into trees/[branchName], preserving each file's path relative to
+     the repo root (creating parent directories as needed — so app/.env lands at
+     trees/[branchName]/app/.env). Only files git actually ignores; exclude node_modules/,
+     .venv/, venv/, trees/, and vendor/; never overwrite a file that already exists in the
+     worktree. Run:
+       git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/[branchName]/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
+     Record the list of "ENV_COPIED:" lines — report them in STEP 6.
+  g. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
 
 STEP 3.5 — Fix the planning/ symlink for the worktree (run from the MAIN repo root, for ALL paths —
   fresh create, re-attach, or reuse). In brain-vaulted repos the MAIN repo's \`planning\` is a
@@ -897,7 +942,14 @@ STEP 6 — Report pipeline-start inputs (run these from the live checkout):
        - The '## Acceptance Criteria' section has no real '- ' bullet (empty, or only a template seed) → thin.
      Do NOT flag bare 'TODO'/'TBD' prose, do NOT treat '<...>' as a token (legitimate in 'Vec<T>', globs),
      never flag the Amendment Log seed '_No amendments yet._'. Else specThin=false, thinReason="".
-
+${useWorktree ? `  d. Env files seeded — collect the "ENV_COPIED: <path>" lines printed during worktree setup
+     (STEP 3 step f, or the RESUME re-attach path) into envFilesCopied (one path per entry; empty
+     array if none printed — that means no gitignored env-shaped file exists in this repo, not that
+     the copy failed silently). Report this list; a run missing config should say so at setup time
+     rather than surface later as a confusing downstream failure (e.g. a fallback DB connection).
+     Note: the worktree's path is derived from the SPEC SLUG (trees/${baseBranchName}), not any
+     program/block ID — anything discovering it externally must use \`git worktree list\`, not guess.
+` : ''}
 Set setupError="" unless STEP 3 aborted (branch mode, dirty tree). Return your result using the StructuredOutput tool.
 `, withModel({ label: 'setup', schema: SETUP_SCHEMA, phase: 'Setup' }, MODEL.worktreeSetup))
 
@@ -913,6 +965,13 @@ const { branchName, worktreePath } = setupResult
 state.branch = branchName
 state.worktree_path = worktreePath
 log(`${useWorktree ? 'Worktree' : 'Branch'} ready: ${worktreePath} (branch: ${branchName})`)
+if (useWorktree) {
+  const envFilesCopied = setupResult.envFilesCopied || []
+  log(envFilesCopied.length
+    ? `Env files copied into worktree: ${envFilesCopied.join(', ')}`
+    : 'Env files copied into worktree: none found')
+  log(`Worktree path derives from the spec slug (trees/${branchName}), not any block ID — use "git worktree list" to locate it, never guess.`)
+}
 
 // D19 — thin-spec guard for a fresh run.
 if (setupResult.specThin) {
@@ -1102,12 +1161,29 @@ IMMEDIATE-BAIL reasons — if the failure is ANY of these, class=MAJOR and put a
 bailReason describing which one and where:
 ${BAIL_REASONS}
 
+This does NOT widen the bail set above — it only constrains what you may ASSERT once you bail.
+Before writing any bailReason that claims a failure PRE-DATES this task / exists "at baseline" / is
+"unrelated to this task's scope": you MUST first re-run ONLY the failing check against the base state
+(the main working tree, or the task's base commit). If you do so, set baseStateChecked=true and put
+the actual result in evidence. If you cannot re-run it in this run's context, set baseStateChecked=false
+and phrase the claim explicitly as a HYPOTHESIS ("possibly pre-existing; NOT verified against base"),
+never as observed fact.
+Self-inflicted-environment caution: harness-created workspace state (git worktree, sparse-checkout,
+copied .env files, repaired planning/ symlinks) is a CANDIDATE CAUSE, not a fixed backdrop. Identical
+failure before and after the change is NOT evidence of pre-existence when both states share the same
+possibly-broken environment.
+This changes only the wording/evidence of bailReason — bailing on IMMEDIATE-BAIL reason #3
+(environment/credential/auth/network) stays correct and fast, "when unsure, BAIL" stays, and no
+additional retry attempts are introduced by this rule.
+
 Otherwise:
   RETRYABLE — transient/infra (agent died, flaky), OR the failure CHANGED from the previous attempt
               (it is making progress and a bounded fix can plausibly close it).
   MAJOR     — the SAME failure again with no progress, OR structural (one of the bail reasons above).
 
-Return via StructuredOutput: class, reason, bailReason (empty when RETRYABLE), sameFailureAsBefore.
+Return via StructuredOutput: class, reason, bailReason (empty when RETRYABLE), sameFailureAsBefore,
+evidence (what was actually OBSERVED, quoting output — no causal claims), baseStateChecked (true only
+if the failing check was actually re-run against the base state).
 ${sameContext ? `(Previous attempt context for the same-failure check: ${sameContext})` : ''}
 `, withModel({ label: `triage:${context}:${attempt}`, schema: TRIAGE_SCHEMA, phase: 'Tasks' }, MODEL.triage))
 }

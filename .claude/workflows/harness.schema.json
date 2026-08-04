@@ -146,9 +146,9 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["command", "baseline-diff", "count-delta", "warning-scan", "forbidden-pattern-scan"],
+          "enum": ["command", "baseline-diff", "count-delta", "warning-scan", "forbidden-pattern-scan", "skip-count-regression"],
           "default": "command",
-          "description": "How the engine runs this check. Omit (or 'command') for a plain exit-code gate. 'baseline-diff': snapshot a baseline at worktree creation and fail only on net-new items. 'count-delta': extract an integer and fail when it regresses vs the previous task. 'warning-scan': run a command (its exit code gates) and record matches of warningPatterns in its output, with severity per `gates`. 'forbidden-pattern-scan': grep source for patterns that must not appear."
+          "description": "How the engine runs this check. Omit (or 'command') for a plain exit-code gate. 'baseline-diff': snapshot a baseline at worktree creation and fail only on net-new items. 'count-delta': extract an integer and fail when it regresses vs the previous task. 'warning-scan': run a command (its exit code gates) and record matches of warningPatterns in its output, with severity per `gates`. 'forbidden-pattern-scan': grep source for patterns that must not appear. 'skip-count-regression': snapshot a baseline SKIPPED-test count at run start and fail only when the current count exceeds it (coverage silently switched off), never on a nonzero absolute count."
         },
         "name": {
           "type": "string",
@@ -156,7 +156,7 @@
         },
         "command": {
           "type": "string",
-          "description": "Shell command to run. Required for all kinds except forbidden-pattern-scan. For baseline-diff this produces the CURRENT snapshot (same format as baselineCommand). For count-delta / warning-scan it is the command whose output is parsed / scanned."
+          "description": "Shell command to run. Required for all kinds except forbidden-pattern-scan. For baseline-diff this produces the CURRENT snapshot (same format as baselineCommand). For count-delta / warning-scan it is the command whose output is parsed / scanned. For skip-count-regression it emits the CURRENT skip count (a bare integer, e.g. `pytest -q --co -rs 2>&1 | grep -c '^SKIPPED'`, or the runner's own summary line filtered to a single integer) evaluated at gate time."
         },
         "purpose": {
           "type": "string",
@@ -176,7 +176,11 @@
         },
         "baselineCommand": {
           "type": "string",
-          "description": "baseline-diff only: run once at worktree creation to capture the pre-task baseline artifact. Must emit the same format as `command` (e.g. a JSON array of violation objects)."
+          "description": "baseline-diff / skip-count-regression: run once at worktree/run creation to capture the pre-task baseline artifact. For baseline-diff must emit the same format as `command` (e.g. a JSON array of violation objects). For skip-count-regression must emit the BASELINE skip count in the same bare-integer format as `command`."
+        },
+        "reasonCommand": {
+          "type": "string",
+          "description": "skip-count-regression only: optional command run at gate time (only when the check is about to fail) that prints the dominant skip reason so the failure message names WHAT stopped running, not only the delta (e.g. the most common skip reason string across newly-skipped tests). Omit if the runner cannot cheaply report skip reasons; the check still fails on count alone."
         },
         "compareKeys": {
           "type": "array",
@@ -220,6 +224,10 @@
         {
           "if": { "properties": { "kind": { "const": "forbidden-pattern-scan" } }, "required": ["kind"] },
           "then": { "required": ["rules"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "skip-count-regression" } }, "required": ["kind"] },
+          "then": { "required": ["command", "baselineCommand"] }
         },
         {
           "if": {

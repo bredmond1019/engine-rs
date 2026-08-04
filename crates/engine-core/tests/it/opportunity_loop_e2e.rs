@@ -106,6 +106,24 @@ fn opportunities_dir(root: &Path) -> std::path::PathBuf {
     dir
 }
 
+/// The stage vocabulary `resolve_stage_vocabulary` (`mev::doc::opportunity`, D58)
+/// parses via [`mev::doc::opportunity::parse_stages`] — mirrors the same
+/// content mev's own `parse_stages_reads_real_vocabulary_in_order` test uses.
+const PIPELINE_MD_FIXTURE: &str = "# Pipeline\n\n## Stages\n\n`identified` → `researching` → \
+`contacted` → `conversation` → `proposal-sent` → `closed-won` → `closed-lost`\n\n---\n\n## Active Leads\n";
+
+/// Every set-stage test needs a real brain root (D58): `resolve_stage_vocabulary`
+/// walks up from the corpus root looking for `brain.toml`, then reads
+/// `business/docs/pipeline.md` for the `## Stages` vocabulary. Call this
+/// alongside [`opportunities_dir`] in any test that calls `run_set_stage`.
+fn brain_root_with_pipeline_md(root: &Path) {
+    std::fs::write(root.join("brain.toml"), "").expect("write brain.toml marker");
+    let docs_dir = root.join("business/docs");
+    std::fs::create_dir_all(&docs_dir).expect("create business/docs");
+    std::fs::write(docs_dir.join("pipeline.md"), PIPELINE_MD_FIXTURE)
+        .expect("write pipeline.md fixture");
+}
+
 // ---------------------------------------------------------------------------
 // RESEARCH_AGENT: real Workflow::run, stubbed transports, real materializer
 // ---------------------------------------------------------------------------
@@ -329,6 +347,7 @@ async fn research_re_run_is_byte_idempotent() {
 async fn set_stage_workflow_changes_stage_and_is_idempotent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     opportunities_dir(tmp.path());
+    brain_root_with_pipeline_md(tmp.path());
 
     run_research(tmp.path(), company_event()).await;
     let path = tmp.path().join("business/docs/opportunities/anthropic.md");
@@ -413,6 +432,7 @@ async fn add_action_workflow_appends_one_entry_and_is_idempotent() {
 async fn invalid_stage_fails_the_run_and_leaves_the_file_unchanged() {
     let tmp = tempfile::tempdir().expect("tempdir");
     opportunities_dir(tmp.path());
+    brain_root_with_pipeline_md(tmp.path());
 
     run_research(tmp.path(), company_event()).await;
     let path = tmp.path().join("business/docs/opportunities/anthropic.md");
@@ -427,9 +447,9 @@ async fn invalid_stage_fails_the_run_and_leaves_the_file_unchanged() {
     let run = &ctx.node_runs[edit_graph::SET_STAGE_NODE_NAME];
     assert_eq!(run.status, NodeRunStatus::Failed);
     let error = run.error.as_deref().unwrap_or_default();
-    for stage in mev::doc::opportunity::VALID_STAGES {
+    for stage in mev::doc::opportunity::parse_stages(PIPELINE_MD_FIXTURE) {
         assert!(
-            error.contains(stage),
+            error.contains(&stage),
             "expected error to name valid stage '{stage}': {error}"
         );
     }

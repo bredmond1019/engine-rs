@@ -16,6 +16,52 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-03]
+
+### `EN.6.M` durable background/cron primitive — done via `/sdlc-flow`
+- **What:** Ported qm §5's durable Cron primitive as a standalone module with no dependency on any
+  specific workflow or envelope type. Task 1 (`crates/engine-core/src/cron/mod.rs`): `CronSchedule`
+  (Calendar `{cron_expr, timezone}` / Interval `{every_ms, first_fire_at}`, mutually exclusive and
+  validated as such), `RawSchedule`, `CronScheduleError`, and `normalize_schedule`/
+  `validate_schedule`/`recover_next_fire_at`/`advance_next_fire_at` — calendar schedules advance
+  drift-free from the last *scheduled* time via the `cron` crate's `Schedule::after`, interval
+  schedules advance catch-up-safe from the actual *fired* time (exactly one catch-up after
+  downtime, never a thundering herd), `every_ms` bounded to `[60_000, 24h)`. Task 2
+  (`cron/record.rs`): `CronRecord`, `FireOutcome` (`Reported`/`Silent`), and `CronFireLogEntry` with
+  a `From<&FireOutcome>` conversion that structurally prevents a `Silent` outcome from ever
+  carrying a note — the silence protocol is enforced by the type, not just documented. Task 3
+  (`cron/store.rs`): the injectable `CronStore` trait, a restart-durable `FileCronStore`
+  (whole-object JSON persistence, `chrono-tz`'s `serde` feature enabled workspace-wide for the
+  `Tz` field), and a `tick()` driver that fires due/enabled records with the correct per-variant
+  advance anchor (record's pre-fire `next_fire_at` for Calendar, `now` for Interval) and durable
+  fire-log recording. Task 4: full validation gate — fmt, clippy `-D warnings`, `nextest run
+  --workspace` (1706/1706), `build --release` — all green with no further code changes needed.
+  PASS review (no findings). Docs: `docs/cron-primitive.md` added, `docs/index.md` updated.
+- **Why:** `EN.6.G` (Schedule source + fan-out/aggregate) needs a real cron substrate to fire
+  through instead of hand-rolling cron mechanics, per the `D2` stacking decision in
+  `planning/orchestrate-2026-08-03-log.md` — this block ships that primitive standalone first.
+- **Decisions:** Added the `cron` crate (chrono-compatible, no async runtime coupling) rather than
+  hand-rolling a cron-expression parser, as pre-specified. Kept the fire-log store JSON-file-backed
+  via the repo's `CommandRunner`-style injectable-seam convention, not `engine-serve/durable.rs`'s
+  Postgres pattern — no new externally-provisioned schema for a single-Mac-Mini scheduler. Scope
+  boundary held: no HTTP endpoint, no dynamic create/list/patch API — entries are constructed
+  programmatically by whatever calls the primitive next (`EN.6.G`).
+- **Verdict:** PASS. This closes `EN.6.M`.
+- Next: `EN.6.G` — wire `schedule.rs` to fire through this primitive.
+
+```
+d2b368b docs: update docs for en-6m-durable-cron-primitive
+9bf20f1 feat: implement en-6m-durable-cron-primitive-task3
+48e89bc feat: implement en-6m-durable-cron-primitive-task2
+4442c7f feat: implement en-6m-durable-cron-primitive-task1
+9b17ea7 feat: implement ticket-sdlc-command-policy-floor-task2
+5c3c618 fix: adapt opportunity stage-vocab tests to mev D58 (parse_stages, brain.toml+pipeline.md fixture)
+088d061 feat: implement ticket-sdlc-command-policy-floor-task1
+3eead6a chore(harness): pull base-template b410add — gate-skip-count-regression + triage-verify-pre-existing-claims
+```
+
+---
+
 ## [run: 2026-08-02]
 
 ### Live review path verified — carryover cleared, hardening train archived
