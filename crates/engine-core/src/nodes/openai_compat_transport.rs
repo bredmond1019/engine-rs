@@ -503,8 +503,7 @@ mod tests {
         assert_eq!(outcome.text, "cloud reply");
     }
 
-    #[tokio::test]
-    async fn constrained_json_adds_response_format_to_request_body() {
+    fn capturing_local_http_post() -> (LocalHttpPost, Arc<std::sync::Mutex<Option<Value>>>) {
         let seen_body = Arc::new(std::sync::Mutex::new(None));
         let seen_body_clone = Arc::clone(&seen_body);
         let capturing: LocalHttpPost = Arc::new(move |_url, body| {
@@ -515,6 +514,15 @@ mod tests {
                 }))
             })
         });
+        (capturing, seen_body)
+    }
+
+    /// `constrained_json: true` + no `Config.json_schema` must keep the
+    /// pre-ticket generic `{"type": "json_object"}` behavior unchanged
+    /// (regression coverage — task 3, AC 2).
+    #[tokio::test]
+    async fn constrained_json_with_no_schema_falls_back_to_generic_json_object() {
+        let (capturing, seen_body) = capturing_local_http_post();
 
         let local = LocalConfig {
             constrained_json: true,
@@ -522,6 +530,7 @@ mod tests {
         };
         let transport = openai_compat_transport(local, capturing, panicking_cloud_fallback());
 
+        // `Config::default()` carries no `json_schema` — the no-schema path.
         let _ = transport(Config::default(), "hello".to_string()).await;
 
         let body = seen_body
@@ -532,7 +541,63 @@ mod tests {
         assert_eq!(
             body["response_format"],
             json!({ "type": "json_object" }),
-            "constrained_json must set response_format on the request body"
+            "constrained_json with no schema must fall back to generic json_object mode, unchanged"
+        );
+    }
+
+    /// `constrained_json: true` + a `Config.json_schema` must send that
+    /// schema through in `response_format` (the OpenAI/Ollama `json_schema`
+    /// structured-output shape), not the generic `json_object` mode —
+    /// task 3, AC 1. Asserts on the full structure/content, not just
+    /// presence, per the ticket's testing strategy.
+    #[tokio::test]
+    async fn constrained_json_with_schema_sends_schema_constrained_response_format() {
+        let (capturing, seen_body) = capturing_local_http_post();
+
+        let local = LocalConfig {
+            constrained_json: true,
+            ..test_local_config()
+        };
+        let transport = openai_compat_transport(local, capturing, panicking_cloud_fallback());
+
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "team_size": { "type": "integer" },
+                "company_name": { "type": "string" },
+            },
+            "required": ["team_size", "company_name"],
+        });
+        let config = Config {
+            json_schema: Some(schema.clone()),
+            ..Config::default()
+        };
+
+        let _ = transport(config, "hello".to_string()).await;
+
+        let body = seen_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("http_post was called");
+        assert_eq!(
+            body["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": JSON_SCHEMA_RESPONSE_NAME,
+                    "schema": schema,
+                },
+            }),
+            "constrained_json with a schema must send the schema-constrained \
+             response_format shape, not generic json_object mode"
+        );
+        // The specific regression this ticket exists to fix: field types
+        // (e.g. team_size: integer) must be present in the schema sent
+        // through, not collapsed into a generic "any valid JSON" hint.
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["properties"]["team_size"]["type"],
+            json!("integer")
         );
     }
 
