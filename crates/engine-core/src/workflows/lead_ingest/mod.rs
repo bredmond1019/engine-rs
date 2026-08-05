@@ -302,7 +302,13 @@ mod tests {
         assert!(path.exists());
         let entries_after_first = std::fs::read_dir(dir.path().join("business/docs/opportunities"))
             .expect("read opportunities dir")
-            .filter(|e| !e.as_ref().unwrap().file_name().to_string_lossy().starts_with('.'))
+            .filter(|e| {
+                !e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            })
             .count();
         assert_eq!(entries_after_first, 1);
 
@@ -324,7 +330,13 @@ mod tests {
         let entries_after_second =
             std::fs::read_dir(dir.path().join("business/docs/opportunities"))
                 .expect("read opportunities dir")
-                .filter(|e| !e.as_ref().unwrap().file_name().to_string_lossy().starts_with('.'))
+                .filter(|e| {
+                    !e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with('.')
+                })
                 .count();
         assert_eq!(
             entries_after_second, 1,
