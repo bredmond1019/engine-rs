@@ -1,5 +1,5 @@
 {
-  "version": "0f8fc30a789b3a3d5c19e807c858586c2d2bfe72",
+  "version": "57d331f447e972c5460ce50505cef836db9ec067",
   "generated": "2026-08-04",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
@@ -57,6 +57,8 @@
     ".claude/workflows/sdlc-task.js": "be13471f70ec5bffb99b1d159c0eafe4ee88f5a589e326cfd7a477f5e3e470cd",
     ".claude/workflows/harness.schema.json": "548f6df2553dbddbf03050bc99b7dca063538789095d4a40fbcc4fecf4a72125",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
+    ".agents/skills/sdlc-task/SKILL.md": "0feb057cb5be64affae64f305955b8fdeb17105b2f9387a9cc854fe5ec3ab736",
+    ".agents/skills/sdlc-flow/SKILL.md": "9e95c38aea3675a15b0716c24d6bbea996e577f0187cf156bfcea49baabae466",
     "hooks/pre-push": "b95f3320932995fe2fefa9dc4a0341fbff0f630b38c565e0b5528b9fb4da8aaf",
     "hooks/test_pre_push.sh": "4b899df250f1e1dd33460547ffd02622b2ed8390a7559f9dfb4494522105c797",
     "hooks/README.md": "8f7e75b5eb43893167290368d2b786f7441131fe033d020f192eaf7058b9e0dd"

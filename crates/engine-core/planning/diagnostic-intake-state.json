@@ -1,0 +1,29 @@
+{
+  "policy": {
+    "local": {
+      "constrained_json": false,
+      "endpoint": "http://localhost:11434",
+      "model": "qwen2.5-coder:7b"
+    },
+    "model_tiers": {
+      "extract": "sonnet"
+    },
+    "output_verbosity": "normal",
+    "prompt_cache": false
+  },
+  "telemetry": {
+    "model_tier_used": {
+      "IntakeExtractNode": "cloud",
+      "extract": "sonnet"
+    },
+    "review_verdicts": [],
+    "tasks_failed": 0,
+    "tasks_passed": 1,
+    "total_attempts": 1,
+    "total_cost_usd": -0.0,
+    "total_input_tokens": 1,
+    "total_output_tokens": 1,
+    "total_retries": 0,
+    "wall_clock_secs": 0.0
+  }
+}

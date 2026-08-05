@@ -129,8 +129,8 @@ Record this as one row: `test_name` `"emoji_check"`, `test_purpose` "Universal h
   {
     "test_name": "clippy",
     "passed": false,
-    "execution_command": "cargo clippy -- -D warnings",
-    "test_purpose": "Lint gate — denies warnings",
+    "execution_command": "cargo clippy --all-targets -- -D warnings",
+    "test_purpose": "Lint gate — end-of-flow review sees test/bench targets too",
     "error": "error: unused variable `parsed` ... -D unused-variables"
   },
   {
