@@ -1,15 +1,15 @@
 ---
 type: Command
-title: lane — Open one lane of a multi-repo roadmap run and drive it through /orchestrate
+title: begin-orchestration — Open one lane of a multi-repo roadmap run and drive it through /orchestrate
 description: Brief yourself from a roadmap and lane file, resolve engine/isolation policy, then drive this repo's chain through /orchestrate with the concurrency, reporting, and operator-gate rules enforced.
 ---
-# Lane — Open one lane of a multi-repo roadmap run
+# Begin Orchestration — Open one lane of a multi-repo roadmap run
 
 Wraps `/orchestrate` with the context a lane agent needs and the rules a concurrent run depends on.
 `/orchestrate` knows how to drive a chain; it does not know *which* chain, *why*, what may not be
 delegated, or who else is running right now. This command supplies that, then hands off.
 
-**One `/lane` session drives one repo.** Run several at once — that is the lane model.
+**One `/begin-orchestration` session drives one repo.** Run several at once — that is the lane model.
 
 ## Variables
 
@@ -37,10 +37,11 @@ Naming it costs one flag and removes a hidden coupling to epic status.
 Empty `$ARGUMENTS` → print usage and stop:
 
 ```
-Usage: /lane --roadmap <path> --lane <path|name> [--repo <slug>]
-             [--isolation worktree|no-worktree|auto] [--plan-file <path>]
-             [--engine task|flow] [--log <path>] [--execute] [--continue-on-fail]
-       /lane --roadmap <path> --blocks <id> [<id> ...] [same optional flags]
+Usage: /begin-orchestration --roadmap <path> --lane <path|name> [--repo <slug>]
+                           [--isolation worktree|no-worktree|auto] [--plan-file <path>]
+                           [--engine task|flow] [--log <path>] [--execute]
+                           [--continue-on-fail]
+       /begin-orchestration --roadmap <path> --blocks <id> [<id> ...] [same optional flags]
 ```
 
 `--roadmap` missing → print usage and stop. Do **not** infer it, and do not offer to; if the
@@ -196,13 +197,13 @@ fact.
 ## Example
 
 ```
-/lane --roadmap planning/demand-ready/roadmap.md --lane bastion-web
+/begin-orchestration --roadmap planning/demand-ready/roadmap.md --lane bastion-web
 
-/lane --roadmap planning/demand-ready/roadmap.md --lane gtm --isolation no-worktree
+/begin-orchestration --roadmap planning/demand-ready/roadmap.md --lane gtm --isolation no-worktree
 
-/lane --roadmap planning/demand-ready/roadmap.md --blocks MV.12.A MV.12.B MV.12.C
+/begin-orchestration --roadmap planning/demand-ready/roadmap.md --blocks MV.12.A MV.12.B MV.12.C
 
-/lane --roadmap planning/demand-ready/roadmap.md --lane bastion-web \
+/begin-orchestration --roadmap planning/demand-ready/roadmap.md --lane bastion-web \
       --plan-file planning/bastion-web-demo/plan.md --execute
 ```
 
