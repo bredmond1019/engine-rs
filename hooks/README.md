@@ -59,6 +59,13 @@ so stage 2 is one `git config` away for each.
 Only one repo still needs a `harness.json`: **`core/okf-core`**, already ticketed as
 `OK.ticket.harness-json-all-targets-clippy`.
 
+**`okf-core`'s hooks were switched on 2026-08-06 anyway**, before that ticket lands. A missing
+`harness.json` makes stage 2 skip with a notice rather than fail (see the graceful-skip cases at the
+top of `hooks/pre-push`), so the repo gets the **stage 1 corpus gate immediately** — which is the
+half that matters for a repo participating in the brain corpus — and picks up stage 2 for free when
+the ticket ships. Verified by running the hook directly: stage 1 ran all five flags, stage 2 printed
+`no planning/harness.json … skipping repo gate`.
+
 These three are **deliberately out of scope** and should not be re-flagged by future sweeps:
 
 | Repo | Why not |
