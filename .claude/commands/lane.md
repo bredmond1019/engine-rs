@@ -13,14 +13,19 @@ delegated, or who else is running right now. This command supplies that, then ha
 
 ## Variables
 
-`$ARGUMENTS` — flags, any order. **One of `--lane` or `--blocks` is required; everything else is
-optional and resolves to a default.**
+`$ARGUMENTS` — flags, any order. **`--roadmap` is required, plus one of `--lane` or `--blocks`.**
+Everything else resolves to a default.
+
+`--roadmap` is mandatory on purpose. An earlier version inferred it from whichever epic was
+`focused`, which is correct during a single-initiative week and silently wrong the moment two
+initiatives overlap — the case where a lane driven against the wrong roadmap is hardest to notice.
+Naming it costs one flag and removes a hidden coupling to epic status.
 
 | Flag | Required | Default | What it does |
 |---|---|---|---|
-| `--lane <path\|name>` | one of | — | Lane chain file. A bare name (`gtm`) resolves to `<roadmap-dir>/lane-<name>.txt` — see step 1, which finds the roadmap *first*. |
+| `--roadmap <path>` | **yes** | — | The roadmap this lane belongs to. Absolute, or relative to `BRAIN_ROOT`. |
+| `--lane <path\|name>` | one of | — | Lane chain file. A bare name (`gtm`) resolves to `<roadmap-dir>/lane-<name>.txt`. |
 | `--blocks <id ...>` | one of | — | Inline block IDs instead of a lane file. Space- or comma-separated. |
-| `--roadmap <path>` | no | see *Resolving the roadmap* | The roadmap this lane belongs to. |
 | `--repo <slug>` | no | inferred from cwd | Override only when inference is wrong. |
 | `--isolation <worktree\|no-worktree\|auto>` | no | `auto` | `auto` applies the policy table below. |
 | `--plan-file <path>` | no | — | Spec source for `/generate-tasks --from`, when the blocks are not in `master-plan.md`. |
@@ -32,35 +37,27 @@ optional and resolves to a default.**
 Empty `$ARGUMENTS` → print usage and stop:
 
 ```
-Usage: /lane --lane <path|name> [--roadmap <path>] [--repo <slug>]
+Usage: /lane --roadmap <path> --lane <path|name> [--repo <slug>]
              [--isolation worktree|no-worktree|auto] [--plan-file <path>]
              [--engine task|flow] [--log <path>] [--execute] [--continue-on-fail]
-       /lane --blocks <id> [<id> ...] [same optional flags]
+       /lane --roadmap <path> --blocks <id> [<id> ...] [same optional flags]
 ```
+
+`--roadmap` missing → print usage and stop. Do **not** infer it, and do not offer to; if the
+operator does not know which roadmap this lane belongs to, that is the thing to resolve first.
 
 ---
 
 ## Step 1 — Resolve
-
-Resolve in this order. It is deliberately non-circular: **the roadmap is found before the lane
-file**, because a bare `--lane` name can only be located relative to the roadmap's directory.
 
 **A. `BRAIN_ROOT`** — walk up from cwd for `brain.toml`.
 
 **B. The repo** — this repo's `planning/state.json` → `repo`. `--repo` overrides. If cwd *is*
 `BRAIN_ROOT`, the repo is the brain (HQ).
 
-**C. The roadmap** — first hit wins:
-1. `--roadmap <path>`.
-2. If `--lane` was given as a **path that exists**, read its `# ROADMAP:` header.
-3. `<BRAIN_ROOT>/planning/state.json` → `epics[]` → the `plan` pointer of the **single `focused`**
-   epic, resolved relative to `BRAIN_ROOT`. Exactly one `focused` epic → use it. **Zero or more than
-   one → stop and ask.** Never pick.
-
-   *This is the path a bare `--lane <name>` takes*, since rule 2 needs a file you cannot locate yet.
-   It is also the fragile one: it infers the roadmap from what the fleet is currently focused on,
-   which is right during a focused run and wrong the moment two initiatives overlap. Pass
-   `--roadmap` explicitly whenever the run is not the focused epic.
+**C. The roadmap** — `--roadmap`, resolved against `BRAIN_ROOT` if relative. It must exist and it
+must be a roadmap; a path that resolves to a lane file or a `tasks.md` is an argument error, not
+something to work around. **Never infer it.**
 
 **D. `roadmap_dir`** = the roadmap's directory.
 
@@ -71,14 +68,15 @@ file**, because a bare `--lane` name can only be located relative to the roadmap
 
 **F. Cross-check** — if the resolved lane file carries a `# ROADMAP:` header and it disagrees with
 the roadmap resolved in C, **stop and report both.** That mismatch means the lane belongs to a
-different run than the one you inferred, and it is the failure this ordering exists to catch.
+different run than the one you were told, and it is the cheapest available check that `--roadmap`
+was typed correctly.
 
 Read the lane file with `#` comments and blanks stripped; file order is execution order. Lane files
 may cover several repos in one running order — **take only your repo's section.** If the file has
 section markers for other repos and you cannot tell which is yours, stop and ask.
 
-Print what you resolved and **which rule produced it**. A lane driven against the wrong roadmap is
-worse than one driven against none.
+Print what you resolved. A lane driven against the wrong roadmap is worse than one driven against
+none.
 
 ## Step 2 — Isolation policy
 
@@ -198,7 +196,15 @@ fact.
 ## Example
 
 ```
-/lane --lane gtm --isolation no-worktree
-/lane --blocks MV.12.A MV.12.B MV.12.C
-/lane --lane lane-bastion-web.txt --plan-file planning/bastion-web-demo/plan.md --execute
+/lane --roadmap planning/demand-ready/roadmap.md --lane bastion-web
+
+/lane --roadmap planning/demand-ready/roadmap.md --lane gtm --isolation no-worktree
+
+/lane --roadmap planning/demand-ready/roadmap.md --blocks MV.12.A MV.12.B MV.12.C
+
+/lane --roadmap planning/demand-ready/roadmap.md --lane bastion-web \
+      --plan-file planning/bastion-web-demo/plan.md --execute
 ```
+
+`--roadmap` resolves against `BRAIN_ROOT` when relative, so the same string works from every repo
+regardless of how deep it sits.
