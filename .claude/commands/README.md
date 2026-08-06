@@ -256,6 +256,27 @@ first unresolved conflict. Pre-flights a clean tree + synced base, classifies ea
 is `CONFLICTING`, confirms with you, then merges each via `gh pr merge --merge --delete-branch`. Exits
 early for `--auto-merge` / `--no-pr` runs. Resume-safe — already-merged blocks are auto-detected on re-run.
 
+### `/orchestrate <block-id ...> | <list-file>`
+Drives an **ordered chain of blocks** through the SDLC engines in one session: spec → (breakdown) →
+`/sdlc-task` or `/sdlc-flow` → integrate → verify the state write → next. Engines run as background
+workflows, so specs for later blocks are prepared while an earlier one builds. **One repo per session,
+one engine run at a time** — several repos run concurrently as separate sessions (the lane model).
+Ten standing rules, each from a real failure: never do block work yourself or via a subagent; verify
+every state write (engine bookkeeping is known-unreliable); check downstream Cargo consumers after a
+shared-crate change; commit after every `mev` command; report each block to the lane log; keep a
+`planning/orchestration-run/notes.md` running tab; and resolve ordinary ambiguities inline while
+recording the call. Flags: `--worktree` / `--no-worktree`, `--engine task|flow`, `--dry-run`,
+`--continue-on-fail`.
+
+### `/begin-orchestration --roadmap <path> (--lane <name|path> | --blocks <id ...>)`
+Wraps `/orchestrate` with the context a lane agent needs and the rules a **concurrent** run depends
+on: which chain, why, what may not be delegated, and who else is running. Resolves `BRAIN_ROOT`, the
+repo, the roadmap and the lane file (cross-checking the lane's `# ROADMAP:` header against the one
+given), then applies the isolation policy — `base-template` is always `--worktree` (a chain there
+edits the engines running it), the brain root is always `--no-worktree` (corpus gates cannot pass in
+a worktree) — before handing off. `--roadmap` is **required and never inferred**. Also enforces the
+heavy-gate concurrency cap, operator gates, and the same notes-file and decision-recording rules.
+
 ---
 
 ## Session Orientation

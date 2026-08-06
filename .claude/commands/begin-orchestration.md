@@ -121,7 +121,7 @@ own standing rules, it adds to them.
 
 ---
 
-## The four rules
+## The six rules
 
 Each has already cost a real run in this fleet.
 
@@ -148,6 +148,34 @@ Each has already cost a real run in this fleet.
 4. **Never start a block showing `blocked`.** If the next one is HELD on a sibling lane, say so
    plainly — `HELD: <id> needs <dep> (<repo>)` — and pull the next `open` block in this repo rather
    than idling or improvising. Never skip silently.
+
+5. **Keep a running notes file — `planning/orchestration-run/notes.md` in this repo.** A lane run
+   surfaces far more than the lane log's one line per block: defects found in passing, deferred
+   fixes, cross-lane blockers, traps re-confirmed, things the roadmap got wrong. All of it dies in
+   the session transcript unless it is written down, and the next session starts blind.
+
+   Create it on the first block if absent (OKF frontmatter, `type: Reference`; add the row to
+   `planning/index.md` per standing rule 7). Then **append after every block** — never rewrite, and
+   never let it become a second status.md. Give every item a status so it can be triaged later:
+   `OPEN` · `DONE` · `HELD` · `WONTFIX`. Commit it with the lane-log line.
+
+   The lane log is the *cross-lane* channel and stays one line per block; this file is the *local*
+   one and holds the detail. Anything that needs a ticket later, or that the next agent would
+   otherwise rediscover the hard way, belongs here.
+
+6. **Resolve what you can; record the call.** A lane that stops at every ambiguity is worthless,
+   and one that stops at none is dangerous. Decide the ordinary things yourself — a spec slug that
+   does not quite match convention, which of two plausible `--from` plan files is meant, whether a
+   surfaced defect is in scope, how to resolve a merge conflict. Say what you assumed and keep
+   moving.
+
+   **Write every such decision into the notes file with its reasoning**, in one or two lines. A
+   decision nobody can find later is indistinguishable from a mistake, and the next agent will
+   re-litigate it or quietly reverse it.
+
+   What you still must **not** decide alone: an operator gate (below), a bailed block's fate, two
+   blocks that genuinely disagree about the same behaviour, and anything that would edit another
+   lane's repo. Those stop and get reported.
 
 ## Operator gates
 
@@ -184,14 +212,18 @@ Run this repo's own gates from `planning/harness.json`, then the corpus gate fro
 Concurrent lanes pushing into one corpus is the exact condition that accumulated 32
 `validate-brain` errors across four lanes and blocked pushes fleet-wide.
 
-**Report:** blocks closed · blocks HELD and on what · operator gates hit · anything the roadmap got
-wrong. The last one matters most — the roadmap is a hand-authored snapshot and the graph is the
-fact.
+**Report:** blocks closed · blocks HELD and on what · operator gates hit · decisions you took and
+why · anything the roadmap got wrong. The last one matters most — the roadmap is a hand-authored
+snapshot and the graph is the fact.
+
+Everything in that report should already be in `planning/orchestration-run/notes.md` (rule 5). The
+report is the summary; the notes file is the record that survives the session.
 
 ## Files
 
 - Reads: the roadmap, the lane file, `planning/state.json`, `planning/harness.json`, `brain.toml`
-- Writes: the lane log (append-only), plus whatever `/orchestrate` and the engines write
+- Writes: the lane log (append-only), `planning/orchestration-run/notes.md` (append-only), plus
+  whatever `/orchestrate` and the engines write
 - Never writes: a roadmap's `<!-- BEGIN generated:* -->` regions
 
 ## Example

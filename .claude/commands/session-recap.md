@@ -41,7 +41,14 @@ start of a coding session before doing anything else.
    `clears_when` is unresolved) — durable constraints, known-issues, env caveats, and deferred
    follow-ons. Skip silently if the file or array is absent.
 
-6. Output the briefing in this exact format — keep it under 300 words:
+6. **Warm memory — by budget, never by reflex** (brain decision **D67**). Run
+   `wc -w planning/knowledge.md planning/memory.md` and branch on the **combined** count:
+   **≤ 2,500 words** → read both in full; **over** → read only the topic list
+   (`grep '^### ' planning/knowledge.md planning/memory.md`). These are D35-distilled entries —
+   the only retrieval path back to archived plans once `planning/archive/` leaves the corpus.
+   Never call `syn recall` here: at session start there is no question yet. Skip if absent.
+
+7. Output the briefing in this exact format — keep it under 300 words:
 
 ---
 
@@ -62,6 +69,10 @@ If the spec is missing, say so. If all steps are done, say "All steps marked com
 <One line per active `carryover[]` entry: `slug` (`kind`) — gist. Omit this section entirely if
 there are none. Flag any `kind: env` caveat that gates the next step (e.g. "rebuild binary first").>
 
+## Warm Memory
+<One line. Under budget: the distilled facts bearing on the current focus. Over budget:
+`N words across M topics — headings only` plus the topics nearest the focus. Omit if absent.>
+
 ## Next Pipeline Step
 <Single line: the exact command to run next, with the full argument.>
 Example: `/test planning/<spec-slug>/tasks.md 2`
@@ -69,7 +80,8 @@ If the block is complete: `Run /log-work to wrap up, then /start-block for the n
 
 ---
 
-Do not read any source code files. Do not run any commands. This is read-only.
+Do not read any source code files. This is read-only: the only commands permitted are the
+read-only warm-memory probes (`wc -w`, `grep '^### '`) and the `ls` in step 0.
 
 ## Context / Files to Read
 
@@ -77,5 +89,7 @@ Do not read any source code files. Do not run any commands. This is read-only.
 - `log.md` (last 3 entries)
 - `planning/status.md`
 - `planning/state.json` (the `carryover[]` array, if present)
+- `planning/knowledge.md` + `planning/memory.md` — **under the warm-memory budget** (D67),
+  never both in full when the combined `wc -w` exceeds 2,500 words
 - `planning/<name>/tasks.md` (current block's spec, if it exists)
 - `planning/<name>/sdlc/reports/` (directory listing to check which step reports exist)

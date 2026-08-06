@@ -5,7 +5,7 @@
 // The cheap rung of the pipeline ladder, for one small unit of behaviour-changing
 // work (a /ticket or /chore). Runs a spec's task(s) through a tight per-task loop —
 //   implement → fast gating-test → triage → fix (≤3 attempts, Opus on the last)
-//   → commit → lean bookkeep close-out
+//   → commit → [terminal authoritative reconcile] → lean bookkeep close-out
 // and nothing else. No scout, no separate review, no document stage, no ui-test, no
 // PR. The bookkeep close-out is deliberately lean: on a passing full run it flips the
 // authored status markers (tasks.md task status, the status.md Progress row, the
@@ -13,6 +13,23 @@
 // does NOT write a log.md narrative, a D18 amendment log, or run review/docs/PR. Run
 // /log-work for the narrative. When you need a consolidated review + docs + a PR, use
 // /sdlc-flow; for a whole spec in place, /sdlc-run; for a roadmap, /sdlc-block.
+//
+// TERMINAL AUTHORITATIVE RECONCILE (D56) — this engine's per-task tripwire runs
+// `fastCommand` in place of `command` (testDepth=fast, the default) and never runs a
+// `perTask: false` check at all, so those checks' real, authoritative form was never
+// verified anywhere in the run. After the last task passes on a full, non-bailed,
+// testDepth=fast run, ONE reconcile pass re-runs — with their real `command`, never
+// `fastCommand` — only the gates:true checks the per-task tripwire actually skipped:
+// those whose fastCommand differs from command, plus every perTask:false gating check.
+// Checks with no fastCommand already ran authoritative on every per-task pass and are
+// NOT re-run (redundant cost; see D56). Default-on, no flag, no harness.json opt-out —
+// see D56 for why. A failing reconcile bails into a distinct terminal state,
+// `reconcile_failed`: bookkeep does NOT run, the block is NOT flipped to done, and all
+// per-task commits stand. Resume (--resume, no task selection) re-enters with every
+// task already "passed" in state.json, so it naturally re-runs only the reconcile —
+// no separate resume path needed. Skipped entirely when testDepth=full (every check,
+// including perTask:false ones, already ran authoritative on every per-task pass — see
+// renderCheckList) or on a partial task-subset run (the existing fullRun guard).
 //
 // ISOLATION
 //   Default: IN PLACE on the current branch (no worktree) — cheapest, like /sdlc-run.
@@ -29,12 +46,18 @@
 //
 // PIPELINE
 //   setup (locate repo / create worktree) → enumerate (D16 lint) → [resume load]
-//     → per-task loop → lean bookkeep close-out (on pass) → final state commit
+//     → per-task loop → [terminal authoritative reconcile, D56] → lean bookkeep
+//     close-out (on pass) → final state commit
 //
 //   Per-task loop (sequential):
 //     implement → fast-test → (triage → fix/bail) ×≤3 → one state write per task
 //   A triage MAJOR / immediate-bail reason breaks straight out (does NOT burn the
 //   remaining attempts); the run stops and reports for human pickup.
+//
+//   Terminal reconcile (D56, after every task passes on a full, testDepth=fast run):
+//     re-run, with their authoritative `command`, only the checks the fast tripwire
+//     substituted (fastCommand) or skipped (perTask:false) → on failure, status
+//     "reconcile_failed" — bookkeep is skipped, the block is NOT flipped to done.
 //
 // STATE (NOT gitignored, but deliberately never committed — at planning/<spec>/sdlc/)
 //   sdlc-task-state.json   the authoritative run index (per-task summary/issues/fixes/commit +
@@ -1387,7 +1410,86 @@ Return via StructuredOutput:
 // FINAL STATE COMMIT + SUMMARY
 // ================================================================
 const passedTasks = taskList.filter(n => state.tasks[String(n)]?.status === 'passed' || passedFromState.has(n))
-state.status = bailed ? 'blocked' : 'done'
+const fullRun = !selectedTasks   // no explicit selection = every task in the spec ran
+
+// ----------------------------------------------------------------
+// PHASE 2.5: TERMINAL AUTHORITATIVE RECONCILE (D56) — after every task passes, before bookkeep.
+//
+// The per-task tripwire above always ran with `gatingOnly: testDepth === 'fast'`. Under that
+// gating, renderCheckList() (a) runs a check's `fastCommand` instead of its authoritative
+// `command` whenever one is configured, and (b) drops every `perTask: false` check from the
+// per-task list entirely (see renderCheckList's `gatingOnly` filter). Neither form's REAL,
+// authoritative command was ever verified anywhere in the run — this is the exact gap D56
+// documents and fixes.
+//
+// Scope (narrow, per D56's Call 1 — NOT a full re-run of every gating check): only the checks
+// the per-task tripwire actually skipped — those whose `fastCommand` differs from `command`,
+// plus every `perTask: false` gating check. A check with no `fastCommand` already ran its
+// authoritative `command` on EVERY per-task pass, so re-running it here would buy zero new
+// coverage at real cost — see D56's `bella` measurement (a full sweep costs ~29% more than this
+// narrow scope for exactly that reason).
+//
+// Reuses sdlc-flow.js's existing `renderCheckList(cfg, { gatingOnly: false, ... })` idiom
+// (sdlc-flow.js:1666 — the end-of-flow review's authoritative re-run) rather than inventing a
+// second one: passing gatingOnly:false makes renderCheckList emit each check's real `command`
+// (never `fastCommand`) with no `perTask` filtering, for whatever check list it is given —
+// so filtering the check list itself, before the call, is exactly enough to narrow the scope.
+//
+// Runs only once per FULL spec run (the fullRun guard below is unchanged by this decision — a
+// partial task-subset run, e.g. `/sdlc-task <slug> 1`, never triggers it and never closes the
+// block) that did NOT bail, and only when testDepth is 'fast' — under `--test-depth full` every
+// check (including perTask:false ones) already ran authoritative on every per-task pass, via the
+// same `gatingOnly:false` codepath, so reconciling again here would be a pure double-run.
+//
+// Resume semantics fall out for free: `--resume` on an already-fully-passed task set (e.g. after
+// a prior `reconcile_failed`) skips every task in the per-task loop (passedFromState already has
+// them all) and lands straight here — re-running ONLY the reconcile, never the task loop, exactly
+// as D56's failure-path recovery describes.
+//
+// Failure path (D56 Call 2): a failing reconcile does NOT run bookkeep, does NOT flip the block
+// to done, and does NOT touch the per-task commits already made — it bails into a distinct
+// terminal status, `reconcile_failed`, with the raw failing output preserved for the operator.
+// This is never folded into an ordinary `blocked`/bail: there is no task to attribute it to and
+// no per-task attempt budget left to spend retrying it here.
+// ----------------------------------------------------------------
+let reconcileFailed = false
+let reconcileFailBlob = ''
+if (!bailed && fullRun && testDepth === 'fast') {
+  phase('Reconcile')
+  const reconcileChecks = (harnessCfg?.validation?.checks ?? [])
+    .filter(c => c.gates && ((c.fastCommand && c.fastCommand !== c.command) || c.perTask === false))
+  if (reconcileChecks.length) {
+    log(`Terminal reconcile (D56): ${reconcileChecks.length} check(s) the per-task fast tripwire substituted or skipped — running their authoritative form once before bookkeep.`)
+    const reconcileCfg = { ...harnessCfg, validation: { ...(harnessCfg.validation || {}), checks: reconcileChecks } }
+    const reconcileResult = await tracedAgent(`${W}
+You are the terminal authoritative-reconcile agent for the lean /sdlc-task pipeline (D56). Every
+task in this spec already passed its fast, per-task tripwire — but that tripwire ran a narrower
+\`fastCommand\` in place of some checks' real \`command\`, and skipped every \`perTask: false\` check
+entirely. This is the ONE point in the run where their real, authoritative form is verified,
+before the block can be reported done. All Bash calls run from the run root (prefix each with:
+cd ${runDir} &&).
+
+${renderCheckList(reconcileCfg, { gatingOnly: false, cwd: runDir, engineFiles: [] })}
+
+For each check record: name, passed (true iff exit code 0), the command, and failure output.
+Return via StructuredOutput: allPassed (true only if EVERY check above passed), passCount,
+failCount, failedTests (names), failBlob (compact: failing check names + the tail of their
+output; empty when allPassed), notes.
+`, withModel({ label: 'reconcile', schema: TEST_SCHEMA, phase: 'Tasks' }, MODEL.test))
+    if (!reconcileResult || !reconcileResult.allPassed) {
+      reconcileFailed = true
+      reconcileFailBlob = (reconcileResult && reconcileResult.failBlob) || 'Reconcile agent returned null or an incomplete result.'
+      log(`Terminal reconcile FAILED (D56) — bookkeep is skipped; the block is NOT reported done. ${reconcileFailBlob}`)
+    } else {
+      log(`Terminal reconcile passed (D56): ${reconcileResult.passCount} check(s), all authoritative.`)
+    }
+  } else {
+    log('Terminal reconcile (D56): no gating check needed reconciling (no fastCommand substitutions, no perTask:false checks in this project) — skipped, zero added cost.')
+  }
+}
+
+state.status = bailed ? 'blocked' : (reconcileFailed ? 'reconcile_failed' : 'done')
+if (reconcileFailed) state.bail_reason = `Terminal reconcile failed (D56): ${reconcileFailBlob}`
 
 // ----------------------------------------------------------------
 // LEAN BOOKKEEP CLOSE-OUT — the one bit of authored state the lean engine still owes.
@@ -1395,12 +1497,12 @@ state.status = bailed ? 'blocked' : 'done'
 // for the narrative). It only flips the AUTHORED markers a passing run leaves stale — tasks.md task
 // status, the status.md Progress row, and the state.json block status — then (in place, on main only)
 // regenerates the derived surfaces via `mev emit-state --write`. Mirrors /start-block's flip pattern.
-// Skipped entirely on a bail (the block is not done) and on a partial task selection (can't close the block).
+// Skipped entirely on a bail or a reconcile_failed (the block is not done) and on a partial task
+// selection (can't close the block).
 // ----------------------------------------------------------------
-const fullRun = !selectedTasks   // no explicit selection = every task in the spec ran
-const blockDone = !bailed && fullRun && passedTasks.length === taskList.length
+const blockDone = !bailed && !reconcileFailed && fullRun && passedTasks.length === taskList.length
 let bookkeepResult = null
-if (!bailed) {
+if (!bailed && !reconcileFailed) {
   // D46: when planning/ is a vaulted symlink, ${specFile}, planning/status.md, and planning/state.json
   // do not live in this repo at all — they live in the brain-owned vault repo at the symlink target. A
   // plain `git add` against any of them from the run root fails ("pathspec is beyond a symbolic link"),
@@ -1522,7 +1624,7 @@ await writeTaskState(`run ${state.status} (${passedTasks.length}/${taskList.leng
 
 const tokensBlock = state.tokens   // already rebuilt by the writeTaskState call just above (no traced agent ran since); reuse it rather than rebuilding (carry-in #3)
 log(`Token roll-up: ${tokensBlock.total.inTokEst} inTokEst${tokensBlock.total.outTok ? ` | ${tokensBlock.total.outTok} outTok` : ''} across ${tokensBlock.stages.length} stage(s) — persisted in ${stateFile}.`)
-log(`/sdlc-task complete. ${bailed ? `BAILED: ${bailReason}` : 'all selected tasks passed'} | passed ${passedTasks.length}/${taskList.length}.`)
+log(`/sdlc-task complete. ${bailed ? `BAILED: ${bailReason}` : reconcileFailed ? `RECONCILE FAILED (D56): ${reconcileFailBlob}` : 'all selected tasks passed'} | passed ${passedTasks.length}/${taskList.length}.`)
 if (useWorktree) {
   log(`Worktree branch "${branchName}" carries the commits at ${runDir}.`)
   log(`Integrate it when ready: git checkout main && git merge ${branchName}, then git worktree remove ${runDir} && git branch -d ${branchName}.`)
@@ -1531,6 +1633,8 @@ if (useWorktree) {
 }
 if (bailed) {
   log(`Pick up: read ${stateFile} for per-task state, fix the blocker, then re-run with --resume.`)
+} else if (reconcileFailed) {
+  log(`Pick up: all per-task commits stand — only the terminal reconcile failed. Fix the surfaced failure, then re-run with --resume (every task is already "passed", so this re-runs ONLY the reconcile) or drive it manually with /fix.`)
 } else {
   log(`Run /log-work to record the narrative log.md entry (the lean bookkeep flipped status only — no prose was written).`)
 }
@@ -1541,7 +1645,8 @@ return {
   branch: branchName,
   runDir,
   bailed,
-  bailReason: bailReason || null,
+  reconcileFailed,
+  bailReason: bailReason || (reconcileFailed ? state.bail_reason : null),
   tasksRun: taskList,
   tasksPassed: passedTasks,
   stateFile,

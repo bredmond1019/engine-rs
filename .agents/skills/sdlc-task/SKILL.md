@@ -11,7 +11,7 @@ description: >
  The cheap rung of the pipeline ladder, for one small unit of behaviour-changing
  work (a /ticket or /chore). Runs a spec's task(s) through a tight per-task loop —
    implement → fast gating-test → triage → fix (≤3 attempts, Opus on the last)
-   → commit → lean bookkeep close-out
+   → commit → [terminal authoritative reconcile] → lean bookkeep close-out
  and nothing else. No scout, no separate review, no document stage, no ui-test, no
  PR. The bookkeep close-out is deliberately lean: on a passing full run it flips the
  authored status markers (tasks.md task status, the status.md Progress row, the
@@ -19,6 +19,23 @@ description: >
  does NOT write a log.md narrative, a D18 amendment log, or run review/docs/PR. Run
  /log-work for the narrative. When you need a consolidated review + docs + a PR, use
  /sdlc-flow; for a whole spec in place, /sdlc-run; for a roadmap, /sdlc-block.
+
+ TERMINAL AUTHORITATIVE RECONCILE (D56) — this engine's per-task tripwire runs
+ `fastCommand` in place of `command` (testDepth=fast, the default) and never runs a
+ `perTask: false` check at all, so those checks' real, authoritative form was never
+ verified anywhere in the run. After the last task passes on a full, non-bailed,
+ testDepth=fast run, ONE reconcile pass re-runs — with their real `command`, never
+ `fastCommand` — only the gates:true checks the per-task tripwire actually skipped:
+ those whose fastCommand differs from command, plus every perTask:false gating check.
+ Checks with no fastCommand already ran authoritative on every per-task pass and are
+ NOT re-run (redundant cost; see D56). Default-on, no flag, no harness.json opt-out —
+ see D56 for why. A failing reconcile bails into a distinct terminal state,
+ `reconcile_failed`: bookkeep does NOT run, the block is NOT flipped to done, and all
+ per-task commits stand. Resume (--resume, no task selection) re-enters with every
+ task already "passed" in state.json, so it naturally re-runs only the reconcile —
+ no separate resume path needed. Skipped entirely when testDepth=full (every check,
+ including perTask:false ones, already ran authoritative on every per-task pass) or
+ on a partial task-subset run (the existing fullRun guard).
 
  ISOLATION
    Default: IN PLACE on the current branch (no worktree) — cheapest, like /sdlc-run.
@@ -35,12 +52,18 @@ description: >
 
  PIPELINE
    setup (locate repo / create worktree) → enumerate (D16 lint) → [resume load]
-     → per-task loop → lean bookkeep close-out (on pass) → final state commit
+     → per-task loop → [terminal authoritative reconcile, D56] → lean bookkeep
+     close-out (on pass) → final state commit
 
    Per-task loop (sequential):
      implement → fast-test → (triage → fix/bail) ×≤3 → one state write per task
    A triage MAJOR / immediate-bail reason breaks straight out (does NOT burn the
    remaining attempts); the run stops and reports for human pickup.
+
+   Terminal reconcile (D56, after every task passes on a full, testDepth=fast run):
+     re-run, with their authoritative `command`, only the checks the fast tripwire
+     substituted (fastCommand) or skipped (perTask:false) → on failure, status
+     "reconcile_failed" — bookkeep is skipped, the block is NOT flipped to done.
 
  STATE (NOT gitignored, but deliberately never committed — at planning/<spec>/sdlc/)
    sdlc-task-state.json   the authoritative run index (per-task summary/issues/fixes/commit +
@@ -330,12 +353,46 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
    branch` on this file** — it is read back off disk only, by `--resume`, never out of git history.
 4. If this task bailed, stop the per-task loop entirely (do not proceed to the next `taskNum`).
 
-### Step 4 — Lean bookkeep close-out (only on a non-bailed run)
+### Step 3.5 — Terminal authoritative reconcile (D56)
 
-Skip this entire step if the run bailed. Otherwise:
+`fullRun` = true iff no task selection was given (every task in the spec ran this pass this run).
 
-- `fullRun` = true iff no task selection was given (every task in the spec ran this pass).
-- `blockDone` = true iff `fullRun` AND every task in `taskList` passed.
+Run this step only if the run did **not** bail, `fullRun` is true, AND `testDepth == 'fast'`. In
+every other case (bailed; a partial task-subset run; `--test-depth full`, where every check
+already ran authoritative on every per-task pass via the same `gatingOnly:false` codepath) skip it
+entirely — proceed straight to Step 4.
+
+This is the ONE point in the run where a check's real, authoritative `command` — never
+`fastCommand` — and every `perTask: false` gating check are actually verified. The per-task
+tripwire in Step 3 never runs either form: it always renders with `gatingOnly:true`, which
+substitutes `fastCommand` for `command` when one is configured, and drops every `perTask: false`
+check from the per-task list entirely.
+
+1. Build the reconcile check set from `planning/harness.json`'s `validation.checks[]`: every check
+   with `gates:true` AND (`fastCommand` is set and differs from `command`, OR `perTask === false`).
+   This is deliberately narrow, not a full re-run of every gating check — a check with no
+   `fastCommand` already ran its authoritative `command` on every per-task pass, so re-running it
+   here buys zero new coverage at real cost (see D56's measurement.md).
+2. If the set is empty (no `fastCommand` substitutions, no `perTask:false` checks in this
+   project), log that the reconcile is a no-op and skip straight to Step 4 — zero added cost.
+3. Otherwise, run exactly that check set with each check's real `command` (never `fastCommand`)
+   and no `perTask` filtering — the same rendering Step 3 uses, but with gating set to run every
+   check's authoritative form unconditionally. All Bash calls run from `runDir`.
+4. If every check in the set passes: log the reconcile passed and proceed to Step 4 normally.
+5. If any check fails: set `reconcileFailed = true` and the run's terminal status to
+   `"reconcile_failed"` (a distinct terminal state — never folded into an ordinary `"blocked"`
+   bail). **Skip Step 4 (bookkeep) entirely** — do not mark tasks done, do not flip
+   `planning/status.md` or `planning/state.json`, do not commit. All per-task commits already made
+   stand untouched; there is no task to attribute the failure to and no per-task attempt budget
+   left to spend retrying it here. Proceed straight to Step 5 to persist this outcome and report
+   it. Resuming later (`--resume`, no task selection) re-enters with every task already `"passed"`
+   in state.json, so it naturally re-runs only this reconcile step, not the task loop.
+
+### Step 4 — Lean bookkeep close-out (only on a non-bailed, non-reconcile-failed run)
+
+Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`. Otherwise:
+
+- `blockDone` = true iff `fullRun` AND `!reconcileFailed` AND every task in `taskList` passed.
 - **Re-detect the vault** (same check as Step 1c, from `runDir`):
   `[ -L planning ]` → symlink (vaulted) vs plain directory; resolve the real path via
   `python3 -c "import os; print(os.path.realpath('planning'))"`.
@@ -418,12 +475,19 @@ Skip this entire step if the run bailed. Otherwise:
 ### Step 5 — Final state write + report
 
 - Write `<stateFile>` one final time (same disk-only rules as Step 3.3), with `status` set to
-  `"blocked"` (bailed) or `"done"` (otherwise), capturing the final token roll-up.
+  `"blocked"` (bailed), `"reconcile_failed"` (Step 3.5's authoritative reconcile failed), or
+  `"done"` (otherwise), capturing the final token roll-up. On `"reconcile_failed"`, also set
+  `bail_reason` to the reconcile's failing check names + a tail of their output.
 - Report to the user:
   - Which tasks passed / bailed, and the final branch (plus the worktree path, under `--worktree`).
   - **On bail**: point the user at `<stateFile>` for the per-task detail, tell them to fix the
     blocker, then **re-run with `--resume`** to pick back up (already-passed tasks are skipped; the
     existing worktree/branch is reused by name; the D19 thin-spec gate is skipped on resume).
+  - **On a reconcile failure (D56)**: tell the user all per-task commits stand — only the terminal
+    authoritative reconcile failed. Point them at the failing check output, tell them to fix it,
+    then **re-run with `--resume`**: every task is already `"passed"` in state.json, so the resumed
+    run skips straight to Step 3.5 and re-runs only the reconcile (never re-runs the task loop).
+    A reconcile failure must never be reported as a clean finish — the block is NOT done.
   - **On a clean finish**: under `--worktree`, remind the user the branch still needs integrating
     (`git checkout main && git merge <branchName>`, then remove the worktree/branch); in-place, note
     the commits already landed on the current branch.

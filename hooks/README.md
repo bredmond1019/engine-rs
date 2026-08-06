@@ -78,8 +78,52 @@ These three are **deliberately out of scope** and should not be re-flagged by fu
 
 | Hook | Fires | What it does |
 |---|---|---|
+| `pre-commit` | Before every commit | Parses the YAML frontmatter of every **staged** `.md` file and blocks the commit on a parse error (unquoted colon/`#`/em-dash clause inside a plain scalar). No-op for clean or absent frontmatter. |
 | `post-commit` | After every commit | If the commit **deleted or renamed** a file: (1) prunes that file's stale rows from the Brain RAG vector store (`brain_documents`), and (2) appends the path(s) to `.brain-moves-pending` for integrity checking. No-op for ordinary edits. |
 | `pre-push` | Before every push | Two stages, both run, either can block. **Stage 1:** the full 5-flag `validate-brain` suite — validates the whole corpus, but blocks only on errors **new since this clone's last successful push** (`PREPUSH_STRICT=1` gates on the total instead). **Stage 2:** this repo's own `planning/harness.json` `validation.checks[]` where `gates: true` (lint/types/test/build) — blocks on a real non-zero exit from any of them. |
+
+### `pre-commit` — author-time OKF frontmatter YAML gate
+
+A `: ` (colon-space), unquoted `#`, or an em-dash clause inside an unquoted plain scalar
+in OKF frontmatter (typically `description:`/`title:`) breaks YAML parsing with
+`mapping values are not allowed in this context`. Because `mev validate-brain`'s
+`--structure`/`--links`/`--graph`/`--state` flags all load the same frontmatter, one bad
+description fails all four simultaneously and looks like four broken gates for a change
+that has nothing to do with any of them. This recurred three separate times on
+2026-08-06 alone across three independent agent sessions (see `planning/state.json`
+carryover `okf-frontmatter-unquoted-colon-trap`) — a day after already being fixed once
+and re-filed as "only a gate prevents recurrence"
+(`core/_planning/orchestrator/state.json` carryover
+`frontmatter-colon-parse-failures-recur-fleet-wide`). This hook is that gate.
+
+- **Staged `.md` files only**, checked against their **staged blob content**
+  (`git show :<path>`), not the working tree — so a broken unstaged edit sitting in the
+  same file is ignored, and re-staging a fix is what clears the block.
+- **No staged `.md` files → exit 0, silent.** Ordinary commits (code, non-markdown docs)
+  pay nothing.
+- **Parses via `hooks/check_frontmatter.py`** (PyYAML `safe_load` over the
+  `---`-delimited block) — a real YAML parser, not a colon-regex, so it does not false-
+  positive on legitimately colon-containing *values* that are already quoted or on block
+  scalars.
+- **This is a parse gate, not a presence gate.** A file with no frontmatter at all, or an
+  unterminated `---` block, passes silently — Standing Rule 6 (every new file needs OKF
+  frontmatter) is a separate concern this hook does not enforce.
+- **Degrades gracefully**, same spirit as `post-commit`/`pre-push`: no `python3` on PATH,
+  PyYAML not importable, or `hooks/check_frontmatter.py` missing → warning on stderr,
+  exit 0. The checker never blocks a commit by failing to run — only a real parse error
+  in staged frontmatter does.
+- **`git commit --no-verify` skips it**, same escape hatch as the other hooks.
+
+```bash
+bash hooks/test_pre-commit.sh   # exit 0 = all pass
+```
+
+10 cases: clean frontmatter passes, an unquoted colon blocks (and names the file:line),
+the same value quoted passes, no-frontmatter passes, a non-`.md` staged file with
+YAML-shaped content is ignored, an unstaged broken file is ignored, re-staging a broken
+edit over a clean one blocks (proves it checks the staged blob, not the first `git add`),
+no staged `.md` files at all is a silent no-op, and PyYAML being unimportable (isolated
+PATH to the bare system `python3`, which has no PyYAML) degrades non-fatally.
 
 ### `post-commit` — Brain RAG delete/rename freshness
 

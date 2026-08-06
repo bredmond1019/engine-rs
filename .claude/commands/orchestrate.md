@@ -85,6 +85,32 @@ Each of these exists because it has already caused a real failure in this fleet.
    centrally*. Per-repo `state.json` writes do not contend because they are different files; the log
    is append-only; the roadmap regenerates. That is the whole communication channel.
 
+9. **Keep a running notes file — `planning/orchestration-run/notes.md` in this repo.** The lane log
+   carries one line per block for *sibling lanes*; this file carries everything else, for the *next
+   session in this repo*. Defects found in passing, deferred fixes, decisions you took, traps
+   re-confirmed, whatever the roadmap got wrong. None of it survives the session transcript
+   otherwise, and the next agent starts blind and rediscovers it the hard way.
+
+   Create it on the first block if absent (OKF frontmatter, `type: Reference`; add a row to
+   `planning/index.md`). **Append after every block — never rewrite.** Status every item so it can
+   be triaged later: `OPEN` · `DONE` · `HELD` · `WONTFIX`. Commit it alongside the lane-log line
+   (rule 7 timing: before the next engine launches).
+
+   Keep it a *log*, not a second `status.md`. If an item turns into real work it becomes a ticket
+   and the entry points at it.
+
+10. **Resolve what you can; record the call.** A chain that halts at every ambiguity is worthless,
+    and one that halts at none is dangerous. Decide the ordinary things inline — an imperfect spec
+    slug, which plan file `--from` means, whether a surfaced defect is in scope, how to resolve a
+    merge conflict — state the assumption, and keep the chain moving. **Every such decision goes in
+    the notes file with its reasoning, in a line or two.** A decision nobody can find later is
+    indistinguishable from a mistake.
+
+    Still not yours to decide alone: a bailed block's fate under `--stop-on-fail`, two blocks that
+    genuinely disagree about the same behaviour, a `BROKEN DOWNSTREAM` consumer (report, never fix),
+    an operator gate, and anything requiring a spec slug you cannot resolve confidently (step 3
+    says stop and ask — that still stands).
+
 ---
 
 ## How the pipeline works
@@ -221,7 +247,7 @@ If any is wrong: set `status` to `closed`, then run **`mev emit-state --write`**
 **`mev validate-brain --state`** (expect 0 errors). **Record every repair** — a pattern of them is
 evidence for that open ticket.
 
-**Then check the corpus, then commit, then report** (rules 7 and 8):
+**Then check the corpus, then commit, then report** (rules 7, 8 and 9):
 
 ```
 ./scripts/validate_brain.sh          # from the brain root — delta against the last good push
@@ -231,8 +257,9 @@ Concurrent lanes pushing into one corpus is exactly the condition that accumulat
 `validate-brain` errors across four lanes on 2026-08-04 and blocked `git push` fleet-wide. Rule 6
 checks downstream *code* consumers; nothing else checks the *corpus*, so this belongs here.
 
-Commit the `state.json` and its regenerated surfaces as their own commit, append the lane-log line,
-and commit that. **Only then** launch the next engine.
+Commit the `state.json` and its regenerated surfaces as their own commit, then append **both** the
+lane-log line and this block's `planning/orchestration-run/notes.md` entries (rule 9 — including any
+decision you took under rule 10) and commit those together. **Only then** launch the next engine.
 
 > **`planning/state.json` is written with `ensure_ascii=False`.** If you edit it with a script,
 > round-trip with `json.dump(..., indent=2, ensure_ascii=False)` plus a trailing newline. Using the
@@ -300,6 +327,10 @@ Then explicitly:
 - **BROKEN DOWNSTREAM** — any consumer repo step 9 found broken by this chain's changes (repo,
   error class, one-line fix estimate). Empty is the expected case; say so rather than omitting
   the line.
+- **Decisions you took** under rule 10, each with its one-line reasoning — and confirmation they
+  are in `planning/orchestration-run/notes.md`, not only in this report.
+- **Open items** the run surfaced but did not fix, as recorded in the notes file (defects found in
+  passing, deferred propagation, anything needing its own ticket).
 - **The remaining chain** if you stopped early — as a paste-ready `/orchestrate` invocation.
 - A reminder to run **`/log-work`**: `sdlc-task`'s bookkeep is deliberately lean and writes no
   `log.md` entry, so a chain of tasks leaves no narrative history without it.
