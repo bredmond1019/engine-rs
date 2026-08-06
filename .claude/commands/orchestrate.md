@@ -34,9 +34,18 @@ Usage: /orchestrate <block-id> [block-id ...]
 
 Each of these exists because it has already caused a real failure in this fleet.
 
-1. **Do NOT spawn subagents.** No `Task`/`Agent` calls. You invoke `/generate-tasks`, `/breakdown`,
-   and the engine workflows **from this session**. The engines spawn their own internal agents —
-   that is theirs to do, not yours.
+1. **Never do block work yourself, and never delegate it to a subagent.** Every block in the chain
+   goes through **`/sdlc-task` or `/sdlc-flow`** — those engines spawn their own internal agents,
+   which is theirs to do. A block implemented by an ad-hoc subagent has no spec, no gate, no state
+   write, and no review; it is indistinguishable from work that never happened, and the chain's
+   verification in step 8 will not catch it because the state write will look fine.
+
+   You may spawn a subagent for **exactly two things**: read-only exploration (finding files,
+   answering a factual question about the codebase), and a long hotfix that has **no block of its
+   own**. Everything else — `/generate-tasks`, `/breakdown`, integration, state verification,
+   conflict resolution — runs **inline in this session**.
+
+   If you find yourself about to write code for a block ID, stop: that is an engine's job.
 2. **Only `sdlc-task` and `sdlc-flow`.** If `/generate-tasks` recommends `/sdlc-run` or
    `/sdlc-block`, stop and report — those have different isolation and merge semantics than this
    command handles.
@@ -51,6 +60,30 @@ Each of these exists because it has already caused a real failure in this fleet.
    9). No lane can see a sibling lane running in a different repo — this is the only thing in this
    command that looks outside its own repo, and it exists because the alternative (nothing looked)
    has already broken two other repos mid-run.
+
+7. **Commit immediately after any `mev` command or roadmap edit.** `mev emit-state --write`,
+   `set-block-status`, `defer-epic`/`resume-epic`/`sync-epics`, and any roadmap or plan edit all
+   mutate files that **sibling lanes read**. An uncommitted state change is invisible to them and
+   will be clobbered by the next agent that writes the same file. Commit the `state.json` plus its
+   regenerated surfaces as their own commit *before* launching the next engine — not batched at the
+   end of the chain.
+
+8. **Report progress where sibling lanes can see it.** After each block integrates, append one line
+   to the run's lane log and commit it:
+
+   ```
+   {"ts":"<ISO-8601>","lane":"<lane-name>","repo":"<repo>","block":"<ID>","status":"closed|bailed|held","note":"<one line>"}
+   ```
+
+   The log lives beside the roadmap driving the run (e.g.
+   `planning/demand-ready/lane-log.jsonl`); if the chain has no roadmap, skip it.
+
+   **Do not hand-edit a roadmap's generated regions.** Run `mev emit-state --write` and let the
+   sequence table regenerate from `state.json`, which is the authority. Four concurrent sessions
+   editing one markdown file is the exact contention pattern this fleet has already been bitten by —
+   the working rule is *each agent reports the state change it wants; one writer applies them
+   centrally*. Per-repo `state.json` writes do not contend because they are different files; the log
+   is append-only; the roadmap regenerates. That is the whole communication channel.
 
 ---
 
@@ -136,7 +169,21 @@ Use `--worktree` when:
 - A `.env` or other untracked file is needed at runtime → check it copied; if not, prefer plain
   branch for that block.
 
-`--worktree` / `--no-worktree` on the command line overrides all of the above.
+**Two repos have a non-negotiable answer. Encode them, do not re-derive them per run:**
+
+| Repo | Isolation | Why |
+|---|---|---|
+| `base-template` | **`--worktree` ALWAYS** | See above — a chain there edits the engines running it. |
+| the brain root (HQ) | **`--no-worktree` ALWAYS** | Carryover `hq-specs-cannot-run-in-a-worktree`. Measured 2026-08-04 inside a real branch worktree: `validate-brain --structure` gave **64 errors** and `--state` **601**, against 0/0 in the main tree. `validate-brain` walks up to the worktree's own `brain.toml` and resolves the 17 sub-repos relative to it — and every sub-repo is gitignored, so absent from any checkout. Worktree creation itself is clean; it is specifically the corpus gates that cannot pass. Same root cause as the CI exclusion in D65. |
+
+`--worktree` / `--no-worktree` on the command line overrides all of the above **except those two** —
+if a flag contradicts the table, stop and report rather than running a chain whose gates cannot pass.
+
+**Concurrency across sessions is not managed by this command.** Rule 3 governs one repo; nothing
+stops four sessions launching `playwright` and `next build` simultaneously. When several lanes run at
+once, keep at most **two heavy-gate repos** (Next/Playwright builds) live concurrently and put the
+rest on cheap-gate repos. Today that is a human decision — the run's roadmap should say which repos
+are heavy.
 
 ### 6. Launch the engine — do not wait idly
 Invoke the workflow **in this session**:
@@ -173,6 +220,24 @@ If the engine **bailed** (triage MAJOR, immediate-bail, review FAIL after its bo
 If any is wrong: set `status` to `closed`, then run **`mev emit-state --write`** and
 **`mev validate-brain --state`** (expect 0 errors). **Record every repair** — a pattern of them is
 evidence for that open ticket.
+
+**Then check the corpus, then commit, then report** (rules 7 and 8):
+
+```
+./scripts/validate_brain.sh          # from the brain root — delta against the last good push
+```
+
+Concurrent lanes pushing into one corpus is exactly the condition that accumulated 32
+`validate-brain` errors across four lanes on 2026-08-04 and blocked `git push` fleet-wide. Rule 6
+checks downstream *code* consumers; nothing else checks the *corpus*, so this belongs here.
+
+Commit the `state.json` and its regenerated surfaces as their own commit, append the lane-log line,
+and commit that. **Only then** launch the next engine.
+
+> **`planning/state.json` is written with `ensure_ascii=False`.** If you edit it with a script,
+> round-trip with `json.dump(..., indent=2, ensure_ascii=False)` plus a trailing newline. Using the
+> default `ensure_ascii=True` escapes every em dash and turns a 3-field edit into ~130 lines of
+> churn — which becomes a conflict for every sibling lane.
 
 ### 9. Check downstream consumers — only for blocks that touched a shared crate's public types
 

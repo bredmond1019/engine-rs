@@ -31,11 +31,25 @@ git config --get core.hooksPath   # → hooks
 > Note: setting `core.hooksPath` replaces `.git/hooks/` wholesale. The brain repo
 > has no active hooks there, so nothing is lost. To revert: `git config --unset core.hooksPath`.
 
-**Enabled per repo (as of 2026-08-04):** HQ (this repo), `learn-ai/`, `business/bastiel/`,
-`client/brazilianportugui/`, `client/wild-trail-photo/`. Everywhere else, `hooks/pre-push` is
-present on disk (synced by `base-template/scripts/sync_downstream_harness.py`) but inert until
-that repo also runs `git config core.hooksPath hooks` — see `HQ.chore.pre-push-gate-hook` for the
-first four revenue-facing repos this was switched on for; fleet-wide rollout is a follow-up.
+**Enabled per repo (as of 2026-08-06): all 15 eligible repos.** The first five were switched on
+2026-08-04 under `HQ.chore.pre-push-gate-hook` — HQ (this repo), `learn-ai/`, `business/bastiel/`,
+`client/brazilianportugui/`, `client/wild-trail-photo/`. The remaining ten were switched on
+2026-08-06 during a quiet-fleet window: `core/orchestrator`, `core/mev`, `core/bastion`,
+`core/bastion-ui`, `core/bella`, `core/engine-rs`, `core/claude-code-rs`, `core/bastion-web`,
+`side/amistad`, `side/price-scout`.
+
+> **`base-template` is not eligible and never was.** It has no `hooks/` directory because
+> `discover_targets()` in `base-template/scripts/sync_downstream_harness.py` explicitly skips
+> base-template itself, so it never receives the synced hook files. Earlier notes that listed it
+> among the pending targets were wrong.
+
+**First watched run (2026-08-06): 6 green, 4 red.** Green through both stages: `bastion-ui`,
+`claude-code-rs`, `bella`, `engine-rs`, `bastion`, `orchestrator`. Red on **stage 2 only**, each
+from pre-existing repo-local breakage rather than hook wiring — `mev` (2 `brain_conformance`
+test failures), `price-scout` (pytest collection: `price_scout` not installed in the venv),
+`amistad` (2 `tsc` errors), `bastion-web` (1 test: real `sync-serve-types` drift against
+`../bastion`). Hooks were left enabled in all four; `git push --no-verify` is the escape hatch.
+Tracked by carryover `hq-hook-propagation-four-repos-red`.
 
 **Rollout scope (settled 2026-08-04).** The remaining work is switching hooks on, *not* authoring
 `harness.json` — 15 of 19 real repos already carry one with real gated checks (orchestrator 7,
