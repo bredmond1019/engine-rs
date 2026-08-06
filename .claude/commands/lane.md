@@ -18,7 +18,7 @@ optional and resolves to a default.**
 
 | Flag | Required | Default | What it does |
 |---|---|---|---|
-| `--lane <path\|name>` | one of | — | Lane chain file. A bare name (`gtm`) resolves to `<roadmap-dir>/lane-<name>.txt`. |
+| `--lane <path\|name>` | one of | — | Lane chain file. A bare name (`gtm`) resolves to `<roadmap-dir>/lane-<name>.txt` — see step 1, which finds the roadmap *first*. |
 | `--blocks <id ...>` | one of | — | Inline block IDs instead of a lane file. Space- or comma-separated. |
 | `--roadmap <path>` | no | see *Resolving the roadmap* | The roadmap this lane belongs to. |
 | `--repo <slug>` | no | inferred from cwd | Override only when inference is wrong. |
@@ -42,25 +42,43 @@ Usage: /lane --lane <path|name> [--roadmap <path>] [--repo <slug>]
 
 ## Step 1 — Resolve
 
-**The repo.** Walk up from cwd for `brain.toml` to find `BRAIN_ROOT`; the repo slug is this
-repo's `planning/state.json` → `repo`. `--repo` overrides. If cwd is `BRAIN_ROOT` itself, the repo
-is the brain (HQ).
+Resolve in this order. It is deliberately non-circular: **the roadmap is found before the lane
+file**, because a bare `--lane` name can only be located relative to the roadmap's directory.
 
-**Resolving the roadmap**, first hit wins:
+**A. `BRAIN_ROOT`** — walk up from cwd for `brain.toml`.
+
+**B. The repo** — this repo's `planning/state.json` → `repo`. `--repo` overrides. If cwd *is*
+`BRAIN_ROOT`, the repo is the brain (HQ).
+
+**C. The roadmap** — first hit wins:
 1. `--roadmap <path>`.
-2. The lane file's own header — lane files written by this convention name their roadmap in a
-   comment.
-3. This repo's `planning/state.json`: the `plan` pointer of the **`focused`** epic in the HQ
-   `epics[]` registry that this repo's open blocks belong to. One `focused` epic → use it. More
-   than one, or none → **stop and ask**; do not pick.
+2. If `--lane` was given as a **path that exists**, read its `# ROADMAP:` header.
+3. `<BRAIN_ROOT>/planning/state.json` → `epics[]` → the `plan` pointer of the **single `focused`**
+   epic, resolved relative to `BRAIN_ROOT`. Exactly one `focused` epic → use it. **Zero or more than
+   one → stop and ask.** Never pick.
 
-Print what you resolved and where it came from. A lane driven against the wrong roadmap is worse
-than one driven against none.
+   *This is the path a bare `--lane <name>` takes*, since rule 2 needs a file you cannot locate yet.
+   It is also the fragile one: it infers the roadmap from what the fleet is currently focused on,
+   which is right during a focused run and wrong the moment two initiatives overlap. Pass
+   `--roadmap` explicitly whenever the run is not the focused epic.
 
-**The chain.** Read the lane file (strip `#` comments and blanks; file order is execution order) or
-take `--blocks` verbatim. Lane files may cover several repos in one running order — **take only your
-repo's section.** If the file has section markers for other repos and you cannot tell which is
-yours, stop and ask.
+**D. `roadmap_dir`** = the roadmap's directory.
+
+**E. The chain** — `--blocks` verbatim, or the lane file:
+- `--lane <path>` → that path.
+- `--lane <name>` (bare) → `<roadmap_dir>/lane-<name>.txt`. Missing → stop and list what
+  `lane-*.txt` files do exist there.
+
+**F. Cross-check** — if the resolved lane file carries a `# ROADMAP:` header and it disagrees with
+the roadmap resolved in C, **stop and report both.** That mismatch means the lane belongs to a
+different run than the one you inferred, and it is the failure this ordering exists to catch.
+
+Read the lane file with `#` comments and blanks stripped; file order is execution order. Lane files
+may cover several repos in one running order — **take only your repo's section.** If the file has
+section markers for other repos and you cannot tell which is yours, stop and ask.
+
+Print what you resolved and **which rule produced it**. A lane driven against the wrong roadmap is
+worse than one driven against none.
 
 ## Step 2 — Isolation policy
 
