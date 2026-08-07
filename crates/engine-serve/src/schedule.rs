@@ -22,7 +22,7 @@
 //! never need to add records, only tick through the ones already there").
 //! So a [`ScheduleRegistry`] is built from a store that has *already* been
 //! seeded with one [`CronRecord`] per entry (via `normalize_schedule` +
-//! `FileCronStore::upsert`, done by [`load_schedule_entries`]'s caller) —
+//! `FileCronStore::upsert`, done by [`build_seeded_registry`]) —
 //! [`ScheduleRegistry::register`] only attaches the workflow-facing metadata
 //! (`workflow_type`, `profile`, `data`) a `CronRecord` has no field for.
 //!
@@ -39,7 +39,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use engine_contract::envelope::{ChannelType, IngressEnvelope, SourcePayload};
 use engine_core::cron::record::{CronRecord, FireOutcome};
-use engine_core::cron::store::CronStore;
+use engine_core::cron::store::{CronStore, FileCronStore};
 use engine_core::cron::CronSchedule;
 use engine_core::{CancellationToken, PauseSignal};
 use serde::Deserialize;
@@ -192,6 +192,66 @@ fn load_schedule_entries_from_str(
     }
 
     Ok(entries)
+}
+
+/// The "two-part registration" caller named in this module's own doc: turn
+/// (`harness_path`, `store_path`) into a fully-seeded, fully-registered
+/// [`ScheduleRegistry`].
+///
+/// Loads `harness_path`'s `schedule.entries` via [`load_schedule_entries`],
+/// opens (or creates) a [`FileCronStore`] at `store_path`, `upsert`s one
+/// [`CronRecord`] per entry, then [`ScheduleRegistry::register`]s each
+/// entry's workflow-facing metadata on top.
+///
+/// **Restart safety.** `FileCronStore::upsert` replaces the whole record,
+/// so a re-seed (e.g. on process restart, against the same `store_path`)
+/// must not clobber a record's firing history: for a `cron_id` the store
+/// already has a record for, `created_at`/`last_fired_at`/`next_fire_at`
+/// are carried over from the existing record rather than reset to the
+/// load-time anchor — otherwise a restart could either immediately
+/// re-fire an entry that already fired, or skip ahead past one that
+/// hadn't. Only a brand-new `cron_id` gets `load_schedule_entries`'s
+/// load-time `next_fire_at` (see [`ScheduleEntry::next_fire_at`]'s doc for
+/// why that must be the loader's value, not a value recomputed here
+/// against a second, later `now`).
+///
+/// Zero configured entries yields an empty, freshly-opened store and an
+/// empty registry — no error, and [`FileCronStore::open`] is the only
+/// filesystem touch (it creates nothing until the first `upsert`).
+pub fn build_seeded_registry(
+    harness_path: &Path,
+    store_path: &Path,
+) -> Result<ScheduleRegistry, LoadScheduleError> {
+    let entries = load_schedule_entries(harness_path)?;
+    let store =
+        FileCronStore::open(store_path).map_err(|err| LoadScheduleError::Io(err.to_string()))?;
+
+    let seeded_at = Utc::now();
+    for entry in &entries {
+        let (created_at, last_fired_at, next_fire_at) = match store.get(&entry.cron_id) {
+            Some(existing) => (
+                existing.created_at,
+                existing.last_fired_at,
+                existing.next_fire_at,
+            ),
+            None => (seeded_at, None, entry.next_fire_at),
+        };
+        store.upsert(CronRecord {
+            id: entry.cron_id.clone(),
+            schedule: entry.schedule.clone(),
+            created_at,
+            enabled: true,
+            last_fired_at,
+            next_fire_at,
+        });
+    }
+
+    let mut registry = ScheduleRegistry::new(Arc::new(store));
+    for entry in entries {
+        registry.register(entry);
+    }
+
+    Ok(registry)
 }
 
 /// The seam a [`ScheduleRegistry::tick`] fire dispatches through. `entries`
@@ -633,6 +693,91 @@ mod tests {
         let path = dir.path().join("does-not-exist.json");
         let entries = load_schedule_entries(&path).expect("missing file is not an error");
         assert!(entries.is_empty());
+    }
+
+    fn write_harness_with_one_entry(dir: &Path, cron_id: &str) -> std::path::PathBuf {
+        let harness_path = dir.join("harness.json");
+        let raw = serde_json::json!({
+            "schedule": {
+                "entries": [
+                    {
+                        "cron_id": cron_id,
+                        "every_ms": 3_600_000,
+                        "workflow_type": "CONTENT_PIPELINE"
+                    }
+                ]
+            }
+        });
+        std::fs::write(&harness_path, raw.to_string()).expect("write harness.json");
+        harness_path
+    }
+
+    #[test]
+    fn build_seeded_registry_seeds_a_store_record_and_registers_metadata_for_each_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let harness_path = write_harness_with_one_entry(dir.path(), "hourly-check");
+        let store_path = dir.path().join("cron-store.json");
+
+        let registry =
+            build_seeded_registry(&harness_path, &store_path).expect("should build registry");
+
+        let record = registry
+            .store()
+            .get("hourly-check")
+            .expect("record should be seeded in the store");
+        assert!(record.enabled);
+        assert!(record.next_fire_at.is_some());
+
+        let entry = registry
+            .get("hourly-check")
+            .expect("entry should be registered");
+        assert_eq!(entry.next_fire_at, record.next_fire_at);
+        assert_eq!(entry.workflow_type, "CONTENT_PIPELINE");
+    }
+
+    #[test]
+    fn build_seeded_registry_with_zero_entries_yields_an_empty_registry_and_no_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let harness_path = dir.path().join("harness.json");
+        std::fs::write(&harness_path, "{}").expect("write harness.json");
+        let store_path = dir.path().join("cron-store.json");
+
+        let registry =
+            build_seeded_registry(&harness_path, &store_path).expect("should build registry");
+
+        assert!(registry.get("anything").is_none());
+        assert!(registry.store().list().is_empty());
+    }
+
+    #[test]
+    fn build_seeded_registry_reseeding_preserves_last_fired_at_and_next_fire_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let harness_path = write_harness_with_one_entry(dir.path(), "hourly-check");
+        let store_path = dir.path().join("cron-store.json");
+
+        let first = build_seeded_registry(&harness_path, &store_path).expect("first seed");
+        let fired_at = utc(2026, 1, 1, 0, 0, 0);
+        let post_fire_next = utc(2026, 1, 1, 1, 0, 0);
+        first.store().record_fire(
+            "hourly-check",
+            CronFireLogEntry {
+                fired_at,
+                scheduled_at: Some(fired_at),
+                outcome_kind: "reported",
+                note: Some("fired".to_string()),
+            },
+            Some(post_fire_next),
+        );
+
+        let second =
+            build_seeded_registry(&harness_path, &store_path).expect("re-seed should succeed");
+        let record = second
+            .store()
+            .get("hourly-check")
+            .expect("record should still exist");
+
+        assert_eq!(record.last_fired_at, Some(fired_at));
+        assert_eq!(record.next_fire_at, Some(post_fire_next));
     }
 
     #[test]
