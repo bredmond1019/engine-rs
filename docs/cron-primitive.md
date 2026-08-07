@@ -130,12 +130,20 @@ handling with `Tz` deriving `Serialize`/`Deserialize` for `CronSchedule::Calenda
 
 ## Status
 
-`EN.6.G`'s `crates/engine-serve/src/schedule.rs` is now the live caller: `ScheduleRegistry` wraps a
-`CronStore` seeded with one `CronRecord` per `planning/harness.json` `schedule.entries[]` entry,
-and `ScheduleRegistry::tick` polls `engine_core::cron::store::tick` on an interval, dispatching each
+`EN.6.G`'s `crates/engine-serve/src/schedule.rs` is the caller: `ScheduleRegistry` wraps a
+`CronStore` seeded with one `CronRecord` per `planning/harness.json` `schedule.entries[]` entry
+(via `build_seeded_registry`, `EN.ticket.cron-schedule-startup-wiring`), and
+`ScheduleRegistry::tick` drives `engine_core::cron::store::tick`, dispatching each
 due fire through `dispatch_scheduled_entry` — a `Schedule`-typed `IngressEnvelope` sent through the
 same non-blocking `dispatch_with_event` -> mint `run_id` -> `spawn_run` sequence
 `crate::http::post_events` uses, never a self-directed HTTP call. See
 [architecture.md § Schedule Source](architecture.md#schedule-source-eng6g) for the adapter's shape
 and [content-pipeline-workflow.md](content-pipeline-workflow.md) for how a scheduled fire reaches a
 workflow.
+
+**Nothing polls it yet.** `spawn_schedule_loop` (below) is the interval driver, but no live process
+calls it — the call site belongs in `bastion`'s `serve/mod.rs`, beside its existing
+`spawn_durable_writer(...)` call, and that is a different repo. **Until that lands, a configured
+`schedule.entries[]` entry will never fire**, silently and without an error. Do not read the
+paragraph above as "scheduling is running in production"; it is wired end-to-end *within this repo*
+only.

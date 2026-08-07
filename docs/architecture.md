@@ -235,7 +235,21 @@ into a workflow dispatch, without any HTTP self-call:
   `<workflow_key>.profiles` convention), normalizing each entry's `cron_expr`/`timezone`/`every_ms`
   via `engine_core::cron::normalize_schedule`. A missing file or missing `schedule` key is an empty
   `Vec`, not an error; a present-but-malformed one is `LoadScheduleError`.
-- `ScheduleRegistry` — wraps a `CronStore` (already seeded with one `CronRecord` per entry via
+- `build_seeded_registry(harness_path, store_path)` — the seeding caller
+  (`EN.ticket.cron-schedule-startup-wiring`): opens a `FileCronStore`, upserts one `CronRecord` per
+  loaded entry using the **load-time** `next_fire_at` anchor (`ScheduleEntry.next_fire_at`;
+  recomputing it against a later `now` would skew the first fire), and registers each entry's
+  workflow metadata. **Re-seeding a store that already holds a record for the same `cron_id`
+  preserves that record's `last_fired_at`/`next_fire_at`**, so a restart neither re-fires nor skips.
+- `spawn_schedule_loop(harness_path, state)` — the interval driver, mirroring
+  `crate::durable::spawn_durable_writer`'s "engine-serve owns the loop, the embedder calls it" seam.
+  `tokio::spawn`s a `tokio::time::interval` loop that runs each `tick` on `spawn_blocking` (the tick
+  persists to disk) and returns `Ok(Some(ScheduleLoopHandle))`. **Zero configured entries returns
+  `Ok(None)` and spawns nothing at all.** Two knobs, both read from `harness.json`'s `schedule`
+  block with behavior-stable defaults: `poll_interval_ms` (default `15_000`, deliberately under the
+  `60_000ms` floor `every_ms` enforces so the fastest legal entry cannot be missed) and `store_path`
+  (default: `cron-store.json` beside `harness.json`).
+- `ScheduleRegistry` — wraps a `CronStore` (seeded with one `CronRecord` per entry via
   `FileCronStore::upsert`, since the `CronStore` trait itself has no insert/upsert by design) plus
   the `ScheduleEntry` metadata attached via `register`. `ScheduleRegistry::tick(now, dispatch)`
   delegates every firing/catch-up mechanic to `engine_core::cron::store::tick`, calling `dispatch`
@@ -254,7 +268,14 @@ avoid an immediate cross-repo compile break for `bastion`, which constructs `App
 unpinned path dependency. See [cron-primitive.md](cron-primitive.md) for the underlying
 `CronSchedule`/`CronStore`/`tick()` primitive and `crates/engine-serve/tests/schedule.rs` for the
 end-to-end proof (one `ScheduleRegistry.tick()` fire dispatching one persist-shaped payload and one
-outbound-action-shaped record through `spawn_run`).
+outbound-action-shaped record through `spawn_run`, plus a configured entry driven all the way to an
+observed dispatch through `spawn_schedule_loop`).
+
+> **The loop is spawnable but unspawned.** No live process calls `spawn_schedule_loop` — the call
+> site belongs in `bastion`'s `serve/mod.rs` alongside `spawn_durable_writer`, which is a different
+> repo and therefore a separate block. Until it lands, a configured `schedule.entries[]` entry never
+> fires, with no error and no log line. Anything downstream that depends on a schedule (e.g. the
+> deferred newsletter digest) needs that block too, not just this one.
 
 ## Build & CI
 
