@@ -31,8 +31,12 @@ use engine_serve::dispatch::Dispatcher;
 use engine_serve::durable::spawn_durable_writer;
 use engine_serve::http::AppState;
 use engine_serve::live_state::LiveStateStore;
-use engine_serve::schedule::{dispatch_scheduled_entry, ScheduleEntry, ScheduleRegistry};
+use engine_serve::schedule::{
+    build_seeded_registry, dispatch_scheduled_entry, spawn_schedule_loop, ScheduleEntry,
+    ScheduleRegistry,
+};
 use serde_json::json;
+use std::sync::Mutex as StdMutex;
 use uuid::Uuid;
 
 const WORKFLOW_TYPE: &str = "CONTENT_PIPELINE_FIXTURE";
@@ -313,4 +317,222 @@ async fn a_disabled_scheduled_entry_dispatches_nothing() {
     let fired = registry.tick(now, |entry| dispatch_scheduled_entry(&state, entry, now));
 
     assert_eq!(fired, 0, "a disabled entry must never fire");
+}
+
+// -- Task 4: end-to-end proof through `spawn_schedule_loop` --------------
+//
+// The tests above drive `ScheduleRegistry::tick` directly. These prove the
+// spawnable bootstrap (`build_seeded_registry` + `spawn_schedule_loop`,
+// EN.ticket.cron-schedule-startup-wiring tasks 2/3) actually reaches
+// dispatch when driven from a temp `harness.json`, not merely that a
+// registry can be constructed.
+
+/// Same shape as `test_app_state`, but the dispatcher factory also records
+/// every dispatched event into a shared sink — the observation point for
+/// "the spawned loop's fire actually reached `dispatch_with_event`", since
+/// the loop runs in its own spawned task with no other channel back to the
+/// caller. Mirrors `crate::schedule`'s own `test_app_state` fixture
+/// (`crates/engine-serve/src/schedule.rs`'s `#[cfg(test)] mod tests`).
+fn test_app_state_with_recorder() -> (AppState, Arc<StdMutex<Vec<serde_json::Value>>>) {
+    let recorded: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
+    let recorded_for_factory = recorded.clone();
+
+    let mut dispatcher = Dispatcher::new();
+    dispatcher.register(
+        fixture_schema(),
+        Box::new(move |event: &serde_json::Value| {
+            recorded_for_factory
+                .lock()
+                .expect("recorded lock poisoned")
+                .push(event.clone());
+            Ok(fixture_workflow())
+        }),
+    );
+
+    let state = AppState {
+        dispatcher: Arc::new(dispatcher),
+        live: LiveStateStore::new(),
+        durable: spawn_durable_writer(None),
+        runs: RunRegistry::new(),
+        api_key: "schedule-loop-test-key".to_string(),
+    };
+    (state, recorded)
+}
+
+/// Write a temp `harness.json` with the given `schedule` block verbatim —
+/// the top-level shape [`build_seeded_registry`] /
+/// [`spawn_schedule_loop`] read (`schedule.entries`, `schedule.poll_interval_ms`,
+/// `schedule.store_path`).
+fn write_harness(dir: &std::path::Path, schedule: serde_json::Value) -> std::path::PathBuf {
+    let harness_path = dir.join("harness.json");
+    let harness = json!({ "schedule": schedule });
+    std::fs::write(&harness_path, harness.to_string()).expect("write harness.json");
+    harness_path
+}
+
+#[actix_web::test]
+async fn spawn_schedule_loop_drives_a_configured_entry_to_an_observed_dispatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("cron-store.json");
+    // A calendar entry firing every second (well under the interval
+    // schedule's 60_000ms floor, and calendar schedules carry no such
+    // floor) so the test does not need to wait a full minute for the
+    // load-time interval anchor (`now + every_ms`) to become due.
+    let harness_path = write_harness(
+        dir.path(),
+        json!({
+            "entries": [
+                {
+                    "cron_id": "loop-fires",
+                    "cron_expr": "* * * * * *",
+                    "timezone": "UTC",
+                    "workflow_type": WORKFLOW_TYPE,
+                    "profile": "cheap-fast",
+                    "data": { "source": "loop-test" }
+                }
+            ],
+            "poll_interval_ms": 50,
+            "store_path": store_path.to_string_lossy()
+        }),
+    );
+
+    let (state, recorded) = test_app_state_with_recorder();
+    let state = Arc::new(state);
+
+    let handle = spawn_schedule_loop(&harness_path, state.clone())
+        .expect("spawn_schedule_loop should succeed")
+        .expect("a configured entry should spawn a loop");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if !recorded.lock().expect("recorded lock poisoned").is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "spawned loop never dispatched the configured entry"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    handle.abort();
+
+    let events = recorded.lock().expect("recorded lock poisoned").clone();
+    assert!(
+        !events.is_empty(),
+        "the spawned loop should have dispatched at least one fire"
+    );
+    assert_eq!(
+        events[0]["envelope"]["channel_type"],
+        json!("schedule"),
+        "the dispatched event should carry the Schedule-channel envelope"
+    );
+}
+
+#[actix_web::test]
+async fn spawn_schedule_loop_with_zero_entries_spawns_nothing_and_dispatches_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("cron-store.json");
+    let harness_path = write_harness(
+        dir.path(),
+        json!({
+            "entries": [],
+            "poll_interval_ms": 20,
+            "store_path": store_path.to_string_lossy()
+        }),
+    );
+
+    let (state, recorded) = test_app_state_with_recorder();
+    let state = Arc::new(state);
+
+    let handle = spawn_schedule_loop(&harness_path, state)
+        .expect("spawn_schedule_loop should succeed with zero entries");
+    assert!(
+        handle.is_none(),
+        "zero configured entries must spawn no loop"
+    );
+
+    // Give a would-be loop time to have woken up at least once, to prove
+    // the negative rather than just the absence of a handle.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        recorded.lock().expect("recorded lock poisoned").is_empty(),
+        "zero configured entries must never dispatch"
+    );
+}
+
+#[actix_web::test]
+async fn build_seeded_registry_reseed_after_a_real_fire_does_not_immediately_refire() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("cron-store.json");
+    let harness_path = write_harness(
+        dir.path(),
+        json!({
+            "entries": [
+                {
+                    "cron_id": "restart-entry",
+                    "every_ms": 3_600_000,
+                    "workflow_type": WORKFLOW_TYPE
+                }
+            ],
+            "store_path": store_path.to_string_lossy()
+        }),
+    );
+
+    // First boot: seed the store, then force the record due right now (an
+    // hourly entry would not naturally be due within the test) and fire it
+    // for real through `registry.tick` + `dispatch_scheduled_entry` — a
+    // real fire, not a hand-built `CronFireLogEntry`.
+    let first = build_seeded_registry(&harness_path, &store_path).expect("first seed");
+    let entry = first
+        .get("restart-entry")
+        .expect("entry should be registered")
+        .clone();
+    let due_store = FileCronStore::open(&store_path).expect("reopen store");
+    let now = Utc::now();
+    due_store.upsert(CronRecord {
+        id: "restart-entry".to_string(),
+        schedule: entry.schedule.clone(),
+        created_at: now,
+        enabled: true,
+        last_fired_at: None,
+        next_fire_at: Some(now),
+    });
+
+    let mut manual_registry = ScheduleRegistry::new(Arc::new(due_store));
+    manual_registry.register(entry);
+    let (state, recorded) = test_app_state_with_recorder();
+    let fired = manual_registry.tick(now, |e| dispatch_scheduled_entry(&state, e, now));
+    assert_eq!(fired, 1, "the forced-due entry should fire exactly once");
+    assert_eq!(
+        recorded.lock().expect("recorded lock poisoned").len(),
+        1,
+        "the fire should have reached dispatch"
+    );
+
+    // "Restart": re-seed from the same harness.json + store_path. The
+    // record's post-fire `next_fire_at` (now + 1h, advanced by the fire
+    // above) must survive, not be reset to a fresh load-time anchor.
+    let second = build_seeded_registry(&harness_path, &store_path).expect("re-seed after fire");
+    let record = second
+        .store()
+        .get("restart-entry")
+        .expect("record should still exist after restart");
+
+    assert!(
+        record.last_fired_at.is_some(),
+        "restart must preserve firing history"
+    );
+    assert!(
+        record.next_fire_at.expect("next_fire_at should be set") > now,
+        "restart must not immediately re-fire an entry that just fired"
+    );
+
+    // And driving a tick at the same `now` again must not fire it a
+    // second time.
+    let refired = second.tick(now, |e| dispatch_scheduled_entry(&state, e, now));
+    assert_eq!(
+        refired, 0,
+        "a re-seeded registry must not immediately re-fire an entry that already fired"
+    );
 }
