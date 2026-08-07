@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-04T04:30:00Z"
+timestamp: "2026-08-07T02:10:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,32 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [run: 2026-08-07]
+
+### Lane C substrate (C5) — both engine-rs blocks closed via `/begin-orchestration` + `/sdlc-task`
+- **What:** Drove the demand-ready roadmap's substrate lane, engine-rs section, in place on `main`.
+  `EN.ticket.call-timeout-policy-knob` closed as a **no-op re-validation** — its 5 tasks were already
+  implemented and committed in prior sessions (`26b1d02`, `b653e52`) while `state.json` still read
+  `open`, so the run changed zero files. `EN.ticket.cron-schedule-startup-wiring` closed with real
+  work across 4 commits: `ScheduleEntry.next_fire_at` (the loader had been discarding
+  `normalize_schedule`'s first-fire anchor, exactly what seeding needs), `build_seeded_registry()`
+  (the seeding caller the module doc claimed existed but did not), `spawn_schedule_loop()` (a
+  `tokio` interval driver that spawns nothing when no entries are configured), restart-safe
+  re-seeding, and two `harness.json` knobs (`schedule.poll_interval_ms` = 15000,
+  `schedule.store_path`). Then a close-out pass: filled the `read_schedule_loop_config` coverage gap
+  and corrected `cron-primitive.md`/`architecture.md`, which described the scheduler as already
+  polling in production when nothing has ever called it.
+- **Why:** The engine had a complete, tested cron primitive that was reachable only from test code —
+  a configured schedule entry would have sat silently and never fired. This block built the missing
+  plumbing. **It still does not run:** the call site belongs in `bastion`'s `serve/mod.rs` beside
+  `spawn_durable_writer`, a different repo, so it is a separate block. The roadmap's claim that this
+  block alone unblocks the newsletter digest is therefore wrong.
+- **Refs:** `planning/orchestration-run/notes.md` (attention items + mid-run decisions),
+  `planning/orchestration-run/review.md` (plain-English overview + manual verification),
+  `planning/handoff.md`, lane log `planning/demand-ready/lane-log.jsonl`.
 
 ---
 
