@@ -60,6 +60,14 @@ pub struct ScheduleEntry {
     pub workflow_type: String,
     pub profile: Option<String>,
     pub data: serde_json::Value,
+    /// The first-fire anchor `engine_core::cron::normalize_schedule` computed
+    /// for this entry at load time (against the `now` [`load_schedule_entries`]
+    /// / [`load_schedule_entries_from_str`] were called with). Seeding a
+    /// [`CronRecord`] from this entry must use this exact value rather than
+    /// recomputing `normalize_schedule` against a second, later `now` — doing
+    /// so would skew the first fire. `None` only for hand-built entries (e.g.
+    /// test fixtures) that never went through the loader.
+    pub next_fire_at: Option<DateTime<Utc>>,
 }
 
 /// The raw shape a `planning/harness.json` `schedule[]` entry deserializes
@@ -167,7 +175,7 @@ fn load_schedule_entries_from_str(
             every_ms: raw_entry.every_ms,
             first_fire_at: None,
         };
-        let (schedule, _next_fire_at) = engine_core::cron::normalize_schedule(normalized, now)
+        let (schedule, next_fire_at) = engine_core::cron::normalize_schedule(normalized, now)
             .map_err(|err| LoadScheduleError::InvalidSchedule {
                 cron_id: raw_entry.cron_id.clone(),
                 message: err.to_string(),
@@ -179,6 +187,7 @@ fn load_schedule_entries_from_str(
             workflow_type: raw_entry.workflow_type,
             profile: raw_entry.profile,
             data: raw_entry.data,
+            next_fire_at: Some(next_fire_at),
         });
     }
 
@@ -446,6 +455,7 @@ mod tests {
             workflow_type: "CONTENT_PIPELINE".to_string(),
             profile: Some("cheap-fast".to_string()),
             data: serde_json::json!({ "source": "daily-digest" }),
+            next_fire_at: Some(utc(2026, 1, 1, 0, 0, 0)),
         }
     }
 
@@ -548,9 +558,49 @@ mod tests {
         assert_eq!(entries[0].cron_id, "daily-digest");
         assert_eq!(entries[0].profile, Some("cheap-fast".to_string()));
         assert!(matches!(entries[0].schedule, CronSchedule::Calendar { .. }));
+        assert!(entries[0].next_fire_at.is_some());
         assert_eq!(entries[1].cron_id, "hourly-check");
         assert_eq!(entries[1].profile, None);
         assert!(matches!(entries[1].schedule, CronSchedule::Interval { .. }));
+        assert!(entries[1].next_fire_at.is_some());
+    }
+
+    #[test]
+    fn load_schedule_entries_from_str_carries_normalize_schedules_anchor_for_the_same_now() {
+        let now = utc(2026, 1, 1, 0, 0, 0);
+        let raw = serde_json::json!({
+            "schedule": {
+                "entries": [
+                    {
+                        "cron_id": "hourly-check",
+                        "every_ms": 3_600_000,
+                        "workflow_type": "CONTENT_PIPELINE"
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let entries = load_schedule_entries_from_str(&raw, now).expect("should parse");
+        assert_eq!(entries.len(), 1);
+
+        // Independently recompute what normalize_schedule returns for the
+        // same raw shape and the same `now` — the loaded entry's
+        // `next_fire_at` must match this exactly, not a value recomputed
+        // against some later `now`.
+        let expected = engine_core::cron::normalize_schedule(
+            engine_core::cron::RawSchedule {
+                cron_expr: None,
+                timezone: None,
+                every_ms: Some(3_600_000),
+                first_fire_at: None,
+            },
+            now,
+        )
+        .expect("valid schedule")
+        .1;
+
+        assert_eq!(entries[0].next_fire_at, Some(expected));
     }
 
     #[test]

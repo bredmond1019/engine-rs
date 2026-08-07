@@ -186,6 +186,7 @@ fn schedule_entry() -> ScheduleEntry {
         workflow_type: WORKFLOW_TYPE.to_string(),
         profile: Some("cheap-fast".to_string()),
         data: json!({ "source": "daily-digest" }),
+        next_fire_at: Some(utc(2026, 1, 1, 0, 0, 0)),
     }
 }
 
