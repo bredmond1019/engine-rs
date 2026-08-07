@@ -942,6 +942,84 @@ mod tests {
     }
 
     #[test]
+    fn read_schedule_loop_config_falls_back_to_both_defaults_when_unconfigured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Three ways to be "unconfigured", all of which must yield the
+        // behavior-stable defaults rather than an error: no file at all, a
+        // file with no `schedule` key, and explicit nulls.
+        let missing = dir.path().join("absent-harness.json");
+
+        let no_key = dir.path().join("no-key.json");
+        std::fs::write(&no_key, "{}").expect("write no-key harness");
+
+        let explicit_nulls = dir.path().join("nulls.json");
+        std::fs::write(
+            &explicit_nulls,
+            r#"{ "schedule": { "poll_interval_ms": null, "store_path": null } }"#,
+        )
+        .expect("write nulls harness");
+
+        for harness_path in [&missing, &no_key, &explicit_nulls] {
+            let (interval, store_path) =
+                read_schedule_loop_config(harness_path).expect("defaults are not an error");
+            assert_eq!(
+                interval,
+                std::time::Duration::from_millis(DEFAULT_SCHEDULE_POLL_INTERVAL_MS),
+                "unconfigured poll interval should fall back to the built-in default"
+            );
+            assert_eq!(
+                store_path,
+                default_schedule_store_path(harness_path),
+                "unconfigured store path should fall back beside harness.json"
+            );
+        }
+
+        // The default must stay under the 60_000ms `every_ms` floor that
+        // `schedule.entries` enforces, or the fastest legal interval entry
+        // could come due and be missed between polls.
+        assert!(
+            DEFAULT_SCHEDULE_POLL_INTERVAL_MS < 60_000,
+            "default poll interval must not exceed the every_ms floor"
+        );
+    }
+
+    #[test]
+    fn read_schedule_loop_config_honours_configured_values_and_rejects_malformed_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let configured = dir.path().join("configured.json");
+        std::fs::write(
+            &configured,
+            r#"{ "schedule": { "poll_interval_ms": 5000, "store_path": "/tmp/somewhere/cron.json" } }"#,
+        )
+        .expect("write configured harness");
+
+        let (interval, store_path) =
+            read_schedule_loop_config(&configured).expect("configured values should parse");
+        assert_eq!(interval, std::time::Duration::from_millis(5000));
+        assert_eq!(
+            store_path,
+            std::path::PathBuf::from("/tmp/somewhere/cron.json")
+        );
+
+        // Present-but-malformed is an error, unlike absent (the distinction
+        // `load_schedule_entries` already draws).
+        let bad_interval = dir.path().join("bad-interval.json");
+        std::fs::write(
+            &bad_interval,
+            r#"{ "schedule": { "poll_interval_ms": "soon" } }"#,
+        )
+        .expect("write bad interval");
+        assert!(read_schedule_loop_config(&bad_interval).is_err());
+
+        let bad_path = dir.path().join("bad-path.json");
+        std::fs::write(&bad_path, r#"{ "schedule": { "store_path": 42 } }"#)
+            .expect("write bad path");
+        assert!(read_schedule_loop_config(&bad_path).is_err());
+    }
+
+    #[test]
     fn build_schedule_envelope_carries_schedule_channel_type_and_workflow_trigger_source() {
         let entry = schedule_entry("daily-digest");
         let fired_at = utc(2026, 1, 1, 12, 0, 0);
