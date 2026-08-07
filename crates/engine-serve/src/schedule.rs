@@ -33,8 +33,9 @@
 //! retry policy.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use engine_contract::envelope::{ChannelType, IngressEnvelope, SourcePayload};
@@ -254,6 +255,154 @@ pub fn build_seeded_registry(
     Ok(registry)
 }
 
+/// Behavior-stable fallback for `schedule.poll_interval_ms` when
+/// `harness.json` doesn't set it (standing rule 6 — a knob's built-in
+/// default must not change what an existing run does; since the default
+/// `schedule.entries` is `[]`, no interval value changes any behavior until
+/// an entry is actually configured). Comfortably under the 60_000ms
+/// `every_ms` floor `schedule.entries` already enforces, so the fastest
+/// legal interval entry cannot fire and clear before the loop next polls.
+const DEFAULT_SCHEDULE_POLL_INTERVAL_MS: u64 = 15_000;
+
+/// Behavior-stable fallback for `schedule.store_path` when `harness.json`
+/// doesn't set it: a `cron-store.json` file next to `harness_path` itself,
+/// so a fresh checkout with no `schedule.store_path` configured still has a
+/// sane, discoverable place for [`FileCronStore`] to persist to.
+fn default_schedule_store_path(harness_path: &Path) -> PathBuf {
+    harness_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("cron-store.json")
+}
+
+/// Read the `schedule.poll_interval_ms` / `schedule.store_path` knobs out of
+/// `harness_path` (documented in `planning/harness.json` alongside
+/// `schedule.entries`), falling back to
+/// [`DEFAULT_SCHEDULE_POLL_INTERVAL_MS`] / [`default_schedule_store_path`]
+/// for whichever is absent. A missing `harness_path` or a missing/absent
+/// `schedule` key both yield the defaults (mirrors
+/// [`load_schedule_entries`]'s own "missing is not an error" rule) — only a
+/// present-but-malformed value is an error.
+fn read_schedule_loop_config(
+    harness_path: &Path,
+) -> Result<(Duration, PathBuf), LoadScheduleError> {
+    let default_store_path = default_schedule_store_path(harness_path);
+    if !harness_path.exists() {
+        return Ok((
+            Duration::from_millis(DEFAULT_SCHEDULE_POLL_INTERVAL_MS),
+            default_store_path,
+        ));
+    }
+
+    let raw = std::fs::read_to_string(harness_path)
+        .map_err(|err| LoadScheduleError::Io(err.to_string()))?;
+    let harness: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|err| LoadScheduleError::Parse(err.to_string()))?;
+
+    let Some(schedule) = harness.get("schedule") else {
+        return Ok((
+            Duration::from_millis(DEFAULT_SCHEDULE_POLL_INTERVAL_MS),
+            default_store_path,
+        ));
+    };
+
+    let poll_interval_ms = match schedule.get("poll_interval_ms") {
+        None | Some(serde_json::Value::Null) => DEFAULT_SCHEDULE_POLL_INTERVAL_MS,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            LoadScheduleError::Parse("schedule.poll_interval_ms must be a positive integer".into())
+        })?,
+    };
+
+    let store_path = match schedule.get("store_path") {
+        None | Some(serde_json::Value::Null) => default_store_path,
+        Some(value) => PathBuf::from(value.as_str().ok_or_else(|| {
+            LoadScheduleError::Parse("schedule.store_path must be a string".into())
+        })?),
+    };
+
+    Ok((Duration::from_millis(poll_interval_ms), store_path))
+}
+
+/// A handle to the background schedule tick loop [`spawn_schedule_loop`]
+/// spawned. Mirrors `crate::durable::DurableHandle`'s "hold or drop" shape:
+/// the caller may hold this to [`abort`](Self::abort) the loop (e.g. on
+/// shutdown) or drop it — dropping does **not** stop the loop (a
+/// `tokio::task::JoinHandle` detaches on drop), matching how the durable
+/// writer's own background task is not torn down by dropping its handle
+/// either.
+pub struct ScheduleLoopHandle {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ScheduleLoopHandle {
+    /// Stop the background tick loop.
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+/// The spawnable schedule bootstrap: seed a [`ScheduleRegistry`] from
+/// `harness_path` (via [`build_seeded_registry`]) and, if any entries were
+/// configured, `tokio::spawn` a background loop that polls
+/// [`ScheduleRegistry::tick`] on a `tokio::time::interval` and dispatches
+/// each fire through [`dispatch_scheduled_entry`].
+///
+/// **Zero entries is a no-op**: nothing is spawned and nothing is logged —
+/// adding this call to a startup path does not change the behavior of any
+/// run that has no `schedule.entries` configured (the harness.json default).
+///
+/// **The tick stays off the async path.** `ScheduleRegistry::tick` calls
+/// into `FileCronStore`, which persists to disk synchronously
+/// (`engine_core::cron::store`), so each poll runs inside
+/// `tokio::task::spawn_blocking` rather than directly in the loop's async
+/// block — a slow disk write must not stall every other task on this
+/// process's runtime.
+///
+/// The poll interval and the store path are both knobs (standing rule 6),
+/// read from `harness_path`'s `schedule` block via
+/// [`read_schedule_loop_config`] — see [`DEFAULT_SCHEDULE_POLL_INTERVAL_MS`]
+/// / [`default_schedule_store_path`] for their built-in defaults.
+///
+/// Returns `Ok(None)` (nothing spawned) for zero configured entries, or
+/// `Ok(Some(handle))` once the loop is running. The one remaining wiring
+/// step — calling this from a live process's startup path — is a different
+/// repo's change (`bastion`'s `serve/mod.rs`, alongside its existing
+/// `spawn_durable_writer` call) and is out of scope here; see this spec's
+/// Notes.
+pub fn spawn_schedule_loop(
+    harness_path: &Path,
+    state: Arc<AppState>,
+) -> Result<Option<ScheduleLoopHandle>, LoadScheduleError> {
+    let (poll_interval, store_path) = read_schedule_loop_config(harness_path)?;
+    let registry = build_seeded_registry(harness_path, &store_path)?;
+
+    if registry.is_empty() {
+        return Ok(None);
+    }
+
+    let entry_count = registry.len();
+    let registry = Arc::new(registry);
+
+    let task = tokio::spawn(async move {
+        println!("schedule loop: starting with {entry_count} entries");
+
+        let mut interval = tokio::time::interval(poll_interval);
+        loop {
+            interval.tick().await;
+
+            let registry = registry.clone();
+            let state = state.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let now = Utc::now();
+                registry.tick(now, |entry| dispatch_scheduled_entry(&state, entry, now))
+            })
+            .await;
+        }
+    });
+
+    Ok(Some(ScheduleLoopHandle { task }))
+}
+
 /// The seam a [`ScheduleRegistry::tick`] fire dispatches through. `entries`
 /// is the workflow-facing metadata attached via [`ScheduleRegistry::register`];
 /// `store` holds the pure cron mechanics (`CronRecord`, fire log,
@@ -290,6 +439,18 @@ impl ScheduleRegistry {
     /// The durable store this registry ticks through.
     pub fn store(&self) -> &Arc<dyn CronStore> {
         &self.store
+    }
+
+    /// The number of registered entries — used by [`spawn_schedule_loop`] to
+    /// decide whether spawning a tick loop is worthwhile at all (zero
+    /// entries must spawn nothing, per this module's Acceptance Criteria).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `true` iff no entries are registered.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Poll the store for every due, enabled [`CronRecord`] as of `now`,
