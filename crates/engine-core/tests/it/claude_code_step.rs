@@ -11,13 +11,14 @@
 //! block's real-session acceptance check, not part of the gated suite.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRunStatus, TaskContext};
+use engine_core::workflows::sdlc_flow::policy::TransportRetry;
 use engine_core::{
     CancellationToken, ClaudeCodeStep, Node, NodeConfig, NodeRegistry, RunOptions, Workflow,
     WorkflowSchema, CANCELLATION_METADATA_KEY,
@@ -136,6 +137,282 @@ async fn workflow_run_maps_sdk_error_to_failed_status_and_halts() {
     // The walk halted: no node output was ever written.
     assert!(!result.nodes.contains_key(NODE_NAME));
 }
+
+/// A retry policy with negligible backoff, used across the retry tests below
+/// so the hermetic suite stays fast — the retry *count* and *outcome* are
+/// under test here, not real backoff timing (that's `MAX_TRANSPORT_BACKOFF_MS`
+/// in `claude_code_step.rs`).
+fn fast_retry(max_attempts: u32) -> TransportRetry {
+    TransportRetry {
+        max_attempts,
+        initial_backoff_ms: 1,
+    }
+}
+
+/// Stub transport that counts every invocation in `calls` and fails with
+/// `err()` on the first `fail_count` attempts before succeeding — the
+/// fail-then-succeed shape `ticket-implement-node-transport-retry` Task 3
+/// requires to prove a transient failure recovers.
+fn counting_stub_transport(
+    calls: Arc<AtomicU32>,
+    fail_count: u32,
+    err: fn() -> claude_code_rs::Error,
+) -> impl Fn(Config, String) -> futures::future::BoxFuture<'static, claude_code_rs::Result<Outcome>>
+{
+    move |_config, _prompt| {
+        let calls = calls.clone();
+        Box::pin(async move {
+            // A real transport is never instantly ready — it always has at
+            // least one await point. Yielding once here gives
+            // `race_one_attempt`'s `tokio::select!` a real Pending/Ready
+            // split to race against a cancellation, instead of two
+            // synchronously-ready futures whose winner would otherwise be an
+            // unspecified (and flaky) `select!` tiebreak.
+            tokio::task::yield_now().await;
+            let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= fail_count {
+                Err(err())
+            } else {
+                Ok(stub_outcome())
+            }
+        })
+    }
+}
+
+/// A transient transport failure (per Task 1's Amendment Log,
+/// `claude_code_rs::Error::Timeout` is retryable) that fails once then
+/// succeeds must produce a successful node run, with output stamped exactly
+/// as an unretried call's would be.
+#[tokio::test]
+async fn transient_failure_recovers_and_stamps_success() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_retry_policy(fast_retry(3))
+        .with_transport(counting_stub_transport(calls.clone(), 1, || {
+            claude_code_rs::Error::Timeout
+        }));
+
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(step));
+
+    let workflow = Workflow::new(registry, single_node_schema());
+    let on_progress: engine_core::OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("workflow should complete successfully after the retried attempt");
+
+    let run = result
+        .node_runs
+        .get(NODE_NAME)
+        .expect("node_runs entry present");
+    assert_eq!(run.status, NodeRunStatus::Success);
+    assert!(run.error.is_none());
+
+    let usage = run.usage.as_ref().expect("usage should be stamped");
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(50));
+    assert_eq!(usage.model, "claude-sonnet-4-5");
+
+    // Output is stamped exactly as an unretried call's would be — same shape
+    // as `workflow_run_stamps_success_usage_and_round_trips_context` above.
+    let output = result
+        .nodes
+        .get(NODE_NAME)
+        .expect("node output should be present");
+    assert_eq!(output["content"], "ok");
+    assert_eq!(output["model"], "claude-sonnet-4-5");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one failed attempt followed by one successful retry"
+    );
+}
+
+/// A persistent failure (every attempt errors) must still yield a
+/// `NodeError` once the retry budget is exhausted — the halt is deferred,
+/// never removed — and the error must surface the underlying transport
+/// message, not a generic "retries exhausted" string.
+#[tokio::test]
+async fn persistent_failure_still_halts_with_underlying_message() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_retry_policy(fast_retry(3))
+        .with_transport(counting_stub_transport(calls.clone(), u32::MAX, || {
+            claude_code_rs::Error::Timeout
+        }));
+
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(step));
+
+    let workflow = Workflow::new(registry, single_node_schema());
+    let on_progress: engine_core::OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("run should return Ok with the accumulated context even on node failure");
+
+    let run = result
+        .node_runs
+        .get(NODE_NAME)
+        .expect("node_runs entry present");
+    assert_eq!(run.status, NodeRunStatus::Failed);
+    assert_eq!(
+        run.error.as_deref(),
+        Some(claude_code_rs::Error::Timeout.to_string().as_str()),
+        "the underlying transport message must surface, not a generic \
+         'retries exhausted' string"
+    );
+    assert!(!result.nodes.contains_key(NODE_NAME));
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "attempts must be bounded by the configured max_attempts, not retried \
+         unboundedly before the halt is reported"
+    );
+}
+
+/// Attempt count is bounded by the policy's `max_attempts`, not open-ended —
+/// asserted directly against `ClaudeCodeStep::process` (bypassing the
+/// workflow harness) with a timeout so a future regression that retries
+/// unboundedly fails loudly rather than hanging the suite.
+#[tokio::test]
+async fn attempt_count_is_bounded_and_does_not_hang() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_retry_policy(fast_retry(5))
+        .with_transport(counting_stub_transport(calls.clone(), u32::MAX, || {
+            claude_code_rs::Error::Api {
+                status: Some(503),
+                message: "service unavailable".to_string(),
+            }
+        }));
+
+    let ctx = TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let result = tokio::time::timeout(Duration::from_secs(5), step.process(ctx))
+        .await
+        .expect("a bounded retry loop must not hang the suite");
+
+    assert!(
+        result.is_err(),
+        "a persistent failure must still become a NodeError once the budget \
+         is exhausted"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "invocation count must equal the configured max_attempts exactly, \
+         never more"
+    );
+}
+
+/// Zero behaviour change on the happy path: a first-attempt success invokes
+/// the transport exactly once, with no speculative extra call.
+#[tokio::test]
+async fn happy_path_invokes_transport_exactly_once() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_retry_policy(fast_retry(3))
+        .with_transport(counting_stub_transport(calls.clone(), 0, || {
+            claude_code_rs::Error::Timeout
+        }));
+
+    let ctx = TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let out = step
+        .process(ctx)
+        .await
+        .expect("a first-attempt success must not error");
+
+    // `process()` called directly (bypassing the `Workflow` harness that
+    // stamps the terminal `Success` status) still writes the node's output
+    // and usage on a successful call — that's what proves the transport
+    // resolved without needing the full workflow round-trip.
+    let output = out
+        .nodes
+        .get(NODE_NAME)
+        .expect("node output should be present on a successful call");
+    assert_eq!(output["content"], "ok");
+    assert!(out.node_runs.get(NODE_NAME).unwrap().usage.is_some());
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a first-attempt success must invoke the transport exactly once"
+    );
+}
+
+/// A pre-cancelled token racing an always-failing stub must never be
+/// retried: `process` returns `Ok(ctx)` unchanged (per
+/// `with_cancellation_token`'s documented semantics) and the transport is
+/// never invoked at all — the regression this ticket exists to prevent
+/// (a retry wrapper resurrecting a cancelled run by re-entering the
+/// transport after the cancel already won).
+#[tokio::test]
+async fn pre_cancelled_token_is_never_retried_into_the_transport() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let token = CancellationToken::new();
+    token.cancel();
+
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_cancellation_token(token)
+        .with_retry_policy(fast_retry(5))
+        .with_transport(counting_stub_transport(calls.clone(), u32::MAX, || {
+            claude_code_rs::Error::Timeout
+        }));
+
+    let ctx = TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let out = tokio::time::timeout(Duration::from_secs(1), step.process(ctx))
+        .await
+        .expect("a pre-cancelled token must return promptly, not hang")
+        .expect("a cancellation win must return Ok, not a NodeError");
+
+    assert!(
+        !out.nodes.contains_key(NODE_NAME),
+        "a cancelled node must not stamp any output"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the transport must never be entered once the token is already \
+         cancelled — the retry loop must check cancellation before the \
+         first attempt, not just between attempts"
+    );
+}
+
+// Blast radius (AC9 / Task 3 AC6): `ClaudeCodeStep` backs five call sites —
+// implement, triage, review, generate, and docs — and the retry above is a
+// property of the node itself, applied uniformly to all constructors
+// (`ClaudeCodeStep::new` / `with_prompt_builder`) rather than gated to any
+// one caller's identity. Every test above exercises the node directly
+// through its public `process`/`with_transport`/`with_retry_policy` surface
+// with no per-caller branching anywhere in `claude_code_step.rs`, so the
+// same bounded retry-with-backoff applies identically regardless of which
+// of the five stages constructs the step — there is no code path by which
+// e.g. triage's calls would retry while implement's did not, or vice versa.
+// The full reasoning (why applying it uniformly rather than implement-only
+// is the right tradeoff) is recorded in this ticket's Amendment Log.
 
 /// Sets a shared flag when dropped — lets a stub transport future prove it
 /// was actually dropped (not awaited to completion) by a cancellation win.
