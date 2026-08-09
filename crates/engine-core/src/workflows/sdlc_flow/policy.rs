@@ -890,6 +890,102 @@ mod tests {
         assert_eq!(untouched.review_diff_max_chars, 120_000);
     }
 
+    /// Change-detector pinning `TransportRetry`'s built-in default (3
+    /// attempts, 200ms initial backoff) — see its docs for why this is
+    /// deliberately NOT behavior-stable on the failure path.
+    #[test]
+    fn builtin_default_transport_retry_allows_two_retries() {
+        let tr = SdlcPolicy::default().transport_retry;
+        assert_eq!(
+            tr,
+            TransportRetry {
+                max_attempts: 3,
+                initial_backoff_ms: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn merge_transport_retry_overrides_only_the_fields_it_sets() {
+        let base = TransportRetry {
+            max_attempts: 3,
+            initial_backoff_ms: 200,
+        };
+        let over = PartialTransportRetry {
+            max_attempts: None,
+            initial_backoff_ms: Some(500),
+        };
+        let merged = merge_transport_retry(base, &over);
+        // `None` in the override leaves the base value alone.
+        assert_eq!(merged.max_attempts, 3);
+        assert_eq!(merged.initial_backoff_ms, 500);
+
+        let capped = PartialTransportRetry {
+            max_attempts: Some(1),
+            initial_backoff_ms: None,
+        };
+        let merged = merge_transport_retry(base, &capped);
+        assert_eq!(merged.max_attempts, 1);
+        assert_eq!(merged.initial_backoff_ms, 200);
+    }
+
+    #[test]
+    fn transport_retry_resolves_through_all_four_layers_in_precedence_order() {
+        let harness = PartialPolicy {
+            transport_retry: Some(PartialTransportRetry {
+                max_attempts: Some(2),
+                initial_backoff_ms: Some(100),
+            }),
+            ..Default::default()
+        };
+        let profile = PartialPolicy {
+            transport_retry: Some(PartialTransportRetry {
+                max_attempts: Some(5),
+                initial_backoff_ms: Some(400),
+            }),
+            ..Default::default()
+        };
+        let event = PartialPolicy {
+            transport_retry: Some(PartialTransportRetry {
+                initial_backoff_ms: Some(900),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            SdlcPolicy::default(),
+            Some(&harness),
+            Some(&profile),
+            Some(&event),
+        );
+        // event > profile > harness > builtin.
+        assert_eq!(resolved.transport_retry.initial_backoff_ms, 900);
+        // event left `max_attempts` unset, so the profile's value survives.
+        assert_eq!(resolved.transport_retry.max_attempts, 5);
+
+        // Only harness -> harness wins over builtin.
+        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, None);
+        assert_eq!(resolved.transport_retry.max_attempts, 2);
+        assert_eq!(resolved.transport_retry.initial_backoff_ms, 100);
+
+        // Nothing anywhere -> the built-in default.
+        let untouched = resolve(SdlcPolicy::default(), None, None, None);
+        assert_eq!(untouched.transport_retry, TransportRetry::default());
+    }
+
+    #[test]
+    fn deserializes_partial_transport_retry_from_harness_json_shape() {
+        let json = r#"{ "transport_retry": { "max_attempts": 5 } }"#;
+        let partial: PartialPolicy = serde_json::from_str(json).expect("valid PartialPolicy JSON");
+        let tr = partial
+            .transport_retry
+            .as_ref()
+            .expect("transport_retry present");
+        assert_eq!(tr.max_attempts, Some(5));
+        // Absent fields stay `None` and fall through on merge.
+        assert_eq!(tr.initial_backoff_ms, None);
+    }
+
     #[test]
     fn deserializes_partial_retry_feedback_from_harness_json_shape() {
         let json = r#"{ "retry_feedback": { "max_chars": 1500 } }"#;
