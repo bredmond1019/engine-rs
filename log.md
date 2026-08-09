@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-07T02:10:00Z"
+timestamp: "2026-08-09T13:30:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,42 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+---
+
+## [run: 2026-08-09]
+
+### C5 substrate lane closed (stale-generate-timeout-caveat, implement-node-transport-retry) + close-out
+- **What:** Drove `planning/close-the-loop/roadmap.md`'s substrate lane, engine-rs section (C5), via
+  `/begin-orchestration` + two `/sdlc-task` runs, then `/close-out`.
+  `EN.ticket.stale-generate-timeout-caveat` closed (4/4 tasks): fixed a stale doc comment on
+  `CallTimeouts` claiming `generate` wasn't consumed by `GenerateTasksNode` when it had been for
+  five days, corrected `docs/sdlc-flow-workflow.md`'s policy-reader rows, and filled two real gaps
+  in `docs/sdlc-flow-policy.md` (missing `docs` knob, undocumented `timeouts.*` family, wrong
+  `harness.json` example default). Zero `.rs` behavior change.
+  `EN.ticket.implement-node-transport-retry` closed (5/5 tasks): decided and recorded shape (A) —
+  bounded in-node retry with backoff — in the ticket's own Amendment Log before writing code, per
+  its own AC1. Landed `TransportRetry`/`PartialTransportRetry` on `SdlcPolicy` (full four-layer
+  resolution) and wrapped all four transport call sites in `ClaudeCodeStep::process` with
+  retry-with-backoff, cancellation re-checked between attempts. Confirmed the blast radius: all
+  five `ClaudeCodeStep` consumers (implement/triage/review/generate/docs) share one retry budget
+  today. This clears the `sdlc-flow-implement-transport-failures-not-retried` carryover (deleted).
+  `/close-out` then ran the full gate clean (fmt/clippy/nextest 1799/1799/build --release), found
+  and filled one real coverage gap — `merge_transport_retry`'s four-layer resolution had zero
+  direct tests, unlike every sibling policy knob — and added 5 tests mirroring the existing
+  pattern.
+- **Why:** The C5 lane was queued substrate work: one doc/code reconciliation ticket, and one
+  real reliability defect (a transient transport blip — timeout, spawn failure — was killing an
+  entire `SDLC_FLOW` run outright, losing all completed task progress, root-caused to a real 2026
+  -08-01 production failure at exactly 300.181s wall clock). Landing both keeps the pipeline's own
+  docs honest and stops future automated runs from dying on network hiccups they should just
+  retry past.
+- **Refs:** `planning/close-the-loop/lane-substrate.txt` (C5 section), `planning/state.json`
+  (carryover: added `transport-retry-policy-not-wired-to-call-sites`, deleted
+  `sdlc-flow-implement-transport-failures-not-retried`), `planning/handoff.md`. New idea captured
+  in the handoff (not yet researched): whether `claude-code-rs` could expose the 5-hour/weekly
+  rate-limit window (distinct from the existing `headless-cli-no-usage-cost-data` dollar-cost
+  carryover) so `TransportRetry` could back off correctly on a rate-limit hit instead of guessing.
 
 ---
 
