@@ -101,7 +101,8 @@ matches the built-in default):
       "implement_simple": "sonnet",
       "review": "sonnet",
       "triage": "sonnet",
-      "generate": "sonnet"
+      "generate": "opus",
+      "docs": "sonnet"
     },
     "llm_triage": false,
     "max_attempts": 3,
@@ -188,7 +189,8 @@ then the inline `policy` fields override individual knobs on top of it.
 | `prompt_cache` | `bool` | Whether a stable system-prompt anchor is added for provider-side prompt caching. |
 | `review_mode` | `per_task` \| `trivial_skip` \| `end_only` | `per_task`: every task routes to `ConsolidatedReviewNode` (today's default). `trivial_skip`: a first-pass-green task under the diff-size thresholds below skips per-task review; a non-trivial task still routes to review. `end_only`: per-task review is collapsed into a single end-of-run review. |
 | `review_skip_max_files` / `review_skip_max_diff_lines` | `u32` | Thresholds (`git diff --numstat`) a task's diff must stay under to count as "trivial" for `trivial_skip`. Defaults: 2 files / 40 lines. |
-| `model_tiers.{implement,implement_simple,review,triage,generate}` | `sonnet` \| `haiku` \| `opus` \| `local` | Per-stage model tier. `implement`/`implement_simple` only ever resolve to a concrete cloud model string — `local` is not wired for the agentic implement stage (see below). |
+| `model_tiers.{implement,implement_simple,review,triage,generate,docs}` | `sonnet` \| `haiku` \| `opus` \| `local` | Per-stage model tier. `implement`/`implement_simple` only ever resolve to a concrete cloud model string — `local` is not wired for the agentic implement stage (see below). `generate` (`GenerateTasksNode`) and `docs` (`PatchDocsNode`) default to `opus`/`sonnet` respectively — see `timeouts.*` below for their paired per-call timeout knob. |
+| `timeouts.{implement,triage,review,generate,docs}` | `u64` seconds, or omitted (`null`) | Per-stage whole-call timeout, in seconds, for the same five stages as `model_tiers`. The built-in default is all-`None`/omitted for every field, which is behavior-stable: an unset field leaves `claude_code_rs::Config::timeout` at its own `None`, i.e. that crate's unconfigured 300s default. Setting a field widens (or narrows) only that stage's `execute()` timeout; it does not change any other stage. `generate` is consumed by `GenerateTasksNode::process`'s `apply_policy` call, and `docs` by `PatchDocsNode::process`'s `apply_policy_config` call, same as their paired `model_tiers` field (see `crates/engine-core/src/workflows/sdlc_flow/policy.rs:106-113` for the source-of-truth doc comment this restates). |
 | `local.{endpoint,model,constrained_json}` | string / string / bool | Config for the `local` tier's OpenAI-compatible transport (endpoint URL, model name, whether to pass a constrained-decoding `response_format`). Only meaningful when some stage's tier is `local`. |
 | `simple_task_max_files` | `u32` | Threshold for classifying a task as "simple" for the `implement_simple` tier. **Not yet consumed** by `ImplementTaskNode`'s tier selection — flagged out-of-scope in EN.3.C task 4, left for a later block. |
 | `llm_triage` | `bool` | Whether `TriageTaskNode` invokes the LLM classifier for a failing-but-under-budget task (`true`) vs. deterministically calling it `RETRYABLE` (`false`, default). |
