@@ -116,8 +116,9 @@ impl Default for ModelTiers {
 /// too. `docs` reaches `PatchDocsNode` through the config half of the
 /// shaping helpers applied directly in `docs.rs` (that node builds its
 /// prompt in a `with_prompt_builder` closure, so it cannot use the combined
-/// `apply_policy`); `generate` is declared here and consumed once
-/// `GenerateTasksNode` is onboarded — see this spec's Amendment Log.
+/// `apply_policy`) — see [`super::docs::PatchDocsNode::process`]. `generate`
+/// is consumed by `GenerateTasksNode::process`'s `apply_policy` call — see
+/// [`super::setup::GenerateTasksNode::process`].
 ///
 /// Unlike [`ModelTiers`], this derives `Default`: all-`None` is exactly what
 /// `#[derive(Default)]` produces, so hand-writing it would only add a place
