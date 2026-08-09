@@ -173,6 +173,60 @@ pub struct PartialRetryFeedback {
     pub max_chars: Option<u32>,
 }
 
+/// Bounded in-node retry-with-backoff budget for `ClaudeCodeStep`'s transport
+/// call (`ticket-implement-node-transport-retry`, shape (A) — see that
+/// ticket's Amendment Log). Applies uniformly across all five
+/// `ClaudeCodeStep` consumers (implement/triage/review/generate/docs — one
+/// knob, not six, per CLAUDE.md standing rule 6) rather than being
+/// implement-only: a transient transport blip is exactly as disruptive to a
+/// cheap triage call as to an implement call, since either still halts the
+/// whole `Workflow::walk` (`run_halts_walk_on_failure`).
+///
+/// Only `claude_code_rs::Error` variants the ticket's investigation marked
+/// retryable (`Spawn`/`Timeout`/`Cli`/`Api`) consume this budget;
+/// `BinaryNotFound`/`Parse`/`Isolation` are treated as persistent and fail
+/// fast regardless of `max_attempts`.
+///
+/// **Deliberate deviation from CLAUDE.md standing rule 6's "behavior-stable
+/// built-in default"** — mirrors [`RetryFeedback`]'s precedent. On the
+/// success path (`ClaudeCodeStep::process` AC7) the default is exactly
+/// behavior-stable: a first-attempt success invokes the transport once,
+/// byte-identical to today. On the *failure* path it is not: today a single
+/// transient transport error halts the run; the default here retries it.
+/// That change of behavior on failure is the fix this knob ships, not a
+/// side effect of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportRetry {
+    /// Total attempts per transport call, including the first — never an
+    /// unbounded loop. `1` disables retry outright (today's behavior on the
+    /// failure path).
+    pub max_attempts: u32,
+    /// Backoff before the second attempt, in milliseconds; doubles on each
+    /// subsequent retry (capped — see `nodes::claude_code_step`'s
+    /// `MAX_TRANSPORT_BACKOFF_MS`) so a persistent failure defers the halt
+    /// briefly rather than hammering a dead transport or, worse, compounding
+    /// a `Timeout` variant's already-expensive wait.
+    pub initial_backoff_ms: u64,
+}
+
+impl Default for TransportRetry {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff_ms: 200,
+        }
+    }
+}
+
+/// All-optional mirror of [`TransportRetry`]. Mirrors [`PartialRetryFeedback`]'
+/// derive set exactly — notably **no** `Copy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PartialTransportRetry {
+    pub max_attempts: Option<u32>,
+    pub initial_backoff_ms: Option<u64>,
+}
+
 /// Which pipeline stages `close-out` (EN.2.x) is allowed to reuse from a
 /// prior flow record rather than re-running (lever #1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -214,6 +268,10 @@ pub struct SdlcPolicy {
     /// Whether the previous attempt's failure output is fed back into
     /// `ImplementTaskNode`'s retry prompt, and how large that block may get.
     pub retry_feedback: RetryFeedback,
+    /// Bounded in-node retry-with-backoff budget for `ClaudeCodeStep`'s
+    /// transport call, applied uniformly to all five consumers. See
+    /// [`TransportRetry`].
+    pub transport_retry: TransportRetry,
     /// Upper bound, in **characters**, on the working-tree diff embedded in
     /// `ConsolidatedReviewNode`'s prompt.
     ///
@@ -254,6 +312,9 @@ impl Default for SdlcPolicy {
             close_out: CloseOut::default(),
             // NOT behavior-stable, deliberately — see `RetryFeedback`'s docs.
             retry_feedback: RetryFeedback::default(),
+            // Behavior-stable on the success path; NOT on the failure path,
+            // deliberately — see `TransportRetry`'s docs.
+            transport_retry: TransportRetry::default(),
             // Behavior-stable in the sense standing rule 6 asks for: chosen
             // so realistic task diffs pass through untruncated (a typical
             // one-task diff is a few hundred lines, ~10-40k characters), yet
@@ -287,6 +348,7 @@ pub struct PartialPolicy {
     pub max_attempts: Option<u32>,
     pub close_out: Option<PartialCloseOut>,
     pub retry_feedback: Option<PartialRetryFeedback>,
+    pub transport_retry: Option<PartialTransportRetry>,
     pub review_diff_max_chars: Option<u32>,
 }
 
@@ -387,6 +449,18 @@ fn merge_retry_feedback(mut base: RetryFeedback, over: &PartialRetryFeedback) ->
     base
 }
 
+/// Merge one `PartialTransportRetry` override layer over a `TransportRetry`
+/// base, field by field. Mirrors [`merge_retry_feedback`].
+fn merge_transport_retry(mut base: TransportRetry, over: &PartialTransportRetry) -> TransportRetry {
+    if let Some(v) = over.max_attempts {
+        base.max_attempts = v;
+    }
+    if let Some(v) = over.initial_backoff_ms {
+        base.initial_backoff_ms = v;
+    }
+    base
+}
+
 fn merge_close_out_reuse(mut base: CloseOutReuse, over: &PartialCloseOutReuse) -> CloseOutReuse {
     if let Some(v) = over.validation {
         base.validation = v;
@@ -452,6 +526,10 @@ impl crate::policy::Policy for SdlcPolicy {
             retry_feedback: match &over.retry_feedback {
                 Some(rf) => merge_retry_feedback(base.retry_feedback, rf),
                 None => base.retry_feedback,
+            },
+            transport_retry: match &over.transport_retry {
+                Some(tr) => merge_transport_retry(base.transport_retry, tr),
+                None => base.transport_retry,
             },
             review_diff_max_chars: merge_opt(
                 base.review_diff_max_chars,

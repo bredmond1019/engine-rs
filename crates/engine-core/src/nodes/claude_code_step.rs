@@ -10,6 +10,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRun, NodeRunStatus, TaskContext, Usage};
@@ -17,6 +18,7 @@ use futures::future::BoxFuture;
 
 use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
+use crate::workflows::sdlc_flow::policy::TransportRetry;
 
 /// Stand-in for `Usage::model` when the SDK reports no model.
 ///
@@ -26,6 +28,116 @@ use crate::node::{Node, NodeError};
 /// non-null string, so absence has to be spelled *somehow*; it is spelled here,
 /// at the seam, rather than by loosening the contract type for a vendor quirk.
 const UNKNOWN_MODEL: &str = "unknown";
+
+/// Ceiling on the exponential backoff between retried transport attempts, in
+/// milliseconds — caps [`TransportRetry::initial_backoff_ms`]'s doubling so a
+/// misconfigured policy (or a large `max_attempts`) cannot turn a bounded
+/// retry into a de-facto unbounded wait.
+const MAX_TRANSPORT_BACKOFF_MS: u64 = 5_000;
+
+/// Whether a `claude_code_rs::Error` is worth retrying, per
+/// `ticket-implement-node-transport-retry` Task 1's Amendment Log
+/// investigation of `claude_code_rs::Error`'s six variants:
+/// `Spawn`/`Timeout`/`Cli`/`Api` are transient or cheap-to-retry;
+/// `BinaryNotFound`/`Parse`/`Isolation` are local/deterministic failures that
+/// would fail identically on a retried attempt.
+fn is_retryable_transport_error(err: &claude_code_rs::Error) -> bool {
+    matches!(
+        err,
+        claude_code_rs::Error::Spawn(_)
+            | claude_code_rs::Error::Timeout
+            | claude_code_rs::Error::Cli { .. }
+            | claude_code_rs::Error::Api { .. }
+    )
+}
+
+/// Result of [`call_with_retry`]: either the transport eventually succeeded,
+/// a cancellation won a race against some attempt (never retried after), or
+/// the retry budget was exhausted / the error was non-retryable (converted
+/// to a `NodeError` surfacing the underlying transport message).
+enum RetriedCall<T> {
+    Ok(T),
+    Cancelled,
+    Err(NodeError),
+}
+
+/// Await one transport attempt, racing it against `token` (if present)
+/// exactly as the pre-retry code did — a cancel win drops the in-flight
+/// future (dropped by `tokio::select!`) and is reported distinctly from a
+/// transport error so the caller never retries past a cancel.
+async fn race_one_attempt<T>(
+    fut: BoxFuture<'static, claude_code_rs::Result<T>>,
+    token: Option<&CancellationToken>,
+) -> Option<claude_code_rs::Result<T>> {
+    match token {
+        Some(token) => {
+            tokio::select! {
+                _ = token.cancelled() => None,
+                result = fut => Some(result),
+            }
+        }
+        None => Some(fut.await),
+    }
+}
+
+/// Drive `make_attempt` (which builds a fresh transport future each call —
+/// required because a `BoxFuture` cannot be polled twice) through a bounded
+/// retry-with-backoff loop.
+///
+/// - A cancelled token wins immediately, on the first attempt or any later
+///   one, and is never retried past — matches
+///   [`ClaudeCodeStep::with_cancellation_token`]'s documented semantics.
+/// - A transient error (per [`is_retryable_transport_error`]) is retried,
+///   with exponential backoff (capped at [`MAX_TRANSPORT_BACKOFF_MS`]), until
+///   `retry.max_attempts` is exhausted. The backoff wait itself re-checks the
+///   token so a cancel during backoff also short-circuits to `Cancelled`
+///   rather than firing one more attempt.
+/// - A persistent error (non-retryable, or the budget exhausted) becomes a
+///   [`NodeError`] carrying the underlying transport message — never a
+///   generic "retries exhausted" string.
+/// - `max_attempts <= 1` behaves exactly as the pre-retry code did: one
+///   attempt, no backoff, first error is fatal.
+async fn call_with_retry<T, F>(
+    mut make_attempt: F,
+    retry: TransportRetry,
+    token: Option<&CancellationToken>,
+) -> RetriedCall<T>
+where
+    F: FnMut() -> BoxFuture<'static, claude_code_rs::Result<T>>,
+{
+    let total_attempts = retry.max_attempts.max(1);
+    let mut backoff_ms = retry.initial_backoff_ms;
+    let mut attempt = 1u32;
+
+    loop {
+        match race_one_attempt(make_attempt(), token).await {
+            None => return RetriedCall::Cancelled,
+            Some(Ok(value)) => return RetriedCall::Ok(value),
+            Some(Err(err)) => {
+                let budget_exhausted = attempt >= total_attempts;
+                if budget_exhausted || !is_retryable_transport_error(&err) {
+                    return RetriedCall::Err(NodeError::new(err.to_string()));
+                }
+            }
+        }
+
+        // Backoff before the next attempt, re-checking cancellation so a
+        // cancel that lands during the wait is never followed by one more
+        // transport call.
+        match token {
+            Some(token) => {
+                tokio::select! {
+                    _ = token.cancelled() => return RetriedCall::Cancelled,
+                    () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                }
+            }
+            None => tokio::time::sleep(Duration::from_millis(backoff_ms)).await,
+        }
+
+        backoff_ms = backoff_ms.saturating_mul(2).min(MAX_TRANSPORT_BACKOFF_MS);
+        attempt += 1;
+    }
+}
 
 /// The injectable transport signature: takes an owned `Config` + prompt and
 /// returns a boxed future resolving to a `claude_code_rs::Result<Outcome>`.
@@ -101,6 +213,13 @@ pub struct ClaudeCodeStep {
     transport: Transport,
     meta_transport: Option<MetaTransport>,
     cancellation_token: Option<CancellationToken>,
+    /// Bounded retry-with-backoff budget for the transport call
+    /// (`ticket-implement-node-transport-retry`). Defaults to
+    /// [`TransportRetry::default`] — behavior-stable on the success path
+    /// (see that type's docs), so every existing caller keeps compiling and
+    /// behaving unchanged unless it opts into a different budget via
+    /// [`ClaudeCodeStep::with_retry_policy`].
+    retry: TransportRetry,
 }
 
 impl fmt::Debug for ClaudeCodeStep {
@@ -133,6 +252,7 @@ impl ClaudeCodeStep {
             transport: Arc::new(default_transport),
             meta_transport: None,
             cancellation_token: None,
+            retry: TransportRetry::default(),
         }
     }
 
@@ -150,6 +270,7 @@ impl ClaudeCodeStep {
             transport: Arc::new(default_transport),
             meta_transport: None,
             cancellation_token: None,
+            retry: TransportRetry::default(),
         }
     }
 
@@ -215,6 +336,16 @@ impl ClaudeCodeStep {
         self.cancellation_token = Some(token);
         self
     }
+
+    /// Override the bounded transport retry-with-backoff budget (defaults to
+    /// [`TransportRetry::default`]). `SdlcPolicy::transport_retry`
+    /// (`policy.rs`) is the resolved four-layer value a caller would
+    /// normally hand in here once wired at the call site.
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry: TransportRetry) -> Self {
+        self.retry = retry;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -227,47 +358,43 @@ impl Node for ClaudeCodeStep {
 
         let (outcome, transport_info) = match &self.meta_transport {
             Some(meta_transport) => {
-                let transport_fut = meta_transport(self.config.clone(), prompt);
-                match &self.cancellation_token {
-                    Some(token) => {
-                        tokio::select! {
-                            // See the plain-`transport` branch below for why a
-                            // cancel win returns `Ok(ctx)` rather than `Err`.
-                            _ = token.cancelled() => {
-                                return Ok(ctx);
-                            }
-                            result = transport_fut => {
-                                result.map_err(|err| NodeError::new(err.to_string()))?
-                            }
-                        }
-                    }
-                    None => transport_fut
-                        .await
-                        .map_err(|err| NodeError::new(err.to_string()))?,
+                let meta_transport = Arc::clone(meta_transport);
+                let config = self.config.clone();
+                let call_result = call_with_retry(
+                    move || meta_transport(config.clone(), prompt.clone()),
+                    self.retry,
+                    self.cancellation_token.as_ref(),
+                )
+                .await;
+
+                match call_result {
+                    // A cancel win returns `Ok(ctx)` rather than `Err` — see
+                    // `with_cancellation_token`'s doc comment. `call_with_retry`
+                    // never retries past a cancellation.
+                    RetriedCall::Cancelled => return Ok(ctx),
+                    RetriedCall::Err(err) => return Err(err),
+                    RetriedCall::Ok(value) => value,
                 }
             }
             None => {
-                let transport_fut = (self.transport)(self.config.clone(), prompt);
+                let transport = Arc::clone(&self.transport);
+                let config = self.config.clone();
+                let call_result = call_with_retry(
+                    move || transport(config.clone(), prompt.clone()),
+                    self.retry,
+                    self.cancellation_token.as_ref(),
+                )
+                .await;
 
-                let outcome = match &self.cancellation_token {
-                    Some(token) => {
-                        tokio::select! {
-                            // A cancel win drops `transport_fut` (tokio::select!
-                            // drops the losing branch's future) rather than awaiting
-                            // it to completion. Returning `Ok(ctx)` unchanged here —
-                            // not `Err` — is deliberate: see
-                            // `with_cancellation_token`'s doc comment.
-                            _ = token.cancelled() => {
-                                return Ok(ctx);
-                            }
-                            result = transport_fut => {
-                                result.map_err(|err| NodeError::new(err.to_string()))?
-                            }
-                        }
-                    }
-                    None => transport_fut
-                        .await
-                        .map_err(|err| NodeError::new(err.to_string()))?,
+                let outcome = match call_result {
+                    // A cancel win drops the in-flight future (`tokio::select!`
+                    // drops the losing branch) rather than awaiting it to
+                    // completion, and is never retried. Returning `Ok(ctx)`
+                    // unchanged here — not `Err` — is deliberate: see
+                    // `with_cancellation_token`'s doc comment.
+                    RetriedCall::Cancelled => return Ok(ctx),
+                    RetriedCall::Err(err) => return Err(err),
+                    RetriedCall::Ok(value) => value,
                 };
 
                 // A plain `Transport` doesn't know its own tier/endpoint — stamp a
