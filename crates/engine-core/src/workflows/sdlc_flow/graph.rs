@@ -37,6 +37,19 @@
 //! `SaveStateNode` is not a router, so its loop-closing hop back to
 //! `TaskQueueRouterNode` *is* a declared connection, but is likewise never
 //! walked into a cycle for the same reason.
+//!
+//! **`ImplementTaskNode -> TestTaskNode` stays a single plain edge**
+//! (`ticket-implement-node-transport-retry`, shape (A)): a `claude_code_rs`
+//! transport failure inside `ImplementTaskNode` (and every other
+//! `ClaudeCodeStep`-backed node — `TriageTaskNode`, `ConsolidatedReviewNode`,
+//! `GenerateTasksNode`, `PatchDocsNode`) is retried with backoff *inside*
+//! `ClaudeCodeStep::process` before it ever returns `Err`, so this file's
+//! graph topology does not gain a branch point for it. Only a persistent
+//! transport failure (retry budget exhausted, or a non-retryable
+//! `claude_code_rs::Error` variant) still surfaces as a plain `NodeError`
+//! and halts the walk exactly as before. See
+//! `crates/engine-core/src/nodes/claude_code_step.rs` and this ticket's
+//! Amendment Log for the retryable/non-retryable classification.
 
 use std::collections::HashMap;
 use std::sync::Arc;
