@@ -65,6 +65,9 @@
 #
 set -uo pipefail
 
+# Consume stdin sent by git push (local_ref local_sha remote_ref remote_sha) to prevent SIGPIPE in caller
+cat >/dev/null
+
 # --- Resolve the brain root by walking up for brain.toml (stage 1 only). ----------------
 find_brain_root() {
   local d="$1"
@@ -106,7 +109,7 @@ stage1_validate_brain() {
   for flag in "${FLAGS[@]}"; do
     printf 'pre-push:   %s ... ' "$flag" >&2
     start_ts=$(date +%s 2>/dev/null || echo 0)
-    out="$(bastion validate-brain "$flag" 2>&1)"
+    out="$(bastion validate-brain "$flag" </dev/null 2>&1)"
     end_ts=$(date +%s 2>/dev/null || echo 0)
     elapsed=$((end_ts - start_ts))
     summary_line="$(printf '%s\n' "$out" | grep -E '^validated .*: [0-9]+ error\(s\), [0-9]+ warning\(s\)$' | tail -1)"
@@ -350,7 +353,7 @@ for c in checks:
     fi
     printf 'pre-push:   %s (%s) ... ' "$name" "$cmd" >&2
     start_ts=$(date +%s 2>/dev/null || echo 0)
-    out="$(cd "$start_dir" && sh -c "$cmd" 2>&1)"
+    out="$(cd "$start_dir" && sh -c "$cmd" </dev/null 2>&1)"
     rc=$?
     end_ts=$(date +%s 2>/dev/null || echo 0)
     elapsed=$((end_ts - start_ts))

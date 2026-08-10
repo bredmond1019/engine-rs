@@ -76,29 +76,43 @@ For each entry in `validation.checks[]`, run `command` and record:
 
 ### Universal harness gate (always runs last, regardless of config)
 
-**Emoji prohibition** — hard FAIL if any markdown file changed by this work introduces an emoji:
+**Emoji prohibition** — hard FAIL if this work ADDS a line containing an emoji to any markdown
+file. DIFF-SCOPED: only lines added by this work are judged, never a whole changed file — a legacy
+file's pre-existing emoji does not fail a diff that never touched it:
 
 ```bash
 python3 - <<'PYEOF'
-import subprocess, re, sys, os
+import subprocess, re, sys
 EMOJI = re.compile(r'[\U0001F300-\U0001FAFF\U00002600-\U000027BF]')
-changed = subprocess.run(['git','diff','main..HEAD','--name-only'], capture_output=True, text=True).stdout.splitlines()
-md_files = [f for f in changed if f.endswith(('.md','.mdx')) and os.path.isfile(f)]
+FOOTER = 'Generated with Claude Code'
+diff = subprocess.run(['git','diff','-M','-U0','main..HEAD','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
 hits = []
-for path in md_files:
-    for n, line in enumerate(open(path, errors='ignore'), 1):
-        if EMOJI.search(line):
-            hits.append(f'{path}:{n}: {line.rstrip()[:100]}')
+cur_file = None
+cur_line = None
+for line in diff:
+    if line.startswith('diff --git '):
+        cur_file = None; cur_line = None
+    elif line.startswith('+++ '):
+        p = line[4:]
+        cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
+    elif line.startswith('@@'):
+        m = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+        cur_line = int(m.group(1)) if m else None
+    elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
+        content = line[1:]
+        if EMOJI.search(content) and FOOTER not in content:
+            hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
+        cur_line += 1
 if hits:
-    print('EMOJI CHECK FAIL: emoji in modified files (violates the no-emoji harness rule):')
+    print('EMOJI CHECK FAIL: emoji added in changed markdown (violates the no-emoji harness rule):')
     for h in hits[:25]: print(h)
     sys.exit(1)
-print('EMOJI CHECK: OK — no emoji in modified files')
+print('EMOJI CHECK: OK — no emoji added in changed markdown')
 sys.exit(0)
 PYEOF
 ```
 
-Record this as one row: `test_name` `"emoji_check"`, `test_purpose` "Universal harness gate — no emoji in changed markdown".
+Record this as one row: `test_name` `"emoji_check"`, `test_purpose` "Universal harness gate — no emoji added in changed markdown".
 
 ## Report
 

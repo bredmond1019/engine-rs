@@ -52,19 +52,19 @@ test failures), `price-scout` (pytest collection: `price_scout` not installed in
 Tracked by carryover `hq-hook-propagation-four-repos-red`.
 
 **Rollout scope (settled 2026-08-04).** The remaining work is switching hooks on, *not* authoring
-`harness.json` — 15 of 19 real repos already carry one with real gated checks (orchestrator 7,
+`harness.json` — 16 of 19 real repos already carry one with real gated checks (orchestrator 7,
 learn-ai 6, bastion 5, most others 4). Eleven of those have a working `harness.json` and no hook,
 so stage 2 is one `git config` away for each.
 
-Only one repo still needs a `harness.json`: **`core/okf-core`**, already ticketed as
-`OK.ticket.harness-json-all-targets-clippy`.
+**No repo is still missing a `harness.json`.** `core/okf-core` was the last one; its
+`OK.ticket.harness-json-all-targets-clippy` closed 2026-08-06 and added a four-gate manifest (`fmt`,
+`clippy --all-targets`, `test`, `build`), so stage 2 now gates that repo instead of skipping.
 
-**`okf-core`'s hooks were switched on 2026-08-06 anyway**, before that ticket lands. A missing
-`harness.json` makes stage 2 skip with a notice rather than fail (see the graceful-skip cases at the
-top of `hooks/pre-push`), so the repo gets the **stage 1 corpus gate immediately** — which is the
-half that matters for a repo participating in the brain corpus — and picks up stage 2 for free when
-the ticket ships. Verified by running the hook directly: stage 1 ran all five flags, stage 2 printed
-`no planning/harness.json … skipping repo gate`.
+`okf-core`'s hooks had been switched on 2026-08-06 *before* that ticket landed, which is why the
+graceful-skip path mattered there: a missing `harness.json` makes stage 2 skip with a notice rather
+than fail (see the cases at the top of `hooks/pre-push`), so the repo got the **stage 1 corpus gate
+immediately** — the half that matters for a repo participating in the brain corpus — and picked up
+stage 2 for free when the ticket shipped. Both halves are live there now.
 
 These three are **deliberately out of scope** and should not be re-flagged by future sweeps:
 
@@ -231,6 +231,13 @@ anything". `scripts/validate_brain.sh` answers the same question outside of a pu
 PREPUSH_STRICT=1 git push        # gate on the whole corpus
 ./scripts/validate_brain.sh      # same question, no push involved
 ```
+
+> **Warning: running `hooks/pre-push` by hand rewrites the baseline.** Invoking the script directly
+> (rather than through an actual `git push`) still writes `.git/validate-last-good.json` on success,
+> silently advancing this clone's delta baseline. Every error present at that moment becomes
+> "pre-existing" and stops blocking future pushes — the gate quietly weakens and nothing reports it.
+> If the intent is only to **look**, run `./scripts/validate_brain.sh` instead — it answers the same
+> question without touching the baseline.
 
 ### `pre-push` — stage 2: repo-native gate (lint/types/test/build)
 

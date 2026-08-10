@@ -88,7 +88,35 @@ $ARGUMENTS — one of two input modes:
    - Do not invent work beyond what the block defines.
    - Size tasks to roughly 21 hours spread across Mon/Wed/Fri sessions.
    - Enforce **the project's standing rules** as written in `CLAUDE.md` — do not assume any stack, locale-parity, or content-layout rule unless written there. Every task must leave the project's gated checks (`planning/harness.json` → `validation.checks[]` with `gates: true`) passing.
-   - **Disjoint file ownership (parallel-merge safety).** A block's tasks run as parallel pipelines that merge independently, so two tasks editing the same existing file collide at merge. Decompose so each task **owns a distinct set of files**. When two tasks would touch the same file, either (a) make one `dependsOn` the other so `/sdlc-block` serializes them into different waves, or (b) restrict the shared file to **append-only** edits (the block engine union-merges files declared `additiveFiles`). Name each task's primary files in its step so the dependency analysis can see the boundaries — an undeclared overlap escalates the whole block on a merge conflict.
+   - **Compilable task boundaries (outranks decomposition preferences under the sequential engines).**
+     `/sdlc-flow` and `/sdlc-task` run every task **sequentially on one branch/worktree with no
+     inter-task merge step** — `sdlc-flow.js`'s own header says so explicitly ("sequential tasks (no
+     inter-task merge conflicts)") — and both gate the project's checks after **every single task**
+     (the `runTests()` call inside each engine's per-task loop: `sdlc-flow.js`'s and `sdlc-task.js`'s
+     `test-${taskNum}-${attempt}` gate). Under those two engines **every task must leave the gating
+     suite passing** — for a compiled or type-checked stack that means the repository must compile
+     (and typecheck) at every task boundary, not just at the end of the spec. When a single logical
+     change cannot be split without leaving an intermediate task non-compiling — a renamed public
+     type, a struct's changed fields, an altered trait/interface signature, and every call site each
+     one touches — do **not** split it across tasks to satisfy disjoint ownership below. Put the whole
+     change in **one** task instead. **This constraint outranks the disjoint-file-ownership rule
+     whenever the two conflict: the tasks merge, not the constraint.** Since this command decomposes
+     before the consuming engine is chosen (the recommendation is step 11, after decomposition), apply
+     this constraint by default unless the block is already known to run under `/sdlc-block` (e.g. it
+     is one block of a multi-block roadmap being decomposed by `/sdlc-block` itself) — in that case the
+     disjoint-ownership rule below governs instead.
+   - **Disjoint file ownership (parallel-merge safety) — `/sdlc-block` only.** This rule is scoped to
+     `/sdlc-block`'s parallel-merge model, where each task runs as its own pipeline and the pipelines
+     merge independently; it does **not** apply under `/sdlc-flow` or `/sdlc-task` (see the compilable
+     task boundaries rule above, which governs task boundaries there instead — including when it
+     requires two tasks that would otherwise be disjoint to merge into one). Under `/sdlc-block`: a
+     block's tasks run as parallel pipelines that merge independently, so two tasks editing the same
+     existing file collide at merge. Decompose so each task **owns a distinct set of files**. When two
+     tasks would touch the same file, either (a) make one `dependsOn` the other so `/sdlc-block`
+     serializes them into different waves, or (b) restrict the shared file to **append-only** edits
+     (the block engine union-merges files declared `additiveFiles`). Name each task's primary files in
+     its step so the dependency analysis can see the boundaries — an undeclared overlap escalates the
+     whole block on a merge conflict.
    - Foundational steps come first; the final step is always Validate.
    - **Write the task list as `tasks.json`, not markdown headings.** Every SDLC engine reads
      `planning/<spec-slug>/tasks.json` directly — a **bare array** of `{task_id, title, description,
@@ -98,6 +126,12 @@ $ARGUMENTS — one of two input modes:
      pattern. `tasks.md` still carries the prose (Goal, Context Pointers, Acceptance Criteria,
      Validation Commands, Notes, Amendment Log) but the Step-by-Step Tasks section in it is just a
      one-line pointer at the JSON file, not the task list itself.
+   - **This command's `--from` mode is one of two derivation surfaces that both author `tasks.json`
+     from a `tasks.md`/block source — the other is each engine's own D16 preflight.** `sdlc-task.js`,
+     `sdlc-flow.js`, and `sdlc-run.js` now derive `tasks.json` from an existing `tasks.md` themselves
+     (rather than aborting with "No tasks.json (D16)") when a spec ships prose-only, using the same
+     author-a-fresh-decomposition discipline this step describes — they are a recovery backstop for
+     an already-written spec, not a substitute for running this command up front.
 
 7. Create the directory `planning/<spec-slug>/` if it does not exist, then write **both**
    `planning/<spec-slug>/tasks.md` (prose) and `planning/<spec-slug>/tasks.json` (task list) using
@@ -110,7 +144,20 @@ $ARGUMENTS — one of two input modes:
    - **`tasks.json` parses as valid JSON** and is a non-empty array (not wrapped in an object —
      orchestrator's `LoadTaskStateNode` expects a bare array).
    - **Every task except the final Validate task names ≥1 file** in its `files[]` (so the dependency
-     analysis and disjoint-ownership guard can see boundaries).
+     analysis, the `/sdlc-block` disjoint-ownership guard, and the compilable-boundary review below
+     can see boundaries). Under the sequential engines this does **not** imply the named files must be
+     disjoint *across* tasks — two tasks are free to touch the same file there, since there is no
+     inter-task merge to collide. This property and the compilable-boundary check below do not
+     contradict each other: naming files is about visibility for both guards, not about which guard's
+     ownership rule applies.
+   - **Compilable task boundaries — can fail.** Check whether any single breaking public-surface
+     change (a renamed public type, a struct's changed fields, an altered trait/interface signature)
+     is split across two or more tasks such that an intermediate task would leave the repository
+     non-compiling. If it is, this check **fails**: merge those tasks into one before proceeding, per
+     the compilable task boundaries rule in step 6, then re-run this self-check. (This still applies
+     even when the block is known to run under `/sdlc-block`: that engine's disjoint-ownership rule
+     governs *which* files a task owns, but a task that cannot compile on its own is never a valid
+     task under any engine.)
    - **`dependsOn` ids are all valid** — every id referenced exists as some task's `task_id` in the
      same array, and the final Validate task depends on every other task's id.
    - **Acceptance Criteria are non-empty and observable** — each criterion can be judged true/false.

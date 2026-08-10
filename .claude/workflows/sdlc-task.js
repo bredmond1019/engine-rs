@@ -189,6 +189,56 @@ resolved absolute path from the second line).
   return result
 }
 
+// Vault-aware task commits (extends D46): the per-task implement/fix stage below is instructed to
+// stage + commit any planning/ paths it wrote THROUGH the vault repo (git -C <vault.planningPath>),
+// reusing detectPlanningVault's real path exactly like the bookkeep/wrap-up recipe already does —
+// never a second detection idiom. But that instruction is self-reported: the amendment log on this
+// ticket recorded a live run where a stage returned a perfectly valid commitHash that covered ONLY
+// the source half of a task, with the vault half silently uncommitted. So a valid commitHash proves
+// nothing about the vault half, and this check never keys on it — it independently re-verifies, for
+// every filesModified path that resolves under the vault, that the path is BOTH tracked and free of
+// any staged/unstaged diff in the vault repo (i.e. actually landed in a commit there), via a cheap
+// Haiku agent turn rather than trusting the implementer's own report.
+const VAULT_VERIFY_SCHEMA = {
+  type: 'object',
+  required: ['allCommitted'],
+  properties: {
+    allCommitted:     { type: 'boolean', description: 'true iff every given path is tracked in the vault repo with no staged/unstaged diff' },
+    uncommittedPaths: { type: 'array', items: { type: 'string' }, description: 'the subset (vault-relative) that failed either check' },
+    notes:            { type: 'string' }
+  }
+}
+async function verifyVaultCommit(runDir, vault, vaultRelPaths) {
+  if (!vault.vaulted || !vaultRelPaths.length) return { allCommitted: true, uncommittedPaths: [] }
+  const result = await agent(`
+Independently verify that these paths are FULLY COMMITTED in the vault repo at ${vault.planningPath}
+(tracked, AND no staged or unstaged diff) — do not take anyone's word for it, re-check directly.
+Paths (relative to ${vault.planningPath}):
+${vaultRelPaths.map(p => `  ${p}`).join('\n')}
+Run exactly these Bash calls (from ${runDir}):
+  cd ${runDir} && git -C ${vault.planningPath} status --porcelain -- ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}
+  cd ${runDir} && git -C ${vault.planningPath} ls-files --error-unmatch -- ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}
+A path is COMMITTED only if it produces NO line in the status --porcelain output AND the ls-files
+--error-unmatch call exits 0 for it (nonzero/"did not match" means untracked or missing — NOT committed).
+Return via StructuredOutput: allCommitted (true only if every path passed both checks),
+uncommittedPaths (the vault-relative paths that failed either check; empty array if all committed),
+notes (what you actually observed).
+`, { label: 'verify-vault-commit', schema: VAULT_VERIFY_SCHEMA, model: 'haiku' })
+  if (!result) return { allCommitted: false, uncommittedPaths: vaultRelPaths, notes: 'verification agent returned null' }
+  return result
+}
+
+// Given a task stage's self-reported filesModified (repo-root-relative) and a resolved vault, return
+// the vault-relative subset (the part of the path after "planning/") that needs an independent
+// vault-commit check. Derived from what the task ACTUALLY wrote — never a hard-coded filename list.
+function vaultRelPathsFrom(filesModified, vault) {
+  if (!vault.vaulted || !Array.isArray(filesModified)) return []
+  return filesModified
+    .filter(f => typeof f === 'string' && (f === 'planning' || f.startsWith('planning/')))
+    .map(f => f.slice('planning/'.length))
+    .filter(Boolean)
+}
+
 log(`Target: ${blockId} (${selectedTasks ? [...selectedTasks].sort((a, b) => a - b).join(', ') : 'all tasks'})`)
 log(`Spec: ${specFile} | mode: ${useWorktree ? 'worktree' : 'in-place'}${resumeMode ? ' | RESUME' : ''}`)
 
@@ -253,6 +303,22 @@ const ENUMERATE_SCHEMA = {
       }
     },
     notes:    { type: 'string' }
+  }
+}
+
+// D16 derive-from-tasks.md fallback — see the abort below. Mirrors sdlc-block.js's ensureTasks()
+// generator and /generate-tasks' --from mode: read the spec's authored step decomposition and
+// write a fresh D45-shaped tasks.json from it (never a verbatim copy of the prose, never the
+// superseded D44 {"tasks": [...]} wrapper).
+const DERIVE_SCHEMA = {
+  type: 'object',
+  required: ['derivable', 'written'],
+  properties: {
+    derivable:  { type: 'boolean', description: 'true iff tasks.md exists and carries a numbered step decomposition to derive from' },
+    written:    { type: 'boolean', description: 'true iff a D45-shaped tasks.json (bare array, integer task_id, single-string description, no status/attempt_count) was written and committed' },
+    commitHash: { type: 'string' },
+    taskCount:  { type: 'integer' },
+    notes:      { type: 'string' }
   }
 }
 
@@ -344,6 +410,7 @@ const BOOKKEEP_SCHEMA = {
 const MODEL = {
   setup:       'haiku',    // scripted git: locate the repo root, or follow the worktree free-name recipe
   enumerate:   'haiku',    // read + parse tasks.json's task list — a fixed procedure
+  derive:      'opus',     // D16 fallback: author a fresh tasks.json from tasks.md's step list — real judgment, mirrors sdlc-block.js's ensureTasks() generator
   stateLoad:   'haiku',    // read + parse one JSON file (resume only)
   implement:   'sonnet',   // writes code/content + tests against a scoped task
   fix:         'sonnet',   // targeted fixes; failures escalate, never silently ship
@@ -936,7 +1003,7 @@ Run all build/test/validation from the run root; relative paths (planning/...) r
 // ================================================================
 phase('Plan')
 
-const enumResult = await tracedAgent(`${W}
+const ENUMERATE_PROMPT = `${W}
 You enumerate the tasks defined in a spec's tasks.json. Do NOT modify anything.
 
 STEP 1 — read the task list:
@@ -957,10 +1024,52 @@ STEP 4 — Engine-parse gate scan. For each task, look at its "files" array. If 
   task's other files). Skip every task whose "files" has no such path.
 
 Return via StructuredOutput: hasTasks, allTasks (integers in order), taskChecks, engineFiles, notes.
-`, withModel({ label: 'enumerate', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
+`
+
+let enumResult = await tracedAgent(ENUMERATE_PROMPT, withModel({ label: 'enumerate', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
 
 if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) {
-  // D16 preflight lint — refuse to guess the task structure.
+  // D16 derive-from-tasks.md fallback — before refusing, check whether the spec's authored
+  // tasks.md carries a derivable step decomposition. Mirrors sdlc-block.js's ensureTasks()
+  // generator and /generate-tasks' --from mode: author a FRESH decomposition from tasks.md (never
+  // a verbatim copy of its prose). Deriving from an authored tasks.md is not guessing the task
+  // structure — D16 exists to refuse fabricating one out of nothing, which the abort below still does.
+  const deriveResult = await tracedAgent(`${W}
+You are the D16 recovery generator for one lean-engine spec. ${tasksJsonFile} is missing, invalid, or
+empty; ${specFile} (tasks.md) may still carry a usable step decomposition. Do NOT implement anything.
+
+STEP 1 — check for a derivable source:
+  cd ${runDir} && cat ${specFile} 2>/dev/null || echo "NO_TASKS_MD"
+
+STEP 2 — If tasks.md is missing, or has no "## Step-by-Step Tasks" / "## Step by Step Tasks"
+  section with at least one numbered step, set derivable=false, written=false, and STOP — do not
+  write anything.
+
+STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from tasks.md's step list plus its
+  Acceptance Criteria / Validation Commands sections (mirrors /generate-tasks' --from mode: a real
+  decomposition, not a verbatim copy of the prose). Write it as valid JSON: a BARE ARRAY (D45 shape —
+  NOT the superseded D44 {"tasks": [...]} wrapper), each entry shaped { task_id, title, description,
+  acceptance_criteria, validation_commands, max_attempts, files, dependsOn } — task_id is a 1-indexed
+  integer in dependency order with no gaps, description is a single string, max_attempts is 3, and
+  you must NEVER author a "status" or "attempt_count" key (those are engine-owned). Each task names
+  the concrete file(s) it owns in "files" so tasks stay disjoint.
+
+STEP 4 — Commit it on the current branch with an explicit pathspec:
+  git add ${tasksJsonFile}
+  git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
+  git log --oneline -1   (capture the short hash)
+
+Return via StructuredOutput: derivable, written, commitHash, taskCount, notes.
+`, withModel({ label: 'derive-tasks-json', schema: DERIVE_SCHEMA, phase: 'Plan' }, MODEL.derive))
+
+  if (deriveResult?.derivable && deriveResult?.written) {
+    log(`Derived tasks.json from tasks.md (D16 derive-from-tasks.md fallback) — ${deriveResult.taskCount || '?'} task(s), commit ${deriveResult.commitHash || 'unknown'}.`)
+    enumResult = await tracedAgent(ENUMERATE_PROMPT, withModel({ label: 'enumerate-post-derive', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
+  }
+}
+
+if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) {
+  // D16 preflight lint — refuse to guess the task structure when nothing was derivable either.
   log(`ABORTED (D16) — ${tasksJsonFile} is missing, invalid, or is an empty array.`)
   log(`Fix: run /generate-tasks ${blockId} to author tasks.json (see the spec template), commit, then re-run.`)
   return { error: 'No tasks.json (D16)', blockId, specFile: tasksJsonFile }
@@ -1165,10 +1274,37 @@ ${usingOverride
     ? renderTaskCheckList(taskCommands, runDir)
     : renderCheckList(harnessCfg, { gatingOnly, cwd: runDir, engineFiles })}
 
-Then run the universal emoji gate (a harness rule, always): scan the files changed by THIS run for emoji
-in markdown/docs.
-  cd ${runDir} && git diff --name-only ${baseSha}..HEAD
-  Inspect the changed .md/.mdx files; a stray emoji in docs FAILS this gate.
+Then run the universal emoji gate (a harness rule, always) — DIFF-SCOPED: it judges only lines
+ADDED by this task, never a whole changed file, so a legacy file's pre-existing emoji does not fail
+a diff that never touched it:
+  cd ${runDir} && python3 - <<'PYEOF'
+import subprocess, re, sys
+EMOJI = re.compile(r'[\\U0001F300-\\U0001FAFF\\U00002600-\\U000027BF]')
+FOOTER = 'Generated with Claude Code'
+diff = subprocess.run(['git','diff','-M','-U0','${baseSha}..HEAD','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
+hits = []
+cur_file = None
+cur_line = None
+for line in diff:
+    if line.startswith('diff --git '):
+        cur_file = None; cur_line = None
+    elif line.startswith('+++ '):
+        p = line[4:]
+        cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
+    elif line.startswith('@@'):
+        m = re.match(r'@@ -\\d+(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@', line)
+        cur_line = int(m.group(1)) if m else None
+    elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
+        content = line[1:]
+        if EMOJI.search(content) and FOOTER not in content:
+            hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
+        cur_line += 1
+if hits:
+    print('EMOJI CHECK FAIL:'); [print(h) for h in hits[:25]]; sys.exit(1)
+print('EMOJI CHECK: OK'); sys.exit(0)
+PYEOF
+  A stray emoji ADDED in docs FAILS this gate; a pre-existing emoji in a file this task did not
+  touch a line of does not.
 
 For each check record: name, passed (true iff exit code 0), the command, and failure output.
 ${onPass ? renderOnPassStateWriteRecipe(onPass) : ''}
@@ -1226,6 +1362,11 @@ ${sameContext ? `(Previous attempt context for the same-failure check: ${sameCon
 // PHASE 2: PER-TASK LOOP (sequential)
 // ================================================================
 phase('Tasks')
+
+// D46 + vault-aware task commits: resolve ONCE for the whole run and reuse everywhere below (the
+// per-task commit step and the bookkeep close-out) — never re-detect per task/stage, and never a
+// second detection idiom.
+const vault = await detectPlanningVault(runDir)
 
 let bailed = false
 let bailReason = null
@@ -1303,16 +1444,38 @@ ${isFix ? `fix: fix pass ${attempt - 1} for ${stem}` : `feat: implement ${stem}`
 EOF
 )"
    Run: cd ${runDir} && git log --oneline -1   (capture the short hash)
-
+${vault.vaulted ? `
+7b. planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a DIFFERENT git
+    repo, invisible to the commit you just made in step 7. If this attempt created or edited ANY file
+    under planning/ (i.e. it belongs in filesModified with a "planning/" prefix), you MUST ALSO stage
+    and commit it there, through the real path — derive the exact set from what you actually wrote,
+    never a fixed list of filenames. NEVER git add -A, git add ., git reset, or git stash against the
+    vault repo — another lane's session may have unrelated work staged there right now; touch ONLY
+    your own paths, and do not checkout/switch/branch inside it (stay on whatever branch it is
+    already on). For each such file, let <relpath> be the part of its path AFTER "planning/":
+      cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
+    Then, once every such path is staged, commit ONLY those paths — pass them explicitly to \`git commit\`
+    itself (not merely to \`git add\`), so a sibling lane's unrelated pre-staged files are never swept
+    into this commit even if they happen to already be staged:
+      cd ${runDir} && git -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+${isFix ? `fix: fix pass ${attempt - 1} for ${stem} (vault)` : `feat: implement ${stem} (vault)`}
+EOF
+)" -- <relpath1> <relpath2> ...
+      cd ${runDir} && git -C ${vault.planningPath} log --oneline -1
+    If NOTHING you wrote this attempt lives under planning/, skip this step entirely — do not run any
+    vault command. If a vault add/commit fails, report it PLAINLY in notes; never paper over it, and
+    never "repair" it by committing on a different branch inside the vault.
+` : ''}
 Return via StructuredOutput:
   success: true if the work completed and the spec validation passed
-  filesModified: every source file you created or modified this attempt
-  commitHash: the 7-char short hash (empty string if no commit was made)
+  filesModified: every file you created or modified this attempt — including any under planning/
+    (do NOT omit vault-side files just because they commit through a different repo)
+  commitHash: the 7-char short hash of THIS repo's commit (empty string if no commit was made here)
   summary: one line — what this task now does
   decisions: any non-obvious choices (empty array if none)
   filesReadKb: telemetry — before returning, sum the byte size of every file you cat/Read this attempt
     (cd ${runDir} && wc -c <each file>), divide the total by 1024, and report the number.
-  notes: one-line status
+  notes: one-line status${vault.vaulted ? ' — mention explicitly whether a vault commit (step 7b) happened and, if so, its outcome' : ''}
 `, withModel({ label: `${isFix ? 'fix' : 'implement'}-${taskNum}-${attempt}`, schema: STAGE_SCHEMA, phase: 'Tasks' }, isFix ? fixModel : MODEL.implement))
     recordFilesRead(stageResult)
 
@@ -1335,6 +1498,43 @@ Return via StructuredOutput:
     if (stageResult.summary) t.summary = stageResult.summary
     if (Array.isArray(stageResult.filesModified)) t.files_changed = [...new Set([...(t.files_changed || []), ...stageResult.filesModified])]
     if (Array.isArray(stageResult.decisions) && stageResult.decisions.length) t.decisions = [...(t.decisions || []), ...stageResult.decisions]
+
+    // Vault-commit verification — independent of the stage's self-report. A non-empty commitHash
+    // proves nothing about the vault half (observed live: one run's commitHash was valid and covered
+    // only the source half, with the vault edit silently uncommitted — see this ticket's amendment
+    // log). So this ALWAYS re-derives the vault-relevant subset from filesModified and re-checks it
+    // directly, rather than trusting anything the stage reported. A failure here surfaces exactly
+    // like a test failure: the task is never marked passed on this attempt.
+    const vaultRelPaths = vaultRelPathsFrom(stageResult.filesModified, vault)
+    if (vaultRelPaths.length) {
+      const vaultVerify = await verifyVaultCommit(runDir, vault, vaultRelPaths)
+      if (!vaultVerify.allCommitted) {
+        const uncommitted = (vaultVerify.uncommittedPaths && vaultVerify.uncommittedPaths.length) ? vaultVerify.uncommittedPaths : vaultRelPaths
+        log(`Task ${taskNum} attempt ${attempt}: vault commit incomplete — not committed in ${vault.planningPath}: ${uncommitted.join(', ')}.`)
+        const vaultFailBlob = `VAULT_COMMIT_INCOMPLETE — planning/ path(s) not committed in the vault repo (${vault.planningPath}): ${uncommitted.join(', ')}. ${vaultVerify.notes || ''}`.trim()
+        t.issues = [...(t.issues || []), 'vault commit incomplete']
+        const vaultBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: vault commit incomplete — ${uncommitted.join(', ')}`)
+        const tr = await triage(`task ${taskNum} vault-commit`, attempt, MAX_TASK_ATTEMPTS, vaultFailBlob, prevFailBlob, vaultBailPayload)
+        prevFailBlob = vaultFailBlob
+        if (tr && tr.class === 'MAJOR') {
+          bailed = true
+          bailReason = tr.bailReason || tr.reason || vaultFailBlob
+          if (tr.stateWritten) taskStateWritten = true
+          log(`Task ${taskNum}: triage → MAJOR on vault-commit failure — bailing immediately.`)
+          break
+        }
+        if (attempt === MAX_TASK_ATTEMPTS) {
+          bailed = true
+          bailReason = `Task ${taskNum} still failing to commit vault paths after ${MAX_TASK_ATTEMPTS} attempts: ${uncommitted.join(', ')}`
+          if (tr && tr.stateWritten) taskStateWritten = true
+          log(`Task ${taskNum}: exhausted ${MAX_TASK_ATTEMPTS} attempts on a vault-commit failure — bailing.`)
+          break
+        }
+        if (tr) t.fixes = [...(t.fixes || []), tr.reason]
+        log(`Task ${taskNum}: triage → RETRYABLE on vault-commit failure — fix pass ${attempt}/${MAX_TASK_ATTEMPTS - 1}. ${tr?.reason || ''}`)
+        continue
+      }
+    }
 
     // Fast test (tripwire) — gating checks only unless testDepth=full. A task declaring its own
     // `validation_commands` in tasks.json runs THOSE instead.
@@ -1508,8 +1708,8 @@ if (!bailed && !reconcileFailed) {
   // plain `git add` against any of them from the run root fails ("pathspec is beyond a symbolic link"),
   // and the wrong repair is to checkout/commit inside the vault. The right behaviour is to stage+commit
   // them THROUGH their real path via `git -C <vault>`, on whatever branch the vault repo is already on,
-  // with no checkout at all. detectPlanningVault() resolves which case applies.
-  const vault = await detectPlanningVault(runDir)
+  // with no checkout at all. `vault` was already resolved once, before the per-task loop, and is
+  // reused here (never a second detectPlanningVault() call).
   bookkeepResult = await tracedAgent(`${W}
 You are the lean bookkeeping close-out for an /sdlc-task run. Flip ONLY the authored status markers a
 passing run leaves stale, then commit. Do NOT write a log.md narrative entry, a D18 amendment log, or
@@ -1528,13 +1728,28 @@ Target:
 
 2. Mark the passed tasks (${passedTasks.join(', ') || 'none'}) done in ${specFile} (Edit tool): add the
    engine's task-done marker to each passed task's line if the spec uses one (e.g. a leading "[done]"),
-   mirroring how completed tasks are already marked in that file. If the spec has no such marker
-   convention, leave it and set tasksMarked=false.
+   mirroring how completed tasks are already marked in that file. NEVER remove or alter a marker
+   already present from a prior run — this run only ADDS markers for ${passedTasks.join(', ') || 'none'}.
+   If the spec has no such marker convention, leave it and set tasksMarked=false.
+   - After marking, COUNT the CUMULATIVE total: how many of the spec's tasks now carry a done marker
+     (this run's + every prior run's combined), out of the spec's total task count (${allTasks.length}).
+     This run's own tally — ${passedTasks.length} of ${taskList.length} selected this run — is only a
+     SLICE. Never use that slice alone as "how many tasks are done" anywhere you write a count; use the
+     cumulative count you just derived from the file.
 
-3. Update planning/status.md (Edit tool, surgical):
+3. Update planning/status.md (Edit tool, surgical). "Current focus" is APPEND-ONLY narrative — never
+   delete or rewrite any existing line under it; a prior block's narrative must survive this edit
+   VERBATIM. The one exception: if an existing line already refers to THIS spec ("${blockId}") by name
+   (e.g. from an earlier partial run), you may replace only that one line — never the whole section —
+   with the update below.
    ${blockDone
-     ? `- The full spec "${blockId}" is done — flip its Status to "Done" in the Progress Table and update "Current focus".`
-     : `- Keep the spec "In progress" (a task subset ran). Point "Current focus" at the next task if helpful.`}
+     ? `- The full spec "${blockId}" is done — flip its Status to "Done" in the Progress Table.
+   - Add ONE new line under "Current focus" recording that "${blockId}" is done, citing the CUMULATIVE
+     task count you derived in step 2 (e.g. "${blockId}: done (N of ${allTasks.length} tasks)") — do
+     not touch any other existing line.`
+     : `- Keep the spec "In progress" (a task subset ran). Add ONE new line under "Current focus"
+   pointing at the next task if helpful, citing the cumulative count from step 2 — do not touch any
+   other existing line.`}
    - Update "Last updated" — run: date +%Y-%m-%d
 
 4. Flip the block's AUTHORED status in planning/state.json (skip this entire step silently if the repo
@@ -1562,7 +1777,7 @@ for track in data.get('tracks', []):
         break
 if found:
     with open(path, 'w') as fh:
-        json.dump(data, fh, indent=2)
+        json.dump(data, fh, indent=2, ensure_ascii=False)
         fh.write(chr(10))
     print('FLIPPED:' + bid)
 else:
@@ -1595,10 +1810,13 @@ ${vault.vaulted ? `
    cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/${blockId}/tasks.md 2>/dev/null || true
    cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/status.md
    cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
-   cd ${runDir} && git -C ${vault.planningPath} diff --cached --quiet || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+   Then commit ONLY these three paths — pass them explicitly to \`git commit\` itself (not merely to
+   \`git add\`), so anything a sibling lane already had staged in this same vault repo is left staged
+   and untouched by this commit:
+   cd ${runDir} && git -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 chore: sdlc-task bookkeep — ${blockId}
 EOF
-)"
+)" -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json
    cd ${runDir} && git -C ${vault.planningPath} log --oneline -1` : `
    planning/ is a plain directory here (not vaulted) — everything commits together as before:
    cd ${runDir} && git add ${specFile} planning/status.md
@@ -1612,7 +1830,7 @@ EOF
 Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emitStateRan, commitHash, notes.
 `, withModel({ label: 'bookkeep', schema: BOOKKEEP_SCHEMA }, MODEL.bookkeep))
   if (bookkeepResult?.blockStatusFlipped) {
-    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed${bookkeepResult.emitStateRan ? '; derived surfaces regenerated (mev emit-state --write).' : useWorktree ? '; derived surfaces regenerate on merge (/clean-worktree or /merge-train).' : '.'}`)
+    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed${bookkeepResult.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : useWorktree ? '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree or /merge-train runs `mev emit-state --write` on merge.' : '.'}`)
   } else if (blockDone) {
     log(`Bookkeep: no state.json block flipped (${bookkeepResult?.notes || 'no state.json, or block not found'}).`)
   }

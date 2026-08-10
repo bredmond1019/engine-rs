@@ -226,6 +226,20 @@ If the engine **bailed** (triage MAJOR, immediate-bail, review FAIL after its bo
 - `--continue-on-fail` → record it, leave the block `open`, continue. **Never mark a bailed block
   closed.**
 
+If the engine did **not** bail but `sdlc-flow`'s return has `stranded: true` — a `PASS` verdict
+that ended with no PR opened and (under `--auto-merge`) no merge, because the PR stage was
+attempted and either errored or could not be independently verified via `gh pr view` — **treat it
+the same as a bail for chain purposes**: it is a completed-looking run whose work never actually
+landed anywhere the next block can build on.
+- `--stop-on-fail` (default) → stop the chain. Report the block, `prOutcome` (`'failed'`) and
+  `state.pr`/the branch name so the operator can open the PR manually, and the remaining chain.
+- `--continue-on-fail` → record it, leave the block `open`, continue — same as a bail. **Never
+  treat a `stranded: true` run as integrated;** the next block would be building on a base missing
+  this one's work.
+- `prOutcome: 'impossible'` (no `gh` / no remote) is **not** `stranded` and needs no special
+  handling here — that is the standalone-repo degradation path working as intended; the branch is
+  intact and ready for a manual PR whenever the operator wants one.
+
 ### 8. Integrate, then verify the state write
 
 **Integrate:**

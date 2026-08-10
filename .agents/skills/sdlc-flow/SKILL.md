@@ -188,9 +188,21 @@ Everything below runs from the main repo root first.
 1. Read `<tasksJsonFile>`. It is a **bare JSON array** of task objects (not wrapped in an object),
    matching the SDLCTask schema — each has at least `task_id`, and may carry `files[]` and
    `validation_commands[]`.
-2. **D16 preflight lint**: if the file is missing, invalid JSON, or an empty array, **abort** — instruct
-   running `/generate-tasks <spec-slug>` to author it, commit, then re-run. Never guess the task
-   structure.
+2. **D16 preflight lint**: if the file is missing, invalid JSON, or an empty array, **before
+   aborting, check the D16 derive-from-tasks.md fallback.** If `<specFile>` (`tasks.md`) exists and
+   carries a `## Step-by-Step Tasks` / `## Step by Step Tasks` section with at least one numbered
+   step, author a FRESH D45-shaped `tasks.json` from that decomposition plus the spec's Acceptance
+   Criteria / Validation Commands (a real decomposition, never a verbatim copy of the prose, never
+   the superseded D44 `{"tasks": [...]}` wrapper — bare array, 1-indexed integer `task_id`,
+   `description` a single string, `max_attempts: 3`, never author `status`/`attempt_count`), write
+   it, and commit it on the current branch with an explicit pathspec (`git add <tasksJsonFile>`,
+   `git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"`). Log a distinct line —
+   `Derived tasks.json from tasks.md (D16 derive-from-tasks.md fallback) — <N> task(s), commit
+   <hash>.` — so a derived spec is distinguishable from an authored one, then re-run this lint.
+   **Only if `tasks.md` is also missing, or has no derivable step content, abort** — instruct
+   running `/generate-tasks <spec-slug>` to author it, commit, then re-run. Deriving from an
+   authored `tasks.md` is not guessing the task structure; fabricating one from nothing is what D16
+   still refuses to do.
 3. Collect `allTasks` = every `task_id`, in array order. If a task range/selection was given, filter to
    it; otherwise use every task. This is `taskList`.
 4. Per-task validation overrides: for each task whose `validation_commands` is a non-empty array, note
@@ -222,10 +234,14 @@ Everything below runs from the main repo root first.
      every check regardless of `gates`/`perTask`. **If `harness.json` is absent, or carries no matching
      checks: fall back to running the spec's own `## Validation Commands` section, in order** — the
      engine ships no stack defaults. If the spec has no such section either, run no project checks.
-   - Always, in addition to whatever checks above: scan changed `.md` files (`git diff --name-only
-     <prBase>..HEAD`) for stray emoji — this "universal emoji gate" always runs, project-agnostic. The
-     literal `🤖 Generated with Claude Code` PR-footer line is the one exception, and only inside a PR
-     body, never inside docs.
+   - Always, in addition to whatever checks above: this "universal emoji gate" always runs,
+     project-agnostic, and is DIFF-SCOPED — it judges only lines **added** on this branch, never a
+     whole changed file, so a legacy file's pre-existing emoji does not fail a diff that never
+     touched it. Run `git diff -M -U0 <prBase>..HEAD -- '*.md' '*.mdx'` and scan only `+` content
+     lines (never the `+++`/`---` header lines) for emoji; a pure rename with no added content
+     lines passes, a brand-new file with an emoji fails. The literal robot-emoji
+     `Generated with Claude Code` PR-footer line is the one exception, and only inside a PR body,
+     never inside docs.
    - For any `baseline-diff` / `skip-count-regression` check with a `baselineCommand`: snapshot a
      baseline once, before task 1, if one doesn't already exist on disk (resume-safe — never overwrite
      an existing baseline).
@@ -249,6 +265,30 @@ For `attempt = 1..3` (stop early on pass or bail):
    **Commit** (stage files explicitly by name — never `git add -A`/`git add .`):
    - Implement (attempt 1): `feat: implement <spec-slug>-task<N>`
    - Fix (attempt > 1, this is "fix pass P" where P = attempt − 1): `fix: fix pass <P> for <spec-slug>-task<N>`
+   - **Vault-aware commit (D46 — if planning/ is a vaulted symlink)**: If this attempt created or edited ANY file 
+     under planning/ (i.e., it belongs in filesModified with a "planning/" prefix), you MUST ALSO stage and commit it 
+     through the real vault path — derive the exact set from what you actually wrote, never a fixed list of filenames. 
+     NEVER git add -A, git add ., git reset, or git stash against the vault repo — another session may have unrelated 
+     work staged there right now; touch ONLY your own paths, and do not checkout/switch/branch inside it. For each such file, 
+     let <relpath> be the part of its path AFTER "planning/":
+     ```
+     git -C <vault.planningPath> add <vault.planningPath>/<relpath>
+     ```
+     Then, once every such path is staged, commit ONLY those paths — pass them explicitly to `git commit`
+     itself (not merely to `git add`), so a sibling lane's unrelated pre-staged files are never swept
+     into this commit even if they happen to already be staged:
+     ```
+     git -C <vault.planningPath> diff --cached --quiet -- <relpath1> <relpath2> ... || git -C <vault.planningPath> commit -m "$(cat <<'EOF'
+     fix: fix pass <P> for <spec-slug>-task<N> (vault)
+     EOF
+     )" -- <relpath1> <relpath2> ...
+     git -C <vault.planningPath> log --oneline -1
+     ```
+     If NOTHING you wrote this attempt lives under planning/, skip this step entirely — do not run any vault command.
+   - **Vault-commit verification (D46 amendment)**: After a vault commit step (if it ran), the engine independently 
+     re-verifies that every vault-relative path is actually COMMITTED in the vault repo (tracked with no staged or unstaged diff). 
+     A vault-commit failure surfaces exactly like a test failure: the task is never marked passed on this attempt; triage 
+     decides whether to RETRYABLE (fix and try again, ≤3 times) or MAJOR (bail to a human right now).
 2. **Fast test.** Run the checks resolved in Phase 2 step 4/7 for this task: if this task declared its
    own `validation_commands`, run ONLY those; otherwise run the gating-only subset when `testDepth ==
    fast`, or the full suite when `testDepth == full`. Always also run the universal emoji gate, and the
@@ -343,6 +383,26 @@ would never reach here either — Docs only ever runs after a clean `PASS`.
    editing it directly.
 5. Commit (stage explicitly) only if something was patched or created:
    **`docs: update docs for <spec-slug>`**. If nothing needed changing, make no commit.
+   - **Vault-aware docs commit (D46 — if planning/ is a vaulted symlink, AND you patched/created docs under planning/)**: 
+     If the changed[] or created[] lists contain any path starting with "planning/", that path is a vaulted symlink pointing 
+     to a brain-owned vault repository (e.g. agentic-portfolio HQ). Its bytes live at a DIFFERENT git repo, invisible to the 
+     commit you just made. For each such path, let <relpath> be the part after "planning/", then stage and commit it through 
+     the real vault path (never git add -A, git add ., git reset, or git stash against the vault; touch only your own paths):
+     ```
+     git -C <vault.planningPath> add <vault.planningPath>/<relpath>
+     ```
+     Then commit ONLY those paths — pass them explicitly to `git commit` itself (not merely to `git add`), so anything a sibling
+     lane already had staged in this same vault repo is left staged and untouched by this commit:
+     ```
+     git -C <vault.planningPath> diff --cached --quiet -- <relpath1> <relpath2> ... || git -C <vault.planningPath> commit -m "docs: update docs for <spec-slug> (vault)" -- <relpath1> <relpath2> ...
+     git -C <vault.planningPath> log --oneline -1
+     ```
+     If nothing in changed[]/created[] lives under planning/, skip this step entirely.
+   - **Vault-commit verification (D46 amendment)**: After a vault docs-commit step (if it ran), the engine independently 
+     re-verifies that every vault-relative path in changed[]/created[] is actually COMMITTED in the vault repo (tracked with 
+     no staged or unstaged diff). A vault-commit failure here flips docResult.success=false and appends VAULT_COMMIT_INCOMPLETE 
+     to notes. The docs phase is non-gating for the pipeline, so this only makes the failure loud in state/logs rather than 
+     silent — docs can fail and wrap-up still runs.
 6. Persist state to disk (same disk-only rule as Phase 3/6).
 
 ### 6. Phase: Wrap-up — status/log/state, then PR, then optional auto-merge
@@ -360,13 +420,19 @@ the second line (works for both cases). **This determination controls how step 6
 get it right before touching git.**
 
 **6b. Update authored docs (Edit tool, surgical):**
-1. `planning/status.md`:
-   - If bailed: keep the spec's Status as-is (or set `Blocked` if appropriate); set "Current focus" to
-     `<spec-slug> — BLOCKED: <bail_reason>`.
+1. `planning/status.md`. **"Current focus" is APPEND-ONLY narrative** — never delete or rewrite any
+   existing line under it; a prior block's narrative must survive this edit VERBATIM. The one
+   exception: if an existing line already refers to THIS spec by name (e.g. from an earlier partial
+   run), replace only that one line — never the whole section.
+   - If bailed: keep the spec's Status as-is (or set `Blocked` if appropriate); add ONE new line under
+     "Current focus" (or replace this spec's own prior line, per the exception above): `<spec-slug> —
+     BLOCKED: <bail_reason>` — do not touch any other existing line.
    - Else: if this run covered the FULL spec (no task-range selection was given), flip the spec's Status
-     to `Done`. If a task range/selection was given, leave Status as `In progress` and point "Current
-     focus" at the next task — UNLESS this range happened to be the last remaining tasks, in which case
-     flip to `Done` too. Update "Current focus" accordingly.
+     to `Done`. If a task range/selection was given, leave Status as `In progress` and add a new line
+     under "Current focus" pointing at the next task — UNLESS this range happened to be the last
+     remaining tasks, in which case flip to `Done` too. Add ONE new line under "Current focus" recording
+     this outcome (or replace this spec's own prior line, per the exception above) — do not touch any
+     other existing line.
    - Update the "Last updated" date.
 2. `planning/state.json` (the **authored block graph** — `tracks[].blocks[]`, a DIFFERENT file from
    `sdlc-flow-state.json`; skip this whole step silently if the repo has no `planning/state.json`):
@@ -393,7 +459,7 @@ get it right before touching git.**
              break
      if found:
          with open(path, 'w') as fh:
-             json.dump(data, fh, indent=2)
+             json.dump(data, fh, indent=2, ensure_ascii=False)
              fh.write(chr(10))
          print('FLIPPED:' + bid)
      else:
@@ -403,12 +469,18 @@ get it right before touching git.**
      Trust only this script's own stdout (`FLIPPED:<id>` or `NOT_FOUND`) — never assume success. Then
      validate: `python3 -c "import json;json.load(open('planning/state.json'))"`.
 3. Regenerate derived surfaces via `mev emit-state --write` — run this step whenever wrap-up runs at
-   all, independent of whether the spec fully completed (status.md was edited either way):
+   all, independent of whether the spec fully completed (status.md was edited either way). This
+   includes `state.json`'s top-level `focus` object (e.g. `focus.next`) — step 2's scripted mutation
+   above touches only the matched block's `status` field and never `focus`, so `focus.next` is stale
+   until this step runs:
    - **Worktree mode**: do NOT run it here — `mev emit-state` refuses to run inside a linked git
-     worktree. Surfaces regenerate on the base branch when this branch eventually merges (via
-     `/clean-worktree`, `/merge-train`, `/close-out --merge-branch`, or the `--auto-merge` path below).
-   - **Branch mode**: run it right here, on this branch, in the repo root: `mev emit-state --write`. If
-     `mev` or `brain.toml` is absent (standalone/non-brain repo), skip silently.
+     worktree. `focus.next` is therefore **DEFERRED**, not updated — it still points at the block that
+     just closed until the branch eventually merges (via `/clean-worktree`, `/merge-train`,
+     `/close-out --merge-branch`, or the `--auto-merge` path below) and re-runs `mev emit-state
+     --write`. Report this explicitly rather than implying `focus` is fresh.
+   - **Branch mode**: run it right here, on this branch, in the repo root: `mev emit-state --write`.
+     This re-derives `focus.next` from the just-flipped block status. If `mev` or `brain.toml` is
+     absent (standalone/non-brain repo), skip silently.
 4. Prepend a new entry to `log.md` (newest first): a dated header, one paragraph summarizing what was
    implemented across the tasks run, the final verdict (and why it bailed, if it did), notable
    decisions, ending with "Next: …", followed by the `git log --oneline -8` of this run's commits.
@@ -438,7 +510,10 @@ fails, report it — do not relocate the commit to force it to succeed.
   ```
   git -C <vaultRealPath> add <vaultRealPath>/status.md
   git -C <vaultRealPath> add <vaultRealPath>/state.json 2>/dev/null || true
-  git -C <vaultRealPath> diff --cached --quiet || git -C <vaultRealPath> commit -m "chore: wrap up <spec-slug>"
+  Then commit ONLY those two paths — pass them explicitly to `git commit` itself (not merely to
+  `git add`), so anything a sibling lane already had staged in this same vault repo is left staged
+  and untouched by this commit:
+  git -C <vaultRealPath> diff --cached --quiet -- <vaultRealPath>/status.md <vaultRealPath>/state.json || git -C <vaultRealPath> commit -m "chore: wrap up <spec-slug>" -- <vaultRealPath>/status.md <vaultRealPath>/state.json
   ```
   and, as a **separate commit**, the repo-local files, in this repo, on this branch:
   ```

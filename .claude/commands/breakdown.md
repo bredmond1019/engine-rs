@@ -48,10 +48,18 @@ $ARGUMENTS — path to the task spec to break down (e.g. `planning/<spec-slug>/t
 6. After each logical group of sub-steps (not only at the end), add an inline **Verify** check:
    a single command or observation that confirms the group succeeded before moving on.
 
-   **Disjoint file ownership:** as you name exact paths, watch for the same existing file being
-   edited under two different spec **steps** that could run as parallel tasks. If you find one, flag
-   it in **Notes** — either the steps are sequentially dependent (say so) or the shared file should be
-   append-only. An undeclared overlap between parallel tasks escalates the whole block at merge.
+   **Disjoint file ownership (parallel-merge safety) — `/sdlc-block` only.** As you name exact
+   paths, watch for the same existing file being edited under two different spec **steps** that
+   could run as parallel tasks under `/sdlc-block`'s parallel-merge model. This does **not** apply
+   when the spec will run under `/sdlc-flow` or `/sdlc-task`: those engines run every step
+   sequentially on one branch/worktree with no inter-task merge, and `generate-tasks.md`'s
+   compilable task boundaries rule governs step boundaries there instead — including when it
+   requires two steps that would otherwise be file-disjoint to merge into one sub-step, because a
+   breaking change (a renamed public type, a struct's changed fields, an altered trait/interface
+   signature) cannot leave an intermediate step non-compiling. Under `/sdlc-block`: if you find an
+   overlap, flag it in **Notes** — either the steps are sequentially dependent (say so) or the
+   shared file should be append-only. An undeclared overlap between parallel tasks escalates the
+   whole block at merge.
 
 7. Write the breakdown to `planning/<block-dir>/breakdown.md` — same directory as the spec, named `breakdown.md`.
 

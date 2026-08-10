@@ -897,6 +897,12 @@ const badSet = new Set()   // escalated OR poisoned block indices
 // missing, an inline agent mirrors /generate-tasks (the runtime cannot invoke a slash command) —
 // reading the block's section out of the plan file, so this works for master-plan.md AND a /plan
 // output path alike.
+//
+// This is the reference implementation for the D16 derive-from-tasks.md fallback: sdlc-task.js,
+// sdlc-flow.js and sdlc-run.js each carry the identical fallback (same D45 shape, same
+// "Derived tasks.json from tasks.md" log line) for the case where their own D16 preflight finds
+// tasks.md but not tasks.json — this generator predates and models that behaviour, it does not
+// duplicate it.
 async function ensureTasks(slug, blk) {
   const blockTasks = `planning/${slug}/tasks.md`
   const blockTasksJson = `planning/${slug}/tasks.json`
@@ -1001,16 +1007,31 @@ only the last of the block's many commits).
 
 STEP 1 — Validation suite
 Read: cd ${worktreePath} && cat planning/harness.json
-Run every check in validation.checks[] in order. Then run the emoji gate:
+Run every check in validation.checks[] in order. Then run the emoji gate — DIFF-SCOPED: it judges
+only lines ADDED in the range below, never a whole changed file, so a legacy file's pre-existing
+emoji does not fail a diff that never touched it:
   python3 - <<'PYEOF'
-import subprocess, re, sys, os
+import subprocess, re, sys
 EMOJI = re.compile(r'[\\U0001F300-\\U0001FAFF\\U00002600-\\U000027BF]')
-changed = subprocess.run(['git','diff','${baseRef}...HEAD','--name-only'], capture_output=True, text=True).stdout.splitlines()
-md_files = [f for f in changed if f.endswith(('.md','.mdx')) and os.path.isfile(f)]
+FOOTER = 'Generated with Claude Code'
+diff = subprocess.run(['git','diff','-M','-U0','${baseRef}...HEAD','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
 hits = []
-for path in md_files:
-    for n, line in enumerate(open(path, errors='ignore'), 1):
-        if EMOJI.search(line): hits.append(f'{path}:{n}: {line.rstrip()[:100]}')
+cur_file = None
+cur_line = None
+for line in diff:
+    if line.startswith('diff --git '):
+        cur_file = None; cur_line = None
+    elif line.startswith('+++ '):
+        p = line[4:]
+        cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
+    elif line.startswith('@@'):
+        m = re.match(r'@@ -\\d+(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@', line)
+        cur_line = int(m.group(1)) if m else None
+    elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
+        content = line[1:]
+        if EMOJI.search(content) and FOOTER not in content:
+            hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
+        cur_line += 1
 if hits:
     print('EMOJI CHECK FAIL:'); [print(h) for h in hits[:25]]; sys.exit(1)
 print('EMOJI CHECK: OK'); sys.exit(0)

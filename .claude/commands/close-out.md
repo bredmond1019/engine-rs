@@ -20,6 +20,10 @@ $ARGUMENTS — optional. Parsed left to right:
     this for a `/sdlc-flow` run in its default branch mode (no worktree to remove). Default is false.
     Mutually exclusive with `--clean-worktree` (that one handles worktree branches; this one handles
     plain branches).
+  - `--base <ref>` — optional. Explicit diff base (branch, tag, or commit-ish) for the Step 1 emoji
+    gate and the Step 2a coverage sweep. Overrides the auto-resolution in Step 0.5 entirely — use it
+    when that resolution would guess wrong, or when Step 0.5 has nothing to resolve from (no
+    `flow.prBase`, no `origin/HEAD`, no local `main`/`master`) and refuses to run.
   - Remaining text — passed through verbatim as the narrative note to `/handoff`. If
     omitted, `/handoff` derives context from git history and status.md.
 
@@ -28,6 +32,7 @@ Examples:
   - `--gap-check-only` — run Steps 1–3 only; no handoff (used by automated orchestration)
   - `--clean-worktree` — run all steps, and clean/merge the worktree at the end
   - `--merge-branch` — run all steps, and merge the current plain branch into the base + emit-state at the end
+  - `--base develop` — scope the gates to `develop` instead of auto-resolving
   - `shipped D36 close-out command` — run all steps; pass note to `/handoff`
   - `--skip-coverage shipped D36` — skip coverage scan; pass note to `/handoff`
 
@@ -44,20 +49,95 @@ Strip `--gap-check-only` if present (record whether it was set — when set, Ste
 Strip `--skip-coverage` if present (record whether it was set).
 Strip `--clean-worktree` if present (record whether it was set).
 Strip `--merge-branch` if present (record whether it was set).
+Strip `--base <ref>` if present (record the ref value; empty string if not passed).
 If BOTH `--clean-worktree` and `--merge-branch` were passed, stop and tell the user they are mutually
 exclusive (worktree branch vs plain branch) — pick one.
 Treat the remainder as the handoff note (may be empty).
 
+### Step 0.5 — Resolve the diff base for Steps 1 and 2
+
+Both the emoji gate (Step 1) and the coverage sweep (Step 2a) must scope to the **same** base — a
+hard-coded two-dot diff against a literal `main` is empty by definition whenever `HEAD` is the base
+branch itself (the default state after an in-place run, a plain-branch run, or right after `--auto-merge`/
+`--merge-branch` land), which reports a vacuous clean instead of "nothing considered." Resolve the
+base **once**, from real evidence, and refuse to proceed if nothing resolves — never fall back to
+the literal string `main`.
+
+Run this once, substituting the `--base` value parsed in Step 0 for `BASE_ARG` (empty string if
+`--base` was not passed):
+
+```bash
+BASE_ARG="<value of --base, or empty>"
+RESOLVED_BASE=""
+
+if [ -n "$BASE_ARG" ]; then
+  if ! git rev-parse --verify "$BASE_ARG" >/dev/null 2>&1; then
+    echo "CLOSE-OUT: --base '$BASE_ARG' does not resolve to a valid ref. Aborting."; exit 1
+  fi
+  RESOLVED_BASE="$BASE_ARG"
+else
+  CONFIGURED_BASE=$(python3 -c "
+import json
+try:
+    cfg = json.load(open('planning/harness.json'))
+    print(cfg.get('flow', {}).get('prBase', ''))
+except Exception:
+    print('')
+")
+  if [ -n "$CONFIGURED_BASE" ] && git rev-parse --verify "$CONFIGURED_BASE" >/dev/null 2>&1; then
+    RESOLVED_BASE="$CONFIGURED_BASE"
+  else
+    ORIGIN_DEFAULT=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+    if [ -n "$ORIGIN_DEFAULT" ] && git rev-parse --verify "$ORIGIN_DEFAULT" >/dev/null 2>&1; then
+      RESOLVED_BASE="$ORIGIN_DEFAULT"
+    elif git rev-parse --verify main >/dev/null 2>&1; then
+      RESOLVED_BASE="main"
+    elif git rev-parse --verify master >/dev/null 2>&1; then
+      RESOLVED_BASE="master"
+    fi
+  fi
+fi
+
+if [ -z "$RESOLVED_BASE" ]; then
+  echo "CLOSE-OUT: could not resolve a diff base — no --base given, no planning/harness.json flow.prBase, no origin/HEAD, no local main or master. Re-run with --base <ref>. Aborting."
+  exit 1
+fi
+
+CURRENT_BRANCH=$(git branch --show-current)
+if [ "$CURRENT_BRANCH" = "$RESOLVED_BASE" ]; then
+  # HEAD IS the resolved base — a two-dot/three-dot diff against it is empty by definition. The
+  # only real evidence left is a merge commit (e.g. --auto-merge's `gh pr merge --merge`): its
+  # first parent is the pre-merge base, so HEAD^1..HEAD is what the merge actually brought in.
+  if git rev-parse --verify -q HEAD^2 >/dev/null 2>&1; then
+    RANGE="HEAD^1..HEAD"
+    echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' via a merge commit — scoping to what it brought in: $RANGE"
+  else
+    echo "CLOSE-OUT: HEAD IS the base branch '$RESOLVED_BASE' with no merge commit to scope from — there is no diff range that means anything here. Refusing to report a vacuous clean. Re-run with --base <ref> naming the commit this session's work started from, or run /close-out from the feature branch before it merges. Aborting."
+    exit 1
+  fi
+else
+  RANGE="${RESOLVED_BASE}...HEAD"
+fi
+
+echo "$RANGE" > .git/CLOSE_OUT_RANGE
+echo "CLOSE-OUT: resolved diff range = $RANGE"
+```
+
+If this script exits non-zero: **stop. Do not proceed to Step 1.** Surface its message to the user
+verbatim — it already states what to do (pass `--base <ref>`, or run from the feature branch).
+
 ### Step 1 — Run the validation suite
 
 Read `planning/harness.json`. Run every check listed in `validation.checks[]` in order
-(lint, type, test, build). Then always run the universal emoji gate last:
+(lint, type, test, build). Then always run the universal emoji gate last, scoped to the range
+resolved in Step 0.5:
 
 ```bash
-python3 - <<'PYEOF'
+python3 - "$(cat .git/CLOSE_OUT_RANGE)" <<'PYEOF'
 import subprocess, re, sys, os
+RANGE = sys.argv[1]
 EMOJI = re.compile(r'[\U0001F300-\U0001FAFF\U00002600-\U000027BF]')
-changed = subprocess.run(['git','diff','main..HEAD','--name-only'], capture_output=True, text=True).stdout.splitlines()
+changed = subprocess.run(['git','diff', RANGE, '--name-only'], capture_output=True, text=True).stdout.splitlines()
 md_files = [f for f in changed if f.endswith(('.md','.mdx')) and os.path.isfile(f)]
 hits = []
 for path in md_files:
@@ -65,7 +145,7 @@ for path in md_files:
         if EMOJI.search(line): hits.append(f'{path}:{n}: {line.rstrip()[:100]}')
 if hits:
     print('EMOJI CHECK FAIL:'); [print(h) for h in hits[:25]]; sys.exit(1)
-print('EMOJI CHECK: OK'); sys.exit(0)
+print(f'EMOJI CHECK: OK ({len(md_files)} file(s) scoped to {RANGE})'); sys.exit(0)
 PYEOF
 ```
 
@@ -85,8 +165,10 @@ gaps.
 
 **2a — Identify changed source files**
 
-Run `git diff main..HEAD --name-only`. Filter to source files only — exclude:
-`*.md`, `*.mdx`, `*.json`, `*.toml`, `*.yaml`, `*.yml`, `planning/`, `docs/`, `scaffold/`.
+Run `git diff "$(cat .git/CLOSE_OUT_RANGE)" --name-only` — the **same** range Step 1 resolved in
+Step 0.5; the coverage sweep must never diverge from the emoji gate's base. Filter to source files
+only — exclude: `*.md`, `*.mdx`, `*.json`, `*.toml`, `*.yaml`, `*.yml`, `planning/`, `docs/`,
+`scaffold/`.
 
 If no source files changed (docs/config-only session): skip to Step 3 silently.
 
@@ -205,5 +287,9 @@ If `--merge-branch` was passed:
 
 ## Context / Files to Read
 
-- `planning/harness.json` — validation suite (checks + gating flags)
+- `planning/harness.json` — validation suite (checks + gating flags); also read for
+  `flow.prBase` by Step 0.5's diff-base resolution
 - `planning/status.md` — current focus (to scope coverage check to recent work)
+- `.git/CLOSE_OUT_RANGE` — scratch file this run writes in Step 0.5 with the resolved diff range
+  (e.g. `main...HEAD` or `HEAD^1..HEAD`); Steps 1 and 2a both read it so they can never diverge.
+  Lives under `.git/`, so it is never tracked and needs no cleanup.

@@ -42,7 +42,16 @@ list), explicit Acceptance Criteria, and a Testing Strategy, feeding directly in
    below.
 8. **Property self-check.** Before reporting, re-read the spec and **revise in place** until every
    property holds, then re-check:
-   - **`tasks.json` parses as valid JSON** and is a non-empty bare array (not wrapped in an object).
+   - **`tasks.json` must be read BACK off disk and parsed** — this is a verification you perform,
+     not an assertion you write down. Run the concrete command:
+     `python3 -c "import json,sys;d=json.load(open('planning/ticket-{slug}/tasks.json'));assert isinstance(d,list) and d,'tasks.json must be a non-empty bare array';print(len(d),'tasks')"`.
+     If that command errors or you skip running it, the check has not been performed. Reporting the
+     spec path without `tasks.json` actually present on disk is a **failed run** — every SDLC engine
+     enumerates its task loop from `tasks.json`, not `tasks.md`, and a missing or unparseable file
+     hard-aborts the very next step (D16).
+   - **Reaffirm the D45 shape at the point of writing**: a bare array (never a `{"tasks": [...]}`
+     wrapper — that shape is D44, and D44 is superseded), 1-indexed integer `task_id`, `description`
+     as one string, and no `status` or `attempt_count` key authored by you (those are engine-owned).
    - **Every task names ≥1 concrete file** in its `files[]` (Validate is exempt).
    - **Acceptance Criteria are non-empty and observable** — each can be judged true/false.
    - **Testing Strategy is non-empty** — names the test file(s) and what each must cover.
@@ -50,6 +59,10 @@ list), explicit Acceptance Criteria, and a Testing Strategy, feeding directly in
      supplies them as the fallback).
    - **No leftover template sentinels** — no `{{TOKEN}}`, unfilled `<placeholder>`-style angle
      stubs, or empty bullets. Legitimate `<...>` in code/prose is fine.
+   - **Note:** if `tasks.json` is somehow absent when an SDLC engine later runs, the engine's D16
+     preflight will now derive it from `tasks.md` and commit the result rather than aborting — but
+     that derivation is a recovery path for the genuinely unrecoverable case, never a licence to
+     skip writing the file here. `/ticket` still must write and verify `tasks.json` itself.
 9. Report the path and next step.
 
 ## Codebase Structure

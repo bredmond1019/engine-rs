@@ -232,6 +232,24 @@ const UI_TEST_SCHEMA = {
   }
 }
 
+// D16 derive-from-tasks.md fallback — see the abort below (after the generate-tasks phase). Mirrors
+// sdlc-block.js's ensureTasks() generator and sdlc-task.js/sdlc-flow.js's identical fallback: when
+// the spec file exists but tasks.json is missing/invalid, read tasks.md's step decomposition and
+// write a fresh D45-shaped tasks.json from it (never a verbatim copy of the prose, never the
+// superseded D44 {"tasks": [...]} wrapper).
+const DERIVE_SCHEMA = {
+  type: 'object',
+  required: ['hasTasksJson', 'derivable', 'written'],
+  properties: {
+    hasTasksJson: { type: 'boolean', description: 'true iff tasksJsonFile already parses as a non-empty bare array — when true, derivable/written are irrelevant and nothing is written' },
+    derivable:    { type: 'boolean', description: 'true iff tasks.json was absent/invalid AND tasks.md exists and carries a numbered step decomposition to derive from' },
+    written:      { type: 'boolean', description: 'true iff a D45-shaped tasks.json (bare array, integer task_id, single-string description, no status/attempt_count) was written and committed' },
+    commitHash:   { type: 'string' },
+    taskCount:    { type: 'integer' },
+    notes:        { type: 'string' }
+  }
+}
+
 // ----------------------------------------------------------------
 // MODEL TIERING — the primary token lever for this pipeline.
 //
@@ -251,6 +269,7 @@ const MODEL = {
   scout:         'haiku',    // deterministic decision tree: ls a few files, apply a fixed 7-rule order
   startBlock:    'haiku',    // one surgical status.md edit + a date stamp
   generateTasks: 'opus',     // PLANNING — authors the spec that drives everything (fallback path)
+  derive:        'opus',     // D16 fallback: author a fresh tasks.json from tasks.md's step list — real judgment, mirrors sdlc-block.js's ensureTasks() generator
   implement:     'sonnet',   // writes content/code + tests against a scoped spec/breakdown
   fix:           'sonnet',   // targeted fixes; failures escalate, never silently ship
   test:          'haiku',    // runs the project's validation suite, reads exit codes; review re-runs the gating checks
@@ -937,6 +956,61 @@ Return your result using the StructuredOutput tool with fields:
   log(`Task spec written: ${genResult.reportFile}`)
   await recordPhaseState('generate-tasks')
   currentStage = 'implement'
+}
+
+// ================================================================
+// D16 preflight — every downstream stage enumerates its task loop from tasksJsonFile. The
+// generate-tasks phase above already wrote it when the spec file itself was missing; this covers
+// the other case — spec file exists (scout found a startStage past generate-tasks, or --from
+// skipped scout) but tasks.json is missing or invalid.
+// ================================================================
+{
+  const deriveResult = await tracedAgent(`
+You are the D16 preflight for one /sdlc-run spec. Run everything from the repo root. Do NOT
+implement anything.
+
+STEP 1 — check whether ${tasksJsonFile} already parses as a non-empty bare array:
+  cat ${tasksJsonFile} 2>/dev/null || echo "NO_TASKS_JSON"
+
+  If it parses as a non-empty JSON array, set hasTasksJson=true, derivable=false, written=false,
+  and STOP — do not write or commit anything.
+
+STEP 2 — D16 derive-from-tasks.md fallback. tasksJsonFile is missing, invalid, or empty; ${specFile}
+  (tasks.md) may still carry a usable step decomposition. Mirrors sdlc-block.js's ensureTasks()
+  generator and /generate-tasks' --from mode: author a FRESH decomposition from tasks.md (never a
+  verbatim copy of its prose). Deriving from an authored tasks.md is not guessing the task
+  structure — D16 exists to refuse fabricating one out of nothing.
+  cat ${specFile} 2>/dev/null || echo "NO_TASKS_MD"
+
+  If tasks.md is missing, or has no "## Step-by-Step Tasks" / "## Step by Step Tasks" section with
+  at least one numbered step, set hasTasksJson=false, derivable=false, written=false, and STOP —
+  do not write anything.
+
+STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from tasks.md's step list plus its
+  Acceptance Criteria / Validation Commands sections (a real decomposition, not a verbatim copy of
+  the prose). Write it as valid JSON: a BARE ARRAY (D45 shape — NOT the superseded D44
+  {"tasks": [...]} wrapper), each entry shaped { task_id, title, description, acceptance_criteria,
+  validation_commands, max_attempts, files, dependsOn } — task_id is a 1-indexed integer in
+  dependency order with no gaps, description is a single string, max_attempts is 3, and you must
+  NEVER author a "status" or "attempt_count" key (those are engine-owned). Each task names the
+  concrete file(s) it owns in "files" so tasks stay disjoint.
+
+STEP 4 — Commit it on the current branch with an explicit pathspec:
+  git add ${tasksJsonFile}
+  git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
+  git log --oneline -1   (capture the short hash)
+
+Return via StructuredOutput: hasTasksJson, derivable, written, commitHash, taskCount, notes.
+`, withModel({ label: 'derive-tasks-json', schema: DERIVE_SCHEMA, phase: 'Plan' }, MODEL.derive))
+
+  if (deriveResult?.derivable && deriveResult?.written) {
+    log(`Derived tasks.json from tasks.md (D16 derive-from-tasks.md fallback) — ${deriveResult.taskCount || '?'} task(s), commit ${deriveResult.commitHash || 'unknown'}.`)
+  } else if (!deriveResult?.hasTasksJson) {
+    // D16 preflight lint — refuse to guess the task structure when nothing was derivable either.
+    log(`ABORTED (D16) — ${tasksJsonFile} is missing, invalid, or is an empty array.`)
+    log(`Fix: run /generate-tasks ${blockId} to author tasks.json (see the spec template), commit, then re-run.`)
+    return { error: 'No tasks.json (D16)', blockId, specFile: tasksJsonFile }
+  }
 }
 
 // Load the project's validation policy once (mechanism/policy split — see planning/harness.json).
@@ -1803,7 +1877,7 @@ for track in data.get('tracks', []):
         break
 if found:
     with open(path, 'w') as fh:
-        json.dump(data, fh, indent=2)
+        json.dump(data, fh, indent=2, ensure_ascii=False)
         fh.write(chr(10))
     print('FLIPPED:' + bid)
 else:

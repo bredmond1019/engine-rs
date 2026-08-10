@@ -137,6 +137,56 @@ resolved absolute path from the second line).
   return result
 }
 
+// Vault-aware task commits (extends D46): the per-task implement/fix stage and the docs stage below
+// are instructed to stage + commit any planning/ paths they wrote THROUGH the vault repo (git -C
+// <vault.planningPath>), reusing detectPlanningVault's real path exactly like the wrap-up recipe
+// already does — never a second detection idiom. But that instruction is self-reported: this
+// ticket's amendment log recorded a live run where a stage returned a perfectly valid commitHash
+// that covered ONLY the source half of a task, with the vault half silently uncommitted. So a valid
+// commitHash proves nothing about the vault half, and this check never keys on it — it independently
+// re-verifies, for every filesModified path that resolves under the vault, that the path is BOTH
+// tracked and free of any staged/unstaged diff in the vault repo (i.e. actually landed in a commit
+// there), via a cheap Haiku agent turn rather than trusting the implementer's own report.
+const VAULT_VERIFY_SCHEMA = {
+  type: 'object',
+  required: ['allCommitted'],
+  properties: {
+    allCommitted:     { type: 'boolean', description: 'true iff every given path is tracked in the vault repo with no staged/unstaged diff' },
+    uncommittedPaths: { type: 'array', items: { type: 'string' }, description: 'the subset (vault-relative) that failed either check' },
+    notes:            { type: 'string' }
+  }
+}
+async function verifyVaultCommit(runDir, vault, vaultRelPaths) {
+  if (!vault.vaulted || !vaultRelPaths.length) return { allCommitted: true, uncommittedPaths: [] }
+  const result = await agent(`
+Independently verify that these paths are FULLY COMMITTED in the vault repo at ${vault.planningPath}
+(tracked, AND no staged or unstaged diff) — do not take anyone's word for it, re-check directly.
+Paths (relative to ${vault.planningPath}):
+${vaultRelPaths.map(p => `  ${p}`).join('\n')}
+Run exactly these Bash calls (from ${runDir}):
+  cd ${runDir} && git -C ${vault.planningPath} status --porcelain -- ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}
+  cd ${runDir} && git -C ${vault.planningPath} ls-files --error-unmatch -- ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}
+A path is COMMITTED only if it produces NO line in the status --porcelain output AND the ls-files
+--error-unmatch call exits 0 for it (nonzero/"did not match" means untracked or missing — NOT committed).
+Return via StructuredOutput: allCommitted (true only if every path passed both checks),
+uncommittedPaths (the vault-relative paths that failed either check; empty array if all committed),
+notes (what you actually observed).
+`, { label: 'verify-vault-commit', schema: VAULT_VERIFY_SCHEMA, model: 'haiku' })
+  if (!result) return { allCommitted: false, uncommittedPaths: vaultRelPaths, notes: 'verification agent returned null' }
+  return result
+}
+
+// Given a stage's self-reported filesModified (repo-root-relative) and a resolved vault, return the
+// vault-relative subset (the part of the path after "planning/") that needs an independent
+// vault-commit check. Derived from what the stage ACTUALLY wrote — never a hard-coded filename list.
+function vaultRelPathsFrom(filesModified, vault) {
+  if (!vault.vaulted || !Array.isArray(filesModified)) return []
+  return filesModified
+    .filter(f => typeof f === 'string' && (f === 'planning' || f.startsWith('planning/')))
+    .map(f => f.slice('planning/'.length))
+    .filter(Boolean)
+}
+
 const autoMergeFlag = hasFlag('--auto-merge')
 const noPr          = hasFlag('--no-pr')
 const resumeMode    = hasFlag('--resume')
@@ -245,6 +295,22 @@ const ENUMERATE_SCHEMA = {
   }
 }
 
+// D16 derive-from-tasks.md fallback — see the abort below. Mirrors sdlc-block.js's ensureTasks()
+// generator and /generate-tasks' --from mode: read the spec's authored step decomposition and
+// write a fresh D45-shaped tasks.json from it (never a verbatim copy of the prose, never the
+// superseded D44 {"tasks": [...]} wrapper).
+const DERIVE_SCHEMA = {
+  type: 'object',
+  required: ['derivable', 'written'],
+  properties: {
+    derivable:  { type: 'boolean', description: 'true iff tasks.md exists and carries a numbered step decomposition to derive from' },
+    written:    { type: 'boolean', description: 'true iff a D45-shaped tasks.json (bare array, integer task_id, single-string description, no status/attempt_count) was written and committed' },
+    commitHash: { type: 'string' },
+    taskCount:  { type: 'integer' },
+    notes:      { type: 'string' }
+  }
+}
+
 const STATE_LOAD_SCHEMA = {
   type: 'object',
   required: ['exists'],
@@ -345,17 +411,43 @@ const WRAPUP_SCHEMA = {
   }
 }
 
+// Outcome vocabulary (replaces the old single `created` boolean, which collapsed three distinct
+// cases into one flag the engine trusted blindly — see planning/decisions/ for the PR-stage
+// outcome vocabulary ADR):
+//   'impossible' — no gh CLI or no git remote in this environment. Correct, expected, MUST NOT
+//                  fail the run. Set only when step 2's GH_ABSENT/NO_REMOTE check fires.
+//   'failed'     — a PR was genuinely attempted (push and/or `gh pr create`) and it errored out.
+//                  Previously indistinguishable from 'impossible'; this is one of the two bugs.
+//   'created'    — the PR exists. The engine does NOT take this on faith — see the dedicated
+//                  PR_VERIFY_SCHEMA call below, which independently confirms it via `gh pr view`
+//                  rather than trusting this self-report (the other bug: the old `|| true` on the
+//                  lookup made a failed lookup indistinguishable from an absent PR).
 const PR_SCHEMA = {
   type: 'object',
-  required: ['created'],
+  required: ['outcome'],
   properties: {
-    created:   { type: 'boolean', description: 'true if a PR was created (or gh reported one already exists)' },
+    outcome:   { type: 'string', enum: ['created', 'impossible', 'failed'], description: "'impossible' = no gh/no remote (do NOT fail); 'failed' = push or gh pr create was attempted and errored; 'created' = PR exists (still independently re-verified by the engine, not trusted on its own)" },
     url:       { type: 'string', description: 'the PR URL, or "" if not created' },
     number:    { type: 'integer', description: 'the PR number, or 0 if not created' },
     draft:     { type: 'boolean', description: 'true if a draft PR (a bail handoff)' },
     pushed:    { type: 'boolean', description: 'true if the branch was pushed to the remote' },
     ghPresent: { type: 'boolean', description: 'true if the gh CLI was available' },
-    notes:     { type: 'string', description: 'when not created: the branch name + manual instructions printed for the user' }
+    notes:     { type: 'string', description: "when outcome != 'created': for 'impossible', the branch name + manual instructions; for 'failed', the actual push/gh error text so the operator can act on it" }
+  }
+}
+
+// Independent verification of PR_SCHEMA's self-reported `outcome` — a SEPARATE agent turn, so the
+// engine is not trusting the pr-create agent's own account of its own work. Reads the raw exit
+// code of `gh pr view` on the branch itself; the engine (not the agent) decides `created` from
+// that code, closing the `|| true` hole that made a failed lookup indistinguishable from "no PR".
+const PR_VERIFY_SCHEMA = {
+  type: 'object',
+  required: ['exitCode'],
+  properties: {
+    exitCode: { type: 'integer', description: 'the exact process exit code `gh pr view <branch> --json number,url,state` returned — 0 only if a PR was actually found (the branch MUST be passed as the positional argument, never via --head, which is a `gh pr list`-only flag that `gh pr view` rejects as an unknown flag)' },
+    url:      { type: 'string', description: 'the PR URL if exitCode == 0, else ""' },
+    number:   { type: 'integer', description: 'the PR number if exitCode == 0, else 0' },
+    state:    { type: 'string', description: 'OPEN/MERGED/CLOSED if exitCode == 0, else ""' }
   }
 }
 
@@ -393,6 +485,7 @@ const STATE_WRITE_SCHEMA = {
 const MODEL = {
   worktreeSetup: 'haiku',    // scripted git following an exact free-name + sparse-checkout recipe
   enumerate:     'haiku',    // read + parse tasks.json's task list — a fixed procedure
+  derive:        'opus',     // D16 fallback: author a fresh tasks.json from tasks.md's step list — real judgment, mirrors sdlc-block.js's ensureTasks() generator
   stateLoad:     'haiku',    // read + parse one JSON file (resume only)
   generateTasks: 'opus',     // PLANNING — authors the spec (fallback path only)
   implement:     'sonnet',   // writes code/content + tests against a scoped task
@@ -403,6 +496,7 @@ const MODEL = {
   docs:          'sonnet',   // surgical doc patches, gated on PASS
   wrapup:        'sonnet',   // human-facing status/log prose + the D18 amendment log (judgment)
   pr:            'sonnet',   // push + gh pr create with a handoff body; degrades if gh absent
+  prVerify:      'haiku',    // ONE `gh pr view` call + report its exit code — mechanical, not judgment
   merge:         'sonnet',   // --auto-merge: merge the PR + clean up + emit-state on the base
   stateWriter:   'haiku',    // stamps timestamps, writes state.json + worklog.md, commits
 }
@@ -1075,7 +1169,7 @@ if (!setupResult.specFileExists) {
   return { error: 'Missing spec', blockId, specFile }
 }
 
-const enumResult = await tracedAgent(`${W}
+const ENUMERATE_PROMPT = `${W}
 You enumerate the tasks defined in a spec's tasks.json. Do NOT modify anything.
 
 STEP 1 — read the task list:
@@ -1096,10 +1190,52 @@ STEP 4 — Engine-parse gate scan. For each task, look at its "files" array. If 
   task's other files). Skip every task whose "files" has no such path.
 
 Return via StructuredOutput: hasTasks, allTasks (integers in order), taskChecks, engineFiles, notes.
-`, withModel({ label: 'enumerate', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
+`
+
+let enumResult = await tracedAgent(ENUMERATE_PROMPT, withModel({ label: 'enumerate', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
 
 if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) {
-  // D16 preflight lint — refuse to guess the task structure.
+  // D16 derive-from-tasks.md fallback — before refusing, check whether the spec's authored
+  // tasks.md carries a derivable step decomposition. Mirrors sdlc-block.js's ensureTasks()
+  // generator and /generate-tasks' --from mode: author a FRESH decomposition from tasks.md (never
+  // a verbatim copy of its prose). Deriving from an authored tasks.md is not guessing the task
+  // structure — D16 exists to refuse fabricating one out of nothing, which the abort below still does.
+  const deriveResult = await tracedAgent(`${W}
+You are the D16 recovery generator for one /sdlc-flow spec. ${tasksJsonFile} is missing, invalid, or
+empty; ${specFile} (tasks.md) may still carry a usable step decomposition. Do NOT implement anything.
+
+STEP 1 — check for a derivable source:
+  cd ${worktreePath} && cat ${specFile} 2>/dev/null || echo "NO_TASKS_MD"
+
+STEP 2 — If tasks.md is missing, or has no "## Step-by-Step Tasks" / "## Step by Step Tasks"
+  section with at least one numbered step, set derivable=false, written=false, and STOP — do not
+  write anything.
+
+STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from tasks.md's step list plus its
+  Acceptance Criteria / Validation Commands sections (mirrors /generate-tasks' --from mode: a real
+  decomposition, not a verbatim copy of the prose). Write it as valid JSON: a BARE ARRAY (D45 shape —
+  NOT the superseded D44 {"tasks": [...]} wrapper), each entry shaped { task_id, title, description,
+  acceptance_criteria, validation_commands, max_attempts, files, dependsOn } — task_id is a 1-indexed
+  integer in dependency order with no gaps, description is a single string, max_attempts is 3, and
+  you must NEVER author a "status" or "attempt_count" key (those are engine-owned). Each task names
+  the concrete file(s) it owns in "files" so tasks stay disjoint.
+
+STEP 4 — Commit it on the current branch with an explicit pathspec:
+  git add ${tasksJsonFile}
+  git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
+  git log --oneline -1   (capture the short hash)
+
+Return via StructuredOutput: derivable, written, commitHash, taskCount, notes.
+`, withModel({ label: 'derive-tasks-json', schema: DERIVE_SCHEMA, phase: 'Plan' }, MODEL.derive))
+
+  if (deriveResult?.derivable && deriveResult?.written) {
+    log(`Derived tasks.json from tasks.md (D16 derive-from-tasks.md fallback) — ${deriveResult.taskCount || '?'} task(s), commit ${deriveResult.commitHash || 'unknown'}.`)
+    enumResult = await tracedAgent(ENUMERATE_PROMPT, withModel({ label: 'enumerate-post-derive', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
+  }
+}
+
+if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) {
+  // D16 preflight lint — refuse to guess the task structure when nothing was derivable either.
   log(`ABORTED (D16) — ${tasksJsonFile} is missing, invalid, or is an empty array.`)
   log(`Fix: run /generate-tasks ${blockId} to author tasks.json (see the spec template), commit, then re-run.`)
   return { error: 'No tasks.json (D16)', blockId, specFile: tasksJsonFile }
@@ -1260,10 +1396,37 @@ ${usingOverride
     ? renderTaskCheckList(taskCommands, worktreePath)
     : renderCheckList(harnessCfg, { gatingOnly, cwd: worktreePath, engineFiles })}
 
-Then run the universal emoji gate (a harness rule, always): scan the files changed on this branch for
-emoji in markdown/docs (excluding the literal "🤖 Generated with Claude Code" PR footer if present).
-  cd ${worktreePath} && git diff --name-only ${prBase}..HEAD
-  Inspect the changed .md files; a stray emoji in docs FAILS this gate.
+Then run the universal emoji gate (a harness rule, always) — DIFF-SCOPED: it judges only lines
+ADDED on this branch, never a whole changed file, so a legacy file's pre-existing emoji does not
+fail a diff that never touched it (the literal "🤖 Generated with Claude Code" PR footer is exempt
+— it lives in the PR body, not a file, but the check exempts the phrase defensively too):
+  cd ${worktreePath} && python3 - <<'PYEOF'
+import subprocess, re, sys
+EMOJI = re.compile(r'[\\U0001F300-\\U0001FAFF\\U00002600-\\U000027BF]')
+FOOTER = 'Generated with Claude Code'
+diff = subprocess.run(['git','diff','-M','-U0','${prBase}..HEAD','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
+hits = []
+cur_file = None
+cur_line = None
+for line in diff:
+    if line.startswith('diff --git '):
+        cur_file = None; cur_line = None
+    elif line.startswith('+++ '):
+        p = line[4:]
+        cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
+    elif line.startswith('@@'):
+        m = re.match(r'@@ -\\d+(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@', line)
+        cur_line = int(m.group(1)) if m else None
+    elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
+        content = line[1:]
+        if EMOJI.search(content) and FOOTER not in content:
+            hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
+        cur_line += 1
+if hits:
+    print('EMOJI CHECK FAIL:'); [print(h) for h in hits[:25]]; sys.exit(1)
+print('EMOJI CHECK: OK'); sys.exit(0)
+PYEOF
+  A stray emoji ADDED in docs FAILS this gate.
 
 For each check record: name, passed (true iff exit code 0), the command, and failure output.
 ${onPass ? renderOnPassStateWriteRecipe(onPass) : ''}
@@ -1429,6 +1592,11 @@ function buildPassPayload(taskNum, t, attempt, validatedLabel) {
 // ================================================================
 phase('Tasks')
 
+// D46 + vault-aware task commits: resolve ONCE for the whole run and reuse everywhere below (the
+// per-task commit step, the docs stage, and the wrap-up stage) — never re-detect per task/stage, and
+// never a second detection idiom.
+const vault = await detectPlanningVault(worktreePath)
+
 let bailed = false
 let bailReason = null
 
@@ -1505,15 +1673,37 @@ ${isFix ? `fix: fix pass ${attempt - 1} for ${stem}` : `feat: implement ${stem}`
 EOF
 )"
    Run: cd ${worktreePath} && git log --oneline -1   (capture the short hash)
-
+${vault.vaulted ? `
+7b. planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a DIFFERENT git
+    repo, invisible to the commit you just made in step 7. If this attempt created or edited ANY file
+    under planning/ (i.e. it belongs in filesModified with a "planning/" prefix), you MUST ALSO stage
+    and commit it there, through the real path — derive the exact set from what you actually wrote,
+    never a fixed list of filenames. NEVER git add -A, git add ., git reset, or git stash against the
+    vault repo — another lane's session may have unrelated work staged there right now; touch ONLY
+    your own paths, and do not checkout/switch/branch inside it (stay on whatever branch it is
+    already on). For each such file, let <relpath> be the part of its path AFTER "planning/":
+      cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
+    Then, once every such path is staged, commit ONLY those paths — pass them explicitly to \`git commit\`
+    itself (not merely to \`git add\`), so a sibling lane's unrelated pre-staged files are never swept
+    into this commit even if they happen to already be staged:
+      cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+${isFix ? `fix: fix pass ${attempt - 1} for ${stem} (vault)` : `feat: implement ${stem} (vault)`}
+EOF
+)" -- <relpath1> <relpath2> ...
+      cd ${worktreePath} && git -C ${vault.planningPath} log --oneline -1
+    If NOTHING you wrote this attempt lives under planning/, skip this step entirely — do not run any
+    vault command. If a vault add/commit fails, report it PLAINLY in notes; never paper over it, and
+    never "repair" it by committing on a different branch inside the vault.
+` : ''}
 Return via StructuredOutput:
   reportFile: ""   (flow keeps state in state.json, not per-stage reports)
   success: true if the work completed and the spec validation passed
-  filesModified: every source file you created or modified this attempt
-  commitHash: the 7-char short hash (empty string if no commit was made)
+  filesModified: every file you created or modified this attempt — including any under planning/
+    (do NOT omit vault-side files just because they commit through a different repo)
+  commitHash: the 7-char short hash of THIS repo's commit (empty string if no commit was made here)
   summary: one line — what this task now does
   decisions: any non-obvious choices (empty array if none)
-  notes: one-line status
+  notes: one-line status${vault.vaulted ? ' — mention explicitly whether a vault commit (step 7b) happened and, if so, its outcome' : ''}
 `, withModel({ label: `${isFix ? 'fix' : 'implement'}-${taskNum}-${attempt}`, schema: STAGE_SCHEMA, phase: 'Tasks' }, isFix ? fixModel : MODEL.implement))
 
     if (!stageResult) {
@@ -1536,6 +1726,43 @@ Return via StructuredOutput:
     if (stageResult.summary) t.summary = stageResult.summary
     if (Array.isArray(stageResult.filesModified)) t.files_changed = [...new Set([...(t.files_changed || []), ...stageResult.filesModified])]
     if (Array.isArray(stageResult.decisions) && stageResult.decisions.length) t.decisions = [...(t.decisions || []), ...stageResult.decisions]
+
+    // 2b. Vault-commit verification — independent of the stage's self-report. A non-empty commitHash
+    // proves nothing about the vault half (observed live: one run's commitHash was valid and covered
+    // only the source half, with the vault edit silently uncommitted — see this ticket's amendment
+    // log). So this ALWAYS re-derives the vault-relevant subset from filesModified and re-checks it
+    // directly, rather than trusting anything the stage reported. A failure here surfaces exactly
+    // like a test failure: the task is never marked passed on this attempt.
+    const vaultRelPaths = vaultRelPathsFrom(stageResult.filesModified, vault)
+    if (vaultRelPaths.length) {
+      const vaultVerify = await verifyVaultCommit(worktreePath, vault, vaultRelPaths)
+      if (!vaultVerify.allCommitted) {
+        const uncommitted = (vaultVerify.uncommittedPaths && vaultVerify.uncommittedPaths.length) ? vaultVerify.uncommittedPaths : vaultRelPaths
+        log(`Task ${taskNum} attempt ${attempt}: vault commit incomplete — not committed in ${vault.planningPath}: ${uncommitted.join(', ')}.`)
+        const vaultFailBlob = `VAULT_COMMIT_INCOMPLETE — planning/ path(s) not committed in the vault repo (${vault.planningPath}): ${uncommitted.join(', ')}. ${vaultVerify.notes || ''}`.trim()
+        t.issues = [...(t.issues || []), 'vault commit incomplete']
+        const vaultBailPayload = buildBailPayload(taskNum, t, attempt, `Task ${taskNum}: vault commit incomplete — ${uncommitted.join(', ')}`)
+        const tr = await triage(`task ${taskNum} vault-commit`, attempt, MAX_TASK_ATTEMPTS, vaultFailBlob, prevFailBlob, vaultBailPayload)
+        prevFailBlob = vaultFailBlob
+        if (tr && tr.class === 'MAJOR') {
+          bailed = true
+          bailReason = tr.bailReason || tr.reason || vaultFailBlob
+          if (tr.stateWritten) taskStateWritten = true
+          log(`Task ${taskNum}: triage → MAJOR on vault-commit failure — bailing immediately.`)
+          break
+        }
+        if (attempt === MAX_TASK_ATTEMPTS) {
+          bailed = true
+          bailReason = `Task ${taskNum} still failing to commit vault paths after ${MAX_TASK_ATTEMPTS} attempts: ${uncommitted.join(', ')}`
+          if (tr && tr.stateWritten) taskStateWritten = true
+          log(`Task ${taskNum}: exhausted ${MAX_TASK_ATTEMPTS} attempts on a vault-commit failure — bailing to wrap-up.`)
+          break
+        }
+        if (tr) t.fixes = [...(t.fixes || []), tr.reason]
+        log(`Task ${taskNum}: triage → RETRYABLE on vault-commit failure — fix pass ${attempt}/${MAX_TASK_ATTEMPTS - 1}. ${tr?.reason || ''}`)
+        continue
+      }
+    }
 
     // 3. Fast test (tripwire) — gating checks only unless testDepth=full. A task that declares its
     //    own `validation_commands` in tasks.json runs THOSE instead (the end review still runs the
@@ -1665,8 +1892,11 @@ but it does NOT replace verifying the criteria against the code:
 
 ${renderCheckList(harnessCfg, { gatingOnly: false, cwd: worktreePath, engineFiles: [...new Set(taskList.flatMap(n => engineFilesFor(n)))] })}
 
-   Plus the universal emoji gate: scan changed .md files for stray emoji (the literal
-   "🤖 Generated with Claude Code" footer is allowed only in a PR body, not in docs).
+   Plus the universal emoji gate, DIFF-SCOPED to ${prBase}..HEAD (only lines ADDED across the
+   branch are judged, never a whole changed file — same script as the per-task gate above, same
+   base): run it again here as the fresh authoritative check (the literal
+   "🤖 Generated with Claude Code" footer is allowed only in a PR body, not in docs; the check
+   exempts the phrase defensively too).
 
 4. For each acceptance criterion, read the relevant source and mark MET / PARTIAL / NOT_MET. Also check
    CLAUDE.md standing-rule compliance (a violation is a failing criterion) and IDENTITY INTEGRITY (flag
@@ -1880,6 +2110,23 @@ EOF
 )"
      cd ${worktreePath} && git log --oneline -1
    If nothing needed changing, make no commit and report success=true with empty changed/created.
+${vault.vaulted ? `
+   This step almost never touches planning/ (docs live under docs/), but if it genuinely did — e.g. a
+   patched/created doc path in changed[]/created[] above starts with "planning/" — that path is a
+   vaulted symlink (D46), a DIFFERENT git repo, invisible to the commit you just made. Stage + commit
+   it there too, through the real path, deriving the exact set from changed[]/created[] (never a fixed
+   list): for each such path, let <relpath> be the part after "planning/":
+     cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
+     Then commit ONLY those paths — pass them explicitly to \`git commit\` itself (not merely to
+     \`git add\`), so a sibling lane's unrelated pre-staged files are never swept into this commit:
+     cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+docs: update docs for ${blockId} (vault)
+EOF
+)" -- <relpath1> <relpath2> ...
+     cd ${worktreePath} && git -C ${vault.planningPath} log --oneline -1
+   NEVER git add -A, git add ., git reset, or git stash against the vault repo, and never checkout/
+   switch/branch inside it. If nothing you patched/created lives under planning/, skip this entirely.
+` : ''}
 ${renderDocsStateWriteRecipe(docsStatePayload)}
 Return via StructuredOutput: success, changed[], created[], flagged[], commitHash, stateWritten (true
 only if you performed the additional state write above), notes.
@@ -1889,6 +2136,18 @@ only if you performed the additional state write above), notes.
     state.docs.changed = docResult.changed || []
     state.docs.created = docResult.created || []
     log(`Docs: ${(docResult.changed || []).length} patched, ${(docResult.created || []).length} created${(docResult.flagged || []).length ? `, ${docResult.flagged.length} flagged NEEDS_REVIEW` : ''}`)
+    // Same independent vault-commit verification as the per-task loop — a docs-agent self-report of
+    // success/commitHash proves nothing about a planning/ path landing committed in the vault repo.
+    const docsVaultRelPaths = vaultRelPathsFrom([...(docResult.changed || []), ...(docResult.created || [])], vault)
+    if (docsVaultRelPaths.length) {
+      const docsVaultVerify = await verifyVaultCommit(worktreePath, vault, docsVaultRelPaths)
+      if (!docsVaultVerify.allCommitted) {
+        const uncommitted = (docsVaultVerify.uncommittedPaths && docsVaultVerify.uncommittedPaths.length) ? docsVaultVerify.uncommittedPaths : docsVaultRelPaths
+        log(`Docs: vault commit incomplete — not committed in ${vault.planningPath}: ${uncommitted.join(', ')}. Treating docs phase as failed.`)
+        docResult.success = false
+        docResult.notes = `${docResult.notes ? docResult.notes + ' | ' : ''}VAULT_COMMIT_INCOMPLETE: ${uncommitted.join(', ')} — ${docsVaultVerify.notes || ''}`.trim()
+      }
+    }
   } else {
     log('Docs agent returned null — continuing to wrap-up.')
   }
@@ -1921,9 +2180,8 @@ log(`Wrap-up. Verdict: ${finalVerdict} | passed ${passedTasks.length}/${taskList
 // link"), and the wrong repair is to checkout/commit inside the vault. The right behaviour is to
 // stage+commit the vaulted files THROUGH their real path via `git -C <vault>`, on whatever branch
 // the vault repo is already on, with no checkout at all — while repo-local files (log.md, the spec)
-// stay staged and committed in the invoking repo exactly as before. detectPlanningVault() resolves
-// which case applies.
-const vault = await detectPlanningVault(worktreePath)
+// stay staged and committed in the invoking repo exactly as before. `vault` was already resolved
+// once, before the per-task loop, and is reused here (never a second detectPlanningVault() call).
 const wrapupStatePayload = buildWrapupStatePayload()
 const wrapupResult = await tracedAgent(`${W}
 You are the wrap-up agent for an /sdlc-flow run. Write the human-facing status/log + the D18 amendment log
@@ -1942,10 +2200,16 @@ Target:
    cd ${worktreePath} && head -40 log.md
    cd ${worktreePath} && git log --oneline -20
 
-2. Update planning/status.md (Edit tool, surgical):
+2. Update planning/status.md (Edit tool, surgical). "Current focus" is APPEND-ONLY narrative — never
+   delete or rewrite any existing line under it; a prior block's narrative must survive this edit
+   VERBATIM. The one exception: if an existing line already refers to THIS spec ("${blockId}") by name
+   (e.g. from an earlier partial run), you may replace only that one line — never the whole section —
+   with the update below.
    ${bailed
-     ? `- This run BAILED. Keep the spec status "In progress" (or "Blocked" if appropriate). Set "Current focus" to: "${blockId} — BLOCKED: ${bailReason}".`
-     : `- ${selectedTasks ? `Tasks ${taskList.join(', ')} of "${blockId}" are done.` : `Full spec "${blockId}" is done.`} ${selectedTasks ? 'If tasks remain, keep status "In progress" and point Current focus at the next task; if this was the last, flip to "Done".' : 'Flip its Status to "Done".'} Update "Current focus" accordingly.`}
+     ? `- This run BAILED. Keep the spec status "In progress" (or "Blocked" if appropriate). Add ONE
+       new line under "Current focus" (or replace this spec's own prior line, per the exception
+       above): "${blockId} — BLOCKED: ${bailReason}" — do not touch any other existing line.`
+     : `- ${selectedTasks ? `Tasks ${taskList.join(', ')} of "${blockId}" are done.` : `Full spec "${blockId}" is done.`} ${selectedTasks ? 'If tasks remain, keep status "In progress" and add a new line under Current focus pointing at the next task; if this was the last, flip to "Done".' : 'Flip its Status to "Done".'} Add ONE new line under "Current focus" recording this outcome (or replace this spec's own prior line, per the exception above) — do not touch any other existing line.`}
    - Update "Last updated" — run: date +%Y-%m-%d
 
 2b. Flip the block's AUTHORED status in planning/state.json (skip this entire step silently if the
@@ -1979,7 +2243,7 @@ for track in data.get('tracks', []):
         break
 if found:
     with open(path, 'w') as fh:
-        json.dump(data, fh, indent=2)
+        json.dump(data, fh, indent=2, ensure_ascii=False)
         fh.write(chr(10))
     print('FLIPPED:' + bid)
 else:
@@ -2026,10 +2290,13 @@ ${vault.vaulted ? `
    Do NOT cd into it and do NOT checkout/switch/branch there:
    cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/status.md
    cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
-   cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+   Then commit ONLY those two paths — pass them explicitly to \`git commit\` itself (not merely to
+   \`git add\`), so anything a sibling lane already had staged in this same vault repo is left staged
+   and untouched by this commit:
+   cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/status.md ${vault.planningPath}/state.json || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 chore: wrap up ${stem}
 EOF
-)"
+)" -- ${vault.planningPath}/status.md ${vault.planningPath}/state.json
    cd ${worktreePath} && git -C ${vault.planningPath} log --oneline -1
 
    Repo-local files stay staged and committed in THIS repo, on this branch, as before:
@@ -2056,8 +2323,8 @@ stateWritten (true only if you performed the additional state write above), note
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
 if (wrapupResult?.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended.`)
-if (wrapupResult?.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch; derived surfaces regenerate on merge (/clean-worktree, /merge-train, or /close-out --merge-branch).`)
-log(`Derived surfaces (in-place, this wrap-up): ${wrapupResult?.emitStateRan ? 'regenerated (mev emit-state --write).' : useWorktree ? 'skipped — worktree mode; regenerate on merge.' : 'skipped (mev/brain.toml absent).'}`)
+if (wrapupResult?.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch${wrapupResult?.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree, /merge-train, or /close-out --merge-branch runs `mev emit-state --write` on merge.'}`)
+log(`Derived surfaces (in-place, this wrap-up): ${wrapupResult?.emitStateRan ? 'regenerated (mev emit-state --write).' : useWorktree ? 'skipped — worktree mode; focus.next stays stale until regenerated on merge.' : 'skipped (mev/brain.toml absent).'}`)
 
 // Final state write (status reflects the terminal state; PR fields filled after creation).
 // state.status was already set by buildWrapupStatePayload() above, before the agent call, so the
@@ -2075,9 +2342,13 @@ if (wrapupResult && wrapupResult.stateWritten) {
 // PR creation (the terminal step) — default: open a PR and STOP.
 //   --no-pr → skip. On bail → DRAFT PR. --auto-merge → merge + clean (only on success).
 // ----------------------------------------------------------------
+const isDraft = bailed
 let prInfo = null
+let prVerify = null
+// Default outcome for the --no-pr path: nothing was attempted, so nothing failed either — this
+// is an intentional skip, not a stranded branch. See the `stranded` field on the final return.
+let prOutcome = 'impossible'
 if (!noPr) {
-  const isDraft = bailed
   const handoffTitle = bailed
     ? `[BLOCKED] ${blockId}: ${bailReason.slice(0, 60)}`
     : `${blockId}: ${passedTasks.length} task(s), review ${finalVerdict}`
@@ -2091,8 +2362,8 @@ the handoff — build it from the committed run-state.
    cd ${worktreePath} && command -v gh >/dev/null 2>&1 && echo "GH_PRESENT" || echo "GH_ABSENT"
    cd ${worktreePath} && git remote -v | head -1 || echo "NO_REMOTE"
 
-2. If GH_ABSENT or NO_REMOTE → do NOT fail. Set created=false, ghPresent=(GH_PRESENT?), pushed=false, and
-   in notes print the branch name "${branchName}" and manual instructions:
+2. If GH_ABSENT or NO_REMOTE → do NOT fail. Set outcome="impossible", ghPresent=(GH_PRESENT?),
+   pushed=false, and in notes print the branch name "${branchName}" and manual instructions:
    "Branch ${branchName} is ready. Push it and open a PR manually: git push -u origin ${branchName} && gh pr create --base ${prBase} --head ${branchName}". Then return.
 
 3. Read the run-state for the body:
@@ -2100,7 +2371,8 @@ the handoff — build it from the committed run-state.
 
 4. Push the branch:
    cd ${worktreePath} && git push -u origin ${branchName}
-   Set pushed=true on success.
+   If this command errors: set outcome="failed", pushed=false, ghPresent=true, put the ACTUAL error
+   text in notes, and return — do not attempt step 6. Otherwise set pushed=true and continue.
 
 5. Build the PR body (markdown) from the run-state:
    ## What & why
@@ -2124,18 +2396,48 @@ EOF
 <the body you built>
 EOF
 )"
-   Capture the printed PR URL. Run: cd ${worktreePath} && gh pr view --json number,url 2>/dev/null || true
-   If gh reports a PR already exists for this branch, treat created=true and capture its url/number.
+   If this errors and the error text does NOT say a PR already exists for this branch: set
+   outcome="failed", put the actual error text in notes, and return.
+   Capture the printed PR URL. Run: cd ${worktreePath} && gh pr view --json number,url 2>/dev/null
+   If create succeeded, OR gh reports a PR already exists for this branch (from the create error or
+   the view above), set outcome="created" and capture url/number from whichever call returned them.
 
-Return via StructuredOutput: created, url, number, draft=${isDraft}, pushed, ghPresent, notes.
+Return via StructuredOutput: outcome, url, number, draft=${isDraft}, pushed, ghPresent, notes.
 `, withModel({ label: 'pr-create', schema: PR_SCHEMA, phase: 'Wrap-up' }, MODEL.pr))
 
-  if (prInfo?.created) {
-    state.pr = { url: prInfo.url || null, number: prInfo.number || null }
-    log(`${prInfo.draft ? 'Draft PR' : 'PR'} opened: ${prInfo.url || '(see gh)'}${prInfo.number ? ` (#${prInfo.number})` : ''}`)
-    await writeFlowState(`pr #${prInfo.number || '?'}`, `## PR\n${prInfo.draft ? 'Draft ' : ''}${prInfo.url || ''}`, { cwd: worktreePath })
+  // Independent verification — a SEPARATE agent turn, run whenever a push/create was actually
+  // attempted (outcome != 'impossible'), regardless of what the create agent itself claimed. This
+  // is what catches case 3 (a PR that exists but was under-reported as failed) as well as
+  // confirming case 2 (a genuine failure) and any 'created' claim — the engine never takes the
+  // create agent's word for its own work.
+  if (prInfo?.outcome && prInfo.outcome !== 'impossible') {
+    prVerify = await tracedAgent(`${W}
+You independently verify whether a PR exists for a branch. Do NOT trust any other agent's report of
+whether a PR was created — only trust what this command actually returns.
+   cd ${worktreePath} && gh pr view ${branchName} --json number,url,state 2>&1; echo "EXIT:$?"
+   The branch MUST be passed as the POSITIONAL argument, exactly as above — do NOT use \`--head
+   ${branchName}\`. \`--head\` is a \`gh pr list\`-only flag; \`gh pr view --head <branch>\` fails with
+   "unknown flag: --head" and exits 1 before it even looks anything up, which makes every genuinely
+   created PR misreport as absent. Run the command exactly as written above.
+Read the literal number after "EXIT:" as the process exit code — do not infer success from output text.
+If exitCode == 0, parse number/url/state from the JSON printed above it. If exitCode != 0, set
+url="", number=0, state="".
+Return via StructuredOutput: exitCode, url, number, state.
+`, withModel({ label: 'pr-verify', schema: PR_VERIFY_SCHEMA, phase: 'Wrap-up' }, MODEL.prVerify))
+  }
+
+  const verifiedPr = (prVerify && prVerify.exitCode === 0 && prVerify.number) ? prVerify : null
+  if (verifiedPr) {
+    prOutcome = 'created'
+    state.pr = { url: verifiedPr.url || prInfo?.url || null, number: verifiedPr.number || prInfo?.number || null }
+    log(`${isDraft ? 'Draft PR' : 'PR'} opened: ${state.pr.url || '(see gh)'}${state.pr.number ? ` (#${state.pr.number})` : ''}`)
+    await writeFlowState(`pr #${state.pr.number || '?'}`, `## PR\n${isDraft ? 'Draft ' : ''}${state.pr.url || ''}`, { cwd: worktreePath })
+  } else if (prInfo?.outcome === 'impossible') {
+    prOutcome = 'impossible'
+    log(`PR not possible in this environment — ${prInfo?.notes || 'gh unavailable; branch is ready for a manual PR.'}`)
   } else {
-    log(`PR not created — ${prInfo?.notes || 'gh unavailable; branch is ready for a manual PR.'}`)
+    prOutcome = 'failed'
+    log(`PR creation failed or could not be independently verified — ${prInfo?.notes || 'no usable outcome reported'}. Branch ${branchName} carries the work; open a PR manually: git push -u origin ${branchName} && gh pr create --base ${prBase} --head ${branchName}`)
   }
 } else {
   log(`--no-pr — stopping after wrap-up. Branch ${branchName} carries all commits; open a PR manually when ready.`)
@@ -2145,7 +2447,7 @@ Return via StructuredOutput: created, url, number, draft=${isDraft}, pushed, ghP
 // --auto-merge: merge the PR + clean up + regenerate derived surfaces. ONLY on a clean success (PASS, not bailed).
 // ----------------------------------------------------------------
 let mergeInfo = null
-if (autoMerge && !bailed && finalVerdict === 'PASS' && prInfo?.created && !prInfo.draft) {
+if (autoMerge && !bailed && finalVerdict === 'PASS' && prOutcome === 'created' && !isDraft) {
   log(`--auto-merge — merging the PR and cleaning up (${useWorktree ? 'worktree' : 'branch'} mode)...`)
   mergeInfo = await tracedAgent(`
 You complete an --auto-merge for an /sdlc-flow run. Merge the PR, ${useWorktree
@@ -2154,11 +2456,11 @@ You complete an --auto-merge for an /sdlc-flow run. Merge the PR, ${useWorktree
 surfaces on the base. Be careful and report honestly.
 
 Branch:   ${branchName}
-${useWorktree ? `Worktree: ${worktreePath}\n` : ''}PR:       ${prInfo.number ? '#' + prInfo.number : prInfo.url || '(look it up)'}
+${useWorktree ? `Worktree: ${worktreePath}\n` : ''}PR:       ${state.pr?.number ? '#' + state.pr.number : state.pr?.url || '(look it up)'}
 Base:     ${prBase}
 
 1. Merge the PR via gh (delete the remote branch as part of the merge):
-   gh pr merge ${prInfo.number || prInfo.url} --merge --delete-branch
+   gh pr merge ${state.pr?.number || state.pr?.url} --merge --delete-branch
    If gh errors (not mergeable, checks pending), STOP — do NOT clean up. Report merged=false + the error in notes.
 
 2. Bring local ${prBase} up to date (this also moves the working tree onto ${prBase}):
@@ -2198,13 +2500,22 @@ Return via StructuredOutput: merged, worktreeRemoved, branchDeleted, emitStateRa
     log(`Auto-merge did not complete: ${mergeInfo?.notes || 'unknown'}. ${useWorktree ? `Worktree left intact at ${worktreePath}.` : `Branch ${branchName} left intact.`}`)
   }
 } else if (autoMerge) {
-  log(`--auto-merge skipped: ${bailed ? 'run bailed' : finalVerdict !== 'PASS' ? `verdict ${finalVerdict}` : 'no PR created'}. ${useWorktree ? 'Worktree' : 'Branch'} left intact for review.`)
+  log(`--auto-merge skipped: ${bailed ? 'run bailed' : finalVerdict !== 'PASS' ? `verdict ${finalVerdict}` : `no PR created (outcome: ${prOutcome})`}. ${useWorktree ? 'Worktree' : 'Branch'} left intact for review.`)
 }
+
+// `stranded`: the one checkable signal a caller needs to tell "clean completion" apart from "the
+// PR stage was attempted and failed, or could not be independently verified" — the case that used
+// to come back indistinguishable from a completed run (pr: null, merged: false, no non-zero
+// signal). `prOutcome === 'impossible'` (no gh / no remote) is deliberately NOT stranded — that is
+// the degradation path that must keep working in a standalone repo. `bailed` runs are already
+// surfaced via the `bailed` field, so `stranded` here is specifically the un-bailed, silently-
+// incomplete case `.claude/commands/orchestrate.md` step 7 must stop the chain on.
+const stranded = prOutcome === 'failed'
 
 // ----------------------------------------------------------------
 const tokensBlock = buildTokensBlock()
 log(`Token roll-up: ${tokensBlock.total.inTokEst} inTokEst${tokensBlock.total.outTok ? ` | ${tokensBlock.total.outTok} outTok` : ''} across ${tokensBlock.stages.length} stage(s) — persisted in ${stateFile}.`)
-log(`/sdlc-flow complete. Verdict: ${finalVerdict} | tasks passed: ${passedTasks.length}/${taskList.length}${bailed ? ` | BAILED: ${bailReason}` : ''}${prInfo?.created ? ` | PR: ${prInfo.url || prInfo.number}` : ''}`)
+log(`/sdlc-flow complete. Verdict: ${finalVerdict} | tasks passed: ${passedTasks.length}/${taskList.length}${bailed ? ` | BAILED: ${bailReason}` : ''}${prOutcome === 'created' ? ` | PR: ${state.pr?.url || state.pr?.number}` : ''}${stranded ? ' | STRANDED: PR stage failed or unverified — branch left intact, chain should stop.' : ''}`)
 if (!noPr && !autoMerge) log('Next: run /close-out to verify coverage + patch docs before handing off.')
 
 return {
@@ -2219,8 +2530,17 @@ return {
   tasksPassed: passedTasks,
   review: state.review,
   docs: state.docs,
-  pr: prInfo?.created ? { url: prInfo.url, number: prInfo.number, draft: prInfo.draft } : null,
+  // prOutcome: 'created' | 'impossible' | 'failed' — see PR_SCHEMA above for the vocabulary.
+  // 'impossible' (no gh / no remote) is expected and NOT a failure. 'failed' means a PR was
+  // attempted and either errored or could not be independently verified via `gh pr view` — the
+  // engine no longer takes the pr-create agent's self-report on faith.
+  prOutcome,
+  pr: prOutcome === 'created' ? { url: state.pr?.url || null, number: state.pr?.number || null, draft: isDraft } : null,
   merged: mergeInfo?.merged || false,
+  // stranded: true iff prOutcome === 'failed' — the one field a chain driver (`/orchestrate` step 7)
+  // must check alongside `bailed` before treating this run as a clean completion. See the comment
+  // where `stranded` is computed above.
+  stranded,
   stateFile,
   worklogFile,
   tokens: tokensBlock,
