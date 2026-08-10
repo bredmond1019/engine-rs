@@ -72,9 +72,16 @@ the roadmap resolved in C, **stop and report both.** That mismatch means the lan
 different run than the one you were told, and it is the cheapest available check that `--roadmap`
 was typed correctly.
 
-Read the lane file with `#` comments and blanks stripped; file order is execution order. Lane files
-may cover several repos in one running order — **take only your repo's section.** If the file has
-section markers for other repos and you cannot tell which is yours, stop and ask.
+Read the lane file with `#` comments and blanks stripped **when extracting the chain / block list**;
+file order is execution order. Lane files may cover several repos in one running order — **take only
+your repo's section.** If the file has section markers for other repos and you cannot tell which is
+yours, stop and ask.
+
+**Comments are binding context for your own section, not decoration.** Stripping applies only to
+parsing the block list out of the file. The prose in your section's `#` comments — isolation
+rationale, prior-run gotchas, "do not touch X" — is the per-repo briefing for this run and must be
+honored exactly like the block list itself. `carryover-improvements`' lane files carry their entire
+per-repo briefing this way; an agent that strips comments before reading drops all of it.
 
 Print what you resolved. A lane driven against the wrong roadmap is worse than one driven against
 none.
@@ -92,14 +99,35 @@ none.
 An explicit `--isolation` that contradicts either of the first two rows → **stop and report.** Do
 not run a chain whose gates cannot pass.
 
+**Re-verify the caveat before you plan on it.** The isolation table above isn't policy handed down
+once — it's
+a measurement ("64 structure / 601 state errors versus 0/0 in the main tree") that can go stale the
+moment the corpus or the worktree machinery changes. The same applies to any carryover caveat this
+lane inherits from a prior run or a sibling lane's notes file. Before treating either as fact: run
+the one command that checks it (`./scripts/validate_brain.sh` in a scratch worktree for the isolation
+row; whatever the carryover names for a carried-forward one) and record the result. An orchestration
+run inherited at least one caveat that had since changed and planned a block on it — this is the
+same failure class `/generate-roadmap`'s Step 2 exists to close ("Inventory, and re-verify before you
+plan on it"); this step is its equivalent for isolation decisions and carryovers.
+
 ## Step 3 — Concurrency
 
 **At most two heavy-gate repos may run concurrently** — anything whose `planning/harness.json` gates
 include a browser or full production build (Playwright, `next build`). Determine whether this repo
-is heavy by reading its `harness.json`, not by memory.
+is heavy mechanically, never by memory:
+`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py is-heavy --repo-path <this-repo>`
+(exit 0 = heavy).
 
-Nothing enforces this. If this repo is heavy, say so and ask before starting; the operator knows
-what else is live.
+**This is enforced, not prose-only.** If this repo is heavy, register before starting:
+`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <this-repo-name>`.
+Exit code `3` (`"allowed": false`) means the fleet is already at capacity (two heavy repos live) —
+stop and report rather than starting a third; wait or swap in a cheap-gate block instead. Release
+the slot once this repo's chain finishes:
+`... release --repo <this-repo-name>`. A lane killed mid-run does not block the fleet forever — its
+entry expires automatically (dead process, or past a fixed TTL) on the next registration. If the
+lock store itself is unavailable, the script degrades to `"allowed": true, "degraded": true` — the
+same advisory behavior this replaces, never a hard failure. Full design:
+`planning/decisions/D61-fleet-concurrency-enforcement.md` (in `base-template`).
 
 ## Step 4 — Confirm
 
@@ -132,6 +160,15 @@ Each has already cost a real run in this fleet.
    conflict resolution — runs inline in this session. A block built by an ad-hoc subagent has no
    spec, no gate, no state write and no review, and the chain's own verification will still look
    fine, so nothing catches it.
+
+   **Two authoring-time rules for any spec or OKF frontmatter `/generate-tasks` (or you, editing
+   one by hand) produces** — generalized from a lane that hit both the same day: a `related:`
+   target must resolve to a real `doc_id` on a document that has actually been crawled, never a
+   carryover slug or an invented id — one bad edge red-gates the whole corpus for every concurrent
+   lane when `--graph` gates, not just the authoring one. And a `validation_command` must be
+   scoped to the task's own changes, never the whole working tree (e.g. never a
+   working-tree-wide `git diff | grep` guard) — it can never pass in a shared index with
+   concurrent lanes and bails the block on an unrelated lane's uncommitted files.
 
 2. **Commit after every `mev` command and every roadmap or plan edit**, before launching the next
    engine. Sibling lanes read those files; an uncommitted state change is invisible to them and gets
@@ -191,7 +228,9 @@ work that has to be redone.
 - `mev validate-brain`'s flags **do not compose** (`main.rs` is an if/else-if chain, first flag
   wins). One invocation per flag.
 - Every `planning/` is a symlink into a `_planning/` vault. Any `rg`/`find` sweep that must be
-  exhaustive needs `-L`; one reporting "clean" without it is not trustworthy.
+  exhaustive needs `-L`; one reporting "clean" without it is not trustworthy. **At the brain root,
+  also pass `-uu`** — every sub-repo is gitignored there, so `rg` skips them all even with `-L`
+  alone, and a sweep missing `-uu` reports a false clean over the whole fleet.
 - `planning/state.json` is written with `ensure_ascii=False`. Script edits must round-trip with
   `json.dump(..., indent=2, ensure_ascii=False)` plus a trailing newline — the default escapes every
   em dash and turns a 3-field edit into ~130 lines of churn, and a conflict for every sibling lane.
@@ -219,11 +258,44 @@ snapshot and the graph is the fact.
 Everything in that report should already be in `planning/orchestration-run/notes.md` (rule 5). The
 report is the summary; the notes file is the record that survives the session.
 
+**A terminal `planning/orchestration-run/review.md` is required, not optional.** It is a
+plain-English summary of what this lane changed plus the hand-verification recipes an operator
+would run to confirm it. Every recipe in it must have been **executed at least once by this lane
+before the file is written**, and the file must say so explicitly — a recipe that was only
+authored, never run, reads as verification while being a guess, which is worse than handing the
+operator nothing. Naming, frontmatter, and lifecycle follow
+`planning/decisions/D57-orchestration-run-artifact-contract.md`; do not restate that contract
+here.
+
+## Standing operator convention
+
+This is the universal end-of-run convention every program used to re-author for itself in a
+per-program `orchestrate-prompt.md` (`close-the-loop`'s and `carryover-improvements`' copies were
+near-duplicates of each other, pasted by the operator because neither command knew they existed).
+**It lives here now, once, and nowhere else — `/generate-roadmap` must stop being a place this
+convention gets authored per-program.** A program-specific rule (a repo's own "no `blocking:
+bool`"-style constraint) still belongs in that program's lane file; only the universal shape below
+moves here.
+
+At the end of every lane, alongside the report and `review.md`:
+
+- **Order every lingering item P0–P3 per `planning/decisions/D43-cross-domain-priority-graph.md`
+  (cite it by doc_id).** Do not restate or paraphrase its rubric here — the priority a lane assigns
+  comes from reading D43 fresh each time, not from a copy of its definition drifting in this file.
+- **Name the owning repo for each lingering item.** Most of a repo's carryover belongs to
+  `base-template` or HQ, not the repo the lane just ran in — a per-repo file that skips this always
+  accumulates other repos' work.
+- **For any lingering item this repo owns, write its next step into `handoff.md`**, ordered by a
+  mix of priority (per D43) and quick-wins, so a fresh session can pick it up without replaying
+  this lane's context.
+- **Close the lane with a terminal `/close-out`.**
+
 ## Files
 
 - Reads: the roadmap, the lane file, `planning/state.json`, `planning/harness.json`, `brain.toml`
-- Writes: the lane log (append-only), `planning/orchestration-run/notes.md` (append-only), plus
-  whatever `/orchestrate` and the engines write
+- Writes: the lane log (append-only), `planning/orchestration-run/notes.md` (append-only),
+  `handoff.md` (per the standing operator convention above), plus whatever `/orchestrate` and the
+  engines write
 - Never writes: a roadmap's `<!-- BEGIN generated:* -->` regions
 
 ## Example

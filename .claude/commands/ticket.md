@@ -33,6 +33,16 @@ list), explicit Acceptance Criteria, and a Testing Strategy, feeding directly in
    - If the fix touches more than 3–4 files or needs its own sub-phases, it belongs in `/plan`.
    - Every task in `tasks.json` must name ≥1 concrete file in its `files[]` (the Validate task is
      exempt).
+   - **Compilable task boundaries (outranks the file-based split when the two conflict).** `/ticket`
+     only ever feeds `/sdlc-task` or `/sdlc-flow` — never `/sdlc-block`'s parallel-merge model — and
+     both of those engines run every task **sequentially on one branch/worktree with no inter-task
+     merge step**, gating the project's checks after **every single task**. That means a single
+     breaking public-surface change (a renamed public type, a struct's changed fields, an altered
+     trait/interface signature, and every call site each one touches) must never be split across
+     tasks such that an intermediate task leaves the repository non-compiling — put the whole change
+     in **one** task instead, even if that task then touches more files than usual. This constraint
+     is **unconditional here**, with no `/sdlc-block` carve-out (unlike `generate-tasks.md`'s
+     equivalent rule): `/ticket` never produces a spec that `/sdlc-block` will decompose in parallel.
 5. Choose a short descriptive slug (e.g. `fix-null-deref`, `add-rate-limit`, `patch-auth-refresh`).
    This is the `<slug>` referenced in "Register the block in state.json" below.
 6. Create `planning/ticket-{slug}/` if it does not exist, then write **both**
@@ -53,6 +63,12 @@ list), explicit Acceptance Criteria, and a Testing Strategy, feeding directly in
      wrapper — that shape is D44, and D44 is superseded), 1-indexed integer `task_id`, `description`
      as one string, and no `status` or `attempt_count` key authored by you (those are engine-owned).
    - **Every task names ≥1 concrete file** in its `files[]` (Validate is exempt).
+   - **Compilable task boundaries — can fail.** Check whether any single breaking public-surface
+     change (a renamed public type, a struct's changed fields, an altered trait/interface signature)
+     is split across two or more tasks such that an intermediate task would leave the repository
+     non-compiling under `/sdlc-task` or `/sdlc-flow`'s per-task gate. If it is, this check **fails**:
+     merge those tasks into one before proceeding, per the compilable task boundaries rule in step 4,
+     then re-run this self-check.
    - **Acceptance Criteria are non-empty and observable** — each can be judged true/false.
    - **Testing Strategy is non-empty** — names the test file(s) and what each must cover.
    - **Validation Commands are present** (or `planning/harness.json` → `validation.checks[]`

@@ -285,9 +285,19 @@ For `attempt = 1..3` (stop early on pass or bail):
      git -C <vault.planningPath> log --oneline -1
      ```
      If NOTHING you wrote this attempt lives under planning/, skip this step entirely — do not run any vault command.
-   - **Vault-commit verification (D46 amendment)**: After a vault commit step (if it ran), the engine independently 
-     re-verifies that every vault-relative path is actually COMMITTED in the vault repo (tracked with no staged or unstaged diff). 
-     A vault-commit failure surfaces exactly like a test failure: the task is never marked passed on this attempt; triage 
+   - **Vault-commit verification (D46 amendment, BRAIN_ROOT-aware)**: After a vault commit step (if it ran), the engine
+     independently re-verifies that every `planning/`-prefixed self-reported path is actually COMMITTED. A
+     `planning/...` path is ambiguous — it may belong to THIS repo's own vault, or (for a command whose own design
+     authors directly at HQ, e.g. `/generate-roadmap`) to the BRAIN ROOT repo's `planning/` instead, a different git
+     repository on disk. The check classifies each path as `VAULT_OK` (committed under this repo's own vault),
+     `BRAIN_ROOT_OK` (not in this repo's vault at all, but committed under the brain root — found by walking up to
+     the nearest ancestor containing `brain.toml`), or `UNCOMMITTED` (a real failure — exists nowhere, or exists but
+     isn't committed). **The classification runs inside a single deterministic Bash script the agent executes
+     verbatim and transcribes** — not agent-driven per-path branching; a cheap model given the branching logic as
+     prose reliably follows only the first branch and silently skips the brain-root fallback (observed live: Haiku
+     checked only the vault path for every path and never attempted the fallback, misclassifying legitimate
+     brain-root writes as failures). Only `UNCOMMITTED` fails; `BRAIN_ROOT_OK` is a legitimate cross-repo write. A
+     vault-commit failure surfaces exactly like a test failure: the task is never marked passed on this attempt; triage
      decides whether to RETRYABLE (fix and try again, ≤3 times) or MAJOR (bail to a human right now).
 2. **Fast test.** Run the checks resolved in Phase 2 step 4/7 for this task: if this task declared its
    own `validation_commands`, run ONLY those; otherwise run the gating-only subset when `testDepth ==
@@ -398,11 +408,12 @@ would never reach here either — Docs only ever runs after a clean `PASS`.
      git -C <vault.planningPath> log --oneline -1
      ```
      If nothing in changed[]/created[] lives under planning/, skip this step entirely.
-   - **Vault-commit verification (D46 amendment)**: After a vault docs-commit step (if it ran), the engine independently 
-     re-verifies that every vault-relative path in changed[]/created[] is actually COMMITTED in the vault repo (tracked with 
-     no staged or unstaged diff). A vault-commit failure here flips docResult.success=false and appends VAULT_COMMIT_INCOMPLETE 
-     to notes. The docs phase is non-gating for the pipeline, so this only makes the failure loud in state/logs rather than 
-     silent — docs can fail and wrap-up still runs.
+   - **Vault-commit verification (D46 amendment, BRAIN_ROOT-aware)**: After a vault docs-commit step (if it ran), the
+     engine independently re-verifies that every `planning/`-prefixed path in changed[]/created[] is actually
+     COMMITTED, using the same three-bucket classification as the per-task check above (`VAULT_OK` / `BRAIN_ROOT_OK`
+     / `UNCOMMITTED` — only `UNCOMMITTED` is a failure). A vault-commit failure here flips docResult.success=false and
+     appends VAULT_COMMIT_INCOMPLETE to notes. The docs phase is non-gating for the pipeline, so this only makes the
+     failure loud in state/logs rather than silent — docs can fail and wrap-up still runs.
 6. Persist state to disk (same disk-only rule as Phase 3/6).
 
 ### 6. Phase: Wrap-up — status/log/state, then PR, then optional auto-merge

@@ -12,6 +12,16 @@ $ARGUMENTS — description of the chore to plan.
    - **SDLC workflow?** — `Yes (patch/task/run/flow)` or `No — <reason>`.
    - **Model** — `Sonnet` | `Gemini Pro` | `Gemini Flash` | `Either`. Rule of thumb: Opus = reasoning/breakdown only; Sonnet = high-risk/complex; Gemini Pro = intermediate; Gemini Flash = simple.
    - **Workflow & Model Rationale** — prose explaining the choices.
+   - **Compilable task boundaries (outranks the file-based split when the two conflict).** `/chore`
+     only ever feeds `/sdlc-task` or `/sdlc-flow` — never `/sdlc-block`'s parallel-merge model — and
+     both of those engines run every task **sequentially on one branch/worktree with no inter-task
+     merge step**, gating the project's checks after **every single task**. That means a single
+     breaking public-surface change (a renamed public type, a struct's changed fields, an altered
+     trait/interface signature, and every call site each one touches) must never be split across
+     tasks such that an intermediate task leaves the repository non-compiling — put the whole change
+     in **one** task instead, even if that task then touches more files than usual. This constraint
+     is **unconditional here**, with no `/sdlc-block` carve-out (unlike `generate-tasks.md`'s
+     equivalent rule): `/chore` never produces a spec that `/sdlc-block` will decompose in parallel.
 4. Choose a short descriptive slug for the chore (e.g. `remove-k8s-secret`, `fix-devin-typos`, `update-stale-handles`).
    Determine this chore's Block ID: find this repo's `prefix` in `brain.toml` at the brain root
    (e.g. `BA`), then `<BlockID> = <Prefix>.chore.<slug>` (chores don't have a phase number — the
@@ -22,7 +32,14 @@ $ARGUMENTS — description of the chore to plan.
    Format below. In the `tasks.md` frontmatter, **populate `related:` with ≥1 real `doc_id`** (the
    project `master-plan`, a governing decision, or a doc the chore touches) — never `related: []`, or
    the file is an isolated graph node (`mev`'s `W_GRAPH_ISOLATED_NODE`). Use genuine doc_ids only.
-6. Return only the paths to the files created.
+6. **Property self-check (can fail).** Before reporting, re-read `tasks.json` and confirm:
+   **Compilable task boundaries.** Check whether any single breaking public-surface change (a
+   renamed public type, a struct's changed fields, an altered trait/interface signature) is split
+   across two or more tasks such that an intermediate task would leave the repository non-compiling
+   under `/sdlc-task` or `/sdlc-flow`'s per-task gate. If it is, this check **fails**: merge those
+   tasks into one before proceeding, per the compilable task boundaries rule in step 3, then re-run
+   this self-check.
+7. Return only the paths to the files created.
 
 ## Codebase Structure
 

@@ -372,6 +372,13 @@ of Done must be written as observations with commands, not as blocks closed** �
 left a previous roadmap 30/53 closed with an undeployed demo and an unverified funnel. Authors only;
 never runs `/orchestrate`. Sits above `/generate-master-plan`, which scopes to one repo.
 
+**Runs only from HQ (the brain root) — single-copy, does not sync downstream.** Step 1A resolves
+`BRAIN_ROOT` and requires it: "a roadmap spanning repos cannot be authored from inside one of them."
+`scripts/sync_downstream_harness.py`'s `EXCLUDED_COMMAND_FILENAMES` excludes `generate-roadmap.md`
+from every sync target, HQ included, so it stays the one copy at `base-template/.claude/commands/`
+rather than fanning out to all 17 leaf repos where it has no meaning. Decision + rationale recorded
+in `planning/ticket-generate-roadmap-command/review.md`.
+
 ### `/generate-master-plan`
 Authors (or revises) `planning/master-plan.md` — the roadmap source of truth — as a sequence of
 canonical **block definitions** (`## Phase N` → `### Block X`, each with What / Why / Build notes /

@@ -151,28 +151,53 @@ const VAULT_VERIFY_SCHEMA = {
   type: 'object',
   required: ['allCommitted'],
   properties: {
-    allCommitted:     { type: 'boolean', description: 'true iff every given path is tracked in the vault repo with no staged/unstaged diff' },
-    uncommittedPaths: { type: 'array', items: { type: 'string' }, description: 'the subset (vault-relative) that failed either check' },
+    allCommitted:     { type: 'boolean', description: 'true iff every given path is tracked+committed either in THIS repo\'s vault, or (BRAIN_ROOT case) in the brain root repo directly' },
+    uncommittedPaths: { type: 'array', items: { type: 'string' }, description: 'the subset (vault-relative) not committed anywhere — a real failure' },
+    brainRootExempt:  { type: 'array', items: { type: 'string' }, description: 'the subset that does not exist under this repo\'s own vault at all, but IS committed directly in the brain root repo — a legitimate cross-repo write (e.g. /generate-roadmap authoring at HQ), not a vault-commit failure' },
     notes:            { type: 'string' }
   }
 }
 async function verifyVaultCommit(runDir, vault, vaultRelPaths) {
-  if (!vault.vaulted || !vaultRelPaths.length) return { allCommitted: true, uncommittedPaths: [] }
+  if (!vault.vaulted || !vaultRelPaths.length) return { allCommitted: true, uncommittedPaths: [], brainRootExempt: [] }
+  // The classification logic runs entirely IN THE SCRIPT, not in the model's own reasoning — a cheap
+  // model following multi-branch conditional prose reliably skips the "else" branch (observed live:
+  // Haiku checked only the vault path for 4/6 paths and never attempted the brain-root fallback for
+  // any of them, silently treating a path that simply doesn't exist in the vault as UNCOMMITTED
+  // instead of trying the brain root). The agent's only job now is to run ONE script and transcribe
+  // its already-classified output lines — no per-path decision-making left to delegate.
+  const script = `set -e
+BRAIN_ROOT=$(cd "${vault.planningPath}" && while [ ! -f brain.toml ] && [ "$PWD" != "/" ]; do cd ..; done; pwd)
+for p in ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}; do
+  if [ -e "${vault.planningPath}/$p" ]; then
+    if [ -z "$(git -C ${vault.planningPath} status --porcelain -- "$p")" ] && git -C ${vault.planningPath} ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+      echo "VAULT_OK:$p"
+    else
+      echo "UNCOMMITTED:$p"
+    fi
+  elif [ -e "$BRAIN_ROOT/planning/$p" ]; then
+    if [ -z "$(git -C "$BRAIN_ROOT/planning" status --porcelain -- "$p")" ] && git -C "$BRAIN_ROOT/planning" ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+      echo "BRAIN_ROOT_OK:$p"
+    else
+      echo "UNCOMMITTED:$p"
+    fi
+  else
+    echo "UNCOMMITTED:$p"
+  fi
+done`
   const result = await agent(`
-Independently verify that these paths are FULLY COMMITTED in the vault repo at ${vault.planningPath}
-(tracked, AND no staged or unstaged diff) — do not take anyone's word for it, re-check directly.
-Paths (relative to ${vault.planningPath}):
-${vaultRelPaths.map(p => `  ${p}`).join('\n')}
-Run exactly these Bash calls (from ${runDir}):
-  cd ${runDir} && git -C ${vault.planningPath} status --porcelain -- ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}
-  cd ${runDir} && git -C ${vault.planningPath} ls-files --error-unmatch -- ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}
-A path is COMMITTED only if it produces NO line in the status --porcelain output AND the ls-files
---error-unmatch call exits 0 for it (nonzero/"did not match" means untracked or missing — NOT committed).
-Return via StructuredOutput: allCommitted (true only if every path passed both checks),
-uncommittedPaths (the vault-relative paths that failed either check; empty array if all committed),
-notes (what you actually observed).
+Run this exact script from ${runDir} with Bash, verbatim, and transcribe its output — do not
+reason about vault vs. brain-root yourself, the script already decided it:
+\`\`\`
+${script}
+\`\`\`
+Each output line is "<BUCKET>:<path>". Return via StructuredOutput: allCommitted (true only if
+every line's bucket is VAULT_OK or BRAIN_ROOT_OK — false if any line is UNCOMMITTED, or if the
+script produced fewer lines than paths given, or errored), uncommittedPaths (the paths from every
+UNCOMMITTED line), brainRootExempt (the paths from every BRAIN_ROOT_OK line — not a failure, just a
+different repo), notes (paste the raw script output).
 `, { label: 'verify-vault-commit', schema: VAULT_VERIFY_SCHEMA, model: 'haiku' })
-  if (!result) return { allCommitted: false, uncommittedPaths: vaultRelPaths, notes: 'verification agent returned null' }
+  if (!result) return { allCommitted: false, uncommittedPaths: vaultRelPaths, brainRootExempt: [], notes: 'verification agent returned null' }
+  if (!Array.isArray(result.brainRootExempt)) result.brainRootExempt = []
   return result
 }
 

@@ -321,13 +321,26 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
    - If the implement/fix agent step produced nothing usable (a dead/empty turn): treat this exactly
      like a test failure below (triage it as `NULL_RESULT — the agent died or returned nothing`) —
      do NOT silently retry without triaging.
-   - **Vault-commit verification (D46 amendment)**: After a vault commit step (if it ran), the engine independently
-     re-verifies that every vault-relative path is actually COMMITTED in the vault repo (tracked with no staged
-     or unstaged diff). This is not about trusting the stage output — a valid commitHash proves nothing about
-     the vault half (observed live: one run returned a valid commitHash that covered only the source half, with
-     the vault edit silently uncommitted). A vault-commit failure surfaces exactly like a test failure: the task
-     is never marked passed on this attempt; triage decides whether to RETRYABLE (fix and try again, ≤3 times)
-     or MAJOR (bail to a human right now).
+   - **Vault-commit verification (D46 amendment, BRAIN_ROOT-aware)**: After a vault commit step (if it ran), the
+     engine independently re-verifies that every `planning/`-prefixed path a stage self-reported as modified is
+     actually COMMITTED — tracked with no staged or unstaged diff. This is not about trusting the stage output —
+     a valid commitHash proves nothing about the vault half (observed live: one run returned a valid commitHash
+     that covered only the source half, with the vault edit silently uncommitted). A `planning/...`-shaped path is
+     ambiguous, though: it may belong to THIS repo's own vault, or — for a command whose own design authors
+     directly at HQ (e.g. `/generate-roadmap`, whose Step 1A states "this command runs at HQ") — to the BRAIN
+     ROOT repo's `planning/` instead, a different git repository on disk. The check classifies each path into one
+     of three buckets: `VAULT_OK` (exists and is committed under this repo's own vault path), `BRAIN_ROOT_OK`
+     (does not exist in this repo's vault at all, but exists and is committed under the brain root — found by
+     walking up from the vault path to the nearest ancestor containing `brain.toml`), or `UNCOMMITTED` (exists
+     nowhere, or exists but is not committed wherever it does exist). **The classification itself runs inside a
+     single deterministic Bash script the agent executes verbatim and transcribes** — not agent-driven per-path
+     branching. A cheap model given the branching logic as prose reliably follows only the first branch and
+     silently skips the brain-root fallback for every path that isn't in this repo's own vault (observed live:
+     Haiku checked the vault path for all 6 paths and never attempted the fallback for the 4 that weren't there,
+     misclassifying legitimate brain-root writes as failures). Only `UNCOMMITTED` paths are a failure;
+     `BRAIN_ROOT_OK` paths are a legitimate cross-repo write, not a vault-commit defect. A vault-commit failure
+     surfaces exactly like a test failure: the task is never marked passed on this attempt; triage decides whether
+     to RETRYABLE (fix and try again, ≤3 times) or MAJOR (bail to a human right now).
    - **Test step** — run ONLY the applicable check set, never invent checks:
      - If this task declared its own `validation_commands` override (Step 2.1): run exactly those
        commands, each one gating.
