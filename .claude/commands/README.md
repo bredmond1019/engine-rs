@@ -277,6 +277,18 @@ edits the engines running it), the brain root is always `--no-worktree` (corpus 
 a worktree) — before handing off. `--roadmap` is **required and never inferred**. Also enforces the
 heavy-gate concurrency cap, operator gates, and the same notes-file and decision-recording rules.
 
+### `/begin-session <session-slug> [--roadmap <path>] [--dry-run]`
+Drives one **operator session** — the unit for work an agent cannot do alone: a decision, a
+credential, a judgement call. `/orchestrate` runs what an agent can do; this runs what it cannot.
+Resolves the slug from `state.json` `depends_on` edges of type `session` (their real home once
+`okf-core:OK.ticket.operator-edge-types` lands), else a roadmap's Wave 0 session table, else a
+`/capture` note — and reports **every** block the session gates, with effective priority, since a
+session gating a P0 block *is* P0. Stops if you are in the wrong repo, and groups every step needing
+another machine (the Mac Mini) into one sitting rather than three. Closes **only** when the named
+exit artifact exists: `mev close-session <slug> --exit-verified`, the operator asserting it — mev
+never infers it. A session marked done without its artifact is worse than one never started, because
+the gate is gone and the work is not.
+
 ---
 
 ## Session Orientation
