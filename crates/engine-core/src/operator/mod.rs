@@ -21,6 +21,8 @@
 pub mod channel;
 pub mod limits;
 pub mod payload;
+#[cfg(test)]
+mod tests;
 pub mod validate;
 
 pub use channel::OperatorChannel;
