@@ -1,5 +1,5 @@
 {
-  "version": "0d9690d378d64477d7333180fa8606a7daf9a22a",
+  "version": "569806bd426451bbb81d55cda01d7c293e82cad4",
   "generated": "2026-08-11",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
@@ -9,7 +9,7 @@
     ".claude/commands/fix.md": "8dda88037f96c63679af8f7b6f87d1aaf89d1f5bd3e8cff1c91cc21dd1ae634c",
     ".claude/commands/sync-brain-skills.md": "15748fadfebcb3113f0b1732437ef1edacb234afaa8ab6c2077ce1f9a6e4bf70",
     ".claude/commands/review-workflow.md": "2e9cd777853af89ed571f2fbc9976853694404f3a4dacdcf6db2971477aa888c",
-    ".claude/commands/begin-orchestration.md": "68aab6a8494675f69ab7a2e0439b02f8ece4e28eddcd3df7152c5d3981408936",
+    ".claude/commands/begin-orchestration.md": "7c3a5464c9514c7172f7868652c42dd0d980e7edf51a3ca52c8885a530b60845",
     ".claude/commands/init-worktree.md": "04ec0d1e578f9d786f5373ed1e0b7cc308e55f0ea35bb1dfc49791e8e191770f",
     ".claude/commands/implement.md": "aa549a3c0440a55c13906e52597c97eb8c0e01c9fc159aff6bf916dcd853d416",
     ".claude/commands/wrap-up.md": "d46fcbb7d55bdce0206f4b6aaeba6f5ff3bf76b78baf0c75c98c317ae1b9c61c",
@@ -46,7 +46,7 @@
     ".claude/commands/plan.md": "74bd644e73a64798e136ad886123644d9c887cd6db11c4d926334a36d3f23ce1",
     ".claude/commands/close-out.md": "56a65232f630285118eed2bbb7fc466c3a6072840ffac36769462597f9a728b8",
     ".claude/commands/commit.md": "fb9c00d28a9db7f05e731d31aad40fb43e8327c9d6fe9a30a374fd41afa8f9bb",
-    ".claude/commands/orchestrate.md": "6b74ac35ccf4e1f27b7c5dde29b2bb21d668c14c42bf2424b7b13bd26ac1cefc",
+    ".claude/commands/orchestrate.md": "9e9deb94dd021b9e77003cbbefc75b65e88a6ea131676d8cbaa17317cce8f27f",
     ".claude/commands/test_auth_gate.md": "57ff94d5033e1e69cbec61d3021a0bc6b08855f0906966971860351cd4b2adfa",
     ".claude/commands/update-state.md": "ea248b14b72c8c858de08c8dc228b8dc0cf8481b50a9316b7c0c658188fb5c5f",
     ".claude/commands/test.md": "9dd42aa48a000ca410d9c91e3c5490be1d2cbeaee9fb5812fcff2c7dc7929b81",
