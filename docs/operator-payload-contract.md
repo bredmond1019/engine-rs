@@ -1,12 +1,12 @@
 ---
 type: Reference
 title: Operator Payload Contract
-description: engine-core::operator (EN.8.A) — OperatorPayload/ValidatedOperatorPayload, confirmed WhatsApp interactive-reply limits, and the OperatorChannel declaration a HarvestGate carries
+description: engine-core::operator (EN.8.A/EN.8.B) — OperatorPayload/ValidatedOperatorPayload, confirmed WhatsApp interactive-reply limits, the OperatorChannel declaration a HarvestGate carries, and the operator::queue depth/timeout/storm-suppression mechanics
 doc_id: operator-payload-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [operator, operator-payload, operator-channel, whatsapp, validation, digest, harvest-gate, EN.8.A]
+keywords: [operator, operator-payload, operator-channel, whatsapp, validation, digest, harvest-gate, operator-queue, EN.8.A, EN.8.B]
 related: [architecture, docs-index, harvest-gate]
 ---
 
@@ -69,6 +69,39 @@ now carries a `channel: OperatorChannel` field (default `Notification`), set via
 `HarvestGate::with_channel(...)` and read via `HarvestGate::channel()` — readable off the gate
 definition without executing the workflow. See [harvest-gate.md](harvest-gate.md) for `HarvestGate`
 itself.
+
+## Queue (`operator::queue`, `EN.8.B`)
+
+`crates/engine-core/src/operator/queue/` turns pending blocked-edge state into an ordered,
+depth-limited operator queue:
+
+- `item.rs` — `OperatorQueueItem { payload, item_id, effective_priority, enqueued_at, source }`
+  and `compare_items`, a total, deterministic comparator (priority descending, `enqueued_at`
+  ascending, `item_id` ascending as the final tiebreak) — no I/O, no clock reads.
+- `source.rs` — the injectable `QueueSource` trait plus `BlockedEdgeSource`, a file-backed reader
+  of bastion's blocked-edge sink JSONL (`default_sink_path` resolves the same file bastion writes;
+  a missing file yields an empty queue, malformed lines are skipped, no handle is held open). Its
+  `pending()` returns lightweight `PendingBlockedEdge { session, host, to, observed_at }` records —
+  turning one into a full `OperatorQueueItem` (`item_id`/`effective_priority`) is `OperatorQueue`'s
+  job, not the source's.
+- `mod.rs` — `OperatorQueue` enforces a policy-resolved open-item depth limit (built-in default 1,
+  the §7.5 Invariant-3 floor), releases the open item back to the queue on `answer()` or on an
+  unanswered `answer_timeout_secs` timeout (re-queued, never dropped), and drops items whose level
+  predicate no longer holds at selection time via an injectable `with_level_predicate` closure.
+- `policy.rs` — `OperatorQueuePolicy` (`operator_queue_depth`, `answer_timeout_secs`,
+  `suppression_window_secs`, `digest_schedule_secs`) resolves through the standard four policy
+  layers (event override > named profile > `planning/harness.json` defaults > built-in default)
+  under `WORKFLOW_KEY = "operator_queue"`; `baseline`/`cheap-fast`/`thorough` profiles all hold
+  `operator_queue_depth` at 1 and vary only the timeout/suppression/digest knobs. `policy_state()`
+  serializes the resolved policy for `RunTelemetry`/`PolicyAggregate` stamping.
+- `digest.rs` — `build_digest`/`storm_digest`, pure functions producing a top-item-plus-count
+  `QueueDigest`. `storm_digest` is `build_digest` narrowed to items enqueued within
+  `suppression_window_secs` of `now` (a non-positive window clamps to zero rather than being
+  treated as unbounded; items with a future `enqueued_at` are excluded as clock-skew guards). The
+  same `QueueDigest` shape backs both storm suppression and the scheduled digest tail
+  (`digest_schedule_secs`) — one JSON shape, no duplicated digest logic.
+
+See `planning/harness.json`'s `operator_queue` section for the policy defaults and named profiles.
 
 ## See also
 
