@@ -13,12 +13,17 @@
 //! (task 3) is the only path to a [`ValidatedOperatorPayload`] — the type
 //! the `notification` channel accepts — so a payload that fails validation
 //! has no route onto that channel; it forces the gate to declare `session`
-//! instead.
+//! instead. [`channel`] (task 4) is [`OperatorChannel`] itself, the
+//! declaration attached to `crate::nodes::harvest_gate::HarvestGate` so
+//! which channel a gate routes to is readable off its definition without
+//! executing the workflow.
 
+pub mod channel;
 pub mod limits;
 pub mod payload;
 pub mod validate;
 
+pub use channel::OperatorChannel;
 pub use limits::OperatorPayloadLimits;
 pub use payload::{OperatorPayload, OperatorResponseOption};
 pub use validate::{validate, OperatorValidationError, ValidatedOperatorPayload};
