@@ -14,14 +14,19 @@
 //! `policy.operator_queue_depth` open items at once, released on `answer`
 //! or on an unanswered timeout (re-queued, never dropped), with stale items
 //! (whose level predicate no longer holds) dropped at selection time. Task
-//! 4 adds the digest/storm-suppression tail on top.
+//! 4 ([`digest`]) adds the digest/storm-suppression tail on top: a pure,
+//! pulled-on-schedule summary (top item plus a count, never the full list),
+//! and a separate storm-collapse of near-simultaneous arrivals into one
+//! delivery — neither substitutes for `bastion:BA.18.A`'s seed-before-emit.
 
 use chrono::{DateTime, Utc};
 
+pub mod digest;
 pub mod item;
 pub mod policy;
 pub mod source;
 
+pub use digest::{build_digest, storm_digest, QueueDigest};
 pub use item::{compare_items, ItemSource, OperatorQueueItem};
 pub use policy::{OperatorQueuePolicy, PartialOperatorQueuePolicy};
 #[cfg(test)]
@@ -274,6 +279,7 @@ mod tests {
         let policy = OperatorQueuePolicy {
             operator_queue_depth: 1,
             answer_timeout_secs: 60,
+            ..OperatorQueuePolicy::default()
         };
         let mut queue = OperatorQueue::new(policy);
         // "a" is the only item pending, so it is delivered first regardless
@@ -318,6 +324,7 @@ mod tests {
         let policy = OperatorQueuePolicy {
             operator_queue_depth: 2,
             answer_timeout_secs: 900,
+            ..OperatorQueuePolicy::default()
         };
         let mut queue = OperatorQueue::new(policy);
         queue.enqueue(item("a", 10, 0));

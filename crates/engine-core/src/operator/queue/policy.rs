@@ -34,15 +34,30 @@ pub struct OperatorQueuePolicy {
     /// [`super::OperatorQueue::next_deliverable`] releases the next item.
     /// The timed-out item is re-queued, never dropped.
     pub answer_timeout_secs: i64,
+    /// Task 4 (`EN.8.B` task 4, [`super::digest`]): the storm-suppression
+    /// window. Items whose `enqueued_at` falls within this many seconds of
+    /// `now` collapse into one digest delivery (top item plus a count)
+    /// rather than one message per item — this is a separate mechanism from
+    /// `bastion:BA.18.A`'s seed-before-emit fix and does not replace it; see
+    /// `super::digest`'s module header.
+    pub suppression_window_secs: i64,
+    /// Task 4: how often the low-priority digest tail may be pulled. The
+    /// digest is **pulled on this schedule, never pushed on arrival** — this
+    /// knob bounds how stale a pulled digest is allowed to be, it does not
+    /// itself trigger anything.
+    pub digest_schedule_secs: i64,
 }
 
 impl Default for OperatorQueuePolicy {
     /// Behavior-stable baseline: at most one open item, released after 15
-    /// minutes (900s) unanswered.
+    /// minutes (900s) unanswered; a 60s storm-suppression window and an
+    /// hourly (3600s) digest pull schedule.
     fn default() -> Self {
         Self {
             operator_queue_depth: 1,
             answer_timeout_secs: 900,
+            suppression_window_secs: 60,
+            digest_schedule_secs: 3600,
         }
     }
 }
@@ -56,6 +71,8 @@ impl Default for OperatorQueuePolicy {
 pub struct PartialOperatorQueuePolicy {
     pub operator_queue_depth: Option<u32>,
     pub answer_timeout_secs: Option<i64>,
+    pub suppression_window_secs: Option<i64>,
+    pub digest_schedule_secs: Option<i64>,
 }
 
 impl Policy for OperatorQueuePolicy {
@@ -67,6 +84,11 @@ impl Policy for OperatorQueuePolicy {
         Self {
             operator_queue_depth: merge_opt(self.operator_queue_depth, over.operator_queue_depth),
             answer_timeout_secs: merge_opt(self.answer_timeout_secs, over.answer_timeout_secs),
+            suppression_window_secs: merge_opt(
+                self.suppression_window_secs,
+                over.suppression_window_secs,
+            ),
+            digest_schedule_secs: merge_opt(self.digest_schedule_secs, over.digest_schedule_secs),
         }
     }
 }
@@ -80,28 +102,39 @@ pub fn baseline() -> PartialOperatorQueuePolicy {
     PartialOperatorQueuePolicy {
         operator_queue_depth: Some(1),
         answer_timeout_secs: Some(900),
+        suppression_window_secs: Some(60),
+        digest_schedule_secs: Some(3600),
     }
 }
 
 /// Cost/latency floor: depth stays 1 (§7.5 Invariant 3 is not a cost dial),
 /// but the answer timeout is shortened to 5 minutes so a run optimizing for
-/// speed cycles through the queue faster when items go unanswered.
+/// speed cycles through the queue faster when items go unanswered. The
+/// suppression window widens (fewer, more-collapsed messages) and the
+/// digest is pulled less often, both cutting the noise a speed-optimized
+/// deployment would otherwise pay attention-cost for.
 #[must_use]
 pub fn cheap_fast() -> PartialOperatorQueuePolicy {
     PartialOperatorQueuePolicy {
         operator_queue_depth: Some(1),
         answer_timeout_secs: Some(300),
+        suppression_window_secs: Some(120),
+        digest_schedule_secs: Some(7200),
     }
 }
 
 /// Quality ceiling: depth stays 1, but the answer timeout is lengthened to
 /// 30 minutes so a run optimizing for operator judgement over speed gives
-/// more room before an item is released to the next one.
+/// more room before an item is released to the next one. The suppression
+/// window narrows (fewer arrivals get collapsed together, so the operator
+/// sees more distinct items) and the digest is pulled more often.
 #[must_use]
 pub fn thorough() -> PartialOperatorQueuePolicy {
     PartialOperatorQueuePolicy {
         operator_queue_depth: Some(1),
         answer_timeout_secs: Some(1800),
+        suppression_window_secs: Some(30),
+        digest_schedule_secs: Some(1800),
     }
 }
 
@@ -172,6 +205,20 @@ mod tests {
         let policy = OperatorQueuePolicy::default();
         assert_eq!(policy.operator_queue_depth, 1);
         assert_eq!(policy.answer_timeout_secs, 900);
+        assert_eq!(policy.suppression_window_secs, 60);
+        assert_eq!(policy.digest_schedule_secs, 3600);
+    }
+
+    #[test]
+    fn every_named_profile_sets_the_digest_knobs_explicitly() {
+        // A knob absent from the profile bundles is a knob nobody will
+        // find — standing rule 6.
+        assert!(baseline().suppression_window_secs.is_some());
+        assert!(baseline().digest_schedule_secs.is_some());
+        assert!(cheap_fast().suppression_window_secs.is_some());
+        assert!(cheap_fast().digest_schedule_secs.is_some());
+        assert!(thorough().suppression_window_secs.is_some());
+        assert!(thorough().digest_schedule_secs.is_some());
     }
 
     #[test]
