@@ -8,10 +8,18 @@
 //!
 //! Task 1 (this module, plus [`item`]) defines the item shape and its
 //! ordering only — pure data and a pure comparator, no I/O, no clock reads.
-//! Later tasks in this block add the durable source reader ([`source`],
-//! task 2), the depth-limited delivery queue itself (task 3), and the
+//! Task 2 ([`source`]) adds the durable source reader over the
+//! `bastion:BA.18.A` blocked-edge sink. Later tasks in this block add the
+//! depth-limited delivery queue itself (task 3) and the
 //! digest/storm-suppression tail (task 4).
 
 pub mod item;
+pub mod source;
 
 pub use item::{compare_items, ItemSource, OperatorQueueItem};
+#[cfg(test)]
+pub use source::InMemoryQueueSource;
+pub use source::{
+    default_sink_path, BlockedEdgeRecord, BlockedEdgeSource, BlockedEdgeState, PendingBlockedEdge,
+    QueueSource,
+};
