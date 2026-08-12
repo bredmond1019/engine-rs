@@ -25,7 +25,7 @@ Usage: /consolidate-run <roadmap-slug> [--repo <slug>]
 
 | Flag | Required | Default | What it does |
 |---|---|---|---|
-| `<roadmap-slug>` | **yes** | — | The roadmap whose records to consolidate. Matches the `roadmap:` frontmatter field on run records and the `<roadmap-dir>` under `planning/`. |
+| `<roadmap-slug>` | **yes** | — | The roadmap whose records to consolidate. Matches the `roadmap:` frontmatter field on run records and resolves to `<roadmap-dir>` under `planning/roadmaps/` (or legacy `planning/`) per Step 1's resolution rule. |
 | `--repo <slug>` | no | none (fleet-wide) | Scope discovery to one repo instead of the whole fleet. |
 
 **Both scopes required by D57 section 5:**
@@ -42,8 +42,10 @@ Empty `$ARGUMENTS` → print usage and stop.
 
 ## Step 1 — Resolve scope
 
-Walk up from cwd for `brain.toml` to find `BRAIN_ROOT`. `roadmap_dir` = `<BRAIN_ROOT>/planning/<roadmap-slug>/`.
-If it does not exist, stop — there is nothing to consolidate into.
+Walk up from cwd for `brain.toml` to find `BRAIN_ROOT`. Resolve `<roadmap-slug>` to `roadmap_dir` via
+`/begin-orchestration`'s Step 1C rule (`planning/roadmaps/<roadmap-slug>/` first, then legacy
+`planning/<roadmap-slug>/`; both existing is an error) — cited here, not restated. If neither
+location exists, stop — there is nothing to consolidate into.
 
 If `--repo <slug>` is given, or the command is invoked from inside a sub-repo (cwd is not
 `BRAIN_ROOT`), scope every step below to that one repo. Otherwise scope to the whole fleet.

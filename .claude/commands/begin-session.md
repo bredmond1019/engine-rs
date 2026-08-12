@@ -28,7 +28,7 @@ Usage: /begin-session <session-slug> [--roadmap <path>] [--dry-run]
 
 | Flag | Default | What it does |
 |---|---|---|
-| `<session-slug>` | **required** | e.g. `session-developer-offer`. Kebab-case. |
+| `<session-slug>` | **required** | e.g. `operator-developer-offer`. Kebab-case, prefixed `operator-`. |
 | `--roadmap <path>` | inferred | Where the session is defined, when it is not yet a graph edge. |
 | `--dry-run` | off | Print the resolved session, its exit artifact and gated blocks; change nothing. |
 
@@ -38,9 +38,10 @@ Empty `$ARGUMENTS` → print usage, list every session you can resolve, and stop
 
 Look in this order and **stop at the first hit**:
 
-1. **`planning/state.json` `depends_on` edges of type `session`** carrying this slug — the real home
-   once `okf-core:OK.ticket.operator-edge-types` has landed. Collect **every** block gated by it,
-   across every repo: one session commonly gates several, and the operator should see all of them.
+1. **`planning/state.json` `depends_on` edges of type `operator`** carrying this slug — the real
+   home now that `okf-core:OK.ticket.operator-edge-types` has landed (`{"type":"session"}` is a
+   hard parse error). Collect **every** block gated by it, across every repo: one session commonly
+   gates several, and the operator should see all of them.
 2. **A roadmap's Wave 0 session table** (`--roadmap`, or search `planning/*/roadmap.md`) — where
    sessions live before the edge type exists.
 3. **`planning/<slug>/notes.md`** — a `/capture` holding area.
@@ -82,9 +83,10 @@ to make it cheap to give.
 A session ends **only** when its exit artifact exists. Then, in order:
 
 1. **Write the artifact**, at the path the session named. OKF frontmatter if it enters the corpus.
-2. **Clear the gate.** Once the edge type exists: `mev close-session <slug> --exit-verified`. Until
-   then, remove the session row from the roadmap's Wave 0 table and say what replaced it.
-   `--exit-verified` is the operator asserting the artifact exists — **mev never infers it.**
+2. **Clear the gate.** For an `operator` edge: `mev close-operator-gate <slug> --exit-verified`.
+   For a session still resolved from a roadmap's Wave 0 table (no edge yet), remove the session row
+   and say what replaced it. `--exit-verified` is the operator asserting the artifact exists —
+   **mev never infers it.**
 3. **Commit with an explicit pathspec.** Every `planning/` is a symlink into one git index; a bare
    commit sweeps other sessions' staged work in.
 4. **Report what unblocked.** Name the blocks that just became startable and the command that runs

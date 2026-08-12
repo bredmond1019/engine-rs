@@ -75,8 +75,10 @@ Each of these exists because it has already caused a real failure in this fleet.
    {"ts":"<ISO-8601>","lane":"<lane-name>","repo":"<repo>","block":"<ID>","status":"closed|bailed|held","note":"<one line>"}
    ```
 
-   The log lives beside the roadmap driving the run (e.g.
-   `planning/demand-ready/lane-log.jsonl`); if the chain has no roadmap, skip it.
+   The log lives beside the roadmap driving the run, at `<roadmap_dir>/lane-log.jsonl` — resolve
+   `<roadmap_dir>` from the driving roadmap's slug via `/begin-orchestration`'s Step 1C rule (new
+   location `planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`; both existing is an
+   error), never a hardcoded `planning/<slug>/`. If the chain has no roadmap, skip it.
 
    **Do not hand-edit a roadmap's generated regions.** Run `mev emit-state --write` and let the
    sequence table regenerate from `state.json`, which is the authority. Four concurrent sessions
@@ -105,6 +107,14 @@ Each of these exists because it has already caused a real failure in this fleet.
    per `planning/decisions/D57-orchestration-run-artifact-contract.md`. Follow that contract; do not
    restate it here. In short: unresolved items never carry into a successor file — at lane close,
    promote any item still `OPEN` into `state.json` `carryover[]`.
+
+   **Verify what you just wrote, before continuing** — and before the commit in rule 7/8 below.
+   After every write or append to `notes.md` (and after writing the terminal `review.md`), run
+   `python3 <path-to-base-template>/scripts/test_orchestration_run_contract.py` and confirm it
+   exits 0, same rule and same reasoning as `/begin-orchestration`'s Rule 5 verify step — do not
+   restate that reasoning here. On a violation attributable to the record just written, **fix it**
+   and re-run the checker; do not proceed with a known violation. **Deleting or emptying the record
+   is never an acceptable way to make the check pass.**
 
    Keep it a *log*, not a second `status.md`. If an item turns into real work it becomes a ticket
    and the entry points at it.

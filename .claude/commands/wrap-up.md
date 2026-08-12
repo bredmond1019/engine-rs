@@ -19,6 +19,17 @@ $ARGUMENTS — optional free-text note about what was done (passed straight thro
    place this kind of note survives. Skip if the session produced none or the repo has no `state.json`.
    **Cross-Repo Constraints Rule:** If a completed block spawns follow-up work in a different repo, **DO NOT** record it as a local `carryover`. You must actively open the downstream repo's `planning/state.json`, inject the new block into its `tracks` and `focus` arrays, and wire it into the `depends_on` DAG immediately.
 
+   **File operator work as a graph edge, never as prose.** Anything this session is leaving for
+   the operator to decide, review, approve, or judge is filed as a `{"type":"operator", slug,
+   exit, start, what?}` entry in `depends_on` on the block(s) it gates — **not** as a `carryover`
+   entry and **not** as a note in this command's output. `slug` is kebab-case, prefixed
+   `operator-`; `exit` names the artifact whose existence ends the gate (never a description of
+   the work); `start` is a paste-ready command. Use `{"type":"approval", slug, what, digest}`
+   instead when the decision is a single reducible yes/no on a fixed payload. **Why:** an operator
+   (or approval) edge inherits the effective priority of everything it gates and surfaces in
+   `/next` as the reason work cannot start; prose surfaces nowhere. Skip if the repo has no
+   `state.json`.
+
 2. Run `/log-work $ARGUMENTS` — this syncs status.md, appends the log entry, and syncs
    the company brain. Wait for it to complete before continuing.
 

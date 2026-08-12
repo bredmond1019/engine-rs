@@ -23,7 +23,7 @@ Naming it costs one flag and removes a hidden coupling to epic status.
 
 | Flag | Required | Default | What it does |
 |---|---|---|---|
-| `--roadmap <path>` | **yes** | — | The roadmap this lane belongs to. Absolute, or relative to `BRAIN_ROOT`. |
+| `--roadmap <path\|slug>` | **yes** | — | The roadmap this lane belongs to. A path is absolute or relative to `BRAIN_ROOT` and is honoured as given; a bare slug is resolved per Step 1C. |
 | `--lane <path\|name>` | one of | — | Lane chain file. A bare name (`gtm`) resolves to `<roadmap-dir>/lane-<name>.txt`. |
 | `--blocks <id ...>` | one of | — | Inline block IDs instead of a lane file. Space- or comma-separated. |
 | `--repo <slug>` | no | inferred from cwd | Override only when inference is wrong. |
@@ -60,7 +60,20 @@ operator does not know which roadmap this lane belongs to, that is the thing to 
 must be a roadmap; a path that resolves to a lane file or a `tasks.md` is an argument error, not
 something to work around. **Never infer it.**
 
-**D. `roadmap_dir`** = the roadmap's directory.
+**Roadmap slug resolution (the canonical rule — `/orchestrate` and `/consolidate-run` cite this
+rather than restating it):** when `--roadmap` is given as a bare slug or resolves to a directory
+rather than a `roadmap.md` file, resolve it in this fixed order:
+
+1. `planning/roadmaps/<slug>/` — if it exists, that is `roadmap_dir`.
+2. Otherwise, legacy `planning/<slug>/` — if it exists, that is `roadmap_dir`.
+3. A slug present in **both** locations is an **error**, not a silent preference — stop and report
+   both paths. An ambiguous roadmap is how a lane appends to the wrong lane log.
+
+An explicit path argument (one that already names a file or a full directory, e.g.
+`planning/roadmaps/close-the-loop/roadmap.md` or `planning/demand-ready/`) is always **honoured as
+given** — resolution applies only to a bare slug, never overriding an explicit path.
+
+**D. `roadmap_dir`** = the roadmap's directory, per the resolution above.
 
 **E. `run_record_dir`** = `planning/orchestration-run/<roadmap-slug>/` in **this repo**, where
 `<roadmap-slug>` is `roadmap_dir`'s directory name (from D). Create the directory if absent; if it
@@ -237,6 +250,17 @@ Each has already cost a real run in this fleet.
    them into — each `(repo, roadmap)` pair has exactly one record, addressed, never rotated (D57
    section 1). At lane close, promote any item still `OPEN` into `state.json` `carryover[]` (D57
    section 4); do not copy it into another `notes.md`.
+
+   **Verify what you just wrote, before continuing.** After every write or append to `notes.md`
+   (and after writing the terminal `review.md`), run
+   `python3 <path-to-base-template>/scripts/test_orchestration_run_contract.py` and confirm it
+   exits 0. This is the writer's job, not some other repo's: the corpus is one shared vault, so an
+   unvalidated record surfaces as a failure in a different repo's gate, blocking a lane that never
+   touched it (the brain root `CLAUDE.md` rule — "any generator writing into the corpus must
+   validate its own output"). On a violation attributable to the record just written, **fix it**
+   (correct the `doc_id`, `roadmap:`, or `lifecycle` field per Rule 5 above) and re-run the checker
+   — do not proceed with a known violation. **Deleting or emptying the record is never an
+   acceptable way to make the check pass**; the record is the run's evidence.
 
 6. **Resolve what you can; record the call.** A lane that stops at every ambiguity is worthless,
    and one that stops at none is dangerous. Decide the ordinary things yourself — a spec slug that

@@ -31,12 +31,16 @@ field, know which bucket it's in:
 
 | Bucket | Fields | You may hand-edit these |
 |---|---|---|
-| **Authored** (source of truth) | `tracks[].blocks[]` (`id`, `title`, `status`, `depends_on`, `wave`, `note?`, `origin?`, `tasks?`), `backlog[]` (HQ only), `carryover[]`, HQ `tiers[]`, `note` (portfolio kind) | **Yes** |
+| **Authored** (source of truth) | `tracks[].blocks[]` (`id`, `title`, `status`, `depends_on`, `wave`, `note?`, `origin?`, `tasks?`), `backlog[]` (HQ only), `carryover[]`, HQ `tiers[]`, `epics[]` (HQ only — `plan` field points at a roadmap's `roadmap.md` per `/generate-roadmap`'s registration step), `note` (portfolio kind) | **Yes** |
 | **Derived** (a regenerated cache) | `focus`, brain `repos[]`, brain `cross_repo[]`, master-plan wave tables | **No — never hand-edit.** Run `mev emit-state --write` instead |
 
 If you find yourself about to type a value into `focus.now[]`, `repos[]`, or `cross_repo[]` directly,
 stop — edit the authored `tracks[].blocks[]` (or the child repo's own state.json) instead, then
 regenerate (see Step 4 below).
+
+An `epics[]` entry's `plan` is a path, not a slug — resolve a roadmap's directory via
+`/begin-orchestration`'s Step 1C rule (`planning/roadmaps/<slug>/`, else legacy `planning/<slug>/`)
+before hand-editing it, rather than assuming either location.
 
 ## `kind` — which template applies
 

@@ -50,8 +50,9 @@ until someone reconciles by hand — the `engine-rs` `state-json-block-status-st
 
 **2b — Drain anything that must outlive this handoff** into `planning/state.json`'s
 `carryover[]`, so the next handoff can't overwrite it away. One quick pass, not a routing
-ceremony — append an entry with `slug`, `scope`, `kind`, `text`, `created` (plus optional
-`related` / `clears_when`), where `kind` is one of:
+ceremony — append an entry with `slug`, `scope`, `kind`, `text`, `created` as the required
+core, plus these optional fields — `docs/state/state-schema.md` is the authoritative field
+table; this restates only what an agent needs inline while appending:
 
 | kind | for |
 |---|---|
@@ -59,6 +60,26 @@ ceremony — append an entry with `slug`, `scope`, `kind`, `text`, `created` (pl
 | `known_issue` | a don't-re-investigate fact |
 | `env` | a transient environmental caveat ("installed binary is stale, rebuild first") |
 | `deferred` | a real follow-on you haven't ticketed yet |
+
+- `priority` (int, `0..=3`) — value if resolved, on the same rubric as `tracks[].blocks[]`.
+  Omit when the entry carries no value judgement.
+- `blocks` (array) — edges to the work this entry blocks, same forms as `depends_on`
+  (`{type:"block",repo,id}` / `{type:"external",what}`); feeds the same reverse-topological
+  `min`-propagation that derives `effective_priority`. Omit (don't write `[]`) when it blocks
+  nothing.
+- `finding_id` (string) — free-form join key so `mev carryover` can correlate the same finding
+  filed in multiple repos.
+- `related`, `reviewed`, `snoozed_until` — as documented in `docs/state/state-schema.md`.
+- `clears_when` — either the legacy human-readable string (for genuinely subjective
+  conditions), or a **typed predicate** object mev can evaluate itself: `block_closed`
+  (`repo`, `id`), `file_exists` (`path`), `file_contains` (`path`, `pattern`), or
+  `command_exits_zero` (`command`) — each takes an optional `note`. Prefer the typed form
+  whenever the condition is checkable.
+
+**Only entries with a typed `clears_when` predicate are machine-evaluable by `mev carryover`**
+— a prose `clears_when` (or none) lands the entry in its not-evaluable lane. `priority` and
+`finding_id` are what make an entry rankable and cross-repo-correlatable; an entry with none
+of these three still counts, but sits inert until someone triages it by hand.
 
 Append; don't duplicate an existing slug. **Delete** any entry whose `clears_when` resolved
 this session. Skip entirely if this repo has no `planning/state.json`.
@@ -69,6 +90,20 @@ here**. Note them in the handoff prose and let the next session file them proper
 
 Never hand-edit a block's `tasks` field — it's a derived pointer, not somewhere to inject
 entries.
+
+**2c — File operator work as a graph edge, never as prose.** Anything this session is leaving
+for the operator to decide, review, approve, or judge — a call only they can make, a credential
+only they hold, a thing they must look at — is filed as a `{"type":"operator", slug, exit,
+start, what?}` entry in `depends_on` on the block(s) it gates, **not** written into the handoff
+prose, a `note` field, or an `## Open questions` bullet. `slug` is kebab-case, prefixed
+`operator-`; `exit` names the artifact whose existence ends the gate (never a description of the
+work — e.g. `planning/decision-rate-card.md exists`, not "decide on pricing"); `start` is a
+paste-ready command the operator runs to begin. If the decision reduces to a single yes/no on a
+fixed payload, use `{"type":"approval", slug, what, digest}` instead. **Why:** an operator (or
+approval) edge inherits the effective priority of everything it gates and surfaces in `/next` as
+the reason work cannot start; prose in a handoff file surfaces nowhere and is exactly how these
+get left for days. Skip entirely if this repo has no `planning/state.json` — say so explicitly in
+the handoff instead (Step 3) and name who is expected to file it once one exists.
 
 ### Step 3 — Write `planning/handoff.md`
 
@@ -102,7 +137,9 @@ not "fixed engine".>
 only — the next agent can look them up.>
 
 ## Open questions / choices
-<Unresolved decisions, or things to verify before proceeding.>
+<Name the `operator-`/`approval` slugs already filed in `depends_on` (Step 2c) and what each
+gates — this section points at the graph, it does not substitute for it. If truly nothing
+needs the operator: "None — clear to proceed.">
 
 ## First command after `/prime`
 `<exact command to run first>`
@@ -155,6 +192,7 @@ asked.
 
 - `planning/handoff.md` written (or updated)
 - Blocks flipped to `closed`; `carryover[]` slugs added or cleared
+- Any `operator`/`approval` edges filed this session, and what they gate
 - The `emit-state --write` summary, or that it was skipped (standalone)
 - What was committed
 - Next session: open a fresh session here → `/prime` (it surfaces the handoff automatically) →

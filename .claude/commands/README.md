@@ -263,7 +263,8 @@ workflows, so specs for later blocks are prepared while an earlier one builds. *
 one engine run at a time** — several repos run concurrently as separate sessions (the lane model).
 Ten standing rules, each from a real failure: never do block work yourself or via a subagent; verify
 every state write (engine bookkeeping is known-unreliable); check downstream Cargo consumers after a
-shared-crate change; commit after every `mev` command; report each block to the lane log; keep a
+shared-crate change; commit after every `mev` command; report each block to the lane log (resolved
+per `/begin-orchestration`'s rule — `planning/roadmaps/<slug>/`, else legacy `planning/<slug>/`); keep a
 `planning/orchestration-run/notes.md` running tab; and resolve ordinary ambiguities inline while
 recording the call. Flags: `--worktree` / `--no-worktree`, `--engine task|flow`, `--dry-run`,
 `--continue-on-fail`.
@@ -280,14 +281,15 @@ heavy-gate concurrency cap, operator gates, and the same notes-file and decision
 ### `/begin-session <session-slug> [--roadmap <path>] [--dry-run]`
 Drives one **operator session** — the unit for work an agent cannot do alone: a decision, a
 credential, a judgement call. `/orchestrate` runs what an agent can do; this runs what it cannot.
-Resolves the slug from `state.json` `depends_on` edges of type `session` (their real home once
-`okf-core:OK.ticket.operator-edge-types` lands), else a roadmap's Wave 0 session table, else a
-`/capture` note — and reports **every** block the session gates, with effective priority, since a
-session gating a P0 block *is* P0. Stops if you are in the wrong repo, and groups every step needing
-another machine (the Mac Mini) into one sitting rather than three. Closes **only** when the named
-exit artifact exists: `mev close-session <slug> --exit-verified`, the operator asserting it — mev
-never infers it. A session marked done without its artifact is worse than one never started, because
-the gate is gone and the work is not.
+Resolves the slug from `state.json` `depends_on` edges of type `operator` (the real home now that
+`okf-core:OK.ticket.operator-edge-types` has landed — `{"type":"session"}` is a hard parse error),
+else a roadmap's Wave 0 session table, else a `/capture` note — and reports **every** block the
+session gates, with effective priority, since a session gating a P0 block *is* P0. Stops if you are
+in the wrong repo, and groups every step needing another machine (the Mac Mini) into one sitting
+rather than three. Closes **only** when the named exit artifact exists:
+`mev close-operator-gate <slug> --exit-verified`, the operator asserting it — mev never infers it.
+A session marked done without its artifact is worse than one never started, because the gate is
+gone and the work is not.
 
 ### `/consolidate-run <roadmap-slug> [--repo <slug>]`
 Gathers `orchestration-run/<roadmap-slug>/` records across the fleet (or one repo with `--repo`),
@@ -303,15 +305,27 @@ is the disposal path for what it proposes.
 ## Session Orientation
 
 ### `/wrap-up [note]`
-Clean session close without a handoff. Runs `/log-work` (syncs status.md + appends log entry)
-then `/commit`. Use this when you're done with a piece of work and don't need to hand off
-to a fresh agent.
+Clean session close without a handoff. Drains any durable caveat into `carryover[]` first (full
+twelve-field shape — `slug`, `scope`, `kind`, `text`, `related?`, `clears_when?`, `priority?`,
+`blocks?`, `finding_id?`, `created`, `reviewed?`, `snoozed_until?`; only entries with a typed
+`clears_when` predicate are machine-evaluable by `mev carryover`), files any operator work as a
+graph edge rather than prose, then runs `/log-work` (syncs status.md + appends log entry) and
+`/commit`. Use this when you're done with a piece of work and don't need to hand off to a fresh
+agent.
 
 ### `/handoff [note]`
 Session end-of-context handoff. Writes `planning/handoff.md` (what's in flight, completed,
-remaining, open questions, first command for the next agent), then invokes `/log-work` and
-`/commit`. `/prime` in the next session detects the handoff file and surfaces it first.
-Delete `planning/handoff.md` once the new session has consumed it.
+remaining, first command for the next agent), then invokes `/log-work` and `/commit`.
+`/prime` in the next session detects the handoff file and surfaces it first. Delete
+`planning/handoff.md` once the new session has consumed it. Drains durable caveats into
+`carryover[]`'s full twelve-field shape (see `docs/state/state-schema.md`) — `priority`,
+`blocks[]`, `finding_id`, and the four typed `clears_when` predicates
+(`block_closed` / `file_exists` / `file_contains` / `command_exits_zero`) are what make an entry
+rankable, cross-repo-correlatable, and machine-evaluable by `mev carryover`; a prose `clears_when`
+lands it in the not-evaluable lane instead. **Anything left for the operator to decide, review,
+approve, or judge is filed as an `operator` (or `approval`) edge in `depends_on`, never written
+into the handoff's `## Open questions / choices` section as prose** — that section now names the
+slugs already filed, it does not hold decisions itself.
 
 ### `/close-out [--base <ref>] [--gap-check-only] [--skip-coverage] [--clean-worktree | --merge-branch] [note]`
 Quality-close pipeline for the end of an `sdlc-run` or `sdlc-flow` session. Runs **(0.5)**
@@ -381,7 +395,8 @@ it are `Done`), and returns a status table. Read-only.
 
 ### `/generate-roadmap <slug> [--from <path> ...] [--supersedes <path>]`
 Authors the two things `/begin-orchestration` consumes: a **roadmap document** and one
-`lane-<name>.txt` chain file per lane. A roadmap is a *concurrency plan* — an assignment of work to
+`lane-<name>.txt` chain file per lane, written to `planning/roadmaps/<slug>/` and registered as an
+epic's `plan:` pointer. A roadmap is a *concurrency plan* — an assignment of work to
 parallel `/orchestrate` sessions that cannot step on each other. Encodes the rules that have cost
 real runs: the lane unit is the **repo, never the wave** (engines are serial inside a repo, so a
 repo holding 10 blocks is the critical path regardless of scheduling); **at most two heavy-gate
