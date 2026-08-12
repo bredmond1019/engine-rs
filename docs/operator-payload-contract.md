@@ -105,6 +105,9 @@ See `planning/harness.json`'s `operator_queue` section for the policy defaults a
 
 ## See also
 
+- [approval-ledger.md](approval-ledger.md) — `EN.8.C`'s record of every decision taken against this
+  contract: the digest a row is bound to is the one computed here, and a digest mismatch is recorded
+  as a re-queue rather than an approval.
 - [harvest-gate.md](harvest-gate.md) — the `HarvestGate` primitive this contract's `OperatorChannel`
   is wired onto (`EN.8.A` task 4).
 - [architecture.md](architecture.md) — module map.
