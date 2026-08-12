@@ -134,18 +134,31 @@ resolved in Step 0.5:
 
 ```bash
 python3 - "$(cat .git/CLOSE_OUT_RANGE)" <<'PYEOF'
-import subprocess, re, sys, os
+import subprocess, re, sys
 RANGE = sys.argv[1]
 EMOJI = re.compile(r'[\U0001F300-\U0001FAFF\U00002600-\U000027BF]')
-changed = subprocess.run(['git','diff', RANGE, '--name-only'], capture_output=True, text=True).stdout.splitlines()
-md_files = [f for f in changed if f.endswith(('.md','.mdx')) and os.path.isfile(f)]
+FOOTER = 'Generated with Claude Code'
+diff = subprocess.run(['git','diff','-M','-U0', RANGE, '--', '*.md', '*.mdx'], capture_output=True, text=True).stdout.splitlines()
 hits = []
-for path in md_files:
-    for n, line in enumerate(open(path, errors='ignore'), 1):
-        if EMOJI.search(line): hits.append(f'{path}:{n}: {line.rstrip()[:100]}')
+cur_file = None
+cur_line = None
+for line in diff:
+    if line.startswith('diff --git '):
+        cur_file = None; cur_line = None
+    elif line.startswith('+++ '):
+        p = line[4:]
+        cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
+    elif line.startswith('@@'):
+        m = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+        cur_line = int(m.group(1)) if m else None
+    elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
+        content = line[1:]
+        if EMOJI.search(content) and FOOTER not in content:
+            hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
+        cur_line += 1
 if hits:
     print('EMOJI CHECK FAIL:'); [print(h) for h in hits[:25]]; sys.exit(1)
-print(f'EMOJI CHECK: OK ({len(md_files)} file(s) scoped to {RANGE})'); sys.exit(0)
+print(f'EMOJI CHECK: OK (diff-scoped added lines only, range={RANGE})'); sys.exit(0)
 PYEOF
 ```
 

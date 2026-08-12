@@ -27,6 +27,7 @@ mod fan_out_aggregate;
 mod harvest_gate_e2e;
 mod locale_rate_card;
 mod materialize_doc;
+mod operator_queue;
 mod opportunity_loop_e2e;
 mod parallel;
 mod policy_dispatch_e2e;

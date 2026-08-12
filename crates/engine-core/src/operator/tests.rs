@@ -211,7 +211,7 @@ fn changed_payload_produces_different_digest_and_would_requeue() {
     // executor uses to refuse to execute a stale approval and re-queue
     // instead.
     assert!(
-        !(re_rendered.digest == approved_digest),
+        re_rendered.digest != approved_digest,
         "digest mismatch is the re-queue trigger, never the execute trigger"
     );
 

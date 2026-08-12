@@ -18,6 +18,40 @@ related: [status, context]
 
 ## [run: 2026-08-12]
 
+### EN.8.B-operator-queue closed — operator queue depth limit, priority ordering, digest tail, storm suppression
+- **What:** Drove `8.B-operator-queue` via `/sdlc-flow` on branch `8.B-operator-queue-flow`, all 6
+  tasks passed, PASS review. Task 1 added `OperatorQueueItem` and a deterministic `compare_items`
+  comparator (priority desc, enqueued_at asc, item_id asc), wired as `operator::queue` with no I/O
+  or clock reads. Task 2 added a `QueueSource` trait plus a file-backed `BlockedEdgeSource` reading
+  bastion's blocked-edge sink JSONL (missing file → empty, malformed lines skipped, no held handle
+  or writer-process dependency). Task 3 made `OperatorQueue` enforce a policy-resolved depth limit
+  (default 1 open item, §7.5 Invariant 3), release the open item on answer or on an unanswered
+  timeout (re-queuing, never dropping it), and drop items whose level predicate no longer holds at
+  selection time — `operator_queue_depth`/`answer_timeout_secs` resolve through the standard four
+  policy layers across `baseline`/`cheap-fast`/`thorough` profiles, stamped via `policy_state()`.
+  Task 4 added storm suppression and a digest tail (`build_digest`/`storm_digest`), with
+  `suppression_window_secs`/`digest_schedule_secs` policy knobs documented in `planning/harness.json`.
+  Task 5 added the 60-item, restart-storm, wedge, deterministic-ordering, and stale-item integration
+  tests in `crates/engine-core/tests/it/operator_queue.rs`. Task 6 ran the full authoritative
+  validation suite (fmt, clippy `-D warnings`, nextest --workspace, build --release) — all green, no
+  code changes needed.
+- **Why:** Closes `EN.8.B`, giving the operator surface its Invariant-3 delivery discipline (at most
+  one open item at a time, priority- not arrival-ordered, with a digest tail so a restart burst
+  produces one message, not N) — unblocking `EN.8.D` (APPROVE_AND_RUN) alongside `EN.8.C`.
+- Docs: `docs/operator-payload-contract.md`, `docs/index.md` updated.
+
+Next: `EN.8.D` — APPROVE_AND_RUN — the POC that makes the pitch true, now unblocked alongside `EN.5.B2`.
+
+```
+d24354d docs: update docs for 8.B-operator-queue
+d99bf6e feat: implement 8.B-operator-queue-task5
+ee31038 feat: implement 8.B-operator-queue-task4
+ceaffdc feat: implement 8.B-operator-queue-task3
+fbe833b feat: implement 8.B-operator-queue-task2
+8fec05d feat: implement 8.B-operator-queue-task1
+16c8db93 chore: wrap up 8.B-operator-queue (vault)
+```
+
 ### EN.8.A-operator-payload-contract closed — operator payload contract + two-channel router
 - **What:** Drove `8.A-operator-payload-contract` via `/sdlc-flow` on branch
   `8.A-operator-payload-contract-flow`, all 6 tasks passed, PASS review. Confirmed WhatsApp Cloud

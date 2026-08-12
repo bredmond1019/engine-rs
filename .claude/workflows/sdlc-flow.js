@@ -1245,6 +1245,20 @@ STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from tasks.md's
   you must NEVER author a "status" or "attempt_count" key (those are engine-owned). Each task names
   the concrete file(s) it owns in "files" so tasks stay disjoint.
 
+  Per-task "validation_commands" scoping — follow the convention documented at
+  \`.claude/commands/generate-tasks.md\` (search it for "validation_commands"); do not restate the
+  rubric in your own words, just apply it: "validation_commands" is [] for any task that touches
+  source the project's checks compile or lint — those tasks fall back to the project-wide harness
+  checks, which are authoritative for them. Set it ONLY for a task that CANNOT break the build
+  (docs-only, config-only, fixture-only), with cheap commands that actually verify that task (file
+  exists, frontmatter present, index updated). If you DO author an override that runs tests, it MUST
+  target that task's own tests specifically — never a bare/positional filter that could silently
+  match zero or the wrong tests — and a command matching nothing must fail rather than pass. Never
+  hardcode a stack-specific command (e.g. a particular test runner invocation) into this prompt;
+  that judgment belongs to the deriving agent at run time, per task. \`sdlc-block.js\`'s generator
+  (its "acceptance_criteria/validation_commands can stay [] per task" step) is the sibling that
+  already gets this right — match its intent.
+
 STEP 4 — Commit it on the current branch with an explicit pathspec:
   git add ${tasksJsonFile}
   git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
