@@ -16,6 +16,7 @@ pub mod locale;
 pub mod loop_combinator;
 pub mod node;
 pub mod nodes;
+pub mod operator;
 pub mod parallel;
 pub mod policy;
 pub mod repo_registry;

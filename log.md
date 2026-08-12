@@ -16,6 +16,43 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-12]
+
+### EN.8.A-operator-payload-contract closed — operator payload contract + two-channel router
+- **What:** Drove `8.A-operator-payload-contract` via `/sdlc-flow` on branch
+  `8.A-operator-payload-contract-flow`, all 6 tasks passed, PASS review. Confirmed WhatsApp Cloud
+  API limits against Meta's developer docs (3 reply buttons, 20-char labels, 1024-char body) and
+  landed the configurable `OperatorPayloadLimits` in `engine-core::operator::limits`, plus a
+  non-platform floor `OPERATOR_MIN_RESPONSE_OPTIONS = 2` (task 1). Added `OperatorPayload`/
+  `OperatorResponseOption` with a sha256 digest computed over the rendered summary+options only
+  (deliberately excluding `gate_id`), giving later re-queue logic a way to detect a payload
+  mutated after rendering (task 2). Added `validate.rs` returning a `ValidatedOperatorPayload`
+  only on success, four distinct typed rejection errors, enforcing "a failing gate cannot reach
+  the notification channel" at the type level via a private-field newtype with no public
+  constructor other than `validate()` (task 3). `HarvestGate` now carries a declared
+  `OperatorChannel` (notification default, or session-<slug> via `with_channel`), readable off the
+  gate definition without executing the workflow (task 4). Added a cross-module hermetic test
+  suite (`operator::tests`) proving all rejection paths force session routing, the gate-channel
+  readability property, and both digest-change re-queue scenarios (task 5). Full validation gate
+  green — fmt, clippy `-D warnings`, `nextest --workspace`, `build --release`, no code changes
+  needed (task 6). Docs: `docs/operator-payload-contract.md` created; `docs/harvest-gate.md`,
+  `docs/index.md`, `docs/architecture.md` updated.
+- **Why:** Closes `EN.8.A`, unblocking `EN.ticket.run-failure-notification` (same payload schema)
+  and clearing the way for `EN.8.B`/`EN.8.C` (operator queue, approval ledger).
+- **Next:** `EN.5.B2` — regression history + blind judge + change gate, per the `next` frontmatter
+  list.
+
+```
+a1a7f27 docs: update docs for 8.A-operator-payload-contract
+c519f06 feat: implement 8.A-operator-payload-contract-task5
+9b84377 feat: implement 8.A-operator-payload-contract-task4
+f4a4eed feat: implement 8.A-operator-payload-contract-task3
+7d205e0 feat: implement 8.A-operator-payload-contract-task2
+0b94c03 feat: implement 8.A-operator-payload-contract-task1
+```
+
+---
+
 ## [run: 2026-08-09]
 
 ### C5 substrate lane closed (stale-generate-timeout-caveat, implement-node-transport-retry) + close-out

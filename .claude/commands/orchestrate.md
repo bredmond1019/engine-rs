@@ -85,16 +85,26 @@ Each of these exists because it has already caused a real failure in this fleet.
    centrally*. Per-repo `state.json` writes do not contend because they are different files; the log
    is append-only; the roadmap regenerates. That is the whole communication channel.
 
-9. **Keep a running notes file — `planning/orchestration-run/notes.md` in this repo.** The lane log
-   carries one line per block for *sibling lanes*; this file carries everything else, for the *next
-   session in this repo*. Defects found in passing, deferred fixes, decisions you took, traps
-   re-confirmed, whatever the roadmap got wrong. None of it survives the session transcript
-   otherwise, and the next agent starts blind and rediscovers it the hard way.
+9. **Keep a running notes file — `planning/orchestration-run/<roadmap-slug>/notes.md` in this
+   repo**, where `<roadmap-slug>` is the driving roadmap's directory name (the one from `$ARGUMENTS`
+   or the list file this chain runs from) — the same directory name `/begin-orchestration` resolves
+   as its `run_record_dir`, so both commands address the same record. If the chain has no roadmap,
+   skip this rule (same as the lane log above). The lane log carries one line per block for
+   *sibling lanes*; this file carries everything else, for the *next session in this repo*. Defects
+   found in passing, deferred fixes, decisions you took, traps re-confirmed, whatever the roadmap
+   got wrong. None of it survives the session transcript otherwise, and the next agent starts blind
+   and rediscovers it the hard way.
 
-   Create it on the first block if absent (OKF frontmatter, `type: Reference`; add a row to
-   `planning/index.md`). **Append after every block — never rewrite.** Status every item so it can
-   be triaged later: `OPEN` · `DONE` · `HELD` · `WONTFIX`. Commit it alongside the lane-log line
-   (rule 7 timing: before the next engine launches).
+   Create the directory and file on the first block if absent; add a row to `planning/index.md`.
+   **Append after every block — never rewrite; never rotate, never move to an archive.** Status
+   every item so it can be triaged later: `OPEN` · `DONE` · `HELD` · `WONTFIX`. Commit it alongside
+   the lane-log line (rule 7 timing: before the next engine launches).
+
+   Required frontmatter, the `doc_id` rule, `lifecycle`, the ledger's `origin_roadmap` column, and
+   the carryover-promotion rule are specified once — in `/begin-orchestration`'s Step 1E / Rule 5 —
+   per `planning/decisions/D57-orchestration-run-artifact-contract.md`. Follow that contract; do not
+   restate it here. In short: unresolved items never carry into a successor file — at lane close,
+   promote any item still `OPEN` into `state.json` `carryover[]`.
 
    Keep it a *log*, not a second `status.md`. If an item turns into real work it becomes a ticket
    and the entry points at it.
@@ -293,8 +303,9 @@ Concurrent lanes pushing into one corpus is exactly the condition that accumulat
 checks downstream *code* consumers; nothing else checks the *corpus*, so this belongs here.
 
 Commit the `state.json` and its regenerated surfaces as their own commit, then append **both** the
-lane-log line and this block's `planning/orchestration-run/notes.md` entries (rule 9 — including any
-decision you took under rule 10) and commit those together. **Only then** launch the next engine.
+lane-log line and this block's `planning/orchestration-run/<roadmap-slug>/notes.md` entries (rule 9
+— including any decision you took under rule 10) and commit those together. **Only then** launch
+the next engine.
 
 > **`planning/state.json` is written with `ensure_ascii=False`.** If you edit it with a script,
 > round-trip with `json.dump(..., indent=2, ensure_ascii=False)` plus a trailing newline. Using the
@@ -383,11 +394,11 @@ Then explicitly:
   error class, one-line fix estimate). Empty is the expected case; say so rather than omitting
   the line.
 - **Decisions you took** under rule 10, each with its one-line reasoning — and confirmation they
-  are in `planning/orchestration-run/notes.md`, not only in this report.
+  are in `planning/orchestration-run/<roadmap-slug>/notes.md`, not only in this report.
 - **Open items** the run surfaced but did not fix, as recorded in the notes file (defects found in
   passing, deferred propagation, anything needing its own ticket).
 - **The remaining chain** if you stopped early — as a paste-ready `/orchestrate` invocation.
-- A **terminal `planning/orchestration-run/review.md`** — required, not optional. It is a
+- A **terminal `planning/orchestration-run/<roadmap-slug>/review.md`** — required, not optional. It is a
   plain-English summary of what this chain changed plus the hand-verification recipes an operator
   would run to confirm it. Every recipe in it must have been **executed at least once by this
   session before the file is written**, and the file must say so explicitly (e.g. "ran, output:

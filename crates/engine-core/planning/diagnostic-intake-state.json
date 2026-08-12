@@ -6,15 +6,15 @@
       "model": "qwen2.5-coder:7b"
     },
     "model_tiers": {
-      "extract": "sonnet"
+      "extract": "local"
     },
     "output_verbosity": "normal",
     "prompt_cache": false
   },
   "telemetry": {
     "model_tier_used": {
-      "IntakeExtractNode": "cloud",
-      "extract": "sonnet"
+      "IntakeExtractNode": "local",
+      "extract": "local"
     },
     "review_verdicts": [],
     "tasks_failed": 0,

@@ -27,6 +27,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::operator::OperatorChannel;
+
 /// The three ways a materialized doc can (or cannot) reach Synapse's ingest
 /// endpoint. Wire form is snake_case: `"off" | "in_process" | "approval"`.
 ///
@@ -64,25 +66,52 @@ pub enum HarvestDecision {
     Defer,
 }
 
-/// The resolved per-run gate a node holds: just the resolved [`HarvestMode`],
-/// with the decision logic factored onto [`HarvestGate::decide`] so a node
-/// never has to match on `HarvestMode` itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The resolved per-run gate a node holds: the resolved [`HarvestMode`] plus
+/// the [`OperatorChannel`] this gate declares for anything it routes to the
+/// operator (`EN.8.A` task 4 — "wire it through the existing harvest_gate
+/// seam rather than adding a parallel gate concept"). The decision logic is
+/// factored onto [`HarvestGate::decide`] so a node never has to match on
+/// `HarvestMode` itself, and the channel is a plain field so it is readable
+/// off this definition without executing anything.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HarvestGate {
     mode: HarvestMode,
+    channel: OperatorChannel,
 }
 
 impl HarvestGate {
-    /// Construct a gate resolved to `mode`.
+    /// Construct a gate resolved to `mode`, with the default
+    /// [`OperatorChannel`] (`notification`). Use [`Self::with_channel`] to
+    /// declare `session-<slug>` instead.
     #[must_use]
     pub fn new(mode: HarvestMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            channel: OperatorChannel::default(),
+        }
+    }
+
+    /// Declare the [`OperatorChannel`] this gate routes to. Readable off the
+    /// gate definition via [`Self::channel`] without executing the
+    /// workflow — `EN.8.A` spec Invariant 2: the channel is declared at
+    /// gate-definition time, never discovered or degraded at emit time.
+    #[must_use]
+    pub fn with_channel(mut self, channel: OperatorChannel) -> Self {
+        self.channel = channel;
+        self
     }
 
     /// The resolved mode this gate holds.
     #[must_use]
     pub fn mode(&self) -> HarvestMode {
         self.mode
+    }
+
+    /// The [`OperatorChannel`] this gate declares — readable without
+    /// executing the workflow.
+    #[must_use]
+    pub fn channel(&self) -> &OperatorChannel {
+        &self.channel
     }
 
     /// What a node should do given this gate's resolved mode.
@@ -146,6 +175,38 @@ mod tests {
     #[test]
     fn harvest_gate_default_is_off() {
         assert_eq!(HarvestGate::default().mode(), HarvestMode::Off);
+    }
+
+    #[test]
+    fn harvest_gate_default_channel_is_notification() {
+        assert_eq!(
+            HarvestGate::default().channel(),
+            &OperatorChannel::Notification
+        );
+        assert_eq!(
+            HarvestGate::new(HarvestMode::InProcess).channel(),
+            &OperatorChannel::Notification
+        );
+    }
+
+    #[test]
+    fn with_channel_declares_session_readable_without_executing() {
+        // Building the gate is the only thing this test does — `decide()`
+        // and the workflow it would drive are never invoked. The channel is
+        // still readable straight off the definition (`EN.8.A` task 4).
+        let gate = HarvestGate::new(HarvestMode::Approval)
+            .with_channel(OperatorChannel::session("dev-to-sweep-review"));
+        assert!(gate.channel().is_session());
+        assert_eq!(gate.channel().session_slug(), Some("dev-to-sweep-review"));
+        // The mode is unaffected by declaring a channel.
+        assert_eq!(gate.mode(), HarvestMode::Approval);
+    }
+
+    #[test]
+    fn with_channel_can_declare_notification_explicitly() {
+        let gate =
+            HarvestGate::new(HarvestMode::InProcess).with_channel(OperatorChannel::Notification);
+        assert!(gate.channel().is_notification());
     }
 
     #[test]

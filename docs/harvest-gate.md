@@ -6,8 +6,8 @@ doc_id: harvest-gate
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [harvest-gate, harvest-mode, persist-to-brain, harvest-approve, synapse-ingest, pending-harvest, D51, materialize-doc-node, boundary-test]
-related: [architecture, docs-index, content-pipeline-workflow, materialize-doc-node, opportunity-edit-workflows, brain:D51-brain-engine-boundary-and-synapse, brain:D53-engine-executes-mev-writes-brain-docs]
+keywords: [harvest-gate, harvest-mode, persist-to-brain, harvest-approve, synapse-ingest, pending-harvest, D51, materialize-doc-node, boundary-test, operator-channel]
+related: [architecture, docs-index, content-pipeline-workflow, materialize-doc-node, opportunity-edit-workflows, operator-payload-contract, brain:D51-brain-engine-boundary-and-synapse, brain:D53-engine-executes-mev-writes-brain-docs]
 ---
 
 # The Materialize -> Harvest Gate
@@ -17,6 +17,16 @@ related: [architecture, docs-index, content-pipeline-workflow, materialize-doc-n
 ingest push can inherit. It sits in front of the ONE existing ingest POST
 (`content_pipeline::persist_to_brain::PersistToBrainNode`), turning an unconditional push into a
 policy-governed one, without adding a second route to the index.
+
+## Operator channel (`EN.8.A`)
+
+`HarvestGate` also carries a declared `OperatorChannel` (`crates/engine-core/src/operator/channel.rs`)
+— `notification` (default) or `session-<slug>`, set via `HarvestGate::with_channel(...)` and read
+via `HarvestGate::channel()`, readable off the gate definition without executing the workflow. This
+is the same "declared at gate-definition time, never discovered or degraded at emit time" pattern
+the gate already applies to `HarvestMode`. See
+[operator-payload-contract.md](operator-payload-contract.md) for the full `OperatorPayload`/
+`ValidatedOperatorPayload`/`OperatorChannel` contract this wires into.
 
 ## The three modes
 
@@ -186,3 +196,6 @@ index. Concretely:
   no profiles module, no `harness.json` section.
 - [architecture.md](architecture.md#injectable-seams) — the `http_post.rs` seam row, now noting
   the harvest gate, and the materialize-\>harvest ordering guarantee.
+- [operator-payload-contract.md](operator-payload-contract.md) — the `OperatorPayload`/
+  `ValidatedOperatorPayload`/`OperatorChannel` contract (`EN.8.A`) this gate's `channel` field
+  declares.
