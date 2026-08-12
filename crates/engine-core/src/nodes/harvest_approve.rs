@@ -24,12 +24,25 @@
 //! malformed/absent pending record is a `NodeError` naming the missing
 //! field, and a non-2xx / transport failure from the `HttpPost` seam is a
 //! `NodeError` too.
+//!
+//! `EN.8.C` task 3 adds an **optional** [`ApprovalLedger`] seam
+//! (`with_ledger`), `None` by default so existing behavior is unchanged
+//! (standing rule 6). When configured, and the triggering event carries an
+//! optional `digest` field, this node records the completed harvest through
+//! [`record_decision`] before POSTing: a `presented_digest` field (defaulting
+//! to `digest` when absent, i.e. no mismatch) that differs from `digest`
+//! records a `Requeued` row and skips the POST entirely — a digest mismatch
+//! never executes, enforced inside `record_decision` itself, not by
+//! convention here. The resolved knob (whether a ledger is configured) is
+//! stamped into this node's `ctx.nodes` result either way.
 
+use chrono::{DateTime, Utc};
 use engine_contract::TaskContext;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
 use crate::nodes::http_post::{http_post_live, HttpPost};
+use crate::operator::ledger::{record_decision, ApprovalLedger, LedgerDecision};
 use crate::workflows::put_result;
 
 /// The `Node::name()` identity `HarvestApproveNode` runs under by default,
@@ -41,14 +54,17 @@ pub const NODE_NAME: &str = "HarvestApproveNode";
 /// record's `payload` to its `url` over the injectable `HttpPost` seam.
 pub struct HarvestApproveNode {
     http_post: std::sync::Arc<dyn HttpPost>,
+    ledger: Option<std::sync::Arc<dyn ApprovalLedger>>,
 }
 
 impl HarvestApproveNode {
-    /// Construct with the live `reqwest`-backed `HttpPost` impl.
+    /// Construct with the live `reqwest`-backed `HttpPost` impl and no
+    /// approval ledger — the behavior-stable default (standing rule 6).
     #[must_use]
     pub fn new() -> Self {
         Self {
             http_post: http_post_live(),
+            ledger: None,
         }
     }
 
@@ -57,6 +73,15 @@ impl HarvestApproveNode {
     #[must_use]
     pub fn with_http_post(mut self, http_post: std::sync::Arc<dyn HttpPost>) -> Self {
         self.http_post = http_post;
+        self
+    }
+
+    /// Configure the [`ApprovalLedger`] this node records completed harvest
+    /// decisions through. `None` (the default from [`Self::new`]) leaves
+    /// existing behavior exactly as it was before `EN.8.C`.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: std::sync::Arc<dyn ApprovalLedger>) -> Self {
+        self.ledger = Some(ledger);
         self
     }
 
@@ -72,6 +97,13 @@ impl HarvestApproveNode {
                 "{NODE_NAME}: pending-harvest record missing required field `{field}`"
             ))
         })
+    }
+
+    /// Read an optional string field off `ctx.event` — used for the ledger
+    /// fields, which are additive to the four fixed pending-record keys and
+    /// therefore never required for the node's core POST behavior.
+    fn optional_str<'a>(&self, event: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+        event.get(field).and_then(|v| v.as_str())
     }
 }
 
@@ -94,6 +126,61 @@ impl Node for HarvestApproveNode {
             ))
         })?;
 
+        // `EN.8.C` task 3: optional ledger recording. Only engages when a
+        // ledger is configured AND the triggering event carries a `digest`
+        // field — neither is present in the four fixed pending-record keys,
+        // so this is purely additive and never affects the `ledger: None`
+        // default path.
+        if let Some(ledger) = &self.ledger {
+            if let Some(digest) = self.optional_str(&event, "digest") {
+                let presented_digest = self
+                    .optional_str(&event, "presented_digest")
+                    .unwrap_or(digest);
+                let who = self
+                    .optional_str(&event, "who")
+                    .unwrap_or("operator")
+                    .to_string();
+                let rendered_diff = self
+                    .optional_str(&event, "rendered_diff")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| payload.to_string());
+                let delivered_at = self
+                    .optional_str(&event, "delivered_at")
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+                let decided_at = Utc::now();
+                let delivered_at = delivered_at.unwrap_or(decided_at);
+
+                let outcome = record_decision(
+                    ledger.as_ref(),
+                    artifact_id.clone(),
+                    digest.to_string(),
+                    presented_digest,
+                    rendered_diff,
+                    LedgerDecision::Approved,
+                    who,
+                    delivered_at,
+                    decided_at,
+                );
+
+                if !outcome.should_execute {
+                    let mut ctx = ctx;
+                    put_result(
+                        &mut ctx,
+                        self.name(),
+                        json!({
+                            "approved": false,
+                            "posted": false,
+                            "requeued": true,
+                            "artifact_id": artifact_id,
+                            "ledger_configured": true,
+                        }),
+                    );
+                    return Ok(ctx);
+                }
+            }
+        }
+
         let response = self.http_post.post(&url, payload).await.map_err(|err| {
             NodeError::new(format!("{NODE_NAME}: harvest approval push failed: {err}"))
         })?;
@@ -108,6 +195,7 @@ impl Node for HarvestApproveNode {
                 "status": response.status,
                 "artifact_id": artifact_id,
                 "response": response.body,
+                "ledger_configured": self.ledger.is_some(),
             }),
         );
 
@@ -220,5 +308,130 @@ mod tests {
     #[test]
     fn default_constructs_without_panicking() {
         let _node = HarvestApproveNode::default();
+    }
+
+    // ── EN.8.C task 3: optional ApprovalLedger wiring ──────────────────────
+
+    use crate::operator::ledger::InMemoryApprovalLedger;
+
+    #[tokio::test]
+    async fn no_ledger_configured_behaves_exactly_as_before() {
+        // Even with a `digest` field present on the event, no ledger
+        // configured means no recording and the exact pre-EN.8.C behavior.
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = HarvestApproveNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+
+        let mut event = pending_event();
+        event
+            .as_object_mut()
+            .unwrap()
+            .insert("digest".to_string(), json!("digest-a"));
+        let ctx = ctx_with_event(event);
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        assert!(stub.last_call().is_some());
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["approved"], json!(true));
+        assert_eq!(result["posted"], json!(true));
+        assert_eq!(result["ledger_configured"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn ledger_configured_with_no_digest_field_records_nothing_and_still_posts() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let ledger = std::sync::Arc::new(InMemoryApprovalLedger::new());
+        let node = HarvestApproveNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_ledger(ledger.clone());
+
+        let ctx = ctx_with_event(pending_event());
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        assert!(stub.last_call().is_some());
+        assert!(
+            ledger.read_all().is_empty(),
+            "no digest field means nothing is recorded"
+        );
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["ledger_configured"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn matched_digest_records_one_approved_row_and_still_posts() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let ledger = std::sync::Arc::new(InMemoryApprovalLedger::new());
+        let node = HarvestApproveNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_ledger(ledger.clone());
+
+        let mut event = pending_event();
+        let obj = event.as_object_mut().unwrap();
+        obj.insert("digest".to_string(), json!("digest-a"));
+        obj.insert("who".to_string(), json!("operator-a"));
+        obj.insert("rendered_diff".to_string(), json!("rendered summary"));
+        let ctx = ctx_with_event(event);
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        assert!(stub.last_call().is_some(), "matched digest still posts");
+        let rows = ledger.rows_for("artifact-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].decision, LedgerDecision::Approved);
+        assert_eq!(rows[0].digest, "digest-a");
+        assert_eq!(rows[0].who, "operator-a");
+        assert_eq!(rows[0].rendered_diff, "rendered summary");
+
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["posted"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn mismatched_digest_records_requeued_and_never_posts() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let ledger = std::sync::Arc::new(InMemoryApprovalLedger::new());
+        let node = HarvestApproveNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_ledger(ledger.clone());
+
+        let mut event = pending_event();
+        let obj = event.as_object_mut().unwrap();
+        obj.insert("digest".to_string(), json!("digest-delivered"));
+        obj.insert("presented_digest".to_string(), json!("digest-different"));
+        let ctx = ctx_with_event(event);
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        assert!(
+            stub.last_call().is_none(),
+            "a digest mismatch must never execute the POST"
+        );
+        let rows = ledger.rows_for("artifact-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].decision, LedgerDecision::Requeued);
+
+        let result = &ctx.nodes[NODE_NAME];
+        assert_eq!(result["approved"], json!(false));
+        assert_eq!(result["posted"], json!(false));
+        assert_eq!(result["requeued"], json!(true));
+    }
+
+    #[test]
+    fn no_node_writes_a_cost_usd_key() {
+        // EN.8.C task 3 explicitly forbids stamping a certain budget-ledger
+        // key (spelled out below, split so this very assertion string does
+        // not trip on itself) into any node's ctx.nodes result — it folds
+        // into BudgetLedger untyped, with no provenance check. Static
+        // evidence: this file never constructs that key as a quoted JSON
+        // field.
+        let forbidden_key = format!("{:?}", ["cost", "usd"].join("_"));
+        let src = include_str!("harvest_approve.rs");
+        let occurrences = src.matches(&forbidden_key).count();
+        // The only occurrence of the quoted key text is this test's own
+        // `forbidden_key` construction below (not a literal quoted key), so
+        // the real result-construction sites must contribute zero.
+        assert_eq!(
+            occurrences, 0,
+            "HarvestApproveNode must never stamp a cost_usd key into ctx.nodes"
+        );
     }
 }
