@@ -22,6 +22,7 @@ pub mod channel;
 pub mod ledger;
 pub mod limits;
 pub mod payload;
+pub mod queue;
 #[cfg(test)]
 mod tests;
 pub mod validate;
