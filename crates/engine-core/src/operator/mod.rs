@@ -19,6 +19,7 @@
 //! executing the workflow.
 
 pub mod channel;
+pub mod ledger;
 pub mod limits;
 pub mod payload;
 #[cfg(test)]
