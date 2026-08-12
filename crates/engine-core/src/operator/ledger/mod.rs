@@ -11,13 +11,18 @@
 //! its file-backed default impl, and the XDG path resolver. Task 3 adds
 //! [`record_decision`] itself — the one function that turns a gate decision
 //! into exactly one ledger row, with the digest-mismatch-\>`Requeued`
-//! enforcement built in so it cannot be bypassed at a call site.
+//! enforcement built in so it cannot be bypassed at a call site. [`query`]
+//! (task 4) adds the pure, hermetic derived queries the client-facing
+//! time-to-approval claim and the roadmap's Phase 4.5 operate-first gate
+//! rest on.
 
 use chrono::{DateTime, Utc};
 
+pub mod query;
 pub mod record;
 pub mod store;
 
+pub use query::{decisions_per_day, time_to_approval, time_to_approval_stats, TimeToApprovalStats};
 pub use record::{ApprovalLedgerRow, LedgerDecision};
 #[cfg(test)]
 pub use store::InMemoryApprovalLedger;
