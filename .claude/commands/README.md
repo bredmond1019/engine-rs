@@ -289,6 +289,15 @@ exit artifact exists: `mev close-session <slug> --exit-verified`, the operator a
 never infers it. A session marked done without its artifact is worse than one never started, because
 the gate is gone and the work is not.
 
+### `/consolidate-run <roadmap-slug> [--repo <slug>]`
+Gathers `orchestration-run/<roadmap-slug>/` records across the fleet (or one repo with `--repo`),
+cross-checks them against `lane-log.jsonl` in both directions, selects on D57 section 3's two-axis
+`origin_roadmap` rule, and emits `<roadmap-dir>/consolidated-review.md` — one proposed `carryover[]`
+entry per finding, each carrying a `finding_id` for mev's cross-repo correlation. It implements no
+dedup, similarity, ranking, or staleness logic of its own (that's mev's — `mev carryover`); it never
+auto-merges, and it writes no `state.json` anywhere. `/generate-roadmap --from <consolidated-review.md>`
+is the disposal path for what it proposes.
+
 ---
 
 ## Session Orientation
@@ -377,7 +386,7 @@ parallel `/orchestrate` sessions that cannot step on each other. Encodes the rul
 real runs: the lane unit is the **repo, never the wave** (engines are serial inside a repo, so a
 repo holding 10 blocks is the critical path regardless of scheduling); **at most two heavy-gate
 repos concurrently**, read from each `harness.json` rather than memory; `base-template` lands early
-in a worktree with propagation **deferred** to an operator gate; ★ blocks must be registered in
+in a worktree with propagation **deferred** to an operator gate; `[*]` blocks must be registered in
 `state.json` in a hard **Wave 0** or the lane cannot resolve them; the generated `epic-sequence`
 region is the only status surface and no wave table may be authored beside it; and the **Definition
 of Done must be written as observations with commands, not as blocks closed** — the failure that

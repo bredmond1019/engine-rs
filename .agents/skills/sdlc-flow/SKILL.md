@@ -203,6 +203,20 @@ Everything below runs from the main repo root first.
    running `/generate-tasks <spec-slug>` to author it, commit, then re-run. Deriving from an
    authored `tasks.md` is not guessing the task structure; fabricating one from nothing is what D16
    still refuses to do.
+
+   **Per-task `validation_commands` scoping**: When authoring tasks.json, follow the convention
+   documented at `.claude/commands/generate-tasks.md` (search it for "validation_commands"); do not
+   restate the rubric in your own words, just apply it. The rule:
+   `validation_commands` is `[]` for any task that touches source the project's checks compile or
+   lint — those tasks fall back to the project-wide harness checks, which are authoritative for them.
+   Set it ONLY for a task that CANNOT break the build (docs-only, config-only, fixture-only), with
+   cheap commands that actually verify that task (e.g. file exists, frontmatter present, index
+   updated). If you DO author an override that runs tests, it MUST target that task's own tests
+   specifically — never a bare/positional filter that could silently match zero or the wrong tests —
+   and a command matching nothing must fail rather than pass. Never hardcode a stack-specific
+   command (e.g. a particular test runner invocation) into this; that judgment belongs to whoever
+   derives or authors the task at run time. Match the intent of the parallel generator in sdlc-block.js
+   ("acceptance_criteria/validation_commands can stay [] per task").
 3. Collect `allTasks` = every `task_id`, in array order. If a task range/selection was given, filter to
    it; otherwise use every task. This is `taskList`.
 4. Per-task validation overrides: for each task whose `validation_commands` is a non-empty array, note
