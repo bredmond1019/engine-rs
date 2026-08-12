@@ -21,6 +21,8 @@ use chrono::{DateTime, Utc};
 pub mod query;
 pub mod record;
 pub mod store;
+#[cfg(test)]
+mod tests;
 
 pub use query::{decisions_per_day, time_to_approval, time_to_approval_stats, TimeToApprovalStats};
 pub use record::{ApprovalLedgerRow, LedgerDecision};
@@ -105,7 +107,7 @@ pub fn record_decision(
 }
 
 #[cfg(test)]
-mod tests {
+mod record_decision_tests {
     use super::*;
     use crate::operator::ledger::store::InMemoryApprovalLedger;
     use chrono::TimeZone;
