@@ -16,6 +16,21 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-13]
+
+`EN.8.D` — APPROVE_AND_RUN — shipped across 8 tasks, PASS review. Built the operator-approval POC engine-rs's half of `business/docs/profile-and-pitch.md:128`'s pitch composes: `render`/`render_and_validate` turn a pending-harvest record into a `ValidatedOperatorPayload` with a deterministic gate_id and a fixed approve/skip/open_session option set (task 1); `ApproveAndRunPolicy` (drain_batch_max/harvest_item_priority/session_fallback_slug) resolves through the standard four-layer precedence with baseline/cheap-fast/thorough profiles (task 2); the drain renders and validates pending-harvest records into `EN.8.B`'s `OperatorQueue`, routing non-conforming records to `session-<slug>` and bounded by `drain_batch_max` (task 3); the verdict path maps a tapped option key to a `LedgerDecision`, records it via `EN.8.C`'s `operator::ledger::record_decision`, re-queues on digest mismatch, and authorizes execution only on a matched Approved verdict (task 4); the declared `APPROVE_AND_RUN` graph composes `HarvestApproveNode` behind `ApproveAndRunExecuteNode` over the injectable `HttpPost` seam (task 5); `ApproveAndRunSeams` (lookup_pending/resolve_verdict, Send+Sync, no DB/network) exposes the two bastion-shaped seams and `engine-serve` registers the workflow with per-event policy resolution (task 6); a hermetic end-to-end suite covers the POC scenario, a 60-item storm, digest-mismatch requeue, and non-conforming session-routing (task 7); the full gate (fmt, clippy `-D warnings`, nextest --workspace, release build) validated green — 1995/1995 tests, no code changes needed (task 8). Notable decisions: `ApproveAndRunExecuteNode` composes rather than reimplements `HarvestApproveNode`'s POST; an engine-side `ApproveAndRunVerdict` struct stands in for bastion's `telegram::ResponseVerdict` since this crate can't name bastion's type; the integration suite uses `FileApprovalLedger` over a tempdir since `InMemoryApprovalLedger` is test-only and invisible from the `tests/it` binary. The block is complete and testable in engine-rs alone; live-on-a-phone still depends on bastion wiring the two open seams (`PendingLookup`/`VerdictSink`) into `run_server`, a separate bastion block. Docs: `docs/operator-payload-contract.md` updated, `docs/approve-and-run-workflow.md` added. Next: `EN.ticket.run-failure-notification`, `EN.9.C`, or `EN.5.B2`.
+
+```
+9042bcc docs: update docs for EN.8.D
+a29f99f feat: implement EN.8.D-task7
+df30fe8 feat: expose APPROVE_AND_RUN's bastion seams and register the workflow
+8f8bb61 feat: implement EN.8.D-task5
+84709b8 feat: implement EN.8.D-task4
+9126202 feat: implement EN.8.D-task3
+468fc2d feat: implement EN.8.D-task2
+0c5d3fa feat: render pending-harvest records into validated operator payloads (EN.8.D task 1)
+```
+
 ## [run: 2026-08-12]
 
 ### EN.8.B-operator-queue closed — operator queue depth limit, priority ordering, digest tail, storm suppression

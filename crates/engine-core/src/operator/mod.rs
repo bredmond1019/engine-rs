@@ -17,6 +17,12 @@
 //! declaration attached to `crate::nodes::harvest_gate::HarvestGate` so
 //! which channel a gate routes to is readable off its definition without
 //! executing the workflow.
+//!
+//! `queue::OperatorQueue::open_item` (`EN.8.D` task 6) resolves a delivered
+//! item's `item_id`/`gate_id` back to what is currently open — the lookup
+//! `crate::workflows::approve_and_run::ApproveAndRunSeams` composes into
+//! the `gate_id -> Option<ValidatedOperatorPayload>` shape
+//! `bastion:BA.18.B`'s `PendingLookup` expects.
 
 pub mod channel;
 pub mod ledger;
