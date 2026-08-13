@@ -498,10 +498,65 @@ pub fn register_lead_ingest(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `APPROVE_AND_RUN` workflow
+/// (`engine_core::workflows::approve_and_run::graph`) with `dispatcher`,
+/// populating both the `workflow_registry` (via a policy-aware factory
+/// built on `approve_and_run::graph::registry_with`) and the
+/// `schema_registry` (via `approve_and_run::graph::schema`). See
+/// `planning/EN.8.D/tasks.json`, Task 6.
+///
+/// Unlike `HARVEST_APPROVE`, this workflow does carry a policy surface
+/// (`approve_and_run::policy` — `drain_batch_max` / `harvest_item_priority` /
+/// `session_fallback_slug`), so this factory resolves it per event via
+/// `resolve_policy_for_run_from` against `PolicyConfigSource::Builtin`
+/// (channel/API-triggered, no repo checkout at dispatch time — mirrors
+/// `RESEARCH_AGENT`/`DIAGNOSTIC_INTAKE`/`PROPOSAL_GENERATOR`/
+/// `CONTENT_PIPELINE` above) and seeds the resolved policy into the run.
+/// The event's optional `profile` field selects a named profile bundle, and
+/// an optional `policy` object supplies the top-precedence per-run override
+/// — the same two-field convention every other policy-aware factory in this
+/// module reads.
+pub fn register_approve_and_run(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::approve_and_run::graph::schema(),
+        Box::new(|event: &serde_json::Value| {
+            let profile_name = event.get("profile").and_then(|v| v.as_str());
+            let event_override: Option<
+                engine_core::workflows::approve_and_run::PartialApproveAndRunPolicy,
+            > = event
+                .get("policy")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|err: serde_json::Error| {
+                    format!("invalid APPROVE_AND_RUN policy override: {err}")
+                })?;
+            let policy =
+                engine_core::workflows::approve_and_run::profiles::resolve_policy_for_run_from(
+                    &PolicyConfigSource::Builtin,
+                    profile_name,
+                    event_override.as_ref(),
+                )
+                .map_err(|err| err.to_string())?;
+            let registry = engine_core::workflows::approve_and_run::graph::registry_with(
+                engine_core::nodes::http_post::http_post_live(),
+                policy.clone(),
+            );
+            let seeded = seed_resolved_policy(&policy)?;
+            Ok(Workflow::new(
+                registry,
+                engine_core::workflows::approve_and_run::graph::schema(),
+            )
+            .with_seeded_nodes(seeded))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`,
-/// `HARVEST_APPROVE`, and `LEAD_INGEST`; future builtins register here too.
+/// `HARVEST_APPROVE`, `LEAD_INGEST`, and `APPROVE_AND_RUN`; future builtins
+/// register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
 /// this with exactly one argument (`../bastion/src/serve/mod.rs:61`) and
@@ -533,6 +588,7 @@ pub fn register_builtin_workflows_with_registry(
     register_opportunity_add_action(dispatcher);
     register_harvest_approve(dispatcher);
     register_lead_ingest(dispatcher);
+    register_approve_and_run(dispatcher);
 }
 
 #[cfg(test)]
@@ -1315,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_workflows_registers_all_nine_workflow_types() {
+    fn register_builtin_workflows_registers_all_ten_workflow_types() {
         let mut dispatcher = Dispatcher::new();
 
         register_builtin_workflows(&mut dispatcher);
@@ -1330,6 +1386,7 @@ mod tests {
             "OPPORTUNITY_ADD_ACTION",
             "HARVEST_APPROVE",
             "LEAD_INGEST",
+            "APPROVE_AND_RUN",
         ] {
             assert!(
                 dispatcher.is_registered(workflow_type),
@@ -1384,6 +1441,109 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("LEAD_INGEST"));
+    }
+
+    #[test]
+    fn register_approve_and_run_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_approve_and_run(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("APPROVE_AND_RUN"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_approve_and_run_execute_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_approve_and_run(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("APPROVE_AND_RUN")
+            .expect("APPROVE_AND_RUN schema should resolve");
+
+        assert_eq!(schema.start_node, "ApproveAndRunExecuteNode");
+    }
+
+    #[test]
+    fn dispatch_approve_and_run_seeds_the_resolved_policy() {
+        let mut dispatcher = Dispatcher::new();
+        register_approve_and_run(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "APPROVE_AND_RUN",
+                &serde_json::json!({ "authorized": false }),
+            )
+            .expect("APPROVE_AND_RUN should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn dispatch_approve_and_run_applies_a_named_profile() {
+        let mut dispatcher = Dispatcher::new();
+        register_approve_and_run(&mut dispatcher);
+
+        let workflow = dispatcher.dispatch_with_event(
+            "APPROVE_AND_RUN",
+            &serde_json::json!({ "authorized": false, "profile": "cheap-fast" }),
+        );
+
+        assert!(
+            workflow.is_ok(),
+            "a known profile should dispatch to a runnable Workflow"
+        );
+    }
+
+    #[test]
+    fn dispatch_approve_and_run_fails_loudly_on_unknown_profile() {
+        let mut dispatcher = Dispatcher::new();
+        register_approve_and_run(&mut dispatcher);
+
+        let result = dispatcher.dispatch_with_event(
+            "APPROVE_AND_RUN",
+            &serde_json::json!({ "authorized": false, "profile": "not-a-real-profile" }),
+        );
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("not-a-real-profile"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_approve_and_run_event_policy_override_beats_profile() {
+        let mut dispatcher = Dispatcher::new();
+        register_approve_and_run(&mut dispatcher);
+
+        // Exercises the same event shape `register_approve_and_run`'s
+        // factory reads: a named `profile` plus a top-precedence `policy`
+        // override object.
+        let workflow = dispatcher.dispatch_with_event(
+            "APPROVE_AND_RUN",
+            &serde_json::json!({
+                "authorized": false,
+                "profile": "thorough",
+                "policy": { "drain_batch_max": 7 },
+            }),
+        );
+
+        assert!(
+            workflow.is_ok(),
+            "an event-level policy override on top of a named profile should still dispatch"
+        );
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_approve_and_run() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("APPROVE_AND_RUN"));
     }
 
     /// `MaterializeDocNode` resolves its brain root before it ever inspects

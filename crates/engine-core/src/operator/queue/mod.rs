@@ -192,6 +192,24 @@ impl OperatorQueue {
         self.open.retain(|open| open.item.item_id != item_id);
         self.open.len() != before
     }
+
+    /// Look up an item currently open (delivered, awaiting an `answer` or an
+    /// unanswered-timeout release) by its `item_id`, alongside the time it
+    /// was opened. `None` when no open item has that id — either it was
+    /// never delivered, or it has already been answered/released.
+    ///
+    /// `EN.8.D` task 6's seams use this to resolve a `gate_id` back to
+    /// exactly what this process currently has open, both to answer
+    /// bastion's `PendingLookup` shape and to recover the `delivered_at`
+    /// [`crate::operator::ledger::record_decision`] needs when a verdict
+    /// arrives for it.
+    #[must_use]
+    pub fn open_item(&self, item_id: &str) -> Option<(&OperatorQueueItem, DateTime<Utc>)> {
+        self.open
+            .iter()
+            .find(|open| open.item.item_id == item_id)
+            .map(|open| (&open.item, open.opened_at))
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +290,30 @@ mod tests {
     fn answer_with_unknown_item_id_returns_false() {
         let mut queue = OperatorQueue::new(OperatorQueuePolicy::default());
         assert!(!queue.answer("nonexistent"));
+    }
+
+    #[test]
+    fn open_item_resolves_a_delivered_item_and_its_opened_at() {
+        let mut queue = OperatorQueue::new(OperatorQueuePolicy::default());
+        queue.enqueue(item("a", 10, 0));
+        let delivered = queue.next_deliverable(now()).expect("delivered");
+
+        let (found, opened_at) = queue
+            .open_item(&delivered.item_id)
+            .expect("open item found");
+        assert_eq!(found.item_id, delivered.item_id);
+        assert_eq!(opened_at, now());
+    }
+
+    #[test]
+    fn open_item_returns_none_for_unknown_or_answered_item() {
+        let mut queue = OperatorQueue::new(OperatorQueuePolicy::default());
+        assert!(queue.open_item("nonexistent").is_none());
+
+        queue.enqueue(item("a", 10, 0));
+        let delivered = queue.next_deliverable(now()).expect("delivered");
+        queue.answer(&delivered.item_id);
+        assert!(queue.open_item(&delivered.item_id).is_none());
     }
 
     #[test]
