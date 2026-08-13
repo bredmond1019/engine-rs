@@ -17,11 +17,17 @@
 //!   `harvest_item_priority` / `session_fallback_slug` knobs this block
 //!   introduces, resolved through the standard four-layer precedence and
 //!   documented in `planning/harness.json`'s `approve_and_run` section.
+//! - [`drain`] (task 3) — renders + validates a batch of pending-harvest
+//!   records, enqueues the conforming ones onto an
+//!   [`crate::operator::queue::OperatorQueue`], routes the rest to
+//!   `session-<slug>`, and makes exactly one `next_deliverable` call.
 
+pub mod drain;
 pub mod policy;
 pub mod profiles;
 pub mod render;
 
+pub use drain::{drain, DrainReport, SessionRoutedRecord};
 pub use policy::{policy_state, ApproveAndRunPolicy, PartialApproveAndRunPolicy};
 pub use profiles::{
     profile_by_name, read_harness_policy_defaults_from, resolve_policy_for_run_from,
