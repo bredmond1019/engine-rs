@@ -88,6 +88,10 @@ depth-limited operator queue:
   the §7.5 Invariant-3 floor), releases the open item back to the queue on `answer()` or on an
   unanswered `answer_timeout_secs` timeout (re-queued, never dropped), and drops items whose level
   predicate no longer holds at selection time via an injectable `with_level_predicate` closure.
+  `open_item(item_id) -> Option<(&OperatorQueueItem, DateTime<Utc>)>` (`EN.8.D` task 6) resolves a
+  delivered item's id back to what is currently open, alongside its `opened_at` — the lookup
+  [`approve-and-run-workflow.md`](approve-and-run-workflow.md)'s `ApproveAndRunSeams` composes
+  into bastion's `PendingLookup` shape.
 - `policy.rs` — `OperatorQueuePolicy` (`operator_queue_depth`, `answer_timeout_secs`,
   `suppression_window_secs`, `digest_schedule_secs`) resolves through the standard four policy
   layers (event override > named profile > `planning/harness.json` defaults > built-in default)
