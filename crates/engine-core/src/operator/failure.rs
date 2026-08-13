@@ -51,6 +51,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::node::NodeError;
+use crate::operator::limits::OperatorPayloadLimits;
+use crate::operator::payload::{OperatorPayload, OperatorResponseOption};
+use crate::operator::validate::{validate, OperatorValidationError, ValidatedOperatorPayload};
 use crate::policy::{merge_opt, Policy, PolicyConfigSource};
 
 /// The `harness.json` section key this policy's knobs live under
@@ -304,6 +307,140 @@ pub fn should_notify(terminal_status: &str, policy: &FailureNotifyPolicy) -> boo
     }
 }
 
+/// Marker appended to a rendered summary's node-detail line when it had to
+/// be shortened to fit [`OperatorPayloadLimits::max_summary_chars`] — see
+/// [`render_failure_payload`]'s module docs on the truncate-rather-than-drop
+/// rule.
+const TRUNCATION_MARKER: &str = "…[truncated]";
+
+/// One failed node's identity plus its error text, as recorded in
+/// `TaskContext::node_runs` (`engine_contract::NodeRun`). Task 3 extracts
+/// these from a terminal run's snapshot; this module never reads
+/// `TaskContext` directly, keeping [`render_failure_payload`] pure and unit
+/// testable without an `engine-contract` dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedNode {
+    /// The node's identity — its class name, matching
+    /// `TaskContext::node_runs`' map key convention.
+    pub name: String,
+    /// The node's recorded error text (`NodeRun::error`, or a placeholder
+    /// if the node run carried none).
+    pub error: String,
+}
+
+impl FailedNode {
+    /// Construct a failed-node identity/error pair.
+    pub fn new(name: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            error: error.into(),
+        }
+    }
+}
+
+/// Render a terminal run into a validated [`OperatorPayload`] naming the
+/// workflow type, the run id, and the failing node (`EN.8.A`'s digest-bound
+/// shape, run through `operator::validate` before it is ever returned).
+///
+/// `failed_nodes` follows `engine-serve/src/suspend.rs::failed_node_reason`'s
+/// existing first-stamped-node convention: this function names
+/// `failed_nodes[0]` and, when there is more than one, states the total
+/// count rather than rendering every node into one summary (spec Task 2:
+/// "Do not render N nodes into one summary"). Task 3 is responsible for
+/// handing this function `failed_nodes` in a deterministic order (the
+/// convention that matters for *this* function's contract, since a
+/// `HashMap`'s own iteration order is not deterministic). An empty
+/// `failed_nodes` renders a status-only summary — the `budget_halted` case,
+/// where the walk stops between nodes with no `NodeRunStatus::Failed` entry
+/// to name.
+///
+/// `terminal_status` is expected to be `"failed"` or `"budget_halted"` (the
+/// two statuses [`should_notify`] can return `true` for by default); the two
+/// render distinguishably in the summary text, per the spec's acceptance
+/// criteria — a budget halt is not a crash, and the operator acts on it
+/// differently. Any other status string renders as a generic failure
+/// (`should_notify` is what gates whether this function is even called for
+/// that status; this function does not re-derive that decision).
+///
+/// The response options are an **acknowledgement set, not an approval
+/// set** — `"acknowledge"`/`"view_run"`, stable machine keys, nothing
+/// executes on either. `gate_id` on the returned payload identifies this as
+/// a run-failure item rather than a gate-approval one (queue wiring is
+/// task 3's concern, not this function's).
+///
+/// A rendered summary that would exceed
+/// [`OperatorPayloadLimits::max_summary_chars`] is truncated deterministically
+/// rather than causing this function to fail: per the spec's Notes, an
+/// unreportable failure has no useful fallback, so silence is the worst
+/// outcome. Truncation shortens the node-detail line only (the fixed
+/// status/workflow/run-id header is never cut) and always ends with
+/// [`TRUNCATION_MARKER`] so the operator knows there is more. The one error
+/// path that remains is [`operator::validate`]'s own — e.g. a caller-supplied
+/// `limits.max_summary_chars` too small to hold even the fixed header, or an
+/// `OperatorPayloadLimits` whose option bounds this function's fixed
+/// two-option set cannot satisfy.
+pub fn render_failure_payload(
+    gate_id: impl Into<String>,
+    run_id: &str,
+    workflow_type: &str,
+    terminal_status: &str,
+    failed_nodes: &[FailedNode],
+    limits: &OperatorPayloadLimits,
+) -> Result<ValidatedOperatorPayload, OperatorValidationError> {
+    let status_line = if terminal_status == "budget_halted" {
+        "Run halted: budget limit reached"
+    } else {
+        "Run failed"
+    };
+
+    let header = format!("{status_line}\nWorkflow: {workflow_type}\nRun: {run_id}\n");
+
+    let node_line = match failed_nodes.split_first() {
+        Some((first, [])) => {
+            format!("Failing node: {} — {}", first.name, first.error)
+        }
+        Some((first, rest)) => {
+            format!(
+                "Failing node: {} — {} (+{} more failed node{})",
+                first.name,
+                first.error,
+                rest.len(),
+                if rest.len() == 1 { "" } else { "s" }
+            )
+        }
+        None => "No specific node failure recorded.".to_string(),
+    };
+
+    let max_chars = limits.max_summary_chars;
+    let header_chars = header.chars().count();
+    let available_for_node_line = max_chars.saturating_sub(header_chars);
+
+    let final_node_line = if node_line.chars().count() <= available_for_node_line {
+        node_line
+    } else {
+        let marker_chars = TRUNCATION_MARKER.chars().count();
+        let keep = available_for_node_line.saturating_sub(marker_chars);
+        let kept: String = node_line.chars().take(keep).collect();
+        format!("{kept}{TRUNCATION_MARKER}")
+    };
+
+    let mut rendered_summary = format!("{header}{final_node_line}");
+    // Safety net: the header/node-line split above should already guarantee
+    // this, but never hand `validate` a summary longer than the declared
+    // limit due to an edge case in the arithmetic above.
+    if rendered_summary.chars().count() > max_chars {
+        rendered_summary = rendered_summary.chars().take(max_chars).collect();
+    }
+
+    let options = vec![
+        OperatorResponseOption::new("acknowledge", "Acknowledge"),
+        OperatorResponseOption::new("view_run", "View run"),
+    ];
+
+    let payload = OperatorPayload::new(gate_id, rendered_summary, options);
+    validate(payload, limits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +634,192 @@ mod tests {
         let partial: PartialFailureNotifyPolicy =
             serde_json::from_str("{}").expect("valid empty PartialFailureNotifyPolicy JSON");
         assert_eq!(partial, PartialFailureNotifyPolicy::default());
+    }
+
+    // --- render_failure_payload (task 2) -----------------------------
+
+    #[test]
+    fn typical_failure_validates_and_names_all_three_facts() {
+        let limits = OperatorPayloadLimits::default();
+        let failed = [FailedNode::new(
+            "BuildNode",
+            "compile error: missing semicolon",
+        )];
+        let validated = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "failed",
+            &failed,
+            &limits,
+        )
+        .expect("typical failure should validate");
+        let summary = &validated.payload().rendered_summary;
+        assert!(
+            summary.contains("sdlc_flow"),
+            "missing workflow type: {summary}"
+        );
+        assert!(summary.contains("run-123"), "missing run id: {summary}");
+        assert!(
+            summary.contains("BuildNode"),
+            "missing failing node: {summary}"
+        );
+        assert!(
+            summary.contains("compile error: missing semicolon"),
+            "missing error text: {summary}"
+        );
+    }
+
+    #[test]
+    fn error_text_far_over_limit_truncates_deterministically_and_still_validates() {
+        let limits = OperatorPayloadLimits::default();
+        let huge_error = "x".repeat(5_000);
+        let failed = [FailedNode::new("BuildNode", huge_error.clone())];
+
+        let first = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "failed",
+            &failed,
+            &limits,
+        )
+        .expect("truncated failure should still validate, never fail to notify");
+        let second = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "failed",
+            &failed,
+            &limits,
+        )
+        .expect("truncated failure should still validate, never fail to notify");
+
+        let summary = &first.payload().rendered_summary;
+        assert!(
+            summary.chars().count() <= limits.max_summary_chars,
+            "rendered summary must fit the declared limit"
+        );
+        assert!(
+            summary.contains(TRUNCATION_MARKER),
+            "truncation must be marked visibly: {summary}"
+        );
+        assert!(
+            !summary.contains(&huge_error),
+            "the full untruncated error text must not appear verbatim"
+        );
+        // Deterministic: same inputs render byte-identical output.
+        assert_eq!(
+            first.payload().rendered_summary,
+            second.payload().rendered_summary
+        );
+    }
+
+    #[test]
+    fn budget_halted_summary_differs_from_failed_summary() {
+        let limits = OperatorPayloadLimits::default();
+        let failed = [FailedNode::new("BuildNode", "boom")];
+
+        let failed_payload = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "failed",
+            &failed,
+            &limits,
+        )
+        .expect("failed run should validate");
+        let halted_payload = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "budget_halted",
+            &[],
+            &limits,
+        )
+        .expect("budget-halted run should validate");
+
+        assert_ne!(
+            failed_payload.payload().rendered_summary,
+            halted_payload.payload().rendered_summary
+        );
+        assert!(halted_payload
+            .payload()
+            .rendered_summary
+            .to_lowercase()
+            .contains("budget"));
+        assert!(!failed_payload
+            .payload()
+            .rendered_summary
+            .to_lowercase()
+            .contains("budget"));
+    }
+
+    #[test]
+    fn multi_node_failure_names_first_and_counts_the_rest() {
+        let limits = OperatorPayloadLimits::default();
+        let failed = [
+            FailedNode::new("FirstNode", "first error"),
+            FailedNode::new("SecondNode", "second error"),
+            FailedNode::new("ThirdNode", "third error"),
+        ];
+        let validated = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "failed",
+            &failed,
+            &limits,
+        )
+        .expect("multi-node failure should validate");
+        let summary = &validated.payload().rendered_summary;
+
+        assert!(
+            summary.contains("FirstNode"),
+            "must name the first failed node: {summary}"
+        );
+        assert!(
+            !summary.contains("SecondNode") && !summary.contains("ThirdNode"),
+            "must not render every failed node into one summary: {summary}"
+        );
+        assert!(
+            summary.contains('2'),
+            "must state the count of the remaining failed nodes: {summary}"
+        );
+    }
+
+    #[test]
+    fn empty_failed_nodes_renders_a_status_only_summary() {
+        let limits = OperatorPayloadLimits::default();
+        let validated = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "budget_halted",
+            &[],
+            &limits,
+        )
+        .expect("status-only summary should validate");
+        assert!(!validated.payload().rendered_summary.is_empty());
+    }
+
+    #[test]
+    fn options_are_a_stable_acknowledgement_set_within_limits() {
+        let limits = OperatorPayloadLimits::default();
+        let failed = [FailedNode::new("BuildNode", "boom")];
+        let validated = render_failure_payload(
+            "run-failure",
+            "run-123",
+            "sdlc_flow",
+            "failed",
+            &failed,
+            &limits,
+        )
+        .expect("should validate");
+        let options = &validated.payload().options;
+        assert!(options.len() >= limits.min_options);
+        assert!(options.len() <= limits.max_options);
+        let keys: Vec<&str> = options.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, vec!["acknowledge", "view_run"]);
     }
 }
