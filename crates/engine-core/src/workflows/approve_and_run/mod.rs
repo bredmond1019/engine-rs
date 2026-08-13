@@ -27,14 +27,25 @@
 //!   `Requeued` enforcement, and authorizes execution against the
 //!   pending-harvest record's stored payload — never a re-derived one —
 //!   only on a matched `Approved` verdict.
+//! - [`graph`] (task 5) — the declared `WorkflowSchema` / `NodeRegistry` /
+//!   `Workflow` assembly. Its single node drives the existing
+//!   `nodes::harvest_approve::HarvestApproveNode` over the injectable
+//!   `HttpPost` seam against task 4's authorization — no second push path —
+//!   and stamps the resolved policy from [`policy`] into its own
+//!   `ctx.nodes` result.
 
 pub mod drain;
+pub mod graph;
 pub mod policy;
 pub mod profiles;
 pub mod render;
 pub mod verdict;
 
 pub use drain::{drain, DrainReport, SessionRoutedRecord};
+pub use graph::{
+    execution_event, registry, registry_with, schema, workflow, ApproveAndRunExecuteNode,
+    APPROVE_AND_RUN_NODE_NAME, APPROVE_AND_RUN_WORKFLOW_TYPE,
+};
 pub use policy::{policy_state, ApproveAndRunPolicy, PartialApproveAndRunPolicy};
 pub use profiles::{
     profile_by_name, read_harness_policy_defaults_from, resolve_policy_for_run_from,
