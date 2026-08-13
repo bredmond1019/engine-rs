@@ -978,10 +978,12 @@ mod tests {
         // The default must stay under the 60_000ms `every_ms` floor that
         // `schedule.entries` enforces, or the fastest legal interval entry
         // could come due and be missed between polls.
-        assert!(
-            DEFAULT_SCHEDULE_POLL_INTERVAL_MS < 60_000,
-            "default poll interval must not exceed the every_ms floor"
-        );
+        const {
+            assert!(
+                DEFAULT_SCHEDULE_POLL_INTERVAL_MS < 60_000,
+                "default poll interval must not exceed the every_ms floor"
+            );
+        }
     }
 
     #[test]
