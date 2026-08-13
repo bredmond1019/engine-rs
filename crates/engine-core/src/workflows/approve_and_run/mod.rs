@@ -21,11 +21,18 @@
 //!   records, enqueues the conforming ones onto an
 //!   [`crate::operator::queue::OperatorQueue`], routes the rest to
 //!   `session-<slug>`, and makes exactly one `next_deliverable` call.
+//! - [`verdict`] (task 4) — resolves one operator verdict for a delivered
+//!   item into exactly one [`crate::operator::ledger`] row via
+//!   `record_decision`, without re-implementing its digest-mismatch ->
+//!   `Requeued` enforcement, and authorizes execution against the
+//!   pending-harvest record's stored payload — never a re-derived one —
+//!   only on a matched `Approved` verdict.
 
 pub mod drain;
 pub mod policy;
 pub mod profiles;
 pub mod render;
+pub mod verdict;
 
 pub use drain::{drain, DrainReport, SessionRoutedRecord};
 pub use policy::{policy_state, ApproveAndRunPolicy, PartialApproveAndRunPolicy};
@@ -36,3 +43,4 @@ pub use render::{
     gate_id_for, render, render_and_validate, PendingHarvestRecord, OPTION_APPROVE,
     OPTION_OPEN_SESSION, OPTION_SKIP,
 };
+pub use verdict::{decide, ExecutionAuthorization, UnknownOptionKey, VerdictOutcome};
