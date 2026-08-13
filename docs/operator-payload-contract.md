@@ -6,7 +6,7 @@ doc_id: operator-payload-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [operator, operator-payload, operator-channel, whatsapp, validation, digest, harvest-gate, operator-queue, EN.8.A, EN.8.B]
+keywords: [operator, operator-payload, operator-channel, whatsapp, validation, digest, harvest-gate, operator-queue, run-failure-notification, EN.8.A, EN.8.B]
 related: [architecture, docs-index, harvest-gate]
 ---
 
@@ -98,6 +98,58 @@ depth-limited operator queue:
   under `WORKFLOW_KEY = "operator_queue"`; `baseline`/`cheap-fast`/`thorough` profiles all hold
   `operator_queue_depth` at 1 and vary only the timeout/suppression/digest knobs. `policy_state()`
   serializes the resolved policy for `RunTelemetry`/`PolicyAggregate` stamping.
+
+## Run-failure notifications (`operator::failure`, `ticket-run-failure-notification`)
+
+`crates/engine-core/src/operator/failure.rs` reuses this contract verbatim to tell the operator
+when a run ends terminal-failed, instead of leaving that fact in a log line nobody reads. It adds
+no new primitive: `should_notify` is a decision function, `render_failure_payload` is a payload
+renderer, and the single hook is `engine-serve/src/live_state.rs::mark_terminal` — the one choke
+point every run passes through on its way out of the live map, on every exit path.
+
+**Which statuses notify.** `http.rs::derive_terminal_status` reports four outcomes in precedence
+order: `cancelled` -> `budget_halted` -> `failed` -> `succeeded`. The built-in default notifies on
+`failed` and `budget_halted`; it does not notify on `cancelled` (the operator caused it themselves)
+or `succeeded`. `budget_halted` notifying is a judgement call flagged for reversal in this ticket's
+spec Notes: a run stopped by its own cost ceiling is not a crash, but it is exactly the kind of
+thing an operator wants to hear about unprompted. Because it is the `notify_on_statuses` policy
+knob (see below), reversing it is a config change, not a code change.
+
+**How this differs from an approval gate.** `HarvestGate`/`APPROVE_AND_RUN` items are an approval
+set — a tapped response authorizes an execution. A failure notification's response options
+(`"acknowledge"`, `"view_run"`) are an **acknowledgement set** — nothing executes on either
+response. It exists so the operator knows, not so the operator authorizes.
+
+**Same queue, same depth limit.** A failure notification is an `OperatorQueueItem` like any other
+— it goes through the same `OperatorQueue` (`EN.8.B`) and the same policy-resolved open-item depth
+limit. A burst of failed runs produces one open item plus a digest tail (`build_digest`/
+`storm_digest`), never N separate messages.
+
+**Once per run, guaranteed by the hook site.** `mark_terminal` runs exactly once per run on its way
+out of the live map, regardless of how many nodes failed — so wiring the notification there,
+rather than at each node-failure site, is what makes "one notification per run" true even when a
+run's walk fails three nodes. `render_failure_payload` names only the first failed node
+(`suspend.rs`'s existing first-stamped-node convention) plus a count of the rest; it never renders
+every failed node into one summary.
+
+**Truncate, never drop.** Unlike an approval gate — which has a safe fallback of routing to a
+session — an unreportable run failure has no useful fallback: silence is exactly the failure mode
+this ticket exists to close. `render_failure_payload` truncates an over-limit error message
+deterministically to fit `OperatorPayloadLimits`, always marking the cut with a trailing
+`…[truncated]` marker, rather than failing to notify at all.
+
+**Policy knobs** (`operator::failure::FailureNotifyPolicy`), resolved through the standard four
+layers under `harness.json` key `run_failure_notification`:
+
+| Knob | Built-in default | What it controls |
+|---|---|---|
+| `notify_on_statuses` | `failed`+`budget_halted` on, `cancelled`+`succeeded` off | Which of the four terminal statuses enqueue a notification |
+| `failure_item_priority` | `0` | The `effective_priority` a rendered failure item carries into `OperatorQueue` |
+
+Both are set explicitly in all three named profiles (`baseline`, `cheap-fast`, `thorough`); only
+`failure_item_priority` varies across them (`-5`/`0`/`+5`) — which statuses notify is not a
+cost/latency dial. `policy_state()` stamps the resolved policy into `ctx.nodes` and never emits a
+`cost_usd` key.
 - `digest.rs` — `build_digest`/`storm_digest`, pure functions producing a top-item-plus-count
   `QueueDigest`. `storm_digest` is `build_digest` narrowed to items enqueued within
   `suppression_window_secs` of `now` (a non-positive window clamps to zero rather than being
