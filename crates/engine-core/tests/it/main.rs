@@ -15,6 +15,7 @@
 //! Do NOT add a new `tests/*.rs` file at this level — that silently reintroduces a second binary.
 
 mod action_dispatch_e2e;
+mod approve_and_run;
 mod budget;
 mod cancellation;
 mod claude_code_step;
