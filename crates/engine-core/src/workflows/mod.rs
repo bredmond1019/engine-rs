@@ -18,6 +18,7 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
 use futures::future::BoxFuture;
 
+pub mod approve_and_run;
 pub mod content_pipeline;
 pub mod diagnostic_intake;
 pub mod harvest_approve;
