@@ -11,12 +11,30 @@
 //! completed runs, which is what `GET /events/{event_id}` (EN.5.F) serves a
 //! terminal readback from. Live runs are never evicted by the completed-run
 //! cap — only entries already marked terminal compete for the ring's slots.
+//!
+//! `mark_terminal` is also the **single hook point** for terminal
+//! run-failure notification (`ticket-run-failure-notification`, task 3):
+//! every run passes through here exactly once on its way out of the live
+//! map (`is_first_terminal_transition` below is what makes "exactly once"
+//! true even if a caller mistakenly called this twice for the same run id),
+//! so this is where the decision (`engine_core::operator::failure::should_notify`)
+//! and the renderer (`engine_core::operator::failure::render_failure_payload`)
+//! get wired in, enqueuing into this store's own `engine_core::operator`
+//! `OperatorQueue` (`EN.8.B`) — no new channel, no bypass of the depth
+//! limit. The hook is cheap and infallible: no network call, no blocking
+//! I/O, no `unwrap`/`expect`/panic path, and a resolved policy that says
+//! "don't notify" (or a render/validate failure) is a silent no-op that
+//! never blocks the exit path.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
-use engine_contract::TaskContext;
+use engine_contract::{NodeRunStatus, TaskContext};
+use engine_core::operator::failure::{self, FailedNode};
+use engine_core::operator::queue::{ItemSource, OperatorQueue, OperatorQueueItem};
+use engine_core::operator::OperatorPayloadLimits;
+use engine_core::policy::PolicyConfigSource;
 use uuid::Uuid;
 
 /// Identifies a single workflow run. Matches the `events.id` primary key
@@ -68,16 +86,43 @@ impl CompletedRing {
 /// Cheap to clone (an `Arc` around each guarded map) so it can be shared
 /// between the HTTP handlers, the `on_progress` recorder, and any
 /// background tasks without extra synchronization.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LiveStateStore {
     inner: Arc<RwLock<HashMap<RunId, TaskContext>>>,
     completed: Arc<RwLock<CompletedRing>>,
+    /// The `EN.8.B` operator queue that terminal run-failure notifications
+    /// (`ticket-run-failure-notification` task 3) enqueue into — reusing
+    /// the existing depth-limited/digest-tailed queue type rather than a
+    /// bespoke channel. Runs under the built-in [`OperatorQueue`] default
+    /// policy; not yet threaded through `harness.json` (no other producer
+    /// is wired into `engine-serve` for it to share policy with today).
+    operator_queue: Arc<RwLock<OperatorQueue>>,
+}
+
+impl Default for LiveStateStore {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            completed: Arc::default(),
+            operator_queue: Arc::new(RwLock::new(OperatorQueue::new(
+                engine_core::operator::queue::OperatorQueuePolicy::default(),
+            ))),
+        }
+    }
 }
 
 impl LiveStateStore {
     /// Create an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read access to the `EN.8.B` operator queue that terminal
+    /// run-failure notifications enqueue into (`mark_terminal`). Exposed so
+    /// `engine-serve`'s transport wiring (and tests) can drain/inspect it;
+    /// this store never delivers or answers items itself.
+    pub fn operator_queue(&self) -> &Arc<RwLock<OperatorQueue>> {
+        &self.operator_queue
     }
 
     /// Record the latest snapshot for `run_id`, overwriting whatever was
@@ -160,6 +205,15 @@ impl LiveStateStore {
     ///
     /// Evicts the oldest completed run once the ring exceeds
     /// [`COMPLETED_RUN_RETENTION`]; live runs are never evicted by this cap.
+    ///
+    /// This is also the single hook point for terminal run-failure
+    /// notification (`ticket-run-failure-notification` task 3, see the
+    /// module docs): the first time a given `run_id` transitions to
+    /// terminal here, [`Self::maybe_enqueue_failure_notification`] runs
+    /// once. `is_first_terminal_transition` is what makes "once per run"
+    /// hold even if a caller mistakenly invoked this twice for the same
+    /// run id — asserted directly by this module's tests rather than
+    /// assumed from "every exit path calls this once".
     pub fn mark_terminal(
         &self,
         run_id: RunId,
@@ -168,9 +222,10 @@ impl LiveStateStore {
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     ) {
+        let workflow_type = workflow_type.into();
         let record = RunRecord {
             snapshot: snapshot.clone(),
-            workflow_type: workflow_type.into(),
+            workflow_type: workflow_type.clone(),
             created_at,
             updated_at,
             terminal: true,
@@ -180,19 +235,116 @@ impl LiveStateStore {
         // `get_record` landing between the two operations must never find
         // the run in neither — briefly present in both is fine, absent from
         // both is a spurious "unknown run".
-        {
+        let is_first_terminal_transition = {
             let mut completed = self
                 .completed
                 .write()
                 .expect("completed run ring lock poisoned on write");
+            let already_terminal = completed.entries.contains_key(&run_id);
             completed.insert(run_id, record);
+            !already_terminal
+        };
+        {
+            let mut live = self
+                .inner
+                .write()
+                .expect("live state store lock poisoned on write");
+            live.remove(&run_id);
         }
-        let mut live = self
-            .inner
-            .write()
-            .expect("live state store lock poisoned on write");
-        live.remove(&run_id);
+        if is_first_terminal_transition {
+            self.maybe_enqueue_failure_notification(run_id, snapshot, &workflow_type);
+        }
     }
+
+    /// The decision (task 1) + renderer (task 2) hook: resolve whether
+    /// `snapshot`'s terminal status should notify, and if so, render and
+    /// enqueue exactly one [`OperatorQueueItem`] into this store's
+    /// [`Self::operator_queue`]. A no-op — never a panic, never blocking
+    /// I/O — for `cancelled`/`succeeded` runs, for an unconfigured/default
+    /// policy that says don't notify, and for the one residual error path
+    /// ([`failure::render_failure_payload`]'s own validation failure, e.g.
+    /// caller-supplied limits too small to hold even the fixed header):
+    /// per the spec's Notes, an unreportable failure has no useful
+    /// fallback, but it must still never block this hot exit path, so it
+    /// is treated as "nothing to enqueue" rather than propagated.
+    ///
+    /// Policy resolves from [`PolicyConfigSource::Builtin`] with no
+    /// profile/event override — the built-in default (`failed` and
+    /// `budget_halted` notify) — since `mark_terminal` has no per-run
+    /// `Policy` surface plumbed through it today; that resolution needs no
+    /// filesystem access, keeping this path cheap.
+    fn maybe_enqueue_failure_notification(
+        &self,
+        run_id: RunId,
+        snapshot: &TaskContext,
+        workflow_type: &str,
+    ) {
+        let terminal_status = crate::http::derive_terminal_status(snapshot);
+
+        let policy = failure::resolve_policy_for_run_from(&PolicyConfigSource::Builtin, None, None)
+            .unwrap_or_default();
+
+        if !failure::should_notify(terminal_status, &policy) {
+            return;
+        }
+
+        let failed_nodes = collect_failed_nodes(snapshot);
+        let limits = OperatorPayloadLimits::default();
+        let gate_id = format!("run-failure:{run_id}");
+
+        let Ok(validated) = failure::render_failure_payload(
+            gate_id.clone(),
+            &run_id.to_string(),
+            workflow_type,
+            terminal_status,
+            &failed_nodes,
+            &limits,
+        ) else {
+            return;
+        };
+
+        let item = OperatorQueueItem::new(
+            gate_id,
+            validated.into_payload(),
+            policy.failure_item_priority,
+            Utc::now(),
+            ItemSource::GateApproval,
+        );
+
+        let mut queue = self
+            .operator_queue
+            .write()
+            .expect("operator queue lock poisoned on write");
+        queue.enqueue(item);
+    }
+}
+
+/// Collect every `node_runs` entry stamped [`NodeRunStatus::Failed`] into
+/// [`FailedNode`]s, sorted by node name ascending. `TaskContext::node_runs`
+/// is a `HashMap`, whose iteration order is not guaranteed —
+/// `failure::render_failure_payload` names `failed_nodes[0]` as *the*
+/// failing node, so which node is "first" must not depend on incidental
+/// `HashMap` iteration order. In practice a failed walk halts after its
+/// first failing node (`suspend.rs::failed_node_reason`'s doc comment), so
+/// this returns at most one entry for most real runs; the sort exists for
+/// the pathological/test case of several `Failed` entries in one snapshot.
+fn collect_failed_nodes(snapshot: &TaskContext) -> Vec<FailedNode> {
+    let mut failed: Vec<(&String, &engine_contract::NodeRun)> = snapshot
+        .node_runs
+        .iter()
+        .filter(|(_, run)| run.status == NodeRunStatus::Failed)
+        .collect();
+    failed.sort_by_key(|(name, _)| (*name).clone());
+    failed
+        .into_iter()
+        .map(|(name, run)| {
+            let error = run
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string());
+            FailedNode::new(name.clone(), error)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -406,5 +558,196 @@ mod tests {
         let active = store.list_active();
         assert!(active.contains(&live_run));
         assert!(!active.contains(&terminal_run));
+    }
+
+    // --- ticket-run-failure-notification, task 3 ------------------------
+
+    fn failed_node_run(error: &str) -> engine_contract::NodeRun {
+        engine_contract::NodeRun {
+            status: NodeRunStatus::Failed,
+            started_at: None,
+            completed_at: None,
+            error: Some(error.to_string()),
+            input: None,
+            usage: None,
+        }
+    }
+
+    fn succeeded_context() -> TaskContext {
+        fixture_context("succeeded")
+    }
+
+    fn cancelled_context() -> TaskContext {
+        let mut ctx = fixture_context("cancelled");
+        ctx.metadata = serde_json::json!({ "cancellation": { "cancelled": true } });
+        ctx
+    }
+
+    fn budget_halted_context() -> TaskContext {
+        let mut ctx = fixture_context("budget_halted");
+        ctx.metadata = serde_json::json!({ "budget": { "halted": true } });
+        ctx
+    }
+
+    fn failed_context(failed_node_names: &[&str]) -> TaskContext {
+        let mut ctx = fixture_context("failed");
+        let mut node_runs = StdHashMap::new();
+        for name in failed_node_names {
+            node_runs.insert(
+                (*name).to_string(),
+                failed_node_run(&format!("{name} exploded")),
+            );
+        }
+        ctx.node_runs = node_runs;
+        ctx
+    }
+
+    #[test]
+    fn three_failed_nodes_produce_exactly_one_enqueued_item() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let snapshot = failed_context(&["NodeA", "NodeB", "NodeC"]);
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let queue = store.operator_queue();
+        let mut guard = queue.write().expect("operator queue lock");
+        assert_eq!(guard.pending_count(), 1);
+        let delivered = guard
+            .next_deliverable(now)
+            .expect("exactly one deliverable item");
+        assert_eq!(guard.pending_count(), 0);
+        assert!(guard.next_deliverable(now).is_none());
+        assert!(
+            delivered.payload.rendered_summary.contains("NodeA"),
+            "should name the first failed node: {}",
+            delivered.payload.rendered_summary
+        );
+    }
+
+    #[test]
+    fn cancelled_run_enqueues_nothing() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let snapshot = cancelled_context();
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let queue = store.operator_queue();
+        assert_eq!(queue.read().expect("lock").pending_count(), 0);
+    }
+
+    #[test]
+    fn succeeded_run_enqueues_nothing() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let snapshot = succeeded_context();
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let queue = store.operator_queue();
+        assert_eq!(queue.read().expect("lock").pending_count(), 0);
+    }
+
+    #[test]
+    fn budget_halted_run_enqueues_exactly_one_item() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let snapshot = budget_halted_context();
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let queue = store.operator_queue();
+        assert_eq!(queue.read().expect("lock").pending_count(), 1);
+    }
+
+    #[test]
+    fn budget_halted_and_failed_summaries_are_distinguishable() {
+        let store_a = LiveStateStore::new();
+        let store_b = LiveStateStore::new();
+        let now = Utc::now();
+
+        store_a.mark_terminal(Uuid::new_v4(), &budget_halted_context(), "wf", now, now);
+        store_b.mark_terminal(Uuid::new_v4(), &failed_context(&["NodeA"]), "wf", now, now);
+
+        let mut guard_a = store_a.operator_queue().write().expect("lock");
+        let mut guard_b = store_b.operator_queue().write().expect("lock");
+        let budget_summary = guard_a
+            .next_deliverable(now)
+            .expect("budget item")
+            .payload
+            .rendered_summary;
+        let failed_summary = guard_b
+            .next_deliverable(now)
+            .expect("failed item")
+            .payload
+            .rendered_summary;
+        assert_ne!(budget_summary, failed_summary);
+    }
+
+    #[test]
+    fn calling_mark_terminal_twice_for_the_same_run_enqueues_only_once() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let snapshot = failed_context(&["NodeA"]);
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let queue = store.operator_queue();
+        assert_eq!(
+            queue.read().expect("lock").pending_count(),
+            1,
+            "the second mark_terminal call for the same run id must not enqueue again"
+        );
+    }
+
+    #[test]
+    fn many_failed_runs_produce_only_one_open_deliverable_at_a_time() {
+        // The burst case at this module's level: `OperatorQueue`'s own
+        // depth limit (default 1) is what a caller reusing this store's
+        // queue relies on -- this store never bypasses it.
+        let store = LiveStateStore::new();
+        let now = Utc::now();
+
+        for i in 0..20 {
+            let run_id = Uuid::new_v4();
+            let snapshot = failed_context(&[&format!("Node{i}")]);
+            store.mark_terminal(run_id, &snapshot, "wf", now, now);
+        }
+
+        let queue = store.operator_queue();
+        assert_eq!(queue.read().expect("lock").pending_count(), 20);
+        let mut guard = queue.write().expect("lock");
+        assert!(guard.next_deliverable(now).is_some());
+        // Depth 1 (the default `OperatorQueuePolicy`) is now occupied.
+        assert!(guard.next_deliverable(now).is_none());
+    }
+
+    #[test]
+    fn terminal_status_reported_by_derive_terminal_status_is_unaffected_by_the_hook() {
+        // Regression assertion (spec Task 3): the notification hook must
+        // never change what `derive_terminal_status` reports for the same
+        // snapshot -- it only reads that status, never mutates the
+        // snapshot or the completed record around it.
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let snapshot = failed_context(&["NodeA"]);
+        let now = Utc::now();
+
+        let expected_status = crate::http::derive_terminal_status(&snapshot);
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+        let record = store
+            .get_record(run_id)
+            .expect("terminal run should have a retained record");
+        let actual_status = crate::http::derive_terminal_status(&record.snapshot);
+
+        assert_eq!(expected_status, actual_status);
+        assert_eq!(expected_status, "failed");
     }
 }
