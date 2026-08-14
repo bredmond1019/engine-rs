@@ -4,7 +4,7 @@
 //! per the orchestrator data contract) — this crate is `engine-serve`'s persistence
 //! layer for the run state it owns. Built on the D2 persistence stack (`sqlx::PgPool`).
 
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use engine_contract::{EventsRow, TaskContext};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
@@ -127,6 +127,52 @@ pub async fn get_task_context(pool: &PgPool, id: Uuid) -> Result<Option<TaskCont
         Some(row) => Some(row.try_get::<Json<TaskContext>, _>("task_context")?.0),
         None => None,
     })
+}
+
+/// List `events` rows that look crash-stranded: no `metadata.completion`
+/// marker (task 1's [`engine_core::completion::stamp_completion`] never ran
+/// for them) and `updated_at` older than `older_than` — the boot sweep's
+/// candidate set (EN.9.C task 3; see `planning/EN.9.C/tasks.md`'s design
+/// decision for why deriving status alone cannot substitute for this marker).
+///
+/// Ordered oldest-first so the sweep reconciles the longest-stranded runs
+/// first. `limit` is a hard bound: a first sweep over a long-lived database
+/// must not attempt to load an unbounded result set into memory.
+///
+/// `task_context` is a `json` column (contract §4), not `jsonb`; the `->`
+/// operator works on `json` directly in Postgres, so no cast is needed here.
+pub async fn list_orphan_candidates(
+    pool: &PgPool,
+    older_than: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<EventsRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, workflow_type, data, task_context, created_at, updated_at \
+         FROM events \
+         WHERE task_context->'metadata'->'completion' IS NULL \
+           AND updated_at < $1 \
+         ORDER BY updated_at ASC \
+         LIMIT $2",
+    )
+    .bind(older_than)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(EventsRow {
+                id: row.try_get("id")?,
+                workflow_type: row.try_get("workflow_type")?,
+                data: row.try_get::<Json<serde_json::Value>, _>("data")?.0,
+                task_context: row
+                    .try_get::<Json<engine_contract::TaskContext>, _>("task_context")?
+                    .0,
+                created_at: row.try_get::<NaiveDateTime, _>("created_at")?.and_utc(),
+                updated_at: row.try_get::<NaiveDateTime, _>("updated_at")?.and_utc(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

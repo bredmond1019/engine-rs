@@ -23,9 +23,13 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 
 ## Module Map
 
-The Cargo workspace (EN.0.A) declares the four member crates below. `engine-core` (EN.1.A),
+The Cargo workspace (EN.0.A) declares the member crates below. `engine-core` (EN.1.A),
 `engine-contract` (EN.0.B), `engine-store` (EN.0.B), and now `engine-serve` (EN.1.C) hold real
 types: dispatch, in-memory live state, the durable-write bridge, and the actix-web HTTP surface.
+`term-core` and `term-attach` (`EN.9.A`) are two more members — tmux session-control ported from
+`core/bastion`, split so the blocking attach path can never be pulled into `engine-core`/
+`engine-serve` by additive feature unification; neither is linked from either binary yet
+(`EN.9.B` wires `term-core` in). See [terminal-crates.md](terminal-crates.md).
 
 ```
 engine-rs/
@@ -169,6 +173,16 @@ engine-rs/
 │   │                         via `dispatch_with_event` + `spawn_run` — no self-directed HTTP call;
 │   │                         see [§ Schedule Source](#schedule-source-en6g) below and
 │   │                         [cron-primitive.md](cron-primitive.md))
+│   ├── term-core/          ← tmux session-control + agent-detection, ported verbatim from
+│   │                         `core/bastion`'s `src/sessions/{tmux,model,claude_state}.rs` and
+│   │                         `src/detect/` (`EN.9.A`) — no `attach_session`/`suspend_and_attach`,
+│   │                         no `anyhow`; not linked by `engine-core` or `engine-serve` in this
+│   │                         block (that wiring is `EN.9.B`). See
+│   │                         [terminal-crates.md](terminal-crates.md)
+│   └── term-attach/        ← `attach_session`/`suspend_and_attach` only — split from `term-core`
+│                              so no cargo feature-unification path can ever pull the blocking
+│                              attach code into the async `engine-core`/`engine-serve` binary
+│                              (`EN.9.A`). See [terminal-crates.md](terminal-crates.md)
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
     crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
@@ -206,6 +220,7 @@ I/O:
 | `http_post.rs` (`EN.4.C`; harvest-gated `EN.7.C`) | `HttpPost` / `ReqwestHttpPost` (`http_post_live()`) | `StubHttpPost` | `proposal_generator::PersistToBrainNode`, `content_pipeline::PersistToBrainNode`, `nodes::harvest_approve::HarvestApproveNode` | POSTs a finished artifact to Synapse's brain-ingest endpoint (`OR.Q`); as of `EN.7.C`, `content_pipeline::PersistToBrainNode`'s push is governed by `nodes::harvest_gate::HarvestGate` (`off`/`in_process`/`approval`, built-in default `off`) — see [harvest-gate.md](harvest-gate.md); as of `EN.8.A`, that same `HarvestGate` also declares an `operator::OperatorChannel` (`notification`/`session-<slug>`) — see [operator-payload-contract.md](operator-payload-contract.md) |
 | `channel_transport.rs` (`EN.6.A`) | `ChannelTransport` / `channel_transport_live()` | `StubChannelTransport` | `content_pipeline::ActionDispatchNode`, `research_agent::ResearchIngressDispatchNode` (`EN.6.E`) | Delivers outbound actions (digest replies, workflow-trigger chaining) back to the channel that originated the run, or self-feeds a finished `RESEARCH_AGENT` run into `CONTENT_PIPELINE` |
 | `doc_materializer.rs` (`EN.7.A`, edit ops `EN.7.B`/`EN.4.E`) | `DocMaterializer` / `MevDocMaterializer` (`doc_materializer_live()`) | `StubDocMaterializer` | `nodes::MaterializeDocNode`, `nodes::OpportunityEditNode` (`EN.7.B`), `nodes::merge_contacts::MergeContactsNode` (`EN.4.E`) | Plans + writes a `BrainDocModel`-shaped artifact into the Brain corpus as a source `.md` document via `mev`/`okf-core` in-process (D53's fourth boundary-test channel); `EN.7.B` extends the seam with `edit_opportunity` (`OpportunityEdit::SetStage`/`AddAction`, over mev's `plan_set_stage`/`plan_add_action`) for editing an already-written opportunity; `EN.4.E` adds a third `OpportunityEdit::MergeContacts` variant (over mev's `plan_merge_contacts`) so `RESEARCH_AGENT`'s `MergeContactsNode` can merge extracted contacts into an already-written opportunity |
+| `crates/engine-serve/src/orphan.rs` (`EN.9.C`) | `OrphanLister` / `PgOrphanLister` (`orphan_lister_live()`) | `RecordingOrphanLister` | `crate::orphan::reconcile_orphans` (the boot sweep) | Lists `events` rows whose `task_context.metadata.completion` is absent past a policy-resolved age (`engine-store::list_orphan_candidates`), so the crash-recovery sweep is testable with no database; not one of the three `crates/engine-core/src/nodes/*` seams above — it lives in `engine-serve` and lists rows rather than dispatching an action. See [orphan-recovery.md](orphan-recovery.md) |
 
 See [materialize-doc-node.md](materialize-doc-node.md) for the `DocMaterializer` seam and
 `MaterializeDocNode` in detail, [opportunity-edit-workflows.md](opportunity-edit-workflows.md) for
@@ -213,7 +228,10 @@ the `edit_opportunity` operation and `OpportunityEditNode`,
 [content-pipeline-workflow.md](content-pipeline-workflow.md) for `HttpPost` and `ChannelTransport`
 in their workflow context, and [harvest-gate.md](harvest-gate.md) for the `HarvestMode`/
 `HarvestGate` gate fronting the `http_post.rs` seam and the `HARVEST_APPROVE` completion
-micro-workflow.
+micro-workflow. The operator-facing half that *drives* those pending records —
+`APPROVE_AND_RUN` (`EN.8.D`), which drains them into the depth-limited operator queue, records each
+decision in the approval ledger, and executes only a matched-digest approval — is documented in
+[approve-and-run-workflow.md](approve-and-run-workflow.md).
 
 **Materialize -\> harvest ordering guarantee.** In `CONTENT_PIPELINE`, `MaterializeDocNode` always
 runs upstream of `PersistToBrainNode` in the declared graph, and the harvest gate never changes
@@ -462,12 +480,12 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   convenience wrapper calling `dispatch_with_event` with an empty (`Null`) event, kept for callers
   with no event payload in hand. Every policy-resolving builtin registration
   (`engine-serve::workflows::register_{sdlc_flow,research_agent,diagnostic_intake,
-  proposal_generator}`) resolves policy against a workflow-appropriate
+  proposal_generator,approve_and_run}`) resolves policy against a workflow-appropriate
   `policy::PolicyConfigSource` — `SDLC_FLOW` (which runs embedded in a real repo checkout) uses
   `PolicyConfigSource::Worktree(current_dir)`; as of `EN.3.K`, that worktree root is resolved per
   run from the event's `repo` registry slug (falling back to the process's cwd only when `repo` is
   absent — see `docs/sdlc-flow-workflow.md`) rather than from the process's cwd unconditionally;
-  the other three (channel/API-shaped, no repo
+  the other four (channel/API-shaped, no repo
   checkout at dispatch time) use `PolicyConfigSource::Builtin` (builtin + profile + event layers
   only, no filesystem access) — so a worktree-free workflow never falls back to
   `std::env::current_dir()` to resolve its policy. The resolved policy is seeded into the run's

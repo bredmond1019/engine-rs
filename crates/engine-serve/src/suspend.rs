@@ -276,6 +276,28 @@ pub(crate) struct SpawnedRun {
 /// `Err` halts the walk (`Workflow::walk`'s dispatch loop stops advancing
 /// once a node fails), so a failed walk has at most one `Failed` entry in
 /// `node_runs` in practice.
+/// Stamps `ctx.metadata.completion` (EN.9.C task 1's
+/// `engine_core::stamp_completion`) with the status
+/// [`crate::http::derive_terminal_status`] reports for this exact snapshot,
+/// and returns that status.
+///
+/// Called at both terminal exits in [`spawn_run`] -- the main terminal
+/// branch and the suspended-index eviction branch -- immediately before
+/// `live.mark_terminal` and the durable persist, so the marker lands in the
+/// snapshot both the in-memory completed ring and Postgres retain. Never
+/// called on the plain suspend path (`suspended == true`, no eviction): a
+/// suspended run is not terminal (`derive_live_status`), and stamping it
+/// complete would hide it from the very orphan sweep this block adds.
+///
+/// `derive_terminal_status` is already `pub(crate)` in this crate, so this
+/// calls it directly rather than widening its visibility further or
+/// duplicating its vocabulary (see the Amendment Log).
+fn stamp_terminal_completion(ctx: &mut TaskContext) -> &'static str {
+    let status = crate::http::derive_terminal_status(ctx);
+    engine_core::stamp_completion(&mut ctx.metadata, status);
+    status
+}
+
 fn failed_node_reason(ctx: &TaskContext) -> Option<String> {
     ctx.node_runs.iter().find_map(|(name, run)| {
         if run.status == NodeRunStatus::Failed {
@@ -324,6 +346,14 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
     } = spawned;
 
     actix_web::rt::spawn(async move {
+        // Cloned before `durable` is moved into `durable_on_progress` below
+        // (EN.9.C task 2): the completion stamp is applied to `final_ctx`
+        // *after* `run_with`/`run_from` returns, so it can never ride the
+        // node-boundary `on_progress` fan-out that closure builds. This
+        // handle is what persists the stamped snapshot durably at both
+        // terminal exits (`:467`, `:485`), mirroring
+        // `DurableHandle::record`'s existing convenience-wrapper contract.
+        let durable_for_terminal = durable.clone();
         let mut durable_progress =
             durable_on_progress(durable, run_id, workflow_type.clone(), data.clone());
         let progress_live = live.clone();
@@ -382,7 +412,7 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         // (a node returning its own `Err` halts the walk but still returns
         // `Ok(ctx)` from `run_with`/`run_from` -- see the comment above this
         // match). `None` for a clean run.
-        let (final_ctx, failure_reason) = match run_result {
+        let (mut final_ctx, failure_reason) = match run_result {
             Ok(Ok(ctx)) => {
                 let reason = failed_node_reason(&ctx);
                 (ctx, reason)
@@ -464,6 +494,20 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
             // backstop documented at the top of this module).
             if let Some((evicted_id, mut evicted_entry)) = insert_suspended(run_id, entry) {
                 engine_core::stamp_cancelled(&mut evicted_entry.snapshot.metadata);
+                // EN.9.C task 2: an eviction from the suspended ring is
+                // terminal too (the run has nowhere left to resume from),
+                // so it gets the same completion stamp + durable persist as
+                // the main terminal exit below -- order the stamp before
+                // both the durable write and `mark_terminal` so neither the
+                // durable row nor the live-state readback is ever seen
+                // without it.
+                stamp_terminal_completion(&mut evicted_entry.snapshot);
+                durable_for_terminal.record(
+                    evicted_id,
+                    &evicted_entry.workflow_type,
+                    &evicted_entry.data,
+                    &evicted_entry.snapshot,
+                );
                 live.mark_terminal(
                     evicted_id,
                     &evicted_entry.snapshot,
@@ -473,6 +517,14 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
                 );
             }
         } else {
+            // EN.9.C task 2: stamp `metadata.completion` with the status
+            // `derive_terminal_status` reports for this exact snapshot, and
+            // persist it durably, before either the SSE terminal frame or
+            // the live-state readback can be observed -- a marker that
+            // never reaches Postgres leaves the boot-sweep orphan query
+            // blind, which is the defect this block exists to close.
+            stamp_terminal_completion(&mut final_ctx);
+            durable_for_terminal.record(run_id, &workflow_type, &data, &final_ctx);
             // Publish the SSE terminal frame before marking the readback
             // terminal, so a client racing the two never sees a terminal
             // readback with no terminal frame having gone out yet.
@@ -517,6 +569,110 @@ pub(crate) fn registry_test_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- stamp_terminal_completion (EN.9.C task 2) --------------------------
+
+    fn context_with_metadata(metadata: serde_json::Value) -> TaskContext {
+        TaskContext {
+            event: serde_json::Value::Null,
+            nodes: StdHashMap::new(),
+            metadata,
+            node_runs: StdHashMap::new(),
+        }
+    }
+
+    #[test]
+    fn stamps_succeeded_status_for_a_clean_run() {
+        let mut ctx = context_with_metadata(serde_json::json!({}));
+        let status = stamp_terminal_completion(&mut ctx);
+
+        assert_eq!(status, "succeeded");
+        assert!(engine_core::is_complete(&ctx.metadata));
+        assert_eq!(
+            ctx.metadata["completion"]["status"],
+            serde_json::json!("succeeded")
+        );
+        assert_eq!(
+            crate::http::derive_terminal_status(&ctx),
+            "succeeded",
+            "the stamp must not change what derive_terminal_status reports"
+        );
+    }
+
+    #[test]
+    fn stamps_failed_status_for_a_node_error() {
+        let mut ctx = context_with_metadata(serde_json::json!({}));
+        ctx.node_runs.insert(
+            "SomeNode".to_string(),
+            engine_contract::NodeRun {
+                status: NodeRunStatus::Failed,
+                started_at: None,
+                completed_at: None,
+                error: Some("boom".to_string()),
+                input: None,
+                usage: None,
+            },
+        );
+
+        let status = stamp_terminal_completion(&mut ctx);
+
+        assert_eq!(status, "failed");
+        assert_eq!(
+            ctx.metadata["completion"]["status"],
+            serde_json::json!("failed")
+        );
+    }
+
+    #[test]
+    fn stamps_cancelled_status_for_a_cancelled_run() {
+        let mut ctx = context_with_metadata(serde_json::json!({
+            "cancellation": { "cancelled": true, "at": "2026-01-01T00:00:00Z" }
+        }));
+
+        let status = stamp_terminal_completion(&mut ctx);
+
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            ctx.metadata["completion"]["status"],
+            serde_json::json!("cancelled")
+        );
+        // The sibling annotation this status was derived from must survive
+        // the stamp -- same contract `stamp_completion`'s own unit tests
+        // assert for `cancellation`/`budget`/`suspension`.
+        assert_eq!(
+            ctx.metadata["cancellation"]["cancelled"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn stamps_budget_halted_status_for_a_budget_halted_run() {
+        let mut ctx = context_with_metadata(serde_json::json!({
+            "budget": { "halted": true, "reason": { "cap": "cost" } }
+        }));
+
+        let status = stamp_terminal_completion(&mut ctx);
+
+        assert_eq!(status, "budget_halted");
+        assert_eq!(
+            ctx.metadata["completion"]["status"],
+            serde_json::json!("budget_halted")
+        );
+    }
+
+    #[test]
+    fn is_not_stamped_on_the_plain_suspend_path() {
+        // No call to `stamp_terminal_completion` happens on the plain
+        // suspend branch of `spawn_run` (only on the two terminal exits) --
+        // asserted here structurally: a freshly-suspended snapshot with no
+        // completion marker must still read as "not complete", which is
+        // exactly the predicate the orphan sweep (task 3/5) relies on to
+        // find crash-stranded runs.
+        let ctx = context_with_metadata(serde_json::json!({
+            "suspension": { "suspended": true, "resume_at": "node-b" }
+        }));
+        assert!(!engine_core::is_complete(&ctx.metadata));
+    }
 
     fn sample_entry(reason: &str) -> SuspendedEntry {
         let now = Utc::now();

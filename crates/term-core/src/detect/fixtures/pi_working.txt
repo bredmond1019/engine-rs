@@ -1,0 +1,6 @@
+You: Can you help me plan a trip to Japan?
+
+Working...
+
+Pi: Of course! Japan is a wonderful destination. Let me put together
+some ideas for you based on what you might enjoy.

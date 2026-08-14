@@ -25,8 +25,10 @@
 //! `bastion:BA.18.B`'s `PendingLookup` expects.
 
 pub mod channel;
+pub mod failure;
 pub mod ledger;
 pub mod limits;
+pub mod orphan;
 pub mod payload;
 pub mod queue;
 #[cfg(test)]
