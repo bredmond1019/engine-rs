@@ -61,11 +61,14 @@
 //
 // STATE (NOT gitignored, but deliberately never committed — at planning/<spec>/sdlc/)
 //   sdlc-task-state.json   the authoritative run index (per-task summary/issues/fixes/commit +
-//                          the Block-A `tokens` block). Written to disk after every task and
+//                          the Block-A `tokens` block, plus `base_sha` — the pre-task HEAD this
+//                          run's own emoji gate diffs from). Written to disk after every task and
 //                          again at the end (cat-visible for crash inspection); read back off
-//                          disk only, by --resume — never out of git — so it is disk-only, never
-//                          committed (D46: planning/ may be a vaulted symlink into the brain repo,
-//                          where a plain `git add planning/...` fails).
+//                          disk only, by --resume, and by /close-out's Step 0.5 in-place fallback
+//                          (base_sha lets close-out scope its diff even when this run committed
+//                          straight to the base branch) — never out of git — so it is disk-only,
+//                          never committed (D46: planning/ may be a vaulted symlink into the brain
+//                          repo, where a plain `git add planning/...` fails).
 //
 // COMMIT STRATEGY
 //   feat: implement <stem>         implement agent (per task)
@@ -996,6 +999,7 @@ if (!setupResult) {
 }
 const { runDir, branchName, baseSha } = setupResult
 state.branch = branchName
+state.base_sha = baseSha
 state.worktree_path = useWorktree ? runDir : ''
 log(`Run root: ${runDir} | branch: ${branchName} | base: ${baseSha}`)
 if (useWorktree) {

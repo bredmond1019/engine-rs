@@ -61,7 +61,9 @@ hard-coded two-dot diff against a literal `main` is empty by definition whenever
 branch itself (the default state after an in-place run, a plain-branch run, or right after `--auto-merge`/
 `--merge-branch` land), which reports a vacuous clean instead of "nothing considered." Resolve the
 base **once**, from real evidence, and refuse to proceed if nothing resolves — never fall back to
-the literal string `main`.
+the literal string `main`. When HEAD is the base with no merge commit, also try recovering the
+pre-task `base_sha` an `/sdlc-task` in-place run persisted to its `sdlc-task-state.json` before
+refusing — see the script below.
 
 Run this once, substituting the `--base` value parsed in Step 0 for `BASE_ARG` (empty string if
 `--base` was not passed):
@@ -112,8 +114,32 @@ if [ "$CURRENT_BRANCH" = "$RESOLVED_BASE" ]; then
     RANGE="HEAD^1..HEAD"
     echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' via a merge commit — scoping to what it brought in: $RANGE"
   else
-    echo "CLOSE-OUT: HEAD IS the base branch '$RESOLVED_BASE' with no merge commit to scope from — there is no diff range that means anything here. Refusing to report a vacuous clean. Re-run with --base <ref> naming the commit this session's work started from, or run /close-out from the feature branch before it merges. Aborting."
-    exit 1
+    # /sdlc-task in its default in-place mode commits straight onto the current (often base)
+    # branch — no merge commit to scope from. It persists its own pre-task HEAD as `base_sha` in
+    # planning/<spec>/sdlc/sdlc-task-state.json for exactly this case. Recover the most recently
+    # updated one for this branch before giving up.
+    TASK_BASE=$(python3 -c "
+import glob, json
+best_sha, best_ts = '', ''
+for f in glob.glob('planning/*/sdlc/sdlc-task-state.json'):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    if d.get('branch') != '$CURRENT_BRANCH' or not d.get('base_sha'):
+        continue
+    ts = d.get('updated_at') or d.get('started_at') or ''
+    if ts >= best_ts:
+        best_ts, best_sha = ts, d['base_sha']
+print(best_sha)
+")
+    if [ -n "$TASK_BASE" ] && git rev-parse --verify -q "$TASK_BASE" >/dev/null 2>&1 && [ "$(git rev-parse "$TASK_BASE")" != "$(git rev-parse HEAD)" ]; then
+      RANGE="${TASK_BASE}..HEAD"
+      echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' with no merge commit — recovered base_sha=$TASK_BASE from an /sdlc-task run's state file: $RANGE"
+    else
+      echo "CLOSE-OUT: HEAD IS the base branch '$RESOLVED_BASE' with no merge commit to scope from, and no /sdlc-task state file for this branch names a usable base_sha. Refusing to report a vacuous clean. Re-run with --base <ref> naming the commit this session's work started from, or run /close-out from the feature branch before it merges. Aborting."
+      exit 1
+    fi
   fi
 else
   RANGE="${RESOLVED_BASE}...HEAD"
@@ -303,6 +329,8 @@ If `--merge-branch` was passed:
 - `planning/harness.json` — validation suite (checks + gating flags); also read for
   `flow.prBase` by Step 0.5's diff-base resolution
 - `planning/status.md` — current focus (to scope coverage check to recent work)
+- `planning/*/sdlc/sdlc-task-state.json` — per-spec `/sdlc-task` run index; Step 0.5's fallback
+  reads `branch` + `base_sha` from these when HEAD is the base branch with no merge commit
 - `.git/CLOSE_OUT_RANGE` — scratch file this run writes in Step 0.5 with the resolved diff range
   (e.g. `main...HEAD` or `HEAD^1..HEAD`); Steps 1 and 2a both read it so they can never diverge.
   Lives under `.git/`, so it is never tracked and needs no cleanup.
