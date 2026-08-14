@@ -18,6 +18,45 @@ related: [status, context]
 
 ## [run: 2026-08-13]
 
+### `EN.9.A` closed — term-core and term-attach extracted from bastion
+- **What:** Drove `EN.9.A` via `/sdlc-flow`, in place on branch `EN.9.A-flow`, all 8 tasks passed,
+  PASS review. Tasks 1–4 scaffolded `crates/term-core` and ported bastion's terminal-control code
+  into it: tmux argv builders + execution (typed `TmuxError`, `anyhow` fully retired), the
+  manifest/golden-test agent-detection engine with its manifests and fixtures, and
+  `model.rs`/`claude_state.rs` (session/pane parsing, workspace-trust observer). `AgentDetection`
+  now derives `Serialize`/`Deserialize`, and new `set_option_args`/`show_option_args` builders lay
+  the groundwork for `EN.9.B`'s session lease. Task 6 added `crates/term-attach` as a second,
+  separate crate (never a feature — Cargo features unify additively, and `bastion`'s blocking and
+  `engine-core`'s tokio dependency edges on the same target would otherwise link one rlib with both
+  present in the shipped binary) holding `attach_session`/`suspend_and_attach`, fixing a bug where
+  attach failures fabricated their stderr text instead of surfacing tmux's real error. Task 5
+  reconciled a spec-authoring discrepancy (114 ported tests vs. 116 actual — 2 net-new tests for
+  the option builders — recorded in the spec's Amendment Log) and confirmed both crates are absent
+  from `engine-core`/`engine-serve`/`engine-store`'s dependency graphs. Task 7 documented the split
+  (`docs/terminal-crates.md`, `architecture.md`, `docs/index.md`) and mechanically re-confirmed the
+  isolation. Task 8 validated the full gate green.
+- **Why:** Closes Phase 9's first block — the engine can now build on terminal-control primitives
+  without ever linking the interactive-attach path into its own binary. Unblocks `EN.9.B` (the
+  async driver seam and session lease).
+- **Refs:** `planning/EN.9.A/tasks.md`; roadmap Phase 9 "Terminal nodes"; HQ lane
+  `planning/operator-surface/lane-terminal.txt`.
+
+```
+29b1282 docs: document term-core/term-attach split and prove isolation
+1a89c23 feat: implement EN.9.A-task6
+721299f feat: implement EN.9.A-task4
+8d88dba feat: implement EN.9.A-task3
+e439281 feat: implement EN.9.A-task2
+8d942eb feat: implement EN.9.A-task1
+```
+
+Next: `EN.9.B` — async driver seam and the session lease (Phase 1), pending the tmux user-option
+spike on the Mini.
+
+---
+
+## [run: 2026-08-13]
+
 ### `EN.ticket.run-failure-notification` closed — terminal run failures reach the operator channel
 - **What:** Drove `ticket-run-failure-notification` via `/sdlc-task`, in place on `main`, all 6 tasks
   passed. Task 1 added `operator::failure` with a pure notify-or-not decision over
