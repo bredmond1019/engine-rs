@@ -27,7 +27,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
   e2e-templates-README.md          ← usage guide for the e2e test templates
 
   archive.md        capture.md       commit.md        handoff.md
-  log-work.md       prime.md         session-recap.md status.md
+  log-work.md       prime.md         session-recap.md
   wrap-up.md        update-state.md  next.md
 
   breakdown.md      chore.md         generate-master-plan.md  generate-tasks.md
@@ -35,7 +35,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 
   close-out.md      conditional_docs.md  document.md      fix.md
   implement.md      patch.md             process-tasks.md review-PR.md
-  review-task.md    review-workflow.md   test.md          update-docs.md
+  review-task.md    test.md              update-docs.md
   update-task.md
 
   clean-worktree.md  init-worktree.md  merge-train.md  start-block.md
@@ -50,10 +50,10 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 
 | Group | Commands |
 |---|---|
-| Session | `/prime`, `/session-recap`, `/status`, `/next`, `/handoff`, `/wrap-up`, `/log-work`, `/archive`, `/capture` |
+| Session | `/prime`, `/session-recap`, `/next`, `/handoff`, `/wrap-up`, `/log-work`, `/archive`, `/capture` |
 | State | `/update-state` — how to safely edit `planning/state.json` per `state-schema.md` |
 | Planning | `/generate-roadmap`, `/generate-master-plan`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` |
-| SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-workflow`, `/review-PR`, `/close-out` |
+| SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block`, `/merge-train` |
 | Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/roadmap-status` |
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
@@ -89,7 +89,6 @@ predictably-named output file.
 | SDLC Phase | Command | Role | Output |
 |---|---|---|---|
 | Session Start | `/session-recap` | Briefing: recent Log entries, where you left off, next step | chat only |
-| Session Start | `/status` | Check current focus and what's in progress | chat only |
 | Session Start | `/process-tasks` | Check which specs are eligible to start | chat only |
 | Session Start | `/next` | Briefing on what's up next, blocked, and recommend next action based on goals | chat only |
 | Session End | `/wrap-up [note]` | Log work + commit; clean close without a handoff file | status.md, log.md, git |
@@ -109,13 +108,12 @@ predictably-named output file.
 | **4 — Review** | `/review-task <spec> [N]` | Verify all criteria; run fresh tests; issue verdict | `planning/<name>/sdlc/reports/[taskN-]review.md` |
 | **5 — Document** | `/document <spec> [N]` | Surgically patch `docs/`; gates on PASS verdict | `planning/<name>/sdlc/reports/[taskN-]document.md` |
 | **6 — Wrap-up** | `/log-work [notes]` | Update status.md + append Log entry + sync company brain | status.md, log.md, brain `docs/projects/<slug>.md`, brain `README.md` |
-| **7 — Verify run** | `/review-workflow <name> [N]` | Audit pipeline execution: reports, commits, Log, STATUS | `planning/<name>/sdlc/reports/[taskN-]workflow-review.md` |
 
 ### Pipeline Flow
 
 ```
 SESSION START
-  /status                  → read-only: current focus and what's next
+  /session-recap            → read-only: recent log, current focus, next action
   /process-tasks           → read-only: which specs are eligible
 
 BLOCK SETUP
@@ -151,9 +149,6 @@ PHASE 5 — DOCUMENT                 ← gates on PASS verdict
 
 PHASE 6 — WRAP-UP
   /log-work [notes]        → status.md, log.md
-
-(OPTIONAL) PHASE 7 — VERIFY RUN
-  /review-workflow <spec> [N] → planning/<spec>/sdlc/reports/[taskN-]workflow-review.md
 ```
 
 ### Argument Convention
@@ -181,7 +176,6 @@ planning/
         review.md            ← or task3-review.md
         document.md          ← or task3-document.md
         workflow.md          ← or task3-workflow.md (written by /sdlc-run)
-        workflow-review.md   ← or task3-workflow-review.md (written by /review-workflow)
 ```
 
 ### Report File Naming
@@ -394,10 +388,6 @@ in a brain) and offers — never auto-runs — `mev emit-state --write` on drift
 codebase, layout, focus, carryover, and standing rules. Read-only except for that one
 user-confirmed emit. Embedded in every pipeline command.
 
-### `/status`
-Reads only `planning/status.md` and reports the Current focus line, what's In progress, and
-what's Next. Read-only.
-
 ### `/next`
 Show what's up next, what's blocked and by what, and recommend the next action based on local status and HQ/business/core goals. Read-only.
 
@@ -557,16 +547,6 @@ the per-project cache doc's `synced_from` watermark, the tier rollup table, the 
 Board, and `master-plan.md`'s wave tables. `brain.toml`-driven and depth-agnostic — resolves
 the brain root and this repo's manifest entry at runtime, no baked paths. Standalone repos
 (no `brain.toml`) skip the brain-sync step entirely.
-
----
-
-## Phase 7 — Verify Run (Optional)
-
-### `/review-workflow`
-Audits a completed `/sdlc-run` pipeline execution — not the implementation, but the mechanics:
-report files present and well-formed, the Test stage ran the suite, commits follow conventional
-format, Log/STATUS reflect the outcome. Issues PASS/PARTIAL/FAIL and writes
-`workflow-review.md`. Does **not** re-run tests — use `/review-task` for that.
 
 ---
 

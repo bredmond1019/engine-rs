@@ -1,5 +1,9 @@
 # Prime — Deep orient to the current project at the start of a session.
 
+> **For routine session starts, use `/session-recap` instead** — lighter, and covers the common
+> case. Reach for `/prime` for genuine deep re-orientation: first session in a repo, returning
+> after a long gap, or when `/session-recap`'s summary isn't enough to get moving.
+
 ## Instructions
 
 1. Read each file listed in **Context / Files to Read** in order.

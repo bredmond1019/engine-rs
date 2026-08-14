@@ -34,8 +34,8 @@ description: >
  per-task commits stand. Resume (--resume, no task selection) re-enters with every
  task already "passed" in state.json, so it naturally re-runs only the reconcile —
  no separate resume path needed. Skipped entirely when testDepth=full (every check,
- including perTask:false ones, already ran authoritative on every per-task pass) or
- on a partial task-subset run (the existing fullRun guard).
+ including perTask:false ones, already ran authoritative on every per-task pass — see
+ renderCheckList) or on a partial task-subset run (the existing fullRun guard).
 
  ISOLATION
    Default: IN PLACE on the current branch (no worktree) — cheapest, like /sdlc-run.
@@ -656,6 +656,11 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
     the commits already landed on the current branch.
   - Either way, remind the user to run **`/log-work`** afterward for the narrative `log.md` entry —
     the lean bookkeep close-out above only flips status markers, it never writes prose.
+
+
+
+
+
 
 
 
