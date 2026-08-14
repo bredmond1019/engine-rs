@@ -63,23 +63,41 @@ $ARGUMENTS — optional flags, space-separated:
    If that prints anything, it's unrelated in-progress work in that repo — leave it out of the
    commit (stage `.claude/` and `planning/.template-version` explicitly, never `git add -A`).
 
-5. **Commit in each repo that changed**, one commit per repo (matching the established convention
-   already used historically — see `mev`/`bastion` git log for examples):
+5. **Commit in each repo that changed** — but in **two** commits, in different repos, because the
+   synced files do not all belong to the same git repo:
+
+   **(a) The sub-repo owns `.claude/` and `.agents/`:**
    ```bash
-   cd <repo_path>
-   git add .claude/ planning/.template-version
-   git commit -m "chore(harness): pull base-template <short-hash> — <what changed, one line>"
+   git -C <repo_path> add .claude .agents
+   git -C <repo_path> commit -m "chore(harness): pull base-template <short-hash> — <one line>"
    ```
+
+   **(b) The brain repo owns every `planning/.template-version`.** In a vaulted repo `planning/` is
+   a symlink into the brain's `_planning/` vault, so that file is tracked by `agentic-portfolio`,
+   not by the sub-repo. **Do not put it in the sub-repo's `git add`** — it fails with
+   `fatal: pathspec 'planning/.template-version' is beyond a symbolic link` **and aborts the entire
+   add, staging nothing at all**, so the `.claude/` files you meant to commit are silently left
+   behind. Measured 2026-08-13 across all 16 repos. Commit the stamps together from the brain root,
+   with an explicit pathspec (never `git add -A` there — one repo tracks every vault):
+   ```bash
+   cd <brain_root>
+   git commit -o <path>/_planning/<slug>/.template-version ... -m "chore(harness): stamp .template-version across N repos — base-template <short-hash>"
+   ```
+
    Portfolio-tier repos (`rag-engine-rs`, `workflow-engine-rs`, `claude-sdk-rs`) gitignore
    `.claude/`/`planning/` entirely by design (D8, published-repo hygiene) — the sync still updates
-   those files locally (harmless), but there is nothing to commit there. Don't force-add them.
+   those files locally (harmless), and only their `.agents/` mirrors are tracked. Don't force-add
+   the rest.
 
-6. **If the pull touched `sdlc-flow.js` / the tasks.json contract specifically**, also check
-   `core/orchestrator` — its `SDLC_FLOW` workflow (`app/schemas/sdlc_schema.py`,
-   `app/workflows/sdlc_flow_workflow.py`) is a second, independent implementation of the same
-   contract (see `core/orchestrator/docs/sdlc-flow-workflow.md`, and D45's provenance). This script
-   does not touch orchestrator's Python code — flag for the user whether orchestrator's schema still
-   matches, or whether a note is needed in orchestrator's own `planning/state.json` `carryover[]`.
+6. **Second consumers of the `tasks.json` contract.** `core/orchestrator` used to carry one — an
+   independent `SDLC_FLOW` workflow implementation. **It was retired**: `app/schemas/sdlc_schema.py`
+   and `docs/sdlc-flow-workflow.md` were both deleted by orchestrator commit `75b6c8e`
+   ("or-x2-sdlc-evals-retirement-task1"), and `SDLC_FLOW` now survives there only as a string in
+   `app/database/eval_record.py`. Verified 2026-08-13 — there is nothing to cross-check in
+   orchestrator any more, so do not go looking for those paths.
+   If a *new* second implementation of the contract ever appears, re-add it here by name; the point
+   of this step is that a contract with two implementations needs both checked, not that
+   orchestrator specifically matters.
 
 7. **Sweep for already-broken specs** the fix should also repair: any repo's `planning/*/tasks.md`
    still using the old `### <prefix>.<n>.<n>` heading pattern with `**Status:** Not started` can be

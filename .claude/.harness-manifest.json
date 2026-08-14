@@ -1,11 +1,11 @@
 {
-  "version": "3fb27e4e36046be46c44ab20c4964fa43213dabe",
+  "version": "ddb6fec9408df80d00bbe6b441a88f3fbe3f73bf",
   "generated": "2026-08-14",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
     ".claude/commands/document.md": "81f4657f7fc57a3d6347e1fee465823820f699545eafa42586b86b375ee033e8",
     ".claude/commands/backlog-ticket.md": "2a4a1f9bb2f9d847be75e84d2b7dafedb796394d84da51367540d03f7bd53b3a",
-    ".claude/commands/sync-downstream-harness.md": "f772958c31fb63664e2b4d43bb8963a9f4356d038adc681f1f90b37ea836fd28",
+    ".claude/commands/sync-downstream-harness.md": "850e899589bd737097629bb1cb0d6ce3a1a1a5ae7fdc451f223763239c10d955",
     ".claude/commands/fix.md": "8dda88037f96c63679af8f7b6f87d1aaf89d1f5bd3e8cff1c91cc21dd1ae634c",
     ".claude/commands/sync-brain-skills.md": "15748fadfebcb3113f0b1732437ef1edacb234afaa8ab6c2077ce1f9a6e4bf70",
     ".claude/commands/review-workflow.md": "2e9cd777853af89ed571f2fbc9976853694404f3a4dacdcf6db2971477aa888c",
