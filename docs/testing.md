@@ -52,6 +52,15 @@ file silently re-adds ~20MB of linking to every full test run.
 
 Unit tests are unaffected — they stay in-file under `#[cfg(test)] mod tests` as usual.
 
+**`term-core` and `term-attach` (added by `EN.9.A`) have no `tests/` directory at all**, and that is
+deliberate rather than an oversight. All 116 `term-core` tests and all 3 `term-attach` tests are
+in-file `#[cfg(test)]` units, carried over in that form from bastion, so neither crate adds an
+integration-test binary to the workspace. Keep it that way: a `tests/*.rs` file in either crate would
+re-introduce exactly the per-binary link cost this section exists to prevent. The `detect/` golden
+tests are the case worth understanding — they read their manifests and fixtures through
+`include_str!`, so they need no filesystem I/O and no test harness, which is why they work as plain
+unit tests despite being fixture-driven.
+
 ### Why the layout, and why it is safe
 
 Measured 2026-07-29 (see [D57](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D57-rust-sdlc-iteration-speed.md)):
