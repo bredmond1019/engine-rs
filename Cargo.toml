@@ -6,6 +6,7 @@ members = [
     "crates/engine-store",
     "crates/engine-serve",
     "crates/term-core",
+    "crates/term-attach",
 ]
 
 [workspace.package]

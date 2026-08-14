@@ -2708,6 +2708,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "term-attach"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "term-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "term-core"
 version = "0.1.0"
 dependencies = [
