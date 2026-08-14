@@ -213,7 +213,10 @@ the `edit_opportunity` operation and `OpportunityEditNode`,
 [content-pipeline-workflow.md](content-pipeline-workflow.md) for `HttpPost` and `ChannelTransport`
 in their workflow context, and [harvest-gate.md](harvest-gate.md) for the `HarvestMode`/
 `HarvestGate` gate fronting the `http_post.rs` seam and the `HARVEST_APPROVE` completion
-micro-workflow.
+micro-workflow. The operator-facing half that *drives* those pending records —
+`APPROVE_AND_RUN` (`EN.8.D`), which drains them into the depth-limited operator queue, records each
+decision in the approval ledger, and executes only a matched-digest approval — is documented in
+[approve-and-run-workflow.md](approve-and-run-workflow.md).
 
 **Materialize -\> harvest ordering guarantee.** In `CONTENT_PIPELINE`, `MaterializeDocNode` always
 runs upstream of `PersistToBrainNode` in the declared graph, and the harvest gate never changes
@@ -462,12 +465,12 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   convenience wrapper calling `dispatch_with_event` with an empty (`Null`) event, kept for callers
   with no event payload in hand. Every policy-resolving builtin registration
   (`engine-serve::workflows::register_{sdlc_flow,research_agent,diagnostic_intake,
-  proposal_generator}`) resolves policy against a workflow-appropriate
+  proposal_generator,approve_and_run}`) resolves policy against a workflow-appropriate
   `policy::PolicyConfigSource` — `SDLC_FLOW` (which runs embedded in a real repo checkout) uses
   `PolicyConfigSource::Worktree(current_dir)`; as of `EN.3.K`, that worktree root is resolved per
   run from the event's `repo` registry slug (falling back to the process's cwd only when `repo` is
   absent — see `docs/sdlc-flow-workflow.md`) rather than from the process's cwd unconditionally;
-  the other three (channel/API-shaped, no repo
+  the other four (channel/API-shaped, no repo
   checkout at dispatch time) use `PolicyConfigSource::Builtin` (builtin + profile + event layers
   only, no filesystem access) — so a worktree-free workflow never falls back to
   `std::env::current_dir()` to resolve its policy. The resolved policy is seeded into the run's
