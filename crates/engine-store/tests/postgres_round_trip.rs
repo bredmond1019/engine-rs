@@ -22,7 +22,8 @@ use std::collections::HashMap;
 use chrono::Utc;
 use engine_contract::{EventsRow, NodeRun, NodeRunStatus, TaskContext};
 use engine_store::{
-    connect, get_event, get_task_context, insert_event, update_event, upsert_event,
+    connect, get_event, get_task_context, insert_event, list_orphan_candidates, update_event,
+    upsert_event,
 };
 use uuid::Uuid;
 
@@ -286,4 +287,105 @@ async fn get_task_context_round_trips_a_malformed_suspension_marker_without_erro
         .execute(&pool)
         .await
         .expect("cleanup delete should succeed");
+}
+
+/// `list_orphan_candidates` (EN.9.C task 3) returns only rows whose
+/// `task_context.metadata.completion` is absent and whose `updated_at` is
+/// older than the caller-supplied cutoff, ordered oldest-first, honouring
+/// both the cutoff and the `limit` bound.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with `cargo test -p engine-store -- --ignored`"]
+async fn list_orphan_candidates_returns_only_uncompleted_rows_older_than_cutoff() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this ignored test (see file header)");
+
+    let pool = connect(&database_url)
+        .await
+        .expect("failed to connect to DATABASE_URL");
+
+    let make_row =
+        |id: Uuid, updated_at: chrono::DateTime<Utc>, metadata: serde_json::Value| EventsRow {
+            id,
+            workflow_type: "engine-store-orphan-test".to_string(),
+            data: serde_json::json!({ "ticket_id": "T-orphan" }),
+            task_context: TaskContext {
+                event: serde_json::json!({ "ticket_id": "T-orphan" }),
+                nodes: HashMap::new(),
+                metadata,
+                node_runs: HashMap::new(),
+            },
+            created_at: updated_at,
+            updated_at,
+        };
+
+    let cutoff = Utc::now();
+    let old_time = cutoff - chrono::Duration::hours(2);
+    let recent_time = cutoff + chrono::Duration::hours(2);
+
+    // Completed, old: must NOT be returned (has a completion marker).
+    let completed_id = Uuid::new_v4();
+    let completed_row = make_row(
+        completed_id,
+        old_time,
+        serde_json::json!({ "completion": { "terminal": true, "status": "succeeded", "at": old_time.to_rfc3339() } }),
+    );
+
+    // Uncompleted, old: MUST be returned — this is the orphan candidate.
+    let orphan_id = Uuid::new_v4();
+    let orphan_row = make_row(orphan_id, old_time, serde_json::json!({}));
+
+    // Uncompleted, recent (newer than cutoff): must NOT be returned.
+    let recent_id = Uuid::new_v4();
+    let recent_row = make_row(recent_id, recent_time, serde_json::json!({}));
+
+    for row in [&completed_row, &orphan_row, &recent_row] {
+        insert_event(&pool, row)
+            .await
+            .expect("insert_event should succeed");
+    }
+
+    let candidates = list_orphan_candidates(&pool, cutoff, 100)
+        .await
+        .expect("list_orphan_candidates should succeed");
+    let candidate_ids: Vec<Uuid> = candidates.iter().map(|r| r.id).collect();
+
+    assert!(
+        candidate_ids.contains(&orphan_id),
+        "the uncompleted, old row must be returned"
+    );
+    assert!(
+        !candidate_ids.contains(&completed_id),
+        "the completed row must NOT be returned regardless of age"
+    );
+    assert!(
+        !candidate_ids.contains(&recent_id),
+        "the uncompleted row newer than the cutoff must NOT be returned"
+    );
+
+    // Ordering: oldest-first among whatever orphan rows exist.
+    let positions: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.id == orphan_id)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(positions.len(), 1, "orphan row must appear exactly once");
+
+    // Limit is honoured: with limit=0, nothing is returned.
+    let limited = list_orphan_candidates(&pool, cutoff, 0)
+        .await
+        .expect("list_orphan_candidates should succeed with limit 0");
+    assert!(
+        limited.is_empty(),
+        "a limit of 0 must return no rows, even though orphan candidates exist"
+    );
+
+    // Clean up so repeated local runs don't accumulate rows.
+    for id in [completed_id, orphan_id, recent_id] {
+        sqlx::query("DELETE FROM events WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("cleanup delete should succeed");
+    }
 }
