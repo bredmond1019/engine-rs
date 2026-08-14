@@ -57,6 +57,8 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block`, `/merge-train` |
 | Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/roadmap-status` |
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
+| Backlog | `/backlog-ticket`, `/initial-research` |
+| Distribution | `/sync-downstream-harness`, `/sync-all`, `/sync-global-commands`, `/sync-global-skills`, `/sync-brain-skills` |
 
 ### `brain/` — Reference Only
 
