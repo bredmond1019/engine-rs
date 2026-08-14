@@ -18,6 +18,42 @@ related: [status, context]
 
 ## [run: 2026-08-13]
 
+### `EN.9.C` closed — the engine can finally see runs a crash stranded
+- **What:** Drove `EN.9.C` via `/sdlc-task`, in place on `main`, all 8 tasks passed. Task 1 added
+  `engine_core::completion` (`stamp_completion`/`is_complete`), a run-level `metadata.completion`
+  annotation mirroring `cancellation`/`budget`/`suspension`. Task 2 stamped it at **both** terminal
+  exits in `spawn_run` (`suspend.rs:504` eviction branch, `:526` main) before the durable write, and
+  deliberately not on the plain suspend path. Task 3 added
+  `engine_store::list_orphan_candidates` — the first non-by-id select in that crate — as a JSONB
+  predicate over the marker's absence plus an `updated_at` cutoff and a hard `limit`. Task 4 added
+  `OrphanPolicy` across the four resolution layers. Task 5 added `engine_serve::orphan` with an
+  injectable `OrphanLister` seam and `reconcile_orphans`, which fails orphans loudly and never
+  resumes them. Task 6 added the stale-run alarm on aged `running`/`suspended` runs, de-duplicated
+  so one stuck run produces one item. Task 7 documented it in `docs/orphan-recovery.md`. Task 8
+  validated the full gate.
+- **Why:** Both Mini plists set `KeepAlive=true`/`ThrottleInterval=10`, so launchd restarts the
+  engine within ~10s of a crash — and until now that **hid the evidence**, because a run that
+  crashed after node 1 of 5 has no failure marker and `derive_terminal_status` reports it as
+  `succeeded`, indistinguishable from a clean finish.
+- **Design note:** the block asked for a `SELECT ... WHERE status` query. **There is no `status`
+  column** — contract §4's `events` schema is externally owned and this repo has no migrations — so
+  the discriminator is the new metadata annotation instead. Operator-confirmed before implementation.
+- **Not yet live:** nothing calls the sweep at boot; that call site is in bastion. Carryover
+  `orphan-reconcile-unwired-in-bastion`.
+- **Refs:** `planning/EN.9.C/tasks.md`; roadmap `operator-surface`, lane `terminal`.
+
+### Lane `terminal` section 1 closed — two blocks, and four defects found in passing
+- **What:** Closed `EN.9.C` and `EN.9.A` (PR #45). Along the way: completed `EN.9.A`'s integration
+  by hand after `/sdlc-flow` returned `stranded: true`; resolved a two-file merge conflict between
+  the unpushed `EN.9.C` commits and the squash-landed `EN.9.A`; repaired a stale spec `Status` line;
+  corrected two wrong acceptance criteria in `master-plan.md` at source; and promoted three new
+  carryovers.
+- **Why the strand matters:** the PR failure had nothing to do with the code — all five repo gates
+  passed. The push was blocked by HQ's pre-push `E_SYNC_DRIFT` because the wrap-up bumped
+  `status.md`'s timestamp without re-syncing the brain project cache, and the engine reported a bare
+  PR failure without the pre-push stderr. Any brain-vaulted repo running `/sdlc-flow` can hit this.
+- **Refs:** `planning/orchestration-run/operator-surface/notes.md` + `review.md`.
+
 ### `EN.9.A` closed — term-core and term-attach extracted from bastion
 - **What:** Drove `EN.9.A` via `/sdlc-flow`, in place on branch `EN.9.A-flow`, all 8 tasks passed,
   PASS review. Tasks 1–4 scaffolded `crates/term-core` and ported bastion's terminal-control code
