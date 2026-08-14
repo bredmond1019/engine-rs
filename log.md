@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-09T13:30:00Z"
+timestamp: "2026-08-13T22:55:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,44 @@ related: [status, context]
 ---
 
 ## [run: 2026-08-13]
+
+### `EN.ticket.run-failure-notification` closed — terminal run failures reach the operator channel
+- **What:** Drove `ticket-run-failure-notification` via `/sdlc-task`, in place on `main`, all 6 tasks
+  passed. Task 1 added `operator::failure` with a pure notify-or-not decision over
+  `derive_terminal_status`'s four outcomes and two policy knobs (`notify_on_statuses`,
+  `failure_item_priority`) resolving through the standard four layers across
+  `baseline`/`cheap-fast`/`thorough`, documented in `planning/harness.json`. Task 2 added the pure
+  renderer — workflow type, run id, first failing node and its error, `budget_halted` distinguished
+  from `failed` in the text, deterministic marked truncation rather than failing to notify. Task 3
+  hooked `live_state::mark_terminal`, the single point every run exits through, so a run that
+  failed three nodes emits one notification, not three; `cancelled` deliberately emits none. Task 4
+  added the integration suite (`tests/it/run_failure_notification.rs`, 6 tests) covering the burst
+  case, the single-failure path and both negative cases. Task 5 carried the documentation as an
+  explicit task, because `/sdlc-task` ships no docs stage. Task 6 validated the full gate.
+- **Why:** Closes the last block of engine-rs's `operator-surface` section. Without it the first
+  thing the operator learns about a failed run is a log line nobody reads.
+- **Refs:** `planning/ticket-run-failure-notification/tasks.md`; roadmap `operator-surface`, lane
+  `surface`.
+
+### Lane close — `operator-surface` section complete, one correction worth keeping
+- **What:** Closed `EN.8.D` (PR #44) and the ticket above, ran the downstream consumer check against
+  `core/bastion` (clean, `--locked`, 1m01s), cleared two carryovers on that single piece of
+  evidence, promoted `approve-and-run-seams-unwired-in-bastion` (P1), and wrote
+  `BA.ticket.approve-and-run-seams` into bastion at the operator's request. `/close-out` found
+  `docs/architecture.md` stale on the policy-resolving registration list and fixed it (`d3c7252`).
+  Repaired one partial state write: `/sdlc-task` set `state.json` to `closed` but left the spec's
+  own Status line reading "Not started".
+- **Why:** The Telegram operator gate cleared between runs, so the two blocks left HELD on
+  2026-08-12 became runnable. **The correction matters more than the closes:** this lane initially
+  recorded bastion's operator seams as stubbed `|_| None`, which is wrong — `notify-send-trigger`
+  already made them real, and the actual gap is narrower (the lookup resolves against a registry fed
+  only by `POST /api/notify/test`, so engine-queued items are invisible to it). The error came from
+  reading bastion's doc comments instead of its wiring; the comments describe authoring-time state
+  and a later ticket moved the code without moving the prose.
+- **Refs:** `planning/orchestration-run/operator-surface/notes.md` + `review.md`;
+  `planning/handoff.md`.
+
+---
 
 `EN.8.D` — APPROVE_AND_RUN — shipped across 8 tasks, PASS review. Built the operator-approval POC engine-rs's half of `business/docs/profile-and-pitch.md:128`'s pitch composes: `render`/`render_and_validate` turn a pending-harvest record into a `ValidatedOperatorPayload` with a deterministic gate_id and a fixed approve/skip/open_session option set (task 1); `ApproveAndRunPolicy` (drain_batch_max/harvest_item_priority/session_fallback_slug) resolves through the standard four-layer precedence with baseline/cheap-fast/thorough profiles (task 2); the drain renders and validates pending-harvest records into `EN.8.B`'s `OperatorQueue`, routing non-conforming records to `session-<slug>` and bounded by `drain_batch_max` (task 3); the verdict path maps a tapped option key to a `LedgerDecision`, records it via `EN.8.C`'s `operator::ledger::record_decision`, re-queues on digest mismatch, and authorizes execution only on a matched Approved verdict (task 4); the declared `APPROVE_AND_RUN` graph composes `HarvestApproveNode` behind `ApproveAndRunExecuteNode` over the injectable `HttpPost` seam (task 5); `ApproveAndRunSeams` (lookup_pending/resolve_verdict, Send+Sync, no DB/network) exposes the two bastion-shaped seams and `engine-serve` registers the workflow with per-event policy resolution (task 6); a hermetic end-to-end suite covers the POC scenario, a 60-item storm, digest-mismatch requeue, and non-conforming session-routing (task 7); the full gate (fmt, clippy `-D warnings`, nextest --workspace, release build) validated green — 1995/1995 tests, no code changes needed (task 8). Notable decisions: `ApproveAndRunExecuteNode` composes rather than reimplements `HarvestApproveNode`'s POST; an engine-side `ApproveAndRunVerdict` struct stands in for bastion's `telegram::ResponseVerdict` since this crate can't name bastion's type; the integration suite uses `FileApprovalLedger` over a tempdir since `InMemoryApprovalLedger` is test-only and invisible from the `tests/it` binary. The block is complete and testable in engine-rs alone; live-on-a-phone still depends on bastion wiring the two open seams (`PendingLookup`/`VerdictSink`) into `run_server`, a separate bastion block. Docs: `docs/operator-payload-contract.md` updated, `docs/approve-and-run-workflow.md` added. Next: `EN.ticket.run-failure-notification`, `EN.9.C`, or `EN.5.B2`.
 
