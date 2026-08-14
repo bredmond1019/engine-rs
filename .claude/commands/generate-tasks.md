@@ -3,10 +3,16 @@
 ## Variables
 
 $ARGUMENTS — one of two input modes:
-             - **Master-plan slug mode (default):** the spec's `planning/` directory name (its
-               phase-dotted slug), e.g. `<spec-slug>` or `2.1-learn-paths-structural-fixes`. New
-               master-plan specs follow the `P.N-slug` convention (see `planning/index.md` → *Task
-               directory naming convention*). The block definition is read from `master-plan.md`.
+             - **Master-plan slug mode (default):** the spec's `planning/` directory name — its block
+               ID. **Write new spec directories in the canonical form `<REPO>.<phase>.<block>`**
+               (e.g. `BA.0.A`, `EN.8.A`) — a repo-unique two-or-three-letter code from `brain.toml`, a
+               phase number, and a block letter or number; the directory name equals the block ID
+               exactly, no title suffix. This is the form `/generate-master-plan.md` and `/plan.md`
+               author (see `/generate-master-plan.md` step 4 for the full rule). **Legacy directories
+               still resolve** for as long as they exist — older specs may be spelled
+               `<phase>.<block>-<title>` (e.g. `2.1-learn-paths-structural-fixes`) or
+               `<repo>-<phase><block>-<title>`; this command does not require migrating them, it only
+               writes new ones canonically. The block definition is read from `master-plan.md`.
              - **Plan-file mode (`--from <path> [phaseN-blockX]`):** decompose a block from a
                standalone plan file instead of `master-plan.md`. The file may be either a single
                standalone block definition (legacy D34) or a master-plan-format `/plan` output with
@@ -161,6 +167,32 @@ $ARGUMENTS — one of two input modes:
    - **`dependsOn` ids are all valid** — every id referenced exists as some task's `task_id` in the
      same array, and the final Validate task depends on every other task's id.
    - **Acceptance Criteria are non-empty and observable** — each criterion can be judged true/false.
+   - **Un-gateable criteria are declared (D64) — can fail.** This repo's checks are all in-repo and
+     in-language (`node --check` plus a set of Python scripts here; `cargo fmt`/`clippy`/`nextest`/
+     `build` for a Rust repo) and structurally cannot observe evidence living outside that boundary.
+     Apply this mechanical test to **every** Acceptance Criterion, keyed on *where the criterion's
+     evidence lives* — never on how important or risky it feels:
+
+     | Evidence location | Verdict |
+     |---|---|
+     | this repo, this language, observable in-process | **gated** — say nothing further |
+     | another process (an external CLI, e.g. `gh`), another repo (a sibling git index), a generated
+       artifact (e.g. a `status.md` a tool emits), or an **installed artefact** (the binary/distributed
+       copy the fleet runs, as opposed to the source tree the checks compile) | **declare it** |
+
+     Any criterion whose evidence lives in another process, another repo, a generated artifact, or
+     an installed artefact, and carries neither a named failing command nor a dedicated
+     fixture-evidence task in `tasks.json` (a task whose `acceptance_criteria` name the concrete
+     fixture standing in for the missing gate — a retro-fixture against a known-bad instance, or a
+     corpus sweep), fails this check: revise the
+     spec in place — declare the criterion explicitly and add the evidence task — then re-run this
+     self-check. **`tasksPassed` is evidence of gate agreement, not correctness** — a green suite is
+     never itself the evidence for an un-gateable criterion. Ordinary criteria ("the function
+     returns X", "the diagnostic fires", "the field validates") resolve to the first row instantly,
+     need no ceremony, and get no added step — this rule must stay quiet on the common case or it
+     destroys the lean lane. A verification task that shells out to an installed binary (`mev`,
+     `bastion`, or similar) must state explicitly whether it is checking **source** or **installed**
+     behaviour — the two diverge, and the divergence is invisible unless named.
    - **Validation Commands are present** (or `planning/harness.json` → `validation.checks[]` supplies
      them as the fallback).
    - **No leftover template sentinels** — no `{{TOKEN}}`, no literal seed strings the Output Format
@@ -292,12 +324,25 @@ heading's bullets used to hold (bulleted lines in one string are fine). `accepta
 `validation_commands` — `[]` for any task that touches source the project's checks compile or lint;
 the spec-level markdown sections stay authoritative for those. **Set it for a task that CANNOT break
 the build** — docs-only, config-only, fixture-only — with the cheap commands that actually verify
-that task (file exists, frontmatter present, index updated). `/sdlc-flow` and `/sdlc-task` run those
-commands INSTEAD of the project-wide gating checks for that task, so a markdown edit stops paying
-for a full compile; the end review still re-runs the full gating suite over the integrated tree, so
-nothing escapes validation. In compile-expensive stacks this is the single cheapest win available
-at authoring time — a docs task in a Rust workspace can otherwise cost minutes per attempt to
-validate a paragraph. Example:
+that task (file exists, frontmatter present, index updated).
+
+**The two engines run an override differently ([D63](../../planning/decisions/D63-per-task-validation-commands-augment-gating.md)) — know which one the spec is targeting:**
+- **`/sdlc-flow`** still runs the override commands INSTEAD of the project-wide gating checks for
+  that task, so a markdown edit stops paying for a full compile; its end review unconditionally
+  re-runs the full gating suite over the integrated tree afterward, so nothing escapes validation.
+- **`/sdlc-task` has no end review.** Every `gates:true` harness check's cheap `fastCommand` (or
+  `command` if no `fastCommand` is defined) still runs alongside the task's own
+  `validation_commands` — the override only ever substitutes for the non-gating portion of the
+  harness list. This means `validation_commands` does **not** buy the same skip-the-gates savings
+  under `/sdlc-task` that it buys under `/sdlc-flow`; it still avoids the *expensive* authoritative
+  form (that only runs once, in `/sdlc-task`'s own terminal reconcile), but a docs-only task cannot
+  use it to skip a project's gating checks entirely — under this lean engine, whatever a task's own
+  tripwire runs is the only gate that task gets until the terminal reconcile.
+
+In compile-expensive stacks, setting `validation_commands` is still the single cheapest win
+available at authoring time for a docs/config/fixture-only task — a docs task in a Rust workspace
+can otherwise cost minutes per attempt to validate a paragraph — but under `/sdlc-task` that saving
+comes from skipping the expensive `command` form, not the gating checks themselves. Example:
 `"validation_commands": ["test -f docs/thing.md", "grep -q '^type:' docs/thing.md", "grep -q 'thing.md' docs/index.md"]`
 `max_attempts` — defaults to 3, only set per-task to override. `files` — every task but the final
 Validate task needs ≥1 entry. `dependsOn` — ids that must complete first; the final Validate task

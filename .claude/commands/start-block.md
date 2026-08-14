@@ -35,6 +35,10 @@ subagent round trip adds latency without adding value.
      `docs/state/state-schema.md`).
    - Save `planning/state.json` and validate it is still valid JSON:
      `python3 -c "import json;json.load(open('planning/state.json'))"`.
+     This is a **parse-only** sanity check, not schema validation — it cannot catch a shape
+     mismatch (e.g. a struct-typed field like `origin` written as a scalar), which parses fine as
+     JSON and only fails `mev`'s typed deserialization. For real schema confidence, run
+     `mev validate-brain --state`.
    - Run `mev emit-state --write` to refresh `focus.now`/`focus.next` from the new status.
 
 ## Context / Files to Read

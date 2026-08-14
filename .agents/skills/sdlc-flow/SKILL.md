@@ -223,6 +223,14 @@ Everything below runs from the main repo root first.
    it — running that task's tests means running ONLY those commands (they fully replace the
    harness/spec checks for that task's fast tripwire). Tasks with no `validation_commands` fall back to
    the harness/spec checks as normal. The end-review always runs the full harness/spec suite regardless.
+   **This is deliberately NOT what `/sdlc-task` does, and the difference must not be "fixed".** Per
+   [D63](../../../planning/decisions/D63-per-task-validation-commands-augment-gating.md), `/sdlc-task`
+   treats an override as **augment-gating-only** — a `gates:true` check is never skipped there —
+   because that engine has no end review, so an overridden task's own list would be the only gate it
+   ever gets. `/sdlc-flow` keeps pure substitution precisely because the end review above re-runs the
+   full suite over the integrated tree, so nothing is ever skipped forever. Unifying the two engines
+   here would either re-impose the compile cost the override exists to avoid, or silently weaken
+   `/sdlc-task`.
 5. Engine-parse-safety scan: for each task, look at its `files[]` for any path under
    `.claude/workflows/`. Record those paths per task — they get an unconditional
    `node --check <path>` gate (see Phase 3), independent of `harness.json`, in both the fast per-task
@@ -465,14 +473,30 @@ get it right before touching git.**
    - If a task range/selection was given and this run did NOT just flip status.md to `Done`: leave it
      untouched (only flip on genuine full-spec completion, never on a partial range).
    - Otherwise: resolve this spec's block id from the `status.md` row you just edited, then run this
-     **scripted, non-interactive** mutation (never open the file in an editor, never a manual Edit-tool
-     diff) — it only ever mutates the single matching block, and never writes if no match is found:
+     **scripted, non-interactive**, **validate-then-commit** mutation (never open the file in an
+     editor, never a manual Edit-tool diff). `json.load()` succeeding is **not** schema validity — mev
+     deserializes `state.json` into typed structs, so a scalar where a struct belongs parses fine as
+     JSON and fails the whole file (this is what happened 2026-08-09: a string `origin` where the
+     schema types it as a struct). The script therefore captures the pre-write bytes, mutates in
+     memory, runs `mev validate-brain --state` BEFORE and AFTER the write, and rejects — byte-exact
+     rollback — any write that introduces diagnostic lines not present in the BEFORE baseline.
+     Pre-existing corpus errors (a sibling lane's unrelated breakage) never block the write —
+     **net-new only**, the same delta-attribution rule the push gate uses under D64. This validation
+     runs identically in `--worktree` mode: `mev validate-brain --state` reads this repo's own
+     `planning/state.json` directly and does not need the cross-repo `BRAIN_ROOT` resolution that
+     makes `emit-state --write` unsafe inside a linked worktree — only step 3's `emit-state --write`
+     is deferred in worktree mode, never this validation:
      ```
      python3 -c "
-     import json, sys
+     import json, subprocess, sys, shutil
+
      path = 'planning/state.json'
      bid = sys.argv[1]
-     data = json.load(open(path))
+
+     with open(path, 'rb') as fh:
+         pre_bytes = fh.read()
+
+     data = json.loads(pre_bytes)
      found = False
      for track in data.get('tracks', []):
          for block in track.get('blocks', []):
@@ -482,17 +506,56 @@ get it right before touching git.**
                  break
          if found:
              break
-     if found:
+
+     if not found:
+         print('NOT_FOUND')
+         sys.exit(0)
+
+     mev_available = shutil.which('mev') is not None
+
+     def diagnostics():
+         r = subprocess.run(['mev', 'validate-brain', '--state'], capture_output=True, text=True)
+         lines = (r.stdout + r.stderr).splitlines()
+         return set(l for l in lines if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
+
+     if not mev_available:
          with open(path, 'w') as fh:
              json.dump(data, fh, indent=2, ensure_ascii=False)
              fh.write(chr(10))
          print('FLIPPED:' + bid)
-     else:
-         print('NOT_FOUND')
+         print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only json.load-level parsing')
+         sys.exit(0)
+
+     baseline = diagnostics()
+
+     with open(path, 'w') as fh:
+         json.dump(data, fh, indent=2, ensure_ascii=False)
+         fh.write(chr(10))
+
+     after = diagnostics()
+     net_new = after - baseline
+
+     if net_new:
+         with open(path, 'wb') as fh:
+             fh.write(pre_bytes)
+         print('REJECTED:' + bid)
+         for line in sorted(net_new):
+             print('NET_NEW: ' + line)
+         sys.exit(1)
+
+     print('FLIPPED:' + bid)
      " "<resolved-block-id>"
      ```
-     Trust only this script's own stdout (`FLIPPED:<id>` or `NOT_FOUND`) — never assume success. Then
-     validate: `python3 -c "import json;json.load(open('planning/state.json'))"`.
+     Read the script's own stdout AND exit code — do not infer success yourself:
+     - `NOT_FOUND` (exit 0) — file stays byte-unchanged; report it, never fabricate a block entry.
+     - `FLIPPED:<id>` with no `UNVALIDATED:` line (exit 0) — mev validated the write, no net-new
+       diagnostics; treat the block as closed.
+     - `FLIPPED:<id>` WITH an `UNVALIDATED:` line (exit 0) — mev is not installed, the write landed
+       unchecked (a degrade, matching how the harness treats other absent tooling); report the
+       UNVALIDATED line verbatim.
+     - `REJECTED:<id>` (exit 1) — net-new schema errors; `state.json` is rolled back byte-exact to its
+       pre-write content. Report every `NET_NEW:` line verbatim and do **not** treat the block as
+       closed this run — a later run must flip it once the underlying cause is fixed.
 3. Regenerate derived surfaces via `mev emit-state --write` — run this step whenever wrap-up runs at
    all, independent of whether the spec fully completed (status.md was edited either way). This
    includes `state.json`'s top-level `focus` object (e.g. `focus.next`) — step 2's scripted mutation

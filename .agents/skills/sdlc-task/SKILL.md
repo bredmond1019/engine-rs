@@ -249,9 +249,14 @@ not persist between calls.
    ("acceptance_criteria/validation_commands can stay [] per task").
    - `allTasks` = every `task_id`, in array order.
    - **Per-task validation override**: for each task whose `validation_commands` is a non-empty array,
-     remember `{taskId, validationCommands}` — this task's test stage runs ONLY these commands,
-     **replacing** the harness gating checks for that task alone (copy the commands verbatim; every
-     other task still uses the harness/spec checks below).
+     remember `{taskId, validationCommands}`. Per
+     [D63](../../../planning/decisions/D63-per-task-validation-commands-augment-gating.md),
+     `/sdlc-task` treats this as **augment-gating-only** — it never causes a `gates:true` harness
+     check to be skipped. This task's test stage runs the project's `gates:true` harness checks
+     (fast form) **in addition to** these commands, copied verbatim; nothing is replaced. (Only if
+     `harness.json` defines zero `gates:true` checks does this task run solely its own commands —
+     see Step 3's test-step bullet for how that edge case is reported, never silent.) Every other
+     task still uses the harness/spec checks below, unchanged.
    - **Engine-parse-safety scan**: for each task, check its `files` array for any path under
      `.claude/workflows/`. Remember `{taskId, files: [...matching paths only...]}` for every task that
      has one. This produces an **unconditional, hardcoded gate** later (independent of
@@ -356,12 +361,20 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
      surfaces exactly like a test failure: the task is never marked passed on this attempt; triage decides whether
      to RETRYABLE (fix and try again, ≤3 times) or MAJOR (bail to a human right now).
    - **Test step** — run ONLY the applicable check set, never invent checks:
-     - If this task declared its own `validation_commands` override (Step 2.1): run exactly those
-       commands, each one gating.
-     - Else, render the harness checks: if `testDepth == fast`, filter to checks with `gates:true`
-       AND `perTask !== false`; if `full`, run the whole `validation.checks[]` list. If no
-       `harness.json`/no matching checks, fall back to the spec's `## Validation Commands` in order
-       (or one informational no-op row if the spec has none).
+     - If this task declared its own `validation_commands` override (Step 2.1) — **D63,
+       augment-gating-only**: run the project's `gates:true` harness checks (fast form —
+       `fastCommand`, or `command` if no `fastCommand` is set), numbered first, **PLUS** this task's
+       own override commands, numbered to continue the sequence, all gating. Nothing is skipped; the
+       override is additive. If `harness.json` defines zero `gates:true` checks, there is nothing of
+       the harness's own to add — this task then runs only its own override commands, and the
+       `validated:` label records this explicitly as **"ran none of the harness list (tasks.json
+       override, /sdlc-flow end review will reconcile)"**, logged to terminal output too (never
+       folded silently into a bare "validated" claim). Otherwise, on a normal project, the label is
+       **"substituted a documented subset (gates:true checks still ran)"**.
+     - Else, render the harness checks (label **"ran the harness list"**): if `testDepth == fast`,
+       filter to checks with `gates:true` AND `perTask !== false`; if `full`, run the whole
+       `validation.checks[]` list. If no `harness.json`/no matching checks, fall back to the spec's
+       `## Validation Commands` in order (or one informational no-op row if the spec has none).
      - **Always additionally add** the engine-parse-safety gate for any `.claude/workflows/` file this
        task's `files[]` names (Step 2.1): `node --check <file>` per file, gating, regardless of
        harness.json.
@@ -489,17 +502,32 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
    M tasks)"); otherwise keep Status "In progress" (a task subset ran) and optionally add a new line
    under "Current focus" pointing at the next task, citing the same cumulative count. Refresh "Last
    updated" to today's date.
-3. **Flip the block's status in `planning/state.json`** — skip silently if there's no
-   `planning/state.json`, OR if `blockDone` is false. Resolve the canonical block id from the
-   status.md Progress Table row (the only judgment call in this step), then run this exact scripted
-   mutation (never a hand Edit) — it searches every `tracks[].blocks[]` entry and only ever mutates
-   the one matching block's `status` field, leaving the file byte-unchanged on a miss:
+3. **Flip the block's status in `planning/state.json`, validate-then-commit** — skip silently if
+   there's no `planning/state.json`, OR if `blockDone` is false. Resolve the canonical block id from
+   the status.md Progress Table row (the only judgment call in this step), then run this exact
+   scripted mutation (never a hand Edit). `json.load()` succeeding is **not** schema validity — mev
+   deserializes into typed structs, so a scalar where a struct belongs parses fine as JSON and fails
+   the whole file (this is what happened 2026-08-09: a string `origin` where the schema types it as a
+   struct). The script therefore captures the pre-write bytes, mutates in memory, runs `mev
+   validate-brain --state` BEFORE and AFTER the write, and rejects — byte-exact rollback — any write
+   that introduces diagnostic lines not present in the BEFORE baseline. Pre-existing corpus errors
+   (a sibling lane's unrelated breakage) never block the write — **net-new only**, the same
+   delta-attribution rule the push gate uses under D64. This validation runs identically whether or
+   not `--worktree` is in effect: `mev validate-brain --state` reads this repo's own
+   `planning/state.json` directly and does not need the cross-repo `BRAIN_ROOT` resolution that makes
+   `--graph`/`emit-state --write` unsafe inside a linked worktree — only step 4's `emit-state --write`
+   is deferred in worktree mode, never this validation:
    ```
    python3 -c "
-   import json, sys
+   import json, subprocess, sys, shutil
+
    path = 'planning/state.json'
    bid = sys.argv[1]
-   data = json.load(open(path))
+
+   with open(path, 'rb') as fh:
+       pre_bytes = fh.read()
+
+   data = json.loads(pre_bytes)
    found = False
    for track in data.get('tracks', []):
        for block in track.get('blocks', []):
@@ -509,17 +537,57 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
                break
        if found:
            break
-   if found:
+
+   if not found:
+       print('NOT_FOUND')
+       sys.exit(0)
+
+   mev_available = shutil.which('mev') is not None
+
+   def diagnostics():
+       r = subprocess.run(['mev', 'validate-brain', '--state'], capture_output=True, text=True)
+       lines = (r.stdout + r.stderr).splitlines()
+       return set(l for l in lines if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
+
+   if not mev_available:
        with open(path, 'w') as fh:
            json.dump(data, fh, indent=2, ensure_ascii=False)
            fh.write(chr(10))
        print('FLIPPED:' + bid)
-   else:
-       print('NOT_FOUND')
+       print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only json.load-level parsing')
+       sys.exit(0)
+
+   baseline = diagnostics()
+
+   with open(path, 'w') as fh:
+       json.dump(data, fh, indent=2, ensure_ascii=False)
+       fh.write(chr(10))
+
+   after = diagnostics()
+   net_new = after - baseline
+
+   if net_new:
+       with open(path, 'wb') as fh:
+           fh.write(pre_bytes)
+       print('REJECTED:' + bid)
+       for line in sorted(net_new):
+           print('NET_NEW: ' + line)
+       sys.exit(1)
+
+   print('FLIPPED:' + bid)
    " "<RESOLVED_ID>"
    ```
-   Read the script's own stdout to decide success — on `NOT_FOUND`, report it; never fabricate a
-   block entry. Validate the file is still valid JSON afterward.
+   Read the script's own stdout AND exit code — do not infer success yourself:
+   - `NOT_FOUND` (exit 0) — file stays byte-unchanged; report it, never fabricate a block entry.
+   - `FLIPPED:<id>` with no `UNVALIDATED:` line (exit 0) — mev validated the write, no net-new
+     diagnostics; treat the block as closed.
+   - `FLIPPED:<id>` WITH an `UNVALIDATED:` line (exit 0) — mev is not installed, the write landed
+     unchecked (a degrade, matching how the harness treats other absent tooling); report the
+     UNVALIDATED line verbatim.
+   - `REJECTED:<id>` (exit 1) — net-new schema errors; state.json is rolled back byte-exact to its
+     pre-write content. Report every `NET_NEW:` line verbatim and do **not** treat the block as
+     closed this run, even though `blockDone` said yes — a later run must flip it once the underlying
+     cause is fixed.
 4. **Regenerate derived surfaces** — run this whenever bookkeep runs at all, NOT only when `blockDone`
    (status.md/tasks.md already changed either way). This includes `state.json`'s top-level `focus`
    object (e.g. `focus.next`) — step 3's scripted mutation above touches only the matched block's

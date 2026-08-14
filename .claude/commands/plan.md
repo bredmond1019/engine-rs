@@ -37,7 +37,11 @@ can run a single block.
    bullet in the block body (Output Format below) — the `### Block <Letter>` **heading itself stays
    a single uppercase letter, unprefixed.** `/sdlc-block` parses `### Block X` expecting `X` to be
    exactly one letter (`.claude/workflows/sdlc-block.js`); embedding the full prefixed ID in the
-   heading text breaks that parse.
+   heading text breaks that parse. `<Prefix>.<PhaseNumber>.<BlockLetter>` is the same canonical
+   block-ID form `/generate-master-plan.md` defines (step 4 there) — this file does not restate its
+   rationale, only its own heading/body split. When `/generate-tasks` decomposes one of this plan's
+   blocks into its own spec directory, that directory equals the Block ID exactly, no title suffix —
+   same rule as `/generate-master-plan.md`.
 5. Read any files directly relevant to the task (the files the blocks will touch).
 6. **THINK HARD about scope and decomposition before writing:**
    - A mini-roadmap is typically 1–3 phases and 1–5 blocks. If it grows larger than that, it belongs
@@ -206,6 +210,10 @@ to any block registered here.
      `{ "type": "backlog", "slug": "<backlog-slug>" }`.
 3. Save `planning/state.json` and validate it is still valid JSON:
    `python3 -c "import json;json.load(open('planning/state.json'))"`.
+   This is a **parse-only** sanity check, not schema validation — it cannot catch a shape mismatch
+   (e.g. a struct-typed field like `origin` written as a scalar), which parses fine as JSON and
+   only fails `mev`'s typed deserialization. For real schema confidence, run
+   `mev validate-brain --state`.
 
 ### State Refresh
 

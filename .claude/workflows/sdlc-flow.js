@@ -429,7 +429,9 @@ const WRAPUP_SCHEMA = {
     nextFocus:     { type: 'string' },
     amendments:    { type: 'array', items: { type: 'string' }, description: 'D18 dated amendment-log lines appended to the spec (empty if none)' },
     commitHash:    { type: 'string' },
-    blockStatusFlipped: { type: 'string', description: 'The state.json tracks[].blocks[].id flipped to "closed" on the branch this run, or "" if none (spec not fully done, no state.json, or block not found).' },
+    blockStatusFlipped: { type: 'string', description: 'The state.json tracks[].blocks[].id flipped to "closed" on the branch this run, or "" if none (spec not fully done, no state.json, block not found, or the write was rejected by validation).' },
+    stateWriteValidated: { type: 'boolean', description: 'true if mev validate-brain --state gated the state.json mutation (before/after diff, net-new only); false when mev was not on PATH and the write landed with only json.load-level parsing (a degrade, not a pass)' },
+    stateWriteRejected: { type: 'boolean', description: 'true if the state.json mutation introduced net-new schema errors and was rolled back byte-exact; the block was NOT flipped to closed this run' },
     emitStateRan:  { type: 'boolean', description: 'true if `mev emit-state --write` regenerated derived surfaces on the branch itself during this in-place (non-worktree) wrap-up; false when skipped (worktree mode, or mev/brain.toml absent)' },
     stateWritten:  { type: 'boolean', description: 'true if the agent ALSO persisted sdlc-flow-state.json + worklog.md this same turn (the wrap-up-phase state-write fold); false/omitted when it did not (write not attempted/completed)' },
     notes:         { type: 'string' }
@@ -1287,6 +1289,13 @@ log(`Tasks in spec: ${allTasks.join(', ')}${selectedTasks ? ` | selected: ${task
 // Per-task validation overrides from tasks.json's `validation_commands` (see ENUMERATE_SCHEMA).
 // Returns null when the task declared none, which means "use the harness gating checks" — the
 // pre-existing behaviour for every task in every existing spec.
+// D63 (planning/decisions/D63-per-task-validation-commands-augment-gating.md) — DELIBERATELY
+// DIFFERENT from sdlc-task.js: this engine stays a PURE SUBSTITUTE, unchanged. When present, a
+// task's validation_commands still fully replaces the harness gating checks for that task's
+// per-task tripwire (zero harness.json gates:true checks run for that task). This is safe here,
+// and unsafe in sdlc-task.js, because this engine's end review (~line 1932 below) unconditionally
+// re-runs the FULL gates:true harness suite over the integrated tree regardless of any per-task
+// override — nothing is ever silently skipped forever, only deferred to the end review.
 const taskCheckMap = new Map(
   (enumResult.taskChecks || [])
     .filter(tc => tc && Number.isInteger(tc.taskId) && Array.isArray(tc.validationCommands) && tc.validationCommands.length)
@@ -1294,7 +1303,17 @@ const taskCheckMap = new Map(
 )
 function taskCommandsFor(taskNum) { return taskCheckMap.get(taskNum) || null }
 if (taskCheckMap.size) {
-  log(`Per-task validation overrides (tasks.json validation_commands): ${[...taskCheckMap.keys()].sort((a, b) => a - b).join(', ')} — these tasks skip the project-wide harness tripwire.`)
+  log(`Per-task validation overrides (tasks.json validation_commands): ${[...taskCheckMap.keys()].sort((a, b) => a - b).join(', ')} — D63: these tasks run ZERO planning/harness.json gates:true checks on their per-task tripwire (pure substitute, unchanged); the end review's full gating suite is the backstop.`)
+}
+
+// D63 — shared validated: vocabulary (identical strings in sdlc-task.js, per the ADR). This engine
+// only ever lands on ranHarnessList (no override) or ranNoneOfHarnessList (override present) — it
+// never reaches substitutedSubset, which is an /sdlc-task-only case (see the ADR's "never actually
+// lands on both case 2 and case 3 within the same engine").
+const VALIDATED_LABEL = {
+  ranHarnessList: 'ran the harness list',
+  substitutedSubset: 'substituted a documented subset (gates:true checks still ran)',
+  ranNoneOfHarnessList: 'ran none of the harness list (tasks.json override, /sdlc-flow end review will reconcile)',
 }
 
 // Hardcoded engine-parse gate (mechanism, not project policy — see renderCheckList). Per-task
@@ -1422,12 +1441,15 @@ STEP W4 — use the Write tool for both files. Do NOT run \`git add\`, \`git com
 }
 
 async function runTests(label, { gatingOnly, taskCommands = null, onPass = null, engineFiles = [] }) {
+  // D63 — pure substitute, unchanged: usingOverride still fully replaces the harness gating checks
+  // for this task's per-task tripwire (not augmented, unlike sdlc-task.js). Safe here because the
+  // end review below unconditionally re-runs the full gates:true suite over the integrated tree.
   const usingOverride = Array.isArray(taskCommands) && taskCommands.length > 0
   return tracedAgent(`${W}
 You are the test agent for the /sdlc-flow pipeline. Run the project's validation checks and report.
 
 IMPORTANT — run ONLY the checks enumerated below (${usingOverride
-    ? "this task declares its OWN validation_commands in tasks.json, which REPLACE the project-wide harness checks for this task — the full harness suite still runs at the end review"
+    ? "this task declares its OWN validation_commands in tasks.json, which REPLACE the project-wide harness checks for this task (D63 — pure substitute for this engine) — the full harness suite still runs at the end review"
     : 'from planning/harness.json + the spec'}). Do NOT invent
 checks. All Bash calls run from the worktree root (prefix each with: cd ${worktreePath} &&).
 
@@ -1804,16 +1826,20 @@ Return via StructuredOutput:
     }
 
     // 3. Fast test (tripwire) — gating checks only unless testDepth=full. A task that declares its
-    //    own `validation_commands` in tasks.json runs THOSE instead (the end review still runs the
-    //    full harness suite over the integrated tree, so nothing escapes validation — this only
-    //    changes what the per-task tripwire costs).
-    const passValidatedLabel = taskCommandsFor(taskNum)
-      ? 'per-task validation_commands (tasks.json override)'
-      : (testDepth === 'fast' ? 'gating checks (fast tripwire)' : 'full gating suite')
+    //    own `validation_commands` in tasks.json runs THOSE instead (D63 — pure substitute, unchanged
+    //    for this engine: the end review still runs the full harness suite over the integrated tree,
+    //    so nothing escapes validation — this only changes what the per-task tripwire costs).
+    //    passValidatedLabel is always one of the shared VALIDATED_LABEL trichotomy (D63).
+    const hasOverride = !!taskCommandsFor(taskNum)
+    const passValidatedLabel = hasOverride ? VALIDATED_LABEL.ranNoneOfHarnessList : VALIDATED_LABEL.ranHarnessList
     const passPayload = buildPassPayload(taskNum, t, attempt, passValidatedLabel)
     const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast', taskCommands: taskCommandsFor(taskNum), onPass: passPayload, engineFiles: engineFilesFor(taskNum) })
     if (testResult && testResult.allPassed) {
       t.validated = passValidatedLabel
+      // D63 — a task that ran ZERO harness.json gating checks must be VISIBLE in terminal output,
+      // never only recorded in state. In this engine that is the ordinary override case (pure
+      // substitute), backstopped by the end review's unconditional full-suite re-run.
+      log(`Task ${taskNum}: validated → "${passValidatedLabel}".${passValidatedLabel === VALIDATED_LABEL.ranNoneOfHarnessList ? ' NOTE: this task ran ZERO planning/harness.json gates:true checks on its per-task tripwire; the end review will re-run the full gating suite over the integrated tree.' : ''}`)
       taskPassed = true
       if (testResult.stateWritten) {
         // The folded write went straight to disk (no STATE_WRITE_SCHEMA result to read startedAt
@@ -2264,13 +2290,27 @@ Target:
       <BlockID> column, or the id that row maps to in state.json). This is the only part of this
       step that stays your judgment call — the mutation itself is scripted below, not an Edit-tool
       diff.
-    - Run ONE scripted mutation (never the Edit tool) to perform the write — substitute the id you
+    - VALIDATE-THEN-COMMIT CONTRACT (same as sdlc-task.js's bookkeep stage): the mutation must not
+      stand unless it passes the real typed schema check. \`json.load()\` succeeding is NOT schema
+      validity — mev deserializes state.json into typed structs, so a scalar where a struct belongs
+      parses fine as JSON and fails deserialization for the WHOLE FILE (this is exactly what happened
+      2026-08-09 with a string \`origin\` where the schema types it as a struct). Run ONE scripted
+      mutation (never the Edit tool) that captures the pre-write bytes, mutates in memory, runs
+      \`mev validate-brain --state\` BEFORE and AFTER the write, and rejects — byte-exact rollback —
+      any write that introduces diagnostic lines NOT present in the BEFORE baseline. Pre-existing
+      corpus errors (e.g. a sibling lane's unrelated breakage) must never block this write — NET-NEW
+      only, the same delta-attribution rule the push gate uses under D64. Substitute the id you
       resolved for <RESOLVED_ID> (keep it as the script's sole argv, quoted):
         cd ${worktreePath} && python3 -c "
-import json, sys
+import json, subprocess, sys, shutil
+
 path = 'planning/state.json'
 bid = sys.argv[1]
-data = json.load(open(path))
+
+with open(path, 'rb') as fh:
+    pre_bytes = fh.read()
+
+data = json.loads(pre_bytes)
 found = False
 for track in data.get('tracks', []):
     for block in track.get('blocks', []):
@@ -2280,22 +2320,70 @@ for track in data.get('tracks', []):
             break
     if found:
         break
-if found:
+
+if not found:
+    print('NOT_FOUND')
+    sys.exit(0)
+
+mev_available = shutil.which('mev') is not None
+
+def diagnostics():
+    r = subprocess.run(['mev', 'validate-brain', '--state'], capture_output=True, text=True)
+    lines = (r.stdout + r.stderr).splitlines()
+    return set(l for l in lines if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
+
+if not mev_available:
     with open(path, 'w') as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
         fh.write(chr(10))
     print('FLIPPED:' + bid)
-else:
-    print('NOT_FOUND')
+    print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only json.load-level parsing')
+    sys.exit(0)
+
+baseline = diagnostics()
+
+with open(path, 'w') as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write(chr(10))
+
+after = diagnostics()
+net_new = after - baseline
+
+if net_new:
+    with open(path, 'wb') as fh:
+        fh.write(pre_bytes)
+    print('REJECTED:' + bid)
+    for line in sorted(net_new):
+        print('NET_NEW: ' + line)
+    sys.exit(1)
+
+print('FLIPPED:' + bid)
 " "<RESOLVED_ID>"
-      The script searches EVERY tracks[].blocks[] entry and only ever mutates the one matching
-      block's "status" field; on a miss it prints NOT_FOUND and never opens the file for writing,
-      so it stays byte-unchanged. Read the script's own stdout — do not infer success yourself: on
-      "FLIPPED:<id>" set blockStatusFlipped to that id; on "NOT_FOUND" report it in notes, do NOT
-      fabricate a block entry, and set blockStatusFlipped to "".
-    - Validate the file is still valid JSON:
-        cd ${worktreePath} && python3 -c "import json;json.load(open('planning/state.json'))"
-    - Set blockStatusFlipped to the block id you closed (or "" if none).
+      The script searches EVERY tracks[].blocks[] entry and only ever mutates the one matching block's
+      "status" field. Read the script's own stdout AND exit code — do not infer success yourself:
+        - "NOT_FOUND" (exit 0) → the file stays byte-unchanged. Report it in notes, do NOT fabricate a
+          block entry, and set blockStatusFlipped to "".
+        - "FLIPPED:<id>" with NO "UNVALIDATED:" line (exit 0) → mev validated the write and found no
+          net-new diagnostics. Set blockStatusFlipped to that id and stateWriteValidated=true.
+        - "FLIPPED:<id>" WITH an "UNVALIDATED:" line (exit 0) → mev is not installed; the write landed
+          unchecked (json.load-level parse only, matching how the harness degrades other absent
+          tooling). Set blockStatusFlipped to that id, stateWriteValidated=false, and copy the
+          UNVALIDATED line verbatim into notes — this is a DEGRADE, not a silent pass.
+        - "REJECTED:<id>" (exit 1) → the write introduced net-new schema errors and was rolled back;
+          state.json on disk is now byte-identical to its content before this step ran. Set
+          blockStatusFlipped to "", stateWriteRejected=true, and copy every "NET_NEW:" line verbatim
+          into notes. This MUST be reported — never silently swallow it, and do not treat the block as
+          closed this run even though earlier logic said to proceed; the spec's status.md edit already
+          recorded progress narrative, but the block stays open until a clean write lands on a later
+          run.
+    - WORKTREE NOTE (decided, not deferred — same as sdlc-task.js and verified here on the worktree
+      path specifically, since \`/sdlc-flow\` runs in a worktree far more often than \`/sdlc-task\`
+      does): this validation step runs the SAME WAY in worktree mode as in place. \`mev validate-brain
+      --state\` reads planning/state.json in THIS repo's working tree directly (\`${worktreePath}\`) — it
+      does not need the cross-repo BRAIN_ROOT resolution that makes \`emit-state --write\` unsafe inside
+      a linked worktree. Only step 2c's \`emit-state --write\` (regenerating derived surfaces) is
+      deferred to merge in worktree mode; this validation is never deferred, in either engine.
+    - Set blockStatusFlipped to the block id you closed (or "" if none, or if the write was rejected).
 
 2c. Regenerate derived surfaces via \`mev emit-state --write\`. Run this step whenever this wrap-up
     stage runs at all — it is NOT conditional on "was this the last task" / full-spec completion above:
@@ -2357,12 +2445,17 @@ EOF
    cd ${worktreePath} && git log --oneline -1`}
 ${renderWrapupStateWriteRecipe(wrapupStatePayload)}
 Return via StructuredOutput: statusUpdated, devlogUpdated, nextFocus, amendments[], commitHash,
-blockStatusFlipped (the state.json block id closed in step 2b, or ""), emitStateRan (step 2c),
+blockStatusFlipped (the state.json block id closed in step 2b, or "" — including when the write was
+rejected by validation), stateWriteValidated, stateWriteRejected (step 2b), emitStateRan (step 2c),
 stateWritten (true only if you performed the additional state write above), notes.
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
+if (wrapupResult?.stateWriteRejected) {
+  log(`state.json: write REJECTED — net-new schema error(s) from mev validate-brain --state; rolled back byte-exact, block NOT closed this run. ${wrapupResult?.notes || ''}`)
+} else if (wrapupResult?.blockStatusFlipped) {
+  log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch (${wrapupResult?.stateWriteValidated ? 'validated: mev validate-brain --state, net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})${wrapupResult?.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree, /merge-train, or /close-out --merge-branch runs `mev emit-state --write` on merge.'}`)
+}
 if (wrapupResult?.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended.`)
-if (wrapupResult?.blockStatusFlipped) log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch${wrapupResult?.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree, /merge-train, or /close-out --merge-branch runs `mev emit-state --write` on merge.'}`)
 log(`Derived surfaces (in-place, this wrap-up): ${wrapupResult?.emitStateRan ? 'regenerated (mev emit-state --write).' : useWorktree ? 'skipped — worktree mode; focus.next stays stale until regenerated on merge.' : 'skipped (mev/brain.toml absent).'}`)
 
 // Final state write (status reflects the terminal state; PR fields filled after creation).

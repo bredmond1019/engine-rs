@@ -86,6 +86,10 @@ error-prone part of editing `state.json` by hand:
    statuses). Never invent a block ID prefix — resolve it from `brain.toml`.
 3. **Validate the JSON is well-formed** before doing anything else:
    `python3 -c "import json;json.load(open('planning/state.json'))"`.
+   This is a **parse-only** sanity check, not schema validation — it cannot catch a shape mismatch
+   (e.g. a struct-typed field like `origin` written as a scalar), which parses fine as JSON and
+   only fails `mev`'s typed deserialization. For real schema confidence, run
+   `mev validate-brain --state`.
 4. **Regenerate derived views** — run `mev emit-state --write` (from anywhere under the brain root; it
    walks up to find `brain.toml`). This recomputes `focus`, brain `repos[]`/`cross_repo[]`, and any
    `master-plan.md` wave tables with `wave-table` sentinels. Never hand-patch these fields to "match" —

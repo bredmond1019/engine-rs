@@ -41,6 +41,12 @@ block into a runnable `tasks.md`.
      *proactive* question rounds; this floor governs *never fabricating*. Prefer an honest "I need X to
      define block N" over a confident invention.
 4. **Determine the Block ID Prefix:** Find this repo's `prefix` in `brain.toml` at the brain root (e.g., `BA`). Use this for all block IDs. If none exists, derive a strict two-letter uppercase prefix (e.g. `BA`). **This prefix must be unique across all projects.**
+   - **Canonical block-ID form:** `<Prefix>.<PhaseNumber>.<BlockLetter>` (e.g. `BA.0.A`) — the repo
+     prefix from `brain.toml`, a phase number, and a block letter or number. This is the settled
+     convention for all block-of-work planning objects (larger than a `/ticket` or `/chore`), across
+     the whole fleet. **The spec directory `/generate-tasks` creates for this block equals the block
+     ID exactly** — `planning/<Prefix>.<PhaseNumber>.<BlockLetter>/` — with **no title suffix**
+     appended (never `planning/0.A-some-title/` or `planning/ba-0a-some-title/`).
 5. **THINK HARD about phase/block decomposition before writing:**
    - **Sequence by dependency and competence, not calendar.** Foundational, enabling work is Phase 0;
      the hardest, most-differentiating work is the last phase. `/sdlc-block` runs **phases
@@ -263,6 +269,10 @@ After writing/revising `master-plan.md`, register every block (new or changed) i
      `mev emit-state --write` from each block's `tasks.json`, if one exists.
 3. Save `planning/state.json` and validate it is still valid JSON:
    `python3 -c "import json;json.load(open('planning/state.json'))"`.
+   This is a **parse-only** sanity check, not schema validation — it cannot catch a shape mismatch
+   (e.g. a struct-typed field like `origin` written as a scalar), which parses fine as JSON and
+   only fails `mev`'s typed deserialization. For real schema confidence, run
+   `mev validate-brain --state`.
 
 ### State Refresh
 

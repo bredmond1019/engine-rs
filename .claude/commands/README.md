@@ -55,6 +55,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | Planning | `/generate-roadmap`, `/generate-master-plan`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` |
 | SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-workflow`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block`, `/merge-train` |
+| Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/roadmap-status` |
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
 
 ### `brain/` — Reference Only
@@ -299,6 +300,19 @@ entry per finding, each carrying a `finding_id` for mev's cross-repo correlation
 dedup, similarity, ranking, or staleness logic of its own (that's mev's — `mev carryover`); it never
 auto-merges, and it writes no `state.json` anywhere. `/generate-roadmap --from <consolidated-review.md>`
 is the disposal path for what it proposes.
+
+### `/roadmap-status --roadmap <slug>`
+Read-only, mid-run view of one roadmap's live lanes across every repo — joins the roadmap's
+`lane-log.jsonl`, `orchestration-run/<roadmap-slug>/{notes.md,review.md}`, per-spec
+`sdlc/sdlc-*state.json`, and each repo's `state.json` (via `scripts/roadmap_status_discovery.py`),
+then reports, in D57 section 6 order: what needs the operator now, what is running or recently
+finished, what stopped and why. With `--roadmap` omitted it lists candidate roadmaps and stops
+rather than guessing. Liveness comes from `updated_at` against a named staleness threshold, never
+from the seven-value `status` field alone; unknown status values pass through verbatim. It
+implements no ranking, dedup, or staleness scoring of its own (that's mev's, same discipline as
+`/consolidate-run`) and writes nothing — no `state.json`, no record, no lock. Not `/attention`
+(fleet-wide staleness triage), not `/next` (what to work on), not `/consolidate-run` (post-run
+finding correlation) — this answers what a roadmap's lanes are doing right now.
 
 ---
 

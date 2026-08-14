@@ -602,14 +602,34 @@ order as the input list.
 // "<Prefix>.<N>.<Letter>" id resolved during enumeration; null/empty when it couldn't be resolved
 // (a legacy heading with no brain.toml prefix) or when this repo has no state.json at all — both are
 // silent no-ops, never a hard failure, so this stays optional for repos that don't use the convention.
-const STATE_SYNC_SCHEMA = { type: 'object', required: ['updated'], properties: { updated: { type: 'boolean' }, reason: { type: 'string' } } }
+// AUDIT (ticket-engine-state-write-validates-before-commit, task 3): this function shares the exact
+// scripted-mutation-then-commit pattern the ticket targets — it used to gate the commit on
+// `json.load()` alone, which is parse-validity, not schema-validity (mev deserializes into typed
+// structs; a scalar where a struct belongs parses fine and fails the WHOLE FILE — the 2026-08-09
+// incident). STEP 3/4 below now run the same validate-then-commit contract as sdlc-task.js's bookkeep
+// and sdlc-flow.js's wrap-up: capture pre-write bytes, mutate in memory, run
+// `mev validate-brain --state` before/after, and reject (byte-exact rollback) only on NET-NEW
+// diagnostics (D64 delta attribution — a sibling lane's pre-existing breakage never blocks this).
+// WORKTREE NOTE (decided, not deferred): the prompt already states this call runs "from the MAIN repo
+// root" (never a linked worktree — /sdlc-block's children run in worktrees, but the orchestrator's own
+// state.json sync always runs from main), so there is no worktree-deferral case here to state.
+const STATE_SYNC_SCHEMA = {
+  type: 'object',
+  required: ['updated'],
+  properties: {
+    updated: { type: 'boolean' },
+    reason: { type: 'string' },
+    stateWriteValidated: { type: 'boolean', description: 'true if mev validate-brain --state gated this write (net-new diagnostics only); false when mev was not on PATH and the write landed with only json.load-level parsing (a degrade, not a pass).' },
+    stateWriteRejected: { type: 'boolean', description: 'true if the mutation introduced net-new schema errors and was rolled back byte-exact; the status was NOT changed this call.' }
+  }
+}
 async function syncBlockState(id, newStatus) {
   if (!id) return
   const r = await agent(`
 You maintain this repo's planning/state.json — the authoritative work-block graph (see
 docs/state/state-schema.md for the schema; the brain root is found by walking up from CWD until
 you find brain.toml, then planning/state.json sits in THIS repo, not the brain root). You run from the
-MAIN repo root.
+MAIN repo root (never a linked worktree).
 
 STEP 1 — Read it:
   cat planning/state.json 2>/dev/null || echo "__NO_STATE__"
@@ -618,15 +638,85 @@ STEP 1 — Read it:
 STEP 2 — Find the block whose "id" field is exactly "${id}" inside ANY tracks[].blocks[] entry (search
   every track). If not found, return updated=false, reason="block ${id} not registered in state.json".
 
-STEP 3 — AUTHORED EDIT ONLY (see state-schema.md's Authored-vs-derived table). Set that block's
-  "status" field to "${newStatus}" (one of open/in_progress/closed — never hand-author "blocked", that
-  value is always derived). Touch NOTHING else on the block and do not touch "focus", "repos[]", or
-  "cross_repo[]" anywhere in the file (all derived — never hand-edit).
+STEP 3/4 — VALIDATE-THEN-COMMIT CONTRACT (AUTHORED EDIT ONLY — see state-schema.md's
+  Authored-vs-derived table; touch ONLY that block's "status" field, never "focus", "repos[]", or
+  "cross_repo[]", all derived). \`json.load()\` succeeding is NOT schema validity. Run ONE scripted
+  mutation (never the Edit tool) that captures the pre-write bytes, mutates in memory, runs
+  \`mev validate-brain --state\` BEFORE and AFTER the write, and rejects — byte-exact rollback — any
+  write that introduces diagnostic lines NOT present in the BEFORE baseline. Pre-existing corpus errors
+  must never block this write — NET-NEW only (D64 delta attribution):
+  python3 -c "
+import json, subprocess, sys, shutil
 
-STEP 4 — Validate the JSON is still well-formed:
-  python3 -c "import json;json.load(open('planning/state.json'))"
-  If that fails: git checkout -- planning/state.json (discard the bad edit), then return updated=false,
-  reason="edit produced invalid JSON".
+path = 'planning/state.json'
+bid = sys.argv[1]
+new_status = sys.argv[2]
+
+with open(path, 'rb') as fh:
+    pre_bytes = fh.read()
+
+data = json.loads(pre_bytes)
+found = False
+for track in data.get('tracks', []):
+    for block in track.get('blocks', []):
+        if block.get('id') == bid:
+            block['status'] = new_status
+            found = True
+            break
+    if found:
+        break
+
+if not found:
+    print('NOT_FOUND')
+    sys.exit(0)
+
+mev_available = shutil.which('mev') is not None
+
+def diagnostics():
+    r = subprocess.run(['mev', 'validate-brain', '--state'], capture_output=True, text=True)
+    lines = (r.stdout + r.stderr).splitlines()
+    return set(l for l in lines if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
+
+if not mev_available:
+    with open(path, 'w') as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write(chr(10))
+    print('FLIPPED:' + bid)
+    print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only json.load-level parsing')
+    sys.exit(0)
+
+baseline = diagnostics()
+
+with open(path, 'w') as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write(chr(10))
+
+after = diagnostics()
+net_new = after - baseline
+
+if net_new:
+    with open(path, 'wb') as fh:
+        fh.write(pre_bytes)
+    print('REJECTED:' + bid)
+    for line in sorted(net_new):
+        print('NET_NEW: ' + line)
+    sys.exit(1)
+
+print('FLIPPED:' + bid)
+" "${id}" "${newStatus}"
+  Read the script's own stdout AND exit code — do not infer success yourself:
+    - "NOT_FOUND" (exit 0) → file stays byte-unchanged. Return updated=false,
+      reason="block ${id} not registered in state.json".
+    - "FLIPPED:<id>" with NO "UNVALIDATED:" line (exit 0) → mev validated the write, no net-new
+      diagnostics. stateWriteValidated=true. Proceed to STEP 5.
+    - "FLIPPED:<id>" WITH an "UNVALIDATED:" line (exit 0) → mev is not installed; the write landed
+      unchecked (a DEGRADE, not a silent pass). stateWriteValidated=false; copy the UNVALIDATED line
+      verbatim into reason. Proceed to STEP 5.
+    - "REJECTED:<id>" (exit 1) → net-new schema errors; state.json on disk is now byte-identical to its
+      content before this call ran. stateWriteRejected=true. Return updated=false immediately — do NOT
+      proceed to STEP 5/6 — reason="write rejected: net-new schema error(s) from mev validate-brain
+      --state" followed by every "NET_NEW:" line verbatim. This MUST be reported, never silently
+      swallowed.
 
 STEP 5 — Commit on the current branch (stage explicitly):
   git add planning/state.json
@@ -643,11 +733,12 @@ STEP 6 — MANDATORY verification (this call must NEVER leave the tree dirty —
   train branch dirty and blocking every subsequent block's merge). Return updated=false in that case,
   reason="commit did not land after retry; discarded the edit to keep the tree clean".
 
-Return via StructuredOutput: updated (true iff the status was actually changed AND committed AND
-git status --porcelain -- planning/state.json is confirmed empty), reason.
+Return via StructuredOutput: updated (true iff the status was actually changed AND validated-or-degraded
+AND committed AND git status --porcelain -- planning/state.json is confirmed empty), reason,
+stateWriteValidated, stateWriteRejected.
 `, { label: `state-sync:${id}:${newStatus}`, schema: STATE_SYNC_SCHEMA, model: 'haiku' })
   if (!r || !r.updated) log(`(state.json) ${id} -> ${newStatus}: skipped — ${r?.reason || 'sync agent returned null'}`)
-  else log(`(state.json) ${id} -> ${newStatus}`)
+  else log(`(state.json) ${id} -> ${newStatus} (${r.stateWriteValidated ? 'validated: mev validate-brain --state, net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})`)
 }
 
 // ================================================================
