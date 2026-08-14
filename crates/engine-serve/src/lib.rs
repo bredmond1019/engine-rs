@@ -10,6 +10,7 @@ pub mod durable;
 pub mod email_webhooks;
 pub mod http;
 pub mod live_state;
+pub mod orphan;
 pub mod resume;
 pub mod schedule;
 pub mod stream;
