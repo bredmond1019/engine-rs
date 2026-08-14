@@ -138,6 +138,28 @@ would be a MAJOR contract bump; see `planning/decisions/D6-cancellation-and-budg
 Both are produced by `Workflow::run_with` (`crates/engine-core/src/workflow.rs`) at the node
 boundary, before dispatching the next node — see `docs/architecture.md` § Core Types.
 
+**`metadata.completion` (`EN.9.C`, engine-rs-side).** Mirroring `metadata.cancellation`/
+`metadata.budget`/`metadata.suspension` exactly, every terminal exit — success, node error,
+cancellation, and budget halt — now stamps a `completion` key into the same `final_ctx` snapshot
+the durable writer persists, keyed with the same status vocabulary `derive_terminal_status`
+reports for that snapshot (`succeeded|failed|cancelled|budget_halted`):
+
+```jsonc
+{ "metadata": { "completion": { "terminal": true, "status": "succeeded", "at": "<rfc3339>" } } }
+```
+
+`crate::completion::stamp_completion` writes this in `crates/engine-serve/src/suspend.rs` at both
+terminal exits (`:467`, `:485`), before `live.mark_terminal`; the suspend path never stamps it — a
+suspended run is not terminal, and marking it complete would hide it from the crash-recovery sweep
+below. This is an **engine-rs-only extension, not a canonical re-pin** — no `engine_contract` Rust
+type changes shape, and the Pinned Contract Version below does not move. It exists because there is
+no `status` column on `events` (contract §4) and status-derivation alone cannot distinguish a clean
+finish from a run that crashed mid-walk (a crash before any failure marker is written also derives
+as `"succeeded"`): the marker's *absence*, not its content, is what `engine-store`'s
+`list_orphan_candidates` query and `engine-serve`'s boot sweep (`crate::orphan::reconcile_orphans`)
+key on to find crash-stranded runs. See [orphan-recovery.md](orphan-recovery.md) for the full
+sweep, the stale-run alarm, and the policy knobs.
+
 The canonical contract's v1.2.0 adds a third run-level annotation, `metadata.failure` — written by
 the orchestrator's Celery worker when a workflow raises inside `process_incoming_event`, on a
 fresh session that survives the enclosing transaction's rollback: `{ "failure": { "failed": true,
@@ -323,3 +345,4 @@ the change Minor for that reason — and no `engine_contract` Rust type changes 
 | — | 2026-07-30 | Not a re-pin — **Pinned Contract Version stays 1.4.0.** `EN.6.F` (engine-rs-side) adds three engine-rs-only routes with no canonical counterpart (§ HTTP surface parity above): `POST /events/{run_id}/pause`, `POST /events/{event_id}/resume`, and `GET /events/suspended`, plus the `metadata.suspension` run-level annotation (§ Run-level `metadata` annotations above) recording a suspended run's resume pointer, origin, and pre-suspend budget-ledger snapshot. Mirrors the abort (`EN.2.B`) and stream (`EN.5.F`) precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `suspension` lives entirely in the existing free-form `TaskContext::metadata` field. `durable.rs`'s writer now upserts across a suspend/resume cycle rather than writing a single terminal update (§ above). See [suspend-resume.md](suspend-resume.md) for the full marker shape and both suspension origins. |
 | 1.5.0 | 2026-08-01 | Re-pin from 1.4.0 to 1.5.0 (`OR.ticket.corpus-reconcile`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.5.0 addition, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact` gain an optional `authored_at: datetime \| null`, threaded to the written `brain_documents` rows. Additive and backward-compatible — omitted or `null` preserves the server-side `datetime.now()` fallback exactly, so `PersistToBrainNode`'s existing payload stays valid unchanged; sending a real `authored_at` is an opt-in improvement for `EN.6.K`'s ingest-client hardening. Sits alongside the 2026-07-28 `EN.4.F` row below (structured `investment` / `authored_locale` inside `roadmap`) rather than superseding it: whoever wires the real ingest URL should send both. No `engine_contract` Rust type changed shape — these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. |
 | 1.6.0 | 2026-08-01 | Re-pin from 1.5.0 to 1.6.0 (`OR.K2`, orchestrator-side; not an engine-rs block) — **the consequential one for `EN.6.K`**. `GET /recall`'s response semantics change (§ HTTP surface parity above): `score` is now a similarity where **higher is always better** on every path (`1.0` exact-id, `1.0 - cosine distance` semantic, unchanged fused similarity for hybrid), where 1.4.0 returned a raw cosine *distance* on the exact-id/semantic paths (`0.0` exact-id, lower-is-better); and `via`'s vocabulary widens from `exact-id \| semantic \| hybrid` to also include `structural \| keyword \| memory` (per-candidate hybrid provenance, previously collapsed to a bare `"hybrid"`). Field names, types, and the `q`/`limit`/`hybrid` query params are unchanged, and no `engine_contract` Rust type changes shape — `GET /recall` is a route engine-rs calls as a client, not one `engine-serve` serves. **`EN.6.K` (the Brain read-client seam — engine-rs's first `GET /recall` consumer, and therefore the first thing this polarity can bite) must be built against 1.6.0 semantics:** `RecallNode` sorts/thresholds `score` **descending / higher-is-better**, and any type deserializing `via` must tolerate all six values or it will fail to parse a hybrid result. A 1.4.0-era comparison direction ranks results backwards with no error — this re-pin exists specifically to close that window before `EN.6.K` runs. |
+| — | 2026-08-13 | Not a re-pin — **Pinned Contract Version stays 1.6.0.** `EN.9.C` (engine-rs-side) adds the `metadata.completion` run-level annotation (§ Run-level `metadata` annotations above), stamped by `crate::completion::stamp_completion` at every terminal exit in `crates/engine-serve/src/suspend.rs`, plus an `engine-store` query (`list_orphan_candidates`) and an `engine-serve` boot sweep (`crate::orphan::reconcile_orphans`) that use the marker's absence to find and fail crash-stranded runs, and a stale-run alarm on age-past-threshold `running`/`suspended` runs. Mirrors the `cancellation`/`budget`/`suspension` precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `completion` lives entirely in the existing free-form `TaskContext::metadata` field. See [orphan-recovery.md](orphan-recovery.md) for the full marker shape, the sweep, the alarm, and the policy knobs. |
