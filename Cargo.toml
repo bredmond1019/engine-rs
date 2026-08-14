@@ -5,6 +5,8 @@ members = [
     "crates/engine-contract",
     "crates/engine-store",
     "crates/engine-serve",
+    "crates/term-core",
+    "crates/term-attach",
 ]
 
 [workspace.package]
@@ -32,6 +34,8 @@ mev = { path = "../mev" }
 okf-core = { path = "../okf-core" }
 tempfile = "3"
 sha2 = "0.10"
+thiserror = "2"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 # Dev/test link-time speedup — engine-core alone compiles to 25+ integration-test binaries, each
 # statically linking the whole crate + its dependency graph (tokio/serde/actix-web/sqlx). Both

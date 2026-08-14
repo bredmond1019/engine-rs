@@ -1,0 +1,31 @@
+# Claude agent-state detection manifest.
+#
+# Rules are evaluated in descending priority order. The first match wins.
+# Adding a new agent requires only a new .toml file — no engine-code changes.
+
+name = "claude"
+
+# ── Blocked (highest priority) ────────────────────────────────────────────────
+# Claude Code's tool-use approval dialog shows "Do you want to proceed?"
+# in a bordered box. Match that phrase anywhere on screen.
+[[rules]]
+state = "blocked"
+priority = 100
+visible_blocker = true
+gate = { contains = "Do you want to proceed?" }
+
+# ── Working ───────────────────────────────────────────────────────────────────
+# While Claude is generating output it shows "esc to interrupt" at the bottom.
+[[rules]]
+state = "working"
+priority = 50
+visible_working = true
+gate = { contains = "esc to interrupt" }
+
+# ── Idle ──────────────────────────────────────────────────────────────────────
+# The resting Claude Code prompt is a bare `> ` line.
+[[rules]]
+state = "idle"
+priority = 10
+visible_idle = true
+gate = { line_regex = "^> " }

@@ -1,0 +1,31 @@
+# Pi agent-state detection manifest.
+#
+# Pi is an AI assistant (pi.ai). This manifest was added by dropping a new .toml
+# file — zero engine-code changes required. That extensibility property is
+# asserted by the golden tests in golden_tests.rs.
+
+name = "pi"
+
+# ── Working (highest priority) ────────────────────────────────────────────────
+# Pi shows "Working..." while generating a response.
+[[rules]]
+state = "working"
+priority = 50
+visible_working = true
+gate = { contains = "Working..." }
+
+# ── Blocked ───────────────────────────────────────────────────────────────────
+# Pi may surface an explicit confirmation prompt.
+[[rules]]
+state = "blocked"
+priority = 40
+visible_blocker = true
+gate = { contains = "Please confirm" }
+
+# ── Idle ──────────────────────────────────────────────────────────────────────
+# Pi's idle state shows its name prefix before the input field.
+[[rules]]
+state = "idle"
+priority = 10
+visible_idle = true
+gate = { line_regex = "^Pi: " }

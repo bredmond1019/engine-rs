@@ -2708,6 +2708,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "term-attach"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "term-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "term-core"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
