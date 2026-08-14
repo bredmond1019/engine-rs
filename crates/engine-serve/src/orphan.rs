@@ -34,10 +34,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use engine_contract::EventsRow;
+use engine_contract::{EventsRow, TaskContext};
 use engine_core::operator::orphan::OrphanPolicy;
+use engine_core::operator::queue::{ItemSource, OperatorQueueItem};
+use engine_core::operator::{
+    validate, OperatorPayload, OperatorPayloadLimits, OperatorResponseOption,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::live_state::{LiveStateStore, RunId};
 
 /// The injectable seam this sweep lists orphan candidates through:
 /// `list_orphan_candidates(older_than, limit)` -> the rows whose
@@ -273,6 +279,132 @@ pub async fn reconcile_orphans(
     })
 }
 
+// ── Stale-run alarm (`EN.9.C` task 6) ──────────────────────────────────
+
+/// Pure decision function: given `records` — the live map's `(run_id,
+/// snapshot, updated_at)` triples, exactly [`LiveStateStore::list_live_records`]'s
+/// shape — `now`, and the policy-resolved `stale_run_alarm_secs`, return
+/// the run ids whose live status (`crate::http::derive_live_status`) is
+/// `"running"` or `"suspended"` AND whose age past `updated_at` is at least
+/// the threshold.
+///
+/// No I/O, no clock reads beyond the `now` argument, no dependency on
+/// [`LiveStateStore`] itself — this is what makes it hermetically testable
+/// with hand-built fixtures, no database and no real store.
+#[must_use]
+pub fn stale_run_ids(
+    records: &[(RunId, TaskContext, DateTime<Utc>)],
+    now: DateTime<Utc>,
+    stale_run_alarm_secs: u64,
+) -> Vec<RunId> {
+    let threshold =
+        chrono::Duration::seconds(i64::try_from(stale_run_alarm_secs).unwrap_or(i64::MAX));
+    records
+        .iter()
+        .filter(|(_, snapshot, updated_at)| {
+            let live_status = crate::http::derive_live_status(snapshot);
+            (live_status == "running" || live_status == "suspended")
+                && now.signed_duration_since(*updated_at) >= threshold
+        })
+        .map(|(run_id, _, _)| *run_id)
+        .collect()
+}
+
+/// Render a stale-run alarm into a validated [`OperatorPayload`] — same
+/// rendering discipline as `failure::render_failure_payload`: a fixed
+/// header naming the run and how long it has sat past its last recorded
+/// progress, a small fixed acknowledgement-only response set (nothing
+/// executes on either option, matching the failure-notification
+/// convention), run through `operator::validate` before ever being
+/// returned. The one error path is `validate`'s own (a caller-supplied
+/// `limits` too small to hold even the fixed header).
+fn render_stale_run_alarm_payload(
+    run_id: RunId,
+    live_status: &str,
+    age_secs: i64,
+    limits: &OperatorPayloadLimits,
+) -> Result<
+    engine_core::operator::ValidatedOperatorPayload,
+    engine_core::operator::OperatorValidationError,
+> {
+    let rendered_summary = format!(
+        "Run stuck: {live_status}\nRun: {run_id}\nNo progress for {age_secs}s, past the alarm threshold"
+    );
+    let options = vec![
+        OperatorResponseOption::new("acknowledge", "Acknowledge"),
+        OperatorResponseOption::new("view_run", "View run"),
+    ];
+    let gate_id = format!("stale-run:{run_id}");
+    let payload = OperatorPayload::new(gate_id, rendered_summary, options);
+    validate(payload, limits)
+}
+
+/// The stale-run alarm: sweep `live`'s live records for any run past the
+/// resolved `policy.stale_run_alarm_secs` threshold (via [`stale_run_ids`])
+/// and enqueue exactly one [`OperatorQueueItem`] per such run into
+/// `live.operator_queue()`, mirroring
+/// `live_state.rs::maybe_enqueue_failure_notification`'s rendering
+/// discipline and `orphan_item_priority` for the item's priority.
+///
+/// De-duplicated via [`LiveStateStore::mark_alarmed`] — the same
+/// once-per-run shape `mark_terminal`'s `is_first_terminal_transition`
+/// established for terminal notifications: a repeated pass over the same
+/// stuck run enqueues nothing further, so one stuck run produces exactly
+/// one item, not one per tick.
+///
+/// Never panics, never blocks: a render/validate failure for one candidate
+/// (the one residual error path `render_stale_run_alarm_payload` can hit)
+/// is skipped rather than propagated, matching
+/// `maybe_enqueue_failure_notification`'s "an unreportable item has no
+/// useful fallback, but must never block this path" contract — the sweep
+/// still processes every other candidate.
+///
+/// Returns the number of items actually enqueued this call (0 for a
+/// no-stale-runs or an already-alarmed-everything pass).
+pub fn alarm_stale_runs(live: &LiveStateStore, policy: &OrphanPolicy, now: DateTime<Utc>) -> usize {
+    let records = live.list_live_records();
+    let stale = stale_run_ids(&records, now, policy.stale_run_alarm_secs);
+
+    let mut enqueued = 0;
+    for run_id in stale {
+        if !live.mark_alarmed(run_id) {
+            continue;
+        }
+
+        let Some((_, snapshot, updated_at)) = records.iter().find(|(id, _, _)| *id == run_id)
+        else {
+            continue;
+        };
+        let live_status = crate::http::derive_live_status(snapshot);
+        let age_secs = now.signed_duration_since(*updated_at).num_seconds();
+
+        let limits = OperatorPayloadLimits::default();
+        let Ok(validated) = render_stale_run_alarm_payload(run_id, live_status, age_secs, &limits)
+        else {
+            continue;
+        };
+
+        let item = OperatorQueueItem::new(
+            format!("stale-run:{run_id}"),
+            validated.into_payload(),
+            policy.orphan_item_priority,
+            now,
+            ItemSource::GateApproval,
+        );
+
+        let mut queue = live
+            .operator_queue()
+            .write()
+            .expect("operator queue lock poisoned on write");
+        queue.enqueue(item);
+        drop(queue);
+
+        enqueued += 1;
+    }
+
+    enqueued
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +605,145 @@ mod tests {
             node_runs,
         };
         assert_eq!(stuck_node_name(&ctx), None);
+    }
+
+    // ── Stale-run alarm (task 6) ───────────────────────────────────────
+
+    fn running_context() -> TaskContext {
+        task_context_with_running_node("SomeNode")
+    }
+
+    fn suspended_context() -> TaskContext {
+        TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({ "suspension": { "suspended": true } }),
+            node_runs: HashMap::new(),
+        }
+    }
+
+    fn terminal_context() -> TaskContext {
+        TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({ "completion": { "terminal": true, "status": "succeeded" } }),
+            node_runs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn fresh_run_does_not_alarm() {
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let records = vec![(run_id, running_context(), now)];
+
+        let stale = stale_run_ids(&records, now, 3600);
+
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn run_past_the_threshold_alarms() {
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let updated_at = now - chrono::Duration::seconds(3601);
+        let records = vec![(run_id, running_context(), updated_at)];
+
+        let stale = stale_run_ids(&records, now, 3600);
+
+        assert_eq!(stale, vec![run_id]);
+    }
+
+    #[test]
+    fn suspended_run_past_the_threshold_also_alarms() {
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let updated_at = now - chrono::Duration::seconds(7200);
+        let records = vec![(run_id, suspended_context(), updated_at)];
+
+        let stale = stale_run_ids(&records, now, 3600);
+
+        assert_eq!(stale, vec![run_id]);
+    }
+
+    #[test]
+    fn terminal_run_never_alarms_regardless_of_age() {
+        // A terminal snapshot's `derive_live_status` still reports
+        // "running" (it never re-derives terminality — see the function's
+        // own docs) so this exercises the real defense: `mark_terminal`
+        // removes a run from the live map entirely, so it can never appear
+        // in `list_live_records` in the first place. This test asserts the
+        // integration-level guarantee via `LiveStateStore`, not the pure
+        // function alone.
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        store.record(run_id, &terminal_context());
+        store.mark_terminal(run_id, &terminal_context(), "wf", now, now);
+
+        let far_future = now + chrono::Duration::hours(10);
+        let enqueued = alarm_stale_runs(&store, &OrphanPolicy::default(), far_future);
+
+        assert_eq!(enqueued, 0);
+    }
+
+    #[test]
+    fn threshold_is_policy_resolved_not_hardcoded() {
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        let updated_at = now - chrono::Duration::seconds(100);
+        let records = vec![(run_id, running_context(), updated_at)];
+
+        // Below a 3600s default threshold: not stale.
+        assert!(stale_run_ids(&records, now, 3600).is_empty());
+        // But stale against a tighter, policy-resolved 60s threshold.
+        assert_eq!(stale_run_ids(&records, now, 60), vec![run_id]);
+    }
+
+    #[test]
+    fn alarm_stale_runs_enqueues_exactly_one_item_for_a_stale_run() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        store.record(run_id, &running_context());
+
+        let far_future = now + chrono::Duration::hours(2);
+        let policy = OrphanPolicy::default();
+        let enqueued = alarm_stale_runs(&store, &policy, far_future);
+
+        assert_eq!(enqueued, 1);
+        let queue_len = store
+            .operator_queue()
+            .read()
+            .expect("queue lock")
+            .pending_count();
+        assert_eq!(queue_len, 1);
+    }
+
+    #[test]
+    fn a_second_pass_over_the_same_stuck_run_enqueues_nothing_further() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        store.record(run_id, &running_context());
+
+        let far_future = now + chrono::Duration::hours(2);
+        let policy = OrphanPolicy::default();
+
+        let first = alarm_stale_runs(&store, &policy, far_future);
+        assert_eq!(first, 1);
+
+        let second = alarm_stale_runs(&store, &policy, far_future + chrono::Duration::hours(1));
+        assert_eq!(second, 0);
+
+        let queue_len = store
+            .operator_queue()
+            .read()
+            .expect("queue lock")
+            .pending_count();
+        assert_eq!(
+            queue_len, 1,
+            "one stuck run must produce one item, not one per tick"
+        );
     }
 }

@@ -26,7 +26,7 @@
 //! "don't notify" (or a render/validate failure) is a silent no-op that
 //! never blocks the exit path.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -41,6 +41,11 @@ use uuid::Uuid;
 /// (contract §4) so the live in-memory snapshot and the durable row share
 /// the same identity.
 pub type RunId = Uuid;
+
+/// The live map's per-run value: the latest recorded snapshot paired with
+/// the wall-clock time it was recorded. See [`LiveStateStore::record`] for
+/// why the timestamp lives here rather than on the public API.
+type LiveEntry = (TaskContext, DateTime<Utc>);
 
 /// Number of completed runs retained for readback once they go terminal.
 /// The oldest completed run is evicted once the ring is full; live
@@ -88,15 +93,31 @@ impl CompletedRing {
 /// background tasks without extra synchronization.
 #[derive(Clone)]
 pub struct LiveStateStore {
-    inner: Arc<RwLock<HashMap<RunId, TaskContext>>>,
+    /// Latest snapshot per live run, paired with the wall-clock time it was
+    /// last `record`ed. The timestamp is stamped internally by [`Self::record`]
+    /// — `record`'s public two-argument signature is locked (see its docs),
+    /// so this is an implementation detail, not a new call-site obligation.
+    /// `EN.9.C` task 6's stale-run alarm ([`Self::list_live_records`]) is
+    /// what this timestamp exists for: the age of a `running`/`suspended`
+    /// run past its last-recorded progress.
+    inner: Arc<RwLock<HashMap<RunId, LiveEntry>>>,
     completed: Arc<RwLock<CompletedRing>>,
     /// The `EN.8.B` operator queue that terminal run-failure notifications
-    /// (`ticket-run-failure-notification` task 3) enqueue into — reusing
-    /// the existing depth-limited/digest-tailed queue type rather than a
-    /// bespoke channel. Runs under the built-in [`OperatorQueue`] default
-    /// policy; not yet threaded through `harness.json` (no other producer
-    /// is wired into `engine-serve` for it to share policy with today).
+    /// (`ticket-run-failure-notification` task 3) and the `EN.9.C` task 6
+    /// stale-run alarm enqueue into — reusing the existing
+    /// depth-limited/digest-tailed queue type rather than a bespoke
+    /// channel. Runs under the built-in [`OperatorQueue`] default policy;
+    /// not yet threaded through `harness.json` (no other producer is wired
+    /// into `engine-serve` for it to share policy with today).
     operator_queue: Arc<RwLock<OperatorQueue>>,
+    /// Run ids the `EN.9.C` task 6 stale-run alarm has already enqueued an
+    /// `OperatorQueueItem` for. Mirrors `mark_terminal`'s
+    /// `is_first_terminal_transition` dedup shape: a repeated pass over the
+    /// same stuck run must enqueue nothing further, so one stuck run
+    /// produces exactly one item. Cleared for a run id on `mark_terminal`
+    /// (a run that has gone terminal is no longer a stale-run candidate and
+    /// must not pin memory here forever).
+    alarmed_runs: Arc<RwLock<HashSet<RunId>>>,
 }
 
 impl Default for LiveStateStore {
@@ -107,6 +128,7 @@ impl Default for LiveStateStore {
             operator_queue: Arc::new(RwLock::new(OperatorQueue::new(
                 engine_core::operator::queue::OperatorQueuePolicy::default(),
             ))),
+            alarmed_runs: Arc::default(),
         }
     }
 }
@@ -137,7 +159,7 @@ impl LiveStateStore {
             .inner
             .write()
             .expect("live state store lock poisoned on write");
-        guard.insert(run_id, snapshot.clone());
+        guard.insert(run_id, (snapshot.clone(), Utc::now()));
     }
 
     /// Read the latest snapshot for `run_id`, if any. Serves from the live
@@ -153,7 +175,7 @@ impl LiveStateStore {
                 .inner
                 .read()
                 .expect("live state store lock poisoned on read");
-            if let Some(snapshot) = guard.get(&run_id) {
+            if let Some((snapshot, _)) = guard.get(&run_id) {
                 return Some(snapshot.clone());
             }
         }
@@ -194,7 +216,37 @@ impl LiveStateStore {
             .inner
             .write()
             .expect("live state store lock poisoned on write");
-        guard.remove(&run_id)
+        guard.remove(&run_id).map(|(snapshot, _)| snapshot)
+    }
+
+    /// Every live (non-terminal) run's current snapshot, paired with its
+    /// run id and the wall-clock time it was last [`Self::record`]ed.
+    /// `EN.9.C` task 6's pure stale-run decision function
+    /// (`crate::orphan::stale_run_ids`) reads this — the age of a
+    /// `running`/`suspended` run past its last-recorded progress is what
+    /// the alarm threshold measures against.
+    pub fn list_live_records(&self) -> Vec<(RunId, TaskContext, DateTime<Utc>)> {
+        let guard = self
+            .inner
+            .read()
+            .expect("live state store lock poisoned on read");
+        guard
+            .iter()
+            .map(|(run_id, (snapshot, updated_at))| (*run_id, snapshot.clone(), *updated_at))
+            .collect()
+    }
+
+    /// Record that the `EN.9.C` task 6 stale-run alarm has enqueued an item
+    /// for `run_id`. Returns `true` the first time this is called for a
+    /// given run id (the caller should enqueue), `false` on every
+    /// subsequent call for the same run id (already alarmed — a repeated
+    /// pass over the same stuck run must enqueue nothing further).
+    pub fn mark_alarmed(&self, run_id: RunId) -> bool {
+        let mut guard = self
+            .alarmed_runs
+            .write()
+            .expect("alarmed-runs lock poisoned on write");
+        guard.insert(run_id)
     }
 
     /// Mark a run terminal: move it out of the live map (if present) and
@@ -250,6 +302,15 @@ impl LiveStateStore {
                 .write()
                 .expect("live state store lock poisoned on write");
             live.remove(&run_id);
+        }
+        {
+            // A terminal run is no longer a stale-run candidate; drop it
+            // from the alarmed-runs set so it does not pin memory forever.
+            let mut alarmed = self
+                .alarmed_runs
+                .write()
+                .expect("alarmed-runs lock poisoned on write");
+            alarmed.remove(&run_id);
         }
         if is_first_terminal_transition {
             self.maybe_enqueue_failure_notification(run_id, snapshot, &workflow_type);
