@@ -1,0 +1,11 @@
+  ╭────────────────────────────────────────────────────────────────────────╮
+  │ Claude wants to execute a bash command                                 │
+  │                                                                        │
+  │ $ rm -rf /tmp/test-artifacts                                           │
+  │                                                                        │
+  │ Do you want to proceed?                                                │
+  │                                                                        │
+  │ ❯ Yes                                                                  │
+  │   No                                                                   │
+  │   Always allow                                                         │
+  ╰────────────────────────────────────────────────────────────────────────╯
