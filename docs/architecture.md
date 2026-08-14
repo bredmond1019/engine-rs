@@ -23,9 +23,13 @@ catch-up (D42). It is a parallel-pilot rewrite of the Python `orchestrator` engi
 
 ## Module Map
 
-The Cargo workspace (EN.0.A) declares the four member crates below. `engine-core` (EN.1.A),
+The Cargo workspace (EN.0.A) declares the member crates below. `engine-core` (EN.1.A),
 `engine-contract` (EN.0.B), `engine-store` (EN.0.B), and now `engine-serve` (EN.1.C) hold real
 types: dispatch, in-memory live state, the durable-write bridge, and the actix-web HTTP surface.
+`term-core` and `term-attach` (`EN.9.A`) are two more members — tmux session-control ported from
+`core/bastion`, split so the blocking attach path can never be pulled into `engine-core`/
+`engine-serve` by additive feature unification; neither is linked from either binary yet
+(`EN.9.B` wires `term-core` in). See [terminal-crates.md](terminal-crates.md).
 
 ```
 engine-rs/
@@ -169,6 +173,16 @@ engine-rs/
 │   │                         via `dispatch_with_event` + `spawn_run` — no self-directed HTTP call;
 │   │                         see [§ Schedule Source](#schedule-source-en6g) below and
 │   │                         [cron-primitive.md](cron-primitive.md))
+│   ├── term-core/          ← tmux session-control + agent-detection, ported verbatim from
+│   │                         `core/bastion`'s `src/sessions/{tmux,model,claude_state}.rs` and
+│   │                         `src/detect/` (`EN.9.A`) — no `attach_session`/`suspend_and_attach`,
+│   │                         no `anyhow`; not linked by `engine-core` or `engine-serve` in this
+│   │                         block (that wiring is `EN.9.B`). See
+│   │                         [terminal-crates.md](terminal-crates.md)
+│   └── term-attach/        ← `attach_session`/`suspend_and_attach` only — split from `term-core`
+│                              so no cargo feature-unification path can ever pull the blocking
+│                              attach code into the async `engine-core`/`engine-serve` binary
+│                              (`EN.9.A`). See [terminal-crates.md](terminal-crates.md)
 └── tests/                 ← round-trip + integration fixtures
     (crates/engine-core/tests/workflow_runner.rs — fixture 3-node linear workflow integration test;
     crates/engine-core/tests/parallel.rs — ParallelNode fan-out/merge integration tests;
