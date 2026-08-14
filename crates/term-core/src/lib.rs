@@ -17,8 +17,8 @@
 //! is the only real guarantee that the attach path cannot be reached from there. Do not
 //! "simplify" this back into a feature.
 //!
-//! Module slots below are filled by later tasks in this spec block (`EN.9.A`); each starts
-//! empty so the workspace builds with this crate present.
+//! `model` and `claude_state` are ported (Task 4 of `EN.9.A`): session/pane parsing and the
+//! read-only `~/.claude.json` workspace-trust observer.
 
 pub mod claude_state;
 pub mod detect;
