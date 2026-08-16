@@ -62,15 +62,27 @@ $ARGUMENTS — one of two input modes:
      files, and acceptance criteria — as the block definition. **Author a fresh decomposed
      `tasks.json` from it; do not merely copy a pre-existing step list verbatim** (apply the same scoping
      and disjoint-ownership rigor below). Do NOT read `master-plan.md` in this mode.
-   - **Master-plan slug mode:** read ONLY the relevant section for the requested block in
-     `planning/master-plan.md` (the phase/block definition).
-   - In both modes: do NOT read status.md — the target is given explicitly.
-   - **Use what the block already gives you.** A well-authored block (see `/generate-master-plan`)
-     names its **Files** (New vs Modified, by path), an **Out of scope** boundary, and an optional
-     **Interfaces / shared surface**. When present, **carry these through** rather than re-deriving:
-     the named files seed each task's disjoint ownership (step 6), and **Out
-     of scope is a hard boundary** — do not generate tasks beyond it. Only fall back to deriving file
-     ownership yourself when the block doesn't name files.
+   - **Block-record mode (the default since D65):** read
+     `planning/blocks/<BlockID>.json` — the authored definition of this block. It is the source of
+     truth for `what`, `why`, `files`, `interfaces`, `out_of_scope`, `acceptance_criteria`,
+     `validation_commands`, and `depends_on`. Do **not** read `master-plan.md`: it is a generated
+     view of the block graph, and reading it instead of the record gets you a stale summary.
+     If no record exists (a legacy directory predating D65), fall back to the block's section in
+     `planning/master-plan.md` and note the fallback in the report.
+   - In every mode: do NOT read status.md — the target is given explicitly.
+   - **Use what the block record already gives you.** It names its **files** (new vs modified, by
+     path), an **out_of_scope** boundary, and optional **interfaces**. **Carry these through**
+     rather than re-deriving: the named files seed each task's disjoint ownership (step 6), and
+     **`out_of_scope` is a hard boundary** — do not generate tasks beyond it. Only derive file
+     ownership yourself when the record does not name files (a `forward_looking: true` block may
+     name them provisionally, in which case refine them and update the record's `updated` date).
+   - **Carry the un-gateable criteria through (D64).** An acceptance criterion written in the
+     object form with `gateable: false` needs a dedicated fixture-evidence task in `tasks.json` —
+     the record names the fixture in its `evidence` field. Do not silently drop it into an
+     ordinary task.
+   - **Carry the operator edges through.** If the record's `depends_on` holds an `operator` or
+     `approval` edge, the spec cannot be run to completion until it clears. Say so in the report
+     rather than generating tasks that will stall.
 
 5. **Clarify gate (only when enabled).** Read `planning/harness.json` → `planning.clarify`. When it is
    `true` **or** `$ARGUMENTS` contains `--clarify`, and the block definition is genuinely ambiguous (its
@@ -139,10 +151,20 @@ $ARGUMENTS — one of two input modes:
      author-a-fresh-decomposition discipline this step describes — they are a recovery backstop for
      an already-written spec, not a substitute for running this command up front.
 
-7. Create the directory `planning/<spec-slug>/` if it does not exist, then write **both**
-   `planning/<spec-slug>/tasks.md` (prose) and `planning/<spec-slug>/tasks.json` (task list) using
-   the Output Format below. (In `--from` mode the directory already exists — it holds the source
-   block file — so the two new files land beside it.)
+7. Create the directory `planning/<spec-slug>/` if it does not exist, then write
+   `planning/<spec-slug>/tasks.json` (the task list) using the Output Format below.
+
+   **Then render the prose view — do not author it (D65).**
+   `python3 scripts/render_spec.py <BlockID>` writes `planning/<BlockID>/tasks.md` from the block
+   record at `planning/blocks/<BlockID>.json`. The engines read that file as the spec document
+   (`sdlc-task.js` sets `specFile = <blockDir>/tasks.md`), so it must exist — but it is
+   **generated**. Never hand-write or hand-edit it: change the block record and re-render, or the
+   two copies drift within a week. The renderer preserves an existing Amendment Log section, so
+   re-rendering mid-run is safe.
+
+   If no block record exists for this spec (a legacy directory predating D65), fall back to
+   authoring `tasks.md` from the Output Format below, and say so in the report — a spec with no
+   block record has no durable statement of *why* it exists, which is the gap D65 closes.
 
 8. **Property self-check (before committing).** A structurally valid spec can still be substantively
    thin and waste pipeline tokens. Re-read what you just wrote and confirm every required property

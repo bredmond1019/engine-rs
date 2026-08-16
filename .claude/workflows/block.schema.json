@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-portfolio/base-template/block.schema.json",
+  "title": "Block Record",
+  "description": "The authored definition of one block of work, written at plan time by /plan, /ticket, or /chore. Lives at planning/blocks/<BlockID>.json, one file per block. Governed by D65. Separate from tasks.json, which is the decomposition authored later by /generate-tasks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "repo",
+    "kind",
+    "title",
+    "description",
+    "what",
+    "why",
+    "sdlc_workflow",
+    "model",
+    "files",
+    "out_of_scope",
+    "acceptance_criteria",
+    "spec_dir",
+    "created",
+    "updated"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Canonical block ID. Equals the spec directory name exactly, and the basename of this file.",
+      "pattern": "^[A-Z]{2,3}\\.(\\d+[A-Z]?|ticket|chore)\\.[A-Za-z0-9][A-Za-z0-9-]*$",
+      "examples": ["MV.3.A", "BW.10.C0", "BA.ticket.fix-null-deref", "EN.chore.bump-deps"]
+    },
+    "repo": {
+      "type": "string",
+      "description": "Repo slug, as registered in brain.toml.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "kind": {
+      "type": "string",
+      "description": "Which producer authored this record and how it is scheduled.",
+      "enum": ["block", "ticket", "chore"]
+    },
+    "phase": {
+      "type": "integer",
+      "description": "Phase number for a roadmap block. Allocated per-repo from state.json, never from a narrative file (D65 section 7). Omit for tickets and chores.",
+      "minimum": 0
+    },
+    "initiative": {
+      "type": "string",
+      "description": "Slug of the owning initiative — the planning/<slug>/ folder holding the authored narrative (plan.md). Omit for standalone tickets and chores.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "description": "Short name. Matches the block's heading in plan.md and the title in state.json.",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "description": {
+      "type": "string",
+      "description": "One line: what this block is, for a surface that renders more than a title. Never empty — 0 of 894 blocks carried one before D65, and that is the gap this record exists to close.",
+      "minLength": 10
+    },
+    "what": {
+      "type": "string",
+      "description": "The scope, in implementation terms. Concrete enough to decompose into tasks.",
+      "minLength": 10
+    },
+    "why": {
+      "type": "string",
+      "description": "The motivation — why this block, why now in the sequence. Keeps a later decomposition from over- or under-scoping, and is the field whose absence forced intent to be re-derived from diffs.",
+      "minLength": 10
+    },
+    "sdlc_workflow": {
+      "type": "string",
+      "description": "Which engine consumes this block.",
+      "enum": ["none", "patch", "task", "run", "flow"]
+    },
+    "model": {
+      "type": "string",
+      "description": "Model tier. Rule of thumb: Opus for reasoning/breakdown only; sonnet for high-risk or complex; gemini-pro intermediate; gemini-flash simple.",
+      "enum": ["sonnet", "gemini-pro", "gemini-flash", "either"]
+    },
+    "workflow_rationale": {
+      "type": "string",
+      "description": "Prose explaining the workflow and model choices."
+    },
+    "files": {
+      "type": "object",
+      "description": "Files the block touches, named by path. Load-bearing: this is how /generate-tasks derives disjoint task ownership without guessing.",
+      "additionalProperties": false,
+      "properties": {
+        "new": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "purpose"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "purpose": { "type": "string", "minLength": 1, "description": "What the new file holds." }
+            }
+          }
+        },
+        "modified": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "change"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "change": { "type": "string", "minLength": 1, "description": "What changes in the existing file." }
+            }
+          }
+        }
+      }
+    },
+    "interfaces": {
+      "type": "array",
+      "description": "Shared exports, APIs, or contracts the block consumes or must add. Empty array when the project has no shared layer.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "out_of_scope": {
+      "type": "array",
+      "description": "Explicit boundaries — what belongs to a later block or a different effort. At least one entry; a block with no stated boundary is under-specified. Note cross-repo or not-yet-built prerequisites here.",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "description": "Each a true/false condition a reviewer can check against the diff, ending with the project's gating checks passing. A criterion whose evidence lives outside this repo's gates must be declared un-gateable per D64.",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          { "type": "string", "minLength": 1 },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["criterion"],
+            "properties": {
+              "criterion": { "type": "string", "minLength": 1 },
+              "gateable": {
+                "type": "boolean",
+                "description": "False when the evidence lives in another process, another repo, a generated artifact, or an installed artefact (D64). A false value requires a named fixture-evidence task.",
+                "default": true
+              },
+              "evidence": {
+                "type": "string",
+                "description": "For an un-gateable criterion: the concrete fixture or command that stands in for the missing gate."
+              }
+            }
+          }
+        ]
+      }
+    },
+    "testing_strategy": {
+      "type": "string",
+      "description": "Which test files cover this block and what each must assert. Required in practice for kind=ticket (behaviour-changing work ships with tests); optional for chores."
+    },
+    "validation_commands": {
+      "type": "array",
+      "description": "The project's gating commands, from planning/harness.json validation.checks[]. Falls back to that file when omitted.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "depends_on": {
+      "type": "array",
+      "description": "Dependency edges, using the same forms as state.json. Mirrored into state.json by the producer until mev derives the scheduling fields from this file (D65 consequences).",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "repo", "id"],
+            "properties": {
+              "type": { "const": "block" },
+              "repo": { "type": "string" },
+              "id": { "type": "string" },
+              "why": { "type": "string", "description": "What breaks without this edge." }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "what"],
+            "properties": {
+              "type": { "const": "external" },
+              "what": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A decision, credential, or judgement call only the operator can supply. Required rather than optional: an operator edge inherits the effective priority of everything it gates and surfaces in /next; the same item written as prose surfaces nowhere.",
+            "additionalProperties": false,
+            "required": ["type", "slug", "exit", "start"],
+            "properties": {
+              "type": { "const": "operator" },
+              "slug": { "type": "string", "pattern": "^operator-[a-z0-9][a-z0-9-]*$" },
+              "exit": { "type": "string", "minLength": 1, "description": "The artifact whose existence ends the gate — never a description of the work." },
+              "start": { "type": "string", "minLength": 1, "description": "A paste-ready command." },
+              "what": { "type": "string" }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A single reducible yes/no on a fixed payload.",
+            "additionalProperties": false,
+            "required": ["type", "slug", "what", "digest"],
+            "properties": {
+              "type": { "const": "approval" },
+              "slug": { "type": "string" },
+              "what": { "type": "string", "minLength": 1 },
+              "digest": { "type": "string", "pattern": "^[a-z0-9]+:[0-9a-f]+$" }
+            }
+          }
+        ]
+      }
+    },
+    "carryover_context": {
+      "type": "array",
+      "description": "Slugs of open carryover[] entries this block must not re-break, or that it partly addresses. Loaded from state.json at authoring time — a defect or drift entry touching the same files is either a prerequisite or a constraint.",
+      "items": { "type": "string" }
+    },
+    "origin": {
+      "description": "Where this block came from, when it was promoted rather than authored fresh.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "slug"],
+          "properties": {
+            "type": { "enum": ["backlog", "carryover", "capture"] },
+            "slug": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "forward_looking": {
+      "type": "boolean",
+      "description": "True for a distant-phase block authored with the full skeleton while context was fresh, whose files and interfaces are provisional and expected to be refined when it becomes next.",
+      "default": false
+    },
+    "spec_dir": {
+      "type": "string",
+      "description": "Repo-relative path to the spec directory. Equals planning/<id>/ exactly, no title suffix (D65 section 3).",
+      "pattern": "^planning/[A-Z]{2,3}\\.(\\d+[A-Z]?|ticket|chore)\\.[A-Za-z0-9][A-Za-z0-9-]*/$"
+    },
+    "related": {
+      "type": "array",
+      "description": "OKF doc_ids this block relates to. At least one real doc_id keeps it off the isolated-node warning; never invent one.",
+      "items": { "type": "string" }
+    },
+    "notes": {
+      "type": "string",
+      "description": "Constraints, follow-ups, or known edge cases not covered by this block."
+    },
+    "created": {
+      "type": "string",
+      "description": "Authoring date. Bare vocabulary matching carryover[] and backlog[], not created_at (D65 section 10).",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "updated": {
+      "type": "string",
+      "description": "Date this definition was last revised — the signal that a forward-looking block was refined when it became next.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "closed": {
+      "type": "string",
+      "description": "Date the block closed. Mirrors the state.json tombstone.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "commit": {
+      "type": "string",
+      "description": "Git hash of the closing commit, for fast later retrieval. Mirrors the state.json tombstone.",
+      "pattern": "^[0-9a-f]{7,40}$"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "block" } }, "required": ["kind"] },
+      "then": { "required": ["phase"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "ticket" } }, "required": ["kind"] },
+      "then": { "required": ["testing_strategy"] }
+    }
+  ]
+}

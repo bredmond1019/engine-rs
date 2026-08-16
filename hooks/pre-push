@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
-# pre-push — two independent gates, run back to back:
+# pre-push — three independent gates, run back to back:
 #   Stage 1: validate-brain drift gate (corpus-wide, ratcheted, ERROR-based).
 #   Stage 2: this repo's OWN validation gates, read from planning/harness.json.
+#   Stage 3: mev repo only — consumer compile gate (`mev check-consumers`). See its own
+#            header comment below for the full rationale (ticket-consumer-compile-gate).
 #
 # Stage 1 background: the full 5-flag `validate-brain` suite already runs nightly on the
 # Mac Mini (scripts/validate_brain.sh, wired from scripts/routine.sh) and exits non-zero
@@ -381,6 +383,83 @@ for c in checks:
 }
 
 # =========================================================================================
+# Stage 3 — consumer compile gate (`mev check-consumers`), mev repo only.
+#
+# ticket-consumer-compile-gate: a mev change can break a downstream path-dependent consumer
+# (bastion, engine-rs, ...) in a way `cargo build`/`cargo test` in THIS repo never sees —
+# three times, the break lived only in a consumer's test fixtures (E0063-class), invisible
+# to anything that doesn't compile that consumer's own test targets. `mev check-consumers`
+# does exactly that, per consumer, and classifies the result instead of collapsing it to one
+# red/green: pass | broken | lockfile-stale | skipped-dirty | not-evaluable.
+#
+# Deliberately NOT wired into planning/harness.json validation.checks[] (stage 2 above) —
+# that list runs at every SDLC task and every review; compiling even one consumer's test
+# targets cold costs ~1 minute (bastion, measured 2026-08-13), two consumers ~2 minutes.
+# Push time is the right boundary: once per push, after the work is done, not once per task.
+#
+# Scoped to the mev repo only (Cargo.toml package name "mev") — this is a gate on mev's
+# OWN outgoing changes, not a general-purpose check every repo's push should pay for.
+#
+# Exit-code contract already does the "only a real break blocks" job for us (mev::main.rs
+# CheckConsumers arm): 0 unless at least one consumer is Broken. lockfile-stale and
+# skipped-dirty are SUCCESS, printed loudly, never blocking — that is what stops this gate
+# from being switched off in week one (engine-rs/bastion have both been lockfile-stale at
+# various points; a naive wiring would have started this red forever).
+#
+# Two infra conditions must degrade to a skip, NOT a block, because they say nothing about
+# whether mev broke a consumer:
+#   - installed `mev` lacks the `check-consumers` subcommand (stale binary) — same class of
+#     problem advisory_mev_freshness below already detects, just fatal to this stage instead
+#     of merely noisy for it.
+#   - brain.toml isn't discoverable from here (e.g. a standalone mev checkout with no HQ
+#     tree above it) — check_consumers can't even discover a consumer list, which is an
+#     environment fact, not a compile break.
+# =========================================================================================
+stage3_check_consumers() {
+  if ! grep -q '^name = "mev"' "$start_dir/Cargo.toml" 2>/dev/null; then
+    return 0   # not the mev repo — this gate is mev-specific, nothing to do here
+  fi
+
+  if ! command -v mev >/dev/null 2>&1; then
+    echo "pre-push: [stage 3/3] 'mev' not found on PATH — skipping consumer compile gate." >&2
+    return 0
+  fi
+
+  if ! mev --help 2>/dev/null | grep -q 'check-consumers'; then
+    echo "pre-push: [stage 3/3] installed 'mev' predates 'check-consumers' — skipping (stale binary? see freshness notice below)." >&2
+    return 0
+  fi
+
+  echo "pre-push: [stage 3/3] running consumer compile gate (mev check-consumers)..." >&2
+  local out rc start_ts end_ts elapsed
+  start_ts=$(date +%s 2>/dev/null || echo 0)
+  out="$(cd "$start_dir" && mev check-consumers . 2>&1)"
+  rc=$?
+  end_ts=$(date +%s 2>/dev/null || echo 0)
+  elapsed=$((end_ts - start_ts))
+
+  if printf '%s\n' "$out" | grep -q 'brain.toml not found'; then
+    echo "pre-push: [stage 3/3] no brain.toml walking up from $start_dir (${elapsed}s) — no HQ tree here, skipping consumer compile gate." >&2
+    return 0
+  fi
+
+  printf '%s\n' "$out" | sed 's/^/pre-push:   /' >&2
+
+  if [ "$rc" -ne 0 ]; then
+    echo "" >&2
+    echo "pre-push: BLOCKED (stage 3) — 'mev check-consumers' reports a broken consumer (${elapsed}s)." >&2
+    echo "pre-push: a downstream consumer no longer compiles its test targets against this mev." >&2
+    echo "pre-push: fix the named sites in that consumer repo (mev never fixes another repo's" >&2
+    echo "pre-push: code), or bypass this check with 'git push --no-verify'." >&2
+    echo "" >&2
+    return 1
+  fi
+
+  echo "pre-push: [stage 3/3] consumer compile gate passed (${elapsed}s) — lockfile-stale/skipped-dirty consumers, if any, are reported above and do not block." >&2
+  return 0
+}
+
+# =========================================================================================
 # Advisory — is the INSTALLED `mev` binary stale vs its source tree? Never blocks.
 #
 # Why this is worth noise: `mev` is the fleet's WRITER. `mev emit-state --write` rewrites
@@ -438,10 +517,12 @@ rc1=0
 stage1_validate_brain || rc1=$?
 rc2=0
 stage2_repo_gates || rc2=$?
+rc3=0
+stage3_check_consumers || rc3=$?
 
 advisory_mev_freshness
 
-if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ]; then
+if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ] || [ "$rc3" -ne 0 ]; then
   exit 1
 fi
 

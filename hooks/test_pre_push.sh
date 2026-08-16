@@ -63,23 +63,61 @@ exit 0
 SH
 chmod +x "$BIN/bastion"
 
-# `mev` shim for the binary-freshness advisory. MEV_SHIM_MODE=drift|pass (default pass).
-# Only the `toolchain-freshness [...]` marker line matters to the hook; the detail lines
-# exist so the test also covers the grep -A3 excerpt that gets echoed back to the user.
+# `mev` shim, dispatched on $1 so it can stand in for both the freshness advisory
+# (`mev conformance`) and the stage 3 consumer compile gate (`mev --help` /
+# `mev check-consumers`).
+#
+#   MEV_SHIM_MODE=drift|pass (default pass) — `mev conformance` freshness banner. Only the
+#     `toolchain-freshness [...]` marker line matters to the hook; the detail lines exist so
+#     the test also covers the grep -A3 excerpt echoed back to the user.
+#   MEV_HELP_HAS_CHECK_CONSUMERS=0 — `mev --help` omits "check-consumers", simulating a
+#     stale installed binary predating the subcommand (default: present).
+#   MEV_CHECK_CONSUMERS_MODE=pass|broken|no-brain (default pass) — `mev check-consumers`
+#     behaviour: pass -> a lockfile-stale line + exit 0 (stale is non-blocking, per the
+#     ticket's own contract); broken -> a broken line + exit 1; no-brain -> the real CLI's
+#     "brain.toml not found" message + exit 1 (must be treated as an environment skip, not
+#     a real break).
 cat > "$BIN/mev" <<'SH'
 #!/usr/bin/env bash
-case "${MEV_SHIM_MODE:-pass}" in
-  drift)
-    echo "toolchain-freshness [DRIFT] — compiled-in build stamp vs source tree HEAD"
-    echo "  compiled-in build stamp (2 items): aaaaaaaaaaaaaaaa"
-    echo "  live source tree HEAD (1 items): bbbbbbbbbbbbbbbb"
-    echo "    the running binary was built from aaaaaaa but the source is now at bbbbbbb"
+case "${1:-}" in
+  --help)
+    echo "mev — content validator"
+    if [ "${MEV_HELP_HAS_CHECK_CONSUMERS:-1}" = "1" ]; then
+      echo "  check-consumers   Compile every path-dependent consumer's test targets"
+    fi
+    exit 0
+    ;;
+  check-consumers)
+    case "${MEV_CHECK_CONSUMERS_MODE:-pass}" in
+      broken)
+        echo "bastion: broken (2 errors: E0063 src/foo.rs:10, src/bar.rs:20)"
+        exit 1
+        ;;
+      no-brain)
+        echo "error: brain.toml not found: walked up from . and reached filesystem root"
+        exit 1
+        ;;
+      *)
+        echo "engine-rs: lockfile-stale"
+        exit 0
+        ;;
+    esac
     ;;
   *)
-    echo "toolchain-freshness [PASS] — compiled-in build stamp vs source tree HEAD"
+    case "${MEV_SHIM_MODE:-pass}" in
+      drift)
+        echo "toolchain-freshness [DRIFT] — compiled-in build stamp vs source tree HEAD"
+        echo "  compiled-in build stamp (2 items): aaaaaaaaaaaaaaaa"
+        echo "  live source tree HEAD (1 items): bbbbbbbbbbbbbbbb"
+        echo "    the running binary was built from aaaaaaa but the source is now at bbbbbbb"
+        ;;
+      *)
+        echo "toolchain-freshness [PASS] — compiled-in build stamp vs source tree HEAD"
+        ;;
+    esac
+    exit 0
     ;;
 esac
-exit 0
 SH
 chmod +x "$BIN/mev"
 
@@ -93,6 +131,15 @@ new_repo() { # new_repo <dir>
     mkdir -p hooks
     cp "$HOOK_SRC" hooks/pre-push; chmod +x hooks/pre-push
   )
+}
+
+# new_mev_repo <dir> — same as new_repo, plus a Cargo.toml naming the "mev" package, so
+# stage 3 (mev-repo-only) actually engages instead of short-circuiting on the
+# `grep '^name = "mev"' Cargo.toml` guard.
+new_mev_repo() {
+  local d="$1"
+  new_repo "$d"
+  printf '[package]\nname = "mev"\nversion = "0.1.0"\n' > "$d/Cargo.toml"
 }
 
 run_hook() { # run_hook <dir> -> sets HOOK_RC, HOOK_OUT
@@ -417,6 +464,43 @@ echo '{"errors": 0, "updated": "2026-07-31"}' > "$R20/hooks/validate-baseline.js
 MEV_SHIM_MODE=drift BASTION_SHIM_ERRORS="3 0 0 0 0" run_hook "$R20"   # total 3 > baseline 0
 { [ "$HOOK_RC" -eq 1 ] && printf '%s' "$HOOK_OUT" | grep -q "installed 'mev' binary is STALE"; }
 check "mev freshness: advisory still prints when the push is blocked" $?
+
+# --- Case 21: non-mev repo -> stage 3 never even runs mev check-consumers ---
+R21="$WORK/r21"; new_repo "$R21"   # plain new_repo: no Cargo.toml at all
+echo '{"errors": 0}' > "$R21/hooks/validate-baseline.json"
+MEV_CHECK_CONSUMERS_MODE=broken BASTION_SHIM_ERRORS="0 0 0 0 0" run_hook "$R21"
+{ [ "$HOOK_RC" -eq 0 ] && ! printf '%s' "$HOOK_OUT" | grep -q "stage 3"; }
+check "consumer gate: non-mev repo skips stage 3 entirely" $?
+
+# --- Case 22: mev repo, a consumer is genuinely broken -> BLOCKS ---
+R22="$WORK/r22"; new_mev_repo "$R22"
+echo '{"errors": 0}' > "$R22/hooks/validate-baseline.json"
+MEV_CHECK_CONSUMERS_MODE=broken BASTION_SHIM_ERRORS="0 0 0 0 0" run_hook "$R22"
+{ [ "$HOOK_RC" -eq 1 ]; }; check "consumer gate: broken consumer blocks (exit 1)" $?
+printf '%s' "$HOOK_OUT" | grep -q "BLOCKED (stage 3)"; check "consumer gate: block message names stage 3" $?
+printf '%s' "$HOOK_OUT" | grep -q -- "--no-verify"; check "consumer gate: block message names the --no-verify escape" $?
+
+# --- Case 23: mev repo, worst outcome is lockfile-stale -> reports loudly, does NOT block ---
+R23="$WORK/r23"; new_mev_repo "$R23"
+echo '{"errors": 0}' > "$R23/hooks/validate-baseline.json"
+MEV_CHECK_CONSUMERS_MODE=pass BASTION_SHIM_ERRORS="0 0 0 0 0" run_hook "$R23"
+{ [ "$HOOK_RC" -eq 0 ]; }; check "consumer gate: lockfile-stale does not block (exit 0)" $?
+printf '%s' "$HOOK_OUT" | grep -q "lockfile-stale"; check "consumer gate: lockfile-stale reported to the operator" $?
+
+# --- Case 24: mev repo, installed mev predates check-consumers -> skip, never block ---
+R24="$WORK/r24"; new_mev_repo "$R24"
+echo '{"errors": 0}' > "$R24/hooks/validate-baseline.json"
+MEV_HELP_HAS_CHECK_CONSUMERS=0 MEV_CHECK_CONSUMERS_MODE=broken BASTION_SHIM_ERRORS="0 0 0 0 0" run_hook "$R24"
+{ [ "$HOOK_RC" -eq 0 ] && printf '%s' "$HOOK_OUT" | grep -q "predates 'check-consumers'"; }
+check "consumer gate: stale binary without the subcommand skips rather than blocks" $?
+
+# --- Case 25: mev repo, no brain.toml discoverable (standalone checkout) -> skip, never block ---
+R25="$WORK/r25"; new_mev_repo "$R25"
+rm -f "$R25/brain.toml"
+echo '{"errors": 0}' > "$R25/hooks/validate-baseline.json"
+MEV_CHECK_CONSUMERS_MODE=no-brain BASTION_SHIM_ERRORS="0 0 0 0 0" run_hook "$R25"
+{ [ "$HOOK_RC" -eq 0 ] && printf '%s' "$HOOK_OUT" | grep -q "no HQ tree here"; }
+check "consumer gate: missing brain.toml skips rather than blocks" $?
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi

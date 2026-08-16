@@ -1,88 +1,121 @@
-# Plan — Author a mini-roadmap for an ad-hoc or experimental feature.
+# Plan — Author an initiative: its narrative and its block records.
 
 ## Variables
 
-$ARGUMENTS — free-text description of the feature, experiment, or bounded task to plan.
+$ARGUMENTS — free-text description of the feature, experiment, or body of work to plan.
+             Optional flags: `--founding`, `--clarify`.
+
+| Flag | What it does |
+|---|---|
+| `--founding` | This is the project's founding roadmap — a new repo's first blocks. Adds the Goal / Destination / Architecture framing and writes to `planning/founding/`. Invoked by `/new-project`. |
+| `--clarify` | Force the clarify gate on regardless of `planning/harness.json`. |
 
 ## Purpose
 
-Turn a free-form description into a `planning/plan-<slug>/plan.md` whose phase/block structure
-`/generate-tasks` can consume directly. This is the **mini-roadmap** producer — for ad-hoc or
-experimental work you want to plan and run **without** putting it in the main `master-plan.md`
-first. The output uses the same master-plan format (phases/blocks/Quick Reference table), so
-`/sdlc-block` can orchestrate it as a branch train, or `/generate-tasks <block>` → `/sdlc-flow`
-can run a single block.
+Author **one initiative**: a coherent body of work in **one repo**, spanning one or more blocks.
+Output is two things:
 
-> For the main project roadmap, use `/generate-master-plan` → `planning/master-plan.md`.
-> See `planning/decisions/D34-adhoc-planning-seam.md`.
+- `planning/<slug>/plan.md` — the authored **narrative**: the goal, the sequencing rationale, the
+  architecture framing, the cut list. Everything true of the *set* rather than of any one block.
+- `planning/blocks/<BlockID>.json` — one **block record** per block. The definition of each
+  member.
+
+`/plan` does **not** write `tasks.json`. Task decomposition is deferred to
+`/generate-tasks <BlockID>`, run later, per block — because a later block's tasks depend on an
+earlier block's code, and decomposing everything at authoring time burns tokens on work that gets
+re-derived anyway (D65).
+
+> **Scope ladder.** Multi-repo program → `/generate-roadmap`. One repo, multiple blocks → here.
+> A single block → `/ticket` (behavior change) or `/chore` (maintenance).
+> `master-plan.md` is **generated** from the block graph, not authored — never hand-write one.
 
 ## Instructions
 
-1. If `$ARGUMENTS` is not provided, stop and ask the user to describe the feature or task.
-2. **Clarify gate (only when enabled).** Read `planning/harness.json` → `planning.clarify`. When it is
-   `true` **or** `$ARGUMENTS` contains `--clarify`, and the prompt is genuinely ambiguous (its scope,
-   target files, or success criteria could be read more than one way), pause and ask the user **2–4
-   targeted clarifying questions** before writing anything; fold the answers into the plan. If the
-   prompt is already unambiguous, skip the questions and proceed even when the gate is on. When
-   `planning.clarify` is absent/`false` and no `--clarify` flag is present, skip this step entirely.
-   Strip a `--clarify` token from the prompt before using it as the title.
-   - **Plan-quality floor — clarify, don't fabricate (holds even when the gate is off).** If filling a
-     load-bearing element (a block's Files, Acceptance criteria, scope boundary, or a dependency) would
-     require *inventing* a fact you cannot ground in `$ARGUMENTS`, `CLAUDE.md`, `planning/context.md`,
-     or the repo — **stop and ask the user a targeted question** rather than write a plausible-looking
-     guess. An honest "I need X to define block N" beats a confident invention.
-3. Read `CLAUDE.md` and `planning/context.md` — internalize the standing rules and current architecture.
-4. **Determine the Block ID Prefix:** find this repo's `prefix` in `brain.toml` at the brain root
-   (e.g. `BA`). Record it per-block as a `**Block ID:** <Prefix>.<PhaseNumber>.<BlockLetter>`
-   bullet in the block body (Output Format below) — the `### Block <Letter>` **heading itself stays
-   a single uppercase letter, unprefixed.** `/sdlc-block` parses `### Block X` expecting `X` to be
-   exactly one letter (`.claude/workflows/sdlc-block.js`); embedding the full prefixed ID in the
-   heading text breaks that parse. `<Prefix>.<PhaseNumber>.<BlockLetter>` is the same canonical
-   block-ID form `/generate-master-plan.md` defines (step 4 there) — this file does not restate its
-   rationale, only its own heading/body split. When `/generate-tasks` decomposes one of this plan's
-   blocks into its own spec directory, that directory equals the Block ID exactly, no title suffix —
-   same rule as `/generate-master-plan.md`.
-5. Read any files directly relevant to the task (the files the blocks will touch).
-6. **THINK HARD about scope and decomposition before writing:**
-   - A mini-roadmap is typically 1–3 phases and 1–5 blocks. If it grows larger than that, it belongs
-     in `master-plan.md` via `/generate-master-plan`, not here.
-   - A **block** is a coherent, independently reviewable unit of work that `/generate-tasks` can turn
-     into ~one spec. Don't make blocks so large they hide separable concerns, nor so small they fragment
-     one feature across many.
-   - `/generate-tasks` reads **only the target block's section** — so every block must be
-     **self-sufficient**: concrete **Files** (New vs Modified, by path), **observable Acceptance
-     criteria**, explicit **Out of scope** boundaries, and any shared **Interfaces**.
-   - **Name files by path.** Tasks sharing a file must be serialized (`dependsOn`) or append-only;
-     tasks owning distinct files may run in parallel.
-   - Sequence blocks by dependency and competence — foundational / enabling work first.
-7. Choose a short descriptive slug (e.g. `keyboard-nav`, `auth-refresh`, `rust-streaming`).
-8. Create `planning/plan-<slug>/` if it does not exist, then write the plan to
-   `planning/plan-<slug>/plan.md` using the Output Format below.
-9. **Property self-check.** Before reporting, re-read the plan and **revise in place** until every
-   property holds, then re-check:
-   - Every block is a `### Block X — <name>` heading (single uppercase letter, no prefix) under a
-     `## Phase N — <name>` heading, so `/generate-tasks phaseN-blockX` and `/sdlc-block` can both
-     parse and locate it. The full `<Prefix>.<PhaseNumber>.<BlockLetter>` id lives in a
-     `**Block ID:**` bullet in the block body, not the heading.
-   - Every block names its **Files** (New vs Modified, by path).
-   - Every block declares **Out of scope** — at least one explicit boundary.
-   - Every block has non-empty **What**, **Why**, and observable **Acceptance criteria** — each a
-     true/false condition checkable against the diff, ending with the project's gating checks passing.
-   - The **Quick Reference Sequence Table** has one row per block and matches the block headings.
-   - No leftover scaffold sentinels (`{{TOKEN}}`, unfilled `<placeholder>`-style angle stubs, empty
-     bullets). Legitimate `<...>` in code/prose is fine.
-   - **Frontmatter `related:` carries ≥1 real `doc_id`** (not `[]`) so this plan is not an isolated
-     graph node (`mev`'s `W_GRAPH_ISOLATED_NODE`) — the source `/capture` notes doc_id if this plan
-     was promoted from one, else the project `master-plan` or a governing decision. Use genuine
-     doc_ids only; never invent one.
-10. Report the path and next steps.
+1. If `$ARGUMENTS` is not provided, stop and ask the user to describe the work.
+
+2. **Clarify gate.** Read `planning/harness.json` → `planning.clarify`. When it is `true`, when
+   `$ARGUMENTS` contains `--clarify`, when `--founding` is set, or when the goal / scope /
+   destination is genuinely underspecified, pause and ask the user **2–4 targeted clarifying
+   questions** (the destination, the checkpoint that signals "done", the load-bearing
+   architectural choices, the rough phase boundaries) before writing. Fold the answers in. When
+   the gate is off and the input is already rich, proceed immediately. Strip the flags before
+   using `$ARGUMENTS` as prose.
+
+   - **Plan-quality floor — clarify, don't fabricate (holds even when the gate is off).** The plan
+     is the highest-leverage artifact; a wrong assumption here multiplies through every downstream
+     task. If filling a load-bearing element (a block's files, acceptance criteria, scope boundary,
+     phase ordering, dependency, or **why**) would require *inventing* a fact you cannot ground in
+     `$ARGUMENTS`, `CLAUDE.md`, `planning/context.md`, the repo, or an existing plan — **stop and
+     ask the user a targeted question** instead of writing a plausible-looking guess. The clarify
+     gate governs *proactive* question rounds; this floor governs *never fabricating*.
+
+3. Read `CLAUDE.md` and `planning/context.md` — internalize the standing rules and current
+   architecture. Read the files the blocks will touch. When revising an existing initiative, read
+   its `plan.md` and every block record it already owns; preserve completed work.
+
+4. **Allocate the phase numbers from `state.json`, not from any narrative file.** Read this repo's
+   `planning/state.json`, take the highest existing phase for this repo, and number upward.
+   Narrative files lag, and that lag is how one repo came to carry two unrelated "Phase 4"s.
+
+5. **THINK HARD about decomposition before writing:**
+   - An initiative is typically 1–3 phases and 1–6 blocks. Much larger and it is a multi-repo
+     program — use `/generate-roadmap`.
+   - A **block** is a coherent, independently reviewable unit that `/generate-tasks` can turn into
+     ~one spec. Not so large it hides separable concerns, not so small it fragments one feature.
+   - **Sequence by dependency and competence, not calendar.** Foundational, enabling work first;
+     the hardest, most-differentiating work last.
+   - **`/generate-tasks` reads only the target block's record** — not this narrative, not sibling
+     blocks. Every block record must therefore be self-sufficient: concrete **files** (new vs
+     modified, by path), **observable acceptance criteria**, an explicit **out of scope**, and any
+     shared **interfaces**.
+   - **Name files by path.** This is load-bearing, not decoration: it is how `/generate-tasks`
+     derives disjoint task ownership without guessing.
+   - **Distant blocks may be forward-looking** — author the full record while context is fresh,
+     but set `forward_looking: true` and expect to refine files and interfaces when each becomes
+     next.
+   - Do **not** bake stack, locale, or deployment specifics into blocks — those live in
+     `CLAUDE.md` + `planning/harness.json`. Blocks are about *what*, *why*, *which files*, and
+     *bounds*.
+
+6. Choose a short descriptive slug (e.g. `keyboard-nav`, `auth-refresh`). With `--founding` the
+   slug is `founding`. Create `planning/<slug>/` if absent.
+
+7. **Write each block record and register it.** For every block, read and follow
+   `.claude/workflows/block-registration.md` — the canonical procedure for the block ID, the
+   operator and cross-repo edge questions, the carryover read, the block record, and `state.json`
+   registration. Do not restate it here or invent a variant. Set `kind` to `block` and
+   `initiative` to `<slug>`.
+
+8. **Write the narrative** to `planning/<slug>/plan.md` using the Output Format below. The
+   narrative holds only what is true of the set — it must not duplicate a block's what/why/files,
+   which live in the block records and would immediately drift.
+
+9. **Property self-check.** Re-read what you wrote and **revise in place** until every property
+   holds, then re-check:
+   - **Every block heading is the full canonical ID** — `### MV.3.A — <name>`, never
+     `### Block A`. The ID is self-describing; there is no literal "Block" word.
+   - **Every block has a record** at `planning/blocks/<BlockID>.json` that validates against
+     `.claude/workflows/block.schema.json`, with `why`, `description`, and `out_of_scope`
+     non-empty and files named by path.
+   - **Every block is registered in `state.json`** with a matching `id`, `wave`, and `depends_on`.
+   - **The Sequence Table lists one row per block** and matches both the headings and the records.
+   - **No leftover scaffold sentinels** — no `{{TOKEN}}`, no unfilled `<...>` stubs, no empty
+     bullets. Legitimate `<...>` in code or prose is fine.
+   - **Frontmatter `related:` carries ≥1 real `doc_id`** (not `[]`), else this plan is an isolated
+     graph node (`mev`'s `W_GRAPH_ISOLATED_NODE`). Use genuine doc_ids only; never invent one. On
+     a revise, leave an already-populated `related:` intact.
+   - **No `master-plan.md` was authored or edited.** It is generated from the block graph.
+
+10. Report the paths and the first runnable block.
 
 ## Codebase Structure
 
 - `CLAUDE.md` — standing rules, stack, build/test/validate commands (start here)
 - `planning/context.md` — why the project exists; `planning/status.md` — current state
 - `planning/harness.json` — validation commands + UI-test config
-- `planning/master-plan.md` — the main project roadmap (this command does NOT modify it)
+- `planning/blocks/` — block records; `planning/<slug>/` — initiative narratives
+- `.claude/workflows/block.schema.json` — the block record field contract
+- `.claude/workflows/block-registration.md` — the shared registration procedure
 
 Read `CLAUDE.md` for the project's actual stack and conventions — do not assume any framework,
 language, or directory structure that isn't written there.
@@ -91,149 +124,95 @@ language, or directory structure that isn't written there.
 
 Read `CLAUDE.md` and `planning/context.md` and enforce **the project's standing rules**. CLAUDE.md
 is the authority; assume no stack, locale-parity, narrative, or content-layout rule unless written
-there. Universal harness rules apply: no fabricated metrics/quotes, no emoji, every block's
-Acceptance criteria leave the project's gating checks (`planning/harness.json` →
+there. Universal harness rules apply: no fabricated metrics or quotes, no emoji, every block's
+acceptance criteria leave the project's gated checks (`planning/harness.json` →
 `validation.checks[]`) passing.
 
 ## Output Format
 
-The plan uses the same block-definition skeleton as `master-plan.md` (so `/sdlc-block` and
-`/generate-tasks` can consume it directly):
-
 ~~~md
 ---
 type: Plan
-title: <Feature Name> Plan
-description: Mini-roadmap for <feature name> — ad-hoc, not in master-plan.md.
+title: <Initiative Name>
+description: <One line: what becomes true when this initiative is done.>
 doc_id: plan-<slug>
-related: [<≥1 real doc_id>]   # required — never leave empty; else this plan is an isolated graph node (mev W_GRAPH_ISOLATED_NODE)
+layer: [<inferred layer>]
+project: <repo slug>
+status: active
+keywords: [<3-5 terms>]
+related: [<≥1 real doc_id>]   # required — never empty; else this is an isolated graph node
 ---
 
-# <Feature Name> — Plan
+# <Initiative Name>
 
-*Mini-roadmap. Created <DATE>. Ad-hoc: not in `planning/master-plan.md`.
-See `planning/decisions/D34-adhoc-planning-seam.md`.*
+*Created <DATE>. Block definitions live in `planning/blocks/`; this document holds only what is
+true of the set.*
 
 ## The Goal, Stated Plainly
-<1–2 paragraphs: what this feature is, why it matters now, and what "done" means.>
+<1–3 paragraphs: what this is, why it matters now, and what "done" means — the checkpoint that
+signals completion. With --founding, this is the project's arc, not one feature's.>
 
 ## The Destination
-<The named outcome: what is true when this plan is fully executed.>
+<The named outcome: what is true when this is fully executed. If commercial: the buyer, the
+differentiator, the through-line.>
 
 ## Architecture / Design Overview
-<Key structural decisions; which existing systems it hooks into; any new abstractions needed.>
+<Key structural decisions; which existing systems this hooks into; new abstractions needed. An
+ASCII diagram if it earns its place. Keep deployment specifics out — those live in CLAUDE.md +
+harness.json.>
+
+## Sequencing Rationale
+<Why the phases fall where they do. What is foundational, what is hardest and therefore last, and
+which orderings are forced by dependency rather than preference.>
 
 ---
 
-## The Block Contract
+## Phase <N> — <name>
 
-`/generate-tasks` reads **only the target block's section** below. Every block is self-sufficient
-and uses the same skeleton:
+### <Prefix>.<Phase>.<Block> — <name>
+<!-- Example: ### MV.3.A — Block record validation -->
+<!-- One short paragraph ONLY: this block's role in the initiative. Its what / why / files /
+     out-of-scope / acceptance criteria live in planning/blocks/<ID>.json — do not restate them
+     here, or the two copies drift within a week. -->
 
-- **What** — the scope, in implementation terms.
-- **Why** — the motivation (keeps the generator from over- or under-scoping).
-- **SDLC workflow?** — `Yes (patch/task/run/flow)` or `No — <reason>`.
-- **Model** — `Sonnet` | `Gemini Pro` | `Gemini Flash` | `Either`. Rule of thumb: Opus = reasoning/breakdown only; Sonnet = high-risk/complex; Gemini Pro = intermediate; Gemini Flash = simple.
-- **Workflow & Model Rationale** — prose explaining the choices.
-- **Files** — *new* vs *modified*, named by path. Load-bearing: tasks sharing a file must be
-  serialized (`dependsOn`) or append-only; tasks owning distinct files may run in parallel.
-- **Interfaces / shared surface** *(optional)* — shared exports/APIs consumed or added. Omit when
-  there is no shared layer.
-- **Out of scope** — explicit boundaries; what belongs to a later block or a different effort.
-- **Acceptance criteria** — true/false conditions checkable against the diff, ending with the
-  project's gating checks passing.
+### <Prefix>.<Phase>.<Block> — <name>
+<!-- same shape -->
 
 ---
 
-## Phase 0 — <name>
+## What Is Cut, and Why
 
-### Block <Letter> — <name>
-- **Block ID:** <Prefix>.<PhaseNumber>.<BlockLetter> — the canonical id used in `state.json` /
-  `depends_on` / `/generate-tasks --from`. The heading above stays a bare letter; `/sdlc-block`
-  parses it as one.
-- **What:** <scope in implementation terms>
-- **Why:** <why this block, why now in the sequence>
-- **SDLC workflow?:** <Yes (patch/task/run/flow) or No — reason>
-- **Model:** <Sonnet | Gemini Pro | Gemini Flash | Either>
-- **Workflow & Model Rationale:** <why this model and workflow were chosen>
-- **Files:**
-  - *New* `<path>` — <what it holds>
-  - *Modified* `<path>` — <what changes>
-- **Interfaces / shared surface:** <optional>
-- **Out of scope:** <explicit boundaries>
-- **Acceptance criteria:**
-  - <observable true/false condition>
-  - Project's gating checks pass (see `planning/harness.json`).
+| Candidate | Why it is out |
+|---|---|
+| <thing considered and excluded> | <the reason> |
+
+<An unstated cut reads as an oversight, gets re-proposed next time, and is re-litigated. A stated
+cut is a decision with a date on it. Make this list longer than is comfortable.>
 
 ---
 
-## Quick Reference Sequence Table
+## Sequence
 
-| Phase | Block | What | Why | SDLC workflow? | Model | Role in destination |
-|---|---|---|---|---|---|---|
-| 0 | A | <short> | <short> | <short> | <short> | <short> |
+| Phase | Block | What | SDLC workflow | Model | Role in the destination |
+|---|---|---|---|---|---|
+| <N> | <ID> | <short> | <short> | <short> | <short> |
 
 ---
 
-*Ad-hoc mini-roadmap — run one block or the full train (see Report below).*
+*Sequenced by dependency and competence, not calendar.*
 ~~~
-
-
-### Step X — Register the block(s) in state.json
-After writing the `plan.md` file, you MUST also register its blocks in `planning/state.json` — this
-plan is ad-hoc (not in `master-plan.md`), so its blocks don't exist there yet. **No `tasks.json`
-exists for any of these blocks yet** — `/plan` only defines blocks; `/generate-tasks --from` (run
-separately, per block, later) is what produces a block's `tasks.json`. Do not add a `tasks` field
-to any block registered here.
-1. Open `planning/state.json`. Find or create a `tracks[]` entry titled `"plan-<slug>"` (or reuse an
-   existing ad-hoc-plans track if the convention already exists in this repo).
-2. For each block in `plan-<slug>/plan.md`, add an entry to that track's `blocks[]` if it doesn't
-   already exist (match by `id`):
-   - `id`: the block's canonical ID (the `**Block ID:**` bullet value, e.g. `BA.0.A` — full
-     prefixed form; the plan.md *heading* stays the bare letter)
-   - `title`: the block's name
-   - `status`: `"open"`
-   - `sdlc_workflow`: the block's chosen workflow (`none` | `patch` | `task` | `run` | `flow`). (Map 'No' to `none`, and 'Yes (task)' to `task`, etc.)
-   - `model`: the block's chosen model (`sonnet` | `gemini-pro` | `gemini-flash` | `either`).
-   - `wave`: an integer rank placing it after this repo's current highest wave (so ad-hoc plans queue
-     behind committed roadmap work) — default to `10 * (floor(highest existing wave / 10) + 1)`, keeping
-     blocks in the same phase on the same wave.
-   - `depends_on`: one `{ "type": "block", "repo": "<this-repo-slug>", "id": "<ID>" }` entry per explicit
-     "Depends on" line in the block; `[]` if none.
-   - **Cross-repo-edge prompt.** A "Depends on" line only ever names a same-repo sibling block, so a
-     dependency on *another repo's* block never surfaces on its own — ask explicitly: "Does this block
-     depend on work landing in another repo first?" If yes, resolve that repo's `slug` from `brain.toml`
-     and add `{ "type": "block", "repo": "<other-repo-slug>", "id": "<their-ID>" }` to this block's
-     `depends_on` (in addition to any same-repo edges); if the dependency is non-block (hardware, a
-     paid-API budget, a manual step), use `{ "type": "external", "what": "<gloss>" }` instead.
-   - `origin`: omit unless this plan was promoted from an HQ backlog item, in which case
-     `{ "type": "backlog", "slug": "<backlog-slug>" }`.
-3. Save `planning/state.json` and validate it is still valid JSON:
-   `python3 -c "import json;json.load(open('planning/state.json'))"`.
-   This is a **parse-only** sanity check, not schema validation — it cannot catch a shape mismatch
-   (e.g. a struct-typed field like `origin` written as a scalar), which parses fine as JSON and
-   only fails `mev`'s typed deserialization. For real schema confidence, run
-   `mev validate-brain --state`.
-
-### State Refresh
-
-Run `mev emit-state --write` to update the brain's focus derivation and state based on the new planning files.
 
 ## Report
 
-Output the path written and the next steps:
-
 ```
-planning/plan-<slug>/plan.md  (<N> phases, <M> blocks)
+planning/<slug>/plan.md            (<N> phases, <M> blocks)
+planning/blocks/                   <M> block records written
+state.json: <created | already existed>, <M> blocks registered
 
-Blocks ready to generate:
-  - BA.0.A — <name>   (block heading: ### Block A)
+Blocks ready to decompose:
+  - <ID> — <name>
   ...
 
-Next (single block — decompose and run):
-  /generate-tasks --from planning/plan-<slug>/plan.md phase0-blockA
-  /sdlc-flow plan-<slug>
-
-Next (all blocks as a branch train):
-  /sdlc-block planning/plan-<slug>/plan.md
+Next (turn the first block into a runnable spec):
+  /generate-tasks <ID>
 ```
