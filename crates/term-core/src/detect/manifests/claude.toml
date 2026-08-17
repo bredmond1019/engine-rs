@@ -5,13 +5,28 @@
 
 name = "claude"
 
-# ── Blocked (highest priority) ────────────────────────────────────────────────
+# ── Blocked: awaiting a question answer (highest priority) ────────────────────
+# Claude Code's AskUserQuestion prompt shows a footer reading
+# "Enter to select · ↑/↓ to navigate · Esc to cancel". The `·` separators and
+# arrow glyphs are the parts most likely to vary across terminal widths and
+# Claude Code versions, so only the stable "Enter to select" substring is
+# matched. This rule must outrank the permission-prompt rule below so the two
+# blocked sub-states never collide.
+[[rules]]
+state = "blocked"
+priority = 110
+visible_blocker = true
+reason = "awaiting_question"
+gate = { contains = "Enter to select" }
+
+# ── Blocked: tool-use permission prompt ────────────────────────────────────────
 # Claude Code's tool-use approval dialog shows "Do you want to proceed?"
 # in a bordered box. Match that phrase anywhere on screen.
 [[rules]]
 state = "blocked"
 priority = 100
 visible_blocker = true
+reason = "permission_prompt"
 gate = { contains = "Do you want to proceed?" }
 
 # ── Working ───────────────────────────────────────────────────────────────────

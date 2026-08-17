@@ -118,8 +118,7 @@ pub fn detect(screen: &str, manifest: &CompiledManifest) -> AgentDetection {
                 visible_blocker: rule.visible_blocker,
                 visible_working: rule.visible_working,
                 skip_state_update: rule.skip_state_update,
-                // Wired to the manifest rule's declared reason in Task 3.
-                blocked_reason: None,
+                blocked_reason: rule.reason,
             };
         }
     }
@@ -312,5 +311,91 @@ gate = { contains = "spinner" }
 
         let detection = detect("any screen content here", &manifest);
         assert_eq!(detection, AgentDetection::unknown());
+    }
+
+    // ── detect() — blocked_reason wired from the matching rule ───────────────
+
+    #[test]
+    fn detect_populates_blocked_reason_permission_prompt() {
+        let src = r#"
+name = "test"
+
+[[rules]]
+state = "blocked"
+reason = "permission_prompt"
+gate = { contains = "Do you want to proceed?" }
+"#;
+        let manifest = parse_manifest(src)
+            .expect("parse failed")
+            .compile()
+            .expect("compile failed");
+
+        let detection = detect("Do you want to proceed?", &manifest);
+        assert_eq!(
+            detection.blocked_reason,
+            Some(BlockedReason::PermissionPrompt)
+        );
+    }
+
+    #[test]
+    fn detect_populates_blocked_reason_awaiting_question() {
+        let src = r#"
+name = "test"
+
+[[rules]]
+state = "blocked"
+reason = "awaiting_question"
+gate = { contains = "Enter to select" }
+"#;
+        let manifest = parse_manifest(src)
+            .expect("parse failed")
+            .compile()
+            .expect("compile failed");
+
+        let detection = detect("Enter to select · Esc to cancel", &manifest);
+        assert_eq!(
+            detection.blocked_reason,
+            Some(BlockedReason::AwaitingQuestion)
+        );
+    }
+
+    #[test]
+    fn detect_blocked_rule_without_reason_leaves_none() {
+        let src = r#"
+name = "test"
+
+[[rules]]
+state = "blocked"
+gate = { contains = "blocked marker" }
+"#;
+        let manifest = parse_manifest(src)
+            .expect("parse failed")
+            .compile()
+            .expect("compile failed");
+
+        let detection = detect("blocked marker present", &manifest);
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert_eq!(detection.blocked_reason, None);
+    }
+
+    // ── claude.toml — the 110>100 ordering is load-bearing ───────────────────
+
+    /// A pane holding both blocked gate strings must resolve to
+    /// `AwaitingQuestion` (priority 110), not `PermissionPrompt` (priority 100).
+    #[test]
+    fn claude_manifest_pane_matching_both_blocked_gates_resolves_awaiting_question() {
+        let src = include_str!("manifests/claude.toml");
+        let manifest = parse_manifest(src)
+            .expect("parse failed")
+            .compile()
+            .expect("compile failed");
+
+        let screen = "Do you want to proceed?\nEnter to select · ↑/↓ to navigate · Esc to cancel";
+        let detection = detect(screen, &manifest);
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert_eq!(
+            detection.blocked_reason,
+            Some(BlockedReason::AwaitingQuestion)
+        );
     }
 }

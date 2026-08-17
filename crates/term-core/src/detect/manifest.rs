@@ -5,7 +5,7 @@
 // regex and sorts rules by descending priority. The compiled form is what
 // `detect()` in `mod.rs` operates on.
 
-use crate::detect::AgentState;
+use crate::detect::{AgentState, BlockedReason};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -80,6 +80,10 @@ pub struct RuleSpec {
     pub priority: i32,
     /// The agent state to report when this rule matches.
     pub state: AgentState,
+    /// Optional sub-classification of a `Blocked` match. Absent by default so
+    /// existing manifests deserialize unchanged.
+    #[serde(default)]
+    pub reason: Option<BlockedReason>,
     /// Carry-through visibility flags for the UI layer.
     #[serde(default)]
     pub visible_idle: bool,
@@ -166,6 +170,7 @@ pub struct CompiledRule {
     pub region: RegionSpec,
     pub gate: CompiledGate,
     pub state: AgentState,
+    pub reason: Option<BlockedReason>,
     pub visible_idle: bool,
     pub visible_blocker: bool,
     pub visible_working: bool,
@@ -203,6 +208,7 @@ impl Manifest {
                         region: r.region.clone(),
                         gate,
                         state: r.state,
+                        reason: r.reason,
                         visible_idle: r.visible_idle,
                         visible_blocker: r.visible_blocker,
                         visible_working: r.visible_working,
@@ -482,5 +488,75 @@ gate = { contains = "x" }
         let manifest = parse_manifest(src).expect("parse failed");
         let compiled = manifest.compile().expect("compile failed");
         assert!(compiled.rules[0].skip_state_update);
+    }
+
+    // ── reason field ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn rule_without_reason_defaults_to_none() {
+        let src = r#"
+name = "test"
+
+[[rules]]
+state = "blocked"
+gate = { contains = "x" }
+"#;
+        let manifest = parse_manifest(src).expect("parse failed");
+        let compiled = manifest.compile().expect("compile failed");
+        assert_eq!(compiled.rules[0].reason, None);
+    }
+
+    #[test]
+    fn rule_with_permission_prompt_reason_parses() {
+        let src = r#"
+name = "test"
+
+[[rules]]
+state = "blocked"
+reason = "permission_prompt"
+gate = { contains = "x" }
+"#;
+        let manifest = parse_manifest(src).expect("parse failed");
+        let compiled = manifest.compile().expect("compile failed");
+        assert_eq!(
+            compiled.rules[0].reason,
+            Some(crate::detect::BlockedReason::PermissionPrompt)
+        );
+    }
+
+    #[test]
+    fn rule_with_awaiting_question_reason_parses() {
+        let src = r#"
+name = "test"
+
+[[rules]]
+state = "blocked"
+reason = "awaiting_question"
+gate = { contains = "x" }
+"#;
+        let manifest = parse_manifest(src).expect("parse failed");
+        let compiled = manifest.compile().expect("compile failed");
+        assert_eq!(
+            compiled.rules[0].reason,
+            Some(crate::detect::BlockedReason::AwaitingQuestion)
+        );
+    }
+
+    #[test]
+    fn rule_with_unknown_reason_is_parse_error() {
+        let src = r#"
+name = "test"
+
+[[rules]]
+state = "blocked"
+reason = "not_a_real_reason"
+gate = { contains = "x" }
+"#;
+        let result = parse_manifest(src);
+        assert!(
+            matches!(result, Err(ManifestError::Toml(_))),
+            "expected Toml error for unrecognized reason, got: {:?}",
+            result.err()
+        );
     }
 }
