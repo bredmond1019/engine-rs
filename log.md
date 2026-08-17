@@ -16,6 +16,23 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-17]
+
+Implemented EN.9.B — Async driver seam and the session lease (Phase 1) — across 9 tasks, all passed, PASS review. Task 1 added a non-default `tokio` feature to `term-core` with `run_tmux_async` sharing one `classify_output` with the sync path, plus `TmuxError::Timeout` that kills a wedged child via `kill_on_drop` instead of leaking it. Task 2 added an object-safe `TerminalDriver` trait with `TmuxDriver` (delegating only to existing tmux.rs argv builders + `run_tmux_async`) and a `StubTerminalDriver` recording exact argv sequences with configurable per-op outcomes. Task 3 added a per-session, ~400ms-TTL, single-flight `CaptureCache` so the hub sweep and a node's await loop coalesce onto one underlying tmux invocation; a failed capture is never cached. Task 4 added the advisory, fail-closed `SessionLease` in `lease.rs` — write-then-read-back arbitration (acquire/renew/release) over tmux user-options, since tmux has no CAS primitive, with jittered backoff derived from `SystemTime` rather than a new `rand` dependency. Task 5 added `OperatorHold` — `@operator_hold` + `#{session_attached}` fallback signals, sends-pause/reads-continue asymmetry, and an injectable-clock 60s detach grace, gating sends via `guard_send`; this required a new `TerminalDriver::display_message` method not in the original file list. Task 6 added `GuardedSender` — a per-session mutex around the literal+Enter send pair with `C-u` line-clear recovery on Enter failure (original error preserved), requiring `send_keys` to split into `send_literal`/`send_enter` so the caller can tell which half failed. Task 7 added `docs/terminal-driver.md` with pointers from `docs/index.md`/`docs/architecture.md`, deferring live-tmux evidence to task 8. Task 8 captured verbatim live-tmux evidence (tmux 3.7b) proving `#{session_attached}` emits `0`/`1`/`0` across detached/attached/detached-again, using a nested-tmux-attach trick, and pinned those bytes as a golden test in `hold.rs`; no contradiction with task 5's design was found. Task 9 validated the full gate: fmt, clippy `-D warnings`, nextest --workspace (2202/2202), build --release, plus `term-core` with and without the `tokio` feature (164/122 tests). Closes `EN.9.B`, unblocking `EN.9.D` (read-only terminal nodes + TERMINAL_PROBE, Phase 2).
+
+Next: EN.9.D — read-only terminal nodes + TERMINAL_PROBE (Phase 2), building on the driver/lease/hold seams shipped here.
+
+```
+898593b docs: update docs for EN.9.B
+583b085 feat: implement EN.9.B-task8
+51f7042 docs: document the terminal driver, session lease, and operator hold
+f550a18 feat: implement EN.9.B-task6
+5aa978a feat: operator hold with @operator_hold + session_attached fallback (EN.9.B task 5)
+8da86ac feat: implement EN.9.B-task4
+43e41f2 feat: implement EN.9.B-task3
+46e7d85 feat(term-core): TerminalDriver trait, TmuxDriver, StubTerminalDriver
+```
+
 ## [run: 2026-08-13]
 
 ### `EN.9.C` closed — the engine can finally see runs a crash stranded
