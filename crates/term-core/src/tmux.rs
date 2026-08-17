@@ -120,6 +120,23 @@ pub fn send_keys_args(session_name: &str, keys: &str) -> Vec<String> {
     ]
 }
 
+/// Returns the argument list for a **literal, no-Enter** send-keys invocation:
+///   tmux send-keys -t <session_name> -l -- <keys>
+///
+/// Identical shape to [`send_keys_args`] — named separately because the two
+/// exist for different use cases and their execution counterparts
+/// (`send_keys` vs `send_keys_no_enter`) issue a different number of tmux
+/// invocations. This exists for the `AskUserQuestion` widget's free-text
+/// option: selecting that option must move the highlight without
+/// submitting, because sending Enter on the free-text option with nothing
+/// typed yet closes the widget and submits nothing. Callers that want the
+/// widget to submit after this call send the trailing Enter themselves via
+/// a later `send_keys_args` / `send_enter_args` call once the actual answer
+/// text is available.
+pub fn send_keys_no_enter_args(session_name: &str, keys: &str) -> Vec<String> {
+    send_keys_args(session_name, keys)
+}
+
 /// Returns the argument list for sending an Enter keypress:
 ///   tmux send-keys -t <session_name> Enter
 ///
@@ -429,6 +446,24 @@ pub fn send_keys(session_name: &str, keys: &str) -> Result<(), TmuxError> {
     Ok(())
 }
 
+/// Send `keys` literally to `session_name`, WITHOUT a trailing Enter.
+///
+/// One tmux invocation is made: `send-keys -t <session> -l -- <keys>`.
+///
+/// This exists for the `AskUserQuestion` widget's free-text option: selecting
+/// that option must move the highlight without submitting, because sending
+/// Enter on the free-text option with nothing typed yet closes the widget and
+/// submits nothing. Callers that want the widget to submit after this call
+/// send the trailing Enter themselves via a later `send_keys` /
+/// `send_enter_args` call once the actual answer text is available.
+///
+/// An unknown session surfaces as `TmuxError::ExitError`.
+pub fn send_keys_no_enter(session_name: &str, keys: &str) -> Result<(), TmuxError> {
+    let literal_args = send_keys_no_enter_args(session_name, keys);
+    run_tmux(&literal_args).context("send-keys (literal, no Enter) failed")?;
+    Ok(())
+}
+
 /// Send a single named key (e.g. `Escape`, `Enter`, `Up`, `C-c`) to
 /// `session_name`.
 ///
@@ -589,6 +624,52 @@ mod tests {
         assert!(
             !args.contains(&"-l".to_string()),
             "-l must not appear in enter args"
+        );
+    }
+
+    // ── send_keys_no_enter_args ───────────────────────────────────────────────
+
+    #[test]
+    fn send_keys_no_enter_args_emits_literal_send_argv() {
+        let args = send_keys_no_enter_args("work", "echo hi");
+        assert_eq!(args[0], "tmux");
+        assert_eq!(args[1], "send-keys");
+        assert_eq!(args[2], "-t");
+        assert_eq!(args[3], "work");
+        assert_eq!(args[4], "-l");
+        assert_eq!(args[5], "--");
+        assert_eq!(args[6], "echo hi");
+        assert_eq!(args.len(), 7);
+        assert_eq!(
+            args,
+            send_keys_args("work", "echo hi"),
+            "no-enter builder must emit the same literal-send argv as send_keys_args"
+        );
+    }
+
+    #[test]
+    fn send_keys_no_enter_records_one_invocation_where_send_keys_records_two() {
+        // send_keys sends the text as one args-vec and Enter as a second —
+        // two distinct tmux invocations.
+        let send_keys_flow = [send_keys_args("work", "echo hi"), send_enter_args("work")];
+        assert_eq!(
+            send_keys_flow.len(),
+            2,
+            "send_keys must issue exactly two tmux invocations"
+        );
+
+        // send_keys_no_enter sends only the literal text — one invocation,
+        // with no following Enter. A future refactor that folds the two
+        // functions together must break this assertion, not pass silently.
+        let send_keys_no_enter_flow = [send_keys_no_enter_args("work", "echo hi")];
+        assert_eq!(
+            send_keys_no_enter_flow.len(),
+            1,
+            "send_keys_no_enter must issue exactly one tmux invocation"
+        );
+        assert!(
+            !send_keys_no_enter_flow.contains(&send_enter_args("work")),
+            "send_keys_no_enter must never append an Enter invocation"
         );
     }
 
