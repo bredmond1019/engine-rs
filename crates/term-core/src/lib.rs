@@ -20,6 +20,8 @@
 //! `model` and `claude_state` are ported (Task 4 of `EN.9.A`): session/pane parsing and the
 //! read-only `~/.claude.json` workspace-trust observer.
 
+#[cfg(feature = "tokio")]
+pub mod capture_cache;
 pub mod claude_state;
 pub mod detect;
 #[cfg(feature = "tokio")]

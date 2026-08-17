@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::capture_cache::CaptureCache;
 use crate::tmux::{
     self, capture_pane_args, kill_session_args, list_sessions_args, new_session_args,
     send_enter_args, send_keys_args, send_named_key_args, set_option_args, show_option_args,
@@ -72,15 +73,17 @@ pub trait TerminalDriver: Send + Sync {
 /// The live driver: every operation delegates to an existing pure `*_args`
 /// builder in [`crate::tmux`] plus [`tmux::run_tmux_async`]. It reimplements
 /// no argv construction.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TmuxDriver {
     timeout: Duration,
+    capture_cache: CaptureCache,
 }
 
 impl Default for TmuxDriver {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_TMUX_TIMEOUT,
+            capture_cache: CaptureCache::new(),
         }
     }
 }
@@ -91,7 +94,19 @@ impl TmuxDriver {
     /// indefinitely (see `run_tmux_async`'s `kill_on_drop` behavior).
     #[must_use]
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            capture_cache: CaptureCache::new(),
+        }
+    }
+
+    /// Build a driver whose `capture_pane` short-TTL cache uses `ttl`
+    /// instead of [`crate::capture_cache::DEFAULT_CAPTURE_TTL`] — the
+    /// override a test (or a future policy knob) reaches for.
+    #[must_use]
+    pub fn with_capture_ttl(mut self, ttl: Duration) -> Self {
+        self.capture_cache = CaptureCache::with_ttl(ttl);
+        self
     }
 }
 
@@ -102,7 +117,12 @@ impl TerminalDriver for TmuxDriver {
     }
 
     async fn capture_pane(&self, session_name: &str) -> Result<String, TmuxError> {
-        tmux::run_tmux_async(&capture_pane_args(session_name), self.timeout).await
+        let timeout = self.timeout;
+        self.capture_cache
+            .get_or_capture(session_name, || async move {
+                tmux::run_tmux_async(&capture_pane_args(session_name), timeout).await
+            })
+            .await
     }
 
     async fn new_session(&self, session_name: &str, dir: Option<&str>) -> Result<(), TmuxError> {
