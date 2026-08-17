@@ -29,7 +29,9 @@ types: dispatch, in-memory live state, the durable-write bridge, and the actix-w
 `term-core` and `term-attach` (`EN.9.A`) are two more members — tmux session-control ported from
 `core/bastion`, split so the blocking attach path can never be pulled into `engine-core`/
 `engine-serve` by additive feature unification; neither is linked from either binary yet
-(`EN.9.B` wires `term-core` in). See [terminal-crates.md](terminal-crates.md).
+(`EN.9.B` wires `term-core` in — the async driver seam, the fail-closed session lease, and the
+operator hold; see [terminal-driver.md](terminal-driver.md)). See
+[terminal-crates.md](terminal-crates.md).
 
 ```
 engine-rs/
