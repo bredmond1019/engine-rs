@@ -26,5 +26,7 @@ pub mod claude_state;
 pub mod detect;
 #[cfg(feature = "tokio")]
 pub mod driver;
+#[cfg(feature = "tokio")]
+pub mod lease;
 pub mod model;
 pub mod tmux;
