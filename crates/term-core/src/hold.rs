@@ -262,6 +262,23 @@ mod tests {
         assert!(!parse_session_attached("garbled"));
     }
 
+    /// Golden test — `EN.9.B` task 8. Pins `parse_session_attached` against
+    /// the exact bytes `tmux display-message -p '#{session_attached}'`
+    /// emitted on a real, locally installed tmux (3.7b, 2026-08-17),
+    /// captured verbatim (`docs/terminal-driver.md`'s "Verified live"
+    /// section) rather than assumed from the man page. A future tmux that
+    /// rewords this output fails HERE instead of silently classifying
+    /// every session as unattached.
+    #[test]
+    fn session_attached_parses_the_captured_live_strings() {
+        // Detached, before any client attached: tmux 3.7b emitted `0x30 0x0a`.
+        assert!(!parse_session_attached("0\n"));
+        // A second client attached via a background pty: `0x31 0x0a`.
+        assert!(parse_session_attached("1\n"));
+        // Detached again, after the attaching client was killed: `0x30 0x0a`.
+        assert!(!parse_session_attached("0\n"));
+    }
+
     // AC: an attached operator pauses sends while reads continue.
     #[tokio::test]
     async fn attached_pauses_sends_but_never_gates_reads() {

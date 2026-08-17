@@ -127,8 +127,51 @@ produce.
 
 ## Verified live
 
-`#{session_attached}` semantics under a raw `tmux attach` are executed against the installed tmux
-and recorded verbatim by `EN.9.B` task 8, which pins the exact captured strings as a golden test
-in `hold.rs`. That section is added there, not here — this reference only states the acceptance
-criterion it satisfies: the `## Verified live` section states the recipe was executed, not
-authored, and any contradiction with the design above is reported rather than papered over.
+**This section was executed against a real tmux, not authored from the design above.** Recorded
+by `EN.9.B` task 8, run on the Mini's installed tmux.
+
+- **tmux version:** `tmux 3.7b`
+- **Date:** 2026-08-17 (UTC)
+
+Recipe:
+
+```bash
+# 1. Create a detached session.
+tmux new-session -d -s en9b-live-test -x 80 -y 24
+
+# 2. Read #{session_attached} while nothing is attached.
+tmux display-message -p -t en9b-live-test '#{session_attached}'
+
+# 3. Attach a second client via a background pty (a nested tmux session
+#    running `tmux attach` in its pane, with $TMUX unset so it treats the
+#    target as a foreign server rather than refusing to nest):
+tmux new-session -d -s en9b-attacher "env -u TMUX tmux attach -t en9b-live-test"
+
+# 4. Re-read while attached.
+tmux display-message -p -t en9b-live-test '#{session_attached}'
+
+# 5. Detach (kill the attacher client) and re-read.
+tmux kill-session -t en9b-attacher
+tmux display-message -p -t en9b-live-test '#{session_attached}'
+```
+
+Verbatim captured output (`xxd` of each `display-message -p` call's stdout, showing the exact
+bytes including the trailing newline tmux always emits):
+
+| Step | Raw bytes | Meaning |
+|---|---|---|
+| Detached (before attach) | `30 0a` → `"0\n"` | not attached |
+| Attached (second client connected) | `31 0a` → `"1\n"` | attached |
+| Detached again (after `kill-session` on the attaching client) | `30 0a` → `"0\n"` | not attached |
+
+`tmux list-clients -t en9b-live-test` during step 4 confirmed one real client attached
+(`/dev/ttys013: en9b-live-test [80x24 tmux-256color] (attached,focused,UTF-8)`), and reported no
+clients before/after — the pty-backed nested-attach trick genuinely connects a client, it is not
+just `@operator_hold`-shaped bookkeeping.
+
+**No contradiction with task 5's design.** `parse_session_attached` in `hold.rs` already treats
+the bare digit with a trailing newline as the wire format (`raw.trim() == "1"`), which is exactly
+what tmux emits here — `"0\n"` and `"1\n"`, never an unadorned `"0"`/`"1"` or anything else. The
+exact captured strings are pinned as a golden test in `hold.rs`
+(`session_attached_parses_the_captured_live_strings`) so a future tmux that rewords this output
+fails a test instead of silently classifying every session as unattached.
