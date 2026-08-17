@@ -225,6 +225,13 @@ pub enum TmuxError {
         #[source]
         source: Box<TmuxError>,
     },
+    /// The invocation did not complete within the supplied bound. The child
+    /// process is killed before this variant is returned — never leaked.
+    #[error("tmux {action} timed out after {after:?}")]
+    Timeout {
+        action: &'static str,
+        after: std::time::Duration,
+    },
 }
 
 /// Private `.context(...)` extension, mirroring the ergonomics of the
@@ -240,6 +247,35 @@ impl<T> ResultExt<T> for Result<T, TmuxError> {
             source: Box::new(source),
         })
     }
+}
+
+/// Classify the outcome of a completed tmux invocation into the same
+/// `Result<String, TmuxError>` shape `run_tmux` returns, without touching
+/// a process handle. Pure — takes the already-collected exit status pieces.
+///
+/// Both the blocking `run_tmux` and the async `run_tmux_async` (behind the
+/// `tokio` feature) delegate to this single function so their success/
+/// no-server/non-zero-exit classification can never drift apart.
+pub fn classify_output(
+    success: bool,
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<String, TmuxError> {
+    if success {
+        let stdout = String::from_utf8_lossy(stdout).into_owned();
+        return Ok(stdout);
+    }
+
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+
+    // tmux exits 1 with this stderr when no server is running.
+    if classify_no_server(&stderr) {
+        return Err(TmuxError::NoServer);
+    }
+
+    let code = code.unwrap_or(-1);
+    Err(TmuxError::ExitError { code, stderr })
 }
 
 /// Execute a tmux command (args[0] = "tmux", args[1..] = subcommand + flags).
@@ -260,20 +296,67 @@ pub fn run_tmux(args: &[String]) -> Result<String, TmuxError> {
             }
         })?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        return Ok(stdout);
+    classify_output(
+        output.status.success(),
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    )
+}
+
+/// Async mirror of `run_tmux`, using `tokio::process::Command`. Shares the
+/// same locale env and the same `classify_output` classification so the
+/// blocking and async paths can never disagree on outcome.
+///
+/// Behind the non-default `tokio` feature — `bastion` consumes this crate
+/// blocking-only and must keep paying nothing for the async path.
+///
+/// On timeout the spawned child is killed before `TmuxError::Timeout` is
+/// returned; it is never left running in the background.
+#[cfg(feature = "tokio")]
+pub async fn run_tmux_async(
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<String, TmuxError> {
+    debug_assert!(!args.is_empty(), "args must not be empty");
+    let (bin, rest) = args.split_first().expect("args must not be empty");
+
+    // `kill_on_drop(true)` is what makes the timeout path below actually kill
+    // the child rather than leak it: `tokio::time::timeout` cancels by
+    // dropping the losing future, which drops this `Child` — and with
+    // `kill_on_drop` set, tokio sends SIGKILL as part of that drop instead of
+    // merely closing our handle to an orphaned process.
+    let child = tokio::process::Command::new(bin)
+        .args(rest)
+        .envs(tmux_locale_env())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                TmuxError::NotInstalled
+            } else {
+                TmuxError::Io(e)
+            }
+        })?;
+
+    let action: &'static str = "run_tmux_async";
+    let wait = child.wait_with_output();
+
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(output)) => classify_output(
+            output.status.success(),
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+        ),
+        Ok(Err(e)) => Err(TmuxError::Io(e)),
+        Err(_elapsed) => Err(TmuxError::Timeout {
+            action,
+            after: timeout,
+        }),
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-    // tmux exits 1 with this stderr when no server is running.
-    if classify_no_server(&stderr) {
-        return Err(TmuxError::NoServer);
-    }
-
-    let code = output.status.code().unwrap_or(-1);
-    Err(TmuxError::ExitError { code, stderr })
 }
 
 /// True when tmux stderr indicates no server is running / reachable.
@@ -632,5 +715,102 @@ mod tests {
     #[test]
     fn classify_no_server_rejects_empty() {
         assert!(!classify_no_server(""));
+    }
+
+    // ── classify_output (#1 — shared blocking/async classification) ────────────
+
+    #[test]
+    fn classify_output_success_returns_stdout() {
+        let result = classify_output(true, Some(0), b"pane contents\n", b"");
+        assert_eq!(result.unwrap(), "pane contents\n");
+    }
+
+    #[test]
+    fn classify_output_no_server_matches_run_tmux_path() {
+        // Same stderr shape run_tmux would see for "no server running".
+        let result = classify_output(
+            false,
+            Some(1),
+            b"",
+            b"no server running on /tmp/tmux-501/default",
+        );
+        assert!(matches!(result, Err(TmuxError::NoServer)));
+    }
+
+    #[test]
+    fn classify_output_non_zero_exit_carries_code_and_stderr() {
+        let result = classify_output(false, Some(2), b"", b"can't find session: nope");
+        match result {
+            Err(TmuxError::ExitError { code, stderr }) => {
+                assert_eq!(code, 2);
+                assert_eq!(stderr, "can't find session: nope");
+            }
+            other => panic!("expected ExitError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_output_missing_exit_code_defaults_to_negative_one() {
+        let result = classify_output(false, None, b"", b"duplicate session: work");
+        match result {
+            Err(TmuxError::ExitError { code, .. }) => assert_eq!(code, -1),
+            other => panic!("expected ExitError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_output_agrees_with_run_tmux_success_shape() {
+        // run_tmux's success branch is `String::from_utf8_lossy(&output.stdout)
+        // .into_owned()`; classify_output must produce byte-identical output
+        // for the same input so the two paths never disagree.
+        let raw: &[u8] = b"session-a\tsession-b\n";
+        let via_classify = classify_output(true, Some(0), raw, b"").unwrap();
+        let via_lossy = String::from_utf8_lossy(raw).into_owned();
+        assert_eq!(via_classify, via_lossy);
+    }
+
+    // ── run_tmux_async (#1 — tokio feature) ─────────────────────────────────────
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn run_tmux_async_wedged_command_times_out_within_bound() {
+        // Stand in for a wedged tmux call with a command that outlives the bound.
+        let args = vec!["sleep".to_string(), "30".to_string()];
+        let bound = std::time::Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        let result = run_tmux_async(&args, bound).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(TmuxError::Timeout { .. })),
+            "expected Timeout, got {result:?}"
+        );
+        // Generous slack over the bound so this isn't flaky under CI load,
+        // while still proving we didn't wait anywhere near the full 30s sleep.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}, expected well under the 30s sleep"
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn run_tmux_async_completes_within_bound_returns_ok() {
+        let args = vec!["echo".to_string(), "hello".to_string()];
+        let bound = std::time::Duration::from_secs(5);
+
+        let result = run_tmux_async(&args, bound).await;
+        assert_eq!(result.unwrap().trim(), "hello");
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn run_tmux_async_missing_binary_returns_not_installed() {
+        let args = vec!["this-binary-does-not-exist-xyz".to_string()];
+        let bound = std::time::Duration::from_secs(5);
+
+        let result = run_tmux_async(&args, bound).await;
+        assert!(matches!(result, Err(TmuxError::NotInstalled)));
     }
 }
