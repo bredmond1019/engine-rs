@@ -12,7 +12,7 @@
 // the engine API; the engine has no knowledge of either agent.
 
 use crate::detect::manifest::parse_manifest;
-use crate::detect::{detect, AgentState};
+use crate::detect::{detect, AgentState, BlockedReason};
 
 // ── Load manifests and fixtures at compile time ───────────────────────────────
 
@@ -20,6 +20,8 @@ const CLAUDE_MANIFEST: &str = include_str!("manifests/claude.toml");
 const PI_MANIFEST: &str = include_str!("manifests/pi.toml");
 
 const CLAUDE_BLOCKED_FIXTURE: &str = include_str!("fixtures/claude_blocked.txt");
+const CLAUDE_AWAITING_QUESTION_FIXTURE: &str =
+    include_str!("fixtures/claude_awaiting_question.txt");
 const CLAUDE_WORKING_FIXTURE: &str = include_str!("fixtures/claude_working.txt");
 const CLAUDE_IDLE_FIXTURE: &str = include_str!("fixtures/claude_idle.txt");
 const PI_WORKING_FIXTURE: &str = include_str!("fixtures/pi_working.txt");
@@ -52,6 +54,64 @@ fn claude_blocked_fixture_yields_blocked_with_visible_blocker() {
         "visible_working should be false"
     );
     assert!(!detection.visible_idle, "visible_idle should be false");
+    assert_eq!(
+        detection.blocked_reason,
+        Some(BlockedReason::PermissionPrompt),
+        "expected blocked_reason == Some(PermissionPrompt)"
+    );
+}
+
+/// Claude AskUserQuestion prompt → Blocked + visible_blocker + AwaitingQuestion.
+#[test]
+fn claude_awaiting_question_fixture_yields_blocked_with_awaiting_question_reason() {
+    let manifest = parse_manifest(CLAUDE_MANIFEST)
+        .expect("claude.toml parse failed")
+        .compile()
+        .expect("claude.toml compile failed");
+
+    let detection = detect(CLAUDE_AWAITING_QUESTION_FIXTURE, &manifest);
+
+    assert_eq!(
+        detection.state,
+        AgentState::Blocked,
+        "expected Blocked, got {:?}",
+        detection.state
+    );
+    assert!(
+        detection.visible_blocker,
+        "expected visible_blocker == true"
+    );
+    assert_eq!(
+        detection.blocked_reason,
+        Some(BlockedReason::AwaitingQuestion),
+        "expected blocked_reason == Some(AwaitingQuestion)"
+    );
+}
+
+/// The awaiting-question fixture and the permission-prompt fixture must be
+/// disjoint: proves the two blocked rules match different pane content rather
+/// than relying solely on priority ordering to separate them.
+#[test]
+fn awaiting_question_fixture_does_not_contain_permission_prompt_text() {
+    assert!(
+        !CLAUDE_AWAITING_QUESTION_FIXTURE.contains("Do you want to proceed?"),
+        "awaiting-question fixture must not contain the permission-prompt phrase"
+    );
+}
+
+/// Idle and working fixtures carry no blocked_reason.
+#[test]
+fn idle_and_working_fixtures_have_no_blocked_reason() {
+    let manifest = parse_manifest(CLAUDE_MANIFEST)
+        .expect("claude.toml parse failed")
+        .compile()
+        .expect("claude.toml compile failed");
+
+    let idle_detection = detect(CLAUDE_IDLE_FIXTURE, &manifest);
+    assert_eq!(idle_detection.blocked_reason, None);
+
+    let working_detection = detect(CLAUDE_WORKING_FIXTURE, &manifest);
+    assert_eq!(working_detection.blocked_reason, None);
 }
 
 /// Claude working screen → Working + visible_working.

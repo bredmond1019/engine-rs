@@ -1,0 +1,40 @@
+
+╭─── Claude Code v2.1.233 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│                Welcome back Brandon!               │ Run /init to create a CLAUDE.md file with instructions for Cla… │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Added GitLab merge request URL support to the `--worktree` fla… │
+│                        ▘▘ ▝▝                       │ Added an opt-in `forward_user_identity` apps gateway setting o… │
+│      Opus 5 with medium effort · Claude Max ·      │ Added opt-in memory cgroup support for Bash tool commands on L… │
+│      operator@example.com's Organization         │ /release-notes for more                                         │
+│                    /private/tmp                    │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 1 MCP server needs authentication · run /mcp
+
+ ▎ Auto mode is now Claude Code's default permission mode.
+ ▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+ ▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+ ▎ https://code.claude.com/docs/en/permission-modes
+
+❯ Use the AskUserQuestion tool right now to ask me which colour I prefer: red, green, or blue. Do nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Colour
+
+Which colour do you prefer?
+
+❯ 1. Red
+     Warm, bold, high-energy.
+  2. Green
+     Natural, calm, balanced.
+  3. Blue
+     Cool, steady, classic.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
