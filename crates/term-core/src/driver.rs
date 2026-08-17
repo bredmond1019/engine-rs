@@ -18,12 +18,16 @@
 //! Behind the non-default `tokio` feature — `bastion` consumes `term-core`
 //! blocking-only and must keep paying nothing for this module.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::capture_cache::CaptureCache;
+use crate::hold::{HoldError, OperatorHold};
+use crate::lease::{LeaseError, SessionLease};
 use crate::tmux::{
     self, capture_pane_args, display_message_args, kill_session_args, list_sessions_args,
     new_session_args, send_enter_args, send_keys_args, send_named_key_args, set_option_args,
@@ -53,9 +57,29 @@ pub trait TerminalDriver: Send + Sync {
     /// Remove a tmux session.
     async fn kill_session(&self, session_name: &str) -> Result<(), TmuxError>;
 
+    /// Send `keys` literally to `session_name` — the FIRST of `send_keys`'s
+    /// two invocations. Exposed separately (rather than folded into
+    /// [`TerminalDriver::send_keys`]) so a caller sitting between the two
+    /// invocations — the per-session guarded sender (`EN.9.B` task 6) — can
+    /// observe a literal-send success followed by an Enter-send failure and
+    /// react (send a `C-u` line-clear) instead of losing that distinction
+    /// behind one bundled `Result`.
+    async fn send_literal(&self, session_name: &str, keys: &str) -> Result<(), TmuxError>;
+
+    /// Send the Enter keypress to `session_name` — the SECOND of
+    /// `send_keys`'s two invocations. See [`TerminalDriver::send_literal`].
+    async fn send_enter(&self, session_name: &str) -> Result<(), TmuxError>;
+
     /// Send `keys` literally to `session_name`, followed by an Enter
     /// keypress — the same two-invocation shape as `tmux::send_keys`.
-    async fn send_keys(&self, session_name: &str, keys: &str) -> Result<(), TmuxError>;
+    /// Default: [`TerminalDriver::send_literal`] then
+    /// [`TerminalDriver::send_enter`], the Enter only attempted if the
+    /// literal send succeeded (mirroring a real tmux invocation, which
+    /// never reaches the second call after the first fails).
+    async fn send_keys(&self, session_name: &str, keys: &str) -> Result<(), TmuxError> {
+        self.send_literal(session_name, keys).await?;
+        self.send_enter(session_name).await
+    }
 
     /// Send a single named key (e.g. `Escape`, `C-c`) to `session_name`.
     async fn send_named_key(&self, session_name: &str, key: &str) -> Result<(), TmuxError>;
@@ -141,8 +165,12 @@ impl TerminalDriver for TmuxDriver {
         Ok(())
     }
 
-    async fn send_keys(&self, session_name: &str, keys: &str) -> Result<(), TmuxError> {
+    async fn send_literal(&self, session_name: &str, keys: &str) -> Result<(), TmuxError> {
         tmux::run_tmux_async(&send_keys_args(session_name, keys), self.timeout).await?;
+        Ok(())
+    }
+
+    async fn send_enter(&self, session_name: &str) -> Result<(), TmuxError> {
         tmux::run_tmux_async(&send_enter_args(session_name), self.timeout).await?;
         Ok(())
     }
@@ -163,6 +191,15 @@ impl TerminalDriver for TmuxDriver {
 
     async fn display_message(&self, session_name: &str, format: &str) -> Result<String, TmuxError> {
         tmux::run_tmux_async(&display_message_args(session_name, format), self.timeout).await
+    }
+}
+
+/// Sleep `delay` if non-zero — a no-op fast path for the overwhelming
+/// majority of stub calls in tests that never configure
+/// [`StubTerminalDriver::set_send_delay`].
+async fn maybe_sleep(delay: Duration) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -225,11 +262,25 @@ pub struct StubTerminalDriver {
     capture_pane_result: Arc<Mutex<StubOutcome>>,
     new_session_result: Arc<Mutex<StubOutcome>>,
     kill_session_result: Arc<Mutex<StubOutcome>>,
-    send_keys_result: Arc<Mutex<StubOutcome>>,
+    send_literal_result: Arc<Mutex<StubOutcome>>,
+    send_enter_result: Arc<Mutex<StubOutcome>>,
     send_named_key_result: Arc<Mutex<StubOutcome>>,
     set_option_result: Arc<Mutex<StubOutcome>>,
+    /// Default `show_option` answer used when `show_option_by_name` has no
+    /// entry for the requested option name.
     show_option_result: Arc<Mutex<StubOutcome>>,
+    /// Per-option-name `show_option` overrides. Real tmux stores
+    /// `@engine_lease@<session>` and `@operator_hold@<session>` as
+    /// distinct options; a test exercising the guarded sender (`EN.9.B`
+    /// task 6) needs to configure the lease's answer independently from
+    /// the hold's, which the single flat `show_option_result` cannot do.
+    show_option_by_name: Arc<Mutex<HashMap<String, StubOutcome>>>,
     display_message_result: Arc<Mutex<StubOutcome>>,
+    /// Optional artificial delay `send_literal`/`send_enter` sleep before
+    /// returning — lets a concurrency test (task 6) use a paused tokio
+    /// clock to prove two sessions' sends overlap instead of serialize,
+    /// without relying on real wall-clock timing.
+    send_delay: Arc<Mutex<Duration>>,
 }
 
 impl Default for StubTerminalDriver {
@@ -240,11 +291,14 @@ impl Default for StubTerminalDriver {
             capture_pane_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
             new_session_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
             kill_session_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
-            send_keys_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
+            send_literal_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
+            send_enter_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
             send_named_key_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
             set_option_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
             show_option_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
+            show_option_by_name: Arc::new(Mutex::new(HashMap::new())),
             display_message_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
+            send_delay: Arc::new(Mutex::new(Duration::ZERO)),
         }
     }
 }
@@ -286,8 +340,12 @@ impl StubTerminalDriver {
         *self.kill_session_result.lock().unwrap() = outcome;
     }
 
-    pub fn set_send_keys_result(&self, outcome: StubOutcome) {
-        *self.send_keys_result.lock().unwrap() = outcome;
+    pub fn set_send_literal_result(&self, outcome: StubOutcome) {
+        *self.send_literal_result.lock().unwrap() = outcome;
+    }
+
+    pub fn set_send_enter_result(&self, outcome: StubOutcome) {
+        *self.send_enter_result.lock().unwrap() = outcome;
     }
 
     pub fn set_send_named_key_result(&self, outcome: StubOutcome) {
@@ -304,6 +362,25 @@ impl StubTerminalDriver {
 
     pub fn set_display_message_result(&self, outcome: StubOutcome) {
         *self.display_message_result.lock().unwrap() = outcome;
+    }
+
+    /// Override `show_option`'s answer for one exact option `name` only,
+    /// independent of the flat [`Self::set_show_option_result`] default —
+    /// how a test gives the lease option and the operator-hold option
+    /// different answers in the same scenario.
+    pub fn set_show_option_result_for(&self, name: impl Into<String>, outcome: StubOutcome) {
+        self.show_option_by_name
+            .lock()
+            .unwrap()
+            .insert(name.into(), outcome);
+    }
+
+    /// Make every `send_literal`/`send_enter` call sleep `delay` before
+    /// returning — a controllable stand-in for real tmux latency, meant to
+    /// be paired with `#[tokio::test(start_paused = true)]` so concurrency
+    /// assertions run on virtual, not wall-clock, time.
+    pub fn set_send_delay(&self, delay: Duration) {
+        *self.send_delay.lock().unwrap() = delay;
     }
 }
 
@@ -345,20 +422,26 @@ impl TerminalDriver for StubTerminalDriver {
             .into_unit_result()
     }
 
-    async fn send_keys(&self, session_name: &str, keys: &str) -> Result<(), TmuxError> {
-        // Mirrors `TmuxDriver::send_keys` / `tmux::send_keys`: the literal
-        // send is recorded first, and the Enter keypress is only recorded
-        // (and sent) if the literal send would have succeeded — a real
-        // tmux invocation never reaches the second call otherwise.
+    async fn send_literal(&self, session_name: &str, keys: &str) -> Result<(), TmuxError> {
         self.record(send_keys_args(session_name, keys));
-        let outcome = self.send_keys_result.lock().unwrap().clone();
-        match outcome {
-            StubOutcome::Ok(_) => {
-                self.record(send_enter_args(session_name));
-                Ok(())
-            }
-            other => other.into_unit_result(),
-        }
+        let delay = *self.send_delay.lock().unwrap();
+        maybe_sleep(delay).await;
+        self.send_literal_result
+            .lock()
+            .unwrap()
+            .clone()
+            .into_unit_result()
+    }
+
+    async fn send_enter(&self, session_name: &str) -> Result<(), TmuxError> {
+        self.record(send_enter_args(session_name));
+        let delay = *self.send_delay.lock().unwrap();
+        maybe_sleep(delay).await;
+        self.send_enter_result
+            .lock()
+            .unwrap()
+            .clone()
+            .into_unit_result()
     }
 
     async fn send_named_key(&self, session_name: &str, key: &str) -> Result<(), TmuxError> {
@@ -381,10 +464,9 @@ impl TerminalDriver for StubTerminalDriver {
 
     async fn show_option(&self, name: &str) -> Result<String, TmuxError> {
         self.record(show_option_args(name));
-        self.show_option_result
-            .lock()
-            .unwrap()
-            .clone()
+        let per_name = self.show_option_by_name.lock().unwrap().get(name).cloned();
+        per_name
+            .unwrap_or_else(|| self.show_option_result.lock().unwrap().clone())
             .into_string_result()
     }
 
@@ -395,6 +477,160 @@ impl TerminalDriver for StubTerminalDriver {
             .unwrap()
             .clone()
             .into_string_result()
+    }
+}
+
+/// The parameters of one [`GuardedSender::send_keys`] attempt. `run_id` /
+/// `nonce` / `identity` / `lease_expires_at_ms` are exactly the fields the
+/// caller already holds from having *acquired* the lease
+/// ([`crate::lease::SessionLease::acquire`]) before ever reaching a send —
+/// this call renews (verifies + extends) rather than re-acquiring, per
+/// `hold.rs`'s documented invariant that the lease is retained, never
+/// released, for the duration of a hold.
+pub struct GuardedSendRequest<'a> {
+    pub session_name: &'a str,
+    pub keys: &'a str,
+    pub run_id: &'a str,
+    pub nonce: &'a str,
+    pub identity: &'a str,
+    pub lease_expires_at_ms: u64,
+    pub now_ms: u64,
+}
+
+/// Why [`GuardedSender::send_keys`] did not deliver `keys`.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    /// The lease renewal (verifying we still hold the session) failed —
+    /// no send was attempted.
+    #[error("lease verification failed: {0}")]
+    Lease(#[source] LeaseError),
+    /// The operator hold refused the send — no send was attempted.
+    #[error("send refused: {0}")]
+    Hold(#[source] HoldError),
+    /// The Enter keypress failed after the literal send succeeded, and the
+    /// `C-u` line-clear recovery succeeded — the pane is clean again, but
+    /// the original error is still what the caller needs to see.
+    #[error("send_keys failed: {0}")]
+    SendFailed(#[source] TmuxError),
+    /// The Enter keypress failed AND the `C-u` recovery that followed it
+    /// also failed — the pane may hold a half-typed line. The worst
+    /// outcome, so both errors are surfaced rather than one swallowing the
+    /// other.
+    #[error("send_keys failed: {source}; C-u line-clear recovery ALSO failed: {recovery}")]
+    SendFailedRecoveryFailed {
+        #[source]
+        source: TmuxError,
+        recovery: TmuxError,
+    },
+}
+
+impl From<LeaseError> for SendError {
+    fn from(e: LeaseError) -> Self {
+        SendError::Lease(e)
+    }
+}
+
+impl From<HoldError> for SendError {
+    fn from(e: HoldError) -> Self {
+        SendError::Hold(e)
+    }
+}
+
+/// The `C-u` line-clear key sent to recover a pane left half-typed by a
+/// literal-succeeded/Enter-failed `send_keys`.
+const LINE_CLEAR_KEY: &str = "C-u";
+
+/// Wraps a [`TerminalDriver`] with the per-session send serialization, the
+/// lease/hold verification, and the `C-u` recovery `EN.9.B` task 6
+/// requires. Every send path goes through here — never call
+/// `TerminalDriver::send_keys` directly on a driver a node holds.
+///
+/// The per-session lock is keyed by session name (never one global lock,
+/// which would serialize unrelated sessions against each other) and is
+/// held across the full literal+Enter(+recovery) sequence, so two
+/// concurrent sends to the SAME session can never interleave their
+/// invocations at the pane.
+pub struct GuardedSender<'a> {
+    driver: &'a dyn TerminalDriver,
+    lease: SessionLease<'a>,
+    hold: OperatorHold<'a>,
+    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+}
+
+impl<'a> GuardedSender<'a> {
+    #[must_use]
+    pub fn new(driver: &'a dyn TerminalDriver) -> Self {
+        Self {
+            driver,
+            lease: SessionLease::new(driver),
+            hold: OperatorHold::new(driver),
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The per-session lock, created on first use and reused thereafter —
+    /// looking one up never blocks on another session's held lock, only
+    /// the brief `std::sync::Mutex` guarding the map itself.
+    fn session_lock(&self, session_name: &str) -> Arc<AsyncMutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry(session_name.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Verify the lease and the hold, then send `req.keys` (literal +
+    /// Enter) to `req.session_name` under that session's exclusive lock,
+    /// recovering with a `C-u` line-clear if the Enter send fails after
+    /// the literal send succeeded.
+    pub async fn send_keys(&self, req: GuardedSendRequest<'_>) -> Result<(), SendError> {
+        // Verify (and extend) the lease first: a send must never proceed
+        // without the caller demonstrably still holding the session.
+        self.lease
+            .renew(
+                req.session_name,
+                req.nonce,
+                req.lease_expires_at_ms,
+                req.run_id,
+                req.identity,
+            )
+            .await?;
+
+        // Verify no operator hold is active. Reads are unaffected by this
+        // check (`hold.rs`'s documented asymmetry) — only this send path
+        // calls `guard_send`.
+        self.hold.guard_send(req.session_name, req.now_ms).await?;
+
+        let lock = self.session_lock(req.session_name);
+        let _guard = lock.lock().await;
+
+        self.driver
+            .send_literal(req.session_name, req.keys)
+            .await
+            .map_err(SendError::SendFailed)?;
+
+        // A deliberate yield between the literal and Enter invocations:
+        // widens the window a concurrent same-session sender's own literal
+        // send would need to land in for the per-session lock (not luck)
+        // to be what prevents an interleaved pane.
+        tokio::task::yield_now().await;
+
+        if let Err(enter_err) = self.driver.send_enter(req.session_name).await {
+            return match self
+                .driver
+                .send_named_key(req.session_name, LINE_CLEAR_KEY)
+                .await
+            {
+                Ok(()) => Err(SendError::SendFailed(enter_err)),
+                Err(recovery_err) => Err(SendError::SendFailedRecoveryFailed {
+                    source: enter_err,
+                    recovery: recovery_err,
+                }),
+            };
+        }
+
+        Ok(())
     }
 }
 
@@ -464,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn stub_send_keys_failure_never_records_the_enter_keypress() {
         let stub = StubTerminalDriver::new();
-        stub.set_send_keys_result(StubOutcome::NotInstalled);
+        stub.set_send_literal_result(StubOutcome::NotInstalled);
         let driver: Arc<dyn TerminalDriver> = as_trait_object(stub.clone());
 
         let result = driver.send_keys("proj-abc", "cargo test").await;
@@ -530,6 +766,283 @@ mod tests {
                 send_named_key_args("proj-abc", "C-c"),
                 kill_session_args("proj-abc"),
             ]
+        );
+    }
+
+    // ── GuardedSender (task 6) ──────────────────────────────────────────
+
+    use crate::hold::operator_hold_option_name;
+    use crate::lease::{Lease, LEASE_OPTION};
+
+    fn lease_option_name(session_name: &str) -> String {
+        format!("{LEASE_OPTION}@{session_name}")
+    }
+
+    /// A stub pre-configured so `GuardedSender::send_keys` clears BOTH
+    /// gates: `show_option` answers a live lease matching `nonce` for the
+    /// lease option, an empty `@operator_hold` for the hold option (the
+    /// two option names differ, exercised independently via
+    /// `set_show_option_result_for` — the flat single-value
+    /// `show_option_result` cannot distinguish them), and
+    /// `display_message` reports `session_attached=0`.
+    fn ready_stub(
+        session_name: &str,
+        nonce: &str,
+        run_id: &str,
+        identity: &str,
+    ) -> StubTerminalDriver {
+        let stub = StubTerminalDriver::new();
+        stub.set_show_option_result_for(
+            lease_option_name(session_name),
+            StubOutcome::Ok(
+                Lease {
+                    run_id: run_id.to_string(),
+                    nonce: nonce.to_string(),
+                    identity: identity.to_string(),
+                    expires_at_ms: 60_000,
+                }
+                .to_value(),
+            ),
+        );
+        stub.set_show_option_result_for(
+            operator_hold_option_name(session_name),
+            StubOutcome::empty_ok(),
+        );
+        stub.set_display_message_result(StubOutcome::Ok("0".to_string()));
+        stub
+    }
+
+    /// Only the `send-keys`-subcommand calls, in order — filters out the
+    /// `show-option`/`display-message` calls the lease/hold verification
+    /// also records, isolating exactly the literal/Enter/C-u sequence an
+    /// interleave test cares about.
+    fn send_subcommand_calls(stub: &StubTerminalDriver) -> Vec<Vec<String>> {
+        stub.calls()
+            .into_iter()
+            .filter(|argv| argv.get(1).map(String::as_str) == Some("send-keys"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_to_one_session_never_interleave() {
+        let session = "proj-abc";
+        let nonce = "nonce-1";
+        let stub = ready_stub(session, nonce, "run-1", "worker-1");
+        let sender = GuardedSender::new(&stub);
+
+        let req = |keys: &'static str| GuardedSendRequest {
+            session_name: session,
+            keys,
+            run_id: "run-1",
+            nonce,
+            identity: "worker-1",
+            lease_expires_at_ms: 60_000,
+            now_ms: 0,
+        };
+
+        let (a, b) = tokio::join!(sender.send_keys(req("AAA")), sender.send_keys(req("BBB")));
+        a.expect("A succeeds");
+        b.expect("B succeeds");
+
+        let calls = send_subcommand_calls(&stub);
+        assert_eq!(calls.len(), 4, "two complete literal+Enter pairs");
+        // Whichever literal ran first, its Enter must be the VERY NEXT
+        // send-keys call — never the other sender's literal. That is what
+        // "never interleave" means at the argv level: a mutex bug would
+        // put the second literal at index 1 instead.
+        assert_eq!(calls[1], send_enter_args(session));
+        assert_eq!(calls[3], send_enter_args(session));
+        assert!(
+            calls[0] == send_keys_args(session, "AAA")
+                || calls[0] == send_keys_args(session, "BBB")
+        );
+        assert!(
+            calls[2] == send_keys_args(session, "AAA")
+                || calls[2] == send_keys_args(session, "BBB")
+        );
+        assert_ne!(
+            calls[0], calls[2],
+            "the two literals sent were the two distinct commands"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sends_to_different_sessions_are_not_serialized() {
+        // Real (small) wall-clock delay, not a paused virtual clock —
+        // `term-core`'s `tokio` feature is `full` without `test-util`, so
+        // `start_paused` is unavailable. The margin below (< 3 legs when
+        // 4 sequential legs would prove a serialization bug) is generous
+        // enough not to flake under normal scheduling jitter.
+        let nonce = "nonce-1";
+        let stub_a = ready_stub("sess-a", nonce, "run-1", "worker-1");
+        let stub_b = ready_stub("sess-b", nonce, "run-1", "worker-1");
+        let delay = Duration::from_millis(80);
+        stub_a.set_send_delay(delay);
+        stub_b.set_send_delay(delay);
+        let sender_a = GuardedSender::new(&stub_a);
+        let sender_b = GuardedSender::new(&stub_b);
+
+        let req = |session: &'static str| GuardedSendRequest {
+            session_name: session,
+            keys: "hello",
+            run_id: "run-1",
+            nonce,
+            identity: "worker-1",
+            lease_expires_at_ms: 60_000,
+            now_ms: 0,
+        };
+
+        let start = std::time::Instant::now();
+        let (a, b) = tokio::join!(
+            sender_a.send_keys(req("sess-a")),
+            sender_b.send_keys(req("sess-b"))
+        );
+        a.expect("A succeeds");
+        b.expect("B succeeds");
+        let elapsed = start.elapsed();
+
+        // Each session's own send pays two legs of `delay` (literal, then
+        // Enter). If the two DIFFERENT sessions were wrongly serialized
+        // against each other, the total would double to ~4 legs. Not
+        // serialized: the elapsed time stays near the depth of ONE
+        // session's own chain, not the sum of both.
+        assert!(
+            elapsed < delay * 3,
+            "different sessions must overlap, not serialize: elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_failure_sends_c_u_recovery_and_returns_the_original_error() {
+        let session = "proj-abc";
+        let nonce = "nonce-1";
+        let stub = ready_stub(session, nonce, "run-1", "worker-1");
+        stub.set_send_enter_result(StubOutcome::ExitError {
+            code: 1,
+            stderr: "pane gone".to_string(),
+        });
+        let sender = GuardedSender::new(&stub);
+
+        let result = sender
+            .send_keys(GuardedSendRequest {
+                session_name: session,
+                keys: "cargo test",
+                run_id: "run-1",
+                nonce,
+                identity: "worker-1",
+                lease_expires_at_ms: 60_000,
+                now_ms: 0,
+            })
+            .await;
+
+        match result {
+            Err(SendError::SendFailed(TmuxError::ExitError { code, stderr })) => {
+                assert_eq!(code, 1);
+                assert_eq!(stderr, "pane gone");
+            }
+            other => panic!("expected the ORIGINAL Enter error, got {other:?}"),
+        }
+
+        let calls = send_subcommand_calls(&stub);
+        assert_eq!(
+            calls,
+            vec![
+                send_keys_args(session, "cargo test"),
+                send_enter_args(session),
+                send_named_key_args(session, LINE_CLEAR_KEY),
+            ],
+            "literal, failed Enter, then the C-u recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_c_u_recovery_is_surfaced_not_swallowed() {
+        let session = "proj-abc";
+        let nonce = "nonce-1";
+        let stub = ready_stub(session, nonce, "run-1", "worker-1");
+        stub.set_send_enter_result(StubOutcome::ExitError {
+            code: 1,
+            stderr: "pane gone".to_string(),
+        });
+        stub.set_send_named_key_result(StubOutcome::NoServer);
+        let sender = GuardedSender::new(&stub);
+
+        let result = sender
+            .send_keys(GuardedSendRequest {
+                session_name: session,
+                keys: "cargo test",
+                run_id: "run-1",
+                nonce,
+                identity: "worker-1",
+                lease_expires_at_ms: 60_000,
+                now_ms: 0,
+            })
+            .await;
+
+        match result {
+            Err(SendError::SendFailedRecoveryFailed { source, recovery }) => {
+                assert!(matches!(source, TmuxError::ExitError { code: 1, .. }));
+                assert!(matches!(recovery, TmuxError::NoServer));
+            }
+            other => panic!("expected both the original AND the recovery error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_never_proceeds_without_a_verified_lease() {
+        let session = "proj-abc";
+        // No lease configured at all: `show_option` defaults to empty_ok,
+        // so `SessionLease::renew` sees no existing lease and returns
+        // `NotOurs` before any send-keys call is made.
+        let stub = StubTerminalDriver::new();
+        stub.set_display_message_result(StubOutcome::Ok("0".to_string()));
+        let sender = GuardedSender::new(&stub);
+
+        let result = sender
+            .send_keys(GuardedSendRequest {
+                session_name: session,
+                keys: "cargo test",
+                run_id: "run-1",
+                nonce: "nonce-1",
+                identity: "worker-1",
+                lease_expires_at_ms: 60_000,
+                now_ms: 0,
+            })
+            .await;
+
+        assert!(matches!(result, Err(SendError::Lease(_))));
+        assert!(
+            send_subcommand_calls(&stub).is_empty(),
+            "no send was attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_never_proceeds_while_a_hold_is_active() {
+        let session = "proj-abc";
+        let nonce = "nonce-1";
+        let stub = ready_stub(session, nonce, "run-1", "worker-1");
+        // Override the hold signal back to attached — the lease is still
+        // fine, but a live operator attach must still refuse the send.
+        stub.set_display_message_result(StubOutcome::Ok("1".to_string()));
+        let sender = GuardedSender::new(&stub);
+
+        let result = sender
+            .send_keys(GuardedSendRequest {
+                session_name: session,
+                keys: "cargo test",
+                run_id: "run-1",
+                nonce,
+                identity: "worker-1",
+                lease_expires_at_ms: 60_000,
+                now_ms: 0,
+            })
+            .await;
+
+        assert!(matches!(result, Err(SendError::Hold(_))));
+        assert!(
+            send_subcommand_calls(&stub).is_empty(),
+            "no send was attempted"
         );
     }
 }
