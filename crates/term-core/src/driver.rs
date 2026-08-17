@@ -25,9 +25,9 @@ use async_trait::async_trait;
 
 use crate::capture_cache::CaptureCache;
 use crate::tmux::{
-    self, capture_pane_args, kill_session_args, list_sessions_args, new_session_args,
-    send_enter_args, send_keys_args, send_named_key_args, set_option_args, show_option_args,
-    TmuxError,
+    self, capture_pane_args, display_message_args, kill_session_args, list_sessions_args,
+    new_session_args, send_enter_args, send_keys_args, send_named_key_args, set_option_args,
+    show_option_args, TmuxError,
 };
 
 /// Default per-invocation timeout for [`TmuxDriver`]'s async calls. Callers
@@ -68,6 +68,12 @@ pub trait TerminalDriver: Send + Sync {
     /// Read back a global tmux option previously written with
     /// [`TerminalDriver::set_option`].
     async fn show_option(&self, name: &str) -> Result<String, TmuxError>;
+
+    /// Print an expanded tmux format string (`display-message -p`) for
+    /// `session_name` — used by the operator hold (`EN.9.B` task 5) to read
+    /// `#{session_attached}` as the raw-`tmux attach` fallback signal for a
+    /// session no managed attach path saw.
+    async fn display_message(&self, session_name: &str, format: &str) -> Result<String, TmuxError>;
 }
 
 /// The live driver: every operation delegates to an existing pure `*_args`
@@ -154,6 +160,10 @@ impl TerminalDriver for TmuxDriver {
     async fn show_option(&self, name: &str) -> Result<String, TmuxError> {
         tmux::run_tmux_async(&show_option_args(name), self.timeout).await
     }
+
+    async fn display_message(&self, session_name: &str, format: &str) -> Result<String, TmuxError> {
+        tmux::run_tmux_async(&display_message_args(session_name, format), self.timeout).await
+    }
 }
 
 /// A cloneable, freshly-materializable stand-in for a `Result<String,
@@ -219,6 +229,7 @@ pub struct StubTerminalDriver {
     send_named_key_result: Arc<Mutex<StubOutcome>>,
     set_option_result: Arc<Mutex<StubOutcome>>,
     show_option_result: Arc<Mutex<StubOutcome>>,
+    display_message_result: Arc<Mutex<StubOutcome>>,
 }
 
 impl Default for StubTerminalDriver {
@@ -233,6 +244,7 @@ impl Default for StubTerminalDriver {
             send_named_key_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
             set_option_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
             show_option_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
+            display_message_result: Arc::new(Mutex::new(StubOutcome::empty_ok())),
         }
     }
 }
@@ -288,6 +300,10 @@ impl StubTerminalDriver {
 
     pub fn set_show_option_result(&self, outcome: StubOutcome) {
         *self.show_option_result.lock().unwrap() = outcome;
+    }
+
+    pub fn set_display_message_result(&self, outcome: StubOutcome) {
+        *self.display_message_result.lock().unwrap() = outcome;
     }
 }
 
@@ -366,6 +382,15 @@ impl TerminalDriver for StubTerminalDriver {
     async fn show_option(&self, name: &str) -> Result<String, TmuxError> {
         self.record(show_option_args(name));
         self.show_option_result
+            .lock()
+            .unwrap()
+            .clone()
+            .into_string_result()
+    }
+
+    async fn display_message(&self, session_name: &str, format: &str) -> Result<String, TmuxError> {
+        self.record(display_message_args(session_name, format));
+        self.display_message_result
             .lock()
             .unwrap()
             .clone()

@@ -184,6 +184,24 @@ pub fn show_option_args(name: &str) -> Vec<String> {
     ]
 }
 
+/// Returns the argument list for:
+///   tmux display-message -p -t <session_name> <format>
+///
+/// Net-new for the `EN.9.B` operator-hold surface: the raw-`tmux attach`
+/// fallback signal (`#{session_attached}`) for a session that no managed
+/// attach path saw, so `@operator_hold` never went missing. `-p` prints the
+/// expanded format string to stdout instead of the tmux status line.
+pub fn display_message_args(session_name: &str, format: &str) -> Vec<String> {
+    vec![
+        "tmux".to_string(),
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        session_name.to_string(),
+        format.to_string(),
+    ]
+}
+
 /// Returns the locale env pairs to force on the spawned tmux child.
 ///
 /// `run_tmux` inherits the parent process environment as-is. When the parent
@@ -647,6 +665,20 @@ mod tests {
         assert_eq!(args[2], "-g");
         assert_eq!(args[3], "@lease");
         assert_eq!(args.len(), 4);
+    }
+
+    // ── display_message_args ─────────────────────────────────────────────────────
+
+    #[test]
+    fn display_message_args_correct() {
+        let args = display_message_args("sess", "#{session_attached}");
+        assert_eq!(args[0], "tmux");
+        assert_eq!(args[1], "display-message");
+        assert_eq!(args[2], "-p");
+        assert_eq!(args[3], "-t");
+        assert_eq!(args[4], "sess");
+        assert_eq!(args[5], "#{session_attached}");
+        assert_eq!(args.len(), 6);
     }
 
     // ── tmux_locale_env ─────────────────────────────────────────────────────────
