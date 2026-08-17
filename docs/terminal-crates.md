@@ -7,15 +7,18 @@ layer: [engine]
 project: engine-rs
 status: active
 keywords: [tmux, term-core, term-attach, agent-detection, feature unification, reversibility, bastion]
-related: [architecture, engine-rs-testing]
+related: [architecture, engine-rs-testing, terminal-driver]
 ---
 
 # Terminal Crates (`term-core` / `term-attach`)
 
 `EN.9.A` ports bastion's tmux session-control and agent-detection code into this workspace as two
 new crates, so a future engine-side workflow can drive terminals without ever linking the code
-path that attaches a process to a live tty. Neither crate is wired into `engine-core` or
-`engine-serve` yet — that is `EN.9.B`. This doc covers the split and its traps; see
+path that attaches a process to a live tty. `EN.9.B` adds the async driver seam, capture cache,
+session lease, and operator hold on top of `term-core` (see
+[terminal-driver.md](terminal-driver.md)); wiring any of it into an actual `engine-core` /
+`engine-serve` workflow node is still ahead, in `EN.9.D`/`EN.9.E`. This doc covers the split and
+its traps; see
 [architecture.md](architecture.md) for where the crates sit in the module map.
 
 ## What each crate holds
@@ -86,7 +89,10 @@ for that window regardless of which order the two reverts happen in. engine-rs C
 bastion and cannot detect that a revert here broke it. This is an accepted operator trade-off, not
 a defect to fix.
 
-## Status as of `EN.9.A`
+## Status as of `EN.9.B`
 
-Neither crate is a dependency of `engine-core` or `engine-serve`. `term-core` builds and tests
-standalone (`cargo nextest run -p term-core`); wiring it into a workflow node is `EN.9.B`.
+Neither crate is a dependency of `engine-core` or `engine-serve` yet. `term-core` builds and
+tests standalone (`cargo nextest run -p term-core`), now including the non-default `tokio`
+feature's async driver/lease/hold surface added in `EN.9.B` (see
+[terminal-driver.md](terminal-driver.md)); wiring any of it into an actual workflow node is
+`EN.9.D`/`EN.9.E`.
