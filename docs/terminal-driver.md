@@ -128,7 +128,9 @@ produce.
 ## Verified live
 
 **This section was executed against a real tmux, not authored from the design above.** Recorded
-by `EN.9.B` task 8, run on the Mini's installed tmux.
+by `EN.9.B` task 8, run against the **locally installed** tmux on the development machine — not on
+the Mini. (The 2026-08-16 `operator-tmux-lease-spike` was the Mini run; it covered `@engine_lease`
+persistence and did **not** cover `#{session_attached}`, which is why this section exists.)
 
 - **tmux version:** `tmux 3.7b`
 - **Date:** 2026-08-17 (UTC)
