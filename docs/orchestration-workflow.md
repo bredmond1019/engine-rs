@@ -23,12 +23,42 @@ those predicates fails, and that stays with a human.
 **Workflow type:** `ORCHESTRATION` · **Node:** `OrchestrationRunNode` ·
 **Source:** `crates/engine-core/src/workflows/orchestration/`
 
-## Why a workflow and not a long-lived session
+## What it actually invokes — read this before extending it
 
-Claude Code reads its rules and harness from its working directory, so **a session cannot span
-repos** — but a workflow can. `ORCHESTRATION` spawns a short-lived, cwd-scoped run per block, each
-pointed at that block's own repo. The practical consequence: lane length stops being a property of
-the driver. A twelve-block chain across four repos is the same shape as a two-block chain in one.
+`ORCHESTRATION` calls the **native Rust `SDLC_FLOW` workflow in-process**. It does not open a Claude
+Code session and type `/sdlc-flow`, and it does not shell out to the JS engines under
+`.claude/workflows/`.
+
+Per step, `execute.rs` resolves the step's repo slug through the injected `RepoRegistry` to an
+absolute path, builds a **fresh** `SDLC_FLOW` `Workflow` (policy-aware registry + schema, registered
+with that same registry so `SetupWorktreeNode` resolves `event.repo` too), seeds `event.repo` on the
+dispatched event, and runs it to completion. Nothing is kept alive or reused between steps.
+
+Claude Code sessions *do* happen — one layer down. `SDLC_FLOW`'s own model-bearing nodes
+(`ClaudeCodeStep` -> `claude_code_rs::execute`, per `D4`) spawn them for the implement, review and
+docs stages. So the call stack is:
+
+```
+ORCHESTRATION (Rust)
+  └─ per block: SDLC_FLOW (Rust, fresh instance, cwd = that block's repo)
+       └─ per stage: ClaudeCodeStep -> a Claude Code session
+```
+
+Both layers read a repo's harness and `CLAUDE.md` from the **working directory**, which is why a
+session cannot span repos but a workflow can. That is what removes the driver as the ceiling on lane
+length: a twelve-block chain across four repos is the same shape as a two-block chain in one.
+
+## Only `Flow` runs today — `Task` is authored but unsupported
+
+`EngineKind` has two variants, but **only `EngineKind::Flow` is runnable**, because only `SDLC_FLOW`
+has been ported to this engine. There is no Rust `SDLC_TASK` workflow. A block authored
+`sdlc_workflow: "task"` fails loudly with `ExecuteError::UnsupportedEngine` naming the block and repo
+— it does not silently fall through to `Flow`, and it does not panic.
+
+This is a real gap between "the workflow exists" and "the workflow can drive your lane." Concretely:
+of the nine blocks the `engine` lane closed on 2026-08-18, **four were authored `task`**
+(`EN.9.F`, `EN.10.C`, and two adopted tickets), so `ORCHESTRATION` as it stands could have driven 5
+of 9. Check the `sdlc_workflow` field of every block in a chain before assuming it is runnable.
 
 ## What happens per block
 
@@ -36,7 +66,7 @@ the driver. A twelve-block chain across four repos is the same shape as a two-bl
 |---|---|---|
 | Resolve | `chain.rs` | Turns a (roadmap, lane) pair or an explicit block list into ordered `(repo, block_id)` steps. Reads mev's structured `HELD-UNTIL` / `BUDGET` / `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json` — it does not re-derive segments. |
 | Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** and refuses to start a block with an unmet edge, naming the edge and its repo. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail. |
-| Execute | `execute.rs` | Invokes the existing `SDLC_FLOW` workflow in a short-lived run with `cwd` set to that block's repo. Selects the engine from the block's own authored `sdlc_workflow` field. |
+| Execute | `execute.rs` | Builds and runs a **fresh in-process Rust `SDLC_FLOW` `Workflow`** with the repo resolved through `RepoRegistry` and `event.repo` seeded. Selects the engine from the block's own authored `sdlc_workflow` field — `Flow` only; `Task` errors (see above). |
 | Integrate | `integrate.rs` | Verifies the state write after the engine returns and **fails the run loudly on a mismatch**. Appends exactly one line to the roadmap's `lane-log.jsonl`. An operator hold pauses and resumes without re-running completed blocks. |
 
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
