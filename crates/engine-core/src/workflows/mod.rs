@@ -24,6 +24,7 @@ pub mod diagnostic_intake;
 pub mod harvest_approve;
 pub mod lead_ingest;
 pub mod opportunity_edit;
+pub mod orchestration;
 pub mod proposal_generator;
 pub mod research_agent;
 pub mod sdlc_flow;

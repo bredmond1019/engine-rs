@@ -18,6 +18,55 @@ related: [status, context]
 
 ## [run: 2026-08-18]
 
+### ORCHESTRATION workflow — sequence SDLC_FLOW runs across repos from a lane chain closes EN.10.B
+
+Drove `EN.10.B` via `/sdlc-flow` on branch `EN.10.B-flow`, all 7 tasks passed, PASS review.
+`chain.rs` (`crates/engine-core/src/workflows/orchestration/chain.rs`) resolves a lane chain from
+mev's `planning/lane-segments.json` — sorted by `(segment, position)`, refusing to start via a
+`ChainError::Held` when a HELD-UNTIL target is still open (an injectable `is_block_open` closure),
+and failing loudly (`ChainError::ParseFailed`, via `#[serde(deny_unknown_fields)]`) on any malformed
+directive shape; `resolve_explicit_chain` bypasses lane-file parsing for an explicit block list
+(task 1). `gates.rs` adds `check_dependencies` (unmet `depends_on` edges never start a block, naming
+the edge + repo) and `AdmissionGate` (wraps the `EN.9.F` `AdmissionControl` so a saturated ceiling
+queues rather than proceeds or fails) (task 2). `execute.rs`'s `execute_step` invokes `SDLC_FLOW`
+(never reimplemented) per chain step via an injectable `FlowRunner`, selecting
+`EngineKind::Task`/`Flow` from an injectable `resolve_engine` closure and resolving each step's repo
+to an absolute cwd via `RepoRegistry`; `default_flow_runner` builds a fresh policy-aware `SDLC_FLOW`
+`Workflow` per invocation, mirroring `engine-serve`'s `register_sdlc_flow_with_registry` factory
+(task 3). `integrate.rs` adds operator-hold pause-and-resume (`HoldSource`/`wait_for_clearance`),
+state-write verification against `sdlc-flow-state.json` `status=="done"`, roadmap-dir resolution per
+`/begin-orchestration` Step 1C, an exactly-one-line `lane-log.jsonl` append, and the
+`integrate_chain` loop tying gates+execute+hold+verify+log together (task 4). The `ORCHESTRATION`
+workflow (`graph.rs`) assembles tasks 1-4 into a single `OrchestrationRunNode`, bridging its
+deliberately non-`Send` future into `Node::process`'s `Send` bound via `tokio::task::spawn_blocking`
+running a fresh current-thread runtime; one `hold_poll_interval_ms` policy knob resolved through the
+standard four-layer precedence with baseline/cheap-fast/thorough profiles, registered in
+`engine-serve`'s dispatcher via `register_orchestration` (task 5). A two-repo end-to-end integration
+suite (`crates/engine-core/tests/it/orchestration.rs`) covers per-step cwd, unmet-dependency
+refusal, admission waiting at capacity, HELD-UNTIL refusal, operator-hold pause/resume,
+one-lane-log-line-per-block, and loud failure on a corrupted state write — using
+`tokio::task::LocalSet`/`spawn_local` for the two concurrency-sensitive tests since `integrate_chain`
+is `!Send` (task 6). Task 7 ran the full validation suite (fmt, clippy `--all-features -D warnings`,
+`nextest --workspace --all-features`, release build, `cargo audit`) on the integrated tree — all
+green, no code changes needed. Closes `EN.10.B`. Docs: `docs/architecture.md` updated.
+
+Next: `EN.10.C` — Sanctioned-engine guard — a block node can only reach `/sdlc-task` or `/sdlc-flow`.
+
+```
+4dc4682 docs: update docs for EN.10.B
+668fc0a feat: implement EN.10.B-task6
+22ef1c6 feat: implement EN.10.B-task5
+0b1b52d feat: implement EN.10.B-task4
+1b5a4af feat: implement EN.10.B-task3
+63ba566 feat: implement EN.10.B-task2
+cd99839 feat: implement EN.10.B-task1
+ff08479 Merge pull request #48 from bredmond1019/EN.10.A-flow
+```
+
+---
+
+## [run: 2026-08-18]
+
 ### Terminal node holds a tmux session and can open a live Claude Code session mid-workflow closes EN.10.A
 
 Drove `EN.10.A` via `/sdlc-flow` on branch `EN.10.A-flow`, all 5 tasks passed, PASS review.

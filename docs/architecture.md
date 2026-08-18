@@ -557,7 +557,14 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `EN.7.C` task 7) follows the same no-policy pattern, since `HarvestApproveNode` is also
   model-free; `register_terminal_probe` (`TERMINAL_PROBE`, `EN.9.D` task 5) is the same no-policy
   shape again — `TerminalSessionNode`/`TerminalObserveNode` call no model and read no
-  `harness.json` — and `register_builtin_workflows` now populates eleven workflow types in total.
+  `harness.json`; `register_orchestration` (`ORCHESTRATION`, `EN.10.B` task 5) resolves no policy
+  at dispatch time either, but for a different reason than the others — `OrchestrationRunNode`
+  resolves its own `orchestration.policy`/`orchestration.profiles` layers itself inside
+  `process()` (from the event's own `brain_root`), and its one policy knob
+  (`hold_poll_interval_ms`) never rewires which node runs, so there is no `registry_for_policy`
+  variant to choose between at dispatch time — `engine_core::workflows::orchestration::graph::registry`
+  is the only registry the workflow ever runs under — and `register_builtin_workflows` now
+  populates twelve workflow types in total.
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a

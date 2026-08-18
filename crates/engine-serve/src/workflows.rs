@@ -579,11 +579,35 @@ pub fn register_terminal_probe(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `ORCHESTRATION` workflow (`engine_core::workflows::orchestration`,
+/// `EN.10.B`) with `dispatcher`. Like [`register_terminal_probe`], this
+/// factory resolves no policy and seeds no policy stamp at dispatch time:
+/// `OrchestrationRunNode::process` resolves its own
+/// `orchestration.policy`/`orchestration.profiles` layers itself (from the
+/// event's own `brain_root`, exactly where `diagnostic_intake`'s sole
+/// terminal node does), and — unlike `sdlc_flow`/`diagnostic_intake` —
+/// `ORCHESTRATION`'s one policy knob (`hold_poll_interval_ms`) never
+/// rewires which node runs, so there is no `registry_for_policy` variant to
+/// choose between here; [`engine_core::workflows::orchestration::graph::registry`]
+/// is the only registry this workflow ever runs under. See
+/// `planning/EN.10.B/tasks.md`, Task 5.
+pub fn register_orchestration(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::orchestration::graph::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::orchestration::graph::registry(),
+                engine_core::workflows::orchestration::graph::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`,
-/// `HARVEST_APPROVE`, `LEAD_INGEST`, `APPROVE_AND_RUN`, and
-/// `TERMINAL_PROBE`; future builtins register here too.
+/// `HARVEST_APPROVE`, `LEAD_INGEST`, `APPROVE_AND_RUN`, `TERMINAL_PROBE`,
+/// and `ORCHESTRATION`; future builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
 /// this with exactly one argument (`../bastion/src/serve/mod.rs:61`) and
@@ -617,6 +641,7 @@ pub fn register_builtin_workflows_with_registry(
     register_lead_ingest(dispatcher);
     register_approve_and_run(dispatcher);
     register_terminal_probe(dispatcher);
+    register_orchestration(dispatcher);
 }
 
 #[cfg(test)]
