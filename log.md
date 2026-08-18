@@ -18,6 +18,44 @@ related: [status, context]
 
 ## [run: 2026-08-18]
 
+### Write and await nodes land at contract v0.2.0, closing Phase 3 of the terminal-node work
+
+- **What:** Drove `EN.9.E` via `/sdlc-flow` on branch `EN.9.E-flow`, all 5 tasks passed, PASS
+  review. `crates/engine-core/src/nodes/terminal/predicate.rs` adds `AwaitPredicate`
+  {Marker,Detect,Regex,Silence,ExitCode} and a pure `evaluate()` over an already-collected
+  `Observation`, covering the four load-bearing marker rules — `{out}.{nonce}.done` path,
+  content equal to the nonce, never `remove_file`, and `out` mtime postdating the send — with
+  `marker_path(out, nonce)` exported as the single source of truth shared with the sender.
+  `send.rs` adds `TerminalSendNode`: refuses org-floor-denied commands via a typed `NodeError`,
+  re-verifies the session lease with `SessionLease::renew` immediately before every send, holds
+  a per-session `tokio::sync::Mutex<()>` across the check+send, and dedupes back-edge re-entries
+  by a `send_id` recorded in a tmux user-option (driver-observable, survives a fresh `ctx`).
+  `await_node.rs` adds `TerminalAwaitNode`: a bounded, cancellable poll over `AwaitPredicate`
+  with its own timeout (the runner has no deadline field), a `CancellationToken` taken through
+  its own builder and `select!`ed every tick, and a four-layer-resolved `AwaitPolicy`
+  (poll_interval_ms/timeout_ms) with baseline/cheap-fast/thorough profiles stamped into
+  `ctx.nodes` on every non-cancelled return. `tests/it/terminal_send_await.rs` (declared in
+  `tests/it/main.rs` per standing rule 8) drives real `Workflow::run_with` walks against
+  `StubTerminalDriver` covering stale-marker rejection, send_id idempotency across two
+  fresh-ctx `Workflow` instances sharing one driver, and cancellation bounded within 5 seconds.
+  Full validation gate green: fmt, clippy `--all-features -D warnings`, nextest
+  `--workspace --all-features` (2370/2370, 17 skipped), release build, cargo audit — no code
+  changes needed at the validation task. `docs/architecture.md` updated. Closes `EN.9.E`,
+  completing Phase 3 of the terminal-node work atop `EN.9.D`.
+- Next: pick up the next queued block per `planning/status.md`'s Current focus / next pointer.
+
+```
+6614eea docs: update docs for EN.9.E
+b241938 feat: implement EN.9.E-task4
+d7ea34b feat: implement EN.9.E-task3
+9d7a385 feat: implement EN.9.E-task2
+0a43fab feat: implement EN.9.E-task1
+```
+
+---
+
+## [run: 2026-08-18]
+
 ### Read-only terminal nodes land, TERMINAL_PROBE proven against the real Mac Mini tmux
 
 - **What:** Drove `EN.9.D` via `/sdlc-flow` on branch `EN.9.D-flow`, all 7 tasks passed, PASS
