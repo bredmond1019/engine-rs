@@ -990,6 +990,88 @@ mod tests {
         assert!(matches!(result, Err(TmuxError::NotInstalled)));
     }
 
+    // ── real-tmux coverage (EN.ticket.term-core-real-tmux-option-reads task 4) ──
+    //
+    // `StubTerminalDriver`'s canned `Ok("")` default is precisely why both
+    // defects (unset-option hard-fail, missing `-v`) shipped undetected — it
+    // can never reproduce either shape. These two tests spawn a genuine tmux
+    // server, not the stub. Each uses a uniquely-named, throwaway session
+    // (pid + wall-clock nanos, so concurrent runs never collide) and kills
+    // that session before returning, on every path including failure.
+    //
+    // Verbatim shapes below are verified live on tmux 3.7b (this dev box).
+    // `EN.9.D`'s real-Mini run independently reproduced the identical
+    // "invalid option" / bare-value shapes on tmux 3.5a — neither is a
+    // version-specific quirk.
+
+    #[cfg(feature = "tokio")]
+    fn unique_test_name(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("term-core-test-{tag}-{}-{nanos}", std::process::id())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn real_tmux_show_option_returns_bare_value_not_name_prefixed() {
+        // `show-option -g '@name'` returns "<name> <value>"; `show-option
+        // -gv '@name'` returns the bare value `set-option` wrote — pinned to
+        // tmux 3.7b, this dev box. A session must exist first: a bare
+        // `set-option -g` against no running server fails with "no server
+        // running", not a useful result.
+        let bound = std::time::Duration::from_secs(5);
+        let session_name = unique_test_name("vflag-session");
+        let option_name = format!("@{}", unique_test_name("vflag-option"));
+
+        run_tmux_async(&new_session_args(&session_name, None), bound)
+            .await
+            .expect("real tmux creates the throwaway session");
+
+        let write_result = run_tmux_async(&set_option_args(&option_name, "v1"), bound).await;
+        let read_result = run_tmux_async(&show_option_args(&option_name), bound).await;
+
+        let _ = run_tmux_async(&kill_session_args(&session_name), bound).await;
+
+        write_result.expect("set-option succeeds against a live session");
+        let raw = read_result.expect("show-option succeeds for the option just written");
+        assert_eq!(
+            raw.trim(),
+            "v1",
+            "show_option_args must include -v so the read returns the bare \
+             value set_option_args wrote, not \"<name> <value>\""
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn real_tmux_unset_option_returns_invalid_option_error_not_empty_output() {
+        // Defect 1's evidence at the tmux-CLI level: a never-set option is
+        // an ERROR (exit 1, stderr "invalid option: <name>"), not empty
+        // stdout — pinned to tmux 3.7b, this dev box; `EN.9.D` reproduced
+        // the same shape on the Mini's tmux 3.5a.
+        let bound = std::time::Duration::from_secs(5);
+        let session_name = unique_test_name("unset-session");
+        let option_name = format!("@{}", unique_test_name("never-set-option"));
+
+        run_tmux_async(&new_session_args(&session_name, None), bound)
+            .await
+            .expect("real tmux creates the throwaway session");
+
+        let result = run_tmux_async(&show_option_args(&option_name), bound).await;
+
+        let _ = run_tmux_async(&kill_session_args(&session_name), bound).await;
+
+        match result {
+            Err(TmuxError::ExitError { code, stderr }) => {
+                assert_eq!(code, 1);
+                assert!(stderr.starts_with("invalid option"), "stderr was: {stderr}");
+            }
+            other => panic!("expected ExitError('invalid option'), got {other:?}"),
+        }
+    }
+
     // ── root_cause() ──────────────────────────────────────────────────────
 
     #[test]

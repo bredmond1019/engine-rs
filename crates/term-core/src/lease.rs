@@ -767,4 +767,126 @@ mod tests {
             .await;
         assert!(matches!(result, Err(LeaseError::NoStealWindow)));
     }
+
+    // ── real-tmux coverage (EN.ticket.term-core-real-tmux-option-reads task 4) ──
+    //
+    // Everything above drives `StubTerminalDriver`, whose canned `Ok("")`
+    // default is precisely why both defects (unset-option hard-fail,
+    // missing `-v`) shipped undetected — it can never reproduce either
+    // shape. These two tests drive a genuine tmux server via `TmuxDriver`.
+    // Each acquires against a uniquely-named, throwaway session (pid +
+    // wall-clock nanos, so concurrent runs never collide) and kills that
+    // session before returning, on every path including failure.
+    //
+    // Pinned to tmux 3.7b (this dev box); `EN.9.D`'s real-Mini run
+    // independently reproduced the identical shapes on tmux 3.5a.
+    use crate::driver::TmuxDriver;
+
+    fn unique_session_name(tag: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("term-core-test-{tag}-{}-{nanos}", std::process::id())
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64
+    }
+
+    #[tokio::test]
+    async fn real_tmux_acquire_succeeds_against_a_never_set_option_with_no_preseed() {
+        let driver = TmuxDriver::new(Duration::from_secs(5));
+        let session_name = unique_session_name("acquire-fresh");
+        driver
+            .new_session(&session_name, None)
+            .await
+            .expect("real tmux creates the throwaway session");
+
+        let lease = SessionLease::new(&driver);
+        let now = now_ms();
+
+        let result = lease
+            .acquire(AcquireRequest {
+                session_name: &session_name,
+                run_id: "run-fresh",
+                nonce: "nonce-fresh",
+                identity: "worker-fresh",
+                expires_at_ms: now + 60_000,
+                now_ms: now,
+                steal_after: None,
+            })
+            .await;
+
+        let _ = driver.kill_session(&session_name).await;
+
+        let acquired = result.expect(
+            "acquiring against a never-set lease option must succeed against real tmux \
+             with no pre-seeding — real tmux reports an unset option as an 'invalid \
+             option' error (exit 1), not empty output",
+        );
+        assert_eq!(acquired.run_id, "run-fresh");
+    }
+
+    #[tokio::test]
+    async fn real_tmux_round_trip_preserves_run_id_through_a_real_set_show_cycle() {
+        let driver = TmuxDriver::new(Duration::from_secs(5));
+        let session_name = unique_session_name("round-trip");
+        driver
+            .new_session(&session_name, None)
+            .await
+            .expect("real tmux creates the throwaway session");
+
+        let lease = SessionLease::new(&driver);
+        let now = now_ms();
+
+        let acquire_result = lease
+            .acquire(AcquireRequest {
+                session_name: &session_name,
+                run_id: "run-roundtrip-abc123",
+                nonce: "nonce-roundtrip",
+                identity: "worker-roundtrip",
+                expires_at_ms: now + 60_000,
+                now_ms: now,
+                steal_after: None,
+            })
+            .await;
+
+        // `renew` re-reads (a real `show-option`) before it writes, so this
+        // is the full `Lease::to_value` -> `set_option` -> `show_option` ->
+        // `Lease::parse` cycle over real tmux: without `-v`, `show-option`
+        // would prepend the option name to the value and `Lease::parse`'s
+        // colon split would fold that prefix into `run_id` instead of
+        // leaving it clean.
+        let renew_result = match &acquire_result {
+            Ok(_) => {
+                lease
+                    .renew(
+                        &session_name,
+                        "nonce-roundtrip",
+                        now + 120_000,
+                        "run-roundtrip-abc123",
+                        "worker-roundtrip",
+                    )
+                    .await
+            }
+            Err(_) => Err(LeaseError::NotOurs),
+        };
+
+        let _ = driver.kill_session(&session_name).await;
+
+        let acquired = acquire_result.expect("initial acquire against a fresh session succeeds");
+        assert_eq!(acquired.run_id, "run-roundtrip-abc123");
+
+        let renewed = renew_result.expect("renew against our own live nonce succeeds");
+        assert_eq!(
+            renewed.run_id, "run-roundtrip-abc123",
+            "run_id must survive a real set-option/show-option cycle unchanged"
+        );
+        assert_eq!(renewed.nonce, "nonce-roundtrip");
+        assert_eq!(renewed.identity, "worker-roundtrip");
+    }
 }
