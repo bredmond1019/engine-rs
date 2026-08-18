@@ -18,11 +18,17 @@
 //! `AwaitPredicate` enum and its evaluation — the marker semantics, and
 //! the `Detect`/`Regex`/`Silence`/`ExitCode` alternatives, that
 //! `TerminalAwaitNode` (task 3) polls against.
+//!
+//! `send` (`EN.9.E` task 2) is `TerminalSendNode` — the guarded,
+//! floor-checked write node: `sdlc_flow::command_floor`, `send_id`
+//! back-edge idempotency, and lease re-verification, all under a
+//! per-session mutex.
 
 pub mod identity;
 pub mod observe;
 pub mod pane;
 pub mod predicate;
+pub mod send;
 pub mod session;
 
 pub use identity::session_name_for;
@@ -33,4 +39,5 @@ pub use pane::{
 pub use predicate::{
     evaluate, marker_path, AwaitPredicate, MarkerObservation, Observation, PredicateOutcome,
 };
+pub use send::TerminalSendNode;
 pub use session::TerminalSessionNode;
