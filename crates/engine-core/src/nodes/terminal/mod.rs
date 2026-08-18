@@ -85,8 +85,8 @@ pub mod session;
 pub use admission::{AdmissionControl, AdmissionPermit, AdmissionPolicy, PartialAdmissionPolicy};
 pub use await_node::{AwaitPolicy, PartialAwaitPolicy, TerminalAwaitNode};
 pub use held_session::{
-    resolve_for_workflow as resolve_held_session_policy_for_workflow, HeldSessionNode,
-    HeldSessionPolicy, PartialHeldSessionPolicy,
+    resolve_for_workflow as resolve_held_session_policy_for_workflow, HeldSessionFailure,
+    HeldSessionHandle, HeldSessionNode, HeldSessionPolicy, PartialHeldSessionPolicy,
 };
 pub use hold_policy::{
     resolve_for_workflow as resolve_hold_policy_for_workflow, HoldPolicy, HoldPolicyNode,

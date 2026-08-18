@@ -63,6 +63,37 @@
 //! [`super::hold_policy`] exactly, generalized via
 //! `crate::policy::read_harness_policy_defaults_from` /
 //! `crate::policy::resolve_profile_from`.
+//!
+//! # External-kill detection (`EN.10.A` task 2)
+//!
+//! Renewal alone cannot notice a session killed out from under a run:
+//! the lease lives in a tmux GLOBAL user-option (`@engine_lease@<name>`,
+//! set with `set-option -g`), so `set-option`/`show-option` against it
+//! keeps succeeding whether or not the SESSION itself still exists. A
+//! killed session is therefore silent to [`renewal_loop`]'s renew call —
+//! it has to check liveness itself, which is exactly what it now does on
+//! every tick, BEFORE attempting the renew:
+//!
+//! 1. `list_sessions` + [`session_present`] — if the session no longer
+//!    appears, the loop records [`HeldSessionFailure::ExternallyKilled`]
+//!    and stops. This is the bounded-liveness half of the acceptance
+//!    criteria: a consumer parked in a long await notices within one
+//!    `renew_interval_ms` tick, never its own (possibly much longer)
+//!    timeout.
+//! 2. Only if the session is still present does the loop attempt the
+//!    renew; a renew failure there means the LEASE was lost (stolen,
+//!    foreign nonce) while the session itself lives on, recorded as
+//!    [`HeldSessionFailure::LeaseLost`] — a different fix (reacquire)
+//!    than an externally-killed session (nothing left to reacquire).
+//!
+//! The outcome is published on a `tokio::sync::watch` channel held by
+//! [`HeldSessionHandle`], so it survives past the loop's own exit:
+//! [`HeldSessionHandle::failure`] reads the latest value synchronously
+//! (the "on next use" half — [`HeldSessionNode::process`]'s re-entry path
+//! checks this before returning success for an already-registered
+//! session), and [`HeldSessionHandle::wait_for_failure`] resolves
+//! asynchronously the moment a failure is recorded, for a caller that
+//! wants to `select!` against it instead of polling.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -244,16 +275,75 @@ pub mod profiles {
     }
 }
 
+// ── External-kill / lease-loss detection (task 2) ──────────────────────
+
+/// Why a [`HeldSessionHandle`]'s [`renewal_loop`] stopped renewing WITHOUT
+/// the caller asking it to. Two distinct failure modes, with two distinct
+/// fixes, are deliberately never collapsed into one message:
+///
+/// - [`HeldSessionFailure::ExternallyKilled`] — the tmux session itself is
+///   gone. Nothing to reacquire; the held session is simply dead.
+/// - [`HeldSessionFailure::LeaseLost`] — the session is still alive but
+///   another identity now holds the lease (or the read-back no longer
+///   shows our nonce). The session could still be used by whoever holds
+///   the lease now; THIS handle no longer may.
+///
+/// Neither is a driver TIMEOUT (a wedged tmux call that neither succeeded
+/// nor definitively failed) — that failure mode is `TmuxError::Timeout`,
+/// surfaced directly by whichever driver call hit it, not routed through
+/// this type at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldSessionFailure {
+    /// `list_sessions` no longer reports `session_name` — killed out from
+    /// under the run.
+    ExternallyKilled { session_name: String },
+    /// The session is still present, but renewing the lease failed
+    /// (`reason` is the `LeaseError`'s own `Display` text).
+    LeaseLost {
+        session_name: String,
+        reason: String,
+    },
+}
+
+impl HeldSessionFailure {
+    /// The session name this failure is about, regardless of variant.
+    #[must_use]
+    pub fn session_name(&self) -> &str {
+        match self {
+            HeldSessionFailure::ExternallyKilled { session_name }
+            | HeldSessionFailure::LeaseLost { session_name, .. } => session_name,
+        }
+    }
+
+    /// Render as a [`NodeError`] whose message names the session and
+    /// states which of the two failure modes occurred, in words that
+    /// distinguish it from a lease-lost message, an externally-killed
+    /// message, and a driver timeout message on sight.
+    #[must_use]
+    pub fn into_node_error(self) -> NodeError {
+        match self {
+            HeldSessionFailure::ExternallyKilled { session_name } => NodeError::new(format!(
+                "{NODE_NAME}: session '{session_name}' vanished externally — \
+                 killed out from under the run (not a lease loss, not a driver timeout)"
+            )),
+            HeldSessionFailure::LeaseLost {
+                session_name,
+                reason,
+            } => NodeError::new(format!(
+                "{NODE_NAME}: lease lost for session '{session_name}': {reason} \
+                 (the session itself may still be alive; not an external kill, not a driver timeout)"
+            )),
+        }
+    }
+}
+
 // ── The held-session registry ───────────────────────────────────────────
 
 /// One held session's renewal state, kept alive in [`registry`] for as
 /// long as the process runs (or until a future task adds explicit
 /// teardown — out of task-1 scope).
 pub struct HeldSessionHandle {
-    /// The tmux session name this handle is renewing the lease for. Not
-    /// read internally today — kept for task 2's external-kill detection,
-    /// which needs to name the session in its error.
-    #[allow(dead_code)]
+    /// The tmux session name this handle is renewing the lease for.
     session_name: String,
     /// The deterministic lease nonce this handle's renewal loop renews
     /// under (mirrors `TerminalSessionNode`'s `nonce = session_name`
@@ -267,6 +357,53 @@ pub struct HeldSessionHandle {
     /// field.
     #[allow(dead_code)]
     renewal: tokio::task::JoinHandle<()>,
+    /// Published by [`renewal_loop`] the moment it detects a failure and
+    /// stops; `None` for as long as the session is healthy. A
+    /// `tokio::sync::watch` (not a plain `Mutex<Option<_>>`) so a caller
+    /// can either read the latest value synchronously
+    /// ([`HeldSessionHandle::failure`]) or await the transition
+    /// ([`HeldSessionHandle::wait_for_failure`]) without polling.
+    status: tokio::sync::watch::Receiver<Option<HeldSessionFailure>>,
+}
+
+impl HeldSessionHandle {
+    /// The tmux session name this handle holds — the identity a future
+    /// caller (e.g. task 3's `LiveClaudeSessionNode`) launches work
+    /// inside, and the name any [`HeldSessionFailure`] read off this
+    /// handle names.
+    #[must_use]
+    pub fn session_name(&self) -> &str {
+        &self.session_name
+    }
+
+    /// The latest known failure, if [`renewal_loop`] has recorded one —
+    /// the "detect on use" half of task 2: a caller re-using an
+    /// already-registered session (e.g. [`HeldSessionNode::process`]'s
+    /// re-entry path) checks this before treating the reuse as healthy.
+    #[must_use]
+    pub fn failure(&self) -> Option<HeldSessionFailure> {
+        self.status.borrow().clone()
+    }
+
+    /// Resolve the moment [`renewal_loop`] records a failure — the
+    /// "bounded liveness check" half of task 2. A node parked in a long
+    /// await can `tokio::select!` this alongside its own work and learn
+    /// of an external kill within one `renew_interval_ms` tick, instead
+    /// of waiting out its own (possibly much longer) timeout. Returns
+    /// `None` only if the sender side was dropped without ever recording
+    /// a failure (the renewal loop's task itself got dropped/aborted),
+    /// which does not happen on any path this module drives today.
+    pub async fn wait_for_failure(&self) -> Option<HeldSessionFailure> {
+        let mut status = self.status.clone();
+        loop {
+            if let Some(failure) = status.borrow().clone() {
+                return Some(failure);
+            }
+            if status.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
 }
 
 type HeldSessionRegistry = HashMap<String, Arc<HeldSessionHandle>>;
@@ -298,34 +435,60 @@ fn register(session_name: String, handle: Arc<HeldSessionHandle>) {
 }
 
 /// The background loop a [`HeldSessionNode`] spawns once per session: wait
-/// `policy.renew_interval_ms`, then renew the lease for another
-/// `policy.lease_ttl_ms` from now. Renewing on a schedule strictly shorter
-/// than the TTL (every built-in default and every profile keeps the
-/// renewal interval at roughly a third of the TTL) is what keeps a held
-/// session from ever looking like an orphan to `EN.9.C`'s reconciliation
-/// while this loop is alive.
+/// `policy.renew_interval_ms`, then check liveness, then renew the lease
+/// for another `policy.lease_ttl_ms` from now. Renewing on a schedule
+/// strictly shorter than the TTL (every built-in default and every
+/// profile keeps the renewal interval at roughly a third of the TTL) is
+/// what keeps a held session from ever looking like an orphan to
+/// `EN.9.C`'s reconciliation while this loop is alive.
 ///
-/// Stops on the first renewal failure (a foreign lease won a race, the
-/// driver errored, or anything else `SessionLease::renew` reports) rather
-/// than spinning against a lease this process no longer holds. Detecting
-/// and surfacing that loss to an in-flight node is task 2's job — this
-/// loop takes no other action here.
+/// Each tick, BEFORE renewing, checks whether the session itself still
+/// exists (see the module doc's "External-kill detection" section for why
+/// the renew call alone cannot tell — the lease lives in a tmux GLOBAL
+/// option that keeps answering fine long after the session is gone). Two
+/// distinct ways this loop stops itself, each publishing its own
+/// [`HeldSessionFailure`] on `status_tx` before breaking:
+///
+/// - the session no longer appears in `list_sessions` ->
+///   [`HeldSessionFailure::ExternallyKilled`];
+/// - the session is still present but `SessionLease::renew` failed ->
+///   [`HeldSessionFailure::LeaseLost`].
+///
+/// A `list_sessions` call that itself errors (driver/timeout trouble, not
+/// "session absent") is treated as inconclusive and does not stop the
+/// loop — the next tick tries again, exactly like a renew failure would if
+/// this loop attempted the renew directly and hit the same driver error.
 async fn renewal_loop(
     driver: Arc<dyn TerminalDriver>,
     session_name: String,
     run_id: String,
     nonce: String,
     policy: HeldSessionPolicy,
+    status_tx: tokio::sync::watch::Sender<Option<HeldSessionFailure>>,
 ) {
     let renew_every = Duration::from_millis(policy.renew_interval_ms);
     loop {
         tokio::time::sleep(renew_every).await;
+
+        if let Ok(listed) = driver.list_sessions().await {
+            if !session_present(&listed, &session_name) {
+                let _ = status_tx.send(Some(HeldSessionFailure::ExternallyKilled {
+                    session_name: session_name.clone(),
+                }));
+                break;
+            }
+        }
+
         let lease = SessionLease::new(driver.as_ref());
         let new_expires_at_ms = now_ms() + policy.lease_ttl_ms;
         let renewed = lease
             .renew(&session_name, &nonce, new_expires_at_ms, &run_id, NODE_NAME)
             .await;
-        if renewed.is_err() {
+        if let Err(err) = renewed {
+            let _ = status_tx.send(Some(HeldSessionFailure::LeaseLost {
+                session_name: session_name.clone(),
+                reason: err.to_string(),
+            }));
             break;
         }
     }
@@ -433,6 +596,13 @@ impl Node for HeldSessionNode {
         // acquired the session and its renewal loop is running. Reuse it
         // — no tmux calls, no lease acquire, no second loop.
         if let Some(existing) = lookup(&session_name) {
+            // "Detect on use" (task 2): a re-entry that finds a session
+            // already recorded as externally killed / lease-lost must
+            // surface that as a node error now, not paper over it with a
+            // success stamp that looks identical to a healthy reuse.
+            if let Some(failure) = existing.failure() {
+                return Err(failure.into_node_error());
+            }
             put_result(
                 &mut ctx,
                 self.name(),
@@ -484,17 +654,20 @@ impl Node for HeldSessionNode {
                 NodeError::new(format!("{NODE_NAME}: lease acquisition failed: {err}"))
             })?;
 
+        let (status_tx, status_rx) = tokio::sync::watch::channel(None);
         let renewal = tokio::spawn(renewal_loop(
             self.driver.clone(),
             session_name.clone(),
             run_id.clone(),
             acquired.nonce.clone(),
             policy,
+            status_tx,
         ));
         let handle = Arc::new(HeldSessionHandle {
             session_name: session_name.clone(),
             nonce: acquired.nonce.clone(),
             renewal,
+            status: status_rx,
         });
         register(session_name.clone(), handle);
 
@@ -773,5 +946,153 @@ mod tests {
             "expected the background loop to renew the lease at least once \
              (before={calls_before_wait}, after={calls_after_wait})"
         );
+    }
+
+    // ── External-kill / lease-loss detection (task 2) ──────────────────
+
+    /// A compressed-TTL event override shared by the task-2 tests, so a
+    /// renewal tick lands well inside the tests' own bounded waits.
+    fn fast_policy_event() -> serde_json::Value {
+        serde_json::json!({
+            "policy": { "lease_ttl_ms": 500, "renew_interval_ms": 20 }
+        })
+    }
+
+    #[tokio::test]
+    async fn external_kill_is_detected_by_the_renewal_loop_and_recorded_on_the_handle() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let run_id = unique_run_id("ext-kill-detect");
+        let session_name = session_name_for(&run_id, NODE_NAME);
+        seed_own_lease(&driver, &run_id, &session_name);
+        driver.set_list_sessions_result(StubOutcome::Ok(list_sessions_line(&session_name)));
+        let node = HeldSessionNode::new(driver.clone());
+
+        let mut ctx = ctx_with_run_id(&run_id);
+        ctx.event = fast_policy_event();
+        node.process(ctx).await.unwrap();
+
+        // Simulate the session vanishing out from under the run: the next
+        // `list_sessions` no longer reports it.
+        driver.set_list_sessions_result(StubOutcome::Ok(String::new()));
+
+        let handle = lookup(&session_name).expect("session was registered by process()");
+        let failure = tokio::time::timeout(Duration::from_secs(2), handle.wait_for_failure())
+            .await
+            .expect("expected the failure to be recorded within a bounded time")
+            .expect("watch sender was not dropped without recording a failure");
+
+        assert_eq!(
+            failure,
+            HeldSessionFailure::ExternallyKilled {
+                session_name: session_name.clone()
+            }
+        );
+        assert_eq!(handle.failure(), Some(failure));
+    }
+
+    #[tokio::test]
+    async fn external_kill_is_surfaced_as_a_node_error_on_next_use_not_a_silent_hang() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let run_id = unique_run_id("ext-kill-on-use");
+        let session_name = session_name_for(&run_id, NODE_NAME);
+        seed_own_lease(&driver, &run_id, &session_name);
+        driver.set_list_sessions_result(StubOutcome::Ok(list_sessions_line(&session_name)));
+        let node = HeldSessionNode::new(driver.clone());
+
+        let mut ctx = ctx_with_run_id(&run_id);
+        ctx.event = fast_policy_event();
+        node.process(ctx).await.unwrap();
+
+        driver.set_list_sessions_result(StubOutcome::Ok(String::new()));
+        let handle = lookup(&session_name).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_for_failure())
+            .await
+            .expect("expected the failure to be recorded within a bounded time");
+
+        // A later node re-entering for this same run must get a typed
+        // error now — never the stale success stamp, never a hang.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            node.process(ctx_with_run_id(&run_id)),
+        )
+        .await
+        .expect("re-entry must return promptly, not hang");
+        let err = result.expect_err("re-entry against a killed session must error");
+        assert!(
+            err.message.contains("vanished externally"),
+            "expected an external-kill message, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("lease lost"),
+            "external-kill error must be distinguishable from a lease-lost message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_lost_is_recorded_and_distinguishable_from_external_kill() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let run_id = unique_run_id("lease-lost");
+        let session_name = session_name_for(&run_id, NODE_NAME);
+        seed_own_lease(&driver, &run_id, &session_name);
+        // The session stays present for the whole test — only the lease
+        // read-back changes, so `ExternallyKilled` must never fire here.
+        driver.set_list_sessions_result(StubOutcome::Ok(list_sessions_line(&session_name)));
+        let node = HeldSessionNode::new(driver.clone());
+
+        let mut ctx = ctx_with_run_id(&run_id);
+        ctx.event = fast_policy_event();
+        node.process(ctx).await.unwrap();
+
+        // A foreign identity won the lease out from under us: the
+        // read-back now shows a different nonce.
+        let foreign_expiry = now_ms() + Duration::from_secs(3600).as_millis() as u64;
+        driver.set_show_option_result_for(
+            format!("@engine_lease@{session_name}"),
+            StubOutcome::Ok(format!(
+                "{run_id}:some-other-nonce:SomeOtherNode:{foreign_expiry}"
+            )),
+        );
+
+        let handle = lookup(&session_name).unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(2), handle.wait_for_failure())
+            .await
+            .expect("expected the failure to be recorded within a bounded time")
+            .unwrap();
+
+        match &failure {
+            HeldSessionFailure::LeaseLost {
+                session_name: name, ..
+            } => {
+                assert_eq!(name, &session_name);
+            }
+            other => panic!("expected LeaseLost, got {other:?}"),
+        }
+
+        let node_err = failure.into_node_error();
+        assert!(node_err.message.contains("lease lost"));
+        assert!(!node_err.message.contains("vanished externally"));
+    }
+
+    #[test]
+    fn held_session_failure_messages_never_mention_a_driver_timeout() {
+        // The three failure descriptions (external-kill, lease-lost, and a
+        // driver timeout) must each read distinctly — a driver timeout is
+        // never routed through `HeldSessionFailure` at all, so neither
+        // variant's message should claim to BE one, only that it is not.
+        let killed = HeldSessionFailure::ExternallyKilled {
+            session_name: "s".to_string(),
+        }
+        .into_node_error();
+        let lost = HeldSessionFailure::LeaseLost {
+            session_name: "s".to_string(),
+            reason: "read-back does not show our nonce".to_string(),
+        }
+        .into_node_error();
+
+        assert!(killed.message.contains("not a driver timeout"));
+        assert!(lost.message.contains("not a driver timeout"));
+        assert_ne!(killed.message, lost.message);
     }
 }
