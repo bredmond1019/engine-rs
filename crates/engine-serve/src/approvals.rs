@@ -190,3 +190,357 @@ pub async fn ledger_stats(
             .collect(),
     })
 }
+
+// ─── tests ──────────────────────────────────────────────────────────────
+//
+// Every test drives the app through `App::new().configure(crate::http::configure)`
+// and `actix_web::test`, never by calling a handler function directly — a
+// handler-level test would pass even if the routes were never registered,
+// which is exactly the gate-blindness shape carryover
+// `gate-scope-must-be-shown-capable-of-failing` describes. Deliberately NOT
+// a new `crates/engine-serve/tests/*.rs` file (CLAUDE.md standing rule 8):
+// engine-serve already carries six such binaries and this ticket must not
+// add a seventh.
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use actix_web::{test, web, App};
+    use chrono::{DateTime, TimeZone, Utc};
+    use engine_core::operator::ledger::{
+        ApprovalLedger, ApprovalLedgerRow, FileApprovalLedger, LedgerDecision,
+    };
+    use tempfile::TempDir;
+
+    use crate::http::{configure, AppState};
+
+    const API_KEY: &str = "approvals-test-key";
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    fn row(
+        item_id: &str,
+        decision: LedgerDecision,
+        delivered_secs: i64,
+        decided_secs: i64,
+    ) -> ApprovalLedgerRow {
+        ApprovalLedgerRow {
+            item_id: item_id.to_string(),
+            digest: "digest-a".to_string(),
+            decision,
+            who: "operator-a".to_string(),
+            delivered_at: ts(delivered_secs),
+            decided_at: ts(decided_secs),
+            rendered_diff: "rendered summary".to_string(),
+        }
+    }
+
+    /// A minimal, hermetic `AppState` — a `Dispatcher` with no registered
+    /// workflows, in-memory live state, an unbound durable writer (no
+    /// Postgres pool), and an empty run registry. Nothing under test here
+    /// touches any of those; only `api_key` and the ledger seam matter.
+    fn test_app_state() -> AppState {
+        AppState {
+            dispatcher: Arc::new(crate::dispatch::Dispatcher::new()),
+            live: crate::live_state::LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: crate::abort::RunRegistry::new(),
+            api_key: API_KEY.to_string(),
+        }
+    }
+
+    /// A `FileApprovalLedger` rooted in a fresh tempdir, pre-populated with
+    /// `rows` via `append` (never by writing the file directly, so the
+    /// real JSONL round-trip is exercised). Returns the `TempDir` too, so
+    /// the caller keeps it alive for the duration of the test.
+    fn ledger_with(rows: Vec<ApprovalLedgerRow>) -> (TempDir, FileApprovalLedger) {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = FileApprovalLedger::new(dir.path().join("ledger.jsonl"));
+        for row in rows {
+            ledger.append(row);
+        }
+        (dir, ledger)
+    }
+
+    fn ledger_data(ledger: FileApprovalLedger) -> web::Data<Arc<dyn ApprovalLedger>> {
+        web::Data::new(Arc::new(ledger) as Arc<dyn ApprovalLedger>)
+    }
+
+    // ── GET /approvals/ledger ──────────────────────────────────────────
+
+    #[actix_web::test]
+    async fn list_ledger_returns_rows_newest_first() {
+        let (_dir, ledger) = ledger_with(vec![
+            row("item-a", LedgerDecision::Approved, 0, 10),
+            row("item-b", LedgerDecision::Approved, 100, 110),
+            row("item-c", LedgerDecision::Approved, 200, 210),
+        ]);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let item_ids: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["item_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            item_ids,
+            vec!["item-c", "item-b", "item-a"],
+            "expected the exact reverse of insertion order"
+        );
+    }
+
+    #[actix_web::test]
+    async fn list_ledger_total_counts_before_paging_and_offset_past_end_is_empty() {
+        let (_dir, ledger) = ledger_with(vec![
+            row("item-a", LedgerDecision::Approved, 0, 10),
+            row("item-b", LedgerDecision::Approved, 100, 110),
+            row("item-c", LedgerDecision::Approved, 200, 210),
+        ]);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger?limit=1")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["total"], 3);
+        assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger?offset=100")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["total"], 3);
+        assert!(body["rows"].as_array().unwrap().is_empty());
+    }
+
+    #[actix_web::test]
+    async fn list_ledger_item_id_filter_returns_only_that_items_rows() {
+        let (_dir, ledger) = ledger_with(vec![
+            row("item-a", LedgerDecision::Approved, 0, 10),
+            row("item-a", LedgerDecision::Requeued, 20, 30),
+            row("item-b", LedgerDecision::Approved, 100, 110),
+        ]);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger?item_id=item-a")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["total"], 2);
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r["item_id"] == "item-a"));
+    }
+
+    #[actix_web::test]
+    async fn list_ledger_limit_defaults_to_100_and_is_clamped_to_1000() {
+        let (_dir, ledger) = ledger_with(vec![row("item-a", LedgerDecision::Approved, 0, 10)]);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["limit"], 100);
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger?limit=5000")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(
+            body["limit"], 1000,
+            "a request over the clamp is served the clamp, not rejected"
+        );
+    }
+
+    #[actix_web::test]
+    async fn list_ledger_missing_ledger_file_is_empty_not_404() {
+        let dir = TempDir::new().expect("tempdir");
+        // Never appended to -- the file never gets created.
+        let ledger = FileApprovalLedger::new(dir.path().join("does-not-exist.jsonl"));
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body["rows"].as_array().unwrap().is_empty());
+        assert_eq!(body["total"], 0);
+    }
+
+    // ── GET /approvals/ledger/stats ────────────────────────────────────
+
+    #[actix_web::test]
+    async fn stats_excludes_requeued_from_time_to_approval_but_includes_it_in_decisions_per_day() {
+        let (_dir, ledger) = ledger_with(vec![
+            row("item-a", LedgerDecision::Approved, 0, 10),
+            row("item-b", LedgerDecision::Requeued, 0, 5),
+        ]);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger/stats")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["time_to_approval"]["count"], 1);
+        assert_eq!(body["time_to_approval"]["median_seconds"], 10);
+        assert_eq!(body["time_to_approval"]["max_seconds"], 10);
+
+        let per_day = body["decisions_per_day"].as_object().unwrap();
+        let total: u64 = per_day.values().map(|v| v.as_u64().unwrap()).sum();
+        assert_eq!(total, 2, "decisions_per_day includes the Requeued row");
+    }
+
+    #[actix_web::test]
+    async fn stats_over_zero_rows_has_null_median_and_max() {
+        let (_dir, ledger) = ledger_with(vec![]);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger/stats")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["time_to_approval"]["count"], 0);
+        assert!(body["time_to_approval"]["median_seconds"].is_null());
+        assert!(body["time_to_approval"]["max_seconds"].is_null());
+    }
+
+    // ── unwired / unauthenticated ──────────────────────────────────────
+
+    #[actix_web::test]
+    async fn both_routes_503_when_no_ledger_registered() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 503);
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger/stats")
+            .insert_header(("X-API-Key", API_KEY))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn both_routes_401_on_absent_or_wrong_api_key() {
+        let (_dir, ledger) = ledger_with(vec![row("item-a", LedgerDecision::Approved, 0, 10)]);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_state()))
+                .app_data(ledger_data(ledger))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401, "absent key on /approvals/ledger");
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger")
+            .insert_header(("X-API-Key", "wrong-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401, "wrong key on /approvals/ledger");
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger/stats")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401, "absent key on /approvals/ledger/stats");
+
+        let req = test::TestRequest::get()
+            .uri("/approvals/ledger/stats")
+            .insert_header(("X-API-Key", "wrong-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401, "wrong key on /approvals/ledger/stats");
+    }
+}
