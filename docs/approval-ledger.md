@@ -16,8 +16,10 @@ related: [operator-payload-contract, harvest-gate, architecture, docs-index]
 one, so that "it pauses and waits for your approval before it acts" is a claim with evidence behind
 it rather than a mechanism nobody can point at. Time-to-approval falls out as a number.
 
-The ledger is the **writer** half only. Rendering it is a different repo's block
-(`bastion-web:BW.ticket.approval-ledger-view`), and this module deliberately ships no HTTP surface.
+This module (`engine-core`) is the **writer** half. `engine-serve` now ships the HTTP **read**
+surface over it (`EN.ticket.approval-ledger-read-endpoint`) — see
+["Reading the ledger over HTTP"](#reading-the-ledger-over-http) below. Rendering it is still a
+different repo's block (`bastion-web:BW.ticket.approval-ledger-view`), which consumes that surface.
 
 ## The row (`ledger::record`)
 
@@ -93,6 +95,86 @@ Pure functions over row slices — no I/O, no clock:
 - `decisions_per_day(rows)` — rows bucketed by UTC date. This exists for a specific bar: the
   `operator-surface` roadmap defines "operated" as **decision rows on at least 10 of any rolling 14
   days**, and that gate needs a query rather than a manual read.
+
+## Reading the ledger over HTTP (`crates/engine-serve/src/approvals.rs`)
+
+`EN.ticket.approval-ledger-read-endpoint` adds two authenticated GET routes to the shared route
+table (`crate::http::configure`, so both the `engine-serve` binary and any embedding host — today,
+`bastion` — pick them up automatically):
+
+### `GET /approvals/ledger`
+
+Query params: `item_id` (optional exact filter, delegating to `ApprovalLedger::rows_for`), `limit`
+(default **100**, clamped to **1000** — a request for more is served the clamp, never rejected),
+`offset` (default 0).
+
+`ApprovalLedger::read_all`/`rows_for` return rows **oldest-first**. This endpoint reverses them, so
+the HTTP response is **newest-first**. `total` counts the rows matching the `item_id` filter
+**before** `limit`/`offset` are applied; paging past the end returns 200 with an empty `rows` array,
+never an error. An absent or empty ledger file also yields 200 with an empty `rows` array — never a
+404.
+
+```json
+{
+  "rows": [ /* ApprovalLedgerRow, newest decided_at first */ ],
+  "total": 12,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+### `GET /approvals/ledger/stats`
+
+Delegates to `engine_core::operator::ledger::{time_to_approval_stats, decisions_per_day}` — neither
+statistic is re-derived here. Note the asymmetry those two functions already encode, unchanged by
+this endpoint: `time_to_approval_stats` **excludes** `Requeued` rows (a re-queue is not an approval),
+while `decisions_per_day` **includes** them.
+
+```json
+{
+  "time_to_approval": { "count": 0, "median_seconds": null, "max_seconds": null },
+  "decisions_per_day": { "2026-08-17": 3 }
+}
+```
+
+`median_seconds`/`max_seconds` are `null` **exactly when** `count` is `0`, matching
+`time_to_approval_stats`'s `Option<Duration>` returns.
+
+### Auth and blocking I/O
+
+Both handlers call `crate::http::check_api_key` first, like every other handler in this crate — a
+missing or wrong `X-API-Key` is **401**. The ledger's file read happens inside `web::block`, never
+directly on the async worker.
+
+### The 503-until-wired contract (additive seam, D15)
+
+Both handlers take the ledger as `Option<web::Data<Arc<dyn ApprovalLedger>>>`, not as a required
+`AppState` field — `AppState` is public and struct-literal-constructed in `bastion` and in five
+`engine-serve` test files, so a required field would be a cross-repo breaking change. The routes are
+registered **unconditionally**. When no ledger is registered, both return **503** with a stable JSON
+body (`{"error": "approval ledger not configured"}` or equivalent — identical between the two
+routes), never 500, never a panic. This lets the routes exist and self-describe before any host wires
+them. See `planning/decisions/D15-additive-seams-over-appstate-fields.md` for the full rationale.
+
+### Wiring it up: the one line a host owes
+
+The routes do nothing useful until the embedding host hands them a ledger. **Reader and writer must
+share the same `Arc`** — a second, independently-constructed `FileApprovalLedger` would resolve
+`default_ledger_path` a second time and silently read an empty file while the writer appends
+elsewhere, with **neither side erroring**; the reader would just render nothing. `bastion` already
+builds the writer's `Arc<FileApprovalLedger>` at `src/serve/mod.rs:587` — that exact `Arc` is what
+must be registered:
+
+```rust
+// in bastion's serve boot, alongside the existing engine_serve::http::configure(..) call
+let ledger: std::sync::Arc<dyn engine_core::operator::ledger::ApprovalLedger> = ledger_arc.clone();
+app_data(actix_web::web::Data::new(ledger))
+```
+
+This wiring is tracked as carryover `approval-ledger-reader-unwired-in-bastion` in
+`planning/state.json`, alongside `approve-and-run-seams-unwired-in-bastion` and
+`orphan-reconcile-unwired-in-bastion` — three engine seams now waiting on the same bastion file.
+Whoever next works there should take all three together.
 
 ## See also
 
