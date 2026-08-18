@@ -27,6 +27,7 @@ mod diagnostic_intake_e2e;
 mod evals_slice;
 mod fan_out_aggregate;
 mod harvest_gate_e2e;
+mod held_session;
 mod locale_rate_card;
 mod materialize_doc;
 mod operator_queue;
