@@ -28,9 +28,9 @@ The Cargo workspace (EN.0.A) declares the member crates below. `engine-core` (EN
 types: dispatch, in-memory live state, the durable-write bridge, and the actix-web HTTP surface.
 `term-core` and `term-attach` (`EN.9.A`) are two more members — tmux session-control ported from
 `core/bastion`, split so the blocking attach path can never be pulled into `engine-core`/
-`engine-serve` by additive feature unification; neither is linked from either binary yet
-(`EN.9.B` wires `term-core` in — the async driver seam, the fail-closed session lease, and the
-operator hold; see [terminal-driver.md](terminal-driver.md)). See
+`engine-serve` by additive feature unification. `term-core` (`tokio` feature) is now a real
+`engine-core` dependency (`EN.9.D`) — see the `nodes/terminal/` entry below and
+[terminal-driver.md](terminal-driver.md); `term-attach` is still linked from neither binary. See
 [terminal-crates.md](terminal-crates.md).
 
 ```
@@ -78,7 +78,12 @@ engine-rs/
                          read-preference, EN.7.B task 1); opportunity_edit.rs —
                          `OpportunityEditNode`, the generic node driving `edit_opportunity` for a
                          configured `OpportunityEditOp` (`SetStage`/`AddAction`) read off
-                         `ctx.event`, EN.7.B task 3), brain_root.rs (`resolve_brain_root`/
+                         `ctx.event`, EN.7.B task 3), terminal/ — `TerminalSessionNode`
+                         (`session.rs`: ensure/stamp/lease-acquire a tmux session via `term-core`'s
+                         `TerminalDriver`) + `TerminalObserveNode` (`observe.rs`: capture_pane +
+                         `term-core::detect`, then `pane.rs`'s `bound_pane_tail` bound/redact/hash),
+                         plus `identity.rs` (`session_name_for`, the `HasSessionInput` builder
+                         trait) and `pane.rs` (pure pane-bounding/redaction helpers), EN.9.D), brain_root.rs (`resolve_brain_root`/
                          `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
                          `mev::brain::config::find_brain_root` walking up from cwd for
                          `brain.toml`, typed `BrainRootError`, EN.7.A task 2), locale.rs —
@@ -500,7 +505,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `OpportunityEditNode` calls no model, so their `WorkflowFactory`s resolve no
   `PolicyConfigSource` and seed no policy stamp; `register_harvest_approve` (`HARVEST_APPROVE`,
   `EN.7.C` task 7) follows the same no-policy pattern, since `HarvestApproveNode` is also
-  model-free; `register_builtin_workflows` now populates eight workflow types in total.
+  model-free; `register_terminal_probe` (`TERMINAL_PROBE`, `EN.9.D` task 5) is the same no-policy
+  shape again — `TerminalSessionNode`/`TerminalObserveNode` call no model and read no
+  `harness.json` — and `register_builtin_workflows` now populates eleven workflow types in total.
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
