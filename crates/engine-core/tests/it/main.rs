@@ -51,5 +51,6 @@ mod sdlc_flow_task_loop;
 mod sdlc_flow_terminal_paths;
 mod sdlc_flow_write_permission;
 mod suspend_resume;
+mod terminal_send_await;
 mod validator;
 mod workflow_runner;

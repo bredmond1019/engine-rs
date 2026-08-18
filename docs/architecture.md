@@ -83,7 +83,18 @@ engine-rs/
                          `TerminalDriver`) + `TerminalObserveNode` (`observe.rs`: capture_pane +
                          `term-core::detect`, then `pane.rs`'s `bound_pane_tail` bound/redact/hash),
                          plus `identity.rs` (`session_name_for`, the `HasSessionInput` builder
-                         trait) and `pane.rs` (pure pane-bounding/redaction helpers), EN.9.D), brain_root.rs (`resolve_brain_root`/
+                         trait) and `pane.rs` (pure pane-bounding/redaction helpers), EN.9.D; plus
+                         `predicate.rs` (`AwaitPredicate` — `Marker`/`Detect`/`Regex`/`Silence`/
+                         `ExitCode` — and the pure `evaluate()` over a caller-collected
+                         `Observation`, with `marker_path(out, nonce)` the single source of truth
+                         for the `{out}.{nonce}.done` marker format), `send.rs`
+                         (`TerminalSendNode` — org-floor command refusal, `SessionLease::renew`
+                         re-verification, a per-session `tokio::sync::Mutex` held across the
+                         check+send, and `send_id` back-edge idempotency recorded in a tmux
+                         user-option), and `await_node.rs` (`TerminalAwaitNode` — a bounded,
+                         cancellable poll over `AwaitPredicate` with its own timeout and a
+                         four-layer-resolved `AwaitPolicy`/`poll_interval_ms`/`timeout_ms`, stamped
+                         into `ctx.nodes` on every non-cancelled return), EN.9.E), brain_root.rs (`resolve_brain_root`/
                          `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
                          `mev::brain::config::find_brain_root` walking up from cwd for
                          `brain.toml`, typed `BrainRootError`, EN.7.A task 2), locale.rs —
