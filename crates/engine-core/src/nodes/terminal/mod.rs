@@ -38,10 +38,18 @@
 //! change, cached between calls, with a malformed override kept on the
 //! last-good compile (never a silent fall-back) rather than taking
 //! detection down.
+//!
+//! `no_match_alarm` (`EN.9.F` task 2) is `NoMatchAlarmTracker` — the
+//! consecutive-Unknown counter and the `Alarm` it raises, naming the
+//! manifest and digest in use. Edge-triggered: fires exactly once per
+//! unmatched streak, resets on any successful match. The only thing
+//! standing between a reworded Claude Code UI string and a silently dead
+//! operator surface — see the module doc for the full rationale.
 
 pub mod await_node;
 pub mod identity;
 pub mod manifest_source;
+pub mod no_match_alarm;
 pub mod observe;
 pub mod pane;
 pub mod predicate;
@@ -51,6 +59,9 @@ pub mod session;
 pub use await_node::{AwaitPolicy, PartialAwaitPolicy, TerminalAwaitNode};
 pub use identity::session_name_for;
 pub use manifest_source::{ManifestOrigin, ManifestSource, ResolvedManifest};
+pub use no_match_alarm::{
+    Alarm, NoMatchAlarmPolicy, NoMatchAlarmTracker, PartialNoMatchAlarmPolicy,
+};
 pub use observe::TerminalObserveNode;
 pub use pane::{
     bound_pane_tail, default_pane_tail_policy, BoundedPane, PaneLimits, PaneTailPolicy,
