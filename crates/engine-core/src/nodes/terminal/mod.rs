@@ -15,10 +15,12 @@
 //! `TerminalObserveNode`.
 
 pub mod identity;
+pub mod observe;
 pub mod pane;
 pub mod session;
 
 pub use identity::session_name_for;
+pub use observe::TerminalObserveNode;
 pub use pane::{
     bound_pane_tail, default_pane_tail_policy, BoundedPane, PaneLimits, PaneTailPolicy,
 };
