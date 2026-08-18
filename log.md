@@ -18,6 +18,43 @@ related: [status, context]
 
 ## [run: 2026-08-18]
 
+### Operator-hold policy surface + the Blocked-edge bridge receiver close EN.9.G
+
+Drove `EN.9.G` via `/sdlc-flow` on branch `EN.9.G-flow`, all 4 tasks passed, PASS review.
+`HoldPolicyNode` (`crates/engine-core/src/nodes/terminal/hold_policy.rs`) is the per-workflow
+operator-hold policy surface over the `EN.9.B` session lease: 60s default grace, a doubly-optional
+`steal_after_ms` (custom serde so an explicit `null` — fail-closed — is distinct from a layer
+leaving the key untouched), resolved through the standard four-layer precedence
+(event override > profile > `harness.json` > built-in default) with baseline/cheap-fast/thorough
+profiles, stamping its resolved values into `ctx.nodes` (task 1). `engine-serve::blocked_bridge`
+is the receiving half of the Blocked-edge bridge: it re-evaluates a live level predicate
+(current state == Blocked) on every trigger via injectable `LevelSource`/`Notifier` traits before
+delivering into an `EN.8.B` `OperatorQueue`, exiting silently on a stale trigger; a deterministic
+`item_id` (`blocked-edge:<session>`) collapses repeated triggers for one session onto the queue's
+single delivery slot (task 2). `crates/engine-core/tests/it/blocked_bridge.rs` reproduces the
+fire-then-resolve-within-one-tick race with a fixed injected clock rather than real sleeps,
+asserting no notification fires on the stale trigger (task 3). Task 4 (validation-only) confirmed
+the full gate green — fmt, clippy `-D warnings`, nextest --workspace (2426 passed), release build,
+cargo audit clean of vulnerabilities (pre-existing advisory warnings only). Docs updated:
+`docs/architecture.md`, `docs/terminal-crates.md`, `docs/operator-payload-contract.md`. This closes
+`EN.9.G`. Next: `EN.10.A` — Terminal node holds a tmux session and can open a live Claude Code
+session mid-workflow.
+
+```
+cf34f1b docs: update docs for EN.9.G
+ab61251 feat: implement EN.9.G-task3
+bc84479 feat: implement EN.9.G-task2
+271f68a feat: implement EN.9.G-task1
+0f5f210 feat: implement EN.9.F-task4
+e19fab3 feat: implement EN.9.F-task3
+6711879 feat: implement EN.9.F-task2
+54404b5 feat: implement EN.9.F-task1
+```
+
+---
+
+## [run: 2026-08-18]
+
 ### Write and await nodes land at contract v0.2.0, closing Phase 3 of the terminal-node work
 
 - **What:** Drove `EN.9.E` via `/sdlc-flow` on branch `EN.9.E-flow`, all 5 tasks passed, PASS

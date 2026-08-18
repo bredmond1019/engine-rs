@@ -52,9 +52,17 @@
 //! Deliberately leaves `ParallelNode` untouched — it bounds terminal-node
 //! fan-out specifically, the precondition for `EN.10.B`'s cross-repo
 //! fan-out.
+//!
+//! `hold_policy` (`EN.9.G` task 1) is `HoldPolicyNode` — the per-workflow
+//! operator-hold policy surface over the `EN.9.B` lease/hold mechanism
+//! (`term_core::lease`, `term_core::hold`): 60s default grace and a
+//! fail-closed `steal_after`, resolved through the same four-layer
+//! precedence, keyed per workflow via `harness.json`'s
+//! `<workflow_key>.policy`/`.profiles` sections.
 
 pub mod admission;
 pub mod await_node;
+pub mod hold_policy;
 pub mod identity;
 pub mod manifest_source;
 pub mod no_match_alarm;
@@ -66,6 +74,10 @@ pub mod session;
 
 pub use admission::{AdmissionControl, AdmissionPermit, AdmissionPolicy, PartialAdmissionPolicy};
 pub use await_node::{AwaitPolicy, PartialAwaitPolicy, TerminalAwaitNode};
+pub use hold_policy::{
+    resolve_for_workflow as resolve_hold_policy_for_workflow, HoldPolicy, HoldPolicyNode,
+    PartialHoldPolicy,
+};
 pub use identity::session_name_for;
 pub use manifest_source::{ManifestOrigin, ManifestSource, ResolvedManifest};
 pub use no_match_alarm::{
