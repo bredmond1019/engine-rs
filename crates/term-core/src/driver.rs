@@ -234,6 +234,26 @@ impl StubOutcome {
         StubOutcome::Ok(String::new())
     }
 
+    /// Real tmux's exit-1 response for `show-option`/`show-option -v`
+    /// against an option that was never set — verified live on tmux 3.7b
+    /// and 3.5a: `tmux show-option -g '@never_set'` exits 1 with stderr
+    /// `invalid option: @never_set`. `StubTerminalDriver`'s canned
+    /// `empty_ok()` default cannot express this: real tmux never answers a
+    /// never-set option with success and an empty string, it errors — and
+    /// that mismatch between the stub's default and reality is why
+    /// `SessionLease::read()`'s `?`-propagation of this exact error went
+    /// undetected by a 2319-test suite. Configure this via
+    /// [`StubTerminalDriver::set_show_option_result`] or
+    /// [`StubTerminalDriver::set_show_option_result_for`] to reproduce that
+    /// failure mode in a unit test without pre-seeding the option.
+    #[must_use]
+    pub fn invalid_option(name: &str) -> Self {
+        StubOutcome::ExitError {
+            code: 1,
+            stderr: format!("invalid option: {name}"),
+        }
+    }
+
     fn into_string_result(self) -> Result<String, TmuxError> {
         match self {
             StubOutcome::Ok(s) => Ok(s),
@@ -750,6 +770,44 @@ mod tests {
                 show_option_args("@engine_lease"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn stub_show_option_can_reproduce_real_tmux_invalid_option_error() {
+        // Real tmux's response to `show-option -gv '@never_set'` for an
+        // option that was never set: exit 1, stderr `invalid option:
+        // @never_set` — verified live on tmux 3.7b and 3.5a. The stub's
+        // canned `empty_ok()` default cannot express this on its own;
+        // `StubOutcome::invalid_option` closes that gap.
+        let stub = StubTerminalDriver::new();
+        stub.set_show_option_result_for("@never_set", StubOutcome::invalid_option("@never_set"));
+        let driver: Arc<dyn TerminalDriver> = as_trait_object(stub.clone());
+
+        let result = driver.show_option("@never_set").await;
+
+        match result {
+            Err(TmuxError::ExitError { code, stderr }) => {
+                assert_eq!(code, 1);
+                assert_eq!(stderr, "invalid option: @never_set");
+            }
+            other => panic!("expected ExitError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_show_option_default_is_unchanged_by_invalid_option_helper() {
+        // Adding `StubOutcome::invalid_option` must not flip the stub's
+        // existing default: an unconfigured `show_option` call still
+        // succeeds with an empty string, exactly as before this task.
+        let stub = StubTerminalDriver::new();
+        let driver: Arc<dyn TerminalDriver> = as_trait_object(stub.clone());
+
+        let value = driver
+            .show_option("@untouched")
+            .await
+            .expect("default remains success");
+
+        assert_eq!(value, "");
     }
 
     #[tokio::test]
