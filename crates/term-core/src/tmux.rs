@@ -196,14 +196,21 @@ pub fn set_option_args(name: &str, value: &str) -> Vec<String> {
 }
 
 /// Returns the argument list for:
-///   tmux show-option -g <name>
+///   tmux show-option -gv <name>
 ///
 /// Reads back a global tmux option previously written with `set_option_args`.
+/// `-v` (value-only) is required: without it, real tmux returns
+/// `"<name> <value>"` rather than the bare value `set_option_args` wrote —
+/// confirmed live on tmux 3.7b: `show-option -g '@engine_lease@ZZ'` ->
+/// `@engine_lease@ZZ v1`, `show-option -gv '@engine_lease@ZZ'` -> `v1`.
+/// Every reader of this output (`SessionLease::read`'s empty check,
+/// `Lease::parse`'s colon split) assumes the bare value.
 pub fn show_option_args(name: &str) -> Vec<String> {
     vec![
         "tmux".to_string(),
         "show-option".to_string(),
         "-g".to_string(),
+        "-v".to_string(),
         name.to_string(),
     ]
 }
@@ -782,8 +789,26 @@ mod tests {
         assert_eq!(args[0], "tmux");
         assert_eq!(args[1], "show-option");
         assert_eq!(args[2], "-g");
-        assert_eq!(args[3], "@lease");
-        assert_eq!(args.len(), 4);
+        assert_eq!(args[3], "-v");
+        assert_eq!(args[4], "@lease");
+        assert_eq!(args.len(), 5);
+    }
+
+    /// Fails if `-v` is ever dropped from `show_option_args` again. Without
+    /// it, real tmux returns `"<name> <value>"` instead of the bare value
+    /// `set_option_args` wrote — confirmed live on tmux 3.7b: `show-option
+    /// -g '@engine_lease@ZZ'` -> `@engine_lease@ZZ v1`, `show-option -gv
+    /// '@engine_lease@ZZ'` -> `v1`. Observed RED against the code before
+    /// this task's fix (args lacked `-v`, so this assertion failed), then
+    /// GREEN after the fix.
+    #[test]
+    fn show_option_args_includes_value_only_flag() {
+        let args = show_option_args("@engine_lease@ZZ");
+        assert!(
+            args.contains(&"-v".to_string()),
+            "show_option_args must pass -v so a read returns the bare value \
+             set_option_args wrote, not \"<name> <value>\": {args:?}"
+        );
     }
 
     // ── display_message_args ─────────────────────────────────────────────────────
