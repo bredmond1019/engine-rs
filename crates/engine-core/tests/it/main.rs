@@ -32,6 +32,7 @@ mod locale_rate_card;
 mod materialize_doc;
 mod operator_queue;
 mod opportunity_loop_e2e;
+mod orchestration;
 mod parallel;
 mod policy_dispatch_e2e;
 mod policy_framework;
