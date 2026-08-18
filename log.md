@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-13T22:55:00Z"
+timestamp: "2026-08-18T00:55:12Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,72 @@ related: [status, context]
 ---
 
 ## [run: 2026-08-17]
+
+### Harness pulled up to D67/D66, and the ledger read path finally has an owner
+
+- **What:** Cleared both open items from the engine-lane handoff. (1) Ran
+  `sync_downstream_harness.py --repo engine-rs` — 9 files, deferred all of last session because the
+  sync copies `.claude/workflows/` and an engine was always mid-run. Brings D67's **mandatory**
+  `mev validate-state` after any `state.json` write, the `defect` carryover kind and the
+  `reference[]`-vs-`carryover[]` routing rule, D66's tiered heavy-lane concurrency, and a fix to the
+  engines' parse-time safety gate: `renderEngineParseChecks` now filters to `.js`, because
+  `node --check` throws `ERR_UNKNOWN_FILE_EXTENSION` on a `.md`/`.json` path regardless of content —
+  a false positive, and one this repo's specs hit routinely since tasks name `tasks.md`. (2) Authored
+  `EN.ticket.approval-ledger-read-endpoint`, 5 tasks: two authenticated GETs
+  (`/approvals/ledger`, `/approvals/ledger/stats`) over `EN.8.C`'s ledger.
+- **Why:** The harness pull was P2-first in the handoff precisely because no engine was running; it
+  is the only safe window. On the ticket: `EN.8.C` shipped the ledger as a JSONL file behind the
+  `ApprovalLedger` trait with no HTTP surface, and the operator-surface roadmap splits writer
+  (`EN.8.C`) from reader (`bastion-web:BW.ticket.approval-ledger-view`) — but nobody owned the
+  engine-side read path, and a browser cannot open a file on another host. Carryover
+  `approval-ledger-has-no-engine-read-path` had tracked that since 2026-08-12.
+- **The load-bearing design call, recorded because it is reversible:** the ledger reaches the
+  handlers as `Option<web::Data<Arc<dyn ApprovalLedger>>>`, **not** as an `AppState` field.
+  `AppState`'s fields are public and it is struct-literal-constructed in bastion
+  (`src/serve/mod.rs`) plus five engine-serve test files, so a required field would be a cross-repo
+  break for a surface bastion is not ready to wire. Additive instead: the routes register
+  unconditionally and answer **503** until one `.app_data(..)` line lands in bastion reusing the
+  `Arc` it already builds at `src/serve/mod.rs:587`. Same shape as `spawn_schedule_loop` and
+  `reconcile_orphans` — an engine seam callable before its host wires it. That makes a **fourth**
+  seam waiting on that one bastion file; whoever next works there should take all four together.
+- **Two ACs declared un-gateable (D64)** rather than written as if a green suite proved them: the
+  additive-seam claim (only evidence is the D62 downstream build of another repo) and reader/writer
+  sharing one `Arc` (the call site is in another repo and does not exist yet). The second names its
+  failure mode explicitly — a second `FileApprovalLedger` resolving `default_ledger_path`
+  independently reads an empty file while the writer appends elsewhere, and **neither side errors**.
+- **Not done, and not ours:** the 8 blocks held on `bastion:BA.18.F` (`EN.9.D`->`EN.9.H`,
+  `EN.10.A/B/C`, `EN.ticket.otel-pane-telemetry`). Untouched deliberately.
+- **Refs:** `planning/blocks/EN.ticket.approval-ledger-read-endpoint.json`;
+  `planning/EN.ticket.approval-ledger-read-endpoint/tasks.md`; carryover
+  `approval-ledger-has-no-engine-read-path` (now has an owning block, cleared on implement);
+  carryover `engine-rs-harness-stale-vs-base-template-d67-d66` (cleared).
+
+### Engine lane closed four blocks; three were found by the consumer, not by our gates
+- **What:** Drove the `engine` lane of roadmap `engine-orchestration`. `EN.9.B` (`/sdlc-flow`, 9/9,
+  PASS) shipped the async driver seam, session lease, operator hold and capture cache into
+  `term-core` behind a non-default `tokio` feature. Three further tickets were **adopted mid-run**,
+  each raised by the `bastion` WIRE lane while it prepared `BA.18.F`:
+  `EN.ticket.term-core-port-gaps` (5/5 — `send_keys_no_enter`, the whole `BlockedReason`
+  sub-classification, and the `awaiting_question` manifest rule `EN.9.A` had dropped outright, so
+  term-core could not detect the AskUserQuestion blocked state at all),
+  `EN.ticket.term-core-embedded-asset-consts` (3/3 — publishes the `include_str!` targets a
+  `pub use` shim structurally cannot re-export), and `EN.ticket.tmux-error-root-cause` (3/3 —
+  `TmuxError::root_cause()`, without which the naive fix to bastion's exhaustive status match turns
+  503/C001 into 500/C010 with a green suite). `BA.18.F` is fully unblocked. Also fixed a blind
+  harness gate: `test`/`fastCommand`/`clippy` now carry `--all-features`.
+- **Why:** `EN.9.A` closed PASS on an incomplete extraction, and none of it was catchable here. The
+  session surfaced six instances of one pattern — a check whose inputs both come from the artifact
+  under test, returning the same green a real check returns: two manifests that both parse while
+  one lost a rule; a port matching a planning inventory that had already dropped 11 tests; a
+  "verified 257" that is the sum of its own two enumerations; a feature-gated module the standing
+  gate never compiled; and the two consumer-found gaps above. Two lanes converged on four
+  constraints, the general one being *a gate must be shown to be capable of failing on the block's
+  own deliverable*.
+- **Correction worth recording:** this lane initially reported `EN.9.B`'s 39 feature-gated tests as
+  "never ran". Too strong — its task 9 did run them (164 tests) because the spec's Validate task
+  called the feature out explicitly. The gap was ongoing coverage, not an untested block.
+- **Refs:** `planning/orchestration-run/engine-orchestration/{notes.md,review.md}`;
+  carryover `gate-scope-must-be-shown-capable-of-failing`.
 
 Implemented EN.9.B — Async driver seam and the session lease (Phase 1) — across 9 tasks, all passed, PASS review. Task 1 added a non-default `tokio` feature to `term-core` with `run_tmux_async` sharing one `classify_output` with the sync path, plus `TmuxError::Timeout` that kills a wedged child via `kill_on_drop` instead of leaking it. Task 2 added an object-safe `TerminalDriver` trait with `TmuxDriver` (delegating only to existing tmux.rs argv builders + `run_tmux_async`) and a `StubTerminalDriver` recording exact argv sequences with configurable per-op outcomes. Task 3 added a per-session, ~400ms-TTL, single-flight `CaptureCache` so the hub sweep and a node's await loop coalesce onto one underlying tmux invocation; a failed capture is never cached. Task 4 added the advisory, fail-closed `SessionLease` in `lease.rs` — write-then-read-back arbitration (acquire/renew/release) over tmux user-options, since tmux has no CAS primitive, with jittered backoff derived from `SystemTime` rather than a new `rand` dependency. Task 5 added `OperatorHold` — `@operator_hold` + `#{session_attached}` fallback signals, sends-pause/reads-continue asymmetry, and an injectable-clock 60s detach grace, gating sends via `guard_send`; this required a new `TerminalDriver::display_message` method not in the original file list. Task 6 added `GuardedSender` — a per-session mutex around the literal+Enter send pair with `C-u` line-clear recovery on Enter failure (original error preserved), requiring `send_keys` to split into `send_literal`/`send_enter` so the caller can tell which half failed. Task 7 added `docs/terminal-driver.md` with pointers from `docs/index.md`/`docs/architecture.md`, deferring live-tmux evidence to task 8. Task 8 captured verbatim live-tmux evidence (tmux 3.7b) proving `#{session_attached}` emits `0`/`1`/`0` across detached/attached/detached-again, using a nested-tmux-attach trick, and pinned those bytes as a golden test in `hold.rs`; no contradiction with task 5's design was found. Task 9 validated the full gate: fmt, clippy `-D warnings`, nextest --workspace (2202/2202), build --release, plus `term-core` with and without the `tokio` feature (164/122 tests). Closes `EN.9.B`, unblocking `EN.9.D` (read-only terminal nodes + TERMINAL_PROBE, Phase 2).
 
