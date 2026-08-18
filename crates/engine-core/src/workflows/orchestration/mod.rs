@@ -22,8 +22,13 @@
 //! - [`graph`] (Task 5) — the `ORCHESTRATION` `WorkflowSchema`/`NodeRegistry`/`Workflow`
 //!   assembly (`Workflow::new_validated`), wrapping Tasks 1-4 in a single
 //!   `OrchestrationRunNode`, plus the three named policy profiles.
+//! - [`engine_kind`] (`EN.10.C` Task 1) — the closed, two-variant [`engine_kind::EngineKind`]
+//!   type that makes an unsanctioned runner structurally unrepresentable, plus the
+//!   `sdlc_workflow` -> `EngineKind` mapping. Re-exported from [`execute`] as
+//!   `execute::EngineKind` for every existing caller/test of this module.
 
 pub mod chain;
+pub mod engine_kind;
 pub mod execute;
 pub mod gates;
 pub mod graph;

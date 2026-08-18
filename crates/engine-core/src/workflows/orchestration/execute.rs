@@ -62,28 +62,16 @@ use super::chain::ChainStep;
 /// Which sanctioned SDLC engine runs a block — taken verbatim from the
 /// block's authored `sdlc_workflow` field (`okf_core::TrackBlock`), which
 /// carries exactly this two-value closed vocabulary (`"task"` / `"flow"`).
-/// A value outside it is the caller's problem to diagnose when resolving
-/// the field, not this enum's — there is no third variant to silently fall
-/// into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineKind {
-    /// `/sdlc-task` — not yet ported to this engine (no Rust `SDLC_TASK`
-    /// workflow exists). Selecting it fails loudly via
-    /// [`ExecuteError::UnsupportedEngine`].
-    Task,
-    /// `/sdlc-flow` — `workflows::sdlc_flow`, invoked (never reimplemented)
-    /// by [`execute_step`].
-    Flow,
-}
-
-impl fmt::Display for EngineKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EngineKind::Task => write!(f, "task"),
-            EngineKind::Flow => write!(f, "flow"),
-        }
-    }
-}
+///
+/// Re-exported from [`super::engine_kind`] (`EN.10.C` Task 1), which owns the
+/// definition and the `sdlc_workflow -> EngineKind` mapping
+/// ([`EngineKind::from_sdlc_workflow`]) — kept as `execute::EngineKind` here
+/// so every existing caller and test of this module's public API keeps
+/// working unchanged. `EngineKind` is a closed, two-variant type: there is no
+/// third variant and no string-typed constructor, so an unsanctioned runner
+/// cannot be represented, only diagnosed as an
+/// [`super::engine_kind::UnsupportedSdlcWorkflow`].
+pub use super::engine_kind::EngineKind;
 
 // ── Invocation / runner seam ────────────────────────────────────────────
 
