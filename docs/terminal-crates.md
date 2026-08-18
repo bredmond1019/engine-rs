@@ -126,3 +126,28 @@ tests standalone (`cargo nextest run -p term-core`), now including the non-defau
 feature's async driver/lease/hold surface added in `EN.9.B` (see
 [terminal-driver.md](terminal-driver.md)); wiring any of it into an actual workflow node is
 `EN.9.D`/`EN.9.E`.
+
+## `TmuxError`'s wrapped-error contract
+
+Every public fn in `tmux.rs` returns its error wrapped in `TmuxError::Context { source, .. }` — a
+caller matching on variant sees `Context`, never a bare `NoServer`/`NotInstalled`/`ExitError`.
+`TmuxError::root_cause()` (`EN.ticket.tmux-error-root-cause`) is the supported way to classify:
+it recursively unwraps `Context` down to the innermost non-`Context` variant, returning `self` for
+every other variant, with `ExitError`'s `code`/`stderr` still reachable afterward. Match on
+`root_cause()`, never on the raw error.
+
+The variant set itself is a cross-repo contract, not a private implementation detail: bastion's
+`serve/handlers/sessions.rs` maps `TmuxError` variants to HTTP status codes and error codes as
+part of its serve contract (`NotInstalled`/`NoServer` → 503/C001, unknown-session `ExitError` →
+404/C002, other → 500/C010). Adding, removing, or renaming a variant is therefore a
+downstream-visible change and wants the D62 consumer check
+(`cargo nextest run --no-run --locked --manifest-path ../bastion/Cargo.toml`) run alongside it,
+the same way the manifest/fixture data contract above is verified before landing.
+
+**The bare-variant test trap.** bastion's tests construct `TmuxError` variants directly by hand
+(e.g. `make_tmux_err(TmuxError::NotInstalled)`) rather than by driving a real `Context`-wrapped
+error through the actual code path. That lets bastion's status-mapping suite stay green while
+still asserting against a shape production no longer produces — a hand-built bare variant proves
+nothing about what a real caller receives once every public fn wraps its result. A test that
+constructs the error value it then matches on can pass even when the mapping it's meant to guard
+has silently regressed.
