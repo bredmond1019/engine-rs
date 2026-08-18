@@ -6,6 +6,7 @@
 
 pub mod abort;
 pub mod approvals;
+pub mod blocked_bridge;
 pub mod dispatch;
 pub mod durable;
 pub mod email_webhooks;
