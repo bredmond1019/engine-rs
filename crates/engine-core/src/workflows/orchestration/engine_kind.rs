@@ -150,66 +150,121 @@ mod tests {
         assert_eq!(EngineKind::Flow.to_string(), "flow");
     }
 
-    /// EN.10.C Task 2 — the unreachability test.
+    /// EN.10.C Task 2 (widened by `EN.ticket.sanctioned-engine-guard-covers-the-execute-seam`
+    /// Task 1) — the unreachability test.
     ///
     /// `from_sdlc_workflow` is the ONE sanctioned entry point allowed to take a
     /// string-shaped runner value; it exists precisely to turn an arbitrary string into
     /// either a closed [`EngineKind`] variant or an [`UnsupportedSdlcWorkflow`]
-    /// diagnostic — never a raw runner. This test scans THIS MODULE'S OWN SOURCE (via
-    /// `include_str!`, not `git diff`, so it is immune to concurrent lanes' unrelated
-    /// uncommitted files elsewhere in the working tree) for every `pub`/`pub(crate)` fn
-    /// signature that accepts a `&str` or `String` parameter, and asserts the only one
-    /// is `from_sdlc_workflow`.
+    /// diagnostic — never a raw runner. This test scans EVERY `.rs` file under this
+    /// module's own directory (`crates/engine-core/src/workflows/orchestration/`, read
+    /// at runtime via `std::fs::read_dir` rooted at `env!("CARGO_MANIFEST_DIR")` — never
+    /// `git diff`, so it is immune to concurrent lanes' unrelated uncommitted files
+    /// elsewhere in the working tree, and never any directory outside this module) for
+    /// every `pub`/`pub(crate)` fn signature that accepts a `&str` or `String`
+    /// parameter, and asserts each one is on the per-file sanctioned allowlist below.
     ///
     /// A working-tree-wide `git diff | grep` guard is explicitly the wrong shape here —
     /// it can never pass in a shared index with concurrent lanes and would bail the
-    /// block on an unrelated lane's uncommitted files. Scoping the read to this file via
-    /// `include_str!(file!())` keeps the check honest without that failure mode.
+    /// block on an unrelated lane's uncommitted files. Scoping the read to this
+    /// module's own directory keeps the check honest without that failure mode.
     ///
-    /// Reintroducing a sibling escape hatch — e.g. `pub fn run_raw(cmd: &str)` beside
-    /// `from_sdlc_workflow` — adds a second `pub fn ...(&str ...)` signature line to this
-    /// file and makes this test fail. Observed manually during EN.10.C Task 2: with a
-    /// `pub fn run_raw(cmd: &str) -> EngineKind` stub added below `from_sdlc_workflow`,
-    /// this test went RED (`extra string-typed pub fn(s) found: ["run_raw"]`); removing
-    /// the stub restored GREEN. See the task notes for the transcript.
+    /// Reintroducing a sibling escape hatch anywhere in the module — e.g.
+    /// `pub fn run_raw(cmd: &str)` in `execute.rs`, the block-execution seam — adds a
+    /// `pub fn ...(&str ...)` signature line not on the allowlist for that file and
+    /// makes this test fail, naming both the offending fn and its file. Demonstrated
+    /// 2026-08-18: before this widening, an identical injection into `execute.rs` left
+    /// the whole orchestration suite GREEN with zero failures — the original,
+    /// file-scoped guard only ever saw its own source. See the task notes for the
+    /// adversarial-injection transcript proving the widened guard now catches it.
     #[test]
     fn no_string_typed_runner_escape_besides_the_one_sanctioned_mapping_fn() {
-        const SANCTIONED_STRING_TAKING_FNS: &[&str] = &["from_sdlc_workflow"];
+        // Per-file allowlist: (file name, sanctioned string-taking `pub`/`pub(crate)` fn
+        // names in that file). A fn not listed here, in a file scanned below, fails the
+        // guard. Every entry here is a legitimate existing string-taking entry point as
+        // of this widening — verified by grepping the module for
+        // `^\s*pub(\(crate\))? fn .*(&str|: String)` on 2026-08-18.
+        const SANCTIONED_STRING_TAKING_FNS: &[(&str, &[&str])] = &[
+            ("chain.rs", &[]),
+            ("engine_kind.rs", &["from_sdlc_workflow"]),
+            ("execute.rs", &[]),
+            ("gates.rs", &[]),
+            // `profile_by_name` resolves a named policy profile (e.g. "cheap-fast") to
+            // its `PartialOrchestrationPolicy` bundle — a config lookup, not a runner.
+            ("graph.rs", &["profile_by_name"]),
+            // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
+            // a path lookup, not a runner.
+            ("integrate.rs", &["resolve_roadmap_dir"]),
+            ("mod.rs", &[]),
+        ];
 
-        let source = include_str!("engine_kind.rs");
-        let mut offending = Vec::new();
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/workflows/orchestration");
 
-        for line in source.lines() {
-            let trimmed = line.trim_start();
-            let is_pub_fn = trimmed.starts_with("pub fn ") || trimmed.starts_with("pub(crate) fn ");
-            if !is_pub_fn {
-                continue;
-            }
-            // Every `pub fn` signature in this module is written on a single line
-            // (enforced by `cargo fmt --check` in the harness); a signature-line scan is
-            // therefore sufficient to catch a reintroduced string-typed runner param
-            // without needing a full parser.
-            let takes_string = trimmed.contains("&str") || trimmed.contains(": String");
-            if !takes_string {
-                continue;
-            }
+        let mut offending: Vec<String> = Vec::new();
+        let mut scanned_files: Vec<&str> = Vec::new();
 
-            let after_fn = trimmed
-                .strip_prefix("pub(crate) fn ")
-                .or_else(|| trimmed.strip_prefix("pub fn "))
-                .unwrap();
-            let name = after_fn.split(['(', '<']).next().unwrap_or("").trim();
+        for &(file_name, sanctioned) in SANCTIONED_STRING_TAKING_FNS {
+            let path = dir.join(file_name);
+            let source = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                panic!("failed to read {path:?} for the sanctioned-engine guard scan: {err}")
+            });
+            scanned_files.push(file_name);
 
-            if !SANCTIONED_STRING_TAKING_FNS.contains(&name) {
-                offending.push(name.to_string());
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                let is_pub_fn =
+                    trimmed.starts_with("pub fn ") || trimmed.starts_with("pub(crate) fn ");
+                if !is_pub_fn {
+                    continue;
+                }
+                // Every `pub fn` signature in this module is written on a single line
+                // (enforced by `cargo fmt --check` in the harness); a signature-line
+                // scan is therefore sufficient to catch a reintroduced string-typed
+                // runner param without needing a full parser.
+                let takes_string = trimmed.contains("&str") || trimmed.contains(": String");
+                if !takes_string {
+                    continue;
+                }
+
+                let after_fn = trimmed
+                    .strip_prefix("pub(crate) fn ")
+                    .or_else(|| trimmed.strip_prefix("pub fn "))
+                    .unwrap();
+                let name = after_fn.split(['(', '<']).next().unwrap_or("").trim();
+
+                if !sanctioned.contains(&name) {
+                    offending.push(format!("{name} (in {file_name})"));
+                }
             }
         }
 
+        // Fail loudly, not silently, if this test's own file list drifts from the
+        // directory's actual contents — a new file added to the module without being
+        // added to `SANCTIONED_STRING_TAKING_FNS` above would otherwise go unscanned.
+        let actual_rs_files: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("failed to read {dir:?}: {err}"))
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.ends_with(".rs").then_some(name)
+            })
+            .collect();
+        let listed_files: std::collections::BTreeSet<String> =
+            scanned_files.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            actual_rs_files, listed_files,
+            "the orchestration module's .rs files have drifted from the guard's scan \
+             list — add the new file to SANCTIONED_STRING_TAKING_FNS in \
+             no_string_typed_runner_escape_besides_the_one_sanctioned_mapping_fn so it \
+             is not silently left unscanned"
+        );
+
         assert!(
             offending.is_empty(),
-            "extra string-typed pub fn(s) found in engine_kind.rs beyond the sanctioned \
-             {SANCTIONED_STRING_TAKING_FNS:?}: {offending:?} — a string-typed runner escape \
-             was reintroduced beside the one sanctioned mapping entry point"
+            "extra string-typed pub fn(s) found in crates/engine-core/src/workflows/\
+             orchestration/ beyond the sanctioned allowlist: {offending:?} — a \
+             string-typed runner escape was reintroduced in the orchestration module"
         );
     }
 
