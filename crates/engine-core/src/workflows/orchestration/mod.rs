@@ -9,5 +9,9 @@
 //! - [`chain`] (Task 1) — lane chain resolution from a roadmap+lane or an explicit
 //!   block list, consuming mev's structured `HELD-UNTIL` / `BUDGET` /
 //!   `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json`.
+//! - [`gates`] (Task 2) — the dependency gate (every `depends_on` edge must be met
+//!   before a block starts) and the `EN.9.F` admission gate (queue at capacity, never
+//!   proceed or fail), both consulted before every block.
 
 pub mod chain;
+pub mod gates;
