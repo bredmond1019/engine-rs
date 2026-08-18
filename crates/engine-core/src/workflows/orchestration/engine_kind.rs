@@ -149,4 +149,85 @@ mod tests {
         assert_eq!(EngineKind::Task.to_string(), "task");
         assert_eq!(EngineKind::Flow.to_string(), "flow");
     }
+
+    /// EN.10.C Task 2 — the unreachability test.
+    ///
+    /// `from_sdlc_workflow` is the ONE sanctioned entry point allowed to take a
+    /// string-shaped runner value; it exists precisely to turn an arbitrary string into
+    /// either a closed [`EngineKind`] variant or an [`UnsupportedSdlcWorkflow`]
+    /// diagnostic — never a raw runner. This test scans THIS MODULE'S OWN SOURCE (via
+    /// `include_str!`, not `git diff`, so it is immune to concurrent lanes' unrelated
+    /// uncommitted files elsewhere in the working tree) for every `pub`/`pub(crate)` fn
+    /// signature that accepts a `&str` or `String` parameter, and asserts the only one
+    /// is `from_sdlc_workflow`.
+    ///
+    /// A working-tree-wide `git diff | grep` guard is explicitly the wrong shape here —
+    /// it can never pass in a shared index with concurrent lanes and would bail the
+    /// block on an unrelated lane's uncommitted files. Scoping the read to this file via
+    /// `include_str!(file!())` keeps the check honest without that failure mode.
+    ///
+    /// Reintroducing a sibling escape hatch — e.g. `pub fn run_raw(cmd: &str)` beside
+    /// `from_sdlc_workflow` — adds a second `pub fn ...(&str ...)` signature line to this
+    /// file and makes this test fail. Observed manually during EN.10.C Task 2: with a
+    /// `pub fn run_raw(cmd: &str) -> EngineKind` stub added below `from_sdlc_workflow`,
+    /// this test went RED (`extra string-typed pub fn(s) found: ["run_raw"]`); removing
+    /// the stub restored GREEN. See the task notes for the transcript.
+    #[test]
+    fn no_string_typed_runner_escape_besides_the_one_sanctioned_mapping_fn() {
+        const SANCTIONED_STRING_TAKING_FNS: &[&str] = &["from_sdlc_workflow"];
+
+        let source = include_str!("engine_kind.rs");
+        let mut offending = Vec::new();
+
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let is_pub_fn = trimmed.starts_with("pub fn ") || trimmed.starts_with("pub(crate) fn ");
+            if !is_pub_fn {
+                continue;
+            }
+            // Every `pub fn` signature in this module is written on a single line
+            // (enforced by `cargo fmt --check` in the harness); a signature-line scan is
+            // therefore sufficient to catch a reintroduced string-typed runner param
+            // without needing a full parser.
+            let takes_string = trimmed.contains("&str") || trimmed.contains(": String");
+            if !takes_string {
+                continue;
+            }
+
+            let after_fn = trimmed
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .unwrap();
+            let name = after_fn.split(['(', '<']).next().unwrap_or("").trim();
+
+            if !SANCTIONED_STRING_TAKING_FNS.contains(&name) {
+                offending.push(name.to_string());
+            }
+        }
+
+        assert!(
+            offending.is_empty(),
+            "extra string-typed pub fn(s) found in engine_kind.rs beyond the sanctioned \
+             {SANCTIONED_STRING_TAKING_FNS:?}: {offending:?} — a string-typed runner escape \
+             was reintroduced beside the one sanctioned mapping entry point"
+        );
+    }
+
+    /// Companion guard: the enum itself stays exhaustively matched with no wildcard arm,
+    /// so adding a third `EngineKind` variant fails to COMPILE this module rather than
+    /// silently falling through an `_ => ...` arm anywhere the type is consumed.
+    #[test]
+    fn engine_kind_match_stays_exhaustive_no_wildcard() {
+        fn describe(kind: EngineKind) -> &'static str {
+            match kind {
+                EngineKind::Task => "task",
+                EngineKind::Flow => "flow",
+                // Deliberately NO `_ =>` arm: a third variant added to `EngineKind`
+                // makes this `match` non-exhaustive and fails the build, rather than
+                // silently falling through.
+            }
+        }
+        assert_eq!(describe(EngineKind::Task), "task");
+        assert_eq!(describe(EngineKind::Flow), "flow");
+    }
 }
