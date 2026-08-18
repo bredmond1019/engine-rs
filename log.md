@@ -16,6 +16,46 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-18]
+
+### Read-only terminal nodes land, TERMINAL_PROBE proven against the real Mac Mini tmux
+
+- **What:** Drove `EN.9.D` via `/sdlc-flow` on branch `EN.9.D-flow`, all 7 tasks passed, PASS
+  review. `TerminalSessionNode` and `TerminalObserveNode` (`crates/engine-core/src/nodes/terminal/`)
+  give the engine its first terminal-facing nodes: session-ensure stamps
+  `@engine_run_id`/`@engine_created_at` before any fallible work and acquires the `EN.9.B` lease
+  with a deterministic nonce so a back-edge re-entry is a no-op reuse rather than a foreign-lease
+  collision; observe resolves the upstream session via a `session_input: InputBinding` field
+  (reused across future terminal nodes through a `HasSessionInput`/`WithSessionInput` trait pair),
+  captures the pane once, and runs it through new pure `bound_pane_tail`/`PaneTailPolicy` helpers
+  that bound, redact, and hash — with HashOnly vs. full-content policy resolved from whether this
+  run created the session or adopted an existing one. The `TERMINAL_PROBE` workflow chains both
+  nodes and is registered in `engine-serve`'s dispatcher alongside the other builtins.
+- **Proven live, not just hermetically:** task 6 built and ran a `terminal_probe` example against
+  the Mac Mini's actual tmux (3.5a), pinned `#{session_attached}` golden bytes, and exercised the
+  orphan kill-restart recipe against the live `:8090` `bastion serve` instance — recording the
+  evidence in `planning/EN.9.D/artifacts/mini-probe-run.txt`. That live run surfaced two real
+  term-core defects — `SessionLease::read()` hard-fails on a never-set lease option, and
+  `show_option_args` omits tmux's `-v` flag, corrupting `Lease::parse`'s `run_id` field — neither
+  fixed in-scope; both recorded as follow-up-ticket recommendations.
+- **Full gate green:** fmt, clippy `--all-features -D warnings`, nextest
+  `--workspace --all-features` (2319 passed, 17 skipped), release build, cargo audit (advisory
+  warnings only, no blocking vulnerabilities).
+- **Closes** `EN.9.D`, unblocking `EN.9.E` (write/await nodes at contract v0.2.0, Phase 3).
+  `docs/architecture.md` and `docs/terminal-crates.md` updated.
+- **Refs:** `planning/EN.9.D/tasks.md`; `planning/EN.9.D/artifacts/mini-probe-run.txt`.
+
+```
+4ca4389 docs: update docs for EN.9.D
+f3f6690 feat: implement EN.9.D-task6
+401e8fb feat: implement EN.9.D-task5
+c56d63b feat: implement EN.9.D-task4
+f420eb2 feat: implement EN.9.D-task3
+edbdde0 feat: implement EN.9.D-task2
+dba021a feat: implement EN.9.D-task1
+15b0dfc docs: log the approval-ledger read endpoint and its downstream bastion wiring block
+```
+
 ## [run: 2026-08-17]
 
 ### The approval ledger is readable over HTTP, and bastion now owns the one line that turns it on
