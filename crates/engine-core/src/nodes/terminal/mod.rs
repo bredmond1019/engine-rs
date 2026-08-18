@@ -30,9 +30,18 @@
 //! through its own builder and `select!`ed on every poll tick (the runner
 //! only observes cancellation between nodes), and a resolved
 //! poll-interval/timeout policy stamped into its `ctx.nodes` result.
+//!
+//! `manifest_source` (`EN.9.F` task 1) is `ManifestSource` — the runtime
+//! override for the detect manifest around `term_core::detect`'s
+//! compile-time `include_str!` consts: resolved from
+//! `ENGINE_TERMINAL_MANIFEST_OVERRIDE`, re-read/re-compiled on mtime
+//! change, cached between calls, with a malformed override kept on the
+//! last-good compile (never a silent fall-back) rather than taking
+//! detection down.
 
 pub mod await_node;
 pub mod identity;
+pub mod manifest_source;
 pub mod observe;
 pub mod pane;
 pub mod predicate;
@@ -41,6 +50,7 @@ pub mod session;
 
 pub use await_node::{AwaitPolicy, PartialAwaitPolicy, TerminalAwaitNode};
 pub use identity::session_name_for;
+pub use manifest_source::{ManifestOrigin, ManifestSource, ResolvedManifest};
 pub use observe::TerminalObserveNode;
 pub use pane::{
     bound_pane_tail, default_pane_tail_policy, BoundedPane, PaneLimits, PaneTailPolicy,
