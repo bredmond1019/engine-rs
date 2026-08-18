@@ -13,15 +13,24 @@
 //! `session` (task 2) is `TerminalSessionNode`. `pane` (task 3) is the pure
 //! pane-bounding/redaction/hashing helpers. `observe` (task 4) is
 //! `TerminalObserveNode`.
+//!
+//! `predicate` (`EN.9.E` task 1) is the Phase-3 write/await pair's pure
+//! `AwaitPredicate` enum and its evaluation — the marker semantics, and
+//! the `Detect`/`Regex`/`Silence`/`ExitCode` alternatives, that
+//! `TerminalAwaitNode` (task 3) polls against.
 
 pub mod identity;
 pub mod observe;
 pub mod pane;
+pub mod predicate;
 pub mod session;
 
 pub use identity::session_name_for;
 pub use observe::TerminalObserveNode;
 pub use pane::{
     bound_pane_tail, default_pane_tail_policy, BoundedPane, PaneLimits, PaneTailPolicy,
+};
+pub use predicate::{
+    evaluate, marker_path, AwaitPredicate, MarkerObservation, Observation, PredicateOutcome,
 };
 pub use session::TerminalSessionNode;
