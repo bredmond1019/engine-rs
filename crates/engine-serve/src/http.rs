@@ -126,6 +126,19 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/webhooks/email/events",
             web::post().to(crate::email_webhooks::email_delivery_events),
+        )
+        // MUST be registered before `/approvals/ledger` -- actix-web
+        // resolves routes first-registration-wins. Neither literal path
+        // contains a dynamic segment today, so they cannot actually shadow
+        // each other yet, but registering `stats` first keeps a future
+        // `/approvals/{item_id}`-style pattern from silently swallowing it.
+        .route(
+            "/approvals/ledger/stats",
+            web::get().to(crate::approvals::ledger_stats),
+        )
+        .route(
+            "/approvals/ledger",
+            web::get().to(crate::approvals::list_ledger),
         );
 }
 
