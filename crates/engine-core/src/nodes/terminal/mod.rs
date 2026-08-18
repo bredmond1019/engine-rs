@@ -68,12 +68,20 @@
 //! find (rather than re-spawn) the background renewal loop already keeping
 //! the lease alive on a resolved `lease_ttl_ms`/`renew_interval_ms` policy
 //! surface.
+//!
+//! `live_claude` (`EN.10.A` task 3) is `LiveClaudeSessionNode` — launches
+//! an INTERACTIVE `claude` session inside an already-held tmux session by
+//! typing the invocation into the pane via `TerminalDriver`, the
+//! programmatic sibling of `bastion sessions`' interactive CLI (never a
+//! replacement for it). See the module's own doc for why this is not
+//! `ClaudeCodeStep` again.
 
 pub mod admission;
 pub mod await_node;
 pub mod held_session;
 pub mod hold_policy;
 pub mod identity;
+pub mod live_claude;
 pub mod manifest_source;
 pub mod no_match_alarm;
 pub mod observe;
@@ -93,6 +101,7 @@ pub use hold_policy::{
     PartialHoldPolicy,
 };
 pub use identity::session_name_for;
+pub use live_claude::LiveClaudeSessionNode;
 pub use manifest_source::{ManifestOrigin, ManifestSource, ResolvedManifest};
 pub use no_match_alarm::{
     Alarm, NoMatchAlarmPolicy, NoMatchAlarmTracker, PartialNoMatchAlarmPolicy,
