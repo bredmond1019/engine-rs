@@ -16,9 +16,10 @@ related: [architecture, engine-rs-testing, terminal-driver]
 new crates, so a future engine-side workflow can drive terminals without ever linking the code
 path that attaches a process to a live tty. `EN.9.B` adds the async driver seam, capture cache,
 session lease, and operator hold on top of `term-core` (see
-[terminal-driver.md](terminal-driver.md)); wiring any of it into an actual `engine-core` /
-`engine-serve` workflow node is still ahead, in `EN.9.D`/`EN.9.E`. This doc covers the split and
-its traps; see
+[terminal-driver.md](terminal-driver.md)). `EN.9.D` wires `term-core` (`tokio` feature) into
+`engine-core` as `nodes/terminal/` (`TerminalSessionNode`/`TerminalObserveNode`, registered as the
+`TERMINAL_PROBE` workflow); `term-attach` is still linked from neither binary. This doc covers the
+split and its traps; see
 [architecture.md](architecture.md) for where the crates sit in the module map.
 
 ## What each crate holds
@@ -119,13 +120,14 @@ for that window regardless of which order the two reverts happen in. engine-rs C
 bastion and cannot detect that a revert here broke it. This is an accepted operator trade-off, not
 a defect to fix.
 
-## Status as of `EN.9.B`
+## Status as of `EN.9.D`
 
-Neither crate is a dependency of `engine-core` or `engine-serve` yet. `term-core` builds and
-tests standalone (`cargo nextest run -p term-core`), now including the non-default `tokio`
-feature's async driver/lease/hold surface added in `EN.9.B` (see
-[terminal-driver.md](terminal-driver.md)); wiring any of it into an actual workflow node is
-`EN.9.D`/`EN.9.E`.
+`term-core` (`tokio` feature) is now a real `engine-core` dependency, wired into
+`nodes/terminal/` (`TerminalSessionNode`/`TerminalObserveNode`) and registered as the
+`TERMINAL_PROBE` builtin workflow in `engine-serve` — see [architecture.md](architecture.md).
+`term-attach` is still linked from neither binary. `term-core` also still builds and tests
+standalone (`cargo nextest run -p term-core`), including the non-default `tokio` feature's async
+driver/lease/hold surface added in `EN.9.B` (see [terminal-driver.md](terminal-driver.md)).
 
 ## `TmuxError`'s wrapped-error contract
 

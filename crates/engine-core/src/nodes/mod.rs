@@ -99,6 +99,12 @@
 //! deterministically-ordered `Vec<serde_json::Value>`, ordered by the
 //! caller's declared source-identity list rather than `HashMap` iteration
 //! order.
+//!
+//! `terminal` (`EN.9.D`) is the Phase-2 read-only terminal nodes —
+//! `TerminalSessionNode`/`TerminalObserveNode` — that create and observe a
+//! tmux session with no sends and no waits. `identity` (task 1) is the pure
+//! session-naming helper plus the per-struct `session_input: InputBinding`
+//! field/builder convention the module's nodes follow.
 
 pub mod aggregate;
 pub mod channel_transport;
@@ -114,6 +120,7 @@ pub mod merge_contacts;
 pub mod openai_compat_transport;
 pub mod opportunity_edit;
 pub mod suspend;
+pub mod terminal;
 
 pub use aggregate::AggregateNode;
 pub use channel_transport::{

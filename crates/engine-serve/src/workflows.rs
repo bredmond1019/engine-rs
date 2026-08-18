@@ -552,11 +552,38 @@ pub fn register_approve_and_run(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `TERMINAL_PROBE` workflow
+/// (`engine_core::workflows::terminal_probe::graph`) with `dispatcher`,
+/// populating both the `workflow_registry` and the `schema_registry`. See
+/// `planning/EN.9.D/tasks.json`, Task 5.
+///
+/// A **fifth model-free workflow** registered in this module, alongside
+/// [`register_opportunity_set_stage`] / [`register_opportunity_add_action`] /
+/// [`register_harvest_approve`] / [`register_lead_ingest`]: neither
+/// `TerminalSessionNode` nor `TerminalObserveNode` calls a model or reads a
+/// `harness.json` policy section (see `terminal_probe::graph`'s module
+/// doc), so this factory resolves no policy and seeds no policy stamp —
+/// there is no `resolve_policy_for_run_from` call and no
+/// `seed_resolved_policy` call. It uses `terminal_probe::graph::registry`,
+/// the live `TmuxDriver`-backed default, exactly as production registers
+/// every other builtin against its live seam.
+pub fn register_terminal_probe(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::terminal_probe::graph::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::terminal_probe::graph::registry(),
+                engine_core::workflows::terminal_probe::graph::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`,
-/// `HARVEST_APPROVE`, `LEAD_INGEST`, and `APPROVE_AND_RUN`; future builtins
-/// register here too.
+/// `HARVEST_APPROVE`, `LEAD_INGEST`, `APPROVE_AND_RUN`, and
+/// `TERMINAL_PROBE`; future builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
 /// this with exactly one argument (`../bastion/src/serve/mod.rs:61`) and
@@ -589,6 +616,7 @@ pub fn register_builtin_workflows_with_registry(
     register_harvest_approve(dispatcher);
     register_lead_ingest(dispatcher);
     register_approve_and_run(dispatcher);
+    register_terminal_probe(dispatcher);
 }
 
 #[cfg(test)]
@@ -1371,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_workflows_registers_all_ten_workflow_types() {
+    fn register_builtin_workflows_registers_all_eleven_workflow_types() {
         let mut dispatcher = Dispatcher::new();
 
         register_builtin_workflows(&mut dispatcher);
@@ -1387,12 +1415,37 @@ mod tests {
             "HARVEST_APPROVE",
             "LEAD_INGEST",
             "APPROVE_AND_RUN",
+            "TERMINAL_PROBE",
         ] {
             assert!(
                 dispatcher.is_registered(workflow_type),
                 "expected {workflow_type} to be registered"
             );
         }
+    }
+
+    #[test]
+    fn register_terminal_probe_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_terminal_probe(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("TERMINAL_PROBE"));
+
+        let workflow = dispatcher
+            .dispatch_with_event("TERMINAL_PROBE", &serde_json::json!({}))
+            .expect("TERMINAL_PROBE should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_terminal_probe() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("TERMINAL_PROBE"));
     }
 
     #[test]
