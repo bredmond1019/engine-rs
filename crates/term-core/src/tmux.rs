@@ -1,11 +1,18 @@
-// tmux.rs — thin wrapper over `std::process::Command` → the tmux CLI.
-// Ported from `core/bastion/src/sessions/tmux.rs` (EN.9.A task 2), MINUS
-// `attach_session` / `suspend_and_attach` — those live in `term-attach` (task 6)
-// so `engine-core` never links a crate that can seize the controlling tty.
-//
-// Design: command *construction* (pure, returns args Vec) is separated from
-// command *execution* (does I/O) so construction can be unit-tested without
-// spawning a real tmux process.
+//! tmux.rs — thin wrapper over `std::process::Command` → the tmux CLI.
+//! Ported from `core/bastion/src/sessions/tmux.rs` (EN.9.A task 2), MINUS
+//! `attach_session` / `suspend_and_attach` — those live in `term-attach` (task 6)
+//! so `engine-core` never links a crate that can seize the controlling tty.
+//!
+//! Design: command *construction* (pure, returns args Vec) is separated from
+//! command *execution* (does I/O) so construction can be unit-tested without
+//! spawning a real tmux process.
+//!
+//! **Error-shape contract:** every public fn in this module returns its
+//! error wrapped in [`TmuxError::Context`]. A consumer matching on variant
+//! never receives a bare `NoServer`/`NotInstalled`/`ExitError`/`Io`/`Timeout`
+//! from a public fn call — call [`TmuxError::root_cause`] first. See the
+//! doc comment on [`TmuxError`] itself for why a catch-all `Context => ...`
+//! arm is the wrong fix for an exhaustive downstream match.
 
 use std::process::Command;
 
@@ -241,6 +248,18 @@ pub fn tmux_locale_env() -> Vec<(&'static str, &'static str)> {
 // ── Execution ─────────────────────────────────────────────────────────────────
 
 /// Errors produced by this module.
+///
+/// **Every public fn in this module returns its error wrapped in
+/// [`TmuxError::Context`]** — the action name is attached via the private
+/// `.context(...)` extension below on every fallible call site. A consumer
+/// that matches on variant therefore never sees a bare `NoServer` /
+/// `NotInstalled` / `ExitError` / `Io` / `Timeout` straight from a public fn
+/// — it sees `Context { action, source }` wrapping one. Call
+/// [`TmuxError::root_cause`] first to reach the real variant; do not add a
+/// catch-all `Context => ...` arm to make an exhaustive match compile, since
+/// that silently collapses every wrapped variant into one bucket (e.g.
+/// turning `no tmux server running` into a generic 500 instead of the 503
+/// its bare `NoServer` would have produced).
 #[derive(Debug, thiserror::Error)]
 pub enum TmuxError {
     #[error("tmux binary not found — is tmux installed?")]
@@ -267,6 +286,25 @@ pub enum TmuxError {
         action: &'static str,
         after: std::time::Duration,
     },
+}
+
+impl TmuxError {
+    /// The innermost non-[`TmuxError::Context`] error in this chain.
+    ///
+    /// Every public fn in this module wraps its error in `Context` (see the
+    /// type-level doc above), so a consumer that wants to match on the real
+    /// variant — `NoServer`, `NotInstalled`, `ExitError { .. }`, `Io`, or
+    /// `Timeout` — must call this first. Recurses through arbitrary nesting
+    /// depth (today's chains are at most two deep, e.g. the `send_keys`
+    /// Enter-send path, but this does not assume a bound); returns `self`
+    /// unchanged for every non-`Context` variant, including a bare one.
+    #[must_use]
+    pub fn root_cause(&self) -> &TmuxError {
+        match self {
+            TmuxError::Context { source, .. } => source.root_cause(),
+            other => other,
+        }
+    }
 }
 
 /// Private `.context(...)` extension, mirroring the ergonomics of the
@@ -925,5 +963,53 @@ mod tests {
 
         let result = run_tmux_async(&args, bound).await;
         assert!(matches!(result, Err(TmuxError::NotInstalled)));
+    }
+
+    // ── root_cause() ──────────────────────────────────────────────────────
+
+    #[test]
+    fn root_cause_unwraps_single_context_layer() {
+        let err = TmuxError::Context {
+            action: "list_sessions",
+            source: Box::new(TmuxError::NoServer),
+        };
+        assert!(matches!(err.root_cause(), TmuxError::NoServer));
+    }
+
+    #[test]
+    fn root_cause_unwraps_double_context_layer() {
+        // Mirrors the send_keys Enter-send path, which can wrap twice.
+        let err = TmuxError::Context {
+            action: "send_enter",
+            source: Box::new(TmuxError::Context {
+                action: "send_keys",
+                source: Box::new(TmuxError::NoServer),
+            }),
+        };
+        assert!(matches!(err.root_cause(), TmuxError::NoServer));
+    }
+
+    #[test]
+    fn root_cause_returns_self_for_bare_variant() {
+        let err = TmuxError::NotInstalled;
+        assert!(matches!(err.root_cause(), TmuxError::NotInstalled));
+    }
+
+    #[test]
+    fn root_cause_preserves_exit_error_fields_through_unwrap() {
+        let err = TmuxError::Context {
+            action: "kill_session",
+            source: Box::new(TmuxError::ExitError {
+                code: 1,
+                stderr: "can't find session foo".to_string(),
+            }),
+        };
+        match err.root_cause() {
+            TmuxError::ExitError { code, stderr } => {
+                assert_eq!(*code, 1);
+                assert!(stderr.contains("can't find session"));
+            }
+            other => panic!("expected ExitError, got {other:?}"),
+        }
     }
 }
