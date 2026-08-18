@@ -144,8 +144,21 @@ impl<'a> SessionLease<'a> {
     /// well-formed. A malformed value (wrong field count, non-numeric
     /// `expires_at`) is reported as `Ok(None)` — never as ours, and never
     /// as an error that would abort a caller's own acquisition attempt.
+    ///
+    /// Real tmux reports a never-set option as an ERROR (exit 1, stderr
+    /// `invalid option: <name>`), not as empty output — verified live on
+    /// tmux 3.7b and 3.5a. That is a normal "nothing here yet" outcome for
+    /// a lease option, not a driver failure, so it is treated as `Ok(None)`
+    /// exactly like empty/malformed output above. A genuine driver failure
+    /// (no server, timeout, permission, or any other tmux error) is NOT
+    /// swallowed here — only the specific "invalid option" shape is, so a
+    /// broken tmux can never be mistaken for a free lease.
     async fn read(&self, session_name: &str) -> Result<Option<Lease>, TmuxError> {
-        let raw = self.driver.show_option(&option_name(session_name)).await?;
+        let raw = match self.driver.show_option(&option_name(session_name)).await {
+            Ok(raw) => raw,
+            Err(e) if is_unset_option_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -248,6 +261,20 @@ impl<'a> SessionLease<'a> {
             _ => Err(LeaseError::LostReadBack),
         }
     }
+}
+
+/// True only for tmux's specific "invalid option: <name>" failure shape
+/// (exit 1, that stderr prefix) — the response a never-set option produces
+/// on real tmux. Matches on `root_cause()` so a `Context`-wrapped instance
+/// of the same underlying error is still recognized. Any other `TmuxError`
+/// (no server, timeout, permission, a different exit error) returns
+/// `false` and must surface to the caller, or a broken tmux would become
+/// indistinguishable from a free lease.
+fn is_unset_option_error(err: &TmuxError) -> bool {
+    matches!(
+        err.root_cause(),
+        TmuxError::ExitError { stderr, .. } if stderr.starts_with("invalid option")
+    )
 }
 
 fn option_name(session_name: &str) -> String {
@@ -601,5 +628,143 @@ mod tests {
     #[test]
     fn jittered_backoff_of_zero_is_zero() {
         assert_eq!(jittered_backoff(Duration::ZERO), Duration::ZERO);
+    }
+
+    // ── SessionLease::read honours its contract for an unset option ────────
+
+    #[tokio::test]
+    async fn read_treats_never_set_option_as_ok_none() {
+        // Real tmux's exit-1 "invalid option: <name>" response for a
+        // never-set option, reproduced via task 1's stub capability — no
+        // pre-seeding. `read()` must NOT propagate this as an error.
+        let stub = StubTerminalDriver::new();
+        let session_lease = SessionLease::new(&stub);
+        let name = option_name("fresh-session");
+        stub.set_show_option_result_for(name.clone(), StubOutcome::invalid_option(&name));
+
+        let result = session_lease.read("fresh-session").await;
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) for an unset option, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_against_a_never_set_option_succeeds_with_no_pre_seed() {
+        // The end-to-end regression this task exists to fix: EN.9.D's
+        // real-Mini probe could only complete by pre-seeding the option
+        // from a fixture binary because every FIRST acquisition against a
+        // fresh session hard-failed. This proves acquire() now succeeds
+        // against a genuinely fresh session with no pre-seed at all.
+        let stub = StubTerminalDriver::new();
+        let name = option_name("fresh-session");
+        stub.set_show_option_result_for(name.clone(), StubOutcome::invalid_option(&name));
+        let session_lease = SessionLease::new(&stub);
+
+        let now = 1_000_000_u64;
+        let expires = future_ms(30);
+        let acquired = session_lease
+            .acquire(AcquireRequest {
+                session_name: "fresh-session",
+                run_id: "run-first",
+                nonce: "nonce-first",
+                identity: "worker-first",
+                expires_at_ms: expires,
+                now_ms: now,
+                steal_after: None,
+            })
+            .await;
+        assert!(
+            matches!(acquired, Err(LeaseError::LostReadBack)),
+            "expected the pre-write check to pass (Ok(None)) and only fail at the \
+             read-back confirm — since the stub's show_option is still pinned to \
+             invalid_option and never reflects the write — got {acquired:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_driver_failure_still_surfaces_as_an_error() {
+        // A real driver failure (no server) must NOT be swallowed as
+        // Ok(None) — only the specific "invalid option" shape is treated
+        // that way. Otherwise a broken tmux becomes indistinguishable from
+        // a free lease and the lease stops being fail-closed.
+        let stub = StubTerminalDriver::new();
+        let session_lease = SessionLease::new(&stub);
+        stub.set_show_option_result(StubOutcome::NoServer);
+
+        let result = session_lease.read("some-session").await;
+        assert!(
+            matches!(result, Err(TmuxError::NoServer)),
+            "expected NoServer to surface as an error, got {result:?}"
+        );
+
+        let acquire_result = session_lease
+            .acquire(AcquireRequest {
+                session_name: "some-session",
+                run_id: "run-x",
+                nonce: "nonce-x",
+                identity: "worker-x",
+                expires_at_ms: future_ms(30),
+                now_ms: 1_000_000,
+                steal_after: None,
+            })
+            .await;
+        assert!(
+            matches!(acquire_result, Err(LeaseError::Driver(TmuxError::NoServer))),
+            "expected acquire() to surface the driver error rather than treat it \
+             as an unset option, got {acquire_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_different_exit_error_is_not_mistaken_for_invalid_option() {
+        // Guard against a too-broad match: any ExitError whose stderr does
+        // NOT start with "invalid option" must still surface, not be
+        // swallowed.
+        let stub = StubTerminalDriver::new();
+        let session_lease = SessionLease::new(&stub);
+        stub.set_show_option_result(StubOutcome::ExitError {
+            code: 1,
+            stderr: "can't find session: nope".to_string(),
+        });
+
+        let result = session_lease.read("some-session").await;
+        match result {
+            Err(TmuxError::ExitError { stderr, .. }) => {
+                assert_eq!(stderr, "can't find session: nope");
+            }
+            other => panic!("expected the unrelated ExitError to surface, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_closed_steal_semantics_are_unchanged_by_the_unset_option_fix() {
+        // An expired FOREIGN lease with no steal_after must still never be
+        // acquired — this task must not touch that path.
+        let stub = StubTerminalDriver::new();
+        let expired_at = future_ms(1);
+        stub.set_show_option_result(StubOutcome::Ok(
+            Lease {
+                run_id: "run-foreign".to_string(),
+                nonce: "nonce-foreign".to_string(),
+                identity: "worker-foreign".to_string(),
+                expires_at_ms: expired_at,
+            }
+            .to_value(),
+        ));
+        let session_lease = SessionLease::new(&stub);
+
+        let result = session_lease
+            .acquire(AcquireRequest {
+                session_name: "proj-abc",
+                run_id: "run-mine",
+                nonce: "nonce-mine",
+                identity: "worker-mine",
+                expires_at_ms: future_ms(60),
+                now_ms: future_ms(10),
+                steal_after: None,
+            })
+            .await;
+        assert!(matches!(result, Err(LeaseError::NoStealWindow)));
     }
 }
