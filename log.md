@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-18T00:55:12Z"
+timestamp: "2026-08-18T01:29:08Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,42 @@ related: [status, context]
 ---
 
 ## [run: 2026-08-17]
+
+### The approval ledger is readable over HTTP, and bastion now owns the one line that turns it on
+- **What:** Drove `EN.ticket.approval-ledger-read-endpoint` via `/sdlc-task`, in place on `main`,
+  all 5 tasks passed. `crates/engine-serve/src/approvals.rs` adds `list_ledger` and `ledger_stats`
+  over `EN.8.C`'s append-only JSONL ledger — newest-first rows with `total` counted before
+  `limit`/`offset`, an `item_id` filter, `limit` defaulting to 100 and **clamped** to 1000 rather
+  than rejected, and stats splitting the two populations deliberately (`Requeued` excluded from
+  median/max, included in `decisions_per_day`). Both routes are registered in `crate::http::configure`
+  with `/approvals/ledger/stats` **before** `/approvals/ledger`, first-registration-wins. The
+  blocking file read runs inside `web::block`; no synchronous `std::fs` read is reachable from a
+  handler body. Nine in-module tests, all driven through the real route table.
+- **Why:** `EN.8.C` shipped the ledger as a file behind the `ApprovalLedger` trait with no HTTP
+  surface, and `bastion-web:BW.ticket.approval-ledger-view` cannot open a file on another host.
+  Carryover `approval-ledger-has-no-engine-read-path` had tracked that since 2026-08-12; it is now
+  cleared.
+- **Shape, per D15:** the ledger arrives as `Option<web::Data<Arc<dyn ApprovalLedger>>>`, not an
+  `AppState` field, so bastion compiles untouched and the routes answer **503** with a stable JSON
+  body until wired. The D62 downstream check against `core/bastion` is the only evidence that claim
+  holds, and it ran green.
+- **Tests are route-table tests on purpose:** every case builds
+  `App::new().configure(crate::http::configure)` over a real `FileApprovalLedger` in a tempdir.
+  A handler-level test would pass even if the routes were never registered — the exact shape
+  carryover `gate-scope-must-be-shown-capable-of-failing` describes. Task 5 additionally ran a D68
+  gate-capability check confirming nextest discovers the 9 approvals tests rather than silently
+  matching none.
+- **Cross-repo:** injected `BA.ticket.approval-ledger-read-wiring` into `core/bastion`'s
+  `state.json` (`tracks[7]`, `focus.next`, P2) rather than leaving the follow-up as prose here. Its
+  note carries the trap: the reader must be handed the **same** `Arc` the writer builds at
+  `src/serve/mod.rs:587` — a second `FileApprovalLedger` resolving `default_ledger_path`
+  independently reads an empty file while the writer appends elsewhere, and **neither side errors**.
+  That bastion file now has four engine seams waiting on it (`BA.ticket.spawn-schedule-loop`,
+  `BA.ticket.orphan-reconcile-wiring`, the approve-and-run seams, and this); take them together.
+- **Still unpushable:** `main` is 27 commits ahead of `origin` — `engine-rs-main-ahead-of-origin-unpushable`
+  is unchanged and nothing in this repo can clear it.
+- **Refs:** `planning/EN.ticket.approval-ledger-read-endpoint/tasks.md`; `docs/approval-ledger.md`;
+  carryover `approval-ledger-reader-unwired-in-bastion`.
 
 ### Harness pulled up to D67/D66, and the ledger read path finally has an owner
 
