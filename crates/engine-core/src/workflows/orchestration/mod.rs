@@ -12,6 +12,10 @@
 //! - [`gates`] (Task 2) — the dependency gate (every `depends_on` edge must be met
 //!   before a block starts) and the `EN.9.F` admission gate (queue at capacity, never
 //!   proceed or fail), both consulted before every block.
+//! - [`execute`] (Task 3) — invokes the existing `SDLC_FLOW` workflow per block in a
+//!   short-lived, cwd-scoped run, selecting the engine from the block's own authored
+//!   `sdlc_workflow` field.
 
 pub mod chain;
+pub mod execute;
 pub mod gates;
