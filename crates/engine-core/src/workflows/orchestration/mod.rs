@@ -15,7 +15,12 @@
 //! - [`execute`] (Task 3) — invokes the existing `SDLC_FLOW` workflow per block in a
 //!   short-lived, cwd-scoped run, selecting the engine from the block's own authored
 //!   `sdlc_workflow` field.
+//! - [`integrate`] (Task 4) — operator hold as pause-and-resume through the `EN.9.G`
+//!   Blocked-edge bridge, state-write verification that fails loudly on a mismatch, and
+//!   exactly one `lane-log.jsonl` line per integrated block, with the roadmap directory
+//!   resolved by `/begin-orchestration`'s Step 1C two-location rule.
 
 pub mod chain;
 pub mod execute;
 pub mod gates;
+pub mod integrate;
