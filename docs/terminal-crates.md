@@ -130,7 +130,12 @@ standalone (`cargo nextest run -p term-core`), including the non-default `tokio`
 driver/lease/hold surface added in `EN.9.B` (see [terminal-driver.md](terminal-driver.md)).
 `nodes/terminal/` also now carries `HoldPolicyNode` (`hold_policy.rs`, `EN.9.G`), the per-workflow
 policy surface over that lease/hold — it resolves and stamps policy only, and does not itself call
-`term_core::lease`/`hold`. See [architecture.md](architecture.md) for the module-map detail.
+`term_core::lease`/`hold`. `EN.10.A` adds `HeldSessionNode` (`held_session.rs`) — a session held
+once per run and reused across node boundaries via a process-global registry, with a background
+lease-renewal loop that detects both lease loss and external tmux kill — and
+`LiveClaudeSessionNode` (`live_claude.rs`), which types an interactive `claude` CLI invocation
+into an already-held pane so the session is visible to `bastion sessions`' tmux listing. See
+[architecture.md](architecture.md) for the module-map detail.
 
 ## `TmuxError`'s wrapped-error contract
 
