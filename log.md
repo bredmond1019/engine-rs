@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-18T01:29:08Z"
+timestamp: "2026-08-18T18:05:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,14 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ---
+
+## [run: 2026-08-18]
+
+### Autonomy research dossier — nine documents, nine tickets, no implementation
+
+- **What:** Produced `planning/orchestration-extensions/` — 9 documents, ~3,500 lines — as research input for a planning session on autonomous multi-repo orchestration. `index.md` routes; `research-overview.md` summarises; `autonomy-brief.md` carries the argument plus seven appendices including a full code map; `sdlc-flow-parity.md`, `sdlc-task-review.md` and `sdlc-task-port-design.md` cover the JS engines and the `SDLC_TASK` port; `leverage-inventory.md` inventories what mev and bastion already do; `corpus-review.md` (5 parts) tests the whole thing against 165 carryovers and 62 backlog items fleet-wide. Filed and registered nine defect tickets with block records and task specs, all under `epics: ["engine-orchestration"]`. Marked one stale `memory.md` entry superseded and deleted one resolved carryover.
+- **Why:** The operator wants an orchestration system that runs campaigns overnight, creates its own follow-on work, and blocks on a human when it must. Before planning that, we needed to know what actually exists. Two P0 defects surfaced that were not previously known: no Rust node ever closes a block (so a chain's second block can never become ready), and a failed final gate still writes `"status": "done"` (so a chain advances on a red build). Also found HQ **D74**, which already governs this programme and which the initial research had not cited.
+- **Refs:** `planning/orchestration-extensions/index.md`, HQ `docs/decisions/D74-orchestration-is-a-workflow.md`, `planning/handoff.md`
 
 ## [run: 2026-08-18]
 
