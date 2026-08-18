@@ -52,7 +52,11 @@ related: [status, context]
   independently reads an empty file while the writer appends elsewhere, and **neither side errors**.
 - **Not done, and not ours:** the 8 blocks held on `bastion:BA.18.F` (`EN.9.D`->`EN.9.H`,
   `EN.10.A/B/C`, `EN.ticket.otel-pane-telemetry`). Untouched deliberately.
-- **Refs:** `planning/blocks/EN.ticket.approval-ledger-read-endpoint.json`;
+- **Decision recorded:** `D15` — cross-repo-visible serve seams are additive extractors, not
+  `AppState` fields. Generalizes the call above past this one ticket, and carries the shared-`Arc`
+  requirement plus the reason the D62 downstream check is load-bearing here rather than routine.
+- **Refs:** `planning/decisions/D15-additive-seams-over-appstate-fields.md`;
+  `planning/blocks/EN.ticket.approval-ledger-read-endpoint.json`;
   `planning/EN.ticket.approval-ledger-read-endpoint/tasks.md`; carryover
   `approval-ledger-has-no-engine-read-path` (now has an owning block, cleared on implement);
   carryover `engine-rs-harness-stale-vs-base-template-d67-d66` (cleared).
