@@ -106,6 +106,24 @@ engine-rs/
                          workflows read distinct `harness.json` sections; does not itself touch
                          `term_core::lease`/`hold` — wiring the actual guard is left to a
                          downstream consumer, mirroring `admission.rs`'s precedent, EN.9.G task 1),
+                         plus `held_session.rs` (`HeldSessionNode` — acquires a tmux session once
+                         per run under the EN.9.B lease and carries it across node boundaries via
+                         a process-global `Mutex<HashMap<session_name, Arc<HeldSessionHandle>>>`
+                         registry keyed by `session_name_for(run_id, "HeldSessionNode")` so every
+                         `HeldSessionNode` call in a run shares one session; spawns a background
+                         tokio renewal loop with a four-layer-resolved
+                         `lease_ttl_ms`/`renew_interval_ms` policy (three named profiles), checks
+                         tmux liveness each renewal tick, and publishes a distinguishable
+                         `HeldSessionFailure` (`ExternallyKilled` vs `LeaseLost`) on a
+                         `tokio::sync::watch` channel that `process()` re-entry surfaces as a typed
+                         `NodeError` instead of hanging or silently succeeding, EN.10.A tasks 1-2)
+                         and `live_claude.rs` (`LiveClaudeSessionNode` — launches an interactive
+                         `claude` CLI session inside an already-held tmux session by typing the
+                         resolved command into the pane via `TerminalDriver::send_keys`, reusing
+                         `claude_code_rs::Config` for model/continue/resume but never calling
+                         `execute()` directly since a headless subprocess is never attached to a
+                         pty and so would be invisible to `bastion sessions`' tmux-surface listing,
+                         EN.10.A task 3),
                          brain_root.rs (`resolve_brain_root`/
                          `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
                          `mev::brain::config::find_brain_root` walking up from cwd for

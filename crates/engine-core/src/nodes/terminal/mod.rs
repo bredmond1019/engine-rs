@@ -59,11 +59,29 @@
 //! fail-closed `steal_after`, resolved through the same four-layer
 //! precedence, keyed per workflow via `harness.json`'s
 //! `<workflow_key>.policy`/`.profiles` sections.
+//!
+//! `held_session` (`EN.10.A` task 1) is `HeldSessionNode` — a tmux session
+//! acquired ONCE and carried across node boundaries under the `EN.9.B`
+//! lease, rather than the per-node scripted session `session::TerminalSessionNode`
+//! creates and lets lapse. A process-global registry keyed by tmux session
+//! name lets every `HeldSessionNode` invocation for a run after the first
+//! find (rather than re-spawn) the background renewal loop already keeping
+//! the lease alive on a resolved `lease_ttl_ms`/`renew_interval_ms` policy
+//! surface.
+//!
+//! `live_claude` (`EN.10.A` task 3) is `LiveClaudeSessionNode` — launches
+//! an INTERACTIVE `claude` session inside an already-held tmux session by
+//! typing the invocation into the pane via `TerminalDriver`, the
+//! programmatic sibling of `bastion sessions`' interactive CLI (never a
+//! replacement for it). See the module's own doc for why this is not
+//! `ClaudeCodeStep` again.
 
 pub mod admission;
 pub mod await_node;
+pub mod held_session;
 pub mod hold_policy;
 pub mod identity;
+pub mod live_claude;
 pub mod manifest_source;
 pub mod no_match_alarm;
 pub mod observe;
@@ -74,11 +92,16 @@ pub mod session;
 
 pub use admission::{AdmissionControl, AdmissionPermit, AdmissionPolicy, PartialAdmissionPolicy};
 pub use await_node::{AwaitPolicy, PartialAwaitPolicy, TerminalAwaitNode};
+pub use held_session::{
+    resolve_for_workflow as resolve_held_session_policy_for_workflow, HeldSessionFailure,
+    HeldSessionHandle, HeldSessionNode, HeldSessionPolicy, PartialHeldSessionPolicy,
+};
 pub use hold_policy::{
     resolve_for_workflow as resolve_hold_policy_for_workflow, HoldPolicy, HoldPolicyNode,
     PartialHoldPolicy,
 };
 pub use identity::session_name_for;
+pub use live_claude::LiveClaudeSessionNode;
 pub use manifest_source::{ManifestOrigin, ManifestSource, ResolvedManifest};
 pub use no_match_alarm::{
     Alarm, NoMatchAlarmPolicy, NoMatchAlarmTracker, PartialNoMatchAlarmPolicy,
