@@ -19,8 +19,12 @@
 //!   Blocked-edge bridge, state-write verification that fails loudly on a mismatch, and
 //!   exactly one `lane-log.jsonl` line per integrated block, with the roadmap directory
 //!   resolved by `/begin-orchestration`'s Step 1C two-location rule.
+//! - [`graph`] (Task 5) — the `ORCHESTRATION` `WorkflowSchema`/`NodeRegistry`/`Workflow`
+//!   assembly (`Workflow::new_validated`), wrapping Tasks 1-4 in a single
+//!   `OrchestrationRunNode`, plus the three named policy profiles.
 
 pub mod chain;
 pub mod execute;
 pub mod gates;
+pub mod graph;
 pub mod integrate;
