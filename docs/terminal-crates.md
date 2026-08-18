@@ -78,6 +78,36 @@ not a runtime one. Any future refactor that reorganizes `detect/`'s directory la
 data files co-located with the module that `include_str!`s them, or update every path literal in
 lockstep.
 
+## The embedded manifests and fixtures are public API, not an implementation detail
+
+`crates/term-core/src/detect/mod.rs` publishes four consts over the bytes it already embeds via
+`include_str!`: `CLAUDE_MANIFEST_TOML`, `PI_MANIFEST_TOML`, `CLAUDE_AWAITING_QUESTION_FIXTURE`, and
+`CLAUDE_BLOCKED_FIXTURE`. These are not exposed for convenience — they are the only way bastion can
+reach this data at all once `BA.18.F` deletes `bastion/src/detect/`. Four bastion files are **not**
+part of that extraction and keep reaching into the deleted directory by relative `include_str!`:
+`src/serve/status/detect.rs:25` — the production path, compiled into a `OnceLock<CompiledManifest>`
+— plus `src/sessions/ask_question.rs:372,416,418,495` for the two shared fixtures. A `pub use` shim
+re-exports *items*; it cannot re-export an `include_str!` target, because the macro resolves its
+path at the call site's compile time, not at the re-exporting module's. So the shim alone cannot
+fix bastion's build, and these bytes have to become real public consts on this crate.
+
+Two alternatives were considered and rejected:
+
+- **A bastion-side copy of `manifests/`.** This reintroduces the exact two-sources-of-truth drift
+  that silently dropped the `awaiting_question` rule and produced `EN.ticket.term-core-port-gaps`
+  — two copies of the same manifest inevitably diverge, and the divergence fails silently (a
+  detection rule just stops firing) rather than as a compile or test error.
+- **`include_str!`-ing across the repo boundary.** This would hard-code a sibling-checkout
+  filesystem layout (`../term-core/...`) into bastion's build, which breaks the moment bastion and
+  engine-rs are not checked out as siblings — a constraint neither repo's CI nor a fresh clone
+  guarantees.
+
+**Consequence:** the manifest and fixture bytes are now a cross-repo contract, not private test
+data. A change to `manifests/claude.toml`, `manifests/pi.toml`, or either published fixture is a
+downstream-visible change to bastion and wants the D62 downstream consumer check (`cargo nextest
+run --no-run --locked --manifest-path ../bastion/Cargo.toml`) run alongside it, the same way any
+other cross-repo data-contract change in this fleet is verified before landing.
+
 ## Two-repo reversibility
 
 `core/bastion` and `core/engine-rs` are separate git repos with separate remotes, separate
