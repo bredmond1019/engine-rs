@@ -5,6 +5,7 @@
 //! `engine-core` and `engine-store` are real — see `docs/architecture.md` for the module map.
 
 pub mod abort;
+pub mod approvals;
 pub mod dispatch;
 pub mod durable;
 pub mod email_webhooks;
