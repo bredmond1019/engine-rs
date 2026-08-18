@@ -12,20 +12,46 @@
 // the engine API; the engine has no knowledge of either agent.
 
 use crate::detect::manifest::parse_manifest;
-use crate::detect::{detect, AgentState, BlockedReason};
+use crate::detect::{
+    detect, AgentState, BlockedReason,
+    CLAUDE_AWAITING_QUESTION_FIXTURE as PUB_CLAUDE_AWAITING_QUESTION_FIXTURE,
+    CLAUDE_BLOCKED_FIXTURE as PUB_CLAUDE_BLOCKED_FIXTURE,
+    CLAUDE_MANIFEST_TOML as PUB_CLAUDE_MANIFEST_TOML, PI_MANIFEST_TOML as PUB_PI_MANIFEST_TOML,
+};
 
-// ── Load manifests and fixtures at compile time ───────────────────────────────
+// ── Aliases of the public embedded-asset consts ───────────────────────────────
+//
+// The only `include_str!` for each of these four assets lives in `mod.rs`,
+// exposed as `pub const`s (public API because a `pub use` shim cannot
+// re-export an `include_str!` target — see mod.rs's doc comment). These are
+// aliases, not re-embeds, kept under the local names this file already reads
+// well with.
 
-const CLAUDE_MANIFEST: &str = include_str!("manifests/claude.toml");
-const PI_MANIFEST: &str = include_str!("manifests/pi.toml");
+const CLAUDE_MANIFEST: &str = PUB_CLAUDE_MANIFEST_TOML;
+const PI_MANIFEST: &str = PUB_PI_MANIFEST_TOML;
 
-const CLAUDE_BLOCKED_FIXTURE: &str = include_str!("fixtures/claude_blocked.txt");
-const CLAUDE_AWAITING_QUESTION_FIXTURE: &str =
-    include_str!("fixtures/claude_awaiting_question.txt");
+const CLAUDE_BLOCKED_FIXTURE: &str = PUB_CLAUDE_BLOCKED_FIXTURE;
+const CLAUDE_AWAITING_QUESTION_FIXTURE: &str = PUB_CLAUDE_AWAITING_QUESTION_FIXTURE;
+
+// The remaining fixtures are not part of the public asset surface (they are
+// golden-test-only, not consumed cross-repo) and stay directly embedded.
 const CLAUDE_WORKING_FIXTURE: &str = include_str!("fixtures/claude_working.txt");
 const CLAUDE_IDLE_FIXTURE: &str = include_str!("fixtures/claude_idle.txt");
 const PI_WORKING_FIXTURE: &str = include_str!("fixtures/pi_working.txt");
 const PI_IDLE_FIXTURE: &str = include_str!("fixtures/pi_idle.txt");
+
+// ── Byte-identity — the re-pointed private consts must be byte-identical ──────
+
+#[test]
+fn repointed_consts_are_byte_identical_to_public_consts() {
+    assert_eq!(CLAUDE_MANIFEST, PUB_CLAUDE_MANIFEST_TOML);
+    assert_eq!(PI_MANIFEST, PUB_PI_MANIFEST_TOML);
+    assert_eq!(CLAUDE_BLOCKED_FIXTURE, PUB_CLAUDE_BLOCKED_FIXTURE);
+    assert_eq!(
+        CLAUDE_AWAITING_QUESTION_FIXTURE,
+        PUB_CLAUDE_AWAITING_QUESTION_FIXTURE
+    );
+}
 
 // ── Claude golden tests ───────────────────────────────────────────────────────
 

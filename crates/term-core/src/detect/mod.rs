@@ -23,6 +23,35 @@ mod golden_tests; // slot owned by spec Task 2 (manifests + fixtures + golden te
 use manifest::{resolve_region, CompiledManifest};
 use serde::{Deserialize, Serialize};
 
+// ── Embedded assets — public API ────────────────────────────────────────────
+//
+// These are `pub` (not merely crate-internal) because a `pub use` shim can
+// re-export an item but cannot re-export an `include_str!` target — the bytes
+// are baked into *this* crate at compile time, so any downstream consumer that
+// needs them (bastion's production status path and its shared ask-question
+// fixtures) must reach them as consts, not files. See `docs/terminal-crates.md`
+// for the full cross-repo-contract rationale (`EN.ticket.term-core-embedded-asset-consts`).
+//
+// Exactly one `include_str!` per embedded asset exists in this crate — here.
+// `golden_tests.rs` and this module's own tests re-point at these consts
+// rather than re-embedding the bytes a second time.
+
+/// The production Claude manifest. Consumed by bastion's
+/// `src/serve/status/detect.rs` on the production status path.
+pub const CLAUDE_MANIFEST_TOML: &str = include_str!("manifests/claude.toml");
+
+/// The Pi manifest — a second fixture proving the engine is agent-agnostic.
+pub const PI_MANIFEST_TOML: &str = include_str!("manifests/pi.toml");
+
+/// Shared with bastion's `src/sessions/ask_question.rs`, which is not part of
+/// the term-core extraction.
+pub const CLAUDE_AWAITING_QUESTION_FIXTURE: &str =
+    include_str!("fixtures/claude_awaiting_question.txt");
+
+/// Shared with bastion's `src/sessions/ask_question.rs`, which is not part of
+/// the term-core extraction.
+pub const CLAUDE_BLOCKED_FIXTURE: &str = include_str!("fixtures/claude_blocked.txt");
+
 // ── Core types ────────────────────────────────────────────────────────────────
 
 /// Classified state of an agent session from its captured pane.
@@ -384,8 +413,7 @@ gate = { contains = "blocked marker" }
     /// `AwaitingQuestion` (priority 110), not `PermissionPrompt` (priority 100).
     #[test]
     fn claude_manifest_pane_matching_both_blocked_gates_resolves_awaiting_question() {
-        let src = include_str!("manifests/claude.toml");
-        let manifest = parse_manifest(src)
+        let manifest = parse_manifest(CLAUDE_MANIFEST_TOML)
             .expect("parse failed")
             .compile()
             .expect("compile failed");
@@ -397,5 +425,40 @@ gate = { contains = "blocked marker" }
             detection.blocked_reason,
             Some(BlockedReason::AwaitingQuestion)
         );
+    }
+
+    // ── Embedded asset consts — public API surface ───────────────────────────
+
+    #[test]
+    fn embedded_asset_consts_are_non_empty() {
+        assert!(!CLAUDE_MANIFEST_TOML.is_empty());
+        assert!(!PI_MANIFEST_TOML.is_empty());
+        assert!(!CLAUDE_AWAITING_QUESTION_FIXTURE.is_empty());
+        assert!(!CLAUDE_BLOCKED_FIXTURE.is_empty());
+    }
+
+    /// Publishing bytes that do not compile into a manifest would relocate
+    /// the failure into bastion — assert the published manifest parses
+    /// through term-core's own parser and yields the two blocked rules at
+    /// their documented priorities.
+    #[test]
+    fn claude_manifest_toml_parses_and_has_blocked_rules_at_110_and_100() {
+        let manifest = parse_manifest(CLAUDE_MANIFEST_TOML).expect("parse failed");
+
+        let priority_110 = manifest
+            .rules
+            .iter()
+            .find(|r| r.priority == 110)
+            .expect("expected a rule at priority 110");
+        assert_eq!(priority_110.state, AgentState::Blocked);
+        assert_eq!(priority_110.reason, Some(BlockedReason::AwaitingQuestion));
+
+        let priority_100 = manifest
+            .rules
+            .iter()
+            .find(|r| r.priority == 100)
+            .expect("expected a rule at priority 100");
+        assert_eq!(priority_100.state, AgentState::Blocked);
+        assert_eq!(priority_100.reason, Some(BlockedReason::PermissionPrompt));
     }
 }
