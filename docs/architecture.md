@@ -94,7 +94,19 @@ engine-rs/
                          user-option), and `await_node.rs` (`TerminalAwaitNode` — a bounded,
                          cancellable poll over `AwaitPredicate` with its own timeout and a
                          four-layer-resolved `AwaitPolicy`/`poll_interval_ms`/`timeout_ms`, stamped
-                         into `ctx.nodes` on every non-cancelled return), EN.9.E), brain_root.rs (`resolve_brain_root`/
+                         into `ctx.nodes` on every non-cancelled return), EN.9.E), plus
+                         `hold_policy.rs` (`HoldPolicyNode` — the per-workflow operator-hold
+                         policy surface over the EN.9.B lease/hold: 60s default grace, a
+                         fail-closed `steal_after_ms` modeled as doubly-optional
+                         (`Option<Option<u64>>`, a custom serde module distinguishing "layer
+                         explicitly asserts fail-closed" from "layer untouched"), resolved through
+                         the same four-layer `resolve_for_workflow(workflow_key, ...)` plumbing as
+                         `AdmissionPolicy`, with three named profiles and its resolved values
+                         stamped into `ctx.nodes`; constructed per `workflow_key` so different
+                         workflows read distinct `harness.json` sections; does not itself touch
+                         `term_core::lease`/`hold` — wiring the actual guard is left to a
+                         downstream consumer, mirroring `admission.rs`'s precedent, EN.9.G task 1),
+                         brain_root.rs (`resolve_brain_root`/
                          `resolve_brain_root_from` — `ENGINE_BRAIN_ROOT` env var, else
                          `mev::brain::config::find_brain_root` walking up from cwd for
                          `brain.toml`, typed `BrainRootError`, EN.7.A task 2), locale.rs —
@@ -190,7 +202,16 @@ engine-rs/
 │   │                         `Schedule`-typed `IngressEnvelope` per fire and dispatches it in-process
 │   │                         via `dispatch_with_event` + `spawn_run` — no self-directed HTTP call;
 │   │                         see [§ Schedule Source](#schedule-source-en6g) below and
-│   │                         [cron-primitive.md](cron-primitive.md))
+│   │                         [cron-primitive.md](cron-primitive.md)), blocked_bridge.rs (`EN.9.G`
+│   │                         task 2 — the Blocked-edge bridge: a `LevelSource` +
+│   │                         `Notifier` injectable receiver that re-evaluates a live level
+│   │                         predicate (current state == Blocked) on every trigger before
+│   │                         delivering into an EN.8.B `OperatorQueue`, exiting silently on a
+│   │                         stale trigger; `OperatorQueue::with_level_predicate` plus a
+│   │                         deterministic `blocked-edge:<session>` item id give exactly-once-
+│   │                         per-tick delivery with no separate dedup/locking logic; not yet
+│   │                         wired into any HTTP route or `AppState` — self-contained until a
+│   │                         production `LevelSource` connects a live bastion sink)
 │   ├── term-core/          ← tmux session-control + agent-detection, ported verbatim from
 │   │                         `core/bastion`'s `src/sessions/{tmux,model,claude_state}.rs` and
 │   │                         `src/detect/` (`EN.9.A`) — no `attach_session`/`suspend_and_attach`,

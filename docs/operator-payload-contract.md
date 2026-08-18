@@ -91,7 +91,11 @@ depth-limited operator queue:
   `open_item(item_id) -> Option<(&OperatorQueueItem, DateTime<Utc>)>` (`EN.8.D` task 6) resolves a
   delivered item's id back to what is currently open, alongside its `opened_at` — the lookup
   [`approve-and-run-workflow.md`](approve-and-run-workflow.md)'s `ApproveAndRunSeams` composes
-  into bastion's `PendingLookup` shape.
+  into bastion's `PendingLookup` shape. `crates/engine-serve/src/blocked_bridge.rs` (`EN.9.G`) is
+  a second `with_level_predicate` consumer: it re-checks a live `LevelSource` (current state ==
+  Blocked) on every trigger before delivering into the queue, using a deterministic
+  `blocked-edge:<session>` item id so repeated triggers for one session collapse to the queue's
+  single open slot rather than needing separate dedup logic.
 - `policy.rs` — `OperatorQueuePolicy` (`operator_queue_depth`, `answer_timeout_secs`,
   `suppression_window_secs`, `digest_schedule_secs`) resolves through the standard four policy
   layers (event override > named profile > `planning/harness.json` defaults > built-in default)

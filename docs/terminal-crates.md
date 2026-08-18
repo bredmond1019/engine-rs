@@ -128,6 +128,9 @@ a defect to fix.
 `term-attach` is still linked from neither binary. `term-core` also still builds and tests
 standalone (`cargo nextest run -p term-core`), including the non-default `tokio` feature's async
 driver/lease/hold surface added in `EN.9.B` (see [terminal-driver.md](terminal-driver.md)).
+`nodes/terminal/` also now carries `HoldPolicyNode` (`hold_policy.rs`, `EN.9.G`), the per-workflow
+policy surface over that lease/hold — it resolves and stamps policy only, and does not itself call
+`term_core::lease`/`hold`. See [architecture.md](architecture.md) for the module-map detail.
 
 ## `TmuxError`'s wrapped-error contract
 
