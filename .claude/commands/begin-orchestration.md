@@ -135,22 +135,26 @@ plan on it"); this step is its equivalent for isolation decisions and carryovers
 
 ## Step 3 — Concurrency
 
-**At most two heavy-gate repos may run concurrently** — anything whose `planning/harness.json` gates
-include a browser or full production build (Playwright, `next build`). Determine whether this repo
-is heavy mechanically, never by memory:
+**Heavy-gate repos are capped per category, not fleet-wide** (D66) — a browser-automation repo
+(Playwright, `next build`, ...) and a native-build repo (`cargo build --release`) draw from separate
+pools, because they have different cost shapes: browser-automation tooling stays CPU-expensive for a
+lane's whole run, while a native build is expensive only once per lane (at the end/reconcile), not
+per task. Determine whether this repo is heavy, and which category, mechanically, never by memory:
 `python3 <path-to-base-template>/scripts/fleet_concurrency_check.py is-heavy --repo-path <this-repo>`
-(exit 0 = heavy).
+(exit 0 = heavy; the JSON `category` field is `"browser-automation"` or `"native-build"`).
 
-**This is enforced, not prose-only.** If this repo is heavy, register before starting:
-`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <this-repo-name>`.
-Exit code `3` (`"allowed": false`) means the fleet is already at capacity (two heavy repos live) —
-stop and report rather than starting a third; wait or swap in a cheap-gate block instead. Release
-the slot once this repo's chain finishes:
+**This is enforced, not prose-only.** If this repo is heavy, register before starting, passing the
+category from the `is-heavy` output:
+`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <this-repo-name> --category <category>`.
+Exit code `3` (`"allowed": false`) means that category's pool is already at capacity (2
+browser-automation lanes, or 4 native-build lanes) — stop and report rather than starting another;
+wait or swap in a cheap-gate block instead. Release the slot once this repo's chain finishes:
 `... release --repo <this-repo-name>`. A lane killed mid-run does not block the fleet forever — its
 entry expires automatically (dead process, or past a fixed TTL) on the next registration. If the
 lock store itself is unavailable, the script degrades to `"allowed": true, "degraded": true` — the
 same advisory behavior this replaces, never a hard failure. Full design:
-`planning/decisions/D61-fleet-concurrency-enforcement.md` (in `base-template`).
+`planning/decisions/D61-fleet-concurrency-enforcement.md` and
+`planning/decisions/D66-tiered-heavy-lane-concurrency.md` (in `base-template`).
 
 ## Step 4 — Confirm
 

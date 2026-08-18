@@ -238,19 +238,25 @@ if a flag contradicts the table, stop and report rather than running a chain who
 repo; nothing stops four sessions launching `playwright` and `next build` simultaneously on their
 own. `scripts/fleet_concurrency_check.py` lives in the `base-template` checkout (the fleet's shared
 harness source, typically a sibling directory at the brain root, e.g. `../base-template` — resolve
-its actual path for this machine rather than assuming). Before starting a heavy repo
-(browser/production-build checks — determine this by reading the target repo's own
+its actual path for this machine rather than assuming). Heavy repos are capped **per category, not
+fleet-wide** (D66): browser-automation (Playwright, `next build`, ...) and native-build
+(`cargo build --release`) draw from separate pools, since browser-automation tooling stays
+CPU-expensive for a lane's whole run while a native build is only expensive once per lane, at the
+end/reconcile. Before starting a heavy repo, determine this by reading the target repo's own
 `planning/harness.json`, never from memory:
-`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py is-heavy --repo-path <target-repo>`),
-register it:
-`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <name>`.
-Exit code `3` (or `"allowed": false` in the JSON output) means the fleet is already at capacity
-(`MAX_HEAVY_LANES = 2`) — put this repo on a cheap-gate block instead, or wait. Release the slot
-when the heavy repo's chain finishes: `... release --repo <name>`. A stale entry (a killed lane, or
-one past the TTL) expires automatically on the next registration, so a dead lane never blocks the
-fleet permanently. If the lock store itself is unavailable (no brain root found, unwritable), the
-script reports `"degraded": true, "allowed": true` — same as today's unenforced-prose behavior, not
-a new way to fail. See `planning/decisions/D61-fleet-concurrency-enforcement.md` for the full design.
+`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py is-heavy --repo-path <target-repo>`
+(the JSON `category` field is `"browser-automation"` or `"native-build"`), then register it with
+that category:
+`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <name> --category <category>`.
+Exit code `3` (or `"allowed": false` in the JSON output) means that category's pool is already at
+capacity (`MAX_LANES_BY_CATEGORY`: 2 browser-automation, 4 native-build) — put this repo on a
+cheap-gate block instead, or wait. Release the slot when the heavy repo's chain finishes:
+`... release --repo <name>`. A stale entry (a killed lane, or one past the TTL) expires
+automatically on the next registration, so a dead lane never blocks the fleet permanently. If the
+lock store itself is unavailable (no brain root found, unwritable), the script reports
+`"degraded": true, "allowed": true` — same as today's unenforced-prose behavior, not a new way to
+fail. See `planning/decisions/D61-fleet-concurrency-enforcement.md` and
+`planning/decisions/D66-tiered-heavy-lane-concurrency.md` for the full design.
 
 ### 6. Launch the engine — do not wait idly
 Invoke the workflow **in this session**:

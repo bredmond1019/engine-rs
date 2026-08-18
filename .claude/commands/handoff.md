@@ -60,6 +60,17 @@ table; this restates only what an agent needs inline while appending:
 | `known_issue` | a don't-re-investigate fact |
 | `env` | a transient environmental caveat ("installed binary is stale, rebuild first") |
 | `deferred` | a real follow-on you haven't ticketed yet |
+| `defect` | a real unticketed bug with a fix — not yet filed as its own block |
+
+**reference[] vs. carryover[] — route at write time, not after.** Before appending, ask
+whether the finding is *permanently true* (a gotcha that will still be true next month, a
+deliberate non-fix the team chose not to reverse, a load-bearing measured number someone will
+need again) — those belong in `reference[]`, not `carryover[]`. `carryover[]` is for work-class
+findings that eventually clear: a constraint, an unticketed defect, a deferred follow-on, or a
+transient env caveat. If you're about to write a fact that has no `clears_when` because nothing
+will ever make it stop being true, that is the signal it belongs in `reference[]` instead — see
+`docs/state/reference-container-schema.md` (`HQ.ticket.reference-container-schema-doc`) for the
+`reference[]` field table and its own kind vocabulary once that doc exists.
 
 - `priority` (int, `0..=3`) — value if resolved, on the same rubric as `tracks[].blocks[]`.
   Omit when the entry carries no value judgement.
@@ -81,8 +92,8 @@ table; this restates only what an agent needs inline while appending:
 `finding_id` are what make an entry rankable and cross-repo-correlatable; an entry with none
 of these three still counts, but sits inert until someone triages it by hand.
 
-Append; don't duplicate an existing slug. **Delete** any entry whose `clears_when` resolved
-this session. Skip entirely if this repo has no `planning/state.json`.
+Append; don't duplicate an existing slug. Skip entirely if this repo has no
+`planning/state.json`.
 
 Sequenced work with real dependencies belongs in `tracks[].blocks[]`, and free-floating ideas
 belong in the HQ `backlog[]` — but **do not invoke `/update-state` or `/backlog-ticket` from
@@ -91,7 +102,39 @@ here**. Note them in the handoff prose and let the next session file them proper
 Never hand-edit a block's `tasks` field — it's a derived pointer, not somewhere to inject
 entries.
 
-**2c — File operator work as a graph edge, never as prose.** Anything this session is leaving
+**2c — Delete resolved entries.** This is not a cleanup pass to run "if there's time" — a
+`carryover[]` array that only ever grows is exactly as broken as one that silently loses
+entries, and it's the more common failure because deleting feels riskier than appending. Before
+writing anything in Step 2b, first sweep the entries you just read in Step 1 and delete every
+one whose `clears_when` has actually resolved this session or was already resolved before it
+(carried forward unnoticed by a prior handoff):
+
+- **Typed `clears_when`** — check it for real, don't eyeball it: `block_closed` means the named
+  `{repo, id}` is `status: "closed"` in *that* target's `state.json` (which may not be this
+  repo's — check the right file); `file_exists` means the path is present now; `file_contains`
+  means the pattern is present in the file now; `command_exits_zero` means running the command
+  now exits `0`. An entry only clears when its predicate is verified true at the moment of this
+  handoff — not because it looks old, not because you vaguely recall it was fixed, and not
+  because deleting it would shrink a messy-looking array.
+- **Prose `clears_when`** — resolve it only if this session's own work (or a fact you can point
+  to concretely) makes the condition true. If you're not sure, leave the entry and say so in
+  Step 5's report rather than guessing either way.
+- **`reference[]` entries are never deleted by this step.** They have no `clears_when` because
+  they're permanently true by construction (Step 2b's routing rule); if one looks stale or wrong,
+  that's a correction, not a resolution, and belongs in the handoff prose as an open question,
+  not a silent delete.
+- Deleting an entry that hasn't actually resolved is worse than leaving a stale one: the next
+  agent loses the only record that the constraint, defect, or caveat exists at all.
+
+**Run `mev validate-state planning/state.json` immediately after Step 2b/2c's writes — this is
+a mandatory step, not a suggestion to consider.** Do it before moving on to Step 2d or Step 3.
+Treat a nonzero exit as blocking: read the reported error, fix the entry (wrong field shape,
+`scope` written as a string instead of a struct, `related` as bare slugs instead of the
+schema's objects — the exact mistakes that cascaded to 50 errors across seven `state.json`
+files in a past incident before anyone ran this check), and re-run until it passes. Skip only
+if this repo has no `planning/state.json` (Step 2b already established that).
+
+**2d — File operator work as a graph edge, never as prose.** Anything this session is leaving
 for the operator to decide, review, approve, or judge — a call only they can make, a credential
 only they hold, a thing they must look at — is filed as a `{"type":"operator", slug, exit,
 start, what?}` entry in `depends_on` on the block(s) it gates, **not** written into the handoff
@@ -137,7 +180,7 @@ not "fixed engine".>
 only — the next agent can look them up.>
 
 ## Open questions / choices
-<Name the `operator-`/`approval` slugs already filed in `depends_on` (Step 2c) and what each
+<Name the `operator-`/`approval` slugs already filed in `depends_on` (Step 2d) and what each
 gates — this section points at the graph, it does not substitute for it. If truly nothing
 needs the operator: "None — clear to proceed.">
 

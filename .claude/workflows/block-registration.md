@@ -124,6 +124,29 @@ artifact, or an installed artefact (the distributed binary rather than the sourc
 `{"criterion": "...", "gateable": false, "evidence": "<the fixture that stands in>"}` and give it
 a dedicated fixture-evidence task. A green suite is evidence of gate agreement, not correctness.
 
+**Extraction/port-shaped blocks must declare four gate-capability constraints (D68).** A block
+that moves, copies, or forks existing code or data across a repo/crate/module boundary is
+"extraction/port-shaped." For such a block, the acceptance-criteria set must name all four of the
+following — each keyed on *where the evidence lives* and *what the gate is actually shown capable
+of failing on*, never on how important or risky the move feels:
+
+1. **Moved-asset content diff.** A content diff of moved non-source assets (`include_str!`/
+   `include_bytes!` targets, fixtures, manifests) — not an existence check. A file present at the
+   new path with different bytes must be able to fail the gate.
+2. **Per-file test-count diff.** A per-file test-count diff measured from both trees at gate time,
+   not a single aggregate total — two independently-wrong sub-counts must not be able to cancel
+   into a plausible-looking sum.
+3. **Source-tree-measured-at-gate-time baseline.** The baseline for (2) is always machine-measured
+   from the source repo at gate time, never read from the extraction block's own planning
+   inventory — a baseline copied into planning prose can be wrong before the block starts, and a
+   gate that trusts it will agree with it anyway.
+4. **Gate-shown-capable-of-failing-on-the-deliverable.** The stated validation command must
+   actually compile/run the shipped code path, not merely declare it covered — e.g. a
+   feature-gated or conditionally-compiled deliverable must be enabled by the validation command
+   itself, not merely present in the crate.
+
+See D68 for the EN.9.A/EN.9.B provenance this rule generalizes from.
+
 Write the file with `json.dump(..., indent=2, ensure_ascii=False)` plus a trailing newline.
 
 ---

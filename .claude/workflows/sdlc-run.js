@@ -458,10 +458,13 @@ Return your findings using the StructuredOutput tool.
 }
 
 // Hardcoded, project-agnostic parse-time safety gate (mechanism, not policy — see CLAUDE.md standing
-// rule 1). Independent of harness.json/spec checks: any .claude/workflows/ file among the files
-// touched by this run gets an unconditional `node --check`. No-op (renders '') when none match —
-// never emits a check with no target.
+// rule 1). Independent of harness.json/spec checks: any .js .claude/workflows/ file among the files
+// touched by this run gets an unconditional `node --check`. Scoped to .js files only — `node --check`
+// throws ERR_UNKNOWN_FILE_EXTENSION on non-JS paths (.md/.json) regardless of content, which is a
+// false positive, not a real defect. No-op (renders '') when none match — never emits a check with no
+// target.
 function renderEngineParseChecks(files, startIndex) {
+  files = (files || []).filter(f => f.endsWith('.js'))
   if (!files || !files.length) return ''
   return files.map((f, i) => {
     const n = startIndex + i

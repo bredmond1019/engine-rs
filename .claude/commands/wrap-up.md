@@ -13,10 +13,36 @@ $ARGUMENTS — optional free-text note about what was done (passed straight thro
 ## Instructions
 
 1. **Drain any durable caveat first.** If this session surfaced something the next agent must not
-   lose — a constraint, a known-issue/don't-re-investigate fact, an environmental gotcha, or a
-   not-yet-ticketed deferred follow-on — append it to `planning/state.json` `carryover[]` (field shape
-   in `docs/state/state-schema.md`). `/wrap-up` writes no handoff file, so `carryover[]` is the only
-   place this kind of note survives. Skip if the session produced none or the repo has no `state.json`.
+   lose, append it to `planning/state.json` `carryover[]` (field shape in
+   `docs/state/state-schema.md`) with one of these `kind` values:
+
+   | kind | for |
+   |---|---|
+   | `constraint` | a rule the next agent must honor |
+   | `known_issue` | a don't-re-investigate fact |
+   | `env` | a transient environmental caveat ("installed binary is stale, rebuild first") |
+   | `deferred` | a real follow-on you haven't ticketed yet |
+   | `defect` | a real unticketed bug with a fix — not yet filed as its own block |
+
+   `/wrap-up` writes no handoff file, so `carryover[]` is the only place this kind of note
+   survives. Skip if the session produced none or the repo has no `state.json`.
+
+   **reference[] vs. carryover[] — route at write time, not after.** Before appending, ask
+   whether the finding is *permanently true* (a gotcha that will still be true next month, a
+   deliberate non-fix the team chose not to reverse, a load-bearing measured number someone will
+   need again) — those belong in `reference[]`, not `carryover[]`. `carryover[]` is for
+   work-class findings that eventually clear: a constraint, an unticketed defect, a deferred
+   follow-on, or a transient env caveat. If you're about to write a fact that has no
+   `clears_when` because nothing will ever make it stop being true, that is the signal it
+   belongs in `reference[]` instead — see `docs/state/reference-container-schema.md`
+   (`HQ.ticket.reference-container-schema-doc`) for the `reference[]` field table and its own
+   kind vocabulary once that doc exists.
+
+   **Run `mev validate-state planning/state.json` immediately after this step's write — this is
+   a mandatory step, not a suggestion to consider.** Treat a nonzero exit as blocking: read the
+   reported error, fix the entry, and re-run until it passes. Skip only if the repo has no
+   `planning/state.json`.
+
    **Cross-Repo Constraints Rule:** If a completed block spawns follow-up work in a different repo, **DO NOT** record it as a local `carryover`. You must actively open the downstream repo's `planning/state.json`, inject the new block into its `tracks` and `focus` arrays, and wire it into the `depends_on` DAG immediately.
 
    **File operator work as a graph edge, never as prose.** Anything this session is leaving for

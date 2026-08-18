@@ -63,6 +63,34 @@ adding value here.
    a future session reconciles by hand (the engine-rs `state-json-block-status-stale` incident,
    2026-07-03).
 
+   **If this session surfaced a durable caveat, drain it into `planning/state.json` `carryover[]`
+   while you're in this file**, with one of these `kind` values:
+
+   | kind | for |
+   |---|---|
+   | `constraint` | a rule the next agent must honor |
+   | `known_issue` | a don't-re-investigate fact |
+   | `env` | a transient environmental caveat ("installed binary is stale, rebuild first") |
+   | `deferred` | a real follow-on you haven't ticketed yet |
+   | `defect` | a real unticketed bug with a fix — not yet filed as its own block |
+
+   **reference[] vs. carryover[] — route at write time, not after.** Before appending, ask
+   whether the finding is *permanently true* (a gotcha that will still be true next month, a
+   deliberate non-fix the team chose not to reverse, a load-bearing measured number someone will
+   need again) — those belong in `reference[]`, not `carryover[]`. `carryover[]` is for
+   work-class findings that eventually clear: a constraint, an unticketed defect, a deferred
+   follow-on, or a transient env caveat. If you're about to write a fact that has no
+   `clears_when` because nothing will ever make it stop being true, that is the signal it
+   belongs in `reference[]` instead — see `docs/state/reference-container-schema.md`
+   (`HQ.ticket.reference-container-schema-doc`) for the `reference[]` field table and its own
+   kind vocabulary once that doc exists.
+
+   **Run `mev validate-state planning/state.json` immediately after any write this step makes
+   to `state.json` (the block-status flip and/or a `carryover[]`/`reference[]` entry) — this is
+   a mandatory step, not a suggestion to consider.** Treat a nonzero exit as blocking: read the
+   reported error, fix the entry, and re-run until it passes. Skip only if the repo has no
+   `planning/state.json`.
+
    Then open this repo's `status_file` (`type: ProjectStatus`) and update **surgically** — only the
    parts `emit-state` does not derive:
    - the `timestamp` frontmatter field → current ISO-8601 time;
