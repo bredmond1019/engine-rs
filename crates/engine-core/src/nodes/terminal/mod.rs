@@ -45,7 +45,15 @@
 //! unmatched streak, resets on any successful match. The only thing
 //! standing between a reworded Claude Code UI string and a silently dead
 //! operator surface — see the module doc for the full rationale.
+//!
+//! `admission` (`EN.9.F` task 3) is `AdmissionControl` — a semaphore
+//! bounding how many terminal-node runs may be in flight at once. Runs
+//! beyond the resolved limit queue rather than starting or failing.
+//! Deliberately leaves `ParallelNode` untouched — it bounds terminal-node
+//! fan-out specifically, the precondition for `EN.10.B`'s cross-repo
+//! fan-out.
 
+pub mod admission;
 pub mod await_node;
 pub mod identity;
 pub mod manifest_source;
@@ -56,6 +64,7 @@ pub mod predicate;
 pub mod send;
 pub mod session;
 
+pub use admission::{AdmissionControl, AdmissionPermit, AdmissionPolicy, PartialAdmissionPolicy};
 pub use await_node::{AwaitPolicy, PartialAwaitPolicy, TerminalAwaitNode};
 pub use identity::session_name_for;
 pub use manifest_source::{ManifestOrigin, ManifestSource, ResolvedManifest};
