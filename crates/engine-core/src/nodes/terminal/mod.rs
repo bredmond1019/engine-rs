@@ -15,5 +15,7 @@
 //! `TerminalObserveNode`.
 
 pub mod identity;
+pub mod session;
 
 pub use identity::session_name_for;
+pub use session::TerminalSessionNode;
