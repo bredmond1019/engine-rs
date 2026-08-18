@@ -18,6 +18,43 @@ related: [status, context]
 
 ## [run: 2026-08-18]
 
+### Terminal node holds a tmux session and can open a live Claude Code session mid-workflow closes EN.10.A
+
+Drove `EN.10.A` via `/sdlc-flow` on branch `EN.10.A-flow`, all 5 tasks passed, PASS review.
+`HeldSessionNode` (`crates/engine-core/src/nodes/terminal/held_session.rs`) extends the Phase 9
+scripted terminal nodes to a HELD session: it acquires a tmux session once per run under the
+`EN.9.B` lease and carries it across node boundaries via a process-global registry keyed by
+session name, spawning a background renewal loop with a `lease_ttl_ms`/`renew_interval_ms` policy
+resolved through the standard four-layer precedence and three named profiles (task 1). That
+renewal loop now checks tmux liveness before every renew tick and publishes a distinguishable
+`HeldSessionFailure` (`ExternallyKilled` vs `LeaseLost`) over a `tokio::sync::watch` channel, so a
+re-entrant `process()` call surfaces the loss as a typed `NodeError` instead of hanging or silently
+succeeding (task 2). `LiveClaudeSessionNode` (`crates/engine-core/src/nodes/terminal/live_claude.rs`)
+launches an interactive `claude` CLI session inside the held tmux pane by typing the resolved
+command via `TerminalDriver::send_keys` — deliberately not `claude_code_rs::execute`, which runs
+headless and is never attached to a pty, so it would be invisible to `bastion sessions` — reusing
+`claude_code_rs::Config` for model/continue/resume and reading the target session name from the
+upstream `HeldSessionNode`'s `ctx.nodes` entry via the existing `session_input`/`InputBinding`
+convention (task 3). A real-tmux integration suite (`crates/engine-core/tests/it/held_session.rs`,
+wired into `tests/it/main.rs`) covers session identity across two node boundaries, lease renewal
+over a compressed TTL, orphan reconcile of an abandoned lease via `steal_after`, and error-not-hang
+on external kill — no mocking, per the block's testing strategy (task 4). Task 5 confirmed the full
+gate on the integrated tree: fmt, clippy, nextest --workspace (2455 passed), release build, cargo
+audit, and `cargo tree -i term-attach` confirming `engine-core` stays absent from that dependency
+graph. Docs updated: `docs/architecture.md`, `docs/terminal-crates.md`. This closes `EN.10.A`.
+Next: `EN.10.B` — ORCHESTRATION workflow — sequence SDLC_FLOW runs across repos from a lane chain.
+
+```
+58006b5 docs: update docs for EN.10.A
+7505cd8 feat: implement EN.10.A-task4
+3598be4 feat: implement EN.10.A-task3
+80ea228 feat: implement EN.10.A-task2
+c2c055b feat: implement EN.10.A-task1
+d226bf1 Merge pull request #47 from bredmond1019/EN.9.G-flow
+73fa14e chore: wrap up EN.9.G
+cf34f1b docs: update docs for EN.9.G
+```
+
 ### Operator-hold policy surface + the Blocked-edge bridge receiver close EN.9.G
 
 Drove `EN.9.G` via `/sdlc-flow` on branch `EN.9.G-flow`, all 4 tasks passed, PASS review.
