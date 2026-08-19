@@ -55,7 +55,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | Session | `/prime`, `/session-recap`, `/next`, `/handoff`, `/wrap-up`, `/log-work`, `/archive`, `/capture` |
 | State | `/update-state` — how to safely edit `planning/state.json` per `state-schema.md` |
 | Pre-plan | `/assess`, `/seams`, `/sequence` |
-| Planning | `/generate-roadmap`, `/generate-master-plan`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` |
+| Planning | `/generate-roadmap`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` (`/generate-master-plan` is superseded by `/plan --founding`, D65) |
 | SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block`, `/merge-train` |
 | Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/roadmap-status` |
@@ -101,9 +101,9 @@ predictably-named output file.
 | **0 — Pre-plan** | `/assess <topic>` | Fan out fresh recon agents, then a second fresh set to re-check the load-bearing claims | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` |
 | **0 — Pre-plan** | `/seams <slug>` | Built/half-built/absent, attachment points with one writer per side, blast radius, one spike, the operator's forks | `planning/<slug>/seams.md` |
 | **0 — Pre-plan** | `/sequence <slug>` | Cut into ordered blocks that each ship something usable; owning repo per block | `planning/<slug>/sequence.md` |
-| **1 — Roadmap** | `/generate-master-plan [desc]` | Author the full roadmap as canonical block definitions | `planning/master-plan.md` |
+| **1 — Roadmap** | `/plan --founding` | A new project's founding roadmap — block records, not a hand-written master plan | `planning/founding/plan.md` + `planning/blocks/*.json` |
 | **1 — Plan** | `/generate-tasks <name>` · `/generate-tasks --from <path>` | Write the full task spec from a master-plan block, **or** from a standalone block file (`--from`) | `planning/<name>/tasks.md` |
-| **1 — Plan (ad-hoc)** | `/chore` · `/ticket` · `/plan <desc>` | Plan ad-hoc work from a free-text description (not a master-plan block) | `planning/<prefix>-<slug>/{tasks,plan}.md` |
+| **1 — Plan (ad-hoc)** | `/chore` · `/ticket` · `/plan <desc>` | Plan ad-hoc work from a free-text description (not a roadmap block). `/ticket` reproduces the failure first and orders the test before the fix; `/chore` takes a pre-change gate baseline | `planning/blocks/<BlockID>.json` + `planning/<BlockID>/tasks.json` — or `planning/<slug>/plan.md` for `/plan` |
 | **1 — Plan (opt.)** | `/breakdown <spec>` | Decompose spec into atomic, agent-executable sub-steps | `planning/<name>/breakdown.md` |
 | **2 — Implement** | `/implement <spec> [N]` | Execute every task (or task N) in the spec | `planning/<name>/sdlc/reports/[taskN-]implement.md` |
 | **2 — Hotfix** | `/patch` | Implement → validate → commit for low-risk single-file fixes; skips test/review/document | git history |
@@ -188,6 +188,8 @@ to report to the operator on close. The map:
 | `/generate-roadmap` | fresh; ends | Opus |
 | `/generate-tasks` | fresh, **one per block** | Sonnet (Opus for breaking-surface blocks) |
 | `/breakdown` | with `/generate-tasks` | Sonnet |
+| `/chore` · `/ticket` | one session — authors **and** decomposes; the engine runs fresh | Sonnet; Opus for a subtle `/ticket` |
+| `/capture` | inline in whatever session found the thing — **never a subagent** | whatever is already running |
 | `/begin-orchestration` | fresh, **one per lane**, held open for the chain | Opus |
 | `/sdlc-task` · `/sdlc-flow` · `/sdlc-run` | fresh | per-engine — the engines tier their own internal agents (Sonnet on mechanical stages, Opus escalation on hard retries) |
 
@@ -557,7 +559,7 @@ in a worktree with propagation **deferred** to an operator gate; `[*]` blocks mu
 region is the only status surface and no wave table may be authored beside it; and the **Definition
 of Done must be written as observations with commands, not as blocks closed** — the failure that
 left a previous roadmap 30/53 closed with an undeployed demo and an unverified funnel. Authors only;
-never runs `/orchestrate`. Sits above `/generate-master-plan`, which scopes to one repo.
+never runs `/orchestrate`. Sits above `/plan`, which scopes to one repo.
 
 **Runs only from HQ (the brain root) — single-copy, does not sync downstream.** Step 1A resolves
 `BRAIN_ROOT` and requires it: "a roadmap spanning repos cannot be authored from inside one of them."
@@ -566,12 +568,11 @@ from every sync target, HQ included, so it stays the one copy at `base-template/
 rather than fanning out to all 17 leaf repos where it has no meaning. Decision + rationale recorded
 in `planning/ticket-generate-roadmap-command/review.md`.
 
-### `/generate-master-plan`
-Authors (or revises) `planning/master-plan.md` — the roadmap source of truth — as a sequence of
-canonical **block definitions** (`## Phase N` → `### Block X`, each with What / Why / Build notes /
-Acceptance criteria) whose phase/block headers `/generate-tasks` can parse directly. Turns a
-free-form planning session into the structure the rest of Phase 1 expects. `/new-project` should call
-this as its post-scaffold roadmap step. See `planning/decisions/D34-adhoc-planning-seam.md`.
+### `/generate-master-plan` — superseded (D65)
+**Authors nothing.** `master-plan.md` is now **generated** from the block graph in `state.json`, not
+hand-written, and a project's founding roadmap is authored by `/plan --founding`. The command file
+remains only to redirect. Do not hand-write or hand-edit a `master-plan.md`; if one looks stale, run
+`mev emit-state --write` and let it regenerate.
 
 ### `/generate-tasks`
 Reads **`planning/blocks/<BlockID>.json`** — the authored block record (D65), *not* `master-plan.md`,
@@ -649,10 +650,18 @@ the note goes next — an ASSESS entry means the next step is `/assess`, not a p
 it is mostly unverified; the tags are what keep that legible.
 
 The notes file sections (What & Why · Context & Background · Key Information · Open Questions ·
-Rough Scope) are designed as direct input to the planning commands below — paste conversation
-content in, then promote with `/plan`, `/chore`, or `/generate-master-plan` when ready. When the
-notes are about an existing system and the shape of the work is still unclear, promote through
-Phase 0 instead — `/assess` takes the notes as its framing input.
+Rough Scope · Provenance) are direct input to the commands below. **Where a note goes next is
+decided by its Open Questions, not by its size:**
+
+| Open Questions are mostly | Promote with |
+|---|---|
+| READ or ASK, and the unit of work is clear | `/ticket` or `/chore` |
+| READ or ASK, several blocks in one repo | `/plan` |
+| SPIKE — one assumption is load-bearing and unsettled | Settle the spike first, then promote |
+| ASSESS, or "what does this call that it does not build" came back *unknown* | `/assess <topic>` — the shape of the work is not yet known |
+
+**Session:** inline only, no subagent — a subagent cold-starts with none of the conversation the
+capture exists to preserve. **Model:** whatever the session is already running.
 
 ### Ad-hoc planners — `/chore`, `/ticket`, `/plan`
 
@@ -660,13 +669,18 @@ Entry points into Phase 1 for work that **isn't** a master-plan block. Each take
 description, researches the codebase, and writes a spec into its own `planning/<dir>/` directory.
 Output feeds the rest of the pipeline unchanged.
 
-| Command | Use for | Writes to |
-|---|---|---|
-| `/chore <description>` | Maintenance / housekeeping (no behavior change) | `planning/chore-<slug>/tasks.md` |
-| `/ticket <description>` | Bug fix or targeted enhancement that requires tests + observable AC | `planning/ticket-<slug>/tasks.md` |
-| `/plan <description>` | Any ad-hoc or experimental feature — mini-roadmap format | `planning/plan-<slug>/plan.md` |
+| Command | Use for | Writes to | Escalates to |
+|---|---|---|---|
+| `/chore <description>` | Maintenance / housekeeping — no behavior change | `planning/blocks/<Prefix>.chore.<slug>.json` + `planning/<BlockID>/tasks.json` (+ rendered `tasks.md`) | `/ticket`, if it turns out to change behavior |
+| `/ticket <description>` | Bug fix or targeted enhancement requiring tests + observable AC | `planning/blocks/<Prefix>.ticket.<slug>.json` + `planning/<BlockID>/tasks.json` (+ rendered `tasks.md`) | `/plan` on size · `/assess` when the behavior can't be reproduced or the half-built question can't be answered |
+| `/plan <description>` | Any ad-hoc or experimental feature — several blocks in one repo | `planning/<slug>/plan.md` + `planning/blocks/*.json` | `/generate-roadmap` if it spans repos · `/assess` per its own floor |
 
-Both carry the pre-plan floor at their own scale. **`/ticket`** reproduces the failure before
+`/chore` and `/ticket` are the **one-session** commands: they author the block record *and* its
+task list in the same pass, because a one-off has no downstream block waiting on its code and so
+nothing to defer (D65). `tasks.md` is rendered from the record by `scripts/render_spec.py` — never
+hand-written.
+
+**`/chore` and `/ticket` carry the pre-plan floor at their own scale.** **`/ticket`** reproduces the failure before
 writing a single Acceptance Criterion — a ticket written from a *described* bug fixes the
 description — records the real error text in the block record, and orders the test **before** the
 fix so the gate is shown capable of failing (D68, red-green). **`/chore`** takes a pre-change gate
@@ -676,6 +690,11 @@ nothing. Both ask the half-built question (does this call something that merely 
 and both have an escalation trigger: `/ticket` stops when the behaviour cannot be reproduced or the
 half-built question cannot be answered; `/chore` stops when the work turns out to change behaviour,
 which makes it a ticket.
+
+**Session:** both author *and* decompose in one session — that is the point of the lean lane, and
+the work is small enough that the record-stands-alone property is cheap to satisfy directly. The
+engine then runs fresh. **Model:** Opus for `/ticket` when the failure is subtle; Sonnet otherwise
+and for most chores.
 
 `/chore` and `/ticket` write a runnable `tasks.md` **directly** and route to lean `/sdlc-task`
 (the fast path). `/plan` writes a `plan.md` in the **master-plan format** (phases/blocks/Quick
