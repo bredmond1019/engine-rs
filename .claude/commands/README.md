@@ -129,6 +129,15 @@ SESSION START
 BLOCK SETUP
   /start-block <spec>      → status.md
 
+UI FOUNDATIONS             ← only when the work has a visual surface. Beside the pipeline.
+  new UI, nothing to read  → /define-design-system  → design-system.md + tokens/theme/components
+                                                      (proved by building one real screen)
+                                     ↓ emits
+  existing UI              → /define-polish-standard → polish-standard.md
+                                                      (calibrated: 2 agents, 1 screenshot, agree)
+  A new page in an existing app needs neither — it inherits both.
+        ↓ polish-standard.md is read by /assess's polish scout, or a UI /ticket's AC
+
 PHASE 0 — PRE-PLAN         ← existing system, cut not obvious. Skip for a known block.
                            ← "|" = fresh session required.  "·" = same session continues.
   /assess <topic>          → planning/<slug>/assessment.md + verification.md + evidence/
@@ -209,7 +218,7 @@ most rule-dense command in the harness, is correctly Sonnet: it reads one block 
 that record names. Escalate it only when the block carries breaking public-surface changes or
 several un-gateable criteria.
 
-Full rationale: `docs/how-to-plan-with-agents.md` §8 in the brain repo.
+Full rationale: `docs/how-to-plan-with-agents.md` §11 in the brain repo.
 
 ### Argument Convention
 
@@ -464,7 +473,8 @@ artifact that the next reads; `/sequence`'s output is the only input `/plan` or 
 needs. Skip all three when you already know the block — go straight to `/ticket`, `/chore`, or
 `/generate-tasks`.
 
-The method behind them is `docs/how-to-plan-with-agents.md` in the brain repo. Its §1 states the
+The method behind them is `docs/how-to-plan-with-agents.md` in the brain repo — §1 for the arc,
+§8 for judging work a test suite cannot check, §11 for sessions and models. Its §1 states the
 whole arc as **six phases named by the question each answers** — assess, seams, sequence, author,
 decompose, evaluate — independent of these commands, which are one implementation of it. The rule
 that makes the phases work is that **each is forbidden from doing the next one's job**: an
