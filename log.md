@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-18T18:05:00Z"
+timestamp: "2026-08-19T14:09:24Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,14 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ---
+
+## [run: 2026-08-19]
+
+### Orphan-reconciled runs 404 on GET /events/{id} — LiveStateStore seed fix in `orphan.rs`
+
+- **What:** Fixed `crates/engine-serve/src/orphan.rs`: `reconcile_orphans` now takes a `&LiveStateStore` and calls `live.mark_terminal(row.id, &row.task_context, row.workflow_type, row.created_at, row.updated_at)` for each row it reconciles, right after `persist_reconciled`. `get_event` (`http.rs`) serves reads only from `LiveStateStore` — no Postgres fallback, by design, since CI has no `DATABASE_URL` — so a run the boot sweep reconciles in Postgres was previously never seeded into the calling process's in-memory store and 404'd forever (idempotency means a later sweep never re-lists it, so there was no second chance). Routing the reconciled row through the existing `mark_terminal` hook also means a boot-reconciled crash now fires the same terminal-run failure notification a live failure would. Updated all 7 existing `orphan.rs` test call sites to pass a `LiveStateStore::new()`, and added a regression assertion (`reconciles_every_candidate_and_names_the_stuck_node`) that `live.get_record(id)` returns a terminal record post-sweep. Full workspace suite: 2239 passed. Left a prompt for a follow-up `bastion` agent — its boot-sweep call site (`src/serve/mod.rs` ~line 516) and 4 tests need the same `&live_store` argument threaded through; `live_store` is already hoisted in scope there, so it's a one-line production fix plus test updates, not new plumbing.
+- **Why:** Reported directly against the Mac Mini production `engine-serve` — confirmed 2026-08-18 by killing `engine-serve` mid-run, letting launchd restart it, and observing the boot orphan sweep correctly mark the run terminal in Postgres while `GET /events/{id}` still 404'd. Breaks any HTTP poller checking terminal status post-crash-recovery, including `scripts/health_check.sh --full`'s workflow-trigger check and `bastion-ui`'s run-status screen.
+- **Refs:** `crates/engine-serve/src/orphan.rs`, `crates/engine-serve/src/live_state.rs`, `crates/engine-serve/src/http.rs::get_event`
 
 ## [run: 2026-08-18]
 

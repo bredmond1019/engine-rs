@@ -223,8 +223,20 @@ fn stuck_node_name(ctx: &engine_contract::TaskContext) -> Option<String> {
 /// Idempotent: a candidate this call reconciles now carries a `completion`
 /// marker, so a second sweep's `list_orphan_candidates` call — live or
 /// stubbed — no longer returns it.
+///
+/// **Seeds `live`'s completed-run ring for every reconciled row** (via
+/// [`LiveStateStore::mark_terminal`]) before returning. Without this, a run
+/// this sweep reconciles in Postgres is correctly terminal in the database
+/// but was never in *this* process's `LiveStateStore` (it crashed under the
+/// previous process), so `GET /events/{event_id}` — which serves reads only
+/// from `LiveStateStore`, by design, since CI has no `DATABASE_URL` — would
+/// 404 it forever: idempotency means a later sweep never re-lists an
+/// already-reconciled row, so there is no second chance to seed it. Routing
+/// through `mark_terminal` also means a boot-reconciled failure fires the
+/// same terminal-run notification hook a live failure would.
 pub async fn reconcile_orphans(
     lister: &dyn OrphanLister,
+    live: &LiveStateStore,
     policy: &OrphanPolicy,
     now: DateTime<Utc>,
 ) -> Result<ReconcileSummary, String> {
@@ -263,6 +275,14 @@ pub async fn reconcile_orphans(
             .persist_reconciled(&row)
             .await
             .map_err(|err| format!("orphan sweep: failed to persist run {}: {err}", row.id))?;
+
+        live.mark_terminal(
+            row.id,
+            &row.task_context,
+            row.workflow_type.clone(),
+            row.created_at,
+            row.updated_at,
+        );
 
         println!("orphan sweep: reconciled run {} ({reason})", row.id);
         reconciled.push(row.id);
@@ -456,8 +476,9 @@ mod tests {
             Utc::now() - chrono::Duration::hours(2),
             ctx,
         )]);
+        let live = LiveStateStore::new();
 
-        let summary = reconcile_orphans(&lister, &OrphanPolicy::default(), old_cutoff())
+        let summary = reconcile_orphans(&lister, &live, &OrphanPolicy::default(), old_cutoff())
             .await
             .expect("sweep should succeed");
 
@@ -476,6 +497,12 @@ mod tests {
             .contains("SendEmailNode"));
         assert_eq!(row.task_context.metadata["completion"]["terminal"], true);
         assert_eq!(row.task_context.metadata["completion"]["status"], "failed");
+
+        // Regression: a run this sweep reconciles must be readable via the
+        // completed ring immediately — no second sweep, no 404.
+        let record = live.get_record(id).expect("reconciled run must be seeded into LiveStateStore");
+        assert!(record.terminal);
+        assert_eq!(record.snapshot.metadata["completion"]["status"], "failed");
     }
 
     #[tokio::test]
@@ -487,8 +514,9 @@ mod tests {
             orphan_row(id_a, old, task_context_with_running_node("NodeA")),
             orphan_row(id_b, old, task_context_with_running_node("NodeB")),
         ]);
+        let live = LiveStateStore::new();
 
-        let summary = reconcile_orphans(&lister, &OrphanPolicy::default(), old_cutoff())
+        let summary = reconcile_orphans(&lister, &live, &OrphanPolicy::default(), old_cutoff())
             .await
             .expect("sweep should succeed");
 
@@ -507,13 +535,14 @@ mod tests {
             old,
             task_context_with_running_node("NodeA"),
         )]);
+        let live = LiveStateStore::new();
 
-        let first = reconcile_orphans(&lister, &OrphanPolicy::default(), old_cutoff())
+        let first = reconcile_orphans(&lister, &live, &OrphanPolicy::default(), old_cutoff())
             .await
             .expect("first sweep should succeed");
         assert_eq!(first.scanned, 1);
 
-        let second = reconcile_orphans(&lister, &OrphanPolicy::default(), old_cutoff())
+        let second = reconcile_orphans(&lister, &live, &OrphanPolicy::default(), old_cutoff())
             .await
             .expect("second sweep should succeed");
         assert_eq!(second.scanned, 0);
@@ -533,8 +562,9 @@ mod tests {
             reconcile_on_boot: false,
             ..OrphanPolicy::default()
         };
+        let live = LiveStateStore::new();
 
-        let summary = reconcile_orphans(&lister, &policy, old_cutoff())
+        let summary = reconcile_orphans(&lister, &live, &policy, old_cutoff())
             .await
             .expect("no-op sweep should still return Ok");
 
@@ -547,8 +577,9 @@ mod tests {
     #[tokio::test]
     async fn surfaces_a_lister_error_rather_than_swallowing_it() {
         let lister = RecordingOrphanLister::failing_list("connection refused");
+        let live = LiveStateStore::new();
 
-        let err = reconcile_orphans(&lister, &OrphanPolicy::default(), old_cutoff())
+        let err = reconcile_orphans(&lister, &live, &OrphanPolicy::default(), old_cutoff())
             .await
             .expect_err("a lister error must propagate");
 
@@ -566,8 +597,9 @@ mod tests {
             node_runs: HashMap::new(),
         };
         let lister = RecordingOrphanLister::new(vec![orphan_row(id, old, ctx)]);
+        let live = LiveStateStore::new();
 
-        reconcile_orphans(&lister, &OrphanPolicy::default(), old_cutoff())
+        reconcile_orphans(&lister, &live, &OrphanPolicy::default(), old_cutoff())
             .await
             .expect("sweep should succeed");
 
