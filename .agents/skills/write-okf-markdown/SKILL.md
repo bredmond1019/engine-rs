@@ -1,7 +1,13 @@
 ---
 name: write-okf-markdown
-description: How to create or edit a markdown file in this brain without red-gating the fleet — whether the file needs OKF frontmatter at all, the four traps that break YAML parsing, the index.md row Standing Rule 7 requires, and the cross-repo `related:` prefix. Use BEFORE writing any new `.md` file anywhere in agentic-portfolio or a sub-repo, before adding frontmatter to an existing one, and when `bastion validate-brain` reports E_STRUCT_ORPHAN_FILE, E_GRAPH_DANGLING_RELATED, W_GRAPH_ISOLATED_NODE, or "mapping values are not allowed in this context".
-allowed-tools: Bash(bastion:*) Bash(mev:*) Bash(python3:*) Bash(grep:*) Bash(ls:*) Bash(test:*)
+description: >
+  How to create or edit a markdown file in this brain without red-gating the fleet — whether
+  the file needs OKF frontmatter at all, the four traps that break YAML parsing, the index.md
+  row Standing Rule 7 requires, and the cross-repo `related:` prefix. Use BEFORE writing any
+  new `.md` file anywhere in agentic-portfolio or a sub-repo, before adding frontmatter to an
+  existing one, and when `bastion validate-brain` reports E_STRUCT_ORPHAN_FILE,
+  E_GRAPH_DANGLING_RELATED, W_GRAPH_ISOLATED_NODE, or "mapping values are not allowed in this
+  context".
 ---
 
 # Writing markdown in this brain
