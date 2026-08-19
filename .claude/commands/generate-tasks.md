@@ -25,6 +25,21 @@ $ARGUMENTS — one of two input modes:
 
 ## Instructions
 
+> **The three checks that can fail this command.** They live in full in steps 6 and 8 below; they
+> are hoisted here because they are the reason a spec is rejected, and they are easy to skim past
+> in a long procedure.
+>
+> 1. **Compilable task boundaries** — under `/sdlc-flow` and `/sdlc-task` every task must leave the
+>    gating suite passing, so a breaking public-surface change may never be split across tasks.
+>    This outranks disjoint file ownership: **the tasks merge, not the constraint.**
+> 2. **Un-gateable acceptance criteria must be declared (D64)** — any criterion whose evidence
+>    lives in another process, another repo, a generated artifact, or an **installed** artefact
+>    needs a named failing command or a dedicated fixture-evidence task. A green suite is never
+>    itself the evidence.
+> 3. **Never fabricate a load-bearing fact** — which files a task owns, an observable criterion, a
+>    real dependency edge. Ask in an interactive session; abort with a specific message in a
+>    preflight context.
+
 1. Run `/prime` to orient to the repo (standing rules, architecture).
 
 2. **Resolve the input mode and the spec slug.**
@@ -102,6 +117,22 @@ $ARGUMENTS — one of two input modes:
      fix the block. This is the proactive complement to the D19 thin-spec abort: D19 catches a thin
      spec after the fact; this prevents writing a confidently-wrong one in the first place.
 
+5a. **Read the actual source the block names — before writing any task.** This is not optional and
+   it is the difference between a spec an engine can execute and one that names things that do not
+   exist. For each file in the record's `files[]`:
+   - **Modified files:** open them. Get the real function names, signatures, struct fields and
+     surrounding conventions. A task that says "update `parse_config`" when the function is called
+     `load_config` costs a full implement→test→fix cycle to discover.
+   - **New files:** read an existing sibling of the same kind, so the task describes the project's
+     established pattern rather than a generic one.
+   - **If a file named as modified does not exist**, the record is wrong. Stop and say which file,
+     rather than emitting a task against a path that is not there. If a file named as new already
+     exists, say so — the block may be re-treading work that landed.
+   - Read only what the named files and their immediate siblings require. Do not load the codebase.
+
+   Line numbers move between authoring and execution: name **symbols**, not line numbers, in every
+   task you write.
+
 6. THINK HARD about correct scope:
    - Do not invent work beyond what the block defines.
    - Size tasks to roughly 21 hours spread across Mon/Wed/Fri sessions.
@@ -119,7 +150,7 @@ $ARGUMENTS — one of two input modes:
      one touches — do **not** split it across tasks to satisfy disjoint ownership below. Put the whole
      change in **one** task instead. **This constraint outranks the disjoint-file-ownership rule
      whenever the two conflict: the tasks merge, not the constraint.** Since this command decomposes
-     before the consuming engine is chosen (the recommendation is step 11, after decomposition), apply
+     before the consuming engine is chosen (the recommendation is step 10, after decomposition), apply
      this constraint by default unless the block is already known to run under `/sdlc-block` (e.g. it
      is one block of a multi-block roadmap being decomposed by `/sdlc-block` itself) — in that case the
      disjoint-ownership rule below governs instead.
@@ -223,16 +254,7 @@ $ARGUMENTS — one of two input modes:
      code/prose (e.g. `Vec<T>`, "the `<concept>` folder") or a bare `TODO`/`TBD` inside authored
      content as a sentinel.
 
-9. **Commit the spec.** Leave the working tree clean so a downstream `/sdlc-block` run never trips
-   its clean-tree merge guard (an uncommitted `tasks.md`/`tasks.json` blocks every merge):
-   ```bash
-   git add planning/<spec-slug>/
-   git commit -m "chore: add spec for <spec-slug>"
-   ```
-   (Use the slug resolved in step 2 — the master-plan directory slug, or in `--from` mode the source
-   file's parent directory. The `git add` stages the source block file too, which is fine.)
-
-10. **Decomposition assessment.** Before reporting, evaluate each task you just wrote against the
+9. **Decomposition assessment.** Before reporting, evaluate each task you just wrote against the
    coarseness heuristic and recommend which (if any) warrant a `/breakdown` first. The real predictor
    is SEPARABLE STRUCTURE, not raw file count. A task is a breakdown candidate when ANY hold: it bundles
    multiple separable concerns ("implement X AND refactor Y AND add Z"), OR it spans multiple layers
@@ -245,7 +267,7 @@ $ARGUMENTS — one of two input modes:
    (the SDLC engines apply the same heuristic at run time per `breakdown.mode`, so this is the
    authoring-time preview of that decision).
 
-11. **Pipeline recommendation.** After writing the tasks, recommend the run command that fits this
+10. **Pipeline recommendation.** After writing the tasks, recommend the run command that fits this
    spec, with a one-line reason. The harness is a ladder of escalating ceremony — match the spec to
    the lowest rung that fits. This command decomposes **one** block, so the recommendation is normally
    one of the single-spec engines; `/sdlc-block` is named only to redirect when the block belongs to a
@@ -279,11 +301,39 @@ $ARGUMENTS — one of two input modes:
      task N). Say which task number and why isolation matters.
 
    Recommend exactly one primary command (optionally plus `/sdlc-task <N>` when a single task warrants
-   isolation). If `breakdown.mode` is `auto` and any tasks were flagged in step 10, note that breakdown
+   isolation). If `breakdown.mode` is `auto` and any tasks were flagged in step 9, note that breakdown
    must run first and the recommendation applies to each resulting sub-spec, not this spec directly.
 
-12. Report the path written and suggest the next step:
-    "Spec written and committed to planning/<spec-slug>/tasks.md. Run `/breakdown planning/<spec-slug>/tasks.md` to decompose into atomic sub-steps."
+11. **Commit the spec — after the self-check, the assessment and the recommendation, not before.**
+    Steps 8–10 can each require revising the spec in place, so committing earlier means committing
+    a draft and amending it. Leave the working tree clean so a downstream `/sdlc-block` run never
+    trips its clean-tree merge guard (an uncommitted `tasks.md`/`tasks.json` blocks every merge):
+    ```bash
+    git add planning/<spec-slug>/
+    git commit -m "chore: add spec for <spec-slug>"
+    ```
+    (Use the slug resolved in step 2 — the master-plan directory slug, or in `--from` mode the
+    source file's parent directory. The `git add` stages the source block file too, which is fine.)
+
+12. **Report — and name the command step 10 actually chose.** Do not hardcode a next step; the
+    pipeline recommendation is the answer, and `/breakdown` is only the next step when step 9
+    flagged a task for it.
+
+    ```
+    planning/<spec-slug>/tasks.json    <N> tasks
+    planning/<spec-slug>/tasks.md      <rendered from block record | authored (legacy)>
+
+    Source files read: <count> (<any that were named but missing>)
+    Un-gateable criteria declared: <n, or none>
+    Operator/approval edges on this block: <list, or none — these stall the run>
+    Breakdown candidates: <task numbers + one-line reason, or none>
+
+    Run:  <the single recommended engine command>   — <one-line reason>
+    <optionally: plus /sdlc-task <N> in isolation — <why>>
+    <if any breakdown candidates and breakdown.mode is auto:
+     First: /breakdown planning/<spec-slug>/tasks.md — the recommendation applies to each
+     resulting sub-spec, not this spec directly.>
+    ```
 
 ## Context / Files to Read
 
