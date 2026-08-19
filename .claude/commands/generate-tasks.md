@@ -335,6 +335,35 @@ $ARGUMENTS — one of two input modes:
      resulting sub-spec, not this spec directly.>
     ```
 
+## Session boundary
+
+**`/breakdown` runs in this session** if you flagged a task for it — it reads the same spec and the
+same source, and it now writes executable corrections back to `tasks.json`, which wants one writer.
+
+**The engine runs fresh.** `/sdlc-task` and `/sdlc-flow` spawn their own agent stack and are a
+different kind of work; carrying an authoring context into them buys nothing and costs room.
+
+**One block per session.** Do not decompose the next block here, even when it looks obvious. The
+next block's tasks depend on this block's code, which does not exist yet.
+
+Close by telling the operator:
+
+```
+Spec written: planning/<spec-slug>/tasks.json (+ rendered tasks.md)
+
+<If a task was flagged for breakdown:>
+  Running /breakdown in this session first.
+
+Start a FRESH session and run:
+  <the recommended engine command>       — <one-line reason>
+
+Then come back for the next block in a new session:
+  /generate-tasks <next block ID>
+
+<If the block carries an operator or approval edge:>
+  This block cannot run to completion until <edge> clears. It will stall.
+```
+
 ## Context / Files to Read
 
 - `planning/master-plan.md` (target block section only) — **or**, in `--from <path>` mode, the

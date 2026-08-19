@@ -168,6 +168,29 @@ PHASE 6 — WRAP-UP
   /log-work [notes]        → status.md, log.md
 ```
 
+### Session boundaries and models
+
+Every command in the planning chain ends with a **Session boundary** section telling the agent what
+to report to the operator on close. The map:
+
+| Command | Session | Model |
+|---|---|---|
+| `/assess` | own; ends | Opus main · Sonnet scouts + verifiers |
+| `/seams` | continues into `/sequence` | Opus · Opus red team |
+| `/sequence` | own; **ends hard** | Opus · Opus red team |
+| `/plan` | fresh; ends | Opus |
+| `/generate-roadmap` | fresh; ends | Opus |
+| `/generate-tasks` | fresh, **one per block** | Sonnet (Opus for breaking-surface blocks) |
+| `/breakdown` | with `/generate-tasks` | Sonnet |
+| `/begin-orchestration` | fresh, **one per lane**, held open for the chain | Opus |
+
+**Fresh** where the next step must be able to disagree with this one, or must prove an artifact
+stands alone. **Continuous** where the work is one sustained act of judgement. The `/sequence` →
+`/plan` \| `/generate-roadmap` break is the load-bearing one: a fresh session reading only
+`sequence.md` *is* the handoff test, performed rather than imagined.
+
+Full rationale: `docs/how-to-plan-with-agents.md` §8 in the brain repo.
+
 ### Argument Convention
 
 Every step from Phase 2 onward takes the same form: `planning/<name>/tasks.md [N]`

@@ -97,6 +97,38 @@ It produces **no blocks, no waves, no estimates.** Those are `/sequence`.
 
 10. Commit with an explicit pathspec. Report and point at `/sequence <slug>`.
 
+## Session boundary — usually continue
+
+**`/sequence` may run in this session, and normally should.** It is the same act of judgement
+continued — where the work attaches, therefore in what order — and it needs the seam map held in
+context, not re-read cold. Its adversarial pass uses fresh subagents, which is where the
+independence has to live anyway.
+
+Two conditions send it to a fresh session instead:
+
+- **The forks are not answered yet.** If the operator will take more than a working session to
+  decide, stop here. A `/sequence` run that opens with stale assumptions about unresolved forks is
+  worse than one that starts cold.
+- **This session is already long.** Spikes, red-team returns and a full seam map add up. If the
+  next command would be starved of room to read source, hand off.
+
+Close by telling the operator:
+
+```
+Seam map complete: planning/<slug>/seams.md
+
+<N> forks need your answer before sequencing — they change the cut, so none can be
+deferred into planning:
+  1. <fork> — recommend <option>, because <reason>
+  ...
+
+Once answered, run in THIS session:
+  /sequence <slug>
+
+If you would rather answer these later, I will /handoff now and a fresh Opus
+session can pick up /sequence from seams.md.
+```
+
 ## Output Format
 
 ~~~md

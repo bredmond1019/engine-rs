@@ -137,6 +137,37 @@ This stage does not author block records or register `state.json`. That is `/pla
 11. Commit with an explicit pathspec. Report the cut and the next command:
     `/plan` for one repo, `/generate-roadmap` for several.
 
+## Session boundary — end here, always
+
+**This command ends its session. The next command runs fresh. This is the strongest boundary in the
+chain and it is not optional.**
+
+`sequence.md` exists to be executable by an agent that was not in the room. If the session that
+authored the cut also authors the plan or the roadmap, it fills every gap from memory — the reason
+behind a wave order, why one repo owns a block, what a `ships` line really meant — and the document
+ships with those holes intact. Nobody finds them until an implementer hits one. Running `/plan` or
+`/generate-roadmap` fresh **is** the handoff test, performed for real instead of imagined, and it
+costs nothing but a new session.
+
+Close with `/handoff` and tell the operator:
+
+```
+Sequence complete: planning/<slug>/sequence.md
+<n> waves · <m> blocks (<r> registered, <c> candidates) · <e> operator errands
+
+Start a FRESH session — Opus — and run ONE of:
+  /plan "<initiative>"                                       — one repo
+  /generate-roadmap <slug> --from planning/<slug>/sequence.md — several repos
+
+<Say which, and why: repo count and block count.>
+
+Fresh is required, not preferred. A fresh session reading only sequence.md is the
+handoff test actually being run. If it has to ask you something, that is a hole in
+this document — send the question back here rather than answering it inline.
+
+Handoff written to planning/handoff.md.
+```
+
 ## Output Format
 
 ~~~md

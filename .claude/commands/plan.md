@@ -196,6 +196,36 @@ re-derived anyway (D65).
 
 11. Report the paths and the first runnable block.
 
+## Session boundary — end here
+
+**This command ends its session. `/generate-tasks` runs fresh, one session per block.**
+
+The reason is structural, not hygienic. `/generate-tasks` reads **only** the target block's record —
+not this narrative, not sibling blocks — because that is what makes a block record self-sufficient
+and what lets a block be decomposed months later. Run in this session, it would lean on plan context
+the record does not carry, and the record's incompleteness would never surface. The property the
+self-check asserts is only actually tested by a fresh session.
+
+Per block, not all at once: a later block's tasks depend on an earlier block's code, and
+decomposing everything now burns tokens on work that gets re-derived (D65).
+
+Close with `/handoff` and tell the operator:
+
+```
+Plan authored: planning/<slug>/plan.md — <N> phases, <M> blocks in planning/blocks/
+Handoff test on <first block ID>: PASS | FAIL — <what was missing>
+
+Start a FRESH session per block — Sonnet is right for most; use Opus when the block
+has breaking public-surface changes or several un-gateable criteria — and run:
+  /generate-tasks <first runnable block ID>
+
+Fresh matters: /generate-tasks reads only the block record. If it cannot decompose
+the block from that record alone, the record is thin and should come back here —
+do not repair it from memory in the decomposition session.
+
+Handoff written to planning/handoff.md.
+```
+
 ## Codebase Structure
 
 - `CLAUDE.md` — standing rules, stack, build/test/validate commands (start here)

@@ -138,6 +138,23 @@ Good sub-step:
 Bad sub-step (too vague to execute without interpretation):
 > - Add tests for the content loader
 
+## Session boundary
+
+Runs in `/generate-tasks`'s session, or its own if the spec already existed. **The engine runs
+fresh** either way.
+
+Close by telling the operator which engine command to run in a new session, and — if you edited
+`tasks.json` — say so explicitly and in one line each. That edit changes what the engine executes,
+and it is the one part of this command's output that will actually run.
+
+```
+Breakdown written: planning/<block-dir>/breakdown.md
+tasks.json: <no changes | the edits, one line each>
+
+Start a FRESH session and run:
+  /sdlc-task <spec-slug>   |   /sdlc-flow <spec-slug>   — <reason>
+```
+
 ## Context / Files to Read
 
 - `$ARGUMENTS` (the spec file, or the current block's spec)

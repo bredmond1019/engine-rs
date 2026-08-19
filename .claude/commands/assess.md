@@ -137,6 +137,34 @@ or an estimate. Those are `/seams` and `/sequence`.
 12. Report the paths, the three spot-checks, the open questions, and the next command
     (`/seams <slug>`).
 
+## Session boundary — end here
+
+**This command ends its session.** Do not run `/seams` in it.
+
+The reason is not context size, though that also applies. `/seams` has to be able to **disagree with
+this assessment** — to look at something you classified as built and find it has no production call
+site. An agent re-reading its own words defends them; "built" was your word. This is the same
+principle as handing verifiers claims instead of conclusions, applied one level up.
+
+Close with `/handoff` and tell the operator, in these words or close to them:
+
+```
+Assessment complete: planning/<slug>/assessment.md (+ verification.md, evidence/)
+
+Start a FRESH session — Opus — and run:
+  /seams <slug>
+
+Fresh matters here: /seams must be free to refute this document's classifications,
+and an agent that wrote them will defend them.
+
+Handoff written to planning/handoff.md. The next session needs nothing else —
+if it has to ask you a question this document should have answered, that is a
+defect in the assessment, not in the question.
+```
+
+If any load-bearing question came back unanswerable and you recommended a spike instead of more
+reading, say so here too — that spike belongs to `/seams`, not to a second assessment round.
+
 ## Output Format
 
 ~~~md
