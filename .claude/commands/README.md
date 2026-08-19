@@ -126,20 +126,26 @@ BLOCK SETUP
   /start-block <spec>      → status.md
 
 PHASE 0 — PRE-PLAN         ← existing system, cut not obvious. Skip for a known block.
+                           ← "|" = fresh session required.  "·" = same session continues.
   /assess <topic>          → planning/<slug>/assessment.md + verification.md + evidence/
+      | fresh — /seams must be free to refute those classifications
   /seams <slug>            → planning/<slug>/seams.md      (+ the operator answers its forks)
+      · same session
   /sequence <slug>         → planning/<slug>/sequence.md
+      | fresh — a fresh reader of sequence.md IS the handoff test
         ↓
   one repo   → /plan             → planning/<slug>/plan.md + planning/blocks/*.json
   many repos → /generate-roadmap --from planning/<slug>/sequence.md
                                  → planning/roadmaps/<slug>/{roadmap.md,lane-*.txt,lane-log.jsonl}
+      | fresh, ONE PER LANE, held open for that lane's whole chain
                                  → /begin-orchestration --roadmap ... --lane ... → /orchestrate
 
-PHASE 1 — PLAN
+PHASE 1 — PLAN             ← fresh session, ONE PER BLOCK
   /generate-tasks <spec>                 → planning/<spec>/tasks.json (+ rendered tasks.md)
-        ↓  (optional — only if a task is genuinely coarse)
+        ↓  (optional — only if a task is genuinely coarse; same session)
   /breakdown planning/<spec>/tasks.md   → planning/<spec>/breakdown.md
                                            (+ any executable correction written back to tasks.json)
+      | fresh — the engine runs in its own session
 
 PHASE 2 — IMPLEMENT
   /implement planning/<spec>/tasks.md [N]
@@ -183,11 +189,17 @@ to report to the operator on close. The map:
 | `/generate-tasks` | fresh, **one per block** | Sonnet (Opus for breaking-surface blocks) |
 | `/breakdown` | with `/generate-tasks` | Sonnet |
 | `/begin-orchestration` | fresh, **one per lane**, held open for the chain | Opus |
+| `/sdlc-task` · `/sdlc-flow` · `/sdlc-run` | fresh | per-engine — the engines tier their own internal agents (Sonnet on mechanical stages, Opus escalation on hard retries) |
 
 **Fresh** where the next step must be able to disagree with this one, or must prove an artifact
 stands alone. **Continuous** where the work is one sustained act of judgement. The `/sequence` →
 `/plan` \| `/generate-roadmap` break is the load-bearing one: a fresh session reading only
 `sequence.md` *is* the handoff test, performed rather than imagined.
+
+Model tier tracks **breadth held at once**, not importance — which is why `/generate-tasks`, the
+most rule-dense command in the harness, is correctly Sonnet: it reads one block record and the files
+that record names. Escalate it only when the block carries breaking public-surface changes or
+several un-gateable criteria.
 
 Full rationale: `docs/how-to-plan-with-agents.md` §8 in the brain repo.
 
@@ -476,6 +488,9 @@ refuted is corrected **in `assessment.md` itself**, not only noted in `verificat
 
 It produces evidence only. It may not propose a sequence, a wave, a block, or an estimate.
 
+**Session:** own session, ends with `/handoff`. **Model:** Opus main, Sonnet scouts and verifiers.
+`/seams` must run fresh so it is free to refute this document's classifications.
+
 ### `/seams`
 The stage most often skipped and the one whose absence most reliably produces a plan that is
 coherent on paper and unbuildable in practice. Classifies every capability the work depends on as
@@ -487,6 +502,10 @@ classification decides whether each is a wiring block or a rewrite. Then: the se
 (migrations · flags · observability · error paths · auth · perf · concurrency · **install/deploy
 boundary** · rollback), and 2–4 forks stated as options plus a recommendation.
 
+**Session:** normally continues into `/sequence` — one sustained act of judgement, and the red team
+is fresh subagents anyway. Split only if the forks will take days to answer or the session is
+already long. **Model:** Opus, Opus red team.
+
 ### `/sequence`
 Cuts by **deliverable, not by layer**. Every block is tested against *"what can the operator do the
 day this merges that they could not do the day before?"* — a block whose answer is "nothing yet" is
@@ -495,6 +514,10 @@ add capability; deletions come before the extensions that would inherit them. Op
 (a credential, a machine visit, a decision) are first-class blocks, not prose asides. Fork answers
 are recorded with dates before the cut, because an unresolved fork gets decided silently by
 whichever agent hits it first.
+
+**Session:** ends hard — `/plan` and `/generate-roadmap` always run fresh. This is the load-bearing
+break in the chain: a fresh session reading only `sequence.md` *is* the handoff test, performed
+rather than imagined. **Model:** Opus, Opus red team.
 
 ---
 
@@ -511,6 +534,11 @@ Any departure from the authored cut must be stated with a reason, and the operat
 may not be silently re-decided. What this command still owns: lane assignment, the heavy budget,
 isolation, Wave 0 mechanics and both crosswalks — `/sequence` decides *what* and *in what order*,
 this decides *who runs it concurrently without colliding*.
+
+**Session:** fresh (reading only `sequence.md`), and it ends without running anything. Each lane is
+then **one fresh Opus session per repo, held open for that lane's whole chain** — the lane agent is
+the single writer for its repo and carries block 1's lessons into block 7. Never two lanes in one
+session. **Model:** Opus throughout.
 
 Authors the two things `/begin-orchestration` consumes: a **roadmap document** and one
 `lane-<name>.txt` chain file per lane, written to `planning/roadmaps/<slug>/` and registered as an
@@ -567,6 +595,11 @@ when a task was flagged for it.
 of a block record — for ad-hoc / experimental features kept out of the roadmap. Slug comes from the
 file's parent directory.
 
+**Session:** fresh, **one per block** — never decompose the next block in the same session, because
+its tasks depend on this block's code, which does not exist yet (D65). **Model:** Sonnet; Opus when
+the block carries breaking public-surface changes or several un-gateable criteria. The engine then
+runs fresh again.
+
 ### `/breakdown`
 Reads a task spec and the source files each step touches, then writes a granular
 `breakdown.md` — every sub-step atomic (one file, one change, one command). Both `/implement`
@@ -585,6 +618,9 @@ It also **verifies every symbol it names actually exists** before committing (an
 either explicitly marked as created by the sub-step, or a mistake), and applies a **coarseness
 floor** — the same heuristic `/generate-tasks` uses at authoring time — so an already-atomic spec is
 reported as such instead of being restated at greater length.
+
+**Session:** runs inside `/generate-tasks`' session (same spec, same source, and it writes back to
+`tasks.json` — one writer). **Model:** Sonnet. The engine runs fresh.
 
 ### Pre-planning capture — `/capture`
 
@@ -634,6 +670,10 @@ is shown capable of *failing*, and a **handoff test** on the first runnable bloc
 agent start from that record alone, without asking a question?). A fresh-agent adversarial pass then
 attacks the sequencing, because step 9 is self-review by the context that wrote the plan. `--no-redteam`
 skips it for small, low-risk initiatives.
+
+**Session:** fresh, and it ends. `/generate-tasks` reads **only** the target block's record — running
+it in the planning session would let it lean on narrative context the record does not carry, and the
+record's incompleteness would never surface. **Model:** Opus.
 
 ---
 
