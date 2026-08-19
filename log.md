@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-19T14:09:24Z"
+timestamp: "2026-08-19T20:54:53Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -17,6 +17,37 @@ related: [status, context]
 ---
 
 ## [run: 2026-08-19]
+
+### OTel telemetry on the pane-launch command — closes `EN.ticket.otel-pane-telemetry`
+
+- **What:** Cleared the ticket's external OTLP-collector-spike dependency by running it locally
+  (Docker `otel/opentelemetry-collector-contrib`, this machine, not the Mini) — confirmed
+  `claude_code.cost.usage` exports over OTLP when `CLAUDE_CODE_ENABLE_TELEMETRY=1` +
+  `OTEL_METRICS_EXPORTER=otlp` are set on the `claude` launch, with `OTEL_RESOURCE_ATTRIBUTES`
+  (`run_id`, `node.identity`) attached to the metric's resource. Authored the ticket spec
+  (`planning/EN.ticket.otel-pane-telemetry/tasks.json`), correcting a stale fact along the way —
+  the pane-launch command actually lives in `EN.10.A`'s `LiveClaudeSessionNode`
+  (`crates/engine-core/src/nodes/terminal/live_claude.rs`), not `EN.9.D`'s `TerminalSessionNode`
+  (which only creates/leases the tmux session and never types a command into it). Ran `/sdlc-task`;
+  hit and fixed one spec bug of my own mid-run (a breaking `build_command_line` signature change
+  split across two tasks left the repo non-compiling between them — merged into one compilable
+  unit) and one over-broad grep check (matched the tests' own negative assertions). Final
+  implementation: `build_command_line` now prepends `CLAUDE_CODE_ENABLE_TELEMETRY=1
+  OTEL_METRICS_EXPORTER=otlp OTEL_RESOURCE_ATTRIBUTES='run_id=...,node.identity=...'` ahead of the
+  resolved `claude` binary/argv, value-only shell-quoted. Full validation suite passed (fmt,
+  clippy `-D warnings`, `cargo nextest run --workspace`, release build). Corrected
+  `docs/terminal-nodes.md`'s `LiveClaudeSessionNode` row (wrongly claimed the launch goes through
+  `claude_code_rs::execute`) during `/close-out`'s doc-patch step. Filed carryover
+  `h2-dos-advisory-unfixable-without-actix-web-major-upgrade` for a pre-existing `cargo audit`
+  gate failure (RUSTSEC-2026-0258, transitively via `actix-web`, no fix short of a major upgrade)
+  found while running close-out's validation suite, and fixed an unrelated pre-existing `cargo fmt`
+  violation in `crates/engine-serve/src/orphan.rs`.
+- **Why:** N7 — `/usage` scraping was rejected (not deferred) as a cost-correlation source: its
+  totals reset on `/clear`, `/cost` doesn't exist, and a pane render has no stability contract.
+  OTel resource attributes give free run/session correlation since the design already controls the
+  launch command.
+- **Refs:** `crates/engine-core/src/nodes/terminal/live_claude.rs`,
+  `planning/blocks/EN.ticket.otel-pane-telemetry.json`, `docs/terminal-nodes.md`
 
 ### Orphan-reconciled runs 404 on GET /events/{id} — LiveStateStore seed fix in `orphan.rs`
 
