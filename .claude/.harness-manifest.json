@@ -1,5 +1,5 @@
 {
-  "version": "9188ddd7bcb67450f63fb647b46e87a47bd963c1",
+  "version": "0e8766ca8531bb75bd61abef27f62e7788484a17",
   "generated": "2026-08-19",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
@@ -28,12 +28,12 @@
     ".claude/commands/next.md": "3ad5b77bb22f9edf43821a2aa98c876e11ddd159740f6e8c2bf6933cd13765f4",
     ".claude/commands/sync-global-skills.md": "c20a7c572bbafd6ee602bbb41562c84d7c4a3d6b92ce1a5ba774b5e0a3d1fd80",
     ".claude/commands/generate-master-plan.md": "28c96669f9601840d94f9d4943e0b0837cbee46f82cad57592f0c25a1240b0e7",
-    ".claude/commands/define-design-system.md": "36fcc19edb7616a1ce5daac07c5a9490befc18d7f2b97f2565d6c19486500c2e",
+    ".claude/commands/define-design-system.md": "454dcd92f47cd93fc843112b90baec6f8aee954ecef2eec1bd018769b2068550",
     ".claude/commands/update-docs.md": "516bb201ada974a1c5b84bc0dd57e63011737bf3adefab9454b4806453596f8d",
     ".claude/commands/generate-tasks.md": "d88eb4193a87e84c10ac6fc2619db436546b4e137fb85a2163f9a28e1f30d04e",
     ".claude/commands/merge-train.md": "8125dc3377aa05bfc7544eff5f7007c00516830da5b6fa549c1d8e6cefb931bf",
     ".claude/commands/breakdown.md": "0db99768b017d445ec9a63aabd5964efae3fe2ff0d63afe22a9e908b005c4678",
-    ".claude/commands/README.md": "4c7aa9bbc9e60c1b8baf433d044781330e1bc15767ffd23393ebe66e922d30a0",
+    ".claude/commands/README.md": "8687b469ea6d201917805970dc6b84d2e62a1dc4bbaae7d168f5a4433a29361c",
     ".claude/commands/clean-worktree.md": "723317864d96815887aa443040fbf67069704caebd113433d8582f28e47b546f",
     ".claude/commands/blocked.md": "4ccdc2a885ac57ff31296f1b5d9ef6e48c4d02332059b968115ff52a03d6d843",
     ".claude/commands/initial-research.md": "51ab634d7bb00cfbc04fea58840a1b61b2173611b85f5867a0f90af1afbe37d3",

@@ -540,11 +540,20 @@ artifacts the first screen is built from — design tokens as real files, a Tail
 config, a justified component inventory, the icon set — plus the rules that keep screen twenty
 consistent with screen one.
 
-Two things keep it honest. It **checks what the practice already settled before choosing a stack**
-(Next + React 19 + Tailwind 4 + `lucide-react` + `clsx`/`tailwind-merge`, hand-rolled components —
-neither `learn-ai` nor `bastion-web` carries a `components.json`, so shadcn-vs-hand-rolled is a real
-decision it surfaces rather than takes silently). And **tokens come before components**, because a
-component that hardcodes a colour cannot be retuned.
+Two things keep it honest. It **starts from the practice's settled stack** — Next 16 + React 19 +
+Tailwind 4 with CSS variables + **shadcn/ui** (`style: base-nova`, `baseColor: neutral`) + `lucide`,
+as built in `business/bastiel` and `client/jardins-fitness`, with the reference `components.json`
+inlined so a new project starts identical. Hand-rolling is the departure and needs a reason.
+
+Note *how* that precedent is chosen, because it generalises: **a pattern found in a codebase tells
+you what happened, not what was intended.** `learn-ai` and `bastion-web` are the largest frontends
+and are explicitly *not* the reference — one predates the practice's design-system discipline, the
+other deferred the decision and retrofitted a system later. The command says to ask the operator
+which projects are exemplary rather than infer a house standard from a majority, because inferring
+propagates an old mistake with a survey as its evidence.
+
+And **tokens come before components**, because a component that hardcodes a colour cannot be
+retuned.
 
 **The gate is building one real screen with it** — not a swatch page or a component gallery. Reaching
 for a value that is not in the scale means the scale is wrong; needing a component that is not in the

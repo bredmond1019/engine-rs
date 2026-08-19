@@ -42,28 +42,59 @@ standard so later work can be reviewed.
    different stack for no reason costs every future context the ability to move between projects.
    Read the sibling repos' `package.json` / `pubspec.yaml` and record what is actually in use.
 
-   The current de-facto web stack across the fleet, verified 2026-08-19 — cite it, and depart only
-   with a stated reason:
+   > **Survey what exists, but ask which examples are deliberate.** A pattern found in a codebase
+   > tells you what happened, not what was intended — some of it is a decision and some is residue
+   > from before the decision was made. **Ask the operator which projects are exemplary** rather
+   > than inferring a house standard from a majority. Getting this backwards propagates an old
+   > mistake into every new project, with the survey as its evidence.
+   >
+   > The web table below is the corrected version: `learn-ai` and `bastion-web` are *not* the
+   > precedent, despite being the largest. `learn-ai` predates the practice's design-system
+   > discipline, and `bastion-web` was built fast with the decision deferred and a basic system
+   > retrofitted later. The newer frontends are the reference.
 
-   | Piece | In use | Where |
+   The practice's web standard, verified 2026-08-19 in `business/bastiel` and
+   `client/jardins-fitness` — the two most recent frontends, and the two built the way the operator
+   intends. Adopt this; depart only with a stated reason:
+
+   | Piece | Standard | Notes |
    |---|---|---|
-   | Framework | Next 15–16, React 19 | `learn-ai`, `bastion-web` |
-   | Styling | Tailwind 4 | both |
-   | Class merging | `clsx` + `tailwind-merge` | both |
-   | Variants | `class-variance-authority` | `bastion-web` only |
-   | Icons | `lucide-react` | both |
-   | Component source | **hand-rolled — neither repo has a `components.json`** | both |
+   | Framework | Next 16, React 19 | RSC on |
+   | Styling | Tailwind 4, CSS variables | `cssVariables: true` — semantic tokens, not literals |
+   | Components | **shadcn/ui** — `components.json` present | `style: base-nova`, `baseColor: neutral` |
+   | Icons | `lucide` via `lucide-react` | one set, one size scale |
+   | Variants | `class-variance-authority` | |
+   | Class merging | `clsx` + `tailwind-merge` | |
+   | Aliases | `@/components`, `@/components/ui`, `@/lib`, `@/lib/utils`, `@/hooks` | identical in both |
 
-   That last row is the decision worth taking deliberately rather than inheriting: **shadcn/ui or
-   hand-rolled?** shadcn gives accessible primitives you own outright and can edit, at the cost of a
-   CLI and a registry convention the fleet does not currently use. Hand-rolled matches the fleet but
-   re-solves focus management, dismissal and ARIA on every interactive component. Put the trade and
-   your recommendation to the operator; do not decide it silently. `--house` adopts the table as-is
-   and skips the question.
+   The reference `components.json`, byte-shared between both projects:
 
-   For **mobile** the equivalent question is Flutter `ThemeData` + Material 3 (which `bastion-ui`
-   uses) versus React Native and a styling layer. For **TUI** it is the widget library's theme
-   primitives. Read the actual repo before asserting either.
+   ```json
+   {
+     "$schema": "https://ui.shadcn.com/schema.json",
+     "style": "base-nova", "rsc": true, "tsx": true,
+     "tailwind": { "config": "", "css": "<app>/globals.css",
+                   "baseColor": "neutral", "cssVariables": true, "prefix": "" },
+     "iconLibrary": "lucide", "rtl": false,
+     "aliases": { "components": "@/components", "utils": "@/lib/utils",
+                  "ui": "@/components/ui", "lib": "@/lib", "hooks": "@/hooks" }
+   }
+   ```
+
+   **Start every greenfield web project with `npx shadcn@latest init` against that config.** It is
+   settled — do not re-open it per project. Hand-rolling is now the *departure* and needs a reason:
+   it re-solves focus management, dismissal and ARIA on every interactive component, which is
+   exactly the cost `bastion-web` paid and had to go back and fix. `--house` adopts this without
+   asking.
+
+   Note what shadcn does **not** give you: it installs primitives, not a design system. The tokens
+   in step 4 and the inventory in step 5 are still yours to decide — and `bastiel` and
+   `jardins-fitness` each ship only one or two `ui/` components today, which is the correct starting
+   size, not an oversight.
+
+   For **mobile** the equivalent is Flutter `ThemeData` + Material 3, which `bastion-ui` uses. For
+   **TUI** it is the widget library's theme primitives. Read the actual repo before asserting
+   either — and apply the same residue-vs-decision question to what you find there.
 
 3. **Ask what this product is, before choosing tokens.** Four questions whose answers change the
    system materially — if `$ARGUMENTS` does not settle them, ask:
@@ -144,7 +175,10 @@ standard so later work can be reviewed.
    - The state containers exist: empty, error, loading, offline.
    - Both themes are defined, or one is chosen with a stated reason.
    - **The proof screen was actually built**, and what it changed is recorded.
-   - The stack matches the fleet table or departs with a stated reason.
+   - The stack matches the standard in step 2, or departs with a stated reason. For web that means
+     `components.json` exists and matches the reference config.
+   - Any precedent cited from another repo was confirmed with the operator as deliberate, not
+     inferred from a survey.
    - Frontmatter `related:` carries ≥1 real `doc_id`; a target outside this file's scope is
      qualified `<scope>:<doc_id>`.
 
