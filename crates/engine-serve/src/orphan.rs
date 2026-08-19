@@ -500,7 +500,9 @@ mod tests {
 
         // Regression: a run this sweep reconciles must be readable via the
         // completed ring immediately — no second sweep, no 404.
-        let record = live.get_record(id).expect("reconciled run must be seeded into LiveStateStore");
+        let record = live
+            .get_record(id)
+            .expect("reconciled run must be seeded into LiveStateStore");
         assert!(record.terminal);
         assert_eq!(record.snapshot.metadata["completion"]["status"], "failed");
     }
