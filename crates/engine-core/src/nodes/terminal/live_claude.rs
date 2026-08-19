@@ -61,6 +61,7 @@ use serde_json::Value;
 use term_core::driver::TerminalDriver;
 
 use crate::node::{InputBinding, Node, NodeError};
+use crate::workflow::read_run_id;
 use crate::workflows::{get_result, put_result};
 
 use super::held_session;
@@ -125,11 +126,34 @@ fn interactive_argv(config: &Config) -> Vec<String> {
     args
 }
 
-/// Build the full command line — resolved binary name plus the
-/// interactive argv, each part shell-quoted — that gets typed into the
-/// held tmux pane.
-fn build_command_line(config: &Config) -> String {
-    let mut parts = vec![shell_quote(&resolve_binary_name())];
+/// Build a single `VAR=value` shell assignment token, quoting only the
+/// value — never the `VAR=` prefix. Quoting the whole assignment (e.g.
+/// `shell_quote("VAR=value")`) would wrongly quote the `=` operator itself,
+/// turning the token into a literal positional argument instead of an env
+/// assignment the pane's shell applies to the command that follows.
+fn env_assignment(var: &str, value: &str) -> String {
+    format!("{var}={}", shell_quote(value))
+}
+
+/// Build the full command line — the OTel telemetry env assignments,
+/// resolved binary name, and interactive argv, each part shell-quoted —
+/// that gets typed into the held tmux pane.
+///
+/// `run_id` + `node_identity` are stamped into `OTEL_RESOURCE_ATTRIBUTES`
+/// so cost telemetry emitted by the launched `claude` process (observed at
+/// the Mini's OTLP collector) correlates back to the run/node without
+/// scraping `/usage` (N7). This never reads or writes any `usage`/
+/// `cost_usd` value itself — it only sets env vars on the launch line.
+fn build_command_line(config: &Config, run_id: &str, node_identity: &str) -> String {
+    let mut parts = vec![
+        env_assignment("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
+        env_assignment("OTEL_METRICS_EXPORTER", "otlp"),
+        env_assignment(
+            "OTEL_RESOURCE_ATTRIBUTES",
+            &format!("run_id={run_id},node.identity={node_identity}"),
+        ),
+        shell_quote(&resolve_binary_name()),
+    ];
     for arg in interactive_argv(config) {
         parts.push(shell_quote(&arg));
     }
@@ -211,7 +235,14 @@ impl HasSessionInput for LiveClaudeSessionNode {
 impl Node for LiveClaudeSessionNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let session_name = self.read_upstream_session(&ctx)?;
-        let command = build_command_line(&self.config);
+        let run_id = read_run_id(&ctx.metadata).ok_or_else(|| {
+            NodeError::new(format!(
+                "{NODE_NAME}: no run_id stamped on ctx.metadata — cannot derive OTel resource \
+                 attributes"
+            ))
+        })?;
+        let node_identity = self.session_input.resolve(held_session::NODE_NAME);
+        let command = build_command_line(&self.config, &run_id, node_identity);
 
         // `send_keys` (literal, then Enter — `TerminalDriver`'s own default
         // composition) is the exact primitive a human operator's keystrokes
@@ -256,7 +287,7 @@ mod tests {
         let mut ctx = TaskContext {
             event: serde_json::json!({}),
             nodes: Default::default(),
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({ "run_id": "eng-run-1" }),
             node_runs: Default::default(),
         };
         ctx.nodes.insert(
@@ -286,7 +317,11 @@ mod tests {
     #[test]
     fn build_command_line_is_bare_binary_with_no_config() {
         std::env::remove_var("CLAUDE_BINARY");
-        assert_eq!(build_command_line(&Config::default()), "claude");
+        assert_eq!(
+            build_command_line(&Config::default(), "eng-run-1", "HeldSessionNode"),
+            "CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=otlp \
+             OTEL_RESOURCE_ATTRIBUTES='run_id=eng-run-1,node.identity=HeldSessionNode' claude"
+        );
     }
 
     #[test]
@@ -299,8 +334,10 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            build_command_line(&config),
-            "claude --model claude-sonnet-4-5 --continue --resume session-123"
+            build_command_line(&config, "eng-run-1", "HeldSessionNode"),
+            "CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=otlp \
+             OTEL_RESOURCE_ATTRIBUTES='run_id=eng-run-1,node.identity=HeldSessionNode' \
+             claude --model claude-sonnet-4-5 --continue --resume session-123"
         );
     }
 
@@ -313,7 +350,7 @@ mod tests {
             dangerously_skip_permissions: true,
             ..Config::default()
         };
-        let line = build_command_line(&config);
+        let line = build_command_line(&config, "eng-run-1", "HeldSessionNode");
         assert!(
             !line.contains("-p "),
             "interactive launch must not carry -p: {line}"
@@ -353,7 +390,11 @@ mod tests {
         let stamped = ctx.nodes.get(NODE_NAME).expect("result stamped");
         assert_eq!(stamped["session_name"], "eng-run-1_HeldSessionNode");
         assert_eq!(stamped["launched"], true);
-        assert_eq!(stamped["command"], "claude");
+        assert_eq!(
+            stamped["command"],
+            "CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=otlp \
+             OTEL_RESOURCE_ATTRIBUTES='run_id=eng-run-1,node.identity=HeldSessionNode' claude"
+        );
 
         // Held session identity is unchanged by the launch — this node
         // only reads it, never re-derives or overwrites it.
@@ -364,8 +405,10 @@ mod tests {
 
         let calls = driver.calls();
         assert!(
-            calls.iter().any(|argv| argv.iter().any(|a| a == "claude")),
-            "expected a send-keys call carrying the literal `claude` command, got {calls:?}"
+            calls
+                .iter()
+                .any(|argv| argv.iter().any(|a| a.ends_with("claude"))),
+            "expected a send-keys call carrying the resolved `claude` command, got {calls:?}"
         );
     }
 
@@ -423,10 +466,11 @@ mod tests {
         assert!(err.to_string().contains("session_name"));
     }
 
-    // --- Task 1 (EN.ticket.otel-pane-telemetry): failing-first tests for
-    // the OTel env-var prefix. `build_command_line` does not yet accept a
-    // run_id/node_identity, so these are expected NOT to compile until
-    // task 2 changes its signature and adds the prefix.
+    // --- Task 1 (EN.ticket.otel-pane-telemetry): OTel env-var prefix on the
+    // pane-launch command. These were written first against the old 2-arg
+    // `build_command_line` signature and failed to compile (E0061 — "this
+    // function takes 1 argument but 3 arguments were supplied") as the D68
+    // red evidence before `build_command_line`/`process` were updated.
 
     #[test]
     fn build_command_line_prepends_otel_env_vars_ahead_of_the_resolved_binary() {
@@ -450,7 +494,9 @@ mod tests {
         // pane's shell treat it as a literal string argument instead of an
         // env-var assignment, breaking the launch.
         assert!(
-            line.contains("OTEL_RESOURCE_ATTRIBUTES='run_id=eng-run-1,node.identity=HeldSessionNode'"),
+            line.contains(
+                "OTEL_RESOURCE_ATTRIBUTES='run_id=eng-run-1,node.identity=HeldSessionNode'"
+            ),
             "expected value-only quoting on OTEL_RESOURCE_ATTRIBUTES, got: {line}"
         );
         assert!(
