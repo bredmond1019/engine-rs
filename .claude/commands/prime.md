@@ -55,8 +55,8 @@
      stale project(s) and whether an emit was offered + the user's answer) / `mev` not found /
      standalone repo (no `brain.toml`). Place this near the Carryover section.
    - **Carryover** — if `planning/state.json` has any `carryover[]` entries, list the active ones
-     (those whose `clears_when` is unresolved): slug, `kind` (constraint / known_issue / env /
-     deferred), and a one-line gist. These are durable caveats/follow-ons the session must respect.
+     (those whose `clears_when` is unresolved): slug, `kind` (defect / deferred / drift / env —
+     `constraint`/`known_issue` are retired but still present on legacy entries), and a one-line gist. These are durable caveats/follow-ons the session must respect.
      Omit if there are none or the file is absent.
    - **Warm memory** — one line. Under budget: the distilled facts bearing on the current focus.
      Over budget: `N words across M topics — headings only`, plus the topics nearest the focus, and

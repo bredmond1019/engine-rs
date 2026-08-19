@@ -361,6 +361,10 @@ given), then applies the isolation policy — `base-template` is always `--workt
 edits the engines running it), the brain root is always `--no-worktree` (corpus gates cannot pass in
 a worktree) — before handing off. `--roadmap` is **required and never inferred**. Also enforces the
 heavy-gate concurrency cap, operator gates, and the same notes-file and decision-recording rules.
+At lane close it routes every still-`OPEN` lingering item to one of **three** homes rather than
+sweeping them all into `carryover[]`: operator-only work becomes an `operator` edge on the block it
+gates, permanently-true facts go to `reference[]`, and the rest becomes a `carryover[]` entry. This
+is the fleet's highest-volume misfiling point — a closing lane promotes four to six items at once.
 
 ### `/begin-session <session-slug> [--roadmap <path>] [--dry-run]`
 Drives one **operator session** — the unit for work an agent cannot do alone: a decision, a
@@ -402,12 +406,13 @@ finding correlation) — this answers what a roadmap's lanes are doing right now
 ## Session Orientation
 
 ### `/wrap-up [note]`
-Clean session close without a handoff. Drains any durable caveat into `carryover[]` first (full
-twelve-field shape — `slug`, `scope`, `kind`, `text`, `related?`, `clears_when?`, `priority?`,
-`blocks?`, `finding_id?`, `created`, `reviewed?`, `snoozed_until?`; only entries with a typed
-`clears_when` predicate are machine-evaluable by `mev carryover`), files any operator work as a
-graph edge rather than prose, then runs `/log-work` (syncs status.md + appends log entry) and
-`/commit`. Use this when you're done with a piece of work and don't need to hand off to a fresh
+Clean session close without a handoff. Routes anything durable to one of **three** homes before
+writing anything — operator-only work to an `operator` edge, permanently-true facts to
+`reference[]`, and only what is left to `carryover[]` (full twelve-field shape — `slug`, `scope`,
+`kind`, `text`, `related?`, `clears_when?`, `priority?`, `blocks?`, `finding_id?`, `created`,
+`reviewed?`, `snoozed_until?`; `kind` is one of `defect` / `deferred` / `drift` / `env` per HQ D72,
+and only entries with a typed `clears_when` predicate are machine-evaluable by `mev carryover`).
+Then runs `/log-work` (syncs status.md + appends log entry) and `/commit`. Use this when you're done with a piece of work and don't need to hand off to a fresh
 agent.
 
 ### `/handoff [note]`
@@ -419,8 +424,10 @@ remaining, first command for the next agent), then invokes `/log-work` and `/com
 `blocks[]`, `finding_id`, and the four typed `clears_when` predicates
 (`block_closed` / `file_exists` / `file_contains` / `command_exits_zero`) are what make an entry
 rankable, cross-repo-correlatable, and machine-evaluable by `mev carryover`; a prose `clears_when`
-lands it in the not-evaluable lane instead. **Anything left for the operator to decide, review,
-approve, or judge is filed as an `operator` (or `approval`) edge in `depends_on`, never written
+lands it in the not-evaluable lane instead. `kind` is one of `defect` / `deferred` / `drift` / `env`
+(HQ D72 — `constraint` and `known_issue` are retired). **Step 2b routes to three destinations, not
+two: anything left for the operator to decide, review, approve, or judge is filed as an `operator`
+(or `approval`) edge in `depends_on` — never as a `carryover[]` entry, and never written
 into the handoff's `## Open questions / choices` section as prose** — that section now names the
 slugs already filed, it does not hold decisions itself.
 

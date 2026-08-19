@@ -354,10 +354,25 @@ At the end of every lane, alongside the report and `review.md`:
 - **For any lingering item this repo owns, write its next step into `handoff.md`**, ordered by a
   mix of priority (per D43) and quick-wins, so a fresh session can pick it up without replaying
   this lane's context.
-- **A lingering item that is still `OPEN` when the lane closes promotes to `state.json`
-  `carryover[]` (D57 section 4) — it never moves into a successor run record.** Each
+- **A lingering item that is still `OPEN` when the lane closes promotes to a durable home — and
+  `carryover[]` is only one of three.** It never moves into a successor run record: each
   `(repo, roadmap)` pair has exactly one record, addressed rather than rotated (Step 1E, rule 5),
-  so there is no successor file to move it into.
+  so there is no successor file to move it into. Route each item at promotion time:
+  1. **Only a human can do it** — a decision, a credential, a judgement call, a thing the operator
+     must look at → an `{"type":"operator", slug, exit, start, what?}` edge on the block it gates,
+     **not** a carryover entry. This is the highest-volume misfiling point in the fleet: a lane
+     closing promotes four to six items at once, and a carryover entry gates nothing, so operator
+     work parked there is never forced while an operator edge blocks the work behind it. Measured
+     2026-08-19 — **30 of the fleet's 202 `carryover[]` entries are operator work misfiled this
+     way.** Entry form: `docs/state/state-schema.md`.
+  2. **Permanently true** — a gotcha still true next month, a deliberate non-fix, a load-bearing
+     measured number → `reference[]`. The signal is having no `clears_when` because nothing will
+     ever make it stop being true.
+  3. **Everything else** → `carryover[]` (D57 section 4), `kind` one of `defect` / `deferred` /
+     `drift` / `env` (HQ D72; `constraint` and `known_issue` are retired). Prefer a typed
+     `clears_when` — but never author one that is **already satisfied**, which retires the entry on
+     its first sweep while the finding is still live. When no honest predicate exists, write prose
+     and say why.
 - **Close the lane with a terminal `/close-out`.**
 
 ## Files
