@@ -59,8 +59,30 @@ This stage does not author block records or register `state.json`. That is `/pla
      whole cut. Rank them accordingly.
    - Deletions go **before** the extensions that would otherwise inherit them.
 
+   **Write each wave's exit as an observation with a command, never as a set of closed blocks.**
+   A block closes when its spec is satisfied, which is not the same as the capability working —
+   a previous roadmap in this fleet closed 30 of 53 blocks and still shipped a demo nobody had
+   loaded in a browser. These lines become the roadmap's Definition of Done verbatim, so they must
+   be checkable by running something:
+
+   ```
+   OK   `mev lane-frontier --repo engine-rs` lists EN.9.B as ready
+   OK   `curl -s localhost:8080/api/runs/<id> | jq .status` returns "aborted" within 5s
+   BAD  EN.9.A and EN.9.B closed
+   BAD  the engine can stop
+   ```
+
 5. **Size each block.** A block is one coherent, independently reviewable unit that
    `/generate-tasks` can turn into roughly one spec. Record for each:
+   - **a stable row ref** — `SQ-01`, `SQ-02`, … assigned once and never renumbered. Downstream,
+     `/generate-roadmap`'s coverage crosswalk greps these to prove no row fell out during lane
+     assignment; without a ref that check degrades to grepping distinctive prose.
+   - **registration state** — `registered` if the block already exists in its repo's `state.json`
+     (give the real ID), or `candidate` if it does not. **`/orchestrate` resolves block IDs from
+     `state.json`, and a lane file naming an ID that is not in the graph does not degrade
+     gracefully — the lane stops, or improvises a spec.** Every `candidate` becomes a Wave 0
+     registration item in the roadmap, so getting this column wrong is what stalls a run on day one.
+     Check it, per repo, with `rg -L '"id": "<ID>"' <repo>/planning/state.json` — never from memory.
    - **owning repo** — and whether it is code, a config/docs change, or an **operator errand**
      (a human action: a credential, a machine visit, a decision). Errands are first-class; they
      block chains and they are invisible if unlisted.
@@ -71,6 +93,13 @@ This stage does not author block records or register `state.json`. That is `/pla
    - **the gate that proves it** — and per base-template D68, how that gate is shown capable of
      failing
    - **the risk that would sink it**
+
+   And once per **repo**, not per block: whether that repo's gates are **heavy** and in which
+   category. Determine it mechanically, never by memory:
+   `python3 <base-template>/scripts/fleet_concurrency_check.py is-heavy --repo-path <repo>`
+   (exit 0 = heavy; the JSON `category` is `browser-automation` or `native-build`). Lane assignment
+   downstream is capped per category, so a repo mislabelled light is a run that gets refused at
+   registration or thrashes the machine.
 
 6. **Split by repo and name the contract.** For every cross-repo edge, say which repo authors the
    contract and which re-pins it, and whether a data-contract or workspace-contract version bump is
@@ -99,6 +128,10 @@ This stage does not author block records or register `state.json`. That is `/pla
     - Operator errands are listed as blocks, not as prose asides.
     - The cut list is non-empty.
     - Absolute numbers carried from the assessment are re-derived or marked stale.
+    - Every block carries a stable `SQ-nn` ref and a registration state checked against the repo's
+      real `state.json`, and every `candidate` appears in the Wave 0 table.
+    - Every repo has a gate weight determined by running `is-heavy`, not asserted.
+    - Every wave exit is a command with an expected output, not a list of closed blocks.
     - Frontmatter `related:` carries ≥1 real `doc_id`.
 
 11. Commit with an explicit pathspec. Report the cut and the next command:
@@ -136,10 +169,14 @@ what is last, which orderings are forced by dependency rather than preference.>
 
 ### Wave <N> — <what becomes true> · <k> blocks · <repos>
 
-| # | Block | Repo | Ships (what the operator can do the day it lands) | depends_on | Files | Gate | Risk |
-|---|---|---|---|---|---|---|---|
+| Ref | Block | Repo | Reg | Ships (what the operator can do the day it lands) | depends_on | Files | Gate | Risk |
+|---|---|---|---|---|---|---|---|---|
+| SQ-01 | <name> | <repo> | `registered: EN.9.A` \| `candidate` | <what becomes possible> | <edges> | <paths> | <check + how it is shown failing> | <what sinks it> |
 
-*Wave exit: <the observable condition that says this wave is done.>*
+*Wave exit (an observation with a command — becomes the roadmap's Definition of Done verbatim):*
+```
+OK  <command> → <expected output>
+```
 
 ## Cross-repo contracts
 
@@ -164,6 +201,23 @@ what is last, which orderings are forced by dependency rather than preference.>
 ## Handoff test
 <Result of running the first block's row past the "could a fresh agent start?" test.>
 
+## Repos and gate weight
+
+| Repo | Blocks | Gate weight | Isolation | What it owns |
+|---|---|---|---|---|
+| <repo> | <n> | light \| browser-automation \| native-build | `--worktree` \| `--no-worktree` | <one line> |
+
+*Gate weight from `fleet_concurrency_check.py is-heavy`, not from memory. Isolation is policy for
+`base-template` (always `--worktree`) and the brain root (always `--no-worktree`).*
+
+## Wave 0 — what must be registered before any lane launches
+
+| Ref | Block | Repo | Why it is not yet in `state.json` |
+|---|---|---|---|
+
+*Every `candidate` row above appears here. `/orchestrate` resolves IDs from `state.json`; a lane
+naming an unregistered ID stops or improvises.*
+
 ## Totals
 
 | Repo | Blocks | What it owns |
@@ -175,12 +229,13 @@ what is last, which orderings are forced by dependency rather than preference.>
 ```
 planning/<slug>/sequence.md
 
-Waves: <n>   Blocks: <m>   Operator errands: <e>
+Waves: <n>   Blocks: <m>  (<r> registered, <c> candidates -> Wave 0)   Operator errands: <e>
+Repos: <list with gate weight>
 Forks resolved: <k>
 Blocks re-cut for failing the ships-alone test: <list>
 Red team: <x> landed, <y> rejected
 Handoff test on block 1: PASS | FAIL — <what was missing>
 
-Next:  /plan "<the initiative>"        (one repo)
-       /generate-roadmap <slug>        (several repos)
+Next:  /plan "<the initiative>"                    (one repo)
+       /generate-roadmap <slug> --from planning/<slug>/sequence.md   (several repos)
 ```

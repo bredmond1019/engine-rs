@@ -128,7 +128,12 @@ BLOCK SETUP
 PHASE 0 — PRE-PLAN         ← existing system, cut not obvious. Skip for a known block.
   /assess <topic>          → planning/<slug>/assessment.md + verification.md + evidence/
   /seams <slug>            → planning/<slug>/seams.md      (+ the operator answers its forks)
-  /sequence <slug>         → planning/<slug>/sequence.md   → read by /plan or /generate-roadmap
+  /sequence <slug>         → planning/<slug>/sequence.md
+        ↓
+  one repo   → /plan             → planning/<slug>/plan.md + planning/blocks/*.json
+  many repos → /generate-roadmap --from planning/<slug>/sequence.md
+                                 → planning/roadmaps/<slug>/{roadmap.md,lane-*.txt,lane-log.jsonl}
+                                 → /begin-orchestration --roadmap ... --lane ... → /orchestrate
 
 PHASE 1 — PLAN
   /generate-tasks <spec>                 → planning/<spec>/tasks.json (+ rendered tasks.md)
@@ -461,6 +466,17 @@ whichever agent hits it first.
 ## Phase 1 — Plan
 
 ### `/generate-roadmap <slug> [--from <path> ...] [--supersedes <path>]`
+**Pre-plan input (Step 1b).** A `sequence.md` passed via `--from` is handled differently from every
+other source: it is an **authored cut**, not a body of findings, so it is carried through rather
+than re-derived — wave headings become the outcomes, wave exit lines become the Definition of done
+verbatim, `candidate` blocks become Wave 0, cross-repo contracts become cross-lane edges, operator
+errands become the operator lane, and `seams.md`'s blast radius lands in the lane files' `#`
+comments where it is read at execution time. `SQ-nn` refs make the coverage crosswalk a one-liner.
+Any departure from the authored cut must be stated with a reason, and the operator's fork answers
+may not be silently re-decided. What this command still owns: lane assignment, the heavy budget,
+isolation, Wave 0 mechanics and both crosswalks — `/sequence` decides *what* and *in what order*,
+this decides *who runs it concurrently without colliding*.
+
 Authors the two things `/begin-orchestration` consumes: a **roadmap document** and one
 `lane-<name>.txt` chain file per lane, written to `planning/roadmaps/<slug>/` and registered as an
 epic's `plan:` pointer. A roadmap is a *concurrency plan* — an assignment of work to

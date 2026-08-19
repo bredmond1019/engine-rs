@@ -1,6 +1,6 @@
 {
-  "version": "61a548815cfc0907ef3f8337509092ab93587b6b",
-  "generated": "2026-08-18",
+  "version": "a930ee32c1cab9f5d7d92b2fe59d20f5bfa531a7",
+  "generated": "2026-08-19",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
     ".claude/commands/document.md": "81f4657f7fc57a3d6347e1fee465823820f699545eafa42586b86b375ee033e8",
@@ -31,7 +31,7 @@
     ".claude/commands/generate-tasks.md": "5b3ad2f6f39a1188b2ab5e55b88aefdfee05263b841453b7087ed87c837b21bb",
     ".claude/commands/merge-train.md": "8125dc3377aa05bfc7544eff5f7007c00516830da5b6fa549c1d8e6cefb931bf",
     ".claude/commands/breakdown.md": "917d5ec2de19c891ed1976f72f177ed9217051822445f2087bef966d7fae0de6",
-    ".claude/commands/README.md": "8178513af49f12ed43e1385fd27747ec1ae7d5c2d17f307503e4b0a4fba83e3a",
+    ".claude/commands/README.md": "e4d6431d8c85b6438d6b301a05ab0a8742824c37ffd866c333f4b7c6631546e3",
     ".claude/commands/clean-worktree.md": "723317864d96815887aa443040fbf67069704caebd113433d8582f28e47b546f",
     ".claude/commands/blocked.md": "4ccdc2a885ac57ff31296f1b5d9ef6e48c4d02332059b968115ff52a03d6d843",
     ".claude/commands/initial-research.md": "51ab634d7bb00cfbc04fea58840a1b61b2173611b85f5867a0f90af1afbe37d3",
@@ -52,7 +52,7 @@
     ".claude/commands/test_auth_gate.md": "57ff94d5033e1e69cbec61d3021a0bc6b08855f0906966971860351cd4b2adfa",
     ".claude/commands/update-state.md": "d6167547a2c123f56c693b1c186fc4c3afcbad9434ced8324a2ce6d53adfbfa1",
     ".claude/commands/test.md": "9dd42aa48a000ca410d9c91e3c5490be1d2cbeaee9fb5812fcff2c7dc7929b81",
-    ".claude/commands/sequence.md": "b8906a0c45c9a2734dfae87c0d72c04ba6b8e6964c20a8e94b3be27c90249b80",
+    ".claude/commands/sequence.md": "a4d8b4dd54b5327ad484cb9d4c5e2cee7ba9d3bd3c68f4020d1ddc98c39c6dc6",
     ".claude/commands/handoff.md": "fb2264a5a5171861f4ba345014f3fe3c583d12f09f04652a4cbc8d2de8e7627d",
     ".claude/commands/test_crud_api.md": "ff003bbd7257819431419cd185b6feba042c34d0d452f72c9af4eb4d3afea270",
     ".claude/commands/test_error_handling.md": "c1d727984d9b26da52d4e24cbca842dc7d818ce5758727a91f96f68c2e5fc4e2",
