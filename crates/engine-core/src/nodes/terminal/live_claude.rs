@@ -423,6 +423,67 @@ mod tests {
         assert!(err.to_string().contains("session_name"));
     }
 
+    // --- Task 1 (EN.ticket.otel-pane-telemetry): failing-first tests for
+    // the OTel env-var prefix. `build_command_line` does not yet accept a
+    // run_id/node_identity, so these are expected NOT to compile until
+    // task 2 changes its signature and adds the prefix.
+
+    #[test]
+    fn build_command_line_prepends_otel_env_vars_ahead_of_the_resolved_binary() {
+        std::env::remove_var("CLAUDE_BINARY");
+        let line = build_command_line(&Config::default(), "eng-run-1", "HeldSessionNode");
+        assert_eq!(
+            line,
+            "CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=otlp \
+             OTEL_RESOURCE_ATTRIBUTES='run_id=eng-run-1,node.identity=HeldSessionNode' claude"
+        );
+    }
+
+    #[test]
+    fn otel_resource_attributes_is_value_quoted_not_assignment_quoted() {
+        std::env::remove_var("CLAUDE_BINARY");
+        let line = build_command_line(&Config::default(), "eng-run-1", "HeldSessionNode");
+        // The value contains '=' and ',', so shell_quote's is_simple rule
+        // forces single-quoting — but only around the VALUE, never around
+        // the whole `VAR=value` assignment. Quoting the assignment itself
+        // (e.g. `'OTEL_RESOURCE_ATTRIBUTES=run_id=...'`) would make the
+        // pane's shell treat it as a literal string argument instead of an
+        // env-var assignment, breaking the launch.
+        assert!(
+            line.contains("OTEL_RESOURCE_ATTRIBUTES='run_id=eng-run-1,node.identity=HeldSessionNode'"),
+            "expected value-only quoting on OTEL_RESOURCE_ATTRIBUTES, got: {line}"
+        );
+        assert!(
+            !line.contains("'OTEL_RESOURCE_ATTRIBUTES="),
+            "must never quote the VAR= prefix together with the value: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_never_stamps_a_usage_or_cost_usd_key() {
+        std::env::remove_var("CLAUDE_BINARY");
+        let driver = Arc::new(StubTerminalDriver::new());
+        driver.set_send_literal_result(StubOutcome::empty_ok());
+        driver.set_send_enter_result(StubOutcome::empty_ok());
+
+        let node = LiveClaudeSessionNode::new(driver);
+        let mut ctx =
+            ctx_with_upstream_session(held_session::NODE_NAME, "eng-run-4_HeldSessionNode");
+        ctx.metadata["run_id"] = serde_json::json!("eng-run-4");
+
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let stamped = ctx.nodes.get(NODE_NAME).expect("result stamped");
+        assert!(
+            stamped.get("usage").is_none(),
+            "stamped result must never carry a usage key: {stamped:?}"
+        );
+        assert!(
+            stamped.get("cost_usd").is_none(),
+            "stamped result must never carry a cost_usd key: {stamped:?}"
+        );
+    }
+
     #[tokio::test]
     async fn process_surfaces_a_node_error_on_driver_send_failure() {
         let driver = Arc::new(StubTerminalDriver::new());
