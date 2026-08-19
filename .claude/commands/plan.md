@@ -142,6 +142,16 @@ re-derived anyway (D65).
    registration. Do not restate it here or invent a variant. Set `kind` to `block` and
    `initiative` to `<slug>`.
 
+7b. **Run the initiative-wide consistency pass before registration closes** — Step 7 of
+   `.claude/workflows/block-registration.md`, once for the whole batch, never per block. It is the
+   only step that reads every block of the initiative at once, and every defect it catches is one a
+   correctly-authored single block cannot show: a second repo with no block record (and `external`
+   edges standing in for unfiled fleet work), a block whose `files[]` leave its own repo's tree, a
+   split row whose halves both inherited the original's `depends_on`, a sizing flag carried forward
+   instead of decided, an operator `exit` naming an artifact nobody can point at, and actionable
+   work left in prose with no row in `state.json`. Report what it
+   found — including "nothing", which on a multi-block initiative is a claim.
+
 8. **Write the narrative** to `planning/<slug>/plan.md` using the Output Format below. The
    narrative holds only what is true of the set — it must not duplicate a block's what/why/files,
    which live in the block records and would immediately drift.
@@ -164,6 +174,18 @@ re-derived anyway (D65).
      graph node (`mev`'s `W_GRAPH_ISOLATED_NODE`). Use genuine doc_ids only; never invent one. On
      a revise, leave an already-populated `related:` intact.
    - **No `master-plan.md` was authored or edited.** It is generated from the block graph.
+   - **Nothing actionable exists only in this document.** Every open question, follow-up, agreed
+     red-team finding and "we should also" in `plan.md` is either a row in `state.json` — a block,
+     an operator/approval edge, a `carryover[]` entry, a `reference[]` fact, a backlog row — or a
+     cut-list line with a reason. Those are the only two destinations. Prose gates nothing and
+     surfaces on no board, so an item held only here is lost, not deferred.
+   - **The consistency pass (7b) ran and is reported** — C1–C6, with what it found and what was
+     left standing deliberately. Specifically: no `depends_on` edge is `{"type": "external"}` for
+     work that lives in a fleet repo; every block whose `files[]` reach outside its own repo's tree
+     says so and names the lane it may not run beside; no two blocks split from one row carry
+     identical inherited edges; every oversized-flagged block carries a split-now-or-defer decision;
+     and every operator `exit` names an artifact you can point at on disk or at the block that
+     creates it — otherwise it says `UNRESOLVED`.
 
    Three further properties, all **can-fail** — a plan passing the structural checks above can
    still be unbuildable:
@@ -332,6 +354,7 @@ Blocks ready to decompose:
   ...
 
 Pre-plan input:   sequence.md <used | absent> <, departures: ...>
+Consistency pass: C1 <n> · C2 <n> · C3 <n> · C4 <n> · C5 <n> · C6 <n> — <fixed | none found>
 Handoff test on <first block ID>: PASS | FAIL — <what was missing>
 Red team: <x> attacks landed, <y> rejected
 

@@ -109,6 +109,19 @@ This stage does not author block records or register `state.json`. That is `/pla
    - **owning repo** — and whether it is code, a config/docs change, or an **operator errand**
      (a human action: a credential, a machine visit, a decision). Errands are first-class; they
      block chains and they are invisible if unlisted.
+
+     An errand is not a footnote in the cut — it becomes a `{"type": "operator", slug, exit, start}`
+     edge in `depends_on` at registration, driven by `/begin-session <slug>`, and that edge is the
+     only thing in the graph that actually holds the work behind it. Sequence with them where a
+     human genuinely gates the chain.
+
+     **Aim the cut at autonomy anyway.** Every errand is a place the chain stops until the operator
+     is at the keyboard, so file one only when *only* a human can do it — a credential, an
+     outward-facing or irreversible action, a machine visit, a decision that is theirs to own.
+     Anything an agent could settle by reading the repo, running the gate, or following an existing
+     decision is not an errand. Then make the ones that survive small and late: one narrow decision
+     with a named exit artifact, placed on the last block that needs it rather than the first, so
+     everything ahead of it keeps running unattended.
    - **ships** — the one-line answer to "what can the operator do now"
    - **depends_on** — real edges, including cross-repo and operator edges
    - **files it will touch, by path** — provisional is fine, but named. `/plan` and
@@ -116,6 +129,11 @@ This stage does not author block records or register `state.json`. That is `/pla
    - **the gate that proves it** — and per base-template D68, how that gate is shown capable of
      failing
    - **the risk that would sink it**
+   - **a split decision, whenever anything has already flagged the block as oversized** — a
+     red-team verdict, a decomposition you wrote into its own row ("this is really T3–T9"), a note
+     from `seams.md`. A sizing flag is a decision owed, not a note to carry forward: write
+     *split now* (and cut the rows) or *defer, with the trigger that forces the split later*.
+     A row that ships carrying an unresolved flag ships oversized — that has already happened.
 
    And once per **repo**, not per block: whether that repo's gates are **heavy** and in which
    category. Determine it mechanically, never by memory:
@@ -128,6 +146,45 @@ This stage does not author block records or register `state.json`. That is `/pla
    contract and which re-pins it, and whether a data-contract or workspace-contract version bump is
    required. A cross-repo edge with no named author is the most common source of two half-built
    sides that never meet.
+
+   **A block that spans two repos is two rows, one per repo, each with its own ID.** One row filed
+   under a single owning repo loses the other half: the row closes, its repo's lane is green, and
+   nobody filed the work on the other side. Test every row mechanically, not by memory — does its
+   `Files` column contain a path outside its `Repo`'s tree? If so, either the paths are wrong or a
+   row is missing. Write both rows and the edge between them.
+
+6b. **Cross-block consistency sweep — run it once, over the whole cut, before the red team.**
+   Steps 3–6 are per-row judgements. Every defect below survives a row that is individually
+   correct, because no single row can see it; they are what actually shipped from the cut this
+   step was added for. Sweep the finished table and fix each in place:
+
+   - **A second repo with no row.** Any row whose `Repo` cell names two repos, or whose `Files`
+     leave its own repo's tree, or whose gate's evidence lives in a sibling repo. Each needs the
+     other half filed as its own row, in that repo, with an ID from that repo's `state.json`.
+   - **Files-touched collisions, not just repo collisions.** Lane assignment downstream reasons
+     about *repos in flight*; blocks do not respect that boundary. A `base-template` row editing
+     files under `core/mev/` collides with a live `mev` lane and nothing sees it. Build the
+     path → row map for the whole cut. Two rows in different repos naming the same path is one
+     writer too many — say which row owns it. A row writing outside its own tree keeps the right
+     to do so, but the `Files` cell must say so and the row must name the lane it may not run
+     beside; that sentence is what `/generate-roadmap` schedules on.
+   - **Split rows that kept the whole row's edges.** When you cut one row into two — a config half
+     and an enforcement half, a read side and a write side — re-derive each half's `depends_on`
+     from what *that half* needs. Inherited edges block the half that never needed them for the
+     length of the run. Identical `depends_on` on two rows split from one is the signature.
+   - **Actionable work that exists only in this document.** Open questions, agreed red-team
+     findings, "we should also" lines, and findings with no row. Every one is either a block in the
+     cut (which becomes a `state.json` row at registration), an operator errand, or a line in the
+     cut list with a reason. Nothing that has to get done survives as prose: a markdown file
+     describes work, the graph holds it, and an item with no container is lost rather than deferred.
+   - **Operator errands whose exit artifact you cannot point at.** Every errand's exit must name a
+     file you can point to on disk, or the row or command that creates it. If you cannot, write
+     `UNRESOLVED — operator names the artifact` rather than a plausible-looking path. An invented
+     path (a plist stated nowhere, a rule file that does not exist) satisfies every check this
+     document runs and gates nothing.
+
+   Report the sweep's findings in `sequence.md` — including "none", which on a multi-repo cut is a
+   claim and should read as one.
 
 7. **State the cut list.** What was considered and excluded, with the reason. Make this longer than
    is comfortable — an unstated cut reads as an oversight, gets re-proposed, and is re-litigated.
@@ -160,6 +217,12 @@ This stage does not author block records or register `state.json`. That is `/pla
       real `state.json`, and every `candidate` appears in the Wave 0 table.
     - Every repo has a gate weight determined by running `is-heavy`, not asserted.
     - Every wave exit is a command with an expected output, not a list of closed blocks.
+    - **The 6b sweep ran and its findings are in the document.** No row's `Files` reach outside its
+      `Repo` without saying so and naming the lane it may not run beside; no path is written by two
+      rows in different repos; no cross-repo row is missing its other half; no two rows split from
+      one carry identical inherited `depends_on`; no oversized flag is left undecided; and every
+      operator errand's exit names an artifact you can point at, or says `UNRESOLVED`; and every
+      actionable item in this document is a block, an errand, or a cut-list line — never loose prose.
     - Frontmatter `related:` carries ≥1 real `doc_id`.
 
 11. Commit with an explicit pathspec. Report the cut and the next command:
@@ -247,13 +310,24 @@ OK  <command> → <expected output>
 
 ## Operator errands
 
-| # | Errand | Blocks | Why a human |
-|---|---|---|---|
+| # | Errand | Blocks | Exit artifact (pointable, or `UNRESOLVED`) | Why a human |
+|---|---|---|---|---|
 
 ## What is cut, and why
 
 | Candidate | Why it is out |
 |---|---|
+
+## Cross-block consistency sweep
+
+| Check | Findings | What changed |
+|---|---|---|
+| Second repo with no row | | |
+| Files-touched collision / cross-tree writer | | |
+| Split rows with inherited edges | | |
+| Oversized flags left undecided | | |
+| Ungrounded operator exit artifacts | | |
+| Actionable work left only in prose | | |
 
 ## Red team — what survived
 
@@ -296,6 +370,8 @@ Block IDs allocated: <per repo, e.g. EN.12.A-EN.13.F (28) · MV.4.A-MV.4.C (3)>
 Repos: <list with gate weight>
 Forks resolved: <k>
 Blocks re-cut for failing the ships-alone test: <list>
+Consistency sweep (6b): <findings per check, or "none">
+Cross-tree writers: <rows whose files leave their own repo, and the lane each may not run beside>
 Red team: <x> landed, <y> rejected
 Handoff test on block 1: PASS | FAIL — <what was missing>
 
