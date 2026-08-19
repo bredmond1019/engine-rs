@@ -35,7 +35,7 @@ Built across `EN.9.D`/`E`/`F`/`G` and `EN.10.A`.
 | `admission.rs` | EN.9.F | Semaphore bounding concurrent terminal runs. Over the cap, runs **queue** — they do not fail. |
 | `hold_policy.rs` | EN.9.G | Per-workflow policy surface over the `EN.9.B` lease: operator-hold grace and `steal_after`. |
 | `held_session.rs` | EN.10.A | One tmux session carried **across node boundaries**, renewing its lease, with external-kill detection. |
-| `LiveClaudeSessionNode` (`live_claude.rs`) | EN.10.A | Opens an interactive Claude Code session inside the held session mid-run, via `claude_code_rs::execute` (D4). Visible to `bastion sessions`. |
+| `LiveClaudeSessionNode` (`live_claude.rs`) | EN.10.A / `EN.ticket.otel-pane-telemetry` | Opens an interactive Claude Code session inside the held session mid-run by typing the command into the pane (`TerminalDriver::send_keys`) — never `claude_code_rs::execute`, which is the headless subprocess path `ClaudeCodeStep` uses instead (D4). Visible to `bastion sessions`. Prepends `CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=otlp OTEL_RESOURCE_ATTRIBUTES='run_id=...,node.identity=...'` to the launch line so cost telemetry (`claude_code.cost.usage`) correlates to the run without scraping `/usage` (N7); `usage`/`cost_usd` are never stamped by this node. |
 
 ## Three rules that look like style and are not
 
