@@ -637,6 +637,17 @@ pointer ticket to the brain's `planning/backlog.md`.
 |---|---|---|
 | `/capture <title>` | Rich pre-plan notes — detailed enough to need a file, not yet a plan | `planning/<slug>/notes.md` + brain backlog |
 
+Captures are read weeks later with none of the originating context, and read as fact unless they
+say otherwise — so every substantive claim is tagged **VERIFIED** (read in source or observed
+running, with the symbol named) · **ASSUMED** (believed, not checked, with what would check it) ·
+**SAID** (stated by someone, unconfirmed). A `## Provenance` block pins the date and each repo's
+SHA, so a later reader can tell in one command whether the note still describes the system that
+exists. Open Questions are each labelled READ · SPIKE · ASK · ASSESS, which is what decides where
+the note goes next — an ASSESS entry means the next step is `/assess`, not a plan.
+
+**A capture is not an assessment and must not be promoted as one.** It is cheap precisely because
+it is mostly unverified; the tags are what keep that legible.
+
 The notes file sections (What & Why · Context & Background · Key Information · Open Questions ·
 Rough Scope) are designed as direct input to the planning commands below — paste conversation
 content in, then promote with `/plan`, `/chore`, or `/generate-master-plan` when ready. When the
@@ -654,6 +665,17 @@ Output feeds the rest of the pipeline unchanged.
 | `/chore <description>` | Maintenance / housekeeping (no behavior change) | `planning/chore-<slug>/tasks.md` |
 | `/ticket <description>` | Bug fix or targeted enhancement that requires tests + observable AC | `planning/ticket-<slug>/tasks.md` |
 | `/plan <description>` | Any ad-hoc or experimental feature — mini-roadmap format | `planning/plan-<slug>/plan.md` |
+
+Both carry the pre-plan floor at their own scale. **`/ticket`** reproduces the failure before
+writing a single Acceptance Criterion — a ticket written from a *described* bug fixes the
+description — records the real error text in the block record, and orders the test **before** the
+fix so the gate is shown capable of failing (D68, red-green). **`/chore`** takes a pre-change gate
+baseline, since "no behaviour change" cannot be claimed against a baseline never taken, and must
+carry at least one criterion that observes a *difference* — "the gates still pass" is true of doing
+nothing. Both ask the half-built question (does this call something that merely exists in source?)
+and both have an escalation trigger: `/ticket` stops when the behaviour cannot be reproduced or the
+half-built question cannot be answered; `/chore` stops when the work turns out to change behaviour,
+which makes it a ticket.
 
 `/chore` and `/ticket` write a runnable `tasks.md` **directly** and route to lean `/sdlc-task`
 (the fast path). `/plan` writes a `plan.md` in the **master-plan format** (phases/blocks/Quick

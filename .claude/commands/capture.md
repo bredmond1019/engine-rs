@@ -45,6 +45,26 @@ already holds the context.
 ### Step 3 — Create the notes file
 
 5. Create `planning/<slug>/notes.md` using the Output Format below. You must populate the body sections with all the important details discussed during the session, but **do not invent content the user or agent hasn't provided/visually seen**. Ensure you capture file paths, class/struct names, functions, important snippets of code, and any additional content that will make it EXTREMELY easy for the next agent or the user to go dig into this note and know exactly what was discussed, how you got to this conclusion or initial research, where to go look to review/investigate further, etc.
+
+   **Mark every claim's standing. This is the single most important rule in this command.** A
+   captured note is read weeks later, by someone with none of this session's context, and read as
+   *fact* unless it says otherwise. Prefix or tag each substantive claim:
+
+   | Tag | Means |
+   |---|---|
+   | **VERIFIED** | Read in source or observed running, this session. Name the file and symbol |
+   | **ASSUMED** | Believed, not checked. Say what would check it |
+   | **SAID** | The user or another agent stated it; not independently confirmed |
+
+   An untagged capture is indistinguishable from an assessment, and it will be planned on as if it
+   were one. Tagging costs a word and is the difference between a useful note and a confident one.
+
+   **Name symbols, not line numbers.** Line numbers move between the capture and the read; a
+   function name can be grepped. Where a line number genuinely helps, keep it *and* the symbol.
+
+   **Pin the moment.** Record today's date and `git rev-parse --short HEAD` for each repo the note
+   makes claims about, in the `## Provenance` section. A reader who knows the SHA can tell in one
+   command whether the note is still describing the system that exists.
    - **Populate `related:` with ≥1 real `doc_id`** — the project's `master-plan` doc_id, a
      governing decision, or the parent `index`. Never ship `related: []`: a doc_id-bearing file
      with zero outbound edges is an isolated graph node (`mev`'s `W_GRAPH_ISOLATED_NODE`). Use
@@ -77,8 +97,10 @@ related: [<≥1 real doc_id>]   # required — never leave empty; else this file
 
 # <Title>
 
-> **Status:** draft — pre-plan holding area.
-> **Promote with:** `/plan "<title>"` · `/chore "<title>"` · `/generate-master-plan "<title>"`
+> **Status:** draft — pre-plan holding area. **Claims are tagged VERIFIED / ASSUMED / SAID;
+> anything untagged is unconfirmed.** Line numbers move — grep the symbol.
+> **Promote with:** `/ticket` or `/chore` (one small unit) · `/plan` (one repo, several blocks) ·
+> `/assess <topic>` (the shape of the work is still unclear — see Open Questions)
 
 ## What & Why
 
@@ -100,18 +122,46 @@ related: [<≥1 real doc_id>]   # required — never leave empty; else this file
 ## Open Questions
 
 <!-- Things not yet resolved that need answers before this can become a plan.
+     For each, say which of these it is — it decides what the next session does:
+       READ   answerable by reading source or docs
+       SPIKE  cheaper to settle by writing ~30 lines or running the thing once
+       ASK    only the operator can answer (a decision, a preference, a credential)
+       ASSESS too many unknowns to answer one at a time — this area needs /assess
      Delete this section if there are none. -->
 
 ## Rough Scope
 
 <!-- Optional early sizing: what building this likely involves. Not tasks — just a
-     directional sense so /plan knows what it's walking into. Delete if not needed. -->
+     directional sense so the next command knows what it's walking into.
+
+     If you can answer either of these cheaply, do — they are what a later planning session
+     would otherwise have to rediscover, and the second one is the expensive miss:
+       - What does this CALL that it does not build, and is that thing wired in production
+         or does it merely exist in source? Name a call site, or write "unknown".
+       - What already exists that this duplicates, and what should be deleted first?
+     "Unknown" is a fine answer here and a useful one — it tells the next session where to look.
+     Delete this section if not needed. -->
+
+## Provenance
+
+<!-- Captured <DATE>. Repos and SHAs this note makes claims about:
+       <repo> @ <short sha>
+     A reader who knows the SHA can tell in one command whether this note still describes the
+     system that exists. Without it, a six-week-old note is indistinguishable from a current one. -->
 ```
 
 ## Notes
 
 - Populate the body sections based on the conversation context, but do not invent new content the user or agent hasn't provided/visually seen.
-- The notes file is the primary input when you later run `/plan`, `/chore`, or
-  `/generate-master-plan` — those commands will read it as context for the feature.
+- The notes file is the primary input when you later run `/ticket`, `/chore`, `/plan`, or
+  `/assess` — those commands read it as context. Where the note goes next depends on what its
+  **Open Questions** say: mostly READ/ASK means it is ready to promote; an ASSESS entry, or an
+  unanswerable "what does this call that it does not build", means the next step is `/assess`,
+  not a plan.
+- **A capture is not an assessment and must not be promoted as one.** It records what a session
+  saw and thought, at one moment, mostly unverified by design — that is why it is cheap. The
+  VERIFIED/ASSUMED/SAID tags exist so a later reader can tell the difference, and the Provenance
+  SHA exists so they can tell whether it is still true. Neither costs anything at capture time
+  and both are unrecoverable afterwards.
 - If the user says the idea is ALSO a content piece, suggest they also run `/add-idea`
   from the brain session.

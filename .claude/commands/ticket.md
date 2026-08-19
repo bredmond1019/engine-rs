@@ -30,9 +30,37 @@ downstream block waiting on its code, so there is nothing to defer (D65).
 3. Research the codebase: read `CLAUDE.md`, `planning/context.md`, then the files directly
    relevant to the change.
 
+3a. **Reproduce it, or observe the current behaviour, before writing a single Acceptance
+   Criterion.** This is the ticket-sized version of establishing ground truth and it is the
+   highest-value minute in this command.
+   - **Bug fix:** make it fail. Run the failing case and record the actual output or error text.
+     A ticket written from a *described* bug fixes the description, not the bug — and the AC will
+     describe a symptom nobody has seen.
+   - **Enhancement:** run the current behaviour so the AC says what changes, not what you assume
+     is there today.
+   - **If you cannot reproduce it**, say so plainly and write that into the block record's `why`.
+     Then either ask the user for the reproduction, or make the first task "reproduce and record
+     the failing case" — do not write AC over an unobserved failure.
+
+3b. **The floor, ticket-sized.** Two questions, a sentence each — this is the whole of the
+   pre-plan discipline at this scale:
+   - **Does this call anything it does not build?** If so: is that capability wired in
+     production, or does it merely exist in source — behind a flag, with only test callers, never
+     executed? Name the call site or say there isn't one. A "small fix" that turns out to depend
+     on something half-built is not small, and this is the only cheap moment to find that out.
+   - **What else touches the file(s) this changes?** One grep. If the answer is "a lot," the
+     blast radius is the real scope.
+
 4. THINK HARD about scope before writing:
    - A ticket is a **single coherent unit** — one logical change, one set of tests. If the fix
      touches more than 3–4 files or needs its own sub-phases, it belongs in `/plan`.
+   - **Escalation trigger — size is not the only reason to escalate.** Stop and say so if step 3a
+     could not reproduce the behaviour and nobody can supply a reproduction, or if step 3b's
+     half-built question cannot be answered for something this change depends on. Both mean the
+     work is not yet understood well enough to be a ticket. Recommend `/assess` on that area, or
+     ask the user — do not write a plausible ticket over the gap. A ticket sized as a one-file fix
+     that turns out to be a rewrite is the specific failure this trigger exists to catch, and it
+     is not visible afterwards.
    - Choose the **SDLC workflow** (`none` | `patch` | `task` | `run` | `flow`) and the **model**
      (`sonnet` | `gemini-pro` | `gemini-flash` | `either`). Rule of thumb: Opus for
      reasoning/breakdown only; sonnet for high-risk or complex; gemini-pro intermediate;
@@ -68,6 +96,16 @@ downstream block waiting on its code, so there is nothing to defer (D65).
    Ordinary criteria ("the function returns X", "the diagnostic fires") resolve to the first row
    instantly and get no added ceremony — this rule must stay quiet on the common case or it
    destroys the lean lane.
+
+5a. **The test must be shown failing before the fix lands (D68, ticket-sized).** A ticket's gate is
+   its new test, and a test that has never gone red is not evidence — it may be asserting something
+   that was already true. Order the tasks so the test is written and observed failing *before* the
+   change that makes it pass, and say so in that task's acceptance criteria: *"`<command>` fails
+   with `<the real error from step 3a>` before task N, passes after."*
+
+   Where the test genuinely cannot precede the fix, name in the task how the gate was otherwise
+   shown capable of failing — a retro-fixture against the known-bad input, or the reproduction
+   recorded in 3a. `tasksPassed` is agreement between gates, never proof of correctness.
 
    **Corollary for any verification step that shells out to an installed binary** (`mev`,
    `bastion`, or similar): state explicitly whether it checks **source** or **installed**
@@ -125,9 +163,37 @@ downstream block waiting on its code, so there is nothing to defer (D65).
       this check. Judge purely on where the evidence lives.
     - **Testing Strategy is non-empty** — names the test file(s) and what each must cover. The
       schema requires it for `kind: ticket`.
+    - **The reproduction is recorded** — the block record's `why` carries the observed failure
+      (real output or error text), or states plainly that it could not be reproduced and what the
+      first task does about that.
+    - **The gate is shown capable of failing** — a task orders the test before the fix, or names
+      the fixture standing in for that.
+    - **Nothing this ticket depends on is unclassified** as built / half-built / absent.
     - **`tasks.md` was rendered** and matches: `python3 scripts/render_spec.py <BlockID> --check`.
 
 11. Report the paths and next step.
+
+## Session boundary
+
+`/ticket` authors and decomposes in one session — that is the point of the lean lane, and the work
+is small enough that the record-stands-alone property is cheap to satisfy directly.
+
+**The engine runs fresh.** `/sdlc-task` spawns its own agent stack; carrying an authoring context
+into it buys nothing.
+
+Close by telling the operator:
+
+```
+Ticket authored: planning/blocks/<BlockID>.json + planning/<BlockID>/tasks.json
+Reproduced: <the observed failure> | NOT REPRODUCED — <what task 1 does about it>
+
+Start a FRESH session and run:
+  /sdlc-task <BlockID>
+
+<If escalation triggered:>
+  I did not write this ticket. <Which question could not be answered.>
+  Recommend: /assess <area>  — or answer the question and re-run /ticket.
+```
 
 ## Codebase Structure
 
