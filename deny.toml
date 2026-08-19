@@ -1,0 +1,37 @@
+# cargo-deny — dependency license policy (HQ D75).
+#
+# This repo ships `MIT OR Apache-2.0`. That is only honest if nothing in the
+# dependency tree imposes a stronger obligation, so this file is the check.
+#
+# Run:  cargo deny check licenses
+#
+# The allow-list is permissive-only plus MPL-2.0. MPL-2.0 is FILE-level
+# copyleft: it obliges anyone who modifies an MPL-covered file to publish that
+# file's source, and imposes nothing on the code that merely depends on it.
+# Unmodified upstream crates (`colored`, `option-ext`) therefore do not affect
+# this repo's own license. Vendoring and patching one of them would.
+#
+# GPL / AGPL / LGPL-only are deliberately absent. If a future dependency pulls
+# one in, this check fails and the choice is: drop the dependency, or revisit
+# D75. Do not widen this list to make the build green.
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "WTFPL",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
