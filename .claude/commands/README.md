@@ -30,6 +30,8 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
   log-work.md       prime.md         session-recap.md
   wrap-up.md        update-state.md  next.md
 
+  assess.md         seams.md         sequence.md
+
   breakdown.md      chore.md         generate-master-plan.md  generate-tasks.md
   generate-roadmap.md  plan.md       ticket.md
 
@@ -96,6 +98,9 @@ predictably-named output file.
 | Session End | `/handoff [note]` | Write handoff + log work + commit; hands off to a fresh session | `planning/handoff.md`, status.md, log.md, git |
 | Session End | `/close-out [--base <ref>] [--gap-check-only] [--skip-coverage] [--clean-worktree \| --merge-branch] [note]` | Resolve diff base (loud-fail if none) → verify coverage → patch docs → clean worktree/merge branch (opt.) → hand off; the quality-close pipeline | status.md, log.md, docs/, git |
 | Block Setup | `/start-block [name]` | Flip a spec to `In progress` in status.md | status.md |
+| **0 — Pre-plan** | `/assess <topic>` | Fan out fresh recon agents, then a second fresh set to re-check the load-bearing claims | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` |
+| **0 — Pre-plan** | `/seams <slug>` | Built/half-built/absent, attachment points with one writer per side, blast radius, one spike, the operator's forks | `planning/<slug>/seams.md` |
+| **0 — Pre-plan** | `/sequence <slug>` | Cut into ordered blocks that each ship something usable; owning repo per block | `planning/<slug>/sequence.md` |
 | **1 — Roadmap** | `/generate-master-plan [desc]` | Author the full roadmap as canonical block definitions | `planning/master-plan.md` |
 | **1 — Plan** | `/generate-tasks <name>` · `/generate-tasks --from <path>` | Write the full task spec from a master-plan block, **or** from a standalone block file (`--from`) | `planning/<name>/tasks.md` |
 | **1 — Plan (ad-hoc)** | `/chore` · `/ticket` · `/plan <desc>` | Plan ad-hoc work from a free-text description (not a master-plan block) | `planning/<prefix>-<slug>/{tasks,plan}.md` |
@@ -120,10 +125,16 @@ SESSION START
 BLOCK SETUP
   /start-block <spec>      → status.md
 
+PHASE 0 — PRE-PLAN         ← existing system, cut not obvious. Skip for a known block.
+  /assess <topic>          → planning/<slug>/assessment.md + verification.md + evidence/
+  /seams <slug>            → planning/<slug>/seams.md      (+ the operator answers its forks)
+  /sequence <slug>         → planning/<slug>/sequence.md   → read by /plan or /generate-roadmap
+
 PHASE 1 — PLAN
-  /generate-tasks <spec>                 → planning/<spec>/tasks.md
-        ↓  (optional)
+  /generate-tasks <spec>                 → planning/<spec>/tasks.json (+ rendered tasks.md)
+        ↓  (optional — only if a task is genuinely coarse)
   /breakdown planning/<spec>/tasks.md   → planning/<spec>/breakdown.md
+                                           (+ any executable correction written back to tasks.json)
 
 PHASE 2 — IMPLEMENT
   /implement planning/<spec>/tasks.md [N]
@@ -398,6 +409,55 @@ it are `Done`), and returns a status table. Read-only.
 
 ---
 
+## Phase 0 — Pre-plan
+
+For work on an **existing** system where the cut is not obvious. Three commands, each writing one
+artifact that the next reads; `/sequence`'s output is the only input `/plan` or `/generate-roadmap`
+needs. Skip all three when you already know the block — go straight to `/ticket`, `/chore`, or
+`/generate-tasks`.
+
+The method behind them, including the fan-out shape, model tiering, the stopping rules, and the
+plan-solidity tests, is `docs/how-to-plan-with-agents.md` in the brain repo.
+
+| Command | Writes | Answers |
+|---|---|---|
+| `/assess <topic> [--slug <name>] [--areas "..."] [--depth quick\|standard\|deep]` | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` | What is actually there, with proof, and which claims survived re-checking |
+| `/seams <slug> [--spike <n>]` | `planning/<slug>/seams.md` | Built / half-built / absent; what to reuse; what to delete; blast radius; the forks the operator must decide |
+| `/sequence <slug> [--single-repo]` | `planning/<slug>/sequence.md` | The cut into blocks, each shipping something usable, with owning repo and cross-repo contract author |
+
+### `/assess`
+Establishes ground truth first — builds, runs the gated checks, and **runs the subsystem once** if
+it can be run — then sweeps the fleet's own `carryover[]` / `decisions/` / `knowledge.md` /
+`memory.md` / `backlog.md` before spawning any scout, so nothing already filed is re-discovered as
+novel. Scouts get fresh context and narrow briefs, report **findings with `file:line` + symbol and
+never recommendations**, and always include a reuse scout and a deletion scout. A second, fresh set
+of agents then re-checks the load-bearing claims — **given claims, not conclusions** — and anything
+refuted is corrected **in `assessment.md` itself**, not only noted in `verification.md`.
+
+It produces evidence only. It may not propose a sequence, a wave, a block, or an estimate.
+
+### `/seams`
+The stage most often skipped and the one whose absence most reliably produces a plan that is
+coherent on paper and unbuildable in practice. Classifies every capability the work depends on as
+**built** (has a production call site), **half-built** (exists in source but has no caller, is
+behind a disabled flag, or was never run), or **absent** — half-built is where plans die, and the
+classification decides whether each is a wiring block or a rewrite. Then: the seam list with a
+**single named writer per side**, a blast radius per seam, one spike on the riskiest assumption
+(a smoke run of an existing path counts, and is always cheapest), the cross-cutting walk
+(migrations · flags · observability · error paths · auth · perf · concurrency · **install/deploy
+boundary** · rollback), and 2–4 forks stated as options plus a recommendation.
+
+### `/sequence`
+Cuts by **deliverable, not by layer**. Every block is tested against *"what can the operator do the
+day this merges that they could not do the day before?"* — a block whose answer is "nothing yet" is
+merged into the block that consumes it. Blocks that make later work observable outrank blocks that
+add capability; deletions come before the extensions that would inherit them. Operator errands
+(a credential, a machine visit, a decision) are first-class blocks, not prose asides. Fork answers
+are recorded with dates before the cut, because an unresolved fork gets decided silently by
+whichever agent hits it first.
+
+---
+
 ## Phase 1 — Plan
 
 ### `/generate-roadmap <slug> [--from <path> ...] [--supersedes <path>]`
@@ -430,21 +490,50 @@ free-form planning session into the structure the rest of Phase 1 expects. `/new
 this as its post-scaffold roadmap step. See `planning/decisions/D34-adhoc-planning-seam.md`.
 
 ### `/generate-tasks`
-Reads the relevant section of `planning/master-plan.md`, writes a full task spec to
-`planning/<name>/tasks.md`, and **commits it** (clean tree for downstream `/sdlc-block`).
-Each spec carries a **Validation Commands** block and ends with a Validate task.
+Reads **`planning/blocks/<BlockID>.json`** — the authored block record (D65), *not* `master-plan.md`,
+which is a generated view and gets you a stale summary. Writes the executable task list to
+`planning/<name>/tasks.json`, renders the prose `tasks.md` from the record via
+`scripts/render_spec.py` (generated — never hand-edit), and **commits** for a clean downstream tree.
 
-**`--from <path>` mode** decomposes a single **standalone block file** (e.g. a `/plan` output)
-instead of a master-plan block — for ad-hoc / experimental features kept out of the roadmap. It
-derives the slug from the file's parent directory and writes `tasks.md` beside the source, then runs
-the identical decomposition / pipeline-recommendation logic. The default master-plan slug mode is
-unchanged.
+**Before writing any task it reads the actual source the record names** — real function names,
+signatures and sibling patterns. A file named as modified that does not exist means the record is
+wrong, and the command stops rather than emitting a task against a path that is not there.
+
+Three checks can **fail** the command and force a revision in place: **compilable task boundaries**
+(under `/sdlc-flow` and `/sdlc-task` every task must leave the gating suite passing, so a breaking
+public-surface change may never be split — the tasks merge, not the constraint); **un-gateable
+acceptance criteria must be declared** (D64 — evidence living in another process, another repo, a
+generated artifact, or an **installed** artefact needs a named failing command or a fixture-evidence
+task); and **never fabricate a load-bearing fact** (ask interactively, abort with specifics in a
+preflight context).
+
+The commit lands **after** the self-check, the decomposition assessment and the pipeline
+recommendation — all three can require a revision, so committing earlier means committing a draft.
+The report names the engine command the recommendation actually chose; `/breakdown` appears only
+when a task was flagged for it.
+
+**`--from <path>` mode** decomposes a single standalone block file (e.g. a `/plan` output) instead
+of a block record — for ad-hoc / experimental features kept out of the roadmap. Slug comes from the
+file's parent directory.
 
 ### `/breakdown`
 Reads a task spec and the source files each step touches, then writes a granular
 `breakdown.md` — every sub-step atomic (one file, one change, one command). Both `/implement`
 and `/fix` auto-detect this file and use the matching `### Step N:` section as the primary
 execution guide (HOW); `tasks.md` stays authoritative for scope (WHAT).
+
+**Only `tasks.json` is executed.** No engine parses `breakdown.md`, so a breakdown changes what an
+implementer *knows*, never what the engine *runs*. If the decomposition should change what gets
+executed — a task split in two, a merge forced by a breaking public-surface change, a new
+`dependsOn` edge, a wrong `files[]` — that correction must be **written back into `tasks.json`**
+and recorded in the breakdown's `## tasks.json changes` section. A breakdown that quietly disagrees
+with the JSON is worse than no breakdown: the engine follows the JSON and the reviewer follows the
+prose.
+
+It also **verifies every symbol it names actually exists** before committing (anything unresolved is
+either explicitly marked as created by the sub-step, or a mistake), and applies a **coarseness
+floor** — the same heuristic `/generate-tasks` uses at authoring time — so an already-atomic spec is
+reported as such instead of being restated at greater length.
 
 ### Pre-planning capture — `/capture`
 
@@ -458,7 +547,9 @@ pointer ticket to the brain's `planning/backlog.md`.
 
 The notes file sections (What & Why · Context & Background · Key Information · Open Questions ·
 Rough Scope) are designed as direct input to the planning commands below — paste conversation
-content in, then promote with `/plan`, `/chore`, or `/generate-master-plan` when ready.
+content in, then promote with `/plan`, `/chore`, or `/generate-master-plan` when ready. When the
+notes are about an existing system and the shape of the work is still unclear, promote through
+Phase 0 instead — `/assess` takes the notes as its framing input.
 
 ### Ad-hoc planners — `/chore`, `/ticket`, `/plan`
 
@@ -477,6 +568,21 @@ Output feeds the rest of the pipeline unchanged.
 Reference table), so `/sdlc-block` can orchestrate it as a branch train or `/generate-tasks --from
 planning/plan-<slug>/plan.md` can decompose a single block into a `tasks.md` → `/sdlc-flow`, all
 **without** touching `master-plan.md`. See `planning/decisions/D34-adhoc-planning-seam.md`.
+
+`/plan` reads **`planning/<slug>/sequence.md`** when Phase 0 has run, and carries its cut, wave
+boundaries, `ships` lines, `depends_on` edges, named files and recorded fork answers through rather
+than re-deriving them — a silent departure means the seam analysis was done and then ignored, so any
+departure has to be stated in the Sequencing Rationale with a reason. Where `assessment.md` and
+`verification.md` disagree, **verification wins**, and no claim it marked REFUTED may reach a block
+record.
+
+Its self-check carries three properties beyond the structural ones, each of which can **fail** the
+plan: **ships alone** (a block record whose `why` reads "enables <later block>" gets merged into the
+block that consumes it), **every block names the gate that proves it** plus — per D68 — how that gate
+is shown capable of *failing*, and a **handoff test** on the first runnable block (could a fresh
+agent start from that record alone, without asking a question?). A fresh-agent adversarial pass then
+attacks the sequencing, because step 9 is self-review by the context that wrote the plan. `--no-redteam`
+skips it for small, low-risk initiatives.
 
 ---
 
