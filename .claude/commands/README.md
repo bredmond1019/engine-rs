@@ -30,7 +30,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
   log-work.md       prime.md         session-recap.md
   wrap-up.md        update-state.md  next.md
 
-  assess.md         seams.md         sequence.md
+  assess.md         seams.md         sequence.md      define-polish-standard.md
 
   breakdown.md      chore.md         generate-master-plan.md  generate-tasks.md
   generate-roadmap.md  plan.md       ticket.md
@@ -54,7 +54,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 |---|---|
 | Session | `/prime`, `/session-recap`, `/next`, `/handoff`, `/wrap-up`, `/log-work`, `/archive`, `/capture` |
 | State | `/update-state` — how to safely edit `planning/state.json` per `state-schema.md` |
-| Pre-plan | `/assess`, `/seams`, `/sequence` |
+| Pre-plan | `/assess`, `/seams`, `/sequence`, `/define-polish-standard` |
 | Planning | `/generate-roadmap`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` (`/generate-master-plan` is superseded by `/plan --founding`, D65) |
 | SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block`, `/merge-train` |
@@ -101,6 +101,7 @@ predictably-named output file.
 | **0 — Pre-plan** | `/assess <topic>` | Fan out fresh recon agents, then a second fresh set to re-check the load-bearing claims | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` |
 | **0 — Pre-plan** | `/seams <slug>` | Built/half-built/absent, attachment points with one writer per side, blast radius, one spike, the operator's forks | `planning/<slug>/seams.md` |
 | **0 — Pre-plan** | `/sequence <slug>` | Cut into ordered blocks that each ship something usable; owning repo per block | `planning/<slug>/sequence.md` |
+| **0 — Pre-plan (UI)** | `/define-polish-standard <desc> --surface <kind>` | Write the falsifiable standard a UI can be judged against, then calibrate it until two reviewers agree | `planning/<slug>/polish-standard.md` |
 | **1 — Roadmap** | `/plan --founding` | A new project's founding roadmap — block records, not a hand-written master plan | `planning/founding/plan.md` + `planning/blocks/*.json` |
 | **1 — Plan** | `/generate-tasks <name>` · `/generate-tasks --from <path>` | Write the full task spec from a master-plan block, **or** from a standalone block file (`--from`) | `planning/<name>/tasks.md` |
 | **1 — Plan (ad-hoc)** | `/chore` · `/ticket` · `/plan <desc>` | Plan ad-hoc work from a free-text description (not a roadmap block). `/ticket` reproduces the failure first and orders the test before the fix; `/chore` takes a pre-change gate baseline | `planning/blocks/<BlockID>.json` + `planning/<BlockID>/tasks.json` — or `planning/<slug>/plan.md` for `/plan` |
@@ -184,6 +185,7 @@ to report to the operator on close. The map:
 | `/assess` | own; ends | Opus main · Sonnet scouts + verifiers |
 | `/seams` | continues into `/sequence` | Opus · Opus red team |
 | `/sequence` | own; **ends hard** | Opus · Opus red team |
+| `/define-polish-standard` | own; calibration subagents spawned from it | Opus |
 | `/plan` | fresh; ends | Opus |
 | `/generate-roadmap` | fresh; ends | Opus |
 | `/generate-tasks` | fresh, **one per block** | Sonnet (Opus for breaking-surface blocks) |
@@ -483,6 +485,7 @@ out to be a rewrite.
 | `/assess <topic> [--slug <name>] [--areas "..."] [--depth quick\|standard\|deep]` | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` | What is actually there, with proof, and which claims survived re-checking |
 | `/seams <slug> [--spike <n>]` | `planning/<slug>/seams.md` | Built / half-built / absent; what to reuse; what to delete; blast radius; the forks the operator must decide |
 | `/sequence <slug> [--single-repo]` | `planning/<slug>/sequence.md` | The cut into blocks, each shipping something usable, with owning repo and cross-repo contract author |
+| `/define-polish-standard <desc> --surface <web\|mobile\|tui\|desktop>` | `planning/<slug>/polish-standard.md` | What "polished" means for this product, in items that can be failed by looking |
 
 ### `/assess`
 Establishes ground truth first — builds, runs the gated checks, and **runs the subsystem once** if
@@ -525,6 +528,31 @@ whichever agent hits it first.
 **Session:** ends hard — `/plan` and `/generate-roadmap` always run fresh. This is the load-bearing
 break in the chain: a fresh session reading only `sequence.md` *is* the handoff test, performed
 rather than imagined. **Model:** Opus, Opus red team.
+
+### `/define-polish-standard`
+Runs **beside** the pipeline rather than in it, whenever the work involves a UI — web, mobile, TUI
+or desktop. "Clean and polished" cannot be assessed against nothing: without a written standard you
+get opinions, opinions differ between reviewers, and opinions do not become blocks of work.
+
+It looks at the running product first (a standard written from general UI knowledge describes some
+other product), **derives the existing system rather than inventing one** — codifying the spacing
+and type scales the code already uses, cited to source — and writes items that can be **failed by
+looking**, each with a verdict procedure. "Spacing is consistent" is not an item; "vertical gaps are
+multiples of 8px, flag any that is not" is. It covers the five states where products are actually
+unpolished — loading, empty, error, offline, permission-denied — and carries a real Out of Scope
+section so a polish review cannot sprawl into a redesign.
+
+**Then it calibrates, and that step is the gate:** two fresh agents, one screenshot, compared item
+by item. Any item they read differently gets tightened and both re-run. An item that will not
+converge after two rounds is taste, not a standard — it moves to Out of Scope or escalates to the
+operator. **Escalation trigger:** if the product has no discernible existing system at all, it stops
+and says so, because a standard written over that gap fails every screen, which is discouraging
+rather than actionable — that is a design decision or a `/ticket`, not a polish pass.
+
+Feed the result to `/assess`'s polish scout, or use it as the acceptance-criteria source for a UI
+`/ticket`. **Session:** one session, calibration subagents spawned from it; whatever reviews the UI
+runs fresh. **Model:** Opus — judging consistency across a whole product's screens is exactly the
+breadth-held-at-once case.
 
 ---
 
