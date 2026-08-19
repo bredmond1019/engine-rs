@@ -222,49 +222,67 @@ Full rationale: `docs/how-to-plan-with-agents.md` §11 in the brain repo.
 
 ### Argument Convention
 
-Every step from Phase 2 onward takes the same form: `planning/<name>/tasks.md [N]`
+Every step from Phase 2 onward takes the same form: `planning/<BlockID>/tasks.md [N]`
+
+That path is what the engines hand their agents as the spec document (`sdlc-task.js` and
+`sdlc-flow.js` both set `specFile = <blockDir>/tasks.md`). It is **not** what determines the work —
+the task loop is enumerated from `tasks.json`, and a missing or unparseable one hard-aborts the run
+(D16).
 
 Split on the last space. Trailing number = task N (scope to that task only). No number = full
-spec. Use the **same `N`** throughout the pipeline — it determines all report filenames at
-every step.
+spec. Use the **same `N`** throughout the pipeline — under `/sdlc-run` and the hand-invoked
+Phase 2–5 commands it determines every report filename (see Run Artifacts below).
 
 ### Directory Layout
 
-Each spec gets its own directory under `planning/`. All reports live in a `reports/`
-subdirectory alongside the spec:
+Each block gets its own directory under `planning/`, named exactly for its block ID. The block
+**record** lives separately in `planning/blocks/`, because it is the planning unit and outlives any
+one run (D65).
 
 ```
 planning/
-  <spec>/
-    tasks.md          ← spec (written by /generate-tasks)
-    breakdown.md      ← optional (written by /breakdown)
+  blocks/
+    <BlockID>.json    <- the block record: what/why/files/out_of_scope/AC. The authored unit.
+  <BlockID>/
+    tasks.json        <- THE EXECUTED TASK LIST. A bare array. Every engine reads this.
+    tasks.md          <- GENERATED from the record by scripts/render_spec.py. Never hand-edit.
+    breakdown.md      <- optional (written by /breakdown)
     sdlc/
-      reports/
-        implement.md         ← or task3-implement.md for task-scoped
-        test.md              ← or task3-test.md
-        review.md            ← or task3-review.md
-        document.md          ← or task3-document.md
-        workflow.md          ← or task3-workflow.md (written by /sdlc-run)
+      sdlc-<engine>-state.json   <- authoritative run state, committed
+      worklog.md                 <- human-readable trail, one section per task (D31)
+      reports/                   <- /sdlc-run only; plus gate baselines for the other engines
 ```
 
-### Report File Naming
+**The two files people confuse.** `tasks.json` is what runs — a bare array, never a
+`{"tasks": [...]}` wrapper. `tasks.md` is a rendered view of the block record that the engines hand
+their agents as the spec document; editing it by hand is silently discarded on the next render.
+Change the record and re-render. `BT.ticket.engines-read-block-record` retires `tasks.md` entirely
+once the engines read the record directly.
 
-Pattern: `[taskN-]{step}.md` inside `planning/<name>/sdlc/reports/`
+### Run Artifacts
+
+**`/sdlc-flow` and `/sdlc-task` do not write per-step reports.** D31 replaced the 5xN report files
+with one committed `sdlc-<engine>-state.json` plus one `worklog.md` — `sdlc-flow.js`'s own header
+says so. Their `sdlc/reports/` path survives only for gate baselines (`<slug>-baseline.json`,
+`<slug>-skip-baseline.txt`), not step output. Measured across the fleet: **0 `sdlc/reports/`
+directories exist; 18 `worklog.md` files do.**
+
+**`/sdlc-run` still writes the report-per-step layout**, and the table below is accurate for it and
+for the Phase 2-5 commands invoked by hand.
 
 | Step | Full-spec | Task-scoped |
 |---|---|---|
 | implement | `implement.md` | `task3-implement.md` |
-| fix | *(overwrites implement slot)* | *(overwrites implement slot)* |
+| fix | *(overwrites the implement slot)* | *(overwrites the implement slot)* |
 | test | `test.md` | `task3-test.md` |
 | review | `review.md` | `task3-review.md` |
 | document | `document.md` | `task3-document.md` |
-| workflow (sdlc-run) | `workflow.md` | `task3-workflow.md` |
+| workflow (`/sdlc-run`) | `workflow.md` | `task3-workflow.md` |
 | workflow-review | `workflow-review.md` | `task3-workflow-review.md` |
 
-> **Note:** `/fix` writes to the same `implement.md` slot as `/implement` — it represents the
-> current state of Phase 2 work. Git history preserves prior versions.
+Pattern: `[taskN-]{step}.md` inside `planning/<BlockID>/sdlc/reports/`. `/fix` writes to the same
+slot as `/implement` — it is the current state of Phase 2 work, and git history holds the rest.
 
----
 
 ## Automated & Orchestrated Pipelines
 
