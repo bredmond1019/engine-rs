@@ -74,9 +74,32 @@ This stage does not author block records or register `state.json`. That is `/pla
 
 5. **Size each block.** A block is one coherent, independently reviewable unit that
    `/generate-tasks` can turn into roughly one spec. Record for each:
-   - **a stable row ref** — `SQ-01`, `SQ-02`, … assigned once and never renumbered. Downstream,
-     `/generate-roadmap`'s coverage crosswalk greps these to prove no row fell out during lane
-     assignment; without a ref that check degrades to grepping distinctive prose.
+   - **a canonical block ID** — `<PFX>.<phase>.<block>`, e.g. `EN.12.A`, using the repo's `prefix`
+     from `brain.toml`. **This is the block's identity everywhere downstream** — the lane files, the
+     roadmap tables, `state.json`, and `/orchestrate`, which resolves IDs from the graph and cannot
+     do anything sensible with a name it does not find there.
+
+     Allocate it the way `.claude/workflows/block-registration.md` step 1 does: read the **owning
+     repo's** `planning/state.json`, take the highest existing phase **for that repo**, and number
+     upward. Never read a phase number from `master-plan.md` or `status.md` — narrative files lag,
+     and that lag is how one repo came to carry two unrelated "Phase 4"s. A cut spanning six repos
+     means six separate allocations, one per repo, each from that repo's own graph.
+
+     A block already registered keeps the ID it has — do not reallocate. Allocating an ID for a
+     candidate is cheap and reversible; a block cut later simply leaves its ID unused.
+
+   - **a stable row ref** — `SQ-01`, `SQ-02`, … assigned once and never renumbered. This is a
+     **document-local reference for this file's rows only**, so `/generate-roadmap`'s coverage
+     crosswalk can prove no row fell out during lane assignment.
+
+     > **`SQ-nn` is not a block ID and must never be used as one.** It may appear in a table
+     > column, in prose, and in a lane-file `#` comment for traceability. It may **not** appear as
+     > a bare line in a lane file, as a block's `id` in `state.json`, or anywhere `/orchestrate`
+     > will try to resolve it. A lane file whose executable lines are `SQ-nn` is unrunnable: every
+     > ID misses the graph, and the lane either stops on the first block or improvises a spec for
+     > something that was never specced. This has already happened once — the first roadmap built
+     > from a `sequence.md` shipped five lane files of `SQ-nn` lines that passed both crosswalks,
+     > because a crosswalk checks that refs *appear*, not that they are resolvable.
    - **registration state** — `registered` if the block already exists in its repo's `state.json`
      (give the real ID), or `candidate` if it does not. **`/orchestrate` resolves block IDs from
      `state.json`, and a lane file naming an ID that is not in the graph does not degrade
@@ -128,6 +151,11 @@ This stage does not author block records or register `state.json`. That is `/pla
     - Operator errands are listed as blocks, not as prose asides.
     - The cut list is non-empty.
     - Absolute numbers carried from the assessment are re-derived or marked stale.
+    - **Every block carries a canonical `<PFX>.<phase>.<block>` ID**, allocated from the owning
+      repo's own `state.json`, and every `depends_on` edge names block IDs rather than `SQ-nn`
+      refs. Grep your own output: a `depends_on` cell or a Wave 0 row containing `SQ-` is a defect.
+    - **No two blocks share an ID**, and no allocated ID collides with one already in that repo's
+      graph — check each against the repo's `state.json`, not against this document.
     - Every block carries a stable `SQ-nn` ref and a registration state checked against the repo's
       real `state.json`, and every `candidate` appears in the Wave 0 table.
     - Every repo has a gate weight determined by running `is-heavy`, not asserted.
@@ -200,9 +228,12 @@ what is last, which orderings are forced by dependency rather than preference.>
 
 ### Wave <N> — <what becomes true> · <k> blocks · <repos>
 
-| Ref | Block | Repo | Reg | Ships (what the operator can do the day it lands) | depends_on | Files | Gate | Risk |
-|---|---|---|---|---|---|---|---|---|
-| SQ-01 | <name> | <repo> | `registered: EN.9.A` \| `candidate` | <what becomes possible> | <edges> | <paths> | <check + how it is shown failing> | <what sinks it> |
+| Ref | Block ID | Name | Repo | Reg | Ships (what the operator can do the day it lands) | depends_on | Files | Gate | Risk |
+|---|---|---|---|---|---|---|---|---|---|
+| SQ-01 | `EN.12.A` | <name> | <repo> | `registered` \| `candidate` | <what becomes possible> | `EN.12.B`, `MV.4.A` | <paths> | <check + how it is shown failing> | <what sinks it> |
+
+*`Block ID` is the identity. `Ref` is a row label for this document's crosswalk and appears in no
+lane file's executable lines. `depends_on` names block IDs, never refs.*
 
 *Wave exit (an observation with a command — becomes the roadmap's Definition of Done verbatim):*
 ```
@@ -243,7 +274,7 @@ OK  <command> → <expected output>
 
 ## Wave 0 — what must be registered before any lane launches
 
-| Ref | Block | Repo | Why it is not yet in `state.json` |
+| Ref | Block ID | Repo | Why it is not yet in `state.json` |
 |---|---|---|---|
 
 *Every `candidate` row above appears here. `/orchestrate` resolves IDs from `state.json`; a lane
@@ -261,6 +292,7 @@ naming an unregistered ID stops or improvises.*
 planning/<slug>/sequence.md
 
 Waves: <n>   Blocks: <m>  (<r> registered, <c> candidates -> Wave 0)   Operator errands: <e>
+Block IDs allocated: <per repo, e.g. EN.12.A-EN.13.F (28) · MV.4.A-MV.4.C (3)>
 Repos: <list with gate weight>
 Forks resolved: <k>
 Blocks re-cut for failing the ships-alone test: <list>

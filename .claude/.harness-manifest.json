@@ -1,5 +1,5 @@
 {
-  "version": "14b931624948a73492fd96f129b9446ff41915da",
+  "version": "117c4032196cbc82ab6f3cd55ce16b861dbc96bd",
   "generated": "2026-08-19",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
@@ -52,7 +52,7 @@
     ".claude/commands/test_auth_gate.md": "57ff94d5033e1e69cbec61d3021a0bc6b08855f0906966971860351cd4b2adfa",
     ".claude/commands/update-state.md": "d6167547a2c123f56c693b1c186fc4c3afcbad9434ced8324a2ce6d53adfbfa1",
     ".claude/commands/test.md": "9dd42aa48a000ca410d9c91e3c5490be1d2cbeaee9fb5812fcff2c7dc7929b81",
-    ".claude/commands/sequence.md": "7d0a08708905cf8fe2a29e276692a92dd72936db0ba988600dcc8042b2f0fca4",
+    ".claude/commands/sequence.md": "3570287f51e39cbf1bfb15c2de54412aea1a66427855d7ec98e071b20e301a70",
     ".claude/commands/handoff.md": "fb2264a5a5171861f4ba345014f3fe3c583d12f09f04652a4cbc8d2de8e7627d",
     ".claude/commands/test_crud_api.md": "ff003bbd7257819431419cd185b6feba042c34d0d452f72c9af4eb4d3afea270",
     ".claude/commands/test_error_handling.md": "c1d727984d9b26da52d4e24cbca842dc7d818ce5758727a91f96f68c2e5fc4e2",
