@@ -424,6 +424,18 @@ needs. Skip all three when you already know the block — go straight to `/ticke
 The method behind them, including the fan-out shape, model tiering, the stopping rules, and the
 plan-solidity tests, is `docs/how-to-plan-with-agents.md` in the brain repo.
 
+**Phase 0 is optional; its floor is not.** `/plan` and `/generate-roadmap` both run fine with no
+pre-plan folder — short planning sessions should skip straight to them. But each carries a small
+inline **floor** for when Phase 0 was skipped: classify every capability the work *calls* rather
+than builds as built / half-built / absent, name the blast radius of each new attachment point, say
+what is deleted first, and (for a roadmap) name the single writer of every artifact two lanes touch.
+Answer them in proportion to the work — a sentence each for two blocks, a paragraph each for six.
+
+Each floor carries an **escalation trigger**: if the half-built question cannot be answered for
+something on the critical path, the command stops and recommends `/assess` rather than planning over
+the gap. That failure is invisible afterwards — it surfaces as a block sized as wiring that turns
+out to be a rewrite.
+
 | Command | Writes | Answers |
 |---|---|---|
 | `/assess <topic> [--slug <name>] [--areas "..."] [--depth quick\|standard\|deep]` | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` | What is actually there, with proof, and which claims survived re-checking |

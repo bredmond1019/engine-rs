@@ -1,5 +1,5 @@
 {
-  "version": "a930ee32c1cab9f5d7d92b2fe59d20f5bfa531a7",
+  "version": "a38439bb395ba99268625efe095ee0369ef7383c",
   "generated": "2026-08-19",
   "files": {
     ".claude/commands/update-task.md": "4033b41d5900ba5f36b0dc2c4e4812cde57574151edd4c29ef1298b49c6736fc",
@@ -31,7 +31,7 @@
     ".claude/commands/generate-tasks.md": "5b3ad2f6f39a1188b2ab5e55b88aefdfee05263b841453b7087ed87c837b21bb",
     ".claude/commands/merge-train.md": "8125dc3377aa05bfc7544eff5f7007c00516830da5b6fa549c1d8e6cefb931bf",
     ".claude/commands/breakdown.md": "917d5ec2de19c891ed1976f72f177ed9217051822445f2087bef966d7fae0de6",
-    ".claude/commands/README.md": "e4d6431d8c85b6438d6b301a05ab0a8742824c37ffd866c333f4b7c6631546e3",
+    ".claude/commands/README.md": "92eab0e1c795e6e228a972ab39d57f0d8cf40a154488979ec6295f1e2291daec",
     ".claude/commands/clean-worktree.md": "723317864d96815887aa443040fbf67069704caebd113433d8582f28e47b546f",
     ".claude/commands/blocked.md": "4ccdc2a885ac57ff31296f1b5d9ef6e48c4d02332059b968115ff52a03d6d843",
     ".claude/commands/initial-research.md": "51ab634d7bb00cfbc04fea58840a1b61b2173611b85f5867a0f90af1afbe37d3",
@@ -45,7 +45,7 @@
     ".claude/commands/chore.md": "0c06c4b05a94da96ff8707f22899b54b8ebf360e9fd7d521b1dad6dcbf225733",
     ".claude/commands/roadmap-status.md": "4d15c840ff88bbbf06c394a77ded5a0c9f0d2b321a08b5cde85d5dbc88b6a945",
     ".claude/commands/prime.md": "66fc6110181b6bd5b7d217c1d37405443467b3fe7a3da834d922edb03ec48d3c",
-    ".claude/commands/plan.md": "f008a97a6de10d36febceb50e05d2ff77c1ac56e457e26003906ba90e9f743c0",
+    ".claude/commands/plan.md": "1e8d3b1cb0e5b70ee976f028e053817cb3581083b47e9660fa2d0ef0a8c03536",
     ".claude/commands/close-out.md": "0c0ff7dd841cfe40acb0fb3c3e1c429b6c80a1a34f3cf7f321a836c56e50658c",
     ".claude/commands/commit.md": "fb9c00d28a9db7f05e731d31aad40fb43e8327c9d6fe9a30a374fd41afa8f9bb",
     ".claude/commands/orchestrate.md": "b01581b228f81166c2c5174d2ea394dd3df0be4a38efc6d7ff11d255ae480e28",

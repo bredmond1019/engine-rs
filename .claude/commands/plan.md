@@ -75,6 +75,29 @@ re-derived anyway (D65).
    - If you depart from `sequence.md`'s cut, say so explicitly in the Sequencing Rationale and
      give the reason. A silent departure means the seam analysis was done and then ignored.
 
+3b. **When there is no pre-plan folder — the floor.** Most initiatives do not need `/assess` →
+   `/seams` → `/sequence`, and this command must stay usable for a twenty-minute planning session.
+   But four questions cause almost all unbuildable plans, and they are cheap to answer inline.
+   Answer them **in proportion to the work** — a sentence each on a two-block initiative, a
+   paragraph each on a six-block one — and record the answers in the plan:
+
+   1. **Ground truth.** Have the repo's gated checks been run, and does the thing this builds on
+      actually run today? Do not plan around a theory of why something fails when running it once
+      settles it.
+   2. **Built, half-built, or absent?** For every capability this initiative *calls* rather than
+      builds: does it have a production call site, or does it merely exist in source — behind a
+      disabled flag, with only test callers, or never executed? Half-built is where plans die,
+      because it reads as reuse and costs a rewrite. Name a call site, or say there isn't one.
+   3. **What breaks if this attaches wrong?** One line of blast radius per new attachment point,
+      grounded in real consumers found by grep, not hypothetical ones.
+   4. **What already exists that this would duplicate, and what should be deleted first?**
+
+   **Escalation trigger — this is the point of the floor.** If you cannot answer question 2 from
+   what you have read, or question 3 comes back "unknown" for a load-bearing attachment, **stop and
+   recommend `/assess <topic>`** rather than planning on top of the gap. Say which question you
+   could not answer. A plan authored over an unanswered half-built question is not detectable
+   later: it surfaces as a block that was sized as wiring and turns out to be a rewrite.
+
 4. **Allocate the phase numbers from `state.json`, not from any narrative file.** Read this repo's
    `planning/state.json`, take the highest existing phase for this repo, and number upward.
    Narrative files lag, and that lag is how one repo came to carry two unrelated "Phase 4"s.
@@ -134,6 +157,9 @@ re-derived anyway (D65).
    - **The Sequence Table lists one row per block** and matches both the headings and the records.
    - **No leftover scaffold sentinels** — no `{{TOKEN}}`, no unfilled `<...>` stubs, no empty
      bullets. Legitimate `<...>` in code or prose is fine.
+   - **The pre-plan floor was answered** — carried from `sequence.md` (3a) or answered inline (3b).
+     In particular no capability this initiative *calls* is left unclassified as built / half-built
+     / absent.
    - **Frontmatter `related:` carries ≥1 real `doc_id`** (not `[]`), else this plan is an isolated
      graph node (`mev`'s `W_GRAPH_ISOLATED_NODE`). Use genuine doc_ids only; never invent one. On
      a revise, leave an already-populated `related:` intact.
