@@ -30,7 +30,8 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
   log-work.md       prime.md         session-recap.md
   wrap-up.md        update-state.md  next.md
 
-  assess.md         seams.md         sequence.md      define-polish-standard.md
+  assess.md         seams.md         sequence.md
+  define-design-system.md            define-polish-standard.md
 
   breakdown.md      chore.md         generate-master-plan.md  generate-tasks.md
   generate-roadmap.md  plan.md       ticket.md
@@ -54,7 +55,8 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 |---|---|
 | Session | `/prime`, `/session-recap`, `/next`, `/handoff`, `/wrap-up`, `/log-work`, `/archive`, `/capture` |
 | State | `/update-state` — how to safely edit `planning/state.json` per `state-schema.md` |
-| Pre-plan | `/assess`, `/seams`, `/sequence`, `/define-polish-standard` |
+| Pre-plan | `/assess`, `/seams`, `/sequence` |
+| UI foundations | `/define-design-system` (greenfield), `/define-polish-standard` (existing UI) |
 | Planning | `/generate-roadmap`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` (`/generate-master-plan` is superseded by `/plan --founding`, D65) |
 | SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block`, `/merge-train` |
@@ -101,7 +103,8 @@ predictably-named output file.
 | **0 — Pre-plan** | `/assess <topic>` | Fan out fresh recon agents, then a second fresh set to re-check the load-bearing claims | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` |
 | **0 — Pre-plan** | `/seams <slug>` | Built/half-built/absent, attachment points with one writer per side, blast radius, one spike, the operator's forks | `planning/<slug>/seams.md` |
 | **0 — Pre-plan** | `/sequence <slug>` | Cut into ordered blocks that each ship something usable; owning repo per block | `planning/<slug>/sequence.md` |
-| **0 — Pre-plan (UI)** | `/define-polish-standard <desc> --surface <kind>` | Write the falsifiable standard a UI can be judged against, then calibrate it until two reviewers agree | `planning/<slug>/polish-standard.md` |
+| **0 — UI (greenfield)** | `/define-design-system <desc> --surface <kind>` | Tokens, components and rules a new UI is built from; proved by building one real screen | `planning/<slug>/design-system.md` + emitted token/theme/component files |
+| **0 — UI (existing)** | `/define-polish-standard <desc> --surface <kind>` | The falsifiable standard a UI is judged against, calibrated until two reviewers agree | `planning/<slug>/polish-standard.md` |
 | **1 — Roadmap** | `/plan --founding` | A new project's founding roadmap — block records, not a hand-written master plan | `planning/founding/plan.md` + `planning/blocks/*.json` |
 | **1 — Plan** | `/generate-tasks <name>` · `/generate-tasks --from <path>` | Write the full task spec from a master-plan block, **or** from a standalone block file (`--from`) | `planning/<name>/tasks.md` |
 | **1 — Plan (ad-hoc)** | `/chore` · `/ticket` · `/plan <desc>` | Plan ad-hoc work from a free-text description (not a roadmap block). `/ticket` reproduces the failure first and orders the test before the fix; `/chore` takes a pre-change gate baseline | `planning/blocks/<BlockID>.json` + `planning/<BlockID>/tasks.json` — or `planning/<slug>/plan.md` for `/plan` |
@@ -185,6 +188,7 @@ to report to the operator on close. The map:
 | `/assess` | own; ends | Opus main · Sonnet scouts + verifiers |
 | `/seams` | continues into `/sequence` | Opus · Opus red team |
 | `/sequence` | own; **ends hard** | Opus · Opus red team |
+| `/define-design-system` | own; the first feature runs fresh | Opus |
 | `/define-polish-standard` | own; calibration subagents spawned from it | Opus |
 | `/plan` | fresh; ends | Opus |
 | `/generate-roadmap` | fresh; ends | Opus |
@@ -485,7 +489,8 @@ out to be a rewrite.
 | `/assess <topic> [--slug <name>] [--areas "..."] [--depth quick\|standard\|deep]` | `planning/<slug>/assessment.md` · `verification.md` · `evidence/` | What is actually there, with proof, and which claims survived re-checking |
 | `/seams <slug> [--spike <n>]` | `planning/<slug>/seams.md` | Built / half-built / absent; what to reuse; what to delete; blast radius; the forks the operator must decide |
 | `/sequence <slug> [--single-repo]` | `planning/<slug>/sequence.md` | The cut into blocks, each shipping something usable, with owning repo and cross-repo contract author |
-| `/define-polish-standard <desc> --surface <web\|mobile\|tui\|desktop>` | `planning/<slug>/polish-standard.md` | What "polished" means for this product, in items that can be failed by looking |
+| `/define-design-system <desc> --surface <kind>` | `planning/<slug>/design-system.md` + token/theme/component files | What a **new** UI is built from — tokens, a justified component inventory, the rules |
+| `/define-polish-standard <desc> --surface <kind>` | `planning/<slug>/polish-standard.md` | What "polished" means for an **existing** product, in items that can be failed by looking |
 
 ### `/assess`
 Establishes ground truth first — builds, runs the gated checks, and **runs the subsystem once** if
@@ -529,7 +534,32 @@ whichever agent hits it first.
 break in the chain: a fresh session reading only `sequence.md` *is* the handoff test, performed
 rather than imagined. **Model:** Opus, Opus red team.
 
-### `/define-polish-standard`
+### `/define-design-system` — greenfield UI
+For a UI that **does not exist yet**: a new client project, a new side project, a new app. Emits the
+artifacts the first screen is built from — design tokens as real files, a Tailwind or `ThemeData`
+config, a justified component inventory, the icon set — plus the rules that keep screen twenty
+consistent with screen one.
+
+Two things keep it honest. It **checks what the practice already settled before choosing a stack**
+(Next + React 19 + Tailwind 4 + `lucide-react` + `clsx`/`tailwind-merge`, hand-rolled components —
+neither `learn-ai` nor `bastion-web` carries a `components.json`, so shadcn-vs-hand-rolled is a real
+decision it surfaces rather than takes silently). And **tokens come before components**, because a
+component that hardcodes a colour cannot be retuned.
+
+**The gate is building one real screen with it** — not a swatch page or a component gallery. Reaching
+for a value that is not in the scale means the scale is wrong; needing a component that is not in the
+inventory means the inventory is wrong or the screen is. What that forces gets folded back and
+recorded. A system never used to build anything is a wish.
+
+Component inventory is deliberately short: an entry earns its place only by appearing on ≥2 real
+screens or being a state container. It ends by emitting a polish standard, so the review path
+converges with the command below. **Escalation trigger:** if the product already has a discernible
+system, it stops — codify it with `/define-polish-standard` instead; a second system is a rewrite.
+
+> **A new page in an existing app needs neither command.** It inherits the system and is reviewed
+> against the existing standard. Both of these are for the uncommon case.
+
+### `/define-polish-standard` — existing UI
 Runs **beside** the pipeline rather than in it, whenever the work involves a UI — web, mobile, TUI
 or desktop. "Clean and polished" cannot be assessed against nothing: without a written standard you
 get opinions, opinions differ between reviewers, and opinions do not become blocks of work.
