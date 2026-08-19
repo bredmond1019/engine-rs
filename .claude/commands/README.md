@@ -456,8 +456,13 @@ artifact that the next reads; `/sequence`'s output is the only input `/plan` or 
 needs. Skip all three when you already know the block — go straight to `/ticket`, `/chore`, or
 `/generate-tasks`.
 
-The method behind them, including the fan-out shape, model tiering, the stopping rules, and the
-plan-solidity tests, is `docs/how-to-plan-with-agents.md` in the brain repo.
+The method behind them is `docs/how-to-plan-with-agents.md` in the brain repo. Its §1 states the
+whole arc as **six phases named by the question each answers** — assess, seams, sequence, author,
+decompose, evaluate — independent of these commands, which are one implementation of it. The rule
+that makes the phases work is that **each is forbidden from doing the next one's job**: an
+assessment may not propose a sequence, a seam map may not cut blocks, a sequence may not assign
+concurrency, an author may not re-cut. The operator decides at exactly two points, both blocking:
+the forks (after seams) and the cut (after sequence).
 
 **Phase 0 is optional; its floor is not.** `/plan` and `/generate-roadmap` both run fine with no
 pre-plan folder — short planning sessions should skip straight to them. But each carries a small
