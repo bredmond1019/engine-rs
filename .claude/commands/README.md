@@ -3,7 +3,8 @@
 Custom Claude Code commands for projects scaffolded from `base-template/`. All commands are flat
 — invoke with `/<name>` directly (e.g. `/prime`, `/plan`, `/implement`, `/commit`).
 
-These drive **structured spec work**: a spec lives at `planning/<name>/tasks.md`, and
+These drive **structured spec work**: a spec lives at `planning/blocks/<BlockID>.json` plus
+`planning/<BlockID>/tasks.json`, and
 the pipeline takes it through implement → test → review → document → wrap-up, writing
 predictably-named reports alongside it.
 
@@ -28,7 +29,6 @@ predictably-named reports alongside it.
     - [Directory Layout](#directory-layout-1)
     - [Run Artifacts](#run-artifacts)
   - [Automated \& Orchestrated Pipelines](#automated--orchestrated-pipelines)
-    - [`/sdlc-block` — roadmap orchestration (branch train)](#sdlc-block--roadmap-orchestration-branch-train)
     - [`/review-PR <PR#> [plan-slug]`](#review-pr-pr-plan-slug)
     - [`/merge-train [plan-slug]`](#merge-train-plan-slug)
     - [`/orchestrate <block-id ...> | <list-file>`](#orchestrate-block-id---list-file)
@@ -218,9 +218,9 @@ PHASE 0 — PRE-PLAN         ← existing system, cut not obvious. Skip for a kn
                                  → /begin-orchestration --roadmap ... --lane ... → /orchestrate
 
 PHASE 1 — PLAN             ← fresh session, ONE PER BLOCK
-  /generate-tasks <spec>                 → planning/<spec>/tasks.json (+ rendered tasks.md)
+  /generate-tasks <spec>                 → planning/<spec>/tasks.json
         ↓  (optional — only if a task is genuinely coarse; same session)
-  /breakdown planning/<spec>/tasks.md   → planning/<spec>/breakdown.md
+  /breakdown <BlockID>                   → planning/<spec>/breakdown.md
                                            (+ any executable correction written back to tasks.json)
       | fresh — the engine runs in its own session
 
@@ -310,7 +310,8 @@ planning/
     <BlockID>.json    <- the block record: what/why/files/out_of_scope/AC. The authored unit.
   <BlockID>/
     tasks.json        <- THE EXECUTED TASK LIST. A bare array. Every engine reads this.
-    tasks.md          <- GENERATED from the record by scripts/render_spec.py. Never hand-edit.
+    tasks.md          <- LEGACY. No longer generated; render_spec.py is deleted. Read only as a
+                         fallback for blocks that predate the block record.
     breakdown.md      <- optional (written by /breakdown)
     sdlc/
       sdlc-<engine>-state.json   <- authoritative run state for /sdlc-task or /sdlc-flow, committed
@@ -319,11 +320,15 @@ planning/
       reports/                   <- gate baselines only (<slug>-baseline.json, <slug>-skip-baseline.txt)
 ```
 
-**The two files people confuse.** `tasks.json` is what runs — a bare array, never a
-`{"tasks": [...]}` wrapper. `tasks.md` is a rendered view of the block record that the engines hand
-their agents as the spec document; editing it by hand is silently discarded on the next render.
-Change the record and re-render. `BT.ticket.engines-read-block-record` retires `tasks.md` entirely
-once the engines read the record directly.
+**Where a spec lives.** `planning/blocks/<BlockID>.json` is the authored record (what/why/files/
+acceptance criteria); `planning/<BlockID>/tasks.json` is what runs — a bare array, never a
+`{"tasks": [...]}` wrapper. The engines read both directly.
+
+`tasks.md` is **retired** (`BT.ticket.engines-read-block-record`, 2026-08-20). Nothing generates it,
+`scripts/render_spec.py` is deleted, and `/ticket`, `/chore` and `/generate-tasks` no longer have a
+render step. The engines still *read* it as a fallback for blocks that have no record yet, so
+existing files keep working — but do not create new ones. Amendments go in a sibling
+`amendments.md`, which no render can overwrite.
 
 ### Run Artifacts
 
@@ -495,7 +500,7 @@ cannot be invoked from a slash command; run it yourself when you want one.
 
 ### `/session-recap`
 Start-of-session briefing: reads the three most recent Log entries, status.md, the current
-spec's `tasks.md`, and the `reports/` directory listing; outputs a concise briefing (under 300
+spec's block record and `tasks.json`, and its `sdlc/worklog.md`; outputs a concise briefing (under 300
 words) and the exact next command. Read-only.
 
 ### `/update-state`
@@ -718,8 +723,8 @@ remains only to redirect. Do not hand-write or hand-edit a `master-plan.md`; if 
 ### `/generate-tasks`
 Reads **`planning/blocks/<BlockID>.json`** — the authored block record (D65), *not* `master-plan.md`,
 which is a generated view and gets you a stale summary. Writes the executable task list to
-`planning/<name>/tasks.json`, renders the prose `tasks.md` from the record via
-`scripts/render_spec.py` (generated — never hand-edit), and **commits** for a clean downstream tree.
+`planning/<name>/tasks.json` and **commits** for a clean downstream tree. There is no render step —
+`tasks.md` is retired and `scripts/render_spec.py` is deleted.
 
 **Before writing any task it reads the actual source the record names** — real function names,
 signatures and sibling patterns. A file named as modified that does not exist means the record is
@@ -812,14 +817,14 @@ Output feeds the rest of the pipeline unchanged.
 
 | Command | Use for | Writes to | Escalates to |
 |---|---|---|---|
-| `/chore <description>` | Maintenance / housekeeping — no behavior change | `planning/blocks/<Prefix>.chore.<slug>.json` + `planning/<BlockID>/tasks.json` (+ rendered `tasks.md`) | `/ticket`, if it turns out to change behavior |
+| `/chore <description>` | Maintenance / housekeeping — no behavior change | `planning/blocks/<Prefix>.chore.<slug>.json` + `planning/<BlockID>/tasks.json` | `/ticket`, if it turns out to change behavior |
 | `/ticket <description>` | Bug fix or targeted enhancement requiring tests + observable AC | `planning/blocks/<Prefix>.ticket.<slug>.json` + `planning/<BlockID>/tasks.json` (+ rendered `tasks.md`) | `/plan` on size · `/assess` when the behavior can't be reproduced or the half-built question can't be answered |
 | `/plan <description>` | Any ad-hoc or experimental feature — several blocks in one repo | `planning/<slug>/plan.md` + `planning/blocks/*.json` | `/generate-roadmap` if it spans repos · `/assess` per its own floor |
 
 `/chore` and `/ticket` are the **one-session** commands: they author the block record *and* its
 task list in the same pass, because a one-off has no downstream block waiting on its code and so
-nothing to defer (D65). `tasks.md` is rendered from the record by `scripts/render_spec.py` — never
-hand-written.
+nothing to defer (D65). Neither writes a `tasks.md`: the render step and `scripts/render_spec.py`
+were retired with `BT.ticket.engines-read-block-record`.
 
 **`/chore` and `/ticket` carry the pre-plan floor at their own scale.** **`/ticket`** reproduces the failure before
 writing a single Acceptance Criterion — a ticket written from a *described* bug fixes the

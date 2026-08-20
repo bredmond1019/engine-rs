@@ -1,5 +1,5 @@
 {
-  "version": "f684dda7bc43e12957c51cf15e93419dc475252c",
+  "version": "6b54be4d9e3041f1652cbb709ae367434292e89f",
   "generated": "2026-08-20",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -33,7 +33,7 @@
     ".claude/commands/generate-tasks.md": "98b59aab1750847f7069c82d376223ada38fd997f682b8d65b76edad6b57c2f7",
     ".claude/commands/merge-train.md": "44e953a900cf80581c79161b85e2e2110d663d68805bd01ed98c38a571b4b750",
     ".claude/commands/breakdown.md": "d26fc0ee89ee385bfba9c008b1b3f991684ea47084793809757162d53b73eae6",
-    ".claude/commands/README.md": "69364337ab3366a6668672e0afa556fceee6323f91dd07c54ff3c085f25f1d82",
+    ".claude/commands/README.md": "b17ad4b7ce05393c1eaaf7bd62d37e65b6a940e5ec5d830684c1156bb0bd29f5",
     ".claude/commands/clean-worktree.md": "f1b6292371a72ea67e2143a604d5f6946482b3be9a7397a124245d7ed304f29c",
     ".claude/commands/blocked.md": "4ccdc2a885ac57ff31296f1b5d9ef6e48c4d02332059b968115ff52a03d6d843",
     ".claude/commands/initial-research.md": "f64b09407089bf5cc27561649408994cdd6ee608b718642a12a7a4b1c82c3287",
@@ -64,7 +64,7 @@
     ".claude/workflows/harness.schema.json": "1044b2e179962a1bae21c6f155cad14d2b9014c4fc69ebbc1769b9a4b91740ee",
     ".claude/workflows/block-registration.md": "615e76f6710df55f89553801c0f300f58b9c9dca09c003663b6350ec048c0505",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
-    ".claude/skills/write-okf-markdown/SKILL.md": "b294aeb7a1af4b210e065bd0d5c37262ecdd4957f14783a742cb37524df7e4a0",
+    ".claude/skills/write-okf-markdown/SKILL.md": "dd2658bc78348bc20e98fdc7fa887b1fab52731b1faa7fed49c4204493f02fe0",
     ".claude/skills/edit-state-json/SKILL.md": "a111e5726221415b5207072ffb7123b4065818e6f26d25f9debf40b45d2d45c7",
     ".claude/skills/commit-in-this-fleet/SKILL.md": "921f3582a7a5bc54afdccc5d49a1b71429121d0a9795256a864308d1015d6d17",
     ".claude/skills/derive-state-safely/SKILL.md": "d431bbf6385cd23d6a86a307e32257f241ed128a09f8ce89195110a0ac5270d0",
@@ -72,7 +72,7 @@
     "scripts/check_block_records.py": "5b0bad333c00aacc26276bd42d274adbb2f8857cba16df9f7e60d7c3cb518132",
     ".agents/skills/sdlc-task/SKILL.md": "d310d5297414f08f0807127d52fb5537d43d423bf91f11bf6700490a236ad70f",
     ".agents/skills/sdlc-flow/SKILL.md": "c9222485e9cf3eff0d047c9e54f55fca6a49ae928c456043f7e9f1ca0fc6e9b9",
-    ".agents/skills/write-okf-markdown/SKILL.md": "6584e7b63785703556a3d410e8a8e50935d0745c04db6f436dd37ec3e8893415",
+    ".agents/skills/write-okf-markdown/SKILL.md": "5ba5dce63af971a22cdcc8e54d36e68f1559364037e4fe01b48932f9e3b99cd7",
     ".agents/skills/edit-state-json/SKILL.md": "fe2b8bece8f44840933311a24637e3368958a42179f4643440d957a445570bea",
     ".agents/skills/commit-in-this-fleet/SKILL.md": "7906b88aae7b3743c50e80fbe8ad9d5883bf6e4e164376a0d434b8d8f6694f1a",
     ".agents/skills/derive-state-safely/SKILL.md": "739dbc5444174348fe375d48a9478062cd3cc41fae0213c9feaaea00168e8935",

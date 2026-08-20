@@ -182,6 +182,53 @@ to `mev`. HQ's `planning/harness.json` gates on the `bastion` form; use it for c
 
 ---
 
+## Deleting a doc — the error lands on OTHER files, in two waves
+
+Deleting a `.md` is not the inverse of adding one. **Every error it causes appears somewhere else,
+so a path-scoped check on what you deleted reports clean.** It arrives in two waves, and fixing the
+first surfaces the second — expect to run the gates at least three times.
+
+**Wave 1 — dead links (`--links`), on every file that pointed AT the deleted doc:**
+- `[text](path/to/deleted.md)` markdown links
+- `file:///abs/path/to/deleted.md` URIs, including in archived or superseded documents nobody
+  thinks of as live
+- `[[wikilinks]]`
+
+**Wave 2 — dangling edges (`--graph`), on every file naming its `doc_id` in `related:`.** These do
+**not** appear until wave 1 is clean, because `--links` and `--graph` are separate flags and you
+only run the second after the first goes green.
+
+Measured 2026-08-20 retiring `/sdlc-block` and `/sdlc-run`: deleting 12 doc pages produced **0**
+errors on the deleted paths, then **58** `E_LINK_DEAD_MARKDOWN` across `index.md` and `commands.md`
+in six repos, then **13** `E_GRAPH_DANGLING_RELATED` on the *surviving* `sdlc-flow.md` /
+`sdlc-task.md` pages once links were clean.
+
+**Do this before deleting, not after:**
+
+```bash
+# 1. Who links to it? (all three link forms, symlink- and gitignore-blind by default -> -L -uu)
+rg -L -uu -l 'deleted-file\.md|\[\[deleted-doc-id\]\]' .
+
+# 2. Who names its doc_id in related:?  Use the doc_id, NOT the filename - they differ.
+rg -L -uu -l 'related:.*deleted-doc-id' .
+
+# 3. Which index.md lists it? (Standing Rule 7 in reverse - the row must go too)
+rg -L -uu -l 'deleted-file\.md' --glob 'index.md'
+```
+
+Fix all three sets **in the same change as the deletion**. Then run `--links` and `--graph`
+separately, in that order, and re-run both after each fix.
+
+**Two traps:**
+- **`related:` holds `doc_id`s, not filenames.** Grepping the filename finds the links and misses
+  every graph edge. `doc_id` defaults to the filename stem but is often set explicitly to something
+  else — read the deleted file's frontmatter before you delete it, and note the `doc_id` down.
+- **A retired doc's *content* usually outlives its links.** De-linking a reference to a deleted
+  engine leaves prose that still describes it as live. Removing the link makes the gate green; it
+  does not make the sentence true. Say what changed, or delete the sentence.
+
+---
+
 ## Before you commit
 
 - [ ] In corpus? (Step 1) — if not, none of this applies
