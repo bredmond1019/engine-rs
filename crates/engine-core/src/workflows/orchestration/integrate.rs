@@ -507,6 +507,23 @@ impl From<ExecuteError> for IntegrateError {
 /// lane-log line is already on disk), and the loop resumes at exactly the
 /// held step the moment [`HoldSource::is_held`] reports clear, never
 /// re-visiting an earlier step.
+///
+/// `lane` is the ORCHESTRATION event's real lane name for a roadmap+lane
+/// chain. An explicit `blocks` chain has no lane by construction (there is
+/// no lane file to have parsed one from) — pass `None` and each step's
+/// lane-log line falls back to that step's own repo slug, matching how the
+/// fleet's hand-written lines already read `lane == repo` for a
+/// single-repo lane. The fallback is resolved per step (not once for the
+/// whole chain) so a mixed-repo explicit chain still gets a truthful lane
+/// per line rather than one step's repo borrowed for another's.
+///
+/// A step that fails — either [`execute_step`] itself or
+/// [`verify_state_write`] afterwards — still gets exactly one `bailed`
+/// line recorded before the error propagates, so a sibling lane sees the
+/// attempt rather than silence. If the bailed append itself fails, that
+/// append failure is swallowed and the *original* step error is what
+/// returns — a lane-log write hiccup must never replace the real reason
+/// the chain stopped.
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain(
     chain: &[ChainStep],
@@ -519,6 +536,7 @@ pub async fn integrate_chain(
     registry: &RepoRegistry,
     run_flow: &FlowRunner,
     roadmap_dir: &Path,
+    lane: Option<&str>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let mut outcomes = Vec::with_capacity(chain.len());
     for step in chain {
@@ -528,16 +546,28 @@ pub async fn integrate_chain(
 
         wait_for_clearance(hold_source, &step.repo, &step.block_id, poll_interval).await;
 
-        let outcome = execute_step(step, resolve_engine, registry, run_flow).await?;
-        verify_state_write(&outcome)?;
+        let step_lane = lane.unwrap_or(step.repo.as_str());
 
-        // Lane threading (the event's real lane vs. this repo-slug
-        // fallback) lands in EN.ticket.lane-log-entry-schema task 3, which
-        // adds a `lane` parameter to this function.
+        let outcome = match execute_step(step, resolve_engine, registry, run_flow).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let integrate_err = IntegrateError::from(err);
+                let entry = LaneLogEntry::bailed(step, step_lane, integrate_err.to_string());
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                return Err(integrate_err);
+            }
+        };
+
+        if let Err(err) = verify_state_write(&outcome) {
+            let entry = LaneLogEntry::bailed(step, step_lane, err.to_string());
+            let _ = append_lane_log_line(roadmap_dir, &entry);
+            return Err(err);
+        }
+
         let entry = LaneLogEntry::closed(
             &outcome,
-            &step.repo,
-            format!("block {} closed", step.block_id),
+            step_lane,
+            format!("block {} closed via SDLC_FLOW", step.block_id),
         );
         append_lane_log_line(roadmap_dir, &entry)?;
 
@@ -979,6 +1009,7 @@ mod tests {
             &registry,
             &runner,
             roadmap_dir.path(),
+            None,
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -1028,5 +1059,200 @@ mod tests {
         )
         .await;
         assert!(cleared.is_ok());
+    }
+
+    // ── Lane threading (EN.ticket.lane-log-entry-schema Task 3) ─────────
+
+    fn failing_runner(fail_block: &'static str) -> FlowRunner {
+        Arc::new(move |invocation| {
+            Box::pin(async move {
+                if invocation.block_id == fail_block {
+                    Err(crate::WorkflowError::new(format!(
+                        "simulated failure for {}",
+                        invocation.block_id
+                    )))
+                } else {
+                    Ok(engine_contract::TaskContext {
+                        event: json!({}),
+                        nodes: std::collections::HashMap::new(),
+                        metadata: json!({}),
+                        node_runs: std::collections::HashMap::new(),
+                    })
+                }
+            })
+        })
+    }
+
+    /// An explicit `blocks` chain has no lane by construction: passing
+    /// `lane: None` must make every appended line's `lane` fall back to
+    /// that step's own repo slug — matching how the fleet's hand-written
+    /// single-repo lines already read `lane == repo`.
+    #[tokio::test]
+    async fn no_lane_falls_back_to_the_step_repo_slug() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+        )
+        .await
+        .expect("chain should complete");
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let parsed: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["lane"], json!("repo-a"));
+        assert_eq!(parsed["repo"], json!("repo-a"));
+        assert_eq!(parsed["status"], json!("closed"));
+    }
+
+    /// A real lane, when given, is used as-is rather than falling back to
+    /// the repo slug.
+    #[tokio::test]
+    async fn a_real_lane_is_threaded_into_every_line() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-b", "B.1")];
+
+        integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            Some("backend"),
+        )
+        .await
+        .expect("chain should complete");
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        for line in contents.lines() {
+            let parsed: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["lane"], json!("backend"));
+        }
+    }
+
+    /// A failing step appends exactly one `bailed` line carrying the
+    /// error's text as its `note`, and the chain still returns that
+    /// error.
+    #[tokio::test]
+    async fn a_failing_step_appends_a_bailed_line_and_still_returns_the_error() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+        )
+        .await
+        .expect_err("a failing step must propagate its error");
+
+        assert!(matches!(err, IntegrateError::Execute(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("simulated failure"), "message was: {msg}");
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one bailed line for the attempt");
+        let parsed: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["status"], json!("bailed"));
+        assert_eq!(parsed["block"], json!("A.1"));
+        assert!(
+            parsed["note"]
+                .as_str()
+                .unwrap()
+                .contains("simulated failure"),
+            "note should carry the error text: {parsed}"
+        );
+    }
+
+    /// If the bailed append itself fails (here: the roadmap directory does
+    /// not exist, so the lane-log append cannot open the file), the
+    /// *original* step error is still what returns — a lane-log write
+    /// hiccup must never replace the real reason the chain stopped.
+    #[tokio::test]
+    async fn a_lane_log_append_failure_during_the_bail_path_does_not_mask_the_original_error() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        // A roadmap dir that does not exist: `append_lane_log_line` will
+        // fail to open the file, since there is no parent directory.
+        let missing_roadmap_dir = dir.path().join("no-such-roadmap-dir");
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            &resolve_engine,
+            &registry,
+            &runner,
+            &missing_roadmap_dir,
+            None,
+        )
+        .await
+        .expect_err("the original step failure must still surface");
+
+        assert!(
+            matches!(err, IntegrateError::Execute(_)),
+            "a masked lane-log write failure would surface as LaneLogWriteFailed instead: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("simulated failure"), "message was: {msg}");
     }
 }

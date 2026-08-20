@@ -337,6 +337,14 @@ impl Node for OrchestrationRunNode {
                 .map_err(|err| NodeError::new(format!("repo registry: {err}")))?,
         );
 
+        // The event's real lane for a roadmap+lane chain — threaded into
+        // every appended lane-log line. An explicit `blocks` chain has no
+        // lane by construction (there is no lane file to have parsed one
+        // from): `None` here means `integrate_chain` falls back to each
+        // step's own repo slug, matching the fleet's hand-written
+        // single-repo lines where `lane == repo`.
+        let mut resolved_lane: Option<String> = None;
+
         let chain: Vec<ChainStep> = if let Some(blocks) = &event.blocks {
             resolve_explicit_chain(
                 blocks
@@ -351,6 +359,7 @@ impl Node for OrchestrationRunNode {
             let lane = event.lane.clone().ok_or_else(|| {
                 NodeError::new("ORCHESTRATION event needs `lane` alongside `roadmap`")
             })?;
+            resolved_lane = Some(lane.clone());
             let lane_segments_path = event.brain_root.join("planning").join("lane-segments.json");
             let is_block_open = self.is_block_open.clone();
             resolve_lane_chain(&lane_segments_path, &roadmap, &lane, &move |token| {
@@ -415,6 +424,7 @@ impl Node for OrchestrationRunNode {
                 &repo_registry,
                 &run_flow,
                 &roadmap_dir,
+                resolved_lane.as_deref(),
             ))
             .map_err(|err| NodeError::new(err.to_string()))
         })
@@ -742,7 +752,91 @@ mod tests {
                 .join("lane-log.jsonl"),
         )
         .expect("lane-log.jsonl should exist");
-        assert_eq!(lane_log.lines().count(), 2);
+        let lines: Vec<serde_json::Value> = lane_log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        // An explicit `blocks` chain has no lane by construction: every
+        // appended line's `lane` falls back to that step's own repo slug,
+        // asserted explicitly rather than left incidental.
+        assert_eq!(lines[0]["lane"], lines[0]["repo"]);
+        assert_eq!(lines[1]["lane"], lines[1]["repo"]);
+        assert_eq!(lines[0]["repo"], "repo-a");
+        assert_eq!(lines[1]["repo"], "repo-b");
+    }
+
+    #[tokio::test]
+    async fn process_drives_a_roadmap_lane_chain_end_to_end_and_writes_the_real_lane() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        std::fs::write(
+            dir.path().join("planning").join("lane-segments.json"),
+            json!({
+                "blocks": [
+                    {
+                        "roadmap": "my-roadmap",
+                        "lane": "backend",
+                        "repo": "repo-a",
+                        "id": "A.1",
+                        "segment": 0,
+                        "position": 0
+                    },
+                    {
+                        "roadmap": "my-roadmap",
+                        "lane": "backend",
+                        "repo": "repo-b",
+                        "id": "B.1",
+                        "segment": 0,
+                        "position": 1
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "roadmap": "my-roadmap",
+            "roadmap_slug": "my-roadmap",
+            "lane": "backend",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["steps_integrated"], 2);
+
+        let lane_log = std::fs::read_to_string(
+            dir.path()
+                .join("planning")
+                .join("roadmaps")
+                .join("my-roadmap")
+                .join("lane-log.jsonl"),
+        )
+        .expect("lane-log.jsonl should exist");
+        let lines: Vec<serde_json::Value> = lane_log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        // The real event lane, not the repo slug.
+        assert_eq!(lines[0]["lane"], "backend");
+        assert_eq!(lines[1]["lane"], "backend");
     }
 
     #[tokio::test]

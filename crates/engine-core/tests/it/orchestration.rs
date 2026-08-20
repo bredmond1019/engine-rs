@@ -207,6 +207,7 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         &registry,
         &flow_runner,
         &roadmap_dir,
+        None,
     )
     .await
     .expect("two-repo chain should integrate cleanly");
@@ -258,6 +259,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         &registry,
         &flow_runner,
         &roadmap_dir,
+        None,
     )
     .await
     .expect_err("an unmet dependency must refuse the block");
@@ -331,6 +333,7 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             &registry,
             &flow_runner2,
             &roadmap_dir2,
+            None,
         )
         .await;
         admitted_writer.store(true, Ordering::SeqCst);
@@ -444,6 +447,7 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             &registry,
             &flow_runner,
             &roadmap_dir2,
+            None,
         )
         .await
     });
@@ -509,6 +513,7 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         &registry,
         &flow_runner,
         &roadmap_dir,
+        None,
     )
     .await
     .expect_err("a corrupted state write must fail the run");
@@ -517,9 +522,14 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
     let msg = err.to_string();
     assert!(msg.contains("A.1"));
 
-    // The run stops loudly rather than logging a line for an unverified
-    // block.
-    assert!(lane_log_lines(&roadmap_dir).is_empty());
+    // The run still stops loudly, but a `bailed` line is recorded for the
+    // attempt (EN.ticket.lane-log-entry-schema Task 3) — a sibling lane
+    // must see that this block was tried and failed, not silence.
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["status"], "bailed");
+    assert_eq!(lines[0]["block"], "A.1");
+    assert!(lines[0]["note"].as_str().unwrap().contains("A.1"));
 }
 
 // ── Lane-log on-disk contract (EN.ticket.lane-log-entry-schema Task 1) ───
