@@ -28,7 +28,13 @@
 //!    mismatch is [`IntegrateError::StateWriteMismatch`] and **fails the
 //!    run loudly** — this module never downgrades a mismatch to a
 //!    warning, which would recreate exactly the unreliability it exists
-//!    to replace.
+//!    to replace. It also independently rejects a state file whose
+//!    `final_validation.all_passed` reads `false` even when `"status"`
+//!    reads `"done"` ([`IntegrateError::FinalValidationGateFailed`]) — the
+//!    second end of `EN.ticket.final-validation-failure-must-block`'s fix,
+//!    defence in depth for a state file written by an older engine build
+//!    or by the JS `/sdlc-flow`, neither of which carries the in-engine
+//!    guard `wrap_up.rs`'s `derive_terminal_signal` now applies.
 //! 3. [`resolve_roadmap_dir`] / [`append_lane_log_line`] — resolve the
 //!    roadmap directory by `/begin-orchestration`'s Step 1C rule
 //!    (`planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`;
@@ -122,6 +128,18 @@ fn state_path_for(repo_path: &Path, block_id: &str) -> PathBuf {
 /// missing file, unparsable JSON, missing `"status"` key, or any value
 /// other than `"done"`; a mismatch on any of those is exactly the class of
 /// silent unreliability this verification step exists to close out.
+///
+/// Belt to `wrap_up.rs`'s brace: also rejects a state file whose
+/// `final_validation.all_passed` reads `false`, even though `"status"`
+/// itself reads `"done"`. `wrap_up.rs`'s `derive_terminal_signal` now
+/// consults the same gate and stops an in-engine run from ever writing
+/// `"done"` on a failed gate (`EN.ticket.final-validation-failure-must-block`
+/// Task 2) — but that guard lives inside one engine build. This assertion
+/// is the only one that also catches a state file written by an older
+/// engine build, or by the JS `/sdlc-flow`, which shares this exact path
+/// and schema but has no equivalent guard. `final_validation` being
+/// absent or `null` (a bailed run, a pre-`EN.3.E` file, or a JS-written
+/// file) is not itself a failure — only an explicit `false` is.
 pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateError> {
     let path = state_path_for(&outcome.repo_path, &outcome.block_id);
     let raw =
@@ -146,6 +164,24 @@ pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateErr
             path,
             found: status.map(str::to_string),
         });
+    }
+    if let Some(final_validation) = value.get("final_validation") {
+        if !final_validation.is_null() {
+            let all_passed = final_validation.get("all_passed").and_then(Value::as_bool);
+            if all_passed == Some(false) {
+                let failure_summary = final_validation
+                    .get("failure_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no failure_summary in state file)")
+                    .to_string();
+                return Err(IntegrateError::FinalValidationGateFailed {
+                    repo: outcome.repo.clone(),
+                    block_id: outcome.block_id.clone(),
+                    path,
+                    failure_summary,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -264,6 +300,18 @@ pub enum IntegrateError {
         path: PathBuf,
         found: Option<String>,
     },
+    /// The block's `sdlc-flow-state.json` parsed and `"status"` read
+    /// `"done"`, but `final_validation.all_passed` read `false` — the run
+    /// finished, but on a red build. Deliberately distinct from
+    /// [`IntegrateError::StateWriteMismatch`]: that variant says the run
+    /// did not finish; this one says it finished with a failing full-suite
+    /// gate, and an operator reading a stopped chain needs to know which.
+    FinalValidationGateFailed {
+        repo: String,
+        block_id: String,
+        path: PathBuf,
+        failure_summary: String,
+    },
     /// A `lane-log.jsonl` entry could not be serialized.
     LaneLogSerialize {
         block_id: String,
@@ -330,6 +378,17 @@ impl fmt::Display for IntegrateError {
                 path.display(),
                 found
             ),
+            IntegrateError::FinalValidationGateFailed {
+                repo,
+                block_id,
+                path,
+                failure_summary,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') state write verification failed: \
+                 \"status\": \"done\" at {} but final_validation.all_passed was false: {failure_summary}",
+                path.display()
+            ),
             IntegrateError::LaneLogSerialize { block_id, source } => write!(
                 f,
                 "lane-log entry for block '{block_id}' failed to serialize: {source}"
@@ -371,6 +430,7 @@ impl std::error::Error for IntegrateError {
             IntegrateError::LaneLogSerialize { source, .. } => Some(source),
             IntegrateError::LaneLogWriteFailed { source, .. } => Some(source),
             IntegrateError::StateWriteMismatch { .. }
+            | IntegrateError::FinalValidationGateFailed { .. }
             | IntegrateError::RoadmapDirNotFound { .. }
             | IntegrateError::AmbiguousRoadmapDir { .. } => None,
         }
@@ -563,6 +623,92 @@ mod tests {
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteUnreadable { .. }));
+    }
+
+    fn write_done_state_with_final_validation(
+        repo_path: &Path,
+        block_id: &str,
+        final_validation: Value,
+    ) {
+        let dir = repo_path.join("planning").join(block_id).join("sdlc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sdlc-flow-state.json"),
+            json!({"status": "done", "final_validation": final_validation}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn outcome_for(repo_path: &Path, block_id: &str) -> ExecutionOutcome {
+        ExecutionOutcome {
+            repo: "repo-a".into(),
+            repo_path: repo_path.to_path_buf(),
+            block_id: block_id.into(),
+            ctx: engine_contract::TaskContext {
+                event: json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn state_write_verification_rejects_done_status_with_failed_final_validation_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_final_validation(
+            dir.path(),
+            "A.1",
+            json!({
+                "all_passed": false,
+                "check_results": [],
+                "failure_summary": "Failed checks: build, clippy",
+            }),
+        );
+        let outcome = outcome_for(dir.path(), "A.1");
+        let err = verify_state_write(&outcome).unwrap_err();
+        assert!(matches!(
+            err,
+            IntegrateError::FinalValidationGateFailed { .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("Failed checks: build, clippy"));
+        assert!(msg.contains("A.1"));
+    }
+
+    #[test]
+    fn state_write_verification_accepts_done_status_with_passing_final_validation_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_final_validation(
+            dir.path(),
+            "A.1",
+            json!({
+                "all_passed": true,
+                "check_results": [],
+                "failure_summary": "",
+            }),
+        );
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_null_final_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_final_validation(dir.path(), "A.1", Value::Null);
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_state_file_with_no_final_validation_key() {
+        // A pre-EN.3.E state file — the "final_validation" key is absent
+        // entirely, not merely null. `write_done_state` produces exactly
+        // this shape.
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state(dir.path(), "A.1");
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
     }
 
     // ── Roadmap directory resolution ────────────────────────────────────
