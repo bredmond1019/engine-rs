@@ -584,3 +584,136 @@ fn lane_log_contract_fixture_round_trips_into_lane_log_entry() {
     assert!(saw_held, "fixture must cover status: held");
     assert!(saw_bailed, "fixture must cover status: bailed");
 }
+
+// ── Task 4: readable by the REAL reader, not a reimplementation ─────────
+//
+// The defect this whole ticket closes is that the writer's shape and the
+// reader's expectations were verified separately — the struct's own doc
+// comment claimed "deliberately plain and stable" while
+// `roadmap_status_discovery.py`'s `read_lane_log` silently skipped every
+// line it produced. Proving that closed means driving `integrate_chain`
+// (the real writer, through its real public API — a stub `FlowRunner`
+// stands in for `SDLC_FLOW` itself, exactly as the other tests in this
+// suite do) to write a real `lane-log.jsonl`, then shelling out to the
+// REAL `scripts/roadmap_status_discovery.py`'s `read_lane_log` /
+// `repos_from_lane_log` via `scripts/verify_lane_log_readable.py` (a thin,
+// checked-in import-and-call wrapper — never a Rust reimplementation of
+// the reader) and asserting on what that script actually returns.
+//
+// BEFORE/AFTER, recorded by hand against the same script (not asserted
+// here, since the old struct no longer exists to construct — this is the
+// direct evidence the defect existed and is now closed):
+//   BEFORE (old `{repo, block_id, integrated_at}` line):
+//     `{"entries": [{"repo": "repo-a", "block_id": "A.1", "integrated_at": "...”}],
+//       "repos": ["repo-a"]}`
+//     -- `repo` survives (as the ticket's own evidence said), but the
+//        entry carries no `lane`, `block`, or `status` key at all: any
+//        reader keying on those fields (which `/roadmap-status` and
+//        `/consolidate-run` both do) sees nothing usable.
+//   AFTER (new `{ts, lane, repo, block, status, note}` line):
+//     `{"entries": [{"ts": "...", "lane": "repo-a", "repo": "repo-a",
+//        "block": "A.1", "status": "closed", "note": "..."}],
+//       "repos": ["repo-a"]}`
+//     -- every field the readers key on is present and non-empty.
+
+/// Locate `scripts/verify_lane_log_readable.py` relative to this crate —
+/// `CARGO_MANIFEST_DIR` is `crates/engine-core`; the repo root (and its
+/// `scripts/`) is two levels up.
+fn verify_lane_log_readable_script() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/verify_lane_log_readable.py")
+}
+
+#[tokio::test]
+async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script() {
+    let script = verify_lane_log_readable_script();
+    assert!(
+        script.is_file(),
+        "expected {} to exist (checked into this repo)",
+        script.display()
+    );
+
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("prove-readability");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
+
+    integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("prove-readability-lane"),
+    )
+    .await
+    .expect("single-block chain should integrate cleanly");
+
+    // Sanity: exactly one line was actually written before we ask the real
+    // reader about it.
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 1, "expected exactly one engine-written line");
+
+    // Now hand the REAL reader the directory the engine just wrote into —
+    // no Rust-side reimplementation of `read_lane_log` in this test.
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(&roadmap_dir)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn python3 {}: {e}", script.display()));
+
+    assert!(
+        output.status.success(),
+        "verify_lane_log_readable.py failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "reader output was not valid JSON: {e}\nstdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+
+    let entries = parsed["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the real reader must see exactly one entry"
+    );
+
+    let entry = &entries[0];
+    for field in ["repo", "lane", "block", "status"] {
+        let value = entry
+            .get(field)
+            .unwrap_or_else(|| panic!("real reader's entry is missing '{field}'"))
+            .as_str()
+            .unwrap_or_else(|| panic!("real reader's entry field '{field}' is not a string"));
+        assert!(
+            !value.is_empty(),
+            "real reader's entry field '{field}' must be non-empty, got {value:?}"
+        );
+    }
+    assert_eq!(entry["repo"], "repo-a");
+    assert_eq!(entry["lane"], "prove-readability-lane");
+    assert_eq!(entry["block"], "A.1");
+    assert_eq!(entry["status"], "closed");
+
+    let repos = parsed["repos"].as_array().expect("repos must be an array");
+    assert_eq!(
+        repos.first().and_then(|v| v.as_str()),
+        Some("repo-a"),
+        "repos_from_lane_log must name the repo"
+    );
+}
