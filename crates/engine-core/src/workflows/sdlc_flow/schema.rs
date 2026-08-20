@@ -718,6 +718,14 @@ pub enum TerminalSignal {
     /// routing gate as [`Self::ReviewFail`], distinguished only by the
     /// upstream verdict string.
     StructuralFail(String),
+    /// `FinalValidationNode` stamped `all_passed: false` on the run-level,
+    /// full-depth harness gate. Unlike the other three variants, this one is
+    /// not a model judgment about a single task or review pass — it is
+    /// derived from a RUN-LEVEL gate that runs once, after every task's own
+    /// loop already reported success, and it is the only variant that can
+    /// fire on a run where every task passed. The carried `String` is the
+    /// gate's `failure_summary` (the failing check names).
+    FinalValidationFailed(String),
 }
 
 impl TerminalSignal {
@@ -727,7 +735,8 @@ impl TerminalSignal {
         match self {
             Self::MajorBail(message)
             | Self::ReviewFail(message)
-            | Self::StructuralFail(message) => message,
+            | Self::StructuralFail(message)
+            | Self::FinalValidationFailed(message) => message,
         }
     }
 }
@@ -789,9 +798,19 @@ pub fn derive_current_task(tasks: &[SDLCTask]) -> u32 {
 
 /// Derive the D31 committed-state `bail_reason`: `Some(message)` for a
 /// `Some` [`TerminalSignal`] of any variant, `None` on the happy path.
+///
+/// [`TerminalSignal::FinalValidationFailed`] is formatted as
+/// `Final validation gate FAILED: <failure_summary>` — the same wording
+/// [`super::wrap_up::WrapUpNode`]'s `gate_note` already renders, so the
+/// prose and this machine-readable field cannot disagree.
 #[must_use]
 pub fn derive_bail_reason(terminal_signal: Option<&TerminalSignal>) -> Option<String> {
-    terminal_signal.map(|signal| signal.message().to_string())
+    terminal_signal.map(|signal| match signal {
+        TerminalSignal::FinalValidationFailed(failure_summary) => {
+            format!("Final validation gate FAILED: {failure_summary}")
+        }
+        other => other.message().to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1416,6 +1435,7 @@ mod tests {
             TerminalSignal::MajorBail("max attempts reached".to_string()),
             TerminalSignal::ReviewFail("review FAIL, 0 issues".to_string()),
             TerminalSignal::StructuralFail("review PARTIAL, 12 issues".to_string()),
+            TerminalSignal::FinalValidationFailed("cargo clippy".to_string()),
         ] {
             assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
         }
@@ -1502,6 +1522,24 @@ mod tests {
             derive_bail_reason(Some(&TerminalSignal::StructuralFail("s".to_string()))),
             Some("s".to_string())
         );
+    }
+
+    #[test]
+    fn derive_bail_reason_final_validation_failed_matches_gate_note_wording() {
+        assert_eq!(
+            derive_bail_reason(Some(&TerminalSignal::FinalValidationFailed(
+                "cargo clippy, cargo nextest".to_string()
+            ))),
+            Some("Final validation gate FAILED: cargo clippy, cargo nextest".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_committed_status_blocked_for_final_validation_failed() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![task(1, SDLCTaskStatus::Done)];
+        let signal = TerminalSignal::FinalValidationFailed("cargo build --release".to_string());
+        assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
     }
 
     #[test]
