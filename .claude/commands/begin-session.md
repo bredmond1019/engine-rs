@@ -114,3 +114,15 @@ never started: the gate is gone and the work is not.
 - **Do not let a session grow.** If it turns out to need work an agent could have done alone, file
   that as a block and keep the session to the decision. Sessions that absorb implementation stop
   being sittings and start being projects, and then they do not get run either.
+
+## Report
+
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
+```
+Session <slug>: <closed | still open>
+- Exit artifact: <path> (<exists | not yet>)
+- Gates it unblocks: <block ids>, effective priority <n>
+<Next: the one command, or the one decision still needed from you>
+```

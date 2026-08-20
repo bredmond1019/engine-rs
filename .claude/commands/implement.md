@@ -36,11 +36,11 @@ Examples:
 
 No prose report file. Record this step's outcome the way `/sdlc-flow` and `/sdlc-task` do (D31): a
 structured `sdlc/worklog.md` section, plus an update to `sdlc/state.json`. Both live under
-`planning/<spec-slug>/sdlc/`, are **write-only artifacts** (never `git add`/`git commit` them — same
-D46-vault reasoning the engines use: `planning/` is a symlink into a brain vault in a vaulted repo,
-so committing anything under it can fail "beyond a symbolic link"; they're read back off disk, never
-out of git history), and are separate from the git commit you still make for the actual code/test
-changes per the spec's own instructions.
+`planning/<spec-slug>/sdlc/`, and are **committed**, exactly as `/sdlc-flow` and `/sdlc-task` commit
+theirs — the fleet tracks 272 worklogs and 577 run-state files. In a vaulted repo commit them
+through the REAL vault path (`git -C <vault>/planning ...`), never through the `planning/` symlink
+face, which aborts the whole `git add` with "beyond a symbolic link" (D46). They are separate from
+the git commit you still make for the actual code/test changes per the spec's own instructions.
 
 1. **Derive the spec dir:** `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/`. Create it if it does not exist (`mkdir -p`).
 

@@ -413,3 +413,15 @@ At the end of every lane, alongside the report and `review.md`:
 
 `--roadmap` resolves against `BRAIN_ROOT` when relative, so the same string works from every repo
 regardless of how deep it sits.
+
+## Report
+
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
+```
+Lane <name> briefed: <n> blocks, engine <task|flow>, isolation <worktree|in-place>
+- Held/blocked: <ids + what they wait on>, or "none"
+- Concurrency: registered <repo> (<category>) | not heavy | at capacity, waiting
+Starting: <first block id>
+```

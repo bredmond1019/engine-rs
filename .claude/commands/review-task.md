@@ -52,9 +52,10 @@ Examples:
 ## Record (worklog + state, not a prose report)
 
 No prose report file. Record this review the way `/sdlc-flow` and `/sdlc-task` do (D31) — a
-worklog section plus a state update. Both `sdlc/worklog.md` and `sdlc/state.json` are **write-only
-artifacts** (never `git add`/`git commit` them — `planning/` is a D46 vault symlink in a vaulted
-repo, so committing under it can fail "beyond a symbolic link"; they're read back off disk only).
+worklog section plus a state update. Both `sdlc/worklog.md` and `sdlc/state.json` are
+**committed**, exactly as the engines commit theirs — in a vaulted repo through the REAL vault path
+(`git -C <vault>/planning ...`), never through the `planning/` symlink face, which aborts the whole
+`git add` with "beyond a symbolic link" (D46).
 
 **Evidence format:** name the symbol first — function, struct, type, or test name — not a bare
 line number. A line number moves the moment the file is next edited; a symbol can still be

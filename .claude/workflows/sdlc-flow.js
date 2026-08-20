@@ -2449,7 +2449,7 @@ print('FLIPPED:' + bid)
     (a task-subset run, or a bail, still leaves it changed on disk), so the derived surfaces (status.md
     rollups, /attention boards, wave tables) need resyncing every time, not only on a full close.
     ${useWorktree
-      ? `- Do NOT run \`mev emit-state --write\` here: this is a linked git worktree, where emit-state refuses to run. The authored edits are committed on the branch below (step 5); the derived surfaces regenerate on the base branch when this branch merges (/clean-worktree, /merge-train, or /close-out --merge-branch run emit-state after integration). Set emitStateRan=false.`
+      ? `- Do NOT run \`mev emit-state --write\` here: this is a linked git worktree, where emit-state refuses to run. The authored edits are committed on the branch below (step 5); the derived surfaces regenerate on the base branch when this branch merges (/clean-worktree or /close-out --merge-branch run emit-state after integration). Set emitStateRan=false.`
       : `- This run is IN PLACE on branch ${branchName} (in the main repo tree, not an isolated worktree) — emit-state is safe to run right here on the branch, the same way \`git commit\` already lands right here: cd ${worktreePath} && mev emit-state --write . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation. (This is separate from the --auto-merge path's own emit-state call in step 5 below, which re-derives again on ${prBase} after the PR merges — that call is unaffected and still runs unconditionally there.)`}
 
 3. Prepend a new log.md entry (newest first):
@@ -2511,7 +2511,7 @@ stateWritten (true only if you performed the additional state write above), note
 if (wrapupResult?.stateWriteRejected) {
   log(`state.json: write REJECTED — net-new schema error(s) from mev validate-brain --state; rolled back byte-exact, block NOT closed this run. ${wrapupResult?.notes || ''}`)
 } else if (wrapupResult?.blockStatusFlipped) {
-  log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch (${wrapupResult?.stateWriteValidated ? 'validated: mev validate-brain --state, net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})${wrapupResult?.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree, /merge-train, or /close-out --merge-branch runs `mev emit-state --write` on merge.'}`)
+  log(`state.json: block "${wrapupResult.blockStatusFlipped}" → closed on the branch (${wrapupResult?.stateWriteValidated ? 'validated: mev validate-brain --state, net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})${wrapupResult?.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree or /close-out --merge-branch runs `mev emit-state --write` on merge.'}`)
 }
 if (wrapupResult?.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended.`)
 log(`Derived surfaces (in-place, this wrap-up): ${wrapupResult?.emitStateRan ? 'regenerated (mev emit-state --write).' : useWorktree ? 'skipped — worktree mode; focus.next stays stale until regenerated on merge.' : 'skipped (mev/brain.toml absent).'}`)

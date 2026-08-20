@@ -431,33 +431,37 @@ Cheap, and it catches anything that changed outside the chain. Then return to st
   — pass `-uu` too. A sweep reporting "clean" without both is not trustworthy. See
   `begin-orchestration.md`'s Traps section for the same rule stated for that command.
 
+## Required deliverable — the terminal `review.md`
+
+Before you report, write `planning/orchestration-run/<roadmap-slug>/review.md`. **Required, not
+optional.** Plain-English summary of what this chain changed, plus the hand-verification recipes an
+operator would run to confirm it. **Every recipe must have been executed by this session before the
+file is written, and the file must say so** (e.g. "ran, output: ..."). An authored-but-unrun recipe
+reads as verification while being a guess — worse than no recipe. Naming, frontmatter and lifecycle
+follow `planning/decisions/D57-orchestration-run-artifact-contract.md`; do not restate it.
+
 ## Final report
 
-A table, one row per block: `position · block ID · spec slug · engine · isolation · outcome ·
-state verified (clean / repaired) · commit or PR`.
+**<= 20 lines.** Everything else is already on disk — link paths, never restate them. See the
+`report-to-the-operator` skill.
 
-Then explicitly:
-- **HELD** blocks and what each waits on.
-- **State repairs** you made, and where.
-- **Merge conflicts** you resolved, and how.
-- **BROKEN DOWNSTREAM** — any consumer repo step 9 found broken by this chain's changes (repo,
-  error class, one-line fix estimate). Empty is the expected case; say so rather than omitting
-  the line.
-- **Decisions you took** under rule 10, each with its one-line reasoning — and confirmation they
-  are in `planning/orchestration-run/<roadmap-slug>/notes.md`, not only in this report.
-- **Open items** the run surfaced but did not fix, as recorded in the notes file (defects found in
-  passing, deferred propagation, anything needing its own ticket).
-- **The remaining chain** if you stopped early — as a paste-ready `/orchestrate` invocation.
-- A **terminal `planning/orchestration-run/<roadmap-slug>/review.md`** — required, not optional. It is a
-  plain-English summary of what this chain changed plus the hand-verification recipes an operator
-  would run to confirm it. Every recipe in it must have been **executed at least once by this
-  session before the file is written**, and the file must say so explicitly (e.g. "ran, output:
-  ...") — an authored-but-unrun recipe reads as verification while being a guess, which is worse
-  than no recipe at all. Naming, frontmatter, and lifecycle follow
-  `planning/decisions/D57-orchestration-run-artifact-contract.md`; do not restate that contract
-  here.
-- A reminder to run **`/log-work`**: `sdlc-task`'s bookkeep is deliberately lean and writes no
-  `log.md` entry, so a chain of tasks leaves no narrative history without it.
+Line 1: `<n>/<m> blocks closed[, <k> HELD]` + whether anything needs the operator.
+
+Then a table, one row per block: `# · block ID · engine · outcome · state (clean/repaired) ·
+commit or PR`.
+
+Then **only the lines that are non-empty**, one line each:
+- **HELD** — block + what it waits on.
+- **State repairs** — block + what was wrong.
+- **Merge conflicts** — block + how resolved.
+- **BROKEN DOWNSTREAM** — repo + error class. Say "none" explicitly; silence is ambiguous here.
+- **Needs your call** — anything you could not decide.
+- **Remaining chain** — a paste-ready `/orchestrate` invocation, if you stopped early.
+
+Close with the `notes.md` and `review.md` paths, and a one-line `/log-work` reminder (`sdlc-task`'s
+bookkeep writes no `log.md` entry).
+
+Decisions and open items go **in `notes.md`**, not in this reply. Name the count and the path.
 
 ## Notes
 

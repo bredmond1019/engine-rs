@@ -71,3 +71,14 @@ $ARGUMENTS — optional free-text note about what was done (passed straight thro
 3. Run `/commit` — stages and commits all remaining changes with a conventional message.
 
 That's it. No handoff file, no context summary — just (drain →) log + commit.
+
+## Report
+
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
+```
+Logged and committed — <n> file(s), <commit sha>
+- <carryover/operator edges filed this session, or "none">
+- <anything left unfinished>
+```

@@ -2073,7 +2073,7 @@ print('FLIPPED:' + bid)
    surfaces (status.md rollups, /attention boards, wave tables) need resyncing every time, not only on
    a full block close.
    ${useWorktree
-     ? `- Do NOT run \`mev emit-state --write\`: this is a linked git worktree, where emit-state refuses to run. The derived surfaces regenerate on MAIN when the branch merges (/clean-worktree or /merge-train). Set emitStateRan=false.`
+     ? `- Do NOT run \`mev emit-state --write\`: this is a linked git worktree, where emit-state refuses to run. The derived surfaces regenerate on MAIN when the branch merges (/clean-worktree). Set emitStateRan=false.`
      : `- This run is IN PLACE on main, so emit-state is safe: cd ${runDir} && mev emit-state --write . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation.`}
 
 6. Commit your edits (stage explicitly — never git add -A). NEVER run git checkout, git switch, or git
@@ -2109,7 +2109,7 @@ Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emi
   if (bookkeepResult?.stateWriteRejected) {
     log(`state.json: write REJECTED — net-new schema error(s) from mev validate-brain --state; rolled back byte-exact, block NOT closed this run. ${bookkeepResult?.notes || ''}`)
   } else if (bookkeepResult?.blockStatusFlipped) {
-    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed (${bookkeepResult.stateWriteValidated ? 'validated: mev validate-brain --state, net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})${bookkeepResult.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : useWorktree ? '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree or /merge-train runs `mev emit-state --write` on merge.' : '.'}`)
+    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed (${bookkeepResult.stateWriteValidated ? 'validated: mev validate-brain --state, net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})${bookkeepResult.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : useWorktree ? '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree runs `mev emit-state --write` on merge.' : '.'}`)
   } else if (blockDone) {
     log(`Bookkeep: no state.json block flipped (${bookkeepResult?.notes || 'no state.json, or block not found'}).`)
   }

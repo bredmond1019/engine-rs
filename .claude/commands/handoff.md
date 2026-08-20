@@ -246,6 +246,9 @@ unless asked.
 
 ### Step 5 — Report
 
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
 - `planning/handoff.md` written (or updated)
 - Blocks flipped to `closed`; `carryover[]` slugs added or cleared
 - Any `operator`/`approval` edges filed this session, and what they gate

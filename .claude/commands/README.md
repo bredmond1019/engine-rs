@@ -30,7 +30,6 @@ predictably-named reports alongside it.
     - [Run Artifacts](#run-artifacts)
   - [Automated \& Orchestrated Pipelines](#automated--orchestrated-pipelines)
     - [`/review-PR <PR#> [plan-slug]`](#review-pr-pr-plan-slug)
-    - [`/merge-train [plan-slug]`](#merge-train-plan-slug)
     - [`/orchestrate <block-id ...> | <list-file>`](#orchestrate-block-id---list-file)
     - [`/begin-orchestration --roadmap <path> (--lane <name|path> | --blocks <id ...>)`](#begin-orchestration---roadmap-path---lane-namepath----blocks-id-)
     - [`/begin-session <session-slug> [--roadmap <path>] [--dry-run]`](#begin-session-session-slug---roadmap-path---dry-run)
@@ -105,7 +104,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
   review-task.md    test.md              update-docs.md
   update-task.md
 
-  clean-worktree.md  init-worktree.md  merge-train.md  start-block.md
+  clean-worktree.md  init-worktree.md  start-block.md
 
   test_auth_gate.md  test_crud_api.md  test_error_handling.md  test_ui_form.md
 
@@ -123,7 +122,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | UI foundations | `/define-design-system` (greenfield), `/define-polish-standard` (existing UI) |
 | Planning | `/generate-roadmap`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` (`/generate-master-plan` is superseded by `/plan --founding`, D65) |
 | SDLC | `/implement`, `/test`, `/fix`, `/patch`, `/document`, `/update-docs`, `/conditional_docs`, `/process-tasks`, `/update-task`, `/review-task`, `/review-PR`, `/close-out` |
-| Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block`, `/merge-train` |
+| Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block` |
 | Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/roadmap-status` |
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
 | Backlog | `/backlog-ticket`, `/initial-research` |
@@ -350,10 +349,11 @@ Each of the five commands, on every call:
    `TEST`, `REVIEW`, `FIX`, or `DOCUMENT` — a few key:value lines, never a narrative. `/fix` appends
    a new fix-pass section; it does not overwrite the prior one.
 
-Both files are **write-only artifacts**: read back off disk by the next command in the chain,
-never `git add`/`git commit`ed — `planning/` is a symlink into a brain vault in a vaulted repo, so
-committing under it can fail "beyond a symbolic link" (same D46 reasoning the engines use). The
-actual code/test changes still get a real git commit per the spec's own instructions.
+Both files are **committed**, exactly as the engines commit theirs — the fleet tracks 272 worklogs
+and 577 run-state files. In a vaulted repo commit them through the REAL vault path
+(`git -C <vault>/planning ...`), never through the `planning/` symlink face, which aborts the whole
+`git add` with "beyond a symbolic link" (D46). The actual code/test changes still get their own
+commit per the spec's own instructions.
 
 
 ## Automated & Orchestrated Pipelines
@@ -376,13 +376,6 @@ out the PR, runs the project's gating suite (from `harness.json`, falling back t
 `## Validation Commands`) + the emoji gate (merge-base scoped), reviews the diff against the block's
 Acceptance Criteria, and posts an APPROVE / REQUEST_CHANGES / COMMENT verdict via `gh pr review`. Restores
 the original branch when done.
-
-### `/merge-train [plan-slug]`
-Merges the block-train PRs into the base in the recorded `merge_order` (dependency order), halting on the
-first unresolved conflict. Pre-flights a clean tree + synced base, classifies each block
-(ready / already-merged / needs-approval / has-conflicts / escalated), stops before any merge if any PR
-is `CONFLICTING`, confirms with you, then merges each via `gh pr merge --merge --delete-branch`. Exits
-early for `--auto-merge` / `--no-pr` runs. Resume-safe — already-merged blocks are auto-detected on re-run.
 
 ### `/orchestrate <block-id ...> | <list-file>`
 Drives an **ordered chain of blocks** through the SDLC engines in one session: spec → (breakdown) →

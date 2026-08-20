@@ -76,6 +76,9 @@ already holds the context.
 
 ### Step 5 — Report
 
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
 7. Shell out to `mev emit-state --write` to update the brain's focus derivation and state.
 
 8. Confirm: output the local path created and (if applicable) confirm the backlog ticket was created.

@@ -203,7 +203,7 @@ Report to the user:
 - Gating summary (pass/fail counts).
 - If REQUEST_CHANGES: list the specific blocking items that must be fixed.
 - Next step:
-  - If APPROVE: "`/merge-train [plan-slug]` once all PRs in the train are approved."
+  - If APPROVE: "merge the PR, then `/clean-worktree <spec-slug>`."
   - If REQUEST_CHANGES: "Fix the blocking items on branch `<headRefName>`, push, and
     re-run `/review-PR <PR#>` to re-review."
 
@@ -219,5 +219,4 @@ Report to the user:
 - **Fat PRs.** In default roadmap-orchestration PR mode, Phase-N PRs include ancestor block work
   (the train branch is the common base). The AC review is still scoped to the target
   block's spec because `baseRefName` is the train branch from which this block forked.
-- **`/merge-train`** reads the orchestration state and merges all approved PRs bottom-up
   in dependency order. Run it after every PR in the train is approved.

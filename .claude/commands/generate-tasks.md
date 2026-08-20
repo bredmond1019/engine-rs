@@ -342,10 +342,12 @@ Then come back for the next block in a new session:
 - `CLAUDE.md` (the project's standing rules)
 - `planning/harness.json` (the project's validation checks)
 
-## Output Format
+## Output Format — files on disk (not the chat reply; see `## Report` below)
 
-Two files, same directory, same basename. `tasks.md` carries the prose; `tasks.json` carries the
-task list the engines actually execute against.
+`planning/<spec-slug>/tasks.json` is the task list the engines execute against, and the block record
+`planning/blocks/<BlockID>.json` carries the prose. **Do not write a `tasks.md`** — it is retired
+(`BT.ticket.engines-read-block-record`) and `scripts/render_spec.py` is deleted. The headings below
+describe the block record's narrative fields; the engines read them from the record directly.
 
 `planning/<spec-slug>/tasks.md`:
 ```md
@@ -431,6 +433,9 @@ derivation isn't implemented in `mev` yet — running the command is a no-op unt
 listed here so the step is already in place when it does.)
 
 ## Report
+
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
 
 Output the path to the file created, the decomposition assessment, the pipeline recommendation, and the next-step options:
 ```

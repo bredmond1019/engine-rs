@@ -161,9 +161,9 @@ Record this as one row: `test_name` `"emoji_check"`, `test_purpose` "Universal h
 
 If `$ARGUMENTS` was provided, after returning the JSON array to chat, record the result the way
 `/sdlc-flow` and `/sdlc-task` do (D31) — no prose report file. Both `sdlc/worklog.md` and
-`sdlc/state.json` are **write-only artifacts** (never `git add`/`git commit` them — `planning/` is
-a D46 vault symlink in a vaulted repo, so committing under it can fail "beyond a symbolic link";
-they're read back off disk only). Let M = total number of checks run, including the emoji gate,
+`sdlc/state.json` are **committed**, exactly as the engines commit theirs — in a vaulted repo
+through the REAL vault path (`git -C <vault>/planning ...`), never through the `planning/` symlink
+face, which aborts the whole `git add` with "beyond a symbolic link" (D46). Let M = total number of checks run, including the emoji gate,
 and n = number passed.
 
 1. **Derive the spec dir:** `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/`. Create it if it does not exist.

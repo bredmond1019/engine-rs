@@ -107,3 +107,15 @@ logged no block — report it as a process finding, not a silent omission) and a
   `planning/orchestration-run/<roadmap>/{notes.md,review.md}` per repo, each lane's
   `planning/<spec>/sdlc/sdlc-*state.json`, each repo's `planning/state.json`).
 - Writes: nothing.
+
+## Report
+
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
+```
+<roadmap>: <n> lanes — <running> running, <done> done, <stopped> stopped
+- Needs you: <lane/block + why>, or "nothing"
+- Stopped: <lane + the real bail reason>
+```
+Read-only: say so if nothing changed. Never dump per-lane detail the operator did not ask for.

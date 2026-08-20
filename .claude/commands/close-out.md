@@ -334,3 +334,15 @@ If `--merge-branch` was passed:
 - `.git/CLOSE_OUT_RANGE` — scratch file this run writes in Step 0.5 with the resolved diff range
   (e.g. `main...HEAD` or `HEAD^1..HEAD`); Steps 1 and 2a both read it so they can never diverge.
   Lives under `.git/`, so it is never tracked and needs no cleanup.
+
+## Report
+
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
+```
+<spec-slug> closed out — <gates>/<total> gates, coverage <ok | gap: ...>, docs <clean | patched: N>
+- <anything that failed or was skipped, with the real error>
+Next: <command>
+```
+Never restate the doc sweep or the coverage table — say the verdict and link the file.

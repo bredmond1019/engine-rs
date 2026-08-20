@@ -171,3 +171,14 @@ The **only** write this command makes is stamping `lifecycle: consolidated` on t
 consumed, so a re-run does not re-propose the same findings. It does not touch `carryover[]`,
 `tracks[]`, or any other `state.json` field in any repo — those writes belong to whatever consumes
 `consolidated-review.md`.
+
+## Report
+
+**<= 10 lines.** First line: outcome + whether it needs the operator. Then <= 6 one-line
+bullets. Link paths; never restate a file. See the `report-to-the-operator` skill.
+
+```
+<roadmap>: <n> records across <m> repos — <k> carryover entries proposed
+- <the one selection surprise, if any (a block whose origin_roadmap disagreed with its ledger)>
+Proposed entries written to: <path>. No state.json was written.
+```
