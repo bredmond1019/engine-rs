@@ -521,3 +521,56 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
     // block.
     assert!(lane_log_lines(&roadmap_dir).is_empty());
 }
+
+// ── Lane-log on-disk contract (EN.ticket.lane-log-entry-schema Task 1) ───
+//
+// `crates/engine-core/tests/fixtures/lane-log-contract.jsonl` holds real
+// lines copied verbatim from `planning/roadmaps/*/lane-log.jsonl` — one
+// `closed`, one `held`, two `bailed` — covering every status value the
+// fleet's real lane logs carry. `LaneLogEntry` must deserialize every one
+// of them with no field loss. As of Task 1 this is deliberately RED: the
+// current struct is `{repo, block_id, integrated_at}` and Serialize-only
+// (no `Deserialize` impl at all), while the fixture lines are
+// `{ts, lane, repo, block, status, note}`. Task 2 reshapes the struct and
+// turns this GREEN.
+#[test]
+fn lane_log_contract_fixture_round_trips_into_lane_log_entry() {
+    let fixture = include_str!("../fixtures/lane-log-contract.jsonl");
+    let mut saw_closed = false;
+    let mut saw_held = false;
+    let mut saw_bailed = false;
+
+    for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+        let entry: engine_core::workflows::orchestration::integrate::LaneLogEntry =
+            serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("fixture line failed to deserialize into LaneLogEntry: {e}\nline: {line}")
+            });
+
+        // No field loss: re-serialize and compare the parsed JSON values
+        // (not raw text, since key order/whitespace need not round-trip
+        // byte-for-byte) so every field on disk survives the round trip.
+        let original: serde_json::Value = serde_json::from_str(line).unwrap();
+        let round_tripped: serde_json::Value =
+            serde_json::to_value(&entry).expect("entry must re-serialize");
+        assert_eq!(
+            original, round_tripped,
+            "round trip must preserve every field with no loss"
+        );
+
+        match entry.status {
+            engine_core::workflows::orchestration::integrate::LaneLogStatus::Closed => {
+                saw_closed = true;
+            }
+            engine_core::workflows::orchestration::integrate::LaneLogStatus::Held => {
+                saw_held = true;
+            }
+            engine_core::workflows::orchestration::integrate::LaneLogStatus::Bailed => {
+                saw_bailed = true;
+            }
+        }
+    }
+
+    assert!(saw_closed, "fixture must cover status: closed");
+    assert!(saw_held, "fixture must cover status: held");
+    assert!(saw_bailed, "fixture must cover status: bailed");
+}
