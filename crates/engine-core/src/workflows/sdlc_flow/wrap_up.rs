@@ -230,6 +230,18 @@ fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidat
 /// An explicit `MAJOR_BAIL` / structural review fail is checked first and
 /// wins over an `unrecognized_verdict` where both are somehow present, so a
 /// real bail signal is never masked by the router-fallback bookkeeping.
+///
+/// After those two model-judgment stages, and before the `unrecognized_verdict`
+/// fallback, this also consults `committed_final_validation`: a stamped
+/// `FinalValidationNode` result with `all_passed: false` returns
+/// `TerminalSignal::FinalValidationFailed`. A run that bailed before the
+/// drain branch never ran `FinalValidationNode`, so `committed_final_validation`
+/// is `None` and this arm is inert for it; a passing gate likewise returns
+/// `None`. The ordering matters for the same reason `MAJOR_BAIL` is checked
+/// before the router-fallback arms: an explicit model-judged bail must never
+/// be masked by the gate signal, so the gate check sits strictly after both
+/// model-judgment arms and strictly before the `unrecognized_verdict`
+/// catch-alls (which only fire when nothing more specific already matched).
 fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
     if let Some(triage) = get_result(ctx, "TriageTaskNode") {
         if triage.get("verdict").and_then(|v| v.as_str()) == Some("MAJOR_BAIL") {
@@ -261,6 +273,21 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
                 Some("PARTIAL") => return Some(TerminalSignal::StructuralFail(summary)),
                 _ => {}
             }
+        }
+    }
+
+    // Run-level gate (this ticket): the tasks themselves may all have
+    // passed their own loops, but a failed `FinalValidationNode` full-suite
+    // gate is still a terminal signal — `verify_state_write` (ORCHESTRATION)
+    // treats a written `"done"` as admission for the next block in a chain,
+    // so a red build must not be reported as clean. Checked after the two
+    // model-judgment arms above (a real bail always wins) and before the
+    // `unrecognized_verdict` fallback below.
+    if let Some(final_validation) = committed_final_validation(ctx) {
+        if !final_validation.all_passed {
+            return Some(TerminalSignal::FinalValidationFailed(
+                final_validation.failure_summary,
+            ));
         }
     }
 
@@ -585,13 +612,20 @@ impl Node for WrapUpNode {
             super::schema::derive_committed_status(&state, terminal_signal.as_ref()).to_string();
 
         // `FinalValidationNode`'s outcome (if the run reached the drain
-        // branch — a bailed run never does) is reported, never converted
-        // into a bail: the tasks themselves already passed their own
-        // tripwires and reviews, so a failed run-level gate is a degraded
-        // terminal status, not a `TerminalSignal::MajorBail` (see this
-        // spec's `tasks.md` Notes and `D12-per-task-vs-final-check-depth.md`
-        // for why `derive_terminal_signal`/`derive_committed_status` above
-        // deliberately never consult it).
+        // branch — a bailed run never does) used to be reported only, never
+        // converted into a bail (`D12-per-task-vs-final-check-depth.md`):
+        // the tasks themselves already passed their own tripwires and
+        // reviews, so a failed run-level gate was treated as a degraded
+        // terminal status rather than a `TerminalSignal`. D12 was chosen for
+        // a human-driven single run where a degraded-wording report is read
+        // by a person. It does not survive contact with ORCHESTRATION's
+        // `verify_state_write`, whose entire admission decision for the next
+        // block in a chain is `status == "done"` — a chain advancing on a
+        // red build is not a reporting problem. `derive_terminal_signal`
+        // above now consults this same gate via `committed_final_validation`
+        // (see its doc comment), so `state.global_status`/`state.bail_reason`
+        // already reflect a failed gate by the time we read it again here
+        // purely to render the prose below.
         let final_validation = committed_final_validation(&ctx);
 
         let spec_slug = &state.spec_slug;
@@ -1681,8 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrap_up_writes_failing_final_validation_with_degraded_wording_but_non_blocked_status()
-    {
+    async fn wrap_up_writes_failing_final_validation_as_blocked_status() {
         let worktree = temp_worktree();
 
         let mut state = SDLCState::new("EN.3.E-fixture");
@@ -1711,10 +1744,17 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         let result = &out.nodes["WrapUpNode"];
 
-        // Reported, not converted into a bail: no task itself failed, so
-        // `status` stays out of `"blocked"` even though the run-level gate
-        // failed (see `derive_terminal_signal`/`derive_committed_status`,
-        // which never consult `FinalValidationNode`).
+        // Renamed from
+        // `wrap_up_writes_failing_final_validation_with_degraded_wording_but_non_blocked_status`,
+        // which pinned `D12-per-task-vs-final-check-depth.md`'s
+        // reporting-only stance: no task itself failed, so `status` stayed
+        // `"done"` even though the run-level gate failed. This ticket
+        // reverses that decision on purpose — ORCHESTRATION's
+        // `verify_state_write` treats a written `"done"` as admission for
+        // the next block in a chain, and D12's human-read-single-run
+        // rationale does not survive contact with that automated gate. The
+        // degraded wording is still expected; only the status assertions
+        // below are inverted.
         let status_suggestion = result["status_suggestion"].as_str().unwrap();
         assert!(status_suggestion.contains("FAILED"));
         assert!(status_suggestion.contains("Failed checks: build"));
@@ -1727,8 +1767,70 @@ mod tests {
             value["final_validation"]["failure_summary"],
             json!("Failed checks: build")
         );
-        assert_ne!(value["status"], json!("blocked"));
-        assert_eq!(value["status"], json!("done"));
+        assert_eq!(value["status"], json!("blocked"));
+        assert_ne!(value["status"], json!("done"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Final validation gate FAILED: Failed checks: build")
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// A real model-judged bail must never be masked by the gate signal
+    /// (this ticket's ordering rule in `derive_terminal_signal`): a
+    /// `MAJOR_BAIL` triage verdict wins even when `FinalValidationNode` also
+    /// failed, so the `bail_reason` names the triage reason, not the gate's.
+    #[tokio::test]
+    async fn wrap_up_prefers_major_bail_reason_over_failed_gate() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.E-fixture");
+        state.telemetry.tasks_passed = 0;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({
+                "verdict": "MAJOR_BAIL",
+                "reason": "Max attempts (3) reached without a passing run.",
+            }),
+        );
+        ctx.nodes.insert(
+            "FinalValidationNode".to_string(),
+            json!({
+                "all_passed": false,
+                "check_results": [
+                    { "name": "build", "kind": "command", "passed": false },
+                ],
+                "failure_summary": "Failed checks: build",
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-02"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+
+        let saved_to = result["saved_to"].as_str().unwrap();
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Max attempts (3) reached without a passing run.")
+        );
+        // The gate's own failure summary must not have won the bail_reason.
+        assert_ne!(
+            value["bail_reason"],
+            json!("Final validation gate FAILED: Failed checks: build")
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }
