@@ -164,6 +164,23 @@ pub struct SDLCFlowEventSchema {
     /// layer down.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Optional owning program block identifier (e.g. `"EN.3.A"`), carried
+    /// onto the created [`SDLCState`] (`LoadTaskStateNode`) so a later
+    /// `CloseBlockNode` (EN.ticket.wrap-up-closes-the-block) knows which
+    /// block this run is for without re-deriving it from the spec
+    /// directory name. `None`/absent preserves today's behavior exactly:
+    /// `SDLCState::block_id` stays `None`, same as before this field
+    /// existed. Only consulted when a state file does not already exist for
+    /// this spec — a resumed run keeps whatever `block_id` was already
+    /// committed to disk rather than letting a differing event value
+    /// silently rewrite it.
+    #[serde(default)]
+    pub block_id: Option<String>,
+    /// Optional owning phase identifier (e.g. `"EN.3"`), carried onto the
+    /// created [`SDLCState`] the same way and under the same rules as
+    /// [`Self::block_id`].
+    #[serde(default)]
+    pub phase_id: Option<String>,
 }
 
 /// Parse a task-range string like `"1-3,5"` into a sorted, deduplicated list

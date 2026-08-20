@@ -725,6 +725,16 @@ impl Node for LoadTaskStateNode {
             })?;
             let mut bootstrapped = SDLCState::new(event.spec_slug.clone());
             bootstrapped.tasks = tasks;
+            // Carry block_id/phase_id from the event onto the freshly
+            // created state (EN.ticket.wrap-up-closes-the-block task 1).
+            // Only done here, on the no-prior-state path: a resumed run
+            // (`resumed_state` above, loaded via
+            // `SDLCState::from_committed_state_json`) already preserves
+            // whatever block_id/phase_id were committed to disk, and must
+            // not have them silently overwritten by a differing event
+            // value on reattach.
+            bootstrapped.block_id = event.block_id.clone();
+            bootstrapped.phase_id = event.phase_id.clone();
             bootstrapped
         } else {
             return Err(NodeError::new(format!(
@@ -1212,6 +1222,83 @@ mod tests {
             sdlc_dir.join("sdlc-flow-state.json").exists(),
             "a resume must leave the state file where it is"
         );
+    }
+
+    #[tokio::test]
+    async fn load_carries_block_id_and_phase_id_from_event_onto_fresh_state() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({
+            "spec_slug": "my-spec",
+            "block_id": "EN.3.A",
+            "phase_id": "EN.3",
+        });
+
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(loaded["block_id"], "EN.3.A");
+        assert_eq!(loaded["phase_id"], "EN.3");
+    }
+
+    #[tokio::test]
+    async fn load_leaves_block_id_and_phase_id_null_when_event_supplies_neither() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert!(loaded["block_id"].is_null());
+        assert!(loaded["phase_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_block_id_and_phase_id_from_the_state_file() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+
+        let mut state = SDLCState::new("my-spec");
+        state.block_id = Some("EN.3.A".to_string());
+        state.phase_id = Some("EN.3".to_string());
+        let run_meta = super::super::schema::RunMeta {
+            branch: "sdlc/my-spec".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-07-25T00:00:00Z".to_string(),
+            updated_at: "2026-07-25T00:00:00Z".to_string(),
+            run_id: None,
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
+        std::fs::write(
+            sdlc_dir.join("sdlc-flow-state.json"),
+            serde_json::to_string(&committed).unwrap(),
+        )
+        .unwrap();
+
+        // A resume must not let a differing event value silently rewrite
+        // what was already committed to disk.
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({
+            "spec_slug": "my-spec",
+            "resume": true,
+            "block_id": "EN.9.Z",
+            "phase_id": "EN.9",
+        });
+
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(loaded["block_id"], "EN.3.A");
+        assert_eq!(loaded["phase_id"], "EN.3");
     }
 
     // --- resume / restart semantics ---------------------------------------
