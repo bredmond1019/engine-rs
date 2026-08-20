@@ -1,7 +1,7 @@
 # /patch — Lightweight hotfix pipeline
 
 > **Warning:** This workflow skips test, review, and document stages. Use only for low-risk
-> hotfixes. If you are unsure whether a change is patch-scope, use `/sdlc-run` instead.
+> hotfixes. If you are unsure whether a change is patch-scope, use `/sdlc-flow` instead.
 
 ## What this is
 
@@ -19,7 +19,7 @@ Step 1 redirects you up the ladder rather than stretching `/patch` past its remi
 |---|---|---|
 | `/patch` | trivial, self-evident hotfix or docs-only; no new test | this command |
 | lean `/sdlc-task` | small, but it changes behaviour and needs a test (implement → fast-test → fix loop → commit) | `/sdlc-task <slug>` |
-| `/sdlc-run` · `/sdlc-flow` | a whole spec (full lifecycle; `/sdlc-flow` adds a review + PR) | `/sdlc-run <slug>` · `/sdlc-flow <slug>` |
+| `/sdlc-flow` | a whole spec (full lifecycle, review + PR) | `/sdlc-flow <slug>` |
 
 ## Instructions
 
@@ -32,7 +32,7 @@ ladder at the first "yes":
 2. Does the change introduce new logic / behaviour that should be proven by a test? → If yes, stop and
    redirect to **lean `/sdlc-task`** (its fast-test→fix loop is exactly for small, tested changes).
 3. Does the change affect an API endpoint, schema, or public interface, or span a whole spec? → If yes,
-   stop and redirect to **`/sdlc-run`** (or `/sdlc-flow` if you want a consolidated review + a PR).
+   stop and redirect to **`/sdlc-flow`** (full lifecycle, review + PR).
 
 If you cannot answer all three with "no", output the matching redirect and stop:
 
@@ -40,8 +40,7 @@ If you cannot answer all three with "no", output the matching redirect and stop:
 SCOPE CHECK FAILED — this change is not patch-scope.
 Redirect:
   - small but needs a test  →  /sdlc-task <spec-slug>      (lean: implement → fast-test → fix → commit)
-  - a whole spec            →  /sdlc-run <spec-slug>        (full lifecycle, in place)
-                               /sdlc-flow <spec-slug>       (full lifecycle + review + PR)
+  - a whole spec            →  /sdlc-flow <spec-slug>       (full lifecycle + review + PR)
 ```
 
 Pick the single rung that matches the change and name it in the redirect, then stop.
@@ -73,4 +72,4 @@ Patch complete: <what was fixed> — <file(s) changed>
 ```
 
 Remind the user: "Patch workflow skips test/review/document. For a small tested change run lean
-/sdlc-task; for full pipeline coverage on a whole spec run /sdlc-run (or /sdlc-flow for a review + PR)."
+/sdlc-task; for full pipeline coverage on a whole spec run /sdlc-flow (review + PR)."

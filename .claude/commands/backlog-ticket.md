@@ -41,12 +41,22 @@ node write — small enough that a subagent round trip adds latency without addi
 
    **gist** — 1–3 sentences: what it is and why it matters. Be specific. Do not pad.
 
+   **routing** — what kind of unknown is blocking this item, using the same vocabulary as
+   `/capture`'s Open Questions:
+     - `READ` — answerable by reading source or docs
+     - `SPIKE` — cheaper to settle by writing ~30 lines or running the thing once
+     - `ASK` — only the operator can answer (a decision, a preference, a credential)
+     - `ASSESS` — too many unknowns to answer one at a time; needs a full `/assess` pass
+   This decides where the item goes when it is picked up — READ/ASK usually go straight to
+   `/ticket` or `/plan`; SPIKE gets a quick spike first; ASSESS routes to `/assess` before any
+   plan is written.
+
 5. Append to the `## Active` section of `$BRAIN_ROOT/core/planning/backlog.md` (before the `## Promoted` section)
    using this exact format:
 
    ```
    ### [YYYY-MM-DD] <title>
-   `repo:<repo>` `type:<type>` `status:<status>`
+   `repo:<repo>` `type:<type>` `status:<status>` `routing:<routing>`
    **related:** <related> (omit this line entirely if no related items)
 
    <gist>
@@ -64,6 +74,7 @@ node write — small enough that a subagent round trip adds latency without addi
    - `repo`: the repo from step 4
    - `type`: the type from step 4
    - `status`: the status from step 4
+   - `routing`: the routing value from step 4 (`READ` / `SPIKE` / `ASK` / `ASSESS`)
    - `depends_on`: `[]` unless the description names a concrete blocking block, in which case one
      `{ "type": "block", "repo": "<repo>", "id": "<ID>" }` entry per block named
    - `notes`: the path to a pre-plan notes doc if one exists (e.g. from `/capture`); omit otherwise

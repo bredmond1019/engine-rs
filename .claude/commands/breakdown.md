@@ -1,6 +1,6 @@
 # Breakdown — Decompose a task spec into agent-executable sub-steps.
 
-Takes a task spec from `planning/` and produces a granular breakdown where every
+Takes a spec from `planning/` and produces a granular breakdown where every
 sub-step names exact file paths, class/function names, and what to write or change —
 precise enough for an agent (or a human) to execute without interpretation.
 
@@ -17,29 +17,48 @@ precise enough for an agent (or a human) to execute without interpretation.
 
 ## Variables
 
-$ARGUMENTS — path to the task spec to break down (e.g. `planning/<spec-slug>/tasks.md`).
-             If omitted, default to the current block's spec identified via `planning/status.md`.
+$ARGUMENTS — the block ID to break down (e.g. `BT.ticket.some-slug`), or a path to a legacy
+             `tasks.md` spec for a block with no record. If omitted, default to the current
+             block identified via `planning/status.md`.
              If no spec exists for the current block, say so and suggest running `/next` to find the current block, then `/generate-tasks <BlockID>` to write its spec.
 
 ## Instructions
 
-1. Resolve the target spec:
-   - If `$ARGUMENTS` is provided, read that file.
-   - If omitted, read `planning/status.md` to find the current block, then read its spec.
-   - If neither yields a file, stop and explain clearly.
+1. Resolve the target spec (D65 stage 2 — the block record is the preferred source; `tasks.md` is
+   a fallback for a block that predates the migration):
+   - Derive `blockId` from `$ARGUMENTS` (if it looks like a block ID) or from `planning/status.md`
+     if `$ARGUMENTS` was omitted.
+   - Check `planning/blocks/<blockId>.json` (the block record, per `block.schema.json`):
+     `ls planning/blocks/<blockId>.json 2>/dev/null && echo RECORD_EXISTS || echo RECORD_MISSING`.
+   - Check `planning/<blockId>/tasks.json` (the task list the engines execute — always read this
+     regardless of which spec source is used): `ls planning/<blockId>/tasks.json`.
+   - If `RECORD_EXISTS`: the spec source is the block record + `tasks.json`. Read both.
+   - If `RECORD_MISSING`: fall back to legacy `planning/<blockId>/tasks.md` (or the path given
+     directly in `$ARGUMENTS`) as the spec source, alongside `tasks.json`.
+   - If neither a block record nor a legacy `tasks.md` exists, stop and explain clearly.
 
-2. Read the spec in full. Note:
-   - Every step in **Step-by-Step Tasks**
-   - The **Relevant Files** or **Context Pointers** section
-   - The **Acceptance Criteria** and **Validation Commands** (copied verbatim into the breakdown)
+2. Read the spec in full.
+   - **Block record present:** read `what` (scope), `why` (motivation), `files.new[]` /
+     `files.modified[]`, `interfaces[]`, `out_of_scope[]`, `acceptance_criteria[]`, and
+     `testing_strategy`. Read `tasks.json` — its array **is** the step list to decompose (each
+     entry's `task_id`/`title`/`description`/`acceptance_criteria`/`files`/`dependsOn` stands in
+     for what `tasks.md`'s "Step-by-Step Tasks" used to hold).
+   - **Legacy `tasks.md` fallback:** note every step in **Step-by-Step Tasks**, the **Relevant
+     Files** or **Context Pointers** section, and the **Acceptance Criteria** and **Validation
+     Commands** sections (copied verbatim into the breakdown) — same as before D65.
+   - **Validation commands**, either way: read `planning/harness.json` -> `validation.checks[]`
+     — the block record's own `validation_commands[]` is usually empty and falls back to that file
+     (per `block.schema.json`); `tasks.md`'s "## Validation Commands" section pointed at the same
+     file.
 
 3. Read `CLAUDE.md` for **the project's standing rules** (do not assume any stack, locale-parity,
    narrative, or content-layout rule unless written there; plus the universal harness rules — no
    fabricated metrics, no emoji, gated checks must pass). These constraints belong in the relevant
    sub-steps, not as a separate note.
 
-4. **For each step in the spec, before writing its breakdown:** read the actual source files
-   that step touches. This is not optional — the breakdown must name real things:
+4. **For each step (each `tasks.json` entry, or each `tasks.md` step on the legacy path) before
+   writing its breakdown:** read the actual source files that step touches. This is not optional —
+   the breakdown must name real things:
    - If a step says "unit test X" → read the module under test to get the actual function names
      and signatures before writing the test sub-steps.
    - If a step adds new code → read an existing sibling of the same kind to match the project's
@@ -63,8 +82,9 @@ $ARGUMENTS — path to the task spec to break down (e.g. `planning/<spec-slug>/t
    from disagreeing. If **no** step qualifies, stop and say the spec is already atomic rather than
    writing a breakdown nobody needs.
 
-5. Decompose each spec step into numbered sub-steps using the format `N.M`
-   (e.g. step 2 → sub-steps 2.1, 2.2, 2.3). Each sub-step must be atomic:
+5. Decompose each step into numbered sub-steps using the format `N.M`, where `N` is the step's
+   `task_id` from `tasks.json` (or the step number from `tasks.md` on the legacy path) — e.g. task
+   2 → sub-steps 2.1, 2.2, 2.3. Each sub-step must be atomic:
    - One file to create or one specific change to one existing file.
    - If creating a file: state the full path and the complete structure (components, functions,
      fixtures, imports) — not "add a test file."
@@ -74,23 +94,18 @@ $ARGUMENTS — path to the task spec to break down (e.g. `planning/<spec-slug>/t
 6. After each logical group of sub-steps (not only at the end), add an inline **Verify** check:
    a single command or observation that confirms the group succeeded before moving on.
 
-   **Disjoint file ownership (parallel-merge safety) — `/sdlc-block` only.** As you name exact
-   paths, watch for the same existing file being edited under two different spec **steps** that
-   could run as parallel tasks under `/sdlc-block`'s parallel-merge model. This does **not** apply
-   when the spec will run under `/sdlc-flow` or `/sdlc-task`: those engines run every step
-   sequentially on one branch/worktree with no inter-task merge, and `generate-tasks.md`'s
-   compilable task boundaries rule governs step boundaries there instead — including when it
-   requires two steps that would otherwise be file-disjoint to merge into one sub-step, because a
-   breaking change (a renamed public type, a struct's changed fields, an altered trait/interface
-   signature) cannot leave an intermediate step non-compiling. Under `/sdlc-block`: if you find an
-   overlap, flag it in **Notes** — either the steps are sequentially dependent (say so) or the
-   shared file should be append-only. An undeclared overlap between parallel tasks escalates the
-   whole block at merge.
+   **Compilable step boundaries.** The spec runs under `/sdlc-flow` or `/sdlc-task`, which run
+   every step sequentially on one branch/worktree with no inter-task merge —
+   `generate-tasks.md`'s compilable task boundaries rule governs step boundaries: when a breaking
+   change (a renamed public type, a struct's changed fields, an altered trait/interface signature)
+   would leave an intermediate step non-compiling, merge those steps into one sub-step rather than
+   splitting them by file.
 
 7. Write the breakdown to `planning/<block-dir>/breakdown.md` — same directory as the spec, named `breakdown.md`.
 
-7a. **Reconcile with `tasks.json` — the engines execute that, not this file.** If reading the
-   source changed your view of the *executable* shape of the work, edit `tasks.json` too:
+7a. **Reconcile with `tasks.json` — the engines execute that, not this file (and not the block
+   record's `what`/`files`).** If reading the source changed your view of the *executable* shape
+   of the work, edit `tasks.json` too:
    - a step that must become two tasks, or two that must merge (a breaking public-surface change
      may never be split — the repository must compile at every task boundary)
    - a `dependsOn` edge the decomposition revealed
@@ -99,7 +114,9 @@ $ARGUMENTS — path to the task spec to break down (e.g. `planning/<spec-slug>/t
 
    Make the edit, and record it in **Notes** with one line per change and why. If nothing changed,
    say "no `tasks.json` changes" — an absent statement reads as an omission. Never leave a
-   correction only in prose: the engine will run the JSON.
+   correction only in prose: the engine will run the JSON. (A correction that instead belongs in
+   the block record's own fields — e.g. `what`/`why`/`out_of_scope` were wrong, not the
+   decomposition — is out of scope for this command; note it and let the author fix the record.)
 
 7b. **Verify every symbol you named actually exists.** The failure mode of this command is a
    confident sub-step referencing a function, type, or file that is not there. Before committing,
@@ -157,8 +174,13 @@ Start a FRESH session and run:
 
 ## Context / Files to Read
 
-- `$ARGUMENTS` (the spec file, or the current block's spec)
-- `planning/status.md` (only if $ARGUMENTS is omitted)
+- `planning/blocks/<blockId>.json` (the block record, preferred spec source — D65 stage 2) and
+  `planning/<blockId>/tasks.json` (the step list to decompose — always authoritative for what the
+  engines execute)
+- `planning/<blockId>/tasks.md`, only as a fallback when no block record exists
+- `planning/status.md` (only if `$ARGUMENTS` is omitted)
+- `planning/harness.json` (`validation.checks[]` — the validation commands, when the block record's
+  own `validation_commands[]` is empty)
 - `CLAUDE.md`
 - Source files relevant to each step (read per-step, not upfront)
 
@@ -168,10 +190,12 @@ Start a FRESH session and run:
 # Task Breakdown — <spec title>
 
 ## Source Spec
-`<path to the spec file this was generated from>`
+`<path to the block record (planning/blocks/<blockId>.json) + tasks.json this was generated from,
+  or the legacy tasks.md path on the fallback path>`
 
 ## Goal
-<copied verbatim from the spec>
+<the block record's "what" field verbatim, or — on the legacy fallback — the tasks.md spec's Goal
+ section verbatim>
 
 ## How to Use
 Work top to bottom. Each sub-step is a single atomic action. Run the inline **Verify**
@@ -181,7 +205,7 @@ checks as you go — do not batch them at the end. Each check must pass before c
 
 ## Steps
 
-### Step 1: <step name from spec>
+### Step 1: <task title from tasks.json (task_id 1), or the step name from tasks.md on the legacy path>
 
 #### 1.1 <atomic action — one file or one change>
 **File:** `<exact relative path>`
@@ -195,7 +219,7 @@ checks as you go — do not batch them at the end. Each check must pass before c
 
 ---
 
-### Step 2: <step name from spec>
+### Step 2: <task title from tasks.json (task_id 2), or the step name from tasks.md on the legacy path>
 
 #### 2.1 ...
 
@@ -205,15 +229,18 @@ checks as you go — do not batch them at the end. Each check must pass before c
 
 ---
 
-<!-- repeat for every step in the spec -->
+<!-- repeat for every task_id in tasks.json (or every step in tasks.md on the legacy path) -->
 
 ---
 
 ## Acceptance Criteria
-<copied verbatim from the spec — do not paraphrase>
+<the block record's acceptance_criteria[] verbatim, or — on the legacy fallback — the tasks.md
+ spec's Acceptance Criteria section verbatim. Do not paraphrase>
 
 ## Validation Commands
-<copied verbatim from the spec — do not paraphrase>
+<planning/harness.json validation.checks[] (or the block record's validation_commands[] when
+ non-empty), or — on the legacy fallback — the tasks.md spec's Validation Commands section
+ verbatim. Do not paraphrase>
 
 ## Notes
 <any discoveries made while reading the codebase that affect execution — e.g. a function

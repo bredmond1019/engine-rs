@@ -9,12 +9,13 @@ automated processing. The suite is **not hardcoded** — it is read from `planni
 $ARGUMENTS — optional path to the task spec and optional task number. Same format as `/implement`.
 
 Examples:
-- (no args) — run full suite; output JSON to chat only; no file written
-- `planning/<spec-slug>/tasks.md` — run full suite; write report to `planning/<spec-slug>/sdlc/reports/test.md`
-- `planning/<spec-slug>/tasks.md 1` — run full suite; write report to `planning/<spec-slug>/sdlc/reports/task1-test.md`
+- (no args) — run full suite; output JSON to chat only; no worklog/state written
+- `planning/<spec-slug>/tasks.md` — run full suite; append a worklog section + update state for the whole spec
+- `planning/<spec-slug>/tasks.md 1` — run full suite; append a worklog section + update state scoped to task 1
 
 The task number N does NOT change which checks run — all checks always run regardless. N only
-determines the output file name so the snapshot is scoped to the right pipeline stage.
+scopes which `sdlc/state.json` task entry and worklog section this run's results are recorded
+against.
 
 ## Purpose
 
@@ -31,10 +32,10 @@ TEST_COMMAND_TIMEOUT: 5 minutes
 
 ## Instructions
 
-- **Step 0 — Parse `$ARGUMENTS`:** If provided, split on the last space. Trailing number = task N; remainder = spec path. Derive the report file path from the spec's parent directory:
-  - No args: no file will be written.
-  - Spec only: `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/reports/test.md`
-  - Spec + task N: `planning/<spec-slug>/tasks.md 1` → `planning/<spec-slug>/sdlc/reports/task1-test.md`
+- **Step 0 — Parse `$ARGUMENTS`:** If provided, split on the last space. Trailing number = task N; remainder = spec path. Derive the spec dir from the spec's parent directory:
+  - No args: no worklog/state will be written.
+  - Spec only: `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/` (record scoped to "all tasks")
+  - Spec + task N: `planning/<spec-slug>/tasks.md 1` → `planning/<spec-slug>/sdlc/` (record scoped to task 1)
 - Run `/prime` to orient to the codebase before executing any checks.
 - **Step 1 — Load the validation suite:** Read `planning/harness.json`.
   - If present and valid JSON: the checks are `validation.checks[]`, run **in order, top to bottom**.
@@ -156,42 +157,34 @@ Record this as one row: `test_name` `"emoji_check"`, `test_purpose` "Universal h
 ]
 ```
 
-## File Output
+## Record (worklog + state, not a prose report)
 
-If `$ARGUMENTS` was provided, after returning the JSON array to chat, write a report file to the
-derived path. Create `planning/<name>/sdlc/reports/` if it does not exist.
+If `$ARGUMENTS` was provided, after returning the JSON array to chat, record the result the way
+`/sdlc-flow` and `/sdlc-task` do (D31) — no prose report file. Both `sdlc/worklog.md` and
+`sdlc/state.json` are **write-only artifacts** (never `git add`/`git commit` them — `planning/` is
+a D46 vault symlink in a vaulted repo, so committing under it can fail "beyond a symbolic link";
+they're read back off disk only). Let M = total number of checks run, including the emoji gate,
+and n = number passed.
 
-**Write the report file in this exact format** (let M = total number of checks run, including the
-emoji gate):
+1. **Derive the spec dir:** `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/`. Create it if it does not exist.
 
-```markdown
-# Test Report — <spec filename> [Task <N> | All Tasks]
+2. **Read `sdlc/state.json`** if it exists (else start from `{}`); preserve fields you don't touch.
 
-**Date:** <YYYY-MM-DD>
-**Plan:** <spec file path, or "ad-hoc">
-**Scope:** Task <N> | All tasks
-**Overall result:** PASS (<n>/<M> passed) | FAIL (<n>/<M> passed)
+3. **Update `sdlc/state.json`**: set `status` to `"test_pass"` (n == M) or `"test_fail"`
+   (n < M); set/merge the task entry (or entries, for a full run) at `tasks["<N>"].validated` to
+   `"PASS (<n>/<M>)"` or `"FAIL (<n>/<M>)"`, and append any failing check names to that entry's
+   `issues` array (don't duplicate ones already present). Bump `updated_at` (NOW, UTC ISO8601);
+   preserve `started_at`.
 
-## Summary
+4. **Append to `sdlc/worklog.md`** (create with header `# Worklog — <spec-slug>` + a blank line
+   first, if it doesn't exist yet):
+   ```markdown
+   ## Task <N> — TEST <PASS|FAIL> (<n>/<M> passed)
+   Failing: <comma-joined failing check names, or omit line if none>
+   ```
+   (`<N>` is "All Tasks" when no task number was given.)
 
-| Test | Result | Error |
-|---|---|---|
-| <check name> | PASS / FAIL | <error snippet or blank> |
-| ... (one row per check, in order) | | |
-| emoji_check | PASS / FAIL | |
-
-## Full Results (JSON)
-
-\`\`\`json
-<the full JSON array, verbatim>
-\`\`\`
-
-## Next Step
-
-`/review-task <spec file path> [N]`
-```
-
-After writing the file, output one line to chat:
+After recording, output one line to chat:
 ```
 Next: /review-task planning/<spec-slug>/tasks.md [N]
 ```

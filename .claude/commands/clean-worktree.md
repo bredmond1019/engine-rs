@@ -128,7 +128,14 @@ The literal single-token form is output by `/sdlc-task` when it creates a suffix
       with the line(s)). Merging tasks in task-number order keeps the amendment lines chronological.
       Omit this sub-step if the section is absent or `_none_`.
    h. Edit `<logFile>`: change `**Applied:** false` → `**Applied:** true`.
-   i. Stage and commit (include the spec only if step g.5 modified it):
+   i. **Stage and commit — check whether this repo is vaulted first**, because `planning/status.md`,
+      `<logFile>`, and `planning/<spec-slug>/tasks.md` (touched only if step g.5 modified it) all
+      live under `planning/`:
+      ```bash
+      [ -L planning ] && echo VAULTED || echo STANDALONE
+      ```
+
+      **STANDALONE** (`planning/` is a real, sub-repo-tracked directory — safe to add together):
       ```bash
       git add planning/status.md log.md <logFile>
       git add planning/<spec-slug>/tasks.md 2>/dev/null || true
@@ -137,7 +144,45 @@ The literal single-token form is output by `/sdlc-task` when it creates a suffix
       EOF
       )"
       ```
-   j. Report: "status.md and log.md updated from task log." (Note if amendment lines were applied to the spec.)
+
+      **VAULTED** (`planning/` is a symlink into the brain's `_planning/` vault, tracked by the
+      *brain* repo, not this one — the same failure `sync-downstream-harness.md` step 5 documents
+      for `.template-version`): staging `planning/status.md` (or `<logFile>`, or
+      `planning/<spec-slug>/tasks.md`) through the sub-repo's own `git add` crosses the symlink —
+      `fatal: pathspec 'planning/status.md' is beyond a symbolic link` — and **aborts the entire
+      `add`, staging NOTHING**, not just the offending path. `log.md` is left silently
+      uncommitted too. The old `git add planning/<spec-slug>/tasks.md 2>/dev/null || true` masked
+      this exact abort on the vault path with a swallowed exit code — never suppress that error;
+      route the path to the vault commit below instead. Split into two commits, in two repos:
+
+      **(a) The sub-repo commits only what it actually tracks:**
+      ```bash
+      git add log.md
+      git commit -m "$(cat <<'EOF'
+      chore: apply task log for <stem>
+      EOF
+      )"
+      ```
+
+      **(b) The brain repo commits the vault paths**, resolved against the real vault path
+      (never through the `planning/` symlink), with an explicit pathspec (never `git add -A`
+      there — one brain repo tracks every vaulted sub-repo's `planning/`):
+      ```bash
+      cd <brain_root>
+      git add <brain_root>/_planning/<repo-slug>/status.md
+      git add <brain_root>/_planning/<repo-slug>/<spec-slug>/sdlc/reports/task<taskNum>-log.md
+      git add <brain_root>/_planning/<repo-slug>/<spec-slug>/tasks.md 2>/dev/null || true
+      git commit -m "$(cat <<'EOF'
+      chore: apply task log for <stem> (vault)
+      EOF
+      )"
+      ```
+      (`<repo-slug>` is this repo's vault directory name under `_planning/` — usually this repo's
+      own name; `<brain_root>` is the parent whose `_planning/<repo-slug>` this repo's `planning`
+      symlink resolves to, e.g. `readlink planning` from this repo's root.)
+      Never `git add -A`/`git add .`/`git reset`/`git stash` against the brain repo — another
+      lane's session may have unrelated work staged there.
+   j. Report: "status.md and log.md updated from task log." (Note if amendment lines were applied to the spec, and whether the commit was single (standalone) or split (vaulted).)
 
    **If `Applied: true`:** report "Task log already applied — skipping STATUS/Log update."
 
@@ -196,4 +241,4 @@ The literal single-token form is output by `/sdlc-task` when it creates a suffix
 - Run this command from the **main repo session** (CWD: repo root), not from inside the worktree.
 - **Task log (sdlc-task only):** When a task was run with `/sdlc-task`, the worktree branch contains a `task<N>-log.md` file instead of status.md/log.md changes. Step 6.5 reads that file and applies the updates to main after the merge. Always merge tasks in task-number order so status.md's "Current focus" ends up pointing to the right next task.
 - **Suffix worktrees:** If `/sdlc-task` created `<spec-slug>-task8-2` (due to a collision), pass the full name as a single argument: `/clean-worktree <spec-slug>-task8-2`. The task log is still found at `planning/<spec-slug>/sdlc/reports/task8-log.md` (based on the task number extracted from the branch name).
-- **`/sdlc-block` does its own merges.** Do not run `/clean-worktree` for tasks driven by `/sdlc-block` — it merges each wave for you. Use this command only for standalone `/sdlc-task` runs or manual worktrees from `/init-worktree`.
+- **`/orchestrate` does its own merges.** Do not run `/clean-worktree` for blocks driven by `/orchestrate` — it merges each block for you. Use this command only for standalone `/sdlc-task` runs or manual worktrees from `/init-worktree`.

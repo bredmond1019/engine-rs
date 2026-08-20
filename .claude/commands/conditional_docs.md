@@ -35,7 +35,7 @@ Read in this order:
 
 Then:
 - If the fix touches one or two files with no new tests needed → use `/patch`.
-- If the fix is multi-file or requires new tests → use `/sdlc-run`.
+- If the fix is multi-file or requires new tests → use `/sdlc-flow`.
 
 ---
 

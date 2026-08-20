@@ -1,21 +1,20 @@
 # Merge Train — Merge the block branch train in dependency order.
 
-Reads the `block-orchestration-state.json` produced by `/sdlc-block` (default/PR mode)
-and merges each block's PR into the base branch in the recorded dependency order, halting
-on the first unresolved conflict.
+Reads a `block-orchestration-state.json` (default/PR mode) and merges each block's PR into
+the base branch in the recorded dependency order, halting on the first unresolved conflict.
 
 Run this after all PRs in the branch train have been reviewed (see `/review-PR`).
 
 ## Variables
 
-$ARGUMENTS — optional. `[plan-slug]` — the plan slug (e.g. `sdlc-block-and-task-updates`)
+$ARGUMENTS — optional. `[plan-slug]` — the plan slug (e.g. `roadmap-and-task-updates`)
 used to locate `planning/<plan-slug>/sdlc/block-orchestration-state.json`. If omitted,
 searches `planning/` for a unique state file.
 
 Examples:
 ```
 /merge-train
-/merge-train sdlc-block-and-task-updates
+/merge-train roadmap-and-task-updates
 ```
 
 ## Instructions
@@ -52,13 +51,13 @@ Read and parse the selected state file. Extract:
 **If `mode` is `auto-merge`:** stop and report:
 ```
 This plan was run with --auto-merge: blocks were merged into <base_branch> during
-the /sdlc-block run. Nothing to do — check git log on <base_branch>.
+the roadmap run. Nothing to do — check git log on <base_branch>.
 ```
 
 **If `mode` is `no-pr`:** stop and report:
 ```
 This plan was run with --no-pr: there are no PRs to merge via this command.
-Merge block branches manually with `git merge`, or re-run /sdlc-block with --auto-merge.
+Merge block branches manually with `git merge`, or re-run the roadmap orchestrator with --auto-merge.
 ```
 
 If `merge_order` is empty, stop: "No blocks recorded in merge_order — nothing to merge."
@@ -202,7 +201,7 @@ Merged into <base_branch>:
 Already on <base_branch> (skipped):
   <slug> — (already merged)
 
-Could not merge (escalated/skipped during /sdlc-block run):
+Could not merge (escalated/skipped during the roadmap run):
   <slug> — <reason from state>
 
 <base_branch> is now up to date with the block train.
@@ -226,8 +225,8 @@ git branch | grep "<planSlug>"
 - **`--delete-branch` on merge.** `gh pr merge --delete-branch` deletes the remote block
   branch after the merge. The local branch (if any) is left for cleanup by the user; the
   worktree is already gone (the child `/sdlc-flow` handles that at wrap-up).
-- **No-PR mode.** If `/sdlc-block` ran with `--no-pr`, this command exits early. Use
+- **No-PR mode.** If the roadmap ran with `--no-pr`, this command exits early. Use
   `git merge <branch>` directly or re-run the orchestrator with `--auto-merge`.
-- **Auto-merge mode.** If `/sdlc-block` ran with `--auto-merge`, blocks were already landed
+- **Auto-merge mode.** If the roadmap ran with `--auto-merge`, blocks were already landed
   during the run. This command exits early in that case.
 - Run from the **main repo root**, not from inside a worktree.

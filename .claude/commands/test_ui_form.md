@@ -64,6 +64,22 @@ Test a form submit flow in the browser using Playwright (or playwright-mcp). Rep
 
 ---
 
+## Negative Case (required before trusting this test as a gate)
+
+A test that has never been observed failing may be asserting something that was already true —
+the same way a green CI check becomes decorative. A test never observed failing is not evidence.
+
+1. Temporarily remove the `required` validation on `{{REQUIRED_FIELD_SELECTOR}}` (or otherwise
+   disable client-side validation for it).
+2. Re-run test 2 (validation error — required field empty) and confirm it now **fails** — the
+   form navigates away / submits with the field empty instead of showing an inline error.
+3. Restore the validation and re-run to confirm the suite passes again.
+
+Only once the assertion has been watched going red does a pass on this test mean the form
+validation is actually enforced.
+
+---
+
 ## Notes
 
 - Use `page.screenshot()` to capture evidence for any failing assertion.

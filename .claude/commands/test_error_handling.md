@@ -98,6 +98,22 @@ Navigate to a protected page without being logged in: `{{PROTECTED_URL}}`
 
 ---
 
+## Negative Case (required before trusting this test as a gate)
+
+A test that has never been observed failing may be asserting something that was already true —
+the same way a green CI check becomes decorative. A test never observed failing is not evidence.
+
+1. Temporarily disable the generic-error handler (let the raw exception / stack trace reach the
+   response body) for the endpoint under test 2 (server error).
+2. Re-run test 2 and confirm it now **fails** — the body contains a stack trace or file path
+   instead of the generic message.
+3. Restore the error handler and re-run to confirm the suite passes again.
+
+Only once the assertion has been watched going red does a pass on this test mean the leak is
+actually being caught, not just absent by coincidence.
+
+---
+
 ## Pass Criteria
 
 | Check | Expected |

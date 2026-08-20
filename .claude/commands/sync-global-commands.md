@@ -21,12 +21,12 @@ excluding the `brain/` reference directory.
 
    Run:
    ```bash
-   test -f .claude/workflows/sdlc-run.js && echo "Guard: OK — running from base-template root" || echo "ABORT: .claude/workflows/sdlc-run.js not found. Run this command from the base-template root."
+   test -f .claude/workflows/sdlc-flow.js && echo "Guard: OK — running from base-template root" || echo "ABORT: .claude/workflows/sdlc-flow.js not found. Run this command from the base-template root."
    ```
 
    If the guard fails (file not found), **stop immediately** and tell the user:
    > "sync-global-commands must be run from the base-template root directory
-   > (the directory that contains `.claude/workflows/sdlc-run.js`).
+   > (the directory that contains `.claude/workflows/sdlc-flow.js`).
    > Please cd to that directory and try again."
 
 2. **Count before — record current state of `~/.claude/commands/`.**

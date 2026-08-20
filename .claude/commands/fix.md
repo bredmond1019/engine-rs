@@ -16,41 +16,40 @@ Examples:
    the **task number** to fix; the remainder is the spec path. If no number is present, operate
    on all tasks.
 
-3. **Derive the review report path:**
-   - Spec only: `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/reports/review.md`
-   - Spec + task N: `planning/phase0-blockC/tasks.md 3` → `planning/phase0-blockC/sdlc/reports/task3-review.md`
+3. **Derive the spec dir:** `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/`.
 
-4. Read the review report. **If it does not exist, stop immediately:**
-   > Cannot fix: no review report found at `<path>`. Run `/review-task <spec> [N]` first.
+4. Read `sdlc/state.json` (if absent, and `sdlc/worklog.md` also has no `## Review` section for
+   this scope, **stop immediately:**
+   > Cannot fix: no review result found for `<spec> [N]`. Run `/review-task <spec> [N]` first.
+   ). Find the most recent `review` verdict for this scope: `state.json`'s top-level `review.verdict`
+   field (spec-wide runs) or, for a task-scoped fix, the relevant `tasks["<N>"]` entry plus the
+   most recent `## Task <N> — REVIEW ...` section in `sdlc/worklog.md` (worklog sections are the
+   ordered history; state.json only holds the latest value per key).
 
-5. Check the **Overall verdict** line in the review report.
+5. Check the verdict.
    - **If PASS:** stop with: "Review verdict is PASS — no fix needed. Run `/document <spec> [N]`."
    - **If FAIL or PARTIAL:** continue.
 
-6. Extract from the review report:
-   a. Every row in the **Acceptance Criteria** table where Status is NOT MET or PARTIAL —
-      collect criterion text and evidence.
-   b. Every item listed under **Issues Found** — collect file:line references and descriptions.
-   c. The full **Verdict** paragraph — understand the blocking rationale.
+6. Extract from the most recent `## Task <N> — REVIEW ...` worklog section (and `state.json`'s
+   `review.findings`, if populated):
+   a. Every acceptance criterion recorded as NOT MET or PARTIAL — criterion text and evidence.
+   b. Every issue listed — collect the symbol reference (function, struct, type, or test name; a
+      line number only as a secondary hint) and description.
+   c. The blocking rationale.
 
 7. Run `/prime` to orient to the codebase.
 
-8. **Derive the implement report path:**
-   - Spec only: `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/reports/implement.md`
-   - Spec + task N: `planning/phase0-blockC/tasks.md 3` → `planning/phase0-blockC/sdlc/reports/task3-implement.md`
+8. **Determine the fix pass number:** read `sdlc/state.json`'s `tasks["<N>"].attempts` (or, for a
+   full run, the highest `attempts` across all task entries touched by this spec). This fix pass
+   is `attempts + 1`. If no prior state exists, this is Fix Pass 1 — note its absence.
 
-9. Read the implement report if it exists:
-   a. Extract the **Files Created or Modified** table — this is the baseline file list.
-   b. Check the report title: if it begins with "Fix Pass" read the `**Fix pass:**` field and set
-      the new pass number to that value + 1. If the title begins with "Implementation Report"
-      (not a fix pass), this is Fix Pass 1. If no implement report exists at all, this is Fix
-      Pass 1 — note its absence in the report.
+9. **Determine the baseline file list:** read `sdlc/state.json`'s `tasks["<N>"].files_changed`
+   (the implement/prior-fix-pass record). If absent, use the files most likely touched based on
+   the spec and the review worklog section's issues.
 
 10. Read the task spec in full: acceptance criteria and Validation Commands section.
 
-11. Read every source file from the **Files Created or Modified** table (or, if that table was
-    absent, the files most likely touched based on the spec and review report's Issues Found).
-    Understand current code state.
+11. Read every source file from the baseline file list (step 9). Understand current code state.
 
 12. THINK HARD: for each failing criterion (step 6a) and each issue found (step 6b), identify
     the minimal targeted change needed. Do not re-implement work that already passed.
@@ -58,23 +57,21 @@ Examples:
 13. **Make only the targeted fixes.** Address every item from steps 6a and 6b. Do not touch
     code paths that the review confirmed as passing.
 
-14. **Compile the complete file list for the report:** start with every file from the prior
-    implement report's table. Add any new files touched by this fix. Remove nothing — even
-    files untouched by the fix pass must remain listed if they were created or modified by a
-    prior implementation step. Run `git diff --stat` to verify completeness. This list is the
-    authoritative input for `/document`.
+14. **Compile the complete file list:** start with the baseline list (step 9). Add any new files
+    touched by this fix. Remove nothing — even files untouched by this fix pass must remain
+    listed if a prior implementation step created or modified them. Run `git diff --stat` to
+    verify completeness. This list is the authoritative input for `/document`.
 
 15. **Run the validation commands** from the spec's Validation Commands section exactly as
     written. If the spec has none, run the project's checks from `planning/harness.json`
     (`validation.checks[]`); if that is absent too, stop and ask the user for the validation
     commands. Capture the exact output.
 
-16. If validation still fails: record the remaining failures clearly in the report —
-    do NOT loop or attempt further changes. The subsequent `/test` and `/review-task` cycle is
-    the authoritative gate. A second fix pass may be needed.
+16. If validation still fails: record the remaining failures clearly in the worklog entry (see
+    Record) — do NOT loop or attempt further changes. The subsequent `/test` and `/review-task`
+    cycle is the authoritative gate. A second fix pass may be needed.
 
-17. Write the Fix Pass report to the implement report path, overwriting any prior content
-    (see Report).
+17. Record this fix pass (see Record).
 
 18. Summarize the fixes to the user in the chat: what was wrong, what was changed, and whether
     validation passed.
@@ -87,70 +84,38 @@ Examples:
 
 ## Context / Files to Read
 
-- Review report (derived from $ARGUMENTS) — read first; gate on non-PASS verdict
-- Implement report (derived from $ARGUMENTS) — for prior file list and fix pass count
+- `sdlc/state.json` and `sdlc/worklog.md`'s most recent `## Task <N> — REVIEW ...` section — read
+  first; gate on non-PASS verdict
 - `$ARGUMENTS` (the task spec) — for acceptance criteria and validation commands
 - `CLAUDE.md` (standing rules)
-- All source files from the implement report's Files Created or Modified table
+- All source files from the baseline file list (step 9)
 
-## Report
+## Record (worklog + state — the fix pass appends, it does not overwrite)
 
-**Write to the implement report path** (overwrites previous implement or fix report):
-- Spec only: `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/reports/implement.md`
-- Spec + task N: `planning/phase0-blockC/tasks.md 3` → `planning/phase0-blockC/sdlc/reports/task3-implement.md`
+No prose report file, and **no overwrite.** The old prose-report version of this command wrote
+"the current state of Phase 2 work" by overwriting the implement report slot on every fix pass —
+that behavior does not carry over. In the worklog model every fix pass **appends** its own
+section like every other step; git history (each fix pass's own commit) already gives you what
+the overwrite was for, so nothing is lost by appending instead.
 
-**Write the report file in this exact format:**
+1. **Read `sdlc/state.json`** (else start from `{}`); preserve fields you don't touch.
 
-```markdown
-# Fix Pass <N> — <plan filename> [Task <N> | All Tasks]
+2. **Update `sdlc/state.json`**: set `tasks["<N>"].status` to `"fix_passed"` or `"fix_failed"`;
+   increment `tasks["<N>"].attempts`; append this pass's fix descriptions to `tasks["<N>"].fixes`;
+   set `tasks["<N>"].files_changed` to the complete list from step 14; set `tasks["<N>"].commit` to
+   this pass's short commit hash; set `tasks["<N>"].validated` to the step-15 result. Bump
+   `updated_at`; preserve `started_at`.
 
-**Date:** <YYYY-MM-DD>
-**Plan:** <plan file path>
-**Scope:** Task <N> | All tasks
-**Fix pass:** <N>
-**Review report consumed:** <path to review report>
-**Prior verdict:** FAIL | PARTIAL
-
-## Failures Addressed
-
-| # | Failing Criterion / Issue | Fix Applied |
-|---|---|---|
-| 1 | <criterion or issue text, ~80 chars> | <what was done to fix it> |
-| 2 | … | … |
-
-## Files Created or Modified
-
-| File | Action |
-|---|---|
-| path/to/file.ts | created / modified |
-
-## Validation Output
-
-**Commands run:**
-\`\`\`
-<exact commands executed>
-\`\`\`
-
-**Results:**
-\`\`\`
-<stdout/stderr output, truncated to relevant lines>
-\`\`\`
-Status: PASSED / FAILED
-
-## Changes Made
-
-- <bullet per logical change with file:line reference>
-
-## Decisions and Trade-offs
-
-- <any non-obvious choice made during the fix, or "None">
-
-## git diff --stat
-
-\`\`\`
-<output>
-\`\`\`
-```
+3. **Append to `sdlc/worklog.md`** (create with header `# Worklog — <spec-slug>` + a blank line
+   first, if it doesn't exist yet):
+   ```markdown
+   ## Task <N> — FIX PASS <k> — <PASSED|FAILED>
+   Addressed: <criterion/issue summaries, semicolon-joined>
+   Files: <comma-joined file list>
+   Commit: <short hash>
+   Validated: <PASS|FAIL, from step 15>
+   ```
+   (`<N>` is "All Tasks" when no task number was given; `<k>` is the fix pass number from step 8.)
 
 Then summarize the fixes to the user in the chat.
 

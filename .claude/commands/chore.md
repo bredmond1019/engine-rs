@@ -48,14 +48,13 @@ Plan one maintenance or housekeeping task — no behavior change, tests incident
      reasoning/breakdown only; sonnet for high-risk or complex; gemini-pro intermediate;
      gemini-flash simple. Record the reasoning in `workflow_rationale`.
    - **Compilable task boundaries (outranks the file-based split when the two conflict).**
-     `/chore` only ever feeds `/sdlc-task` or `/sdlc-flow` — never `/sdlc-block`'s parallel-merge
-     model — and both run every task **sequentially on one branch/worktree with no inter-task
-     merge step**, gating the project's checks after **every single task**. A single breaking
-     public-surface change (a renamed public type, a struct's changed fields, an altered
-     trait/interface signature, and every call site each touches) must never be split across tasks
-     such that an intermediate task leaves the repository non-compiling — put the whole change in
-     **one** task, even if it then touches more files than usual. **Unconditional here**, with no
-     `/sdlc-block` carve-out.
+     `/chore` only ever feeds `/sdlc-task` or `/sdlc-flow`, and both run every task
+     **sequentially on one branch/worktree with no inter-task merge step**, gating the project's
+     checks after **every single task**. A single breaking public-surface change (a renamed public
+     type, a struct's changed fields, an altered trait/interface signature, and every call site
+     each touches) must never be split across tasks such that an intermediate task leaves the
+     repository non-compiling — put the whole change in **one** task, even if it then touches more
+     files than usual. Unconditional: both engines are sequential.
    - Acceptance criteria are lighter than a ticket's but still **observable** — "the check passes
      on a corpus sweep", not "the code is cleaner". End with the project's gating checks passing.
    - **"The gates still pass" is a weak criterion on its own.** They passed before too — that is
@@ -92,13 +91,7 @@ Plan one maintenance or housekeeping task — no behavior change, tests incident
    and 53% with empty `validation_commands` because the template's empty array was read as a
    default.
 
-8. **Render the spec view:** `python3 scripts/render_spec.py <BlockID>`. This writes
-   `planning/<BlockID>/tasks.md` from the block record — the SDLC engines read it as the spec
-   document. It is **generated**: never hand-edit it, edit the block record and re-render. Until
-   D65 stage 2 lands this step is not optional; an engine run against a missing `tasks.md` has no
-   spec to read.
-
-9. **Property self-check (can fail).** Before reporting, confirm:
+8. **Property self-check (can fail).** Before reporting, confirm:
    - **`tasks.json` reads back off disk and parses** — run it, do not assert it:
      `python3 -c "import json;d=json.load(open('planning/<BlockID>/tasks.json'));assert isinstance(d,list) and d;print(len(d),'tasks')"`.
    - **The block record validates** against `.claude/workflows/block.schema.json`, with `why`,
@@ -107,13 +100,12 @@ Plan one maintenance or housekeeping task — no behavior change, tests incident
      change is split across two or more tasks such that an intermediate task would leave the
      repository non-compiling under the per-task gate. If so this check **fails**: merge those
      tasks and re-run the self-check.
-   - **`tasks.md` was rendered** and matches: `python3 scripts/render_spec.py <BlockID> --check`.
    - **The pre-change baseline is recorded** in the block record's `why` or `description` — which
      gates passed before this chore, so a later red one is attributable.
    - **At least one acceptance criterion observes a difference**, not merely that the gates are
      still green.
 
-10. Report the paths created and the next step.
+9. Report the paths created and the next step.
 
 ## Session boundary
 
@@ -157,7 +149,6 @@ metrics or quotes, no emoji.
 ```
 planning/blocks/<BlockID>.json     (block record)
 planning/<BlockID>/tasks.json      (<N> tasks)
-planning/<BlockID>/tasks.md        (generated view)
 state.json: <created | already existed>, block registered
 
 Next (implement + test loop):

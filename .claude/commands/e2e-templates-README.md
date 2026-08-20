@@ -11,6 +11,12 @@ markdown that an agent can follow to write or execute E2E tests for a feature.
    auth tokens, etc.).
 3. Run the test via your project's test runner, or invoke it as a Claude Code command if you
    want the agent to drive it.
+4. **Before trusting the test as a gate, break the thing it asserts and watch the test fail.**
+   Each template has a "Negative Case" section — introduce the concrete failure it names (a bad
+   credential, a missing field, a wrong status), re-run, and confirm the assertion goes red.
+   Then restore the fix and re-run to confirm it goes green again. A test that has never been
+   observed failing may be asserting something that was already true, which is exactly how a
+   green CI check becomes decorative — a test never observed failing is not evidence.
 
 ## Available templates
 
@@ -23,9 +29,9 @@ markdown that an agent can follow to write or execute E2E tests for a feature.
 
 ## Integrating with the SDLC pipeline
 
-If you want E2E tests to run as part of the `sdlc-block` back-half, set
-`block.verify: "consolidated+review"` in `planning/harness.json` and add your E2E command to
-`validation.checks[]`. The consolidated review stage will run it over the integrated tree.
+If you want E2E tests to run as part of a roadmap orchestration run's back-half, add your E2E
+command to `validation.checks[]` in `planning/harness.json`. The consolidated review stage will
+run it over the integrated tree.
 
 ## Placeholders
 

@@ -4,7 +4,7 @@
 //
 // The default engine for non-trivial feature work. Runs one spec's tasks
 // SEQUENTIALLY on a SINGLE shared branch (so there are no inter-task merges to
-// conflict — sdlc-block's #1 failure mode), with a per-task test→fix loop, ONE
+// conflict), with a per-task test→fix loop, ONE
 // consolidated review at the end, a docs patch, and a PR as the terminal step.
 //
 // ISOLATION MODE
@@ -12,7 +12,7 @@
 //   sparse-checkout worktree, so a relative planning/ symlink (brain-vaulted repos)
 //   stays intact. main is left on the branch until the PR merges.
 //   --worktree: the isolated sparse-checkout worktree under trees/<spec>-flow/ —
-//   opt in when you need true isolation (e.g. /sdlc-block fans out parallel children).
+//   opt in when you need true isolation.
 //
 // A compact, COMMITTED, AUTHORITATIVE state.json + one worklog.md replace the 5×N
 // per-stage report files: resume + review + wrap-up read a structured index instead
@@ -217,7 +217,7 @@ const noPr          = hasFlag('--no-pr')
 const resumeMode    = hasFlag('--resume')
 // Isolation mode: default runs on a plain branch checked out in the MAIN working tree (keeps a relative
 // planning/ symlink intact — worktrees break it). --worktree opts back into the isolated sparse-checkout
-// worktree (needed for true parallelism — e.g. /sdlc-block fans out concurrent children).
+// worktree (needed for true isolation).
 const useWorktree   = hasFlag('--worktree')
 
 const VALID_TEST_DEPTHS = ['fast', 'full']
@@ -239,8 +239,9 @@ if (rangeSpec) {
   selectedTasks = new Set(parsed)
 }
 
-const blockDir      = `planning/${blockId}`
-const specFile      = `${blockDir}/tasks.md`
+const blockDir       = `planning/${blockId}`
+const blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
+let specFile         = `${blockDir}/tasks.md`                // legacy fallback for a spec with no block record (reassigned once setup reports which source exists)
 const tasksJsonFile = `${blockDir}/tasks.json`
 const breakdownFile = `${blockDir}/breakdown.md`
 const reportsDir    = `${blockDir}/sdlc/reports`
@@ -252,7 +253,7 @@ const MAX_TASK_ATTEMPTS   = 3   // implement→test→fix attempts per task befo
 const MAX_REVIEW_ATTEMPTS = 3   // consolidated-review fix passes before bail
 
 log(`Target: ${blockId} (${selectedTasks ? [...selectedTasks].sort((a, b) => a - b).join(', ') : 'all tasks'})`)
-log(`Spec: ${specFile} | branch: ${baseBranchName} | mode: ${useWorktree ? 'worktree' : 'branch'}${resumeMode ? ' | RESUME' : ''}`)
+log(`Spec: ${blockId} (resolving block record first, tasks.md fallback) | branch: ${baseBranchName} | mode: ${useWorktree ? 'worktree' : 'branch'}${resumeMode ? ' | RESUME' : ''}`)
 
 // ================================================================
 // Schemas
@@ -264,7 +265,8 @@ const SETUP_SCHEMA = {
     branchName:     { type: 'string', description: 'Actual branch name used (may have -2, -3 suffix if base was taken)' },
     worktreePath:   { type: 'string', description: 'Absolute path to the worktree directory' },
     wasCreated:     { type: 'boolean', description: 'true if a new worktree was created, false if an existing one was reused' },
-    specFileExists: { type: 'boolean', description: 'true if the task spec file exists in the worktree' },
+    specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
+    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'" },
     blockStatus:    { type: 'string', description: "This spec's Status in status.md (title-case), or 'Unknown'" },
     specThin:       { type: 'boolean', description: 'D19: true ONLY on a fresh run (wasCreated && specFileExists) with a structurally-valid but substantively-thin spec. false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
@@ -320,8 +322,8 @@ const ENUMERATE_SCHEMA = {
   }
 }
 
-// D16 derive-from-tasks.md fallback — see the abort below. Mirrors sdlc-block.js's ensureTasks()
-// generator and /generate-tasks' --from mode: read the spec's authored step decomposition and
+// D16 derive-from-tasks.md fallback — see the abort below. Mirrors /generate-tasks' --from mode:
+// read the spec's authored step decomposition and
 // write a fresh D45-shaped tasks.json from it (never a verbatim copy of the prose, never the
 // superseded D44 {"tasks": [...]} wrapper).
 const DERIVE_SCHEMA = {
@@ -391,7 +393,7 @@ const REVIEW_SCHEMA = {
 }
 
 // Triage a per-task or per-review failure: RETRYABLE (a bounded fix can help) vs MAJOR (bail to a
-// human now). Mirrors sdlc-block's TRIAGE_SCHEMA + the immediate-bail reason set.
+// human now).
 const TRIAGE_SCHEMA = {
   type: 'object',
   required: ['class', 'reason'],
@@ -505,14 +507,14 @@ const STATE_WRITE_SCHEMA = {
 // MODEL TIERING — the primary token lever for this pipeline.
 //
 // Without this map every stage inherits the SESSION model — so launching /sdlc-flow from an Opus
-// session silently runs the mechanical stages on Opus too. Principle (mirrors sdlc-run/task): match
+// session silently runs the mechanical stages on Opus too. Principle (mirrors sdlc-task): match
 // the model to the work. To re-tier, change one value here — nothing else moves.
 // Valid values: 'haiku' | 'sonnet' | 'opus' | undefined (inherit session model).
 // ----------------------------------------------------------------
 const MODEL = {
   worktreeSetup: 'haiku',    // scripted git following an exact free-name + sparse-checkout recipe
   enumerate:     'haiku',    // read + parse tasks.json's task list — a fixed procedure
-  derive:        'opus',     // D16 fallback: author a fresh tasks.json from tasks.md's step list — real judgment, mirrors sdlc-block.js's ensureTasks() generator
+  derive:        'opus',     // D16 fallback: author a fresh tasks.json from tasks.md's step list — real judgment
   stateLoad:     'haiku',    // read + parse one JSON file (resume only)
   generateTasks: 'opus',     // PLANNING — authors the spec (fallback path only)
   implement:     'sonnet',   // writes code/content + tests against a scoped task
@@ -569,8 +571,7 @@ async function tracedAgent(prompt, opts = {}) {
 // CONTRACT SCOPE (Phase 0 /code-review carry-in): `metrics` — and therefore `tokens.total` — cover the
 // SUBSTANTIVE stages only. Cheap helper / state-writer agents (the Haiku state-writer, config + baseline
 // loaders) deliberately use bare agent() and are EXCLUDED; this bounded, Haiku-cheap exclusion is the
-// same boundary in all four engines, named here so it is explicit rather than silent — it keeps the
-// two-level /sdlc-block roll-up summing comparable substantive-stage totals at both levels.
+// same boundary in both engines, named here so it is explicit rather than silent.
 function buildTokensBlock() {
   const stages = metrics.map(m => {
     const filesReadKb = m.filesReadKb != null ? m.filesReadKb : null
@@ -711,8 +712,13 @@ function renderEngineParseChecks(files, cd, startIndex) {
   return files.map((f, i) => {
     const n = startIndex + i
     return `CHECK ${n} — engine-parse-safety (hardcoded parse-time gate on modified SDLC engine file — mechanism, unconditional on harness.json) [GATING — a failure here blocks the verdict]:
-  ${cd}node --check ${f}
-  echo "CHECK${n}_EXIT:$?"`
+  ${cd}if [ -f ${f} ]; then node --check ${f}; else echo "engine-parse-safety: ${f} does not exist (deleted by this task) — nothing to parse"; fi
+  echo "CHECK${n}_EXIT:$?"
+  Run that line EXACTLY as written and judge it ONLY by CHECK${n}_EXIT. Do NOT substitute a bare
+  node --check on ${f}: this task may legitimately DELETE ${f}, and a deleted engine has no syntax
+  to be wrong. The [ -f ] guard IS the check. "Cannot find module" from an unguarded node --check
+  is YOUR command failing, not this gate failing, and reporting it as a gate failure bails the run
+  on work that is actually correct (observed twice on 2026-08-19).`
   }).join('\n\n')
 }
 
@@ -1114,7 +1120,9 @@ You are the setup agent. ${useWorktree
 All bash commands run from the MAIN REPO ROOT (your current CWD).
 
 Target:
-  Spec:       ${blockId}
+  Spec:              ${blockId}
+  Block record:      ${blockRecordFile} (preferred spec source, D65 stage 2)
+  Legacy spec file:  ${specFile} (fallback — only used when the block record is absent)
   Base name:  ${baseBranchName}
 
 STEP 1 — Get the absolute repo root:
@@ -1123,16 +1131,21 @@ STEP 1 — Get the absolute repo root:
 ${useWorktree ? worktreeRecipe : branchRecipe}
 
 STEP 6 — Report pipeline-start inputs (run these from the live checkout):
-  a. Spec file:
-       cd ${setupWorkdir} && ls ${specFile} 2>/dev/null && echo "SPEC_EXISTS" || echo "SPEC_MISSING"
-     specFileExists = true iff "SPEC_EXISTS" printed.
+  a. Spec source (D65 stage 2) — the block record is checked FIRST and is preferred; tasks.md is only
+     a fallback for a legacy spec that predates the block-record migration:
+       cd ${setupWorkdir} && ls ${blockRecordFile} 2>/dev/null && echo "RECORD_EXISTS" || echo "RECORD_MISSING"
+       cd ${setupWorkdir} && ls ${specFile} 2>/dev/null && echo "LEGACY_EXISTS" || echo "LEGACY_MISSING"
+     specSource = "block-record" if RECORD_EXISTS (regardless of the legacy file); else "tasks-md" if
+     LEGACY_EXISTS; else "missing". specFileExists = true iff specSource != "missing".
   b. Block status — find this spec's row in status.md:
        cd ${setupWorkdir} && grep -iE "${blockId}" planning/status.md | head -5
      blockStatus = the title-case Status value (Not started / In progress / Done / Blocked / Skipped),
      or "Unknown" if no row is found.
-  c. Thin-spec check (D19) — ONLY when wasCreated AND specFileExists (a fresh run about to spend
-     implement tokens; skip on resume). Set specThin=true ONLY on these high-confidence signals (a
-     blocked valid spec is far costlier than a missed thin one — when in doubt do NOT flag):
+  c. Thin-spec check (D19) — ONLY when wasCreated AND specSource == "tasks-md" (the legacy path — a
+     block-record spec is authored structured JSON, not markdown prose, so the {{TOKEN}}/section checks
+     below do not apply to it) (a fresh run about to spend implement tokens; skip on resume). Set
+     specThin=true ONLY on these high-confidence signals (a blocked valid spec is far costlier than a
+     missed thin one — when in doubt do NOT flag):
        - cd ${setupWorkdir} && grep -n '{{' ${specFile}  → any unfilled {{TOKEN}} is thin.
        - The '## Acceptance Criteria' section has no real '- ' bullet (empty, or only a template seed) → thin.
      Do NOT flag bare 'TODO'/'TBD' prose, do NOT treat '<...>' as a token (legitimate in 'Vec<T>', globs),
@@ -1168,7 +1181,21 @@ if (useWorktree) {
   log(`Worktree path derives from the spec slug (trees/${branchName}), not any block ID — use "git worktree list" to locate it, never guess.`)
 }
 
-// D19 — thin-spec guard for a fresh run.
+// D65 stage 2: resolve which spec source this run actually has. specSource defaults to 'tasks-md'
+// only if the setup agent omitted the field (older cached run) — never silently prefer a source
+// that was not actually checked.
+const specSource = setupResult.specSource || (setupResult.specFileExists ? 'tasks-md' : 'missing')
+if (specSource === 'block-record') {
+  specFile = blockRecordFile
+  log(`Spec source: block record (${specFile})`)
+} else if (specSource === 'tasks-md') {
+  log(`Spec source: legacy tasks.md (${specFile}) — no block record found at ${blockRecordFile}`)
+}
+const specDesc = specSource === 'block-record'
+  ? '(JSON block record — what/why/acceptance_criteria/testing_strategy/validation_commands fields)'
+  : '(prose — Goal, Acceptance Criteria, Validation Commands)'
+
+// D19 — thin-spec guard for a fresh run (legacy tasks.md path only — see STEP 6c above).
 if (setupResult.specThin) {
   log(`ABORTED (D19) — spec is structurally valid but substantively thin: ${setupResult.thinReason || '(no reason given)'}`)
   log(`Fix: flesh out ${specFile} (run /generate-tasks --force to regenerate, or edit + commit), then re-run.`)
@@ -1194,9 +1221,9 @@ build/test/validation from the repo root; relative paths (planning/...) resolve 
 phase('Plan')
 
 if (!setupResult.specFileExists) {
-  log(`Spec file ${specFile} not found in the worktree. /sdlc-flow expects an authored spec.`)
+  log(`Neither the block record (${blockRecordFile}) nor the legacy spec file (${specFile}) was found in the worktree. /sdlc-flow expects an authored spec.`)
   log(`Fix: run /generate-tasks ${blockId} (and /breakdown) on main, commit, then re-run /sdlc-flow ${blockId}.`)
-  return { error: 'Missing spec', blockId, specFile }
+  return { error: 'Missing spec', blockId, specFile, blockRecordFile }
 }
 
 const ENUMERATE_PROMPT = `${W}
@@ -1226,8 +1253,8 @@ let enumResult = await tracedAgent(ENUMERATE_PROMPT, withModel({ label: 'enumera
 
 if (!enumResult || !enumResult.hasTasks || !(enumResult.allTasks || []).length) {
   // D16 derive-from-tasks.md fallback — before refusing, check whether the spec's authored
-  // tasks.md carries a derivable step decomposition. Mirrors sdlc-block.js's ensureTasks()
-  // generator and /generate-tasks' --from mode: author a FRESH decomposition from tasks.md (never
+  // tasks.md carries a derivable step decomposition. Mirrors /generate-tasks' --from mode:
+  // author a FRESH decomposition from tasks.md (never
   // a verbatim copy of its prose). Deriving from an authored tasks.md is not guessing the task
   // structure — D16 exists to refuse fabricating one out of nothing, which the abort below still does.
   const deriveResult = await tracedAgent(`${W}
@@ -1260,9 +1287,7 @@ STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from tasks.md's
   target that task's own tests specifically — never a bare/positional filter that could silently
   match zero or the wrong tests — and a command matching nothing must fail rather than pass. Never
   hardcode a stack-specific command (e.g. a particular test runner invocation) into this prompt;
-  that judgment belongs to the deriving agent at run time, per task. \`sdlc-block.js\`'s generator
-  (its "acceptance_criteria/validation_commands can stay [] per task" step) is the sibling that
-  already gets this right — match its intent.
+  that judgment belongs to the deriving agent at run time, per task.
 
 STEP 4 — Commit it on the current branch with an explicit pathspec:
   git add ${tasksJsonFile}
@@ -1444,6 +1469,16 @@ STEP W4 — use the Write tool for both files. Do NOT run \`git add\`, \`git com
 }
 
 async function runTests(label, { gatingOnly, taskCommands = null, onPass = null, engineFiles = [] }) {
+  // Diff-window concurrent-sessions fix: the emoji gate scopes to the commit SHAs THIS run itself
+  // recorded in the run-state (state.tasks[N].commit — the in-memory object writeFlowState()
+  // persists to disk at stateFile), never to the whole prBase..HEAD range. Reading state.tasks
+  // in-memory (rather than re-reading stateFile off disk) is deliberate: disk writes only happen
+  // after a task fully passes, so by the time THIS task's own gate runs, its own just-made commit
+  // would not yet be on disk — only the in-memory object already reflects it at prompt-build time,
+  // right after `t.commit = stageResult.commit` in the caller.
+  const recordedCommits = Object.values(state.tasks).map(x => x.commit).filter(Boolean)
+  const recordedCommitsJson = JSON.stringify(recordedCommits)
+
   // D63 — pure substitute, unchanged: usingOverride still fully replaces the harness gating checks
   // for this task's per-task tripwire (not augmented, unlike sdlc-task.js). Safe here because the
   // end review below unconditionally re-runs the full gates:true suite over the integrated tree.
@@ -1460,37 +1495,49 @@ ${usingOverride
     ? renderTaskCheckList(taskCommands, worktreePath)
     : renderCheckList(harnessCfg, { gatingOnly, cwd: worktreePath, engineFiles })}
 
-Then run the universal emoji gate (a harness rule, always) — DIFF-SCOPED: it judges only lines
-ADDED on this branch, never a whole changed file, so a legacy file's pre-existing emoji does not
-fail a diff that never touched it (the literal "🤖 Generated with Claude Code" PR footer is exempt
-— it lives in the PR body, not a file, but the check exempts the phrase defensively too):
+Then run the universal emoji gate (a harness rule, always) — DIFF-SCOPED to this run's OWN
+recorded commit SHAs, never the whole ${prBase}..HEAD range: it judges only lines ADDED by
+commits THIS run itself made, so neither a legacy file's pre-existing emoji nor a concurrent
+sibling session's commit can fail a diff this run never touched (the literal "🤖 Generated with
+Claude Code" PR footer is exempt — it lives in the PR body, not a file, but the check exempts the
+phrase defensively too):
   cd ${worktreePath} && python3 - <<'PYEOF'
 import subprocess, re, sys
 EMOJI = re.compile(r'[\\U0001F300-\\U0001FAFF\\U00002600-\\U000027BF]')
 FOOTER = 'Generated with Claude Code'
-diff = subprocess.run(['git','diff','-M','-U0','${prBase}..HEAD','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
+BASE_SHA = '${prBase}'
+STATE_FILE = '${stateFile}'
+RUN_COMMITS = ${recordedCommitsJson}
+if not RUN_COMMITS:
+    base_diff = subprocess.run(['git','diff','--name-only',f'{BASE_SHA}..HEAD'], capture_output=True, text=True).stdout.strip()
+    if base_diff:
+        print(f'EMOJI CHECK: cannot scope diff -- no commits recorded in the run-state ({STATE_FILE}) for this run, but {BASE_SHA}..HEAD is non-empty. Refusing to pass on an unscoped diff.')
+        sys.exit(1)
+    print('EMOJI CHECK: OK'); sys.exit(0)
 hits = []
-cur_file = None
-cur_line = None
-for line in diff:
-    if line.startswith('diff --git '):
-        cur_file = None; cur_line = None
-    elif line.startswith('+++ '):
-        p = line[4:]
-        cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
-    elif line.startswith('@@'):
-        m = re.match(r'@@ -\\d+(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@', line)
-        cur_line = int(m.group(1)) if m else None
-    elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
-        content = line[1:]
-        if EMOJI.search(content) and FOOTER not in content:
-            hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
-        cur_line += 1
+for commit in RUN_COMMITS:
+    diff = subprocess.run(['git','diff','-M','-U0',f'{commit}^..{commit}','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
+    cur_file = None
+    cur_line = None
+    for line in diff:
+        if line.startswith('diff --git '):
+            cur_file = None; cur_line = None
+        elif line.startswith('+++ '):
+            p = line[4:]
+            cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
+        elif line.startswith('@@'):
+            m = re.match(r'@@ -\\d+(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@', line)
+            cur_line = int(m.group(1)) if m else None
+        elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
+            content = line[1:]
+            if EMOJI.search(content) and FOOTER not in content:
+                hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
+            cur_line += 1
 if hits:
     print('EMOJI CHECK FAIL:'); [print(h) for h in hits[:25]]; sys.exit(1)
 print('EMOJI CHECK: OK'); sys.exit(0)
 PYEOF
-  A stray emoji ADDED in docs FAILS this gate.
+  A stray emoji ADDED in a commit THIS run made FAILS this gate.
 
 For each check record: name, passed (true iff exit code 0), the command, and failure output.
 ${onPass ? renderOnPassStateWriteRecipe(onPass) : ''}
@@ -1698,7 +1745,7 @@ on Task ${taskNum} of this spec.
 Target:
   Spec:        ${blockId}
   Task:        Task ${taskNum} only
-  Spec file:   ${specFile} (prose — Goal, Acceptance Criteria, Validation Commands)
+  Spec file:   ${specFile} ${specDesc}
   Tasks file:  ${tasksJsonFile} (the task list — find the entry with "task_id": ${taskNum})
 
 1. Read CLAUDE.md and planning/context.md — internalize the project's standing rules (CLAUDE.md is the
@@ -1786,7 +1833,14 @@ Return via StructuredOutput:
       }
       continue
     }
-    if (stageResult.commit) t.commit = stageResult.commit
+    // D-fix (BT.ticket.emoji-gate-diff-window-concurrent-sessions): the stage schema's field is
+    // `commitHash`, never `commit` — reading `.commit` here silently left t.commit unset on EVERY
+    // run in this fleet's history. Harmless while it only fed the state file's index; load-bearing
+    // now that the emoji gate scopes to these SHAs, where an empty set trips the cannot-scope abort.
+    // A stage occasionally returns a quoted empty string (observed live: commitHash === '""'), so
+    // require something that actually looks like a short hash rather than merely truthy.
+    const rawCommit = (stageResult.commitHash || '').replace(/["']/g, '').trim()
+    if (/^[0-9a-f]{7,40}$/i.test(rawCommit)) t.commit = rawCommit
     if (stageResult.summary) t.summary = stageResult.summary
     if (Array.isArray(stageResult.filesModified)) t.files_changed = [...new Set([...(t.files_changed || []), ...stageResult.filesModified])]
     if (Array.isArray(stageResult.decisions) && stageResult.decisions.length) t.decisions = [...(t.decisions || []), ...stageResult.decisions]
@@ -1940,7 +1994,7 @@ the ACTUAL code and issue a verdict. All Bash calls run from the worktree root.
 
 Target:
   Spec:        ${blockId}
-  Spec file:   ${specFile}
+  Spec file:   ${specFile} ${specDesc}
   Tasks run:   ${taskList.join(', ')}
   Base branch: ${prBase}
 
@@ -1948,7 +2002,8 @@ The committed run-state is your INDEX (per-task summary/issues/fixes/decisions/f
 but it does NOT replace verifying the criteria against the code:
   cd ${worktreePath} && cat ${stateFile}
 
-1. Read the spec's COMPLETE "## Acceptance Criteria" — this is your checklist.
+1. Read the spec's COMPLETE acceptance criteria — this is your checklist (the "## Acceptance Criteria"
+   section in prose, or the "acceptance_criteria" array in a JSON block record).
    Run: cd ${worktreePath} && cat ${specFile}
 
 2. Read the actual integrated diff (every task's work is sequential commits on this branch):

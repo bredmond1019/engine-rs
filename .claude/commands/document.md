@@ -1,7 +1,7 @@
 # Document — Update docs to reflect a completed, reviewed implementation.
 
-Gates on the review verdict being PASS. Uses the implement report's file list to scope
-doc updates surgically, without relying on git diff alone.
+Gates on the review verdict being PASS. Scopes doc updates surgically from the real diff, scoped
+to this task's branch/commit, cross-checked against the recorded file list.
 
 ## Variables
 
@@ -20,37 +20,42 @@ Examples:
 
 3. Run `/prime` to orient to the codebase before reading any files.
 
-4. **Derive the review report path** (reports live in the spec's `reports/` sibling directory):
-   - Plan only: `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/reports/review.md`
-   - Plan + task N: `planning/<spec-slug>/tasks.md 3` → `planning/<spec-slug>/sdlc/reports/task3-review.md`
+4. **Derive the spec dir:** `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/`.
 
-5. Read the review report. Check the **Overall verdict** line.
+5. Read `sdlc/state.json`'s top-level `review.verdict` (spec-wide) or `tasks["<N>"].status` (task-scoped).
    **If the verdict is not PASS, STOP immediately:**
    > "Cannot document: review verdict is [FAIL/PARTIAL]. Resolve all blocking issues and
    > re-run `/review-task [args]` until the verdict is PASS."
+   If no state file / no review recorded, STOP with the same message, naming the missing state.
 
-6. **Derive the implement report path:**
-   - Plan only: `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/reports/implement.md`
-   - Plan + task N: `planning/<spec-slug>/tasks.md 3` → `planning/<spec-slug>/sdlc/reports/task3-implement.md`
+6. **Derive the changed-file list from the real diff, scoped to this task's branch/commit —
+   not the whole working tree, which may hold unrelated concurrent-session noise in a shared
+   index.** Run `git diff --name-only <base>...HEAD` (or, for an uncommitted worktree,
+   `git diff --name-only HEAD`) against the branch or commit this implement/review pass produced,
+   not a bare `git status` over the shared index. This diff is the authoritative list of changed
+   source files.
 
-7. Read the implement report. Extract the **Files Created or Modified** table. This is the
-   authoritative list of changed source files — do not guess from git or the spec.
+   Then read `sdlc/state.json`'s `tasks["<N>"].files_changed` as a cross-check. If the two
+   disagree — a file the state entry claims but the diff doesn't show, or vice versa — treat the
+   mismatch itself as a finding: note it in the worklog entry's Docs Checked line rather than
+   silently trusting either side, and prefer the diff's list for scoping the doc-update work in
+   step 8.
 
-8. Read every file in `docs/`. For each doc, check whether it references any of the changed
+7. Read every file in `docs/`. For each doc, check whether it references any of the changed
    source files (look for `**Source:**` annotations, code paths, class/function/component names that
    appear in the changed files). Build a map: `{ doc_path → [changed_source_files_it_covers] }`.
-   If no docs reference any changed file, note "No docs affected" and skip to step 10.
+   If no docs reference any changed file, note "No docs affected" and skip to step 9.
 
-9. For each affected doc + changed source pair:
+8. For each affected doc + changed source pair:
    a. Read the full current doc and the full changed source file.
    b. Identify only the sections that describe the changed code.
    c. Rewrite those sections to match the source exactly. Leave all other sections untouched.
    d. If a change is too large for surgical patching (e.g. an entire module was replaced),
       flag it as `NEEDS_REVIEW` and skip — do not attempt a full rewrite.
 
-10. Apply all surgical updates.
+9. Apply all surgical updates.
 
-11. Write the document report and summarize to the user (see Report).
+10. Record the result (see Record) and summarize to the user.
 
 ## Rules
 
@@ -63,56 +68,40 @@ Examples:
 
 ## Context / Files to Read
 
-- Review report (derived from $ARGUMENTS) — read first; gate on PASS
-- Implement report (derived from $ARGUMENTS) — for the changed file list
+- `sdlc/state.json` — read first; gate on `review.verdict` (or task-scoped status) being PASS
+- `git diff --name-only` output scoped to this task's branch/commit — the authoritative changed-file list
+- `sdlc/state.json`'s `tasks["<N>"].files_changed` — cross-check against the diff
 - `docs/` — all existing reference docs
-- Changed source files identified from the implement report
+- Changed source files identified from the diff
 
-## Report
+## Record (worklog + state, not a prose report)
 
-**Derive the document report file path** (reports live in the spec's `reports/` sibling directory):
-- Plan only: `planning/<spec-slug>/tasks.md` → `planning/<spec-slug>/sdlc/reports/document.md`
-- Plan + task N: `planning/<spec-slug>/tasks.md 3` → `planning/<spec-slug>/sdlc/reports/task3-document.md`
+No prose report file. Both `sdlc/worklog.md` and `sdlc/state.json` are **write-only artifacts**
+(never `git add`/`git commit` them — `planning/` is a D46 vault symlink in a vaulted repo, so
+committing under it can fail "beyond a symbolic link"; they're read back off disk only). Doc file
+edits themselves (under `docs/`) are ordinary source changes and still get committed normally per
+the spec's own instructions.
 
-Create `planning/<spec-slug>/sdlc/reports/` if it does not exist.
+1. **Read `sdlc/state.json`** (else start from `{}`); preserve fields you don't touch.
 
-**Write the report file in this exact format:**
+2. **Update `sdlc/state.json`**: set `docs.changed` to the list of doc paths surgically updated
+   this run (append, don't duplicate); set `docs.created` similarly if `/update-docs` created new
+   files as a prerequisite this run (usually empty for `/document` itself). Bump `updated_at`;
+   preserve `started_at`.
 
-```markdown
-# Document Report — <spec filename> [Task <N> | All Tasks]
-
-**Date:** <YYYY-MM-DD>
-**Plan:** <spec file path>
-**Scope:** Task <N> | All tasks
-**Review verdict confirmed:** PASS
-**Implement report read:** <path>
-**Source files scanned:** <N>
-**Docs updated:** <N>
-
-## Docs Updated
-
-| Doc | Sections Updated |
-|---|---|
-| docs/OPERATIONS.md | "Content loader" subsection |
-
-## Docs Checked — No Changes Needed
-
-- docs/DEPLOYMENT.md — no references to changed source files
-
-## NEEDS_REVIEW
-
-- docs/architecture.md — an architecture-level source file was modified; manual review required
-
-## Source Files Covered
-
-| Source File | Action | Docs Updated |
-|---|---|---|
-| src/services/data-loader | modified | docs/OPERATIONS.md |
-| src/routes/index | modified | (no docs reference this file) |
-
-## Next Step
-
-`/log-work [notes about what was completed]`
-```
+3. **Append to `sdlc/worklog.md`** (create with header `# Worklog — <spec-slug>` + a blank line
+   first, if it doesn't exist yet):
+   ```markdown
+   ## Docs
+   Patched: <comma-joined docs.changed, or "none">
+   Checked, no changes needed: <comma-joined doc paths, or omit line if none>
+   NEEDS_REVIEW: <comma-joined doc paths, or omit line if none>
+   Mismatch: <diff vs. recorded files_changed note, or omit line if none>
+   ```
 
 Then summarize the updates to the user in the chat.
+
+Then output the pipeline next step:
+```
+Next: /log-work [notes about what was completed]
+```

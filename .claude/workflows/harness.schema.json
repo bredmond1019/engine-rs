@@ -90,23 +90,6 @@
         }
       }
     },
-    "block": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "Optional policy for /sdlc-block (the block-level roadmap orchestrator: fans out one /sdlc-flow per independent block in its own worktree, runs blocks in dependency-ordered waves derived from a master-plan-format file, opens a PR per block by default). Absent → maxParallelBlocks 3, autoMerge false. Only read by /sdlc-block; other engines ignore it.",
-      "properties": {
-        "maxParallelBlocks": {
-          "type": "integer",
-          "default": 3,
-          "description": "Maximum number of blocks /sdlc-block fans out concurrently within a wave. A wave contains blocks that share no dependency; this cap limits concurrent worktree creation and /sdlc-flow runs. Lower for machines with tight disk/memory; raise for CI with ample resources."
-        },
-        "autoMerge": {
-          "type": "boolean",
-          "default": false,
-          "description": "When true, /sdlc-block merges each block's branch into the train branch as it completes (no PRs opened; human review bypassed). When false (default), one PR is opened per block and /merge-train handles the ordered merge after human review. CLI --auto-merge overrides this per run."
-        }
-      }
-    },
     "flow": {
       "type": "object",
       "additionalProperties": false,

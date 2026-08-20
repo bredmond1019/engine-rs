@@ -1,6 +1,6 @@
 # Close Out — Verify test coverage, patch docs, and hand off cleanly.
 
-Run this after `/sdlc-run`, `/sdlc-flow`, or any implementation session to close the
+Run this after `/sdlc-flow` or any implementation session to close the
 quality loop before handing off: run the full test suite, fill coverage gaps, patch stale
 docs, then produce a clean `/handoff`.
 
@@ -8,8 +8,8 @@ docs, then produce a clean `/handoff`.
 
 $ARGUMENTS — optional. Parsed left to right:
   - `--gap-check-only` — run Steps 1–3 only (validation + coverage + docs); skip Step 4
-    (`/handoff`). Designed for automated per-block close-out from `/sdlc-block` where
-    handing off mid-run makes no sense. Preserves all gating and coverage logic.
+    (`/handoff`). Designed for automated per-block close-out from a roadmap orchestration run
+    where handing off mid-run makes no sense. Preserves all gating and coverage logic.
   - `--skip-coverage` — skip Step 2 (coverage scan + gap fill); use when coverage is
     already known good or was verified by a prior `/review-task`.
   - `--clean-worktree` — run Step 5 (clean-worktree) at the very end to merge a **worktree** branch

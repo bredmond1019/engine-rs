@@ -114,6 +114,22 @@ Authorization: Bearer {{LOW_PRIV_TOKEN}}
 
 ---
 
+## Negative Case (required before trusting this test as a gate)
+
+A test that has never been observed failing may be asserting something that was already true —
+the same way a green CI check becomes decorative. A test never observed failing is not evidence.
+
+1. Temporarily disable the auth check (comment out the guard/middleware on `{{PROTECTED_URL}}`,
+   or point step 1 at a route you know is unprotected).
+2. Re-run test 1 (unauthenticated request) and confirm it now **fails** — the endpoint returns
+   `200` instead of `401`.
+3. Restore the auth check and re-run to confirm the suite passes again.
+
+Only once the assertion has been watched going red does a pass on this test mean the auth gate
+is actually enforced.
+
+---
+
 ## Pass Criteria
 
 | Check | Expected |

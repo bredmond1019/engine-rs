@@ -35,7 +35,7 @@ $ARGUMENTS — optional flags, space-separated:
 
    Run:
    ```bash
-   test -f .claude/workflows/sdlc-run.js && echo "Guard: OK — running from base-template root" || echo "ABORT: .claude/workflows/sdlc-run.js not found. Run this command from the base-template root."
+   test -f .claude/workflows/sdlc-flow.js && echo "Guard: OK — running from base-template root" || echo "ABORT: .claude/workflows/sdlc-flow.js not found. Run this command from the base-template root."
    ```
 
 2. **Dry run first, always** — even if `$ARGUMENTS` includes `--apply`, run once without it first
@@ -48,14 +48,33 @@ $ARGUMENTS — optional flags, space-separated:
    confirmed harmless in practice (D48's provenance) via `diff <target file> <base-template file>`
    showing the sync produces a byte-identical copy, not corruption. Flag it in the report either way.
 
-3. **If `--apply` was requested, run it for real:**
+   **Report this live-lane check too, before the destructive step is even considered** — see step 3.
+   Do not wait until `--apply` is requested to surface it; the whole point is to see the warning
+   while it's still cheap to back out.
+
+3. **Guard — check for a live orchestration lane before applying.** This command overwrites
+   `.claude/workflows/*.js` in every synced repo. If a lane is mid-flight in one of those repos,
+   its engine file changes underneath the process already executing it — a running lane has had
+   its engine swapped out from under it this way before. Check both of the following, and if either
+   shows a live lane in a repo this run would touch, **stop and do not pass `--apply`** until that
+   lane finishes or the operator confirms it's safe:
+   ```bash
+   python3 scripts/fleet_concurrency_check.py list
+   grep -l 'lifecycle: active' planning/orchestration-run/*/notes.md 2>/dev/null
+   ```
+   The first names any repo holding a registered heavy-lane lock (`scripts/fleet_concurrency_check.py`,
+   D61). The second finds any `planning/orchestration-run/<roadmap>/notes.md` whose frontmatter is
+   still `lifecycle: active` — run it inside each target repo, not just here, since a lane can be
+   live in a downstream repo this command is about to overwrite.
+
+4. **If `--apply` was requested, run it for real:**
    ```bash
    python3 scripts/sync_downstream_harness.py <$ARGUMENTS>
    ```
    This writes the changed files and updates each synced repo's `planning/.template-version`
    (`commit:` + `synced:` fields). It does **not** commit.
 
-4. **Per repo, before committing:** check for pre-existing unrelated dirty state so it doesn't get
+5. **Per repo, before committing:** check for pre-existing unrelated dirty state so it doesn't get
    swept into the harness-pull commit by accident:
    ```bash
    cd <repo_path> && git status --short | grep -v '\.claude/' | grep -v 'planning/\.template-version'
@@ -63,7 +82,7 @@ $ARGUMENTS — optional flags, space-separated:
    If that prints anything, it's unrelated in-progress work in that repo — leave it out of the
    commit (stage `.claude/` and `planning/.template-version` explicitly, never `git add -A`).
 
-5. **Commit in each repo that changed** — but in **two** commits, in different repos, because the
+6. **Commit in each repo that changed** — but in **two** commits, in different repos, because the
    synced files do not all belong to the same git repo:
 
    **(a) The sub-repo owns `.claude/` and `.agents/`:**
@@ -89,7 +108,7 @@ $ARGUMENTS — optional flags, space-separated:
    those files locally (harmless), and only their `.agents/` mirrors are tracked. Don't force-add
    the rest.
 
-6. **Second consumers of the `tasks.json` contract.** `core/orchestrator` used to carry one — an
+7. **Second consumers of the `tasks.json` contract.** `core/orchestrator` used to carry one — an
    independent `SDLC_FLOW` workflow implementation. **It was retired**: `app/schemas/sdlc_schema.py`
    and `docs/sdlc-flow-workflow.md` were both deleted by orchestrator commit `75b6c8e`
    ("or-x2-sdlc-evals-retirement-task1"), and `SDLC_FLOW` now survives there only as a string in
@@ -99,14 +118,14 @@ $ARGUMENTS — optional flags, space-separated:
    of this step is that a contract with two implementations needs both checked, not that
    orchestrator specifically matters.
 
-7. **Sweep for already-broken specs** the fix should also repair: any repo's `planning/*/tasks.md`
+8. **Sweep for already-broken specs** the fix should also repair: any repo's `planning/*/tasks.md`
    still using the old `### <prefix>.<n>.<n>` heading pattern with `**Status:** Not started` can be
    converted cleanly (write its `tasks.json`, trim `tasks.md`'s Step-by-Step Tasks section to a
    pointer). A spec already `In progress` or `Done` needs no touching — leave it. See
    `core/bastion/planning/13.1-persistent-agent-panel/` for a worked example of this conversion.
 
-8. **Report:** which repos were synced, how many files each, which repos had nothing to sync, any
-   repo skipped (no `.claude/workflows/`, or gitignored), and any spec found + fixed in step 7.
+9. **Report:** which repos were synced, how many files each, which repos had nothing to sync, any
+   repo skipped (no `.claude/workflows/`, or gitignored), and any spec found + fixed in step 8.
 
 ## Notes
 

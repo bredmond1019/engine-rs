@@ -5,9 +5,10 @@ Produces a structured gap report (stale sections, missing coverage, confirmed-cu
 Optionally fixes STALE sections and creates MISSING docs with `--patch`, or skips the audit
 and creates all missing docs from scratch with `--bootstrap`.
 
-This is the **ad-hoc maintenance** counterpart to `/document` (which gates on a PASS verdict
-and is driven by a pipeline report). Use `/update-docs` for periodic doc health checks and
-bootstrapping outside the SDLC pipeline; use `/document` inside it.
+This is the **ad-hoc maintenance** counterpart to `/document` (which gates on `sdlc/state.json`'s
+recorded `review.verdict` being PASS, not a prose report — see `/document`'s Record section).
+Use `/update-docs` for periodic doc health checks and bootstrapping outside the SDLC pipeline;
+use `/document` inside it.
 
 ## Variables
 

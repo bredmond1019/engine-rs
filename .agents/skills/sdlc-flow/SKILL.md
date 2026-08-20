@@ -44,7 +44,9 @@ description: >
      straight to wrap-up (draft PR) — it does NOT burn three attempts.
 
    End-review: ONE review over the integrated tree, fed state.json as the index but
-   reading `git diff <prBase>..HEAD` + tasks.md criteria directly + re-running the
+   reading `git diff <prBase>..HEAD` + the spec's acceptance criteria directly (the block record's
+   `acceptance_criteria` array when D65's block record is the spec source, else `tasks.md`'s
+   `## Acceptance Criteria` prose) + re-running the
    FULL gating suite (authoritative). PASS → docs; FAIL/PARTIAL → triage findings:
    small/localized → bounded fix→test→review (≤2, Opus last); broad → bail.
 

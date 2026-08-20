@@ -178,9 +178,10 @@ created: YYYY-MM-DD
 would otherwise re-derive. Cite file paths and decision numbers.>
 
 ## Completed this session
-<Concrete things done — commits, files changed, decisions reached. "bumped harness-config
-loader to sonnet in all 3 engines (sdlc-block.js:473, sdlc-task.js:455, sdlc-run.js:326)",
-not "fixed engine".>
+<Concrete things done — commits, files changed, decisions reached. "bumped the harness-config
+loader to sonnet in both engines (`loadHarnessConfig` in sdlc-flow.js and sdlc-task.js)",
+not "fixed engine". Name the symbol, not a line number — it drifts the moment the file is
+next edited.>
 
 ## Remaining work
 <What's left, in priority order. Mark blockers explicitly.>
@@ -238,8 +239,10 @@ target this repo feeds, report it rather than inventing the missing sentinel pai
 
 **4d — Commit.** Stage `planning/handoff.md`, the `state.json` edits, `log.md`, `status.md`, and
 any other uncommitted work. Write a conventional-commit message. Show the staged file list and
-get confirmation before committing. Branch first if on the default branch. Do not push unless
-asked.
+get confirmation before committing. **Commit on whatever branch you are already on — do not
+create one.** `/handoff` is called at the end of finished work, which is normally already on
+`main`; branching there strands the handoff off the branch the next session opens. Do not push
+unless asked.
 
 ### Step 5 — Report
 

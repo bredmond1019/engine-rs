@@ -3,20 +3,20 @@
 Checks out the PR branch, runs the project's gating suite + emoji gate, reviews the
 diff against the block's Acceptance Criteria, and posts a verdict via `gh pr review`.
 
-Designed for PRs produced by `/sdlc-block` in default (PR) mode. Can also review any
-PR for a spec-based block by pointing at the spec manually.
+Designed for PRs produced by a roadmap orchestration run in default (PR) mode. Can also
+review any PR for a spec-based block by pointing at the spec manually.
 
 ## Variables
 
 $ARGUMENTS — `<PR#> [plan-slug]`
 - `<PR#>` — required. The GitHub PR number (integer).
-- `[plan-slug]` — optional. The plan slug (e.g. `sdlc-block-and-task-updates`) to scope
+- `[plan-slug]` — optional. The plan slug (e.g. `roadmap-and-task-updates`) to scope
   state lookup when multiple `block-orchestration-state.json` files exist.
 
 Examples:
 ```
 /review-PR 42
-/review-PR 42 sdlc-block-and-task-updates
+/review-PR 42 roadmap-and-task-updates
 ```
 
 ## Instructions
@@ -171,7 +171,7 @@ Build the review body:
 
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| 1 | <criterion text, ~80 chars> | MET / PARTIAL / NOT MET | file:line or test name |
+| 1 | <criterion text, ~80 chars> | MET / PARTIAL / NOT MET | symbol name or test name (line number optional, secondary) |
 
 ### Gating Results
 
@@ -216,7 +216,7 @@ Report to the user:
   so it covers only the PR's own changes, not the full branch history.
 - **Gating vs. non-gating checks.** Only checks with `gates: true` in `harness.json`
   are blocking. Non-gating failures are surfaced as informational findings in the review body.
-- **Fat PRs.** In default `/sdlc-block` mode, Phase-N PRs include ancestor block work
+- **Fat PRs.** In default roadmap-orchestration PR mode, Phase-N PRs include ancestor block work
   (the train branch is the common base). The AC review is still scoped to the target
   block's spec because `baseRefName` is the train branch from which this block forked.
 - **`/merge-train`** reads the orchestration state and merges all approved PRs bottom-up

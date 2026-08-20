@@ -126,7 +126,7 @@ The spec slug is the directory name under `planning/` (e.g. `<spec-slug>`,
     To run the SDLC pipeline in isolation:
       1. Open a new Claude Code session with working directory set to:
            <absolute-path-to-repo>/trees/<worktreeName>
-      2. Run: /sdlc-run <specSlug>[ <taskNum>]
+      2. Run: /sdlc-flow <specSlug>  (or /sdlc-task <specSlug> <taskNum> for a single task)
 
     Note: install the project's dependencies in the worktree before any build/test runs:
       cd trees/<worktreeName> && <install command per project>   (dependencies are NOT shared across worktrees)

@@ -98,7 +98,7 @@ error-prone part of editing `state.json` by hand:
    `W_STATE_*` warnings. A `W_STATE_ROLLUP_DRIFT` after step 4 means step 4 didn't actually run against
    the file you just edited (check you're pointing `emit-state` at the right root).
 6. **Check for concurrent in-flight work before committing.** If this repo has an active `/sdlc-flow`
-   or `/sdlc-block` running (look for `planning/<slug>/trees/*` worktrees, or a fresh unexpected commit
+   or `/orchestrate` running (look for `planning/<slug>/trees/*` worktrees, or a fresh unexpected commit
    on `main` since you started), your uncommitted edit can be silently discarded by that process's own
    git operations. Commit your `state.json` edit **promptly** once it's correct, or coordinate with
    whatever is running before editing further.

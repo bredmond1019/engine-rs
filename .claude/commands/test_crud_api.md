@@ -115,3 +115,18 @@ GET {{BASE_URL}}/{{RESOURCE}}
 **Assert:**
 - Status: `401 Unauthorized` (or `403 Forbidden`).
 - No data is returned.
+
+---
+
+## Negative Case (required before trusting this test as a gate)
+
+A test that has never been observed failing may be asserting something that was already true —
+the same way a green CI check becomes decorative. A test never observed failing is not evidence.
+
+1. Temporarily remove the required-field check on the server (or point step 5 at an endpoint
+   that skips validation) so the empty-body create succeeds instead of returning `422`/`400`.
+2. Re-run test 5 and confirm it now **fails**.
+3. Restore the validation and re-run to confirm the suite passes again.
+
+Only once the assertion has been watched going red does a pass on this test mean the validation
+gate is actually enforced.

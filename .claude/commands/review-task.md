@@ -14,27 +14,20 @@ Examples:
 1. If `$ARGUMENTS` is not provided, stop and ask the user for the task spec path.
 2. Parse `$ARGUMENTS`: split on the last space. If the trailing token is a number, treat it as the **task number** to review; the remainder is the task spec path.
 3. Run `/prime` to orient to the codebase before reading any files.
-4. **Derive file paths for prior step outputs** (reports live in the spec's `reports/` sibling directory):
-
-   Implement report (written by `/implement`):
-   - Plan only: `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/reports/implement.md`
-   - Plan + task N: `planning/phase0-blockC/tasks.md 3` → `planning/phase0-blockC/sdlc/reports/task3-implement.md`
-
-   Test report (written by `/test`):
-   - Plan only: `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/reports/test.md`
-   - Plan + task N: `planning/phase0-blockC/tasks.md 3` → `planning/phase0-blockC/sdlc/reports/task3-test.md`
+4. **Derive the spec dir:** `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/`.
 
 5. Read the task spec in full.
-6. Read both prior step outputs as historical context:
-   a. Read the implement report if it exists. If absent, note it and continue from source alone.
-   b. Read the test report if it exists. Note the historical results, but do NOT treat them as
-      authoritative — a fresh test run is required in step 8. If absent, note that `/test` was
-      not run before this review; the fresh run below covers it.
-7. Read every file listed in the implement report's **Files Created or Modified** table (or, if no
-   report, read the files most likely touched by the task based on the spec). Verify the actual
-   content — do not trust the report alone.
+6. Read prior step history as context, from `sdlc/state.json` and `sdlc/worklog.md`:
+   a. Read `sdlc/state.json`'s `tasks["<N>"]` entry, if present — `summary`, `files_changed`,
+      `validated`. If absent, note it and continue from source alone.
+   b. Read `sdlc/worklog.md`'s `## Task <N> — TEST ...` section(s), if present, for the historical
+      test result. Do NOT treat it as authoritative — a fresh test run is required in step 8. If
+      absent, note that `/test` was not run before this review; the fresh run below covers it.
+7. Read every file listed in `tasks["<N>"].files_changed` (or, if absent, read the files most
+   likely touched by the task based on the spec). Verify the actual content — do not trust the
+   recorded summary alone.
 8. **Run a fresh test suite** as the authoritative verification. Do NOT rely on the historical
-   test report — run the commands now and capture the results.
+   test worklog entry — run the commands now and capture the results.
    - **Task-scoped:** run the spec's Validation Commands section exactly as written.
    - **Full block:** run the spec's complete Validation Commands block. If none exist, run the
      project's checks from `planning/harness.json` (`validation.checks[]`); if that is absent too,
@@ -46,79 +39,49 @@ Examples:
 9. **Check every Acceptance Criterion** in the spec against the actual code and fresh test output:
    - For each criterion: state whether it is **MET**, **PARTIAL**, or **NOT MET**, and cite the evidence (file + line, test name, command output).
    - A criterion is MET only when you can point to code or test output that directly satisfies it.
-   - Do not mark anything MET based solely on the implementation report — verify in source.
-10. Write the review report file and summarize to the user (see Report).
+   - Do not mark anything MET based solely on the recorded `summary` — verify in source.
+10. Record the verdict (see Record) and summarize to the user.
 
 ## Context / Files to Read
 
 - `$ARGUMENTS` (the task spec)
-- `planning/phase0-blockC/sdlc/reports/implement.md` (or task-scoped variant — the implementation report, if present)
-- `planning/phase0-blockC/sdlc/reports/test.md` (or task-scoped variant — the test report, if present)
+- `sdlc/state.json`'s `tasks["<N>"]` entry, and `sdlc/worklog.md`'s prior `## Task <N> — ...` sections, if present
 - `CLAUDE.md` (standing rules — check for violations)
 - All files created or modified by the implementation
 
-## Report
+## Record (worklog + state, not a prose report)
 
-**Derive the review report file path** (reports live in the spec's `reports/` sibling directory):
-- Plan only: `planning/phase0-blockC/tasks.md` → `planning/phase0-blockC/sdlc/reports/review.md`
-- Plan + task N: `planning/phase0-blockC/tasks.md 3` → `planning/phase0-blockC/sdlc/reports/task3-review.md`
+No prose report file. Record this review the way `/sdlc-flow` and `/sdlc-task` do (D31) — a
+worklog section plus a state update. Both `sdlc/worklog.md` and `sdlc/state.json` are **write-only
+artifacts** (never `git add`/`git commit` them — `planning/` is a D46 vault symlink in a vaulted
+repo, so committing under it can fail "beyond a symbolic link"; they're read back off disk only).
 
-**Write the review report file** in this exact format:
+**Evidence format:** name the symbol first — function, struct, type, or test name — not a bare
+line number. A line number moves the moment the file is next edited; a symbol can still be
+grepped weeks later when this worklog entry is read. A line number may follow as a secondary hint.
 
-```markdown
-# Review Report — <plan filename> [Task <N> | All Tasks]
-
-**Date:** <YYYY-MM-DD>
-**Plan:** <plan file path>
-**Scope:** Task <N> | All tasks
-**Implement report:** found / not found
-**Test report:** found / not found
-**Overall verdict:** PASS / FAIL / PARTIAL
-
-## Acceptance Criteria
-
-| # | Criterion | Status | Evidence |
-|---|---|---|---|
-| 1 | <criterion text, truncated to ~80 chars> | MET / PARTIAL / NOT MET | file:line or test name or command output |
-| 2 | … | … | … |
-
-## Fresh Test Run
-
-**Commands run:**
-\`\`\`
-<exact commands executed>
-\`\`\`
-
-**Output:**
-\`\`\`
-<stdout/stderr, truncated to relevant lines>
-\`\`\`
-Result: PASS / FAIL
-
-## CLAUDE.md Rule Violations
-
-Check against **the project's standing rules** as written in `CLAUDE.md` and `planning/context.md`
-(stack, locale-parity, narrative, content-layout — only what is actually written there). Plus the
-universal harness rules:
-- **No fabricated metrics/quotes** — every number verifiable; model ids / package names verified, not from memory.
-- **No emoji** in docs or output.
-- **Gated checks pass** — every `planning/harness.json` check with `gates: true` passes before the task is done.
-
-- <any standing-rule violation found, or "None">
-
-## Issues Found
-
-- <concrete problem with file + line reference, or "None">
-
-**Verdict rules:**
+**Verdict rules** (unchanged):
 - **PASS** — all acceptance criteria MET AND fresh test run passed.
 - **PARTIAL** — criteria MET but one or more fresh tests failed; or fresh tests pass but some criteria only partially met.
 - **FAIL** — blocking acceptance criteria NOT MET, or fresh test run produced failures that invalidate the implementation.
 
-## Verdict
+1. **Read `sdlc/state.json`** (else start from `{}`); preserve fields you don't touch.
 
-<One paragraph: overall assessment, what passed, what failed, what must be fixed before this task is considered done. If PASS, state clearly. If FAIL or PARTIAL, list the blocking items.>
-```
+2. **Update `sdlc/state.json`**: set top-level `review.verdict` (spec-wide) or, for a task-scoped
+   review, `tasks["<N>"].status` to `"reviewed_<verdict lowercased>"`; set/append
+   `review.findings` with any NOT MET/PARTIAL criteria and issues found (short strings); increment
+   `review.attempts`. Bump `updated_at`; preserve `started_at`.
+
+3. **Append to `sdlc/worklog.md`** (create with header `# Worklog — <spec-slug>` + a blank line
+   first, if it doesn't exist yet):
+   ```markdown
+   ## Task <N> — REVIEW <PASS|FAIL|PARTIAL>
+   Criteria: <n> MET, <n> PARTIAL, <n> NOT MET
+   Issues: <symbol/test-name references, semicolon-joined; omit line if none>
+   CLAUDE.md violations: <summary, or omit line if none>
+   Verdict: <one-sentence rationale>
+   ```
+   (`<N>` is "All Tasks" when no task number was given.)
 
 Then summarize the verdict and any blocking issues to the user in the chat.
 

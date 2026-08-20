@@ -148,11 +148,23 @@ category from the `is-heavy` output:
 `python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <this-repo-name> --category <category>`.
 Exit code `3` (`"allowed": false`) means that category's pool is already at capacity (2
 browser-automation lanes, or 4 native-build lanes) — stop and report rather than starting another;
-wait or swap in a cheap-gate block instead. Release the slot once this repo's chain finishes:
-`... release --repo <this-repo-name>`. A lane killed mid-run does not block the fleet forever — its
-entry expires automatically (dead process, or past a fixed TTL) on the next registration. If the
-lock store itself is unavailable, the script degrades to `"allowed": true, "degraded": true` — the
-same advisory behavior this replaces, never a hard failure. Full design:
+wait or swap in a cheap-gate block instead.
+
+**Do not pass `--pid`.** The process running `register` is this short-lived command invocation —
+it exits as soon as this step returns, so its own pid is never a valid liveness signal for a later
+process to check. Leave `pid_source` at its default (`"self"`); the entry is then held by **TTL
+(90 minutes) plus explicit release only**, never by pid liveness. If this chain runs longer than
+that, **re-register periodically as a heartbeat** (repeat the same `register --repo <this-repo-name>
+--category <category>` call) — it is idempotent-refresh, so it bumps `started_at` instead of
+consuming a second slot.
+
+**Release the slot when this repo's chain finishes — this is required, not optional:**
+`... release --repo <this-repo-name>`, on success, failure, or abandonment. A lane killed mid-run
+without releasing does not block the fleet forever — its entry expires automatically once it is
+past the TTL, or (for an entry with an *explicitly*-supplied `--pid`) once that pid has died — but
+that is the fallback, not a substitute for releasing on exit. If the lock store itself is
+unavailable, the script degrades to `"allowed": true, "degraded": true` — the same advisory
+behavior this replaces, never a hard failure. Full design:
 `planning/decisions/D61-fleet-concurrency-enforcement.md` and
 `planning/decisions/D66-tiered-heavy-lane-concurrency.md` (in `base-template`).
 
@@ -188,14 +200,17 @@ Each has already cost a real run in this fleet.
    spec, no gate, no state write and no review, and the chain's own verification will still look
    fine, so nothing catches it.
 
-   **Two authoring-time rules for any spec or OKF frontmatter `/generate-tasks` (or you, editing
-   one by hand) produces** — generalized from a lane that hit both the same day: a `related:`
-   target must resolve to a real `doc_id` on a document that has actually been crawled, never a
-   carryover slug or an invented id — one bad edge red-gates the whole corpus for every concurrent
-   lane when `--graph` gates, not just the authoring one. And a `validation_command` must be
-   scoped to the task's own changes, never the whole working tree (e.g. never a
-   working-tree-wide `git diff | grep` guard) — it can never pass in a shared index with
-   concurrent lanes and bails the block on an unrelated lane's uncommitted files.
+   **Two authoring-time rules for any spec or OKF frontmatter this step (or `/generate-tasks`,
+   or hand-editing) produces or edits** — generalized from a lane that hit both in one day: a
+   `related:` target must resolve to a real `doc_id` on a document that has actually been crawled,
+   never a carryover slug or an invented id — an unresolved edge red-gates the whole corpus for
+   every concurrent lane when `--graph` gates, not just the authoring one. A cross-repo target must
+   be qualified `<repo>:<doc_id>` (e.g. `base-template:D48-downstream-harness-sync-script`); a bare
+   `doc_id` resolves only within the authoring repo and is treated as unresolved everywhere else —
+   see `docs/okf-frontmatter.md` for the full syntax. And a `validation_command` must be scoped to
+   the task's own changes, never the whole working tree (e.g. never a working-tree-wide `git diff |
+   grep` guard) — a tree-wide guard can never pass in a shared index with concurrent lanes and bails
+   the block on an unrelated lane's uncommitted files.
 
 2. **Commit after every `mev` command and every roadmap or plan edit**, before launching the next
    engine. Sibling lanes read those files; an uncommitted state change is invisible to them and gets
