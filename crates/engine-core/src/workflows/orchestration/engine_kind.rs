@@ -193,8 +193,10 @@ mod tests {
             // its `PartialOrchestrationPolicy` bundle — a config lookup, not a runner.
             ("graph.rs", &["profile_by_name"]),
             // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
-            // a path lookup, not a runner.
-            ("integrate.rs", &["resolve_roadmap_dir"]),
+            // a path lookup, not a runner. `closed`/`bailed` are `LaneLogEntry`
+            // constructors taking a `lane: &str` and a `note: impl Into<String>` —
+            // building a log line, not selecting or invoking a runner.
+            ("integrate.rs", &["resolve_roadmap_dir", "closed", "bailed"]),
             ("mod.rs", &[]),
         ];
 

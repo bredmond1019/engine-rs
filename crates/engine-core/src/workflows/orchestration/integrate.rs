@@ -52,8 +52,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::Utc;
-use serde::Serialize;
+use chrono::{DateTime, FixedOffset, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::repo_registry::RepoRegistry;
@@ -218,23 +218,64 @@ pub fn resolve_roadmap_dir(planning_root: &Path, slug: &str) -> Result<PathBuf, 
 // ── Lane-log append ─────────────────────────────────────────────────────
 
 /// One `lane-log.jsonl` line — the cross-lane channel a sibling lane reads
-/// to learn what this lane has already integrated. Field names are
-/// deliberately plain and stable; this is a durable on-disk artifact other
-/// repos' agents parse.
-#[derive(Debug, Clone, Serialize)]
+/// to learn what this lane has already integrated. Field names AND field
+/// order are the durable on-disk contract other repos' agents parse:
+/// `{ts, lane, repo, block, status, note}`, exactly and in that order,
+/// since the file is read by humans as often as by machines. See
+/// `scripts/roadmap_status_discovery.py`'s `read_lane_log`.
+///
+/// `ts` is `DateTime<FixedOffset>` rather than `DateTime<Utc>` so that a
+/// fixture line written with a non-UTC offset (e.g. `-03:00`, as most of
+/// the fleet's hand-written lines are) round-trips byte-for-byte through
+/// serde instead of being silently normalized to `Z` — the offset is part
+/// of what is on disk, not lost information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneLogEntry {
+    pub ts: DateTime<FixedOffset>,
+    pub lane: String,
     pub repo: String,
-    pub block_id: String,
-    pub integrated_at: chrono::DateTime<Utc>,
+    pub block: String,
+    pub status: LaneLogStatus,
+    pub note: String,
+}
+
+/// The closed vocabulary of outcomes a lane-log line can record. No
+/// string-typed escape variant: this type is only ever constructed by
+/// this crate, so an unknown status is a bug here, not data to carry
+/// through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneLogStatus {
+    Closed,
+    Bailed,
+    Held,
 }
 
 impl LaneLogEntry {
+    /// A block that finished successfully.
     #[must_use]
-    pub fn for_outcome(outcome: &ExecutionOutcome) -> Self {
+    pub fn closed(outcome: &ExecutionOutcome, lane: &str, note: impl Into<String>) -> Self {
         Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
             repo: outcome.repo.clone(),
-            block_id: outcome.block_id.clone(),
-            integrated_at: Utc::now(),
+            block: outcome.block_id.clone(),
+            status: LaneLogStatus::Closed,
+            note: note.into(),
+        }
+    }
+
+    /// A block whose step failed before it could complete — recorded so a
+    /// sibling lane sees the attempt rather than silence.
+    #[must_use]
+    pub fn bailed(step: &ChainStep, lane: &str, note: impl Into<String>) -> Self {
+        Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
+            repo: step.repo.clone(),
+            block: step.block_id.clone(),
+            status: LaneLogStatus::Bailed,
+            note: note.into(),
         }
     }
 }
@@ -250,7 +291,7 @@ pub fn append_lane_log_line(
 ) -> Result<(), IntegrateError> {
     let path = roadmap_dir.join("lane-log.jsonl");
     let line = serde_json::to_string(entry).map_err(|source| IntegrateError::LaneLogSerialize {
-        block_id: entry.block_id.clone(),
+        block_id: entry.block.clone(),
         source,
     })?;
     let mut file = OpenOptions::new()
@@ -490,7 +531,14 @@ pub async fn integrate_chain(
         let outcome = execute_step(step, resolve_engine, registry, run_flow).await?;
         verify_state_write(&outcome)?;
 
-        let entry = LaneLogEntry::for_outcome(&outcome);
+        // Lane threading (the event's real lane vs. this repo-slug
+        // fallback) lands in EN.ticket.lane-log-entry-schema task 3, which
+        // adds a `lane` parameter to this function.
+        let entry = LaneLogEntry::closed(
+            &outcome,
+            &step.repo,
+            format!("block {} closed", step.block_id),
+        );
         append_lane_log_line(roadmap_dir, &entry)?;
 
         outcomes.push(outcome);
@@ -761,7 +809,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
         };
-        let entry = LaneLogEntry::for_outcome(&outcome);
+        let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         append_lane_log_line(dir.path(), &entry).unwrap();
 
         let contents = std::fs::read_to_string(dir.path().join("lane-log.jsonl")).unwrap();
@@ -769,7 +817,61 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let parsed: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed["repo"], json!("repo-a"));
-        assert_eq!(parsed["block_id"], json!("A.1"));
+        assert_eq!(parsed["block"], json!("A.1"));
+    }
+
+    /// Guard against a future field being added and silently breaking
+    /// every reader again: the serialized key set must be exactly
+    /// `{ts, lane, repo, block, status, note}`, no more, no fewer.
+    #[test]
+    fn serialized_key_set_is_exactly_the_six_contract_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = ExecutionOutcome {
+            repo: "repo-a".into(),
+            repo_path: dir.path().to_path_buf(),
+            block_id: "A.1".into(),
+            ctx: engine_contract::TaskContext {
+                event: json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+        };
+        let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
+        let value = serde_json::to_value(&entry).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("entry must serialize to a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["block", "lane", "note", "repo", "status", "ts"]);
+    }
+
+    /// No constructor can produce an entry without an explicit status —
+    /// `closed` and `bailed` are the only ways to build one, and each
+    /// bakes in its own [`LaneLogStatus`] variant.
+    #[test]
+    fn constructors_bake_in_their_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = ExecutionOutcome {
+            repo: "repo-a".into(),
+            repo_path: dir.path().to_path_buf(),
+            block_id: "A.1".into(),
+            ctx: engine_contract::TaskContext {
+                event: json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+        };
+        let closed_entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
+        assert_eq!(closed_entry.status, LaneLogStatus::Closed);
+
+        let failing_step = step("repo-a", "A.1");
+        let bailed_entry = LaneLogEntry::bailed(&failing_step, "repo-a", "boom");
+        assert_eq!(bailed_entry.status, LaneLogStatus::Bailed);
     }
 
     #[test]
@@ -797,18 +899,26 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
         };
-        append_lane_log_line(dir.path(), &LaneLogEntry::for_outcome(&outcome_a)).unwrap();
-        append_lane_log_line(dir.path(), &LaneLogEntry::for_outcome(&outcome_b)).unwrap();
+        append_lane_log_line(
+            dir.path(),
+            &LaneLogEntry::closed(&outcome_a, "repo-a", "closed"),
+        )
+        .unwrap();
+        append_lane_log_line(
+            dir.path(),
+            &LaneLogEntry::closed(&outcome_b, "repo-b", "closed"),
+        )
+        .unwrap();
 
         let contents = std::fs::read_to_string(dir.path().join("lane-log.jsonl")).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(
-            serde_json::from_str::<Value>(lines[0]).unwrap()["block_id"],
+            serde_json::from_str::<Value>(lines[0]).unwrap()["block"],
             json!("A.1")
         );
         assert_eq!(
-            serde_json::from_str::<Value>(lines[1]).unwrap()["block_id"],
+            serde_json::from_str::<Value>(lines[1]).unwrap()["block"],
             json!("B.1")
         );
     }

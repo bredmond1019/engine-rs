@@ -222,9 +222,9 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
 
     let lines = lane_log_lines(&roadmap_dir);
     assert_eq!(lines.len(), 2, "exactly one lane-log line per block");
-    assert_eq!(lines[0]["block_id"], "A.1");
+    assert_eq!(lines[0]["block"], "A.1");
     assert_eq!(lines[0]["repo"], "repo-a");
-    assert_eq!(lines[1]["block_id"], "B.1");
+    assert_eq!(lines[1]["block"], "B.1");
     assert_eq!(lines[1]["repo"], "repo-b");
 }
 
