@@ -113,6 +113,44 @@ Untagged: either free prose, or one of the typed predicates — `block_closed`, 
 `file_contains`, `command_exits_zero`. Unknown `type` values are **rejected by serde** (there is no
 `#[serde(other)]`), so a typo surfaces as a whole-file parse error, not a warning.
 
+**The typed form is a flat object with a `type` key** — not `{"<predicate_name>": {...}}`. Nesting it
+under its own name is the natural guess and it fails as
+`data did not match any variant of untagged enum ClearsWhen`:
+
+```json
+"clears_when": {"type": "block_closed", "repo": "bastion-web", "id": "BW.8.N"}
+"clears_when": {"type": "file_exists", "path": "planning/decision-rate-card.md"}
+"clears_when": {"type": "file_contains", "path": "docs/x.md", "pattern": "Folded into", "note": "…"}
+"clears_when": {"type": "command_exits_zero", "command": "bastion validate-brain --links", "note": "…"}
+
+"clears_when": {"command_exits_zero": {"command": "…"}}   ❌ nested under its own name — parse error
+```
+
+`note` is optional on all four. A prose string is still legal, but only typed predicates are
+evaluable by `mev carryover` — a prose one lands in the not-evaluable lane.
+
+### `related[]` on a carryover entry is a typed edge, not a doc_id list
+
+**This is the single easiest carryover field to get wrong**, because the frontmatter field of the same
+name *is* a list of `doc_id` strings. In `state.json` it is not: it takes the same dependency objects
+as `depends_on[]`, and a bare string fails as
+`invalid type: string "...", expected internally tagged enum BlockedBy`.
+
+```json
+"related": [{"type": "block", "repo": "base-template", "id": "BT.ticket.retire-unused-engines",
+             "what": "the closed block whose deletions orphaned these refs"}]
+"related": [{"type": "external", "what": "planning/artifacts/review/tripwire.py — fires on this independently"}]
+
+"related": ["D77-build-first-productize-the-diagnostic"]    ❌ doc_id string — parse error
+```
+
+**Point a doc, decision or file reference at `{"type": "external", "what": "<path or id> — why"}`.**
+`what` is free text, so the citation survives; it simply is not a graph edge. `blocks[]` takes the
+same shapes.
+
+**Both errors poison the whole file**, and a whole-file parse error stops `emit-state` regenerating
+**every** board in the fleet (Step 4) — so a mis-shaped carryover field in one repo reds every lane.
+
 ---
 
 ## Step 3 — The vocabularies are closed
@@ -186,6 +224,7 @@ So one malformed file in one repo stops `emit-state` regenerating **every** boar
 
 Sibling code, same family: `E_STATE_SCHEMA_BAD_BLOCKED_BY` — a `related[]` or `depends_on[]` entry
 written as a bare string instead of a dependency object (`{"type": "block", "repo": ..., "id": ...}`).
+Shapes and the two ways this bites on `carryover[]` are in Step 2.
 
 ---
 
