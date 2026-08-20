@@ -188,41 +188,20 @@ structured work through:
 <!-- BEGIN:response-style -->
 ## Response Style
 
-Optimize every reply for an operator scanning several concurrent agent sessions. Default to the
-shortest response that fully answers. Long prose is the failure mode, not thoroughness.
+You are read by an operator scanning several concurrent agent sessions. Long prose is the failure
+mode, not thoroughness.
 
-**Shape**
+1. **First line = the outcome** — what happened, and whether it needs them.
+2. **Then the specifics** — bullets, one line each, max ~6. Facts, not narration.
+3. **Last line = the ask**, if there is one. One question, answerable in a word.
 
-1. **First line = the outcome.** What happened, and did it work. No preamble, no restating the ask.
-2. **Then the specifics, if any** — bullets, one line each, max ~6. Facts, not narration.
-3. **Last line = the ask, if any** — one question the user can answer in a word.
+**Ceiling: 10 lines for a normal turn, 20 for an end-of-run report.** Only depth the operator
+explicitly asked for may exceed it.
 
-Ceiling for a normal turn: **~150 words / ~15 lines**. Only depth the user explicitly asked for
-(a review, a design rationale, a plan document) may exceed it.
+Durable detail goes to disk — the commands already require that. **Link the path; do not restate
+the file.** Lead with failures, blocks, and anything that did not match the ask, in plain words with
+the real error text. Cut reasoning narration, unasked-for next steps, and self-assessment.
 
-**Cut**
-
-- Reasoning narration — how you got there, what you considered, what you almost did. Report
-  conclusions; the transcript already holds the steps.
-- Justifying decisions that worked out. Explain only what was non-obvious or that the user may
-  want to reverse.
-- Unasked-for "what's next", roadmaps, option menus, and status recaps.
-- Tables or headings for fewer than ~4 rows/sections — a sentence or bullets is faster to read.
-- Self-assessment and stage direction: "the finding that reframes everything", "worth your
-  attention", "one thing I want to flag", praise, hedging, apology.
-- Re-explaining anything already in a file you just wrote. Link the path instead.
-
-**Keep — these earn their space**
-
-- Failures, blocks, and anything not matching what was asked: say it first, plainly, with the
-  real error text.
-- Assumptions the user might reject, and decisions that need their call.
-- Security, data-loss, or money implications.
-- Exact identifiers where they *are* the content: `src/serve/handlers/attention.rs:101`, a
-  version, an error code. Never a paragraph describing what a one-line reference would say.
-
-**Register**
-
-Plain English for status, decisions, and trade-offs. Technical depth only where it changes what
-the user does next. One idea per sentence; no stacked em-dash asides.
+Full rationale, the complete cut-list, and worked before/after examples: the
+**`report-to-the-operator`** skill.
 <!-- END:response-style -->
