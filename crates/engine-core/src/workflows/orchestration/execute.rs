@@ -274,6 +274,11 @@ pub struct ExecutionOutcome {
     pub repo_path: PathBuf,
     pub block_id: String,
     pub ctx: TaskContext,
+    /// The isolation this step actually resolved to, per [`resolve_isolation`]
+    /// — stamped here so a caller (`OrchestrationRunNode::process`) can
+    /// attribute observed cost/behavior to the setting that produced it,
+    /// per CLAUDE.md standing rule 6.
+    pub use_worktree: bool,
 }
 
 // ── Execution ────────────────────────────────────────────────────────────
@@ -363,6 +368,7 @@ pub async fn execute_step(
         repo_path,
         block_id: step.block_id.clone(),
         ctx,
+        use_worktree,
     })
 }
 

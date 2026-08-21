@@ -211,6 +211,7 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         &roadmap_dir,
         None,
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect("two-repo chain should integrate cleanly");
@@ -265,6 +266,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         &roadmap_dir,
         None,
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect_err("an unmet dependency must refuse the block");
@@ -341,6 +343,7 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             &roadmap_dir2,
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await;
         admitted_writer.store(true, Ordering::SeqCst);
@@ -457,6 +460,7 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             &roadmap_dir2,
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
     });
@@ -525,6 +529,7 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         &roadmap_dir,
         None,
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect_err("a corrupted state write must fail the run");
@@ -666,6 +671,7 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script()
         &roadmap_dir,
         Some("prove-readability-lane"),
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect("single-block chain should integrate cleanly");
@@ -808,6 +814,7 @@ async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_run
             &roadmap_dir2,
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
     });
@@ -895,6 +902,7 @@ async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner
             &roadmap_dir2,
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
     });
@@ -959,6 +967,7 @@ async fn n_step_chain_calls_the_observer_exactly_n_times_with_correct_indices() 
         &roadmap_dir,
         None,
         &observer,
+        false,
     )
     .await
     .expect("three-step chain should integrate cleanly");
@@ -1028,6 +1037,7 @@ async fn the_observer_fires_after_the_lane_log_line_is_appended() {
         &roadmap_dir,
         None,
         &observer,
+        false,
     )
     .await
     .expect("two-step chain should integrate cleanly");
@@ -1063,6 +1073,7 @@ async fn no_observer_injected_changes_nothing() {
         &roadmap_dir,
         None,
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect("two-repo chain should integrate cleanly");

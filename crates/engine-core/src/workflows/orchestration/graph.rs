@@ -16,12 +16,15 @@
 //!
 //! # Policy
 //!
-//! This workflow introduces exactly one knob so far: `hold_poll_interval_ms`
-//! — how often [`integrate::wait_for_clearance`] re-polls an operator hold
-//! while paused. It is a pure latency/overhead trade (a busier poll notices
-//! clearance sooner at the cost of more wake-ups) and never changes the
-//! declared node set, so — unlike `sdlc_flow`/`diagnostic_intake` — there is
-//! no `registry_for_policy`: [`registry`] alone is what every profile runs.
+//! This workflow carries two knobs: `hold_poll_interval_ms` — how often
+//! [`integrate::wait_for_clearance`] re-polls an operator hold while paused
+//! — and `default_use_worktree` — the row-3 fallback
+//! [`execute::resolve_isolation`] consults for any repo that isn't one of
+//! the two non-negotiable rows (`base-template` always `true`, the brain
+//! root always `false`). Both are pure latency/overhead/isolation trades
+//! that never change the declared node set, so — unlike
+//! `sdlc_flow`/`diagnostic_intake` — there is no `registry_for_policy`:
+//! [`registry`] alone is what every profile runs.
 //! [`OrchestrationRunNode::process`] resolves the four-layer policy
 //! (`crate::policy::resolve`) itself, exactly where `diagnostic_intake`'s
 //! sole `IntakeExtractNode` does, since there is likewise no dedicated setup
@@ -112,13 +115,22 @@ pub struct OrchestrationPolicy {
     /// How often [`integrate::wait_for_clearance`] re-polls an operator
     /// hold while the chain is paused.
     pub hold_poll_interval_ms: u64,
+    /// The row-3 fallback [`execute::resolve_isolation`] consults for any
+    /// repo that is neither `base-template` (always `true`) nor the brain
+    /// root (always `false`) — those two rows are external contracts and
+    /// are NOT reachable through this knob, whatever it is set to. Defaults
+    /// to `false`: today every orchestrated run is in-place, and standing
+    /// rule 6 requires a new knob to be behavior-stable.
+    pub default_use_worktree: bool,
 }
 
 impl Default for OrchestrationPolicy {
-    /// The behavior-stable baseline: poll every 2s while held.
+    /// The behavior-stable baseline: poll every 2s while held, run every
+    /// ordinary repo in-place.
     fn default() -> Self {
         Self {
             hold_poll_interval_ms: 2_000,
+            default_use_worktree: false,
         }
     }
 }
@@ -129,6 +141,7 @@ impl Default for OrchestrationPolicy {
 #[serde(default)]
 pub struct PartialOrchestrationPolicy {
     pub hold_poll_interval_ms: Option<u64>,
+    pub default_use_worktree: Option<bool>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -139,6 +152,10 @@ impl crate::policy::Policy for OrchestrationPolicy {
             hold_poll_interval_ms: crate::policy::merge_opt(
                 self.hold_poll_interval_ms,
                 over.hold_poll_interval_ms,
+            ),
+            default_use_worktree: crate::policy::merge_opt(
+                self.default_use_worktree,
+                over.default_use_worktree,
             ),
         }
     }
@@ -152,24 +169,31 @@ impl crate::policy::Policy for OrchestrationPolicy {
 pub fn baseline() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(2_000),
+        default_use_worktree: Some(false),
     }
 }
 
 /// Cheapest/fastest profile: poll far less often — fewer wake-ups, at the
-/// cost of noticing an operator clearance later.
+/// cost of noticing an operator clearance later. Also runs in-place: a
+/// worktree is a fresh checkout plus a second target dir, the expensive
+/// option, not the cheap one.
 #[must_use]
 pub fn cheap_fast() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(10_000),
+        default_use_worktree: Some(false),
     }
 }
 
 /// Highest-responsiveness profile: poll far more often — a cleared hold is
-/// noticed almost immediately, at the cost of more wake-ups.
+/// noticed almost immediately, at the cost of more wake-ups. Also
+/// quarantines every ordinary repo into its own worktree, the highest-safety
+/// isolation option.
 #[must_use]
 pub fn thorough() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(500),
+        default_use_worktree: Some(true),
     }
 }
 
@@ -471,6 +495,11 @@ impl Node for OrchestrationRunNode {
             .clone()
             .unwrap_or_else(|| default_flow_runner(repo_registry.clone()));
         let poll_interval = Duration::from_millis(policy.hold_poll_interval_ms);
+        // The row-3 fallback `execute::resolve_isolation` consults for any
+        // repo that isn't one of the two non-negotiable rows. `bool` is
+        // `Copy`, so this is captured into the `spawn_blocking` closure by
+        // value like `poll_interval` above — no `Arc`/clone needed.
+        let default_use_worktree = policy.default_use_worktree;
 
         let resolve_depends_on = self.resolve_depends_on.clone();
         let is_edge_met = self.is_edge_met.clone();
@@ -525,6 +554,7 @@ impl Node for OrchestrationRunNode {
                 &roadmap_dir,
                 resolved_lane.as_deref(),
                 step_observer.as_ref(),
+                default_use_worktree,
             ))
             .map_err(|err| NodeError::new(err.to_string()))
         })
@@ -583,9 +613,16 @@ impl Node for OrchestrationRunNode {
                 "steps_integrated": outcomes.len(),
                 "blocks": outcomes
                     .iter()
-                    .map(|o| json!({ "repo": o.repo, "block_id": o.block_id }))
+                    .map(|o| json!({
+                        "repo": o.repo,
+                        "block_id": o.block_id,
+                        "use_worktree": o.use_worktree,
+                    }))
                     .collect::<Vec<_>>(),
-                "policy": { "hold_poll_interval_ms": policy.hold_poll_interval_ms },
+                "policy": {
+                    "hold_poll_interval_ms": policy.hold_poll_interval_ms,
+                    "default_use_worktree": policy.default_use_worktree,
+                },
                 "cancellation": cancellation,
             }),
         );
@@ -702,6 +739,14 @@ mod tests {
     #[test]
     fn builtin_default_is_behavior_stable_baseline() {
         assert_eq!(OrchestrationPolicy::default().hold_poll_interval_ms, 2_000);
+        assert!(!OrchestrationPolicy::default().default_use_worktree);
+    }
+
+    #[test]
+    fn all_three_profiles_set_default_use_worktree_explicitly() {
+        assert_eq!(baseline().default_use_worktree, Some(false));
+        assert_eq!(cheap_fast().default_use_worktree, Some(false));
+        assert_eq!(thorough().default_use_worktree, Some(true));
     }
 
     #[test]
@@ -753,6 +798,7 @@ mod tests {
     fn event_override_beats_profile() {
         let event_override = PartialOrchestrationPolicy {
             hold_poll_interval_ms: Some(42),
+            ..Default::default()
         };
         let resolved = crate::policy::resolve(
             OrchestrationPolicy::default(),
@@ -763,12 +809,12 @@ mod tests {
         assert_eq!(resolved.hold_poll_interval_ms, 42);
     }
 
-    /// Every named profile only ever changes `hold_poll_interval_ms` — the
-    /// declared node set ([`registry`]) is identical regardless of which
-    /// profile a run selects, since this workflow's sole policy knob never
-    /// rewires which node runs (CLAUDE.md standing rule 6: "a policy knob
-    /// may change a bound or a tier; it must not change... a declared
-    /// node set").
+    /// Every named profile only ever changes `hold_poll_interval_ms` and
+    /// `default_use_worktree` — the declared node set ([`registry`]) is
+    /// identical regardless of which profile a run selects, since neither
+    /// policy knob rewires which node runs (CLAUDE.md standing rule 6: "a
+    /// policy knob may change a bound or a tier; it must not change... a
+    /// declared node set").
     #[test]
     fn every_named_profile_leaves_the_declared_node_set_identical() {
         let default_registry = registry();

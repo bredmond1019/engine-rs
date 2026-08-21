@@ -482,6 +482,7 @@ async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
         &roadmap_dir,
         None,
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect("two-block chain over one repo should integrate cleanly");
@@ -629,6 +630,7 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         &roadmap_dir,
         None,
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect_err("the chain must not report success for a failed SetupWorktreeNode");
@@ -687,6 +689,7 @@ fn outcome_with_state_file(
             metadata: serde_json::json!({}),
             node_runs: HashMap::new(),
         },
+        use_worktree: false,
     };
     (repo_root, outcome)
 }
@@ -802,6 +805,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         &roadmap_dir,
         Some("en-11-b-lane"),
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect("two-block chain should close cleanly");
@@ -825,6 +829,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         &roadmap_dir,
         Some("en-11-b-lane"),
         &|_: &StepProgress| {},
+        false,
     )
     .await
     .expect_err("D.3 never writes a state file, so the chain must stop");

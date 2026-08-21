@@ -680,6 +680,7 @@ pub async fn integrate_chain(
     roadmap_dir: &Path,
     lane: Option<&str>,
     step_observer: &StepObserverFn,
+    default_use_worktree: bool,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -714,12 +715,21 @@ pub async fn integrate_chain(
 
         let step_lane = lane.unwrap_or(step.repo.as_str());
 
-        // `default_use_worktree` is hardcoded `false` here — behavior-stable
-        // with today's implicit in-place default — until `EN.ticket
-        // .orchestration-isolation-passthrough` Task 3 threads the real
-        // `OrchestrationPolicy::default_use_worktree` knob through
-        // `integrate_chain` from `OrchestrationRunNode::process`.
-        let outcome = match execute_step(step, resolve_engine, registry, run_flow, false).await {
+        // `default_use_worktree` is the resolved `OrchestrationPolicy
+        // ::default_use_worktree` fallback, threaded in from
+        // `OrchestrationRunNode::process` — the row-3 case of
+        // `execute::resolve_isolation`'s table. Rows 1/2 (base-template
+        // always worktree, the brain root never) are resolved inside
+        // `execute_step` itself and are unreachable from this value.
+        let outcome = match execute_step(
+            step,
+            resolve_engine,
+            registry,
+            run_flow,
+            default_use_worktree,
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(err) => {
                 let integrate_err = IntegrateError::from(err);
@@ -842,6 +852,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         assert!(verify_state_write(&outcome).is_ok());
     }
@@ -860,6 +871,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteMismatch { .. }));
@@ -881,6 +893,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteUnreadable { .. }));
@@ -960,6 +973,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         }
     }
 
@@ -1070,6 +1084,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         append_lane_log_line(dir.path(), &entry).unwrap();
@@ -1098,6 +1113,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         let value = serde_json::to_value(&entry).unwrap();
@@ -1127,6 +1143,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         let closed_entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         assert_eq!(closed_entry.status, LaneLogStatus::Closed);
@@ -1149,6 +1166,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         let outcome_b = ExecutionOutcome {
             repo: "repo-b".into(),
@@ -1160,6 +1178,7 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
         };
         append_lane_log_line(
             dir.path(),
@@ -1244,6 +1263,7 @@ mod tests {
             roadmap_dir.path(),
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -1348,6 +1368,7 @@ mod tests {
             roadmap_dir.path(),
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
         .expect("chain should complete");
@@ -1389,6 +1410,7 @@ mod tests {
             roadmap_dir.path(),
             Some("backend"),
             &|_: &StepProgress| {},
+            false,
         )
         .await
         .expect("chain should complete");
@@ -1430,6 +1452,7 @@ mod tests {
             roadmap_dir.path(),
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -1486,6 +1509,7 @@ mod tests {
             &missing_roadmap_dir,
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
         .expect_err("the original step failure must still surface");
@@ -1548,6 +1572,7 @@ mod tests {
             roadmap_dir.path(),
             None,
             &|_: &StepProgress| {},
+            false,
         )
         .await
         .expect_err("the chain must stop on the first failing step");
