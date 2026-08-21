@@ -1,24 +1,28 @@
 ---
 type: Reference
-title: engine-rs <-> Orchestrator Data Contract (Consumer)
-description: engine-rs's pinned view of the orchestrator's versioned data contract — how each contract field maps to engine-rs's Rust types, and how engine-rs's own HTTP/write surface tracks the same contract it ports. The canonical contract lives in the orchestrator (Python) repo.
+title: engine-rs Data Contract (Canonical)
+description: The canonical, authoritative data contract for the engine-rs execution runtime — how each contract field maps to engine-rs's Rust types, and how engine-rs's HTTP/write surface implements the contract it authors. Synapse (orchestrator) and bastion are pinning consumers.
 doc_id: data-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.6.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse, locale, rate card, investment shape]
-related: [architecture, D6-cancellation-and-budget-semantics, brain:D20-shared-data-contract]
+keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.7.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse, locale, rate card, investment shape]
+related: [architecture, D6-cancellation-and-budget-semantics, brain:D20-shared-data-contract, brain:D78-engine-rs-owns-the-data-contract]
 ---
 
-# Data Contract (Consumer View)
+# Data Contract
 
-**Pinned Contract Version: 1.6.0**
+**Contract Version: 1.7.0**
 
-The **canonical, authoritative** contract is owned by the orchestrator:
-`orchestrator/docs/data-contract.md`. This file is engine-rs's *consumer* view — it pins the
-version engine-rs is built against and maps each contract field to engine-rs's Rust types. When
-the canonical contract bumps, re-pin the version here and update the mappings. The `/log-work`
-checklist in both repos prompts this.
+Per [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md)
+(2026-08-21), **this document is the canonical, authoritative data contract.** D78 superseded D20's
+ownership clause: engine-rs now authors the contract, and `orchestrator` (soon Synapse) and
+`bastion` are its *pinning consumers* — each re-pins its own consumer-view doc
+(`orchestrator/docs/data-contract.md`, `bastion/docs/data-contract.md`) to the version stated here
+whenever it changes. This file maps each contract field to engine-rs's Rust types. When this
+contract bumps, update the version and mappings here first, then note the change in
+`planning/status.md` so consumers know to re-pin. The `/log-work` checklist in all three repos
+prompts this.
 
 > **engine-rs's role differs from a pure read-only consumer like `bastion`.** `bastion` only reads
 > `events.task_context` from PostgreSQL. `engine-rs` is a **parallel-pilot implementer** of the
@@ -151,8 +155,10 @@ reports for that snapshot (`succeeded|failed|cancelled|budget_halted`):
 `crate::completion::stamp_completion` writes this in `crates/engine-serve/src/suspend.rs` at both
 terminal exits (`:467`, `:485`), before `live.mark_terminal`; the suspend path never stamps it — a
 suspended run is not terminal, and marking it complete would hide it from the crash-recovery sweep
-below. This is an **engine-rs-only extension, not a canonical re-pin** — no `engine_contract` Rust
-type changes shape, and the Pinned Contract Version below does not move. It exists because there is
+below. **This is canonical contract text as of 1.7.0** — no `engine_contract` Rust type changes
+shape (the annotation lives in the existing free-form `TaskContext::metadata` field, per D6), but
+the `metadata.completion` key and the derived-`status` rule that consumes it are now part of the
+contract this document defines, not an engine-rs-side footnote. It exists because there is
 no `status` column on `events` (contract §4) and status-derivation alone cannot distinguish a clean
 finish from a run that crashed mid-walk (a crash before any failure marker is written also derives
 as `"succeeded"`): the marker's *absence*, not its content, is what `engine-store`'s
@@ -316,23 +322,30 @@ the change Minor for that reason — and no `engine_contract` Rust type changes 
 
 ---
 
-## Re-pin checklist (when the canonical contract bumps)
+## Authoring checklist (when this contract bumps)
 
-1. Read the canonical changelog (`orchestrator/docs/data-contract.md` § Versioning); update the
-   **Pinned Contract Version** above.
-2. Update the field-mapping tables here.
-3. Update affected Rust types (`engine-contract::events`, `engine-contract::task_context`) and, if
-   the shape change is behavioral, the corresponding `engine-core`/`engine-serve` logic.
-4. Re-run `crates/engine-contract/tests/round_trip.rs` against a freshly captured orchestrator
-   fixture (see `docs/scripts.md` in the orchestrator repo for the emit script) — do not hand-edit
-   the fixture.
+This is now the authoring checklist for engine-rs, the canonical repo (D78) — not a pointer to read
+someone else's changelog.
+
+1. Land the engine-rs-side implementation (Rust type or route change) first; the contract text
+   documents shipped behavior, it does not precede it.
+2. Update the **Contract Version** above and add a changelog row explaining the change and why the
+   bump is MAJOR/MINOR/PATCH.
+3. Update the field-mapping tables here to describe the new/changed shape.
+4. Re-run `crates/engine-contract/tests/round_trip.rs` against a freshly captured fixture — do not
+   hand-edit the fixture.
 5. Note it in `planning/status.md`.
+6. **Tell consumers to re-pin.** `orchestrator/docs/data-contract.md` and
+   `bastion/docs/data-contract.md` each pin a version of this contract; when it bumps, both must
+   update their own pinned-version line and field mappings to match. Engine-rs cannot edit those
+   files directly (different repos, different lanes) — record the obligation (e.g. an `OPEN` item
+   in the relevant orchestration-run notes) so it reaches the other lanes.
 
 ---
 
-## Changelog (this pin)
+## Changelog
 
-| Pinned At | Date | Change |
+| Version | Date | Change |
 |---|---|---|
 | 1.0.1 | 2026-07-02 | Retroactive: `engine-contract`'s types (`EventsRow`, `TaskContext`, `NodeRun`, `NodeRunStatus`, `Usage`) were built matching canonical 1.0.1 during EN.0.B, but this consumer doc did not exist yet (Gap 2, `core/_planning/engine-rs/orchestrator-contract-conformance/notes.md`). Backfilled here rather than left undocumented. |
 | 1.1.0 | 2026-07-16 | Re-pin to 1.1.0. Registers the canonical's v1.1.0 additions, both introduced by engine-rs's own EN.2.B: `POST /events/{run_id}/abort` (§ HTTP surface parity above) and the `metadata.cancellation` / `metadata.budget` run-level annotations (§ above). No `engine_contract` Rust type changed shape — both additions live in the existing `TaskContext::metadata: serde_json::Value` free-form field, per D6. |
@@ -345,4 +358,4 @@ the change Minor for that reason — and no `engine_contract` Rust type changes 
 | — | 2026-07-30 | Not a re-pin — **Pinned Contract Version stays 1.4.0.** `EN.6.F` (engine-rs-side) adds three engine-rs-only routes with no canonical counterpart (§ HTTP surface parity above): `POST /events/{run_id}/pause`, `POST /events/{event_id}/resume`, and `GET /events/suspended`, plus the `metadata.suspension` run-level annotation (§ Run-level `metadata` annotations above) recording a suspended run's resume pointer, origin, and pre-suspend budget-ledger snapshot. Mirrors the abort (`EN.2.B`) and stream (`EN.5.F`) precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `suspension` lives entirely in the existing free-form `TaskContext::metadata` field. `durable.rs`'s writer now upserts across a suspend/resume cycle rather than writing a single terminal update (§ above). See [suspend-resume.md](suspend-resume.md) for the full marker shape and both suspension origins. |
 | 1.5.0 | 2026-08-01 | Re-pin from 1.4.0 to 1.5.0 (`OR.ticket.corpus-reconcile`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.5.0 addition, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact` gain an optional `authored_at: datetime \| null`, threaded to the written `brain_documents` rows. Additive and backward-compatible — omitted or `null` preserves the server-side `datetime.now()` fallback exactly, so `PersistToBrainNode`'s existing payload stays valid unchanged; sending a real `authored_at` is an opt-in improvement for `EN.6.K`'s ingest-client hardening. Sits alongside the 2026-07-28 `EN.4.F` row below (structured `investment` / `authored_locale` inside `roadmap`) rather than superseding it: whoever wires the real ingest URL should send both. No `engine_contract` Rust type changed shape — these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. |
 | 1.6.0 | 2026-08-01 | Re-pin from 1.5.0 to 1.6.0 (`OR.K2`, orchestrator-side; not an engine-rs block) — **the consequential one for `EN.6.K`**. `GET /recall`'s response semantics change (§ HTTP surface parity above): `score` is now a similarity where **higher is always better** on every path (`1.0` exact-id, `1.0 - cosine distance` semantic, unchanged fused similarity for hybrid), where 1.4.0 returned a raw cosine *distance* on the exact-id/semantic paths (`0.0` exact-id, lower-is-better); and `via`'s vocabulary widens from `exact-id \| semantic \| hybrid` to also include `structural \| keyword \| memory` (per-candidate hybrid provenance, previously collapsed to a bare `"hybrid"`). Field names, types, and the `q`/`limit`/`hybrid` query params are unchanged, and no `engine_contract` Rust type changes shape — `GET /recall` is a route engine-rs calls as a client, not one `engine-serve` serves. **`EN.6.K` (the Brain read-client seam — engine-rs's first `GET /recall` consumer, and therefore the first thing this polarity can bite) must be built against 1.6.0 semantics:** `RecallNode` sorts/thresholds `score` **descending / higher-is-better**, and any type deserializing `via` must tolerate all six values or it will fail to parse a hybrid result. A 1.4.0-era comparison direction ranks results backwards with no error — this re-pin exists specifically to close that window before `EN.6.K` runs. |
-| — | 2026-08-13 | Not a re-pin — **Pinned Contract Version stays 1.6.0.** `EN.9.C` (engine-rs-side) adds the `metadata.completion` run-level annotation (§ Run-level `metadata` annotations above), stamped by `crate::completion::stamp_completion` at every terminal exit in `crates/engine-serve/src/suspend.rs`, plus an `engine-store` query (`list_orphan_candidates`) and an `engine-serve` boot sweep (`crate::orphan::reconcile_orphans`) that use the marker's absence to find and fail crash-stranded runs, and a stale-run alarm on age-past-threshold `running`/`suspended` runs. Mirrors the `cancellation`/`budget`/`suspension` precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `completion` lives entirely in the existing free-form `TaskContext::metadata` field. See [orphan-recovery.md](orphan-recovery.md) for the full marker shape, the sweep, the alarm, and the policy knobs. |
+| 1.7.0 | 2026-08-13 | `EN.9.C` (engine-rs-side) adds the `metadata.completion` run-level annotation (§ Run-level `metadata` annotations above) as canonical contract text, stamped by `crate::completion::stamp_completion` at every terminal exit in `crates/engine-serve/src/suspend.rs`, plus an `engine-store` query (`list_orphan_candidates`) and an `engine-serve` boot sweep (`crate::orphan::reconcile_orphans`) that use the marker's absence to find and fail crash-stranded runs, and a stale-run alarm on age-past-threshold `running`/`suspended` runs. Mirrors the `cancellation`/`budget`/`suspension` precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `completion` lives entirely in the existing free-form `TaskContext::metadata` field. **Corrected 2026-08-21 (D78, this task):** originally recorded as "Not a re-pin — Pinned Contract Version stays 1.6.0"; that was true only from the outgoing orchestrator-owned canonical's perspective. Engine-rs already implemented and shipped this annotation on 2026-08-13, so absorbing it into this now-canonical document is a version bump to 1.7.0, not new code. See [orphan-recovery.md](orphan-recovery.md) for the full marker shape, the sweep, the alarm, and the policy knobs. |
