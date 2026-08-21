@@ -41,11 +41,21 @@ use serde::Deserialize;
 ///
 /// [`resolve_explicit_chain`] always produces `directives: None` — an explicit block list
 /// is a deliberate bypass of the lane file, not merely a lane with no directives declared.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `roadmap`/`lane`/`segment` (`EN.11.K` Task 2) identify which `(roadmap, lane, segment)`
+/// tuple this step came from in `planning/lane-segments.json` — the same tuple mev's
+/// `planning/lane-frontier.json` keys its entries on (see
+/// [`gates::find_lane_head`](super::gates::find_lane_head)). [`resolve_lane_chain`] fills
+/// all three; [`resolve_explicit_chain`] leaves them `None`, matching `directives: None`'s
+/// same "deliberate bypass" contract — an explicit list names no lane segment at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChainStep {
     pub repo: String,
     pub block_id: String,
     pub directives: Option<LaneDirectives>,
+    pub roadmap: Option<String>,
+    pub lane: Option<String>,
+    pub segment: Option<usize>,
 }
 
 /// A lane's structured directives, mirroring the shape `mev`'s
@@ -244,13 +254,18 @@ pub fn resolve_lane_chain(
             repo: b.repo.clone(),
             block_id: b.id.clone(),
             directives: b.directives.clone(),
+            roadmap: Some(b.roadmap.clone()),
+            lane: Some(b.lane.clone()),
+            segment: Some(b.segment),
         })
         .collect())
 }
 
 /// Resolve an explicit `(repo, block_id)` list into a chain, bypassing lane-file parsing
 /// entirely — no `planning/lane-segments.json` read, no `HELD-UNTIL` check. Order is
-/// preserved exactly as given; every produced [`ChainStep`] carries `directives: None`.
+/// preserved exactly as given; every produced [`ChainStep`] carries `directives: None` and
+/// `roadmap`/`lane`/`segment: None` — an explicit list names no lane segment, so it cannot
+/// be matched against a `lane-frontier.json` entry either.
 #[must_use]
 pub fn resolve_explicit_chain(blocks: Vec<(String, String)>) -> Vec<ChainStep> {
     blocks
@@ -259,6 +274,9 @@ pub fn resolve_explicit_chain(blocks: Vec<(String, String)>) -> Vec<ChainStep> {
             repo,
             block_id,
             directives: None,
+            roadmap: None,
+            lane: None,
+            segment: None,
         })
         .collect()
 }
@@ -306,12 +324,18 @@ mod tests {
                 ChainStep {
                     repo: "repo-a".into(),
                     block_id: "A.1".into(),
-                    directives: None
+                    directives: None,
+                    roadmap: Some("r".into()),
+                    lane: Some("l".into()),
+                    segment: Some(0),
                 },
                 ChainStep {
                     repo: "repo-b".into(),
                     block_id: "B.2".into(),
-                    directives: None
+                    directives: None,
+                    roadmap: Some("r".into()),
+                    lane: Some("l".into()),
+                    segment: Some(0),
                 },
             ]
         );
@@ -375,12 +399,14 @@ mod tests {
                 ChainStep {
                     repo: "repo-a".into(),
                     block_id: "A.1".into(),
-                    directives: None
+                    directives: None,
+                    ..Default::default()
                 },
                 ChainStep {
                     repo: "repo-b".into(),
                     block_id: "B.2".into(),
-                    directives: None
+                    directives: None,
+                    ..Default::default()
                 },
             ]
         );

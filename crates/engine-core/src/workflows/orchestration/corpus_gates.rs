@@ -454,6 +454,7 @@ repo_path = "repo-b"
                 repo: "repo-a".to_string(),
                 block_id: "A.1".to_string(),
                 directives: None,
+                ..Default::default()
             };
 
             let err = super::super::gates::check_dependencies(&step, &resolve_deps, &is_edge_met)

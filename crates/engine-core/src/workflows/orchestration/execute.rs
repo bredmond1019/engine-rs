@@ -511,6 +511,7 @@ mod tests {
             repo: repo.to_string(),
             block_id: block_id.to_string(),
             directives: None,
+            ..Default::default()
         }
     }
 

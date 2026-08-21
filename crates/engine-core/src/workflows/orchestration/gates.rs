@@ -276,6 +276,50 @@ pub fn find_lane_head<'a>(
         .find(|e| e.roadmap == roadmap && e.lane == lane && e.segment == segment)
 }
 
+/// Resolve the [`FrontierEntry`] `step` refers to, by matching `step`'s own
+/// `roadmap`/`lane`/`segment` (`chain.rs`'s `EN.11.K` Task 2 addition, filled by
+/// [`resolve_lane_chain`](super::chain::resolve_lane_chain)) against `artifact`'s entries
+/// via [`find_lane_head`]. Returns `None` when `step` carries no lane identity at all —
+/// i.e. it came from [`resolve_explicit_chain`](super::chain::resolve_explicit_chain),
+/// which deliberately bypasses the lane file and so names no `(roadmap, lane, segment)`
+/// to look up.
+#[must_use]
+pub fn frontier_lane_head<'a>(
+    step: &ChainStep,
+    artifact: &'a FrontierArtifact,
+) -> Option<&'a FrontierEntry> {
+    let roadmap = step.roadmap.as_deref()?;
+    let lane = step.lane.as_deref()?;
+    let segment = step.segment?;
+    find_lane_head(artifact, roadmap, lane, segment)
+}
+
+/// Gate a step's start using **both** signals, without ever letting the frontier's
+/// `startable` substitute for the live per-edge check.
+///
+/// `check_dependencies` always runs, unconditionally — its result is computed first and
+/// returned as-is; nothing about the frontier lookup can suppress or skip it. Per the
+/// block's `why`: at spec time the frontier's own engine-rs head (`EN.11.E`) reports
+/// `startable: true` with `unmet_gates: []` while being HELD on an operator decision the
+/// graph cannot express, so treating `startable: true` as a licence to start would have
+/// launched it. This function's shape makes that impossible structurally — the returned
+/// [`FrontierEntry`] (when present) is advisory/telemetry only, never consulted to decide
+/// the `Result`.
+///
+/// `frontier` is `Option` because a caller may be resolving an explicit chain (no
+/// lane-file identity to look up) or may not have loaded a `lane-frontier.json` at all;
+/// either way the per-edge gate still runs.
+pub fn check_step_with_frontier_advice<'a>(
+    step: &ChainStep,
+    frontier: Option<&'a FrontierArtifact>,
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+) -> (Result<(), GateError>, Option<&'a FrontierEntry>) {
+    let gate_result = check_dependencies(step, resolve_depends_on, is_edge_met);
+    let head = frontier.and_then(|artifact| frontier_lane_head(step, artifact));
+    (gate_result, head)
+}
+
 // ── Admission gate ──────────────────────────────────────────────────────
 
 /// A thin, orchestration-flavoured wrapper over `EN.9.F`'s [`AdmissionControl`]: consult
@@ -337,6 +381,7 @@ mod tests {
             repo: repo.to_string(),
             block_id: block_id.to_string(),
             directives: None,
+            ..Default::default()
         }
     }
 
@@ -697,6 +742,150 @@ mod tests {
 
         assert_eq!(artifact.gate_ranks[0].kind, "operator");
         assert_eq!(artifact.gate_ranks[0].rank, 1);
+    }
+
+    // ── Task 2: wiring the frontier into gates.rs without letting it override ──
+
+    fn lane_step(
+        roadmap: &str,
+        lane: &str,
+        segment: usize,
+        repo: &str,
+        block_id: &str,
+    ) -> ChainStep {
+        ChainStep {
+            repo: repo.to_string(),
+            block_id: block_id.to_string(),
+            directives: None,
+            roadmap: Some(roadmap.to_string()),
+            lane: Some(lane.to_string()),
+            segment: Some(segment),
+        }
+    }
+
+    #[test]
+    fn frontier_lane_head_matches_a_step_from_resolve_lane_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let step = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let head = frontier_lane_head(&step, &artifact).expect("must find the matching entry");
+        assert_eq!(head.id, "EN.11.E");
+        assert!(head.startable);
+    }
+
+    #[test]
+    fn frontier_lane_head_is_none_for_an_explicit_chain_step() {
+        // resolve_explicit_chain leaves roadmap/lane/segment all None — there is no lane
+        // identity to look up, by construction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let step = step("engine-rs", "EN.11.E");
+        assert!(step.roadmap.is_none());
+        assert!(frontier_lane_head(&step, &artifact).is_none());
+    }
+
+    #[test]
+    fn frontier_startable_true_does_not_short_circuit_check_dependencies() {
+        // This is the exact live condition named in the block's Why: the frontier's own
+        // engine-rs head is startable:true with unmet_gates:[] while a per-edge check
+        // (standing in for the HELD-UNTIL operator decision the graph cannot express)
+        // still refuses. check_step_with_frontier_advice must surface the refusal, not
+        // the frontier's optimism.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let s = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let resolve_deps = |_repo: &str, _block_id: &str| {
+            vec![DependencyEdge::Operator {
+                slug: "some-other-gate".to_string(),
+            }]
+        };
+        let is_edge_met = |_repo: &str, _block_id: &str| true;
+
+        let (gate_result, head) =
+            check_step_with_frontier_advice(&s, Some(&artifact), &resolve_deps, &is_edge_met);
+
+        let head = head.expect("frontier entry must still be found");
+        assert!(
+            head.startable,
+            "the frontier itself must say startable:true"
+        );
+        assert!(head.unmet_gates.is_empty());
+        assert!(
+            gate_result.is_err(),
+            "check_dependencies must still refuse despite frontier startable:true"
+        );
+        match gate_result.unwrap_err() {
+            GateError::UnmetDependency {
+                edge: DependencyEdge::Operator { slug },
+                ..
+            } => assert_eq!(slug, "some-other-gate"),
+            other => panic!("expected an Operator UnmetDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frontier_advice_is_none_when_no_artifact_is_supplied() {
+        let s = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let resolve_deps = |_repo: &str, _block_id: &str| Vec::new();
+        let is_edge_met = |_repo: &str, _block_id: &str| true;
+
+        let (gate_result, head) =
+            check_step_with_frontier_advice(&s, None, &resolve_deps, &is_edge_met);
+        assert!(gate_result.is_ok());
+        assert!(head.is_none());
+    }
+
+    #[test]
+    fn check_dependencies_still_passes_when_frontier_agrees() {
+        // The agreement path: frontier says startable, and the live per-edge check has
+        // nothing outstanding either. Both signals concur, and the gate's own Ok(()) is
+        // what actually permits the start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let s = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let resolve_deps = |_repo: &str, _block_id: &str| Vec::new();
+        let is_edge_met = |_repo: &str, _block_id: &str| true;
+
+        let (gate_result, head) =
+            check_step_with_frontier_advice(&s, Some(&artifact), &resolve_deps, &is_edge_met);
+        assert!(gate_result.is_ok());
+        assert!(head.expect("must find entry").startable);
     }
 
     #[tokio::test]

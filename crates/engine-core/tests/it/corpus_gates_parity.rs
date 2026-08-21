@@ -242,6 +242,7 @@ fn corpus_gates_matches_mev_recorded_answers_operator_edge_unmet_and_named() {
         repo: "repo-a".to_string(),
         block_id: "A.4".to_string(),
         directives: None,
+        ..Default::default()
     };
     let err = engine_core::workflows::orchestration::gates::check_dependencies(
         &step,
