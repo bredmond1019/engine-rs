@@ -14,6 +14,9 @@
 //! - `docs` — `PatchDocsNode` (bottom-half, EN.3.B).
 //! - `wrap_up` — `WrapUpNode` (bottom-half, EN.3.B).
 //! - `pr` — `PullRequestNode` (bottom-half, EN.3.B).
+//! - `close_block` — `CloseBlockNode`: closes this run's block in
+//!   `planning/state.json` through mev, under mev's advisory lock and D71
+//!   operator gate (`EN.ticket.wrap-up-closes-the-block`).
 //! - `emit_state` — `EmitStateNode` (bottom-half, EN.3.B).
 //! - `final_validation` — `FinalValidationNode`: the unconditional run-level
 //!   full-suite gate on the task-loop drain branch (`EN.3.E`).
@@ -47,6 +50,7 @@ pub use super::{ModelTransport, TransportSlot};
 pub use command_floor::{evaluate_command, CommandDecision};
 
 pub mod aggregate;
+pub mod close_block;
 pub mod command_floor;
 pub mod docs;
 pub mod emit_state;
