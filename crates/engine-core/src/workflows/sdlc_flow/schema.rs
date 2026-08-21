@@ -743,6 +743,17 @@ pub enum TerminalSignal {
     /// fire on a run where every task passed. The carried `String` is the
     /// gate's `failure_summary` (the failing check names).
     FinalValidationFailed(String),
+    /// `EndReviewNode` (`EN.ticket.review-mode-endonly-reviews-nothing`)
+    /// returned a `FAIL`/`PARTIAL` verdict over the whole run's diff against
+    /// the complete Acceptance Criteria, and `EndReviewRouterNode` routed
+    /// straight to `WrapUpNode` rather than `PatchDocsNode`. Only reachable
+    /// under `ReviewMode::EndOnly` — `EndReviewNode` is a zero-call
+    /// pass-through under `PerTask`/`TrivialSkip`, so this variant never
+    /// fires for those modes. An explicit [`Self::MajorBail`] (checked
+    /// first in `wrap_up::derive_terminal_signal`) still wins over this one.
+    /// The carried `String` names the unmet criteria (the review's summary,
+    /// plus its issue list when non-empty).
+    EndReviewFail(String),
 }
 
 impl TerminalSignal {
@@ -753,7 +764,8 @@ impl TerminalSignal {
             Self::MajorBail(message)
             | Self::ReviewFail(message)
             | Self::StructuralFail(message)
-            | Self::FinalValidationFailed(message) => message,
+            | Self::FinalValidationFailed(message)
+            | Self::EndReviewFail(message) => message,
         }
     }
 }
@@ -1453,6 +1465,7 @@ mod tests {
             TerminalSignal::ReviewFail("review FAIL, 0 issues".to_string()),
             TerminalSignal::StructuralFail("review PARTIAL, 12 issues".to_string()),
             TerminalSignal::FinalValidationFailed("cargo clippy".to_string()),
+            TerminalSignal::EndReviewFail("criterion X not met".to_string()),
         ] {
             assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
         }
@@ -1538,6 +1551,10 @@ mod tests {
         assert_eq!(
             derive_bail_reason(Some(&TerminalSignal::StructuralFail("s".to_string()))),
             Some("s".to_string())
+        );
+        assert_eq!(
+            derive_bail_reason(Some(&TerminalSignal::EndReviewFail("e".to_string()))),
+            Some("e".to_string())
         );
     }
 

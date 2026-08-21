@@ -44,6 +44,7 @@ use serde_json::json;
 
 use crate::node::{Node, NodeError};
 use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::routing::Router;
 
 use super::policy::ReviewMode;
 use super::task_loop::{
@@ -258,6 +259,64 @@ impl Node for EndReviewNode {
 
     fn name(&self) -> &str {
         NODE_NAME
+    }
+}
+
+/// The drain-branch router wired directly after [`EndReviewNode`]:
+/// `TaskQueueRouterNode -> FinalValidationNode -> EndReviewNode ->
+/// EndReviewRouterNode -> {PatchDocsNode | WrapUpNode}` (`graph.rs`).
+///
+/// **Pass-through case (`PerTask`/`TrivialSkip`, or `EndOnly` PASS):**
+/// routes to `PatchDocsNode` — the existing path, unchanged. This is also
+/// the branch taken when `EndReviewNode` wrote no `ctx.nodes["EndReviewNode"]`
+/// entry at all (the zero-call pass-through under `PerTask`/`TrivialSkip`),
+/// so the graph's node set stays identical under every `review_mode`
+/// (standing rule 6) while only `EndOnly` can ever route this router to
+/// `WrapUpNode`.
+///
+/// **FAIL/PARTIAL:** routes to `WrapUpNode`. `wrap_up::derive_terminal_signal`
+/// reads `EndReviewNode`'s stamped verdict independently (this router does
+/// not stamp anything itself) and derives `TerminalSignal::EndReviewFail`,
+/// so the run ends `blocked` with a `bail_reason` naming the unmet criteria
+/// — an explicit `MAJOR_BAIL` from the task loop still wins over this, per
+/// that function's checked-first ordering.
+///
+/// **No retry loop here** (see the module doc comment) — an unrecognized
+/// verdict also routes to `WrapUpNode` (the same fallback-safety-net shape
+/// `TriageRouterNode`/`ReviewRouterNode` use), matching
+/// `wrap_up::derive_terminal_signal`'s `unrecognized_verdict` fallback arm.
+pub struct EndReviewRouterNode;
+
+#[async_trait::async_trait]
+impl Node for EndReviewRouterNode {
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "EndReviewRouterNode"
+    }
+
+    fn as_router(&self) -> Option<&dyn Router> {
+        Some(self)
+    }
+}
+
+impl Router for EndReviewRouterNode {
+    fn route(&self, ctx: &TaskContext) -> Option<String> {
+        let Some(review) = get_result(ctx, NODE_NAME) else {
+            // EndReviewNode's zero-call pass-through under
+            // `PerTask`/`TrivialSkip` writes no result — continue to the
+            // existing drain path unchanged.
+            return Some("PatchDocsNode".to_string());
+        };
+        let verdict = review.get("verdict").and_then(|v| v.as_str());
+        match verdict {
+            Some("PASS") => Some("PatchDocsNode".to_string()),
+            // FAIL/PARTIAL and any unrecognized verdict all route to
+            // WrapUpNode — the same catch-all shape ReviewRouterNode uses.
+            _ => Some("WrapUpNode".to_string()),
+        }
     }
 }
 
@@ -562,5 +621,77 @@ mod tests {
         assert!(rendered.contains("- b"));
         assert!(rendered.contains("Task 2: Task Two"));
         assert!(rendered.contains("- c"));
+    }
+
+    // --- EndReviewRouterNode -------------------------------------------
+
+    fn ctx_with_end_review_result(value: serde_json::Value) -> TaskContext {
+        let mut ctx = TaskContext {
+            event: json!({}),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(NODE_NAME.to_string(), value);
+        ctx
+    }
+
+    #[test]
+    fn router_passes_through_to_patch_docs_when_end_review_never_ran() {
+        // The PerTask/TrivialSkip pass-through case: EndReviewNode wrote no
+        // ctx.nodes entry, so the router must not treat that as a FAIL.
+        let ctx = TaskContext {
+            event: json!({}),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        let router = EndReviewRouterNode;
+        assert_eq!(router.route(&ctx), Some("PatchDocsNode".to_string()));
+    }
+
+    #[test]
+    fn router_routes_pass_to_patch_docs() {
+        let ctx = ctx_with_end_review_result(json!({
+            "verdict": "PASS",
+            "summary": "all good",
+            "issues": [],
+        }));
+        let router = EndReviewRouterNode;
+        assert_eq!(router.route(&ctx), Some("PatchDocsNode".to_string()));
+    }
+
+    #[test]
+    fn router_routes_fail_to_wrap_up() {
+        let ctx = ctx_with_end_review_result(json!({
+            "verdict": "FAIL",
+            "summary": "criteria unmet",
+            "issues": ["criterion X not met"],
+        }));
+        let router = EndReviewRouterNode;
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    #[test]
+    fn router_routes_partial_to_wrap_up() {
+        let ctx = ctx_with_end_review_result(json!({
+            "verdict": "PARTIAL",
+            "summary": "some criteria unmet",
+            "issues": ["criterion Y not met"],
+        }));
+        let router = EndReviewRouterNode;
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    #[test]
+    fn router_routes_unrecognized_verdict_to_wrap_up() {
+        let ctx = ctx_with_end_review_result(json!({
+            "verdict": "WAT",
+            "summary": "",
+            "issues": [],
+            "unrecognized_verdict": "WAT",
+        }));
+        let router = EndReviewRouterNode;
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
     }
 }

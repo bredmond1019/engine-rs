@@ -14,8 +14,11 @@
 //!                                 -> TriageRouterNode -> ConsolidatedReviewNode
 //!                                 -> ReviewRouterNode -> UpdateTaskStatusNode
 //!                                 -> SaveStateNode -> (loop) TaskQueueRouterNode
-//!                             | FinalValidationNode -> PatchDocsNode -> WrapUpNode
+//!                             | FinalValidationNode -> EndReviewNode -> EndReviewRouterNode
+//!                                 -> { PatchDocsNode -> WrapUpNode | WrapUpNode }
 //!                                 -> CloseBlockNode -> PullRequestNode -> EmitStateNode }
+//!
+//! EndReviewRouterNode -> { PatchDocsNode | WrapUpNode }
 //!
 //! TriageRouterNode    -> { ConsolidatedReviewNode | IncrementAttemptNode | WrapUpNode }
 //! ReviewRouterNode    -> { UpdateTaskStatusNode | IncrementAttemptNode | WrapUpNode }
@@ -64,6 +67,7 @@ use crate::workflow::Workflow;
 use super::close_block::CloseBlockNode;
 use super::docs::PatchDocsNode;
 use super::emit_state::EmitStateNode;
+use super::end_review::{EndReviewNode, EndReviewRouterNode};
 use super::final_validation::FinalValidationNode;
 use super::policy::{ModelTier, SdlcPolicy};
 use super::pr::PullRequestNode;
@@ -178,7 +182,24 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "FinalValidationNode".to_string(),
-        NodeConfig::new("FinalValidationNode", vec!["PatchDocsNode".to_string()]),
+        NodeConfig::new("FinalValidationNode", vec!["EndReviewNode".to_string()]),
+    );
+    // `EndReviewNode` (`EN.ticket.review-mode-endonly-reviews-nothing`):
+    // the drain-branch, end-of-run review. Always present in the declared
+    // graph — under `PerTask`/`TrivialSkip` it is a zero-call pass-through
+    // (standing rule 6: a policy knob must not change the declared node
+    // set). `EndReviewRouterNode` decides PatchDocs vs WrapUp from its
+    // stamped verdict (or the pass-through absence of one).
+    nodes.insert(
+        "EndReviewNode".to_string(),
+        NodeConfig::new("EndReviewNode", vec!["EndReviewRouterNode".to_string()]),
+    );
+    nodes.insert(
+        "EndReviewRouterNode".to_string(),
+        NodeConfig::new(
+            "EndReviewRouterNode",
+            vec!["PatchDocsNode".to_string(), "WrapUpNode".to_string()],
+        ),
     );
     nodes.insert(
         "PatchDocsNode".to_string(),
@@ -259,6 +280,11 @@ pub fn registry() -> NodeRegistry {
     // Its depth is pinned to `TestDepth::Full`; see `planning/decisions/
     // D12-per-task-vs-final-check-depth.md`.
     registry.register(Box::new(FinalValidationNode::new()));
+    // `EndReviewNode`/`EndReviewRouterNode` — always registered; behavior is
+    // gated on the resolved policy, not the graph's declared node set (see
+    // schema()'s comment above).
+    registry.register(Box::new(EndReviewNode::new()));
+    registry.register(Box::new(EndReviewRouterNode));
     // The model string here is a fallback only: `PatchDocsNode::process`
     // overwrites it from the resolved `model_tiers.docs` tier (whose
     // built-in default resolves to this same string). This registration
@@ -386,11 +412,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_twenty_nodes_incl_bottom_half() {
+    fn registry_contains_all_twenty_two_nodes_incl_bottom_half() {
         // Was misnamed "...eighteen..." while actually asserting nineteen
         // (`EN.ticket.wrap-up-closes-the-block` task 5 notes this rather
-        // than compounding it); now twenty with `CloseBlockNode` added
-        // between `WrapUpNode` and `PullRequestNode`.
+        // than compounding it); twenty with `CloseBlockNode` added between
+        // `WrapUpNode` and `PullRequestNode`; now twenty-two with
+        // `EndReviewNode`/`EndReviewRouterNode`
+        // (`EN.ticket.review-mode-endonly-reviews-nothing`) added between
+        // `FinalValidationNode` and `PatchDocsNode`.
         let registry = registry();
 
         let expected = [
@@ -409,6 +438,8 @@ mod tests {
             "SaveStateNode",
             "IncrementAttemptNode",
             "FinalValidationNode",
+            "EndReviewNode",
+            "EndReviewRouterNode",
             "PatchDocsNode",
             "WrapUpNode",
             "CloseBlockNode",
@@ -450,8 +481,59 @@ mod tests {
             .expect("FinalValidationNode declared");
         assert_eq!(
             final_validation.connections,
-            vec!["PatchDocsNode".to_string()]
+            vec!["EndReviewNode".to_string()]
         );
+
+        let end_review = schema
+            .nodes
+            .get("EndReviewNode")
+            .expect("EndReviewNode declared");
+        assert_eq!(
+            end_review.connections,
+            vec!["EndReviewRouterNode".to_string()]
+        );
+
+        let end_review_router = schema
+            .nodes
+            .get("EndReviewRouterNode")
+            .expect("EndReviewRouterNode declared");
+        assert!(end_review_router
+            .connections
+            .contains(&"PatchDocsNode".to_string()));
+        assert!(end_review_router
+            .connections
+            .contains(&"WrapUpNode".to_string()));
+    }
+
+    /// The graph's declared node set must be IDENTICAL across every
+    /// `review_mode` — `EndReviewNode`/`EndReviewRouterNode` are always
+    /// present, only their *behavior* is policy-gated (standing rule 6).
+    /// `registry_for_policy` never adds/removes an identity for any
+    /// `review_mode`, so this asserts against the plain `registry()`/
+    /// `schema()` pair directly rather than driving a full run per mode.
+    #[test]
+    fn node_set_is_identical_across_all_review_modes() {
+        use super::super::policy::ReviewMode;
+
+        let base_registry = registry();
+        for mode in [
+            ReviewMode::PerTask,
+            ReviewMode::TrivialSkip,
+            ReviewMode::EndOnly,
+        ] {
+            let policy = SdlcPolicy {
+                review_mode: mode,
+                ..SdlcPolicy::default()
+            };
+            let policy_registry = registry_for_policy(&policy);
+            assert_eq!(
+                policy_registry.len(),
+                base_registry.len(),
+                "node count must be identical under {mode:?}"
+            );
+            assert!(policy_registry.contains("EndReviewNode"));
+            assert!(policy_registry.contains("EndReviewRouterNode"));
+        }
     }
 
     #[test]
@@ -568,6 +650,8 @@ mod tests {
             "SaveStateNode",
             "IncrementAttemptNode",
             "FinalValidationNode",
+            "EndReviewNode",
+            "EndReviewRouterNode",
             "PatchDocsNode",
             "WrapUpNode",
             "CloseBlockNode",

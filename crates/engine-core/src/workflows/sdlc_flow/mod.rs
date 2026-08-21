@@ -54,6 +54,7 @@ pub mod close_block;
 pub mod command_floor;
 pub mod docs;
 pub mod emit_state;
+pub mod end_review;
 pub mod final_validation;
 pub mod graph;
 pub mod policy;
