@@ -55,9 +55,19 @@ pub fn init_tracing() {
     let filter = EnvFilter::try_from_env(ENGINE_LOG_ENV)
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
 
+    // `flatten_event(true)` (EN.11.I task 5): moves each event's OWN fields (e.g.
+    // `crate::workflow::node_context`'s `node`/`run_id`/`campaign_id`) up to the top level of
+    // the JSON line instead of nesting them under a `"fields"` object — required for the
+    // block's own acceptance criterion, `jq -e 'select(.run_id==$ID) | .node'`, to be a literal
+    // top-level-key query rather than `.fields.run_id`/`.fields.node`.
+    //
     // try_init (not init): a second call, or a host that already installed a global default
     // subscriber, is a no-op. The error variant carries no information worth surfacing here.
-    let _ = fmt().json().with_env_filter(filter).try_init();
+    let _ = fmt()
+        .json()
+        .flatten_event(true)
+        .with_env_filter(filter)
+        .try_init();
 }
 
 #[cfg(test)]

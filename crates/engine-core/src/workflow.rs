@@ -622,6 +622,20 @@ pub(crate) fn node_cost_usd(ctx: &TaskContext, identity: &str) -> Option<f64> {
 /// `run_id`/`campaign_id` fields — `tracing`'s span-list formatting
 /// attaches every ancestor span's recorded fields to a descendant event,
 /// not just the immediate parent's.
+///
+/// **EN.11.I task 5:** the block's own acceptance criterion (`jq -e
+/// 'select(.run_id==$ID) | .node'` returns every node of a run, in order)
+/// reads `run_id`/`node` as TOP-LEVEL keys on each JSON line. `#[instrument]`
+/// fields are only ever nested under the JSON formatter's `"span"`/`"spans"`
+/// objects — there is no `tracing-subscriber` option that flattens a span's
+/// *inherited* fields into an event's own top-level field set, only
+/// `flatten_event` for an event's OWN fields (`engine_serve::init_tracing`
+/// sets it). So each dispatch explicitly emits ONE event of its own —
+/// `info!` on success, the existing `error!` on failure — carrying `node`
+/// and `run_id` (and `campaign_id`, when the run has one) as literal event
+/// fields, not merely relying on span inheritance. This is what task 2's
+/// `instrumentation::CaptureLayer` deliberately did NOT pin (its own doc
+/// comment says so) — it proves propagation; this proves the wire shape.
 #[tracing::instrument(name = "workflow.node.dispatch", skip(node, ctx, on_progress), fields(node = %node.name()))]
 async fn node_context(
     node: &dyn crate::node::Node,
@@ -651,12 +665,28 @@ async fn node_context(
     // and return on `Err`.
     let pre_call_ctx = ctx.clone();
 
+    // Read once, from the pre-call snapshot, before `ctx` is moved into
+    // `node.process`: both branches below need the same values, and
+    // `read_run_id`/`read_campaign_id` are the same defensive readers
+    // `Workflow::walk` uses (never a third implementation — task 2's own
+    // rule still applies here). `Option<&str>` fields are OMITTED by
+    // `tracing` when `None`, never recorded as an empty string — matching
+    // task 2's `campaign_id` convention exactly.
+    let run_id = read_run_id(&pre_call_ctx.metadata);
+    let campaign_id = read_campaign_id(&pre_call_ctx);
+
     match node.process(ctx).await {
         Ok(mut ok_ctx) => {
             if let Some(run) = ok_ctx.node_runs.get_mut(&identity) {
                 run.status = NodeRunStatus::Success;
                 run.completed_at = Some(Utc::now());
             }
+            tracing::info!(
+                node = %identity,
+                run_id = run_id.as_deref(),
+                campaign_id = campaign_id.as_deref(),
+                "node dispatched"
+            );
             on_progress(&ok_ctx);
             (ok_ctx, false)
         }
@@ -669,6 +699,8 @@ async fn node_context(
             }
             tracing::error!(
                 node = %identity,
+                run_id = run_id.as_deref(),
+                campaign_id = campaign_id.as_deref(),
                 error = %err.message,
                 "node failed"
             );
