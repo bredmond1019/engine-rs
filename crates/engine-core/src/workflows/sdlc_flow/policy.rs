@@ -271,6 +271,14 @@ pub struct SdlcPolicy {
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
     pub simple_task_max_files: u32,
+    /// Enables `TriageTaskNode`'s model-triage branch. **Precedence: the
+    /// bare `event.llm_triage` field (`SDLCFlowEventSchema::llm_triage`,
+    /// the pre-existing, still-supported spelling) wins when a caller sets
+    /// it explicitly; otherwise this resolved policy value applies** (a
+    /// per-run `policy` override, then a named `profile`, then
+    /// `harness.json`, then this built-in default of `false`). This is the
+    /// canonical spelling going forward — see `TriageTaskNode` in
+    /// `task_loop.rs`.
     pub llm_triage: bool,
     /// Run-wide SEED for [`super::schema::SDLCTask::max_attempts`], applied
     /// at task-creation/load time by `setup.rs`'s `GenerateTasksNode` and

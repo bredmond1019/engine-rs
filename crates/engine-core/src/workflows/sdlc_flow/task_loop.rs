@@ -11,8 +11,10 @@
 //! Model/deterministic split (per the spec's Context Pointers):
 //! `ImplementTaskNode` and `ConsolidatedReviewNode` always call a model;
 //! `TriageTaskNode` is deterministic by default and only calls a model when
-//! `event.llm_triage` is true. Everything else here — the routers,
-//! `TestTaskNode`, `UpdateTaskStatusNode`, `SaveStateNode` — is pure Rust.
+//! triage is enabled — the bare `event.llm_triage` field if set, else the
+//! resolved policy's `llm_triage` (profile / `harness.json` / per-run
+//! `policy` override). Everything else here — the routers, `TestTaskNode`,
+//! `UpdateTaskStatusNode`, `SaveStateNode` — is pure Rust.
 
 use std::path::Path;
 
@@ -1671,7 +1673,9 @@ impl Node for TestTaskNode {
 /// `PASS`/`RETRYABLE`/`MAJOR_BAIL`. Deterministic by default (a passing test
 /// forces `PASS`; an over-budget task forces `MAJOR_BAIL`; a failing task
 /// still under budget is deterministically `RETRYABLE`), consulting a
-/// `ClaudeCodeStep` (Sonnet) only when `event.llm_triage` is true.
+/// `ClaudeCodeStep` (Sonnet) only when triage is enabled: the bare
+/// `event.llm_triage` field wins if set, else the resolved policy's
+/// `llm_triage` (see `resolved_policy` above).
 pub struct TriageTaskNode {
     config: Config,
     transport: TransportSlot,
@@ -1808,11 +1812,18 @@ impl Node for TriageTaskNode {
             return Ok(ctx);
         }
 
-        let llm_triage = ctx
-            .event
-            .get("llm_triage")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Precedence: the bare `event.llm_triage` field (the pre-existing,
+        // still-supported spelling — `SDLCFlowEventSchema::llm_triage`,
+        // `schema.rs:157`) wins when a caller sets it explicitly; otherwise
+        // fall through to the resolved policy's `llm_triage` (profile /
+        // `harness.json` / per-run `policy` override), which is the
+        // canonical spelling going forward. Both are read via `resolved_policy`
+        // above so a bad policy layer still errors loudly rather than being
+        // silently ignored the way it was before this knob was wired.
+        let llm_triage = match ctx.event.get("llm_triage").and_then(|v| v.as_bool()) {
+            Some(bare) => bare,
+            None => resolved_policy(&ctx)?.llm_triage,
+        };
 
         if !llm_triage {
             put_result(
@@ -3168,6 +3179,74 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(*called.lock().unwrap());
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 2: the resolved policy's
+    /// `llm_triage` must reach `TriageTaskNode` even when the bare
+    /// `event.llm_triage` field is absent — that is the whole point of
+    /// wiring the policy layer instead of leaving it dead. Companion to
+    /// [`triage_llm_gate_invokes_model_when_enabled`] above, which proves
+    /// the bare event field alone (against a default `llm_triage: false`
+    /// policy) still works — together they cover both spellings per the
+    /// task's acceptance criteria.
+    #[tokio::test]
+    async fn triage_llm_gate_invokes_model_when_only_policy_sets_it() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let called = Arc::new(Mutex::new(false));
+        let called_clone = called.clone();
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            *called_clone.lock().unwrap() = true;
+            let outcome = Outcome {
+                cost_usd: 0.0,
+                usage: claude_code_rs::parse::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string(),
+                is_error: false,
+                api_error_status: None,
+                structured_output: None,
+            };
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = TriageTaskNode::new().with_transport(transport);
+        let ctx = ctx_with_test_result(false, &task);
+        // No `event.llm_triage` field at all — only the resolved policy
+        // enables triage.
+        let mut policy = SdlcPolicy::default();
+        policy.llm_triage = true;
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert!(*called.lock().unwrap());
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+    }
+
+    /// The bare `event.llm_triage` field is the top-precedence layer: an
+    /// explicit `false` on the event must gate the model branch off even
+    /// when the resolved policy has `llm_triage: true`.
+    #[tokio::test]
+    async fn triage_bare_event_field_false_overrides_policy_true() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let node = TriageTaskNode::new().with_transport(panicking_transport());
+        let mut ctx = ctx_with_test_result(false, &task);
+        let mut policy = SdlcPolicy::default();
+        policy.llm_triage = true;
+        ctx = ctx_with_policy(ctx, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": false });
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
     }
 
     /// `EN.ticket.wire-meta-transport-telemetry` task 2: a `with_meta_transport`
