@@ -97,6 +97,19 @@ impl DurableHandle {
     }
 }
 
+/// Test-only constructor: a [`DurableHandle`] wired to a channel the caller
+/// can read from directly, plus its receiving end — for asserting exactly
+/// what a caller (e.g. `suspend::publish_step_progress`,
+/// EN.ticket.orchestration-abort-and-progress task 4) sent, without a real
+/// Postgres pool. `DurableHandle`'s `sender`/`pool` fields are private to
+/// this module, so callers in other modules (`suspend.rs`'s own tests)
+/// cannot build one directly — this is the seam for them.
+#[cfg(test)]
+pub(crate) fn test_handle() -> (DurableHandle, mpsc::UnboundedReceiver<DurableMessage>) {
+    let (sender, receiver) = mpsc::unbounded_channel::<DurableMessage>();
+    (DurableHandle { sender, pool: None }, receiver)
+}
+
 /// Map a `DurableMessage` plus a `(created_at, updated_at)` timestamp pair
 /// into the `EventsRow` the contract expects. Kept as a pure function
 /// (independent of the channel/async plumbing) so the mapping's

@@ -50,15 +50,135 @@
 //! delegates to it using the process-global, so `bastion` compiles
 //! unchanged.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use engine_contract::TaskContext;
 use engine_core::policy::{PolicyConfigSource, RESOLVED_POLICY_IDENTITY};
 use engine_core::repo_registry::RepoRegistry;
+use engine_core::workflows::orchestration::integrate::StepProgress;
 use engine_core::workflows::sdlc_flow::setup::SetupWorktreeNode;
-use engine_core::Workflow;
+use engine_core::{CancellationToken, Workflow};
 use serde::Serialize;
+
+// ── ORCHESTRATION abort/progress handoff (EN.ticket.orchestration-abort-and-progress task 4) ──
+//
+// `register_orchestration_with_registry`'s factory (below) builds a fresh
+// `OrchestrationRunNode` -- including its `CancellationToken` and
+// step-progress observer -- *before* `POST /events/`'s `post_events`
+// handler (`http.rs`) has minted a `run_id` or cloned this run's
+// `LiveStateStore`/`DurableHandle`: `Dispatcher::dispatch_with_event` runs
+// first, and only afterward does `post_events` mint `run_id`, register a
+// token in `abort::RunRegistry`, and call `suspend::spawn_run`. Neither
+// `http.rs` nor `Dispatcher`'s factory signature is this ticket's to change
+// (see the top-level spec's file list), so the token this node embeds and
+// the fan-out context its observer needs cross that gap via a **thread-local**
+// handoff, not a process-global one: `post_events`' whole
+// `dispatch_with_event -> mint run_id -> spawn_run` sequence is synchronous
+// (no `.await` anywhere in it), so it never yields its OS thread to another
+// request's handler mid-sequence. A `OnceLock`/process-global equivalent
+// would race under two concurrent `POST /events/` calls for ORCHESTRATION
+// landing on different worker threads; this cannot, because each request's
+// un-awaited segment owns its thread for the whole handoff.
+//
+// Every other workflow type never calls [`set_pending_orchestration_run`],
+// so [`take_pending_orchestration_run`] returns `None` for them and
+// `suspend::spawn_run` falls back to exactly its pre-existing behavior.
+
+/// Everything an ORCHESTRATION step-progress observer needs to publish
+/// through `suspend.rs`'s three-way fan-out (live state, the durable
+/// writer, SSE), but cannot know at factory-build time. Filled in by
+/// `suspend::spawn_run` — via [`take_pending_orchestration_run`] — before
+/// the workflow it is embedded in ever runs.
+#[derive(Clone)]
+pub(crate) struct StepFanoutContext {
+    pub run_id: uuid::Uuid,
+    pub live: crate::live_state::LiveStateStore,
+    pub durable: crate::durable::DurableHandle,
+    pub workflow_type: String,
+    pub data: serde_json::Value,
+}
+
+/// The token + fan-out cell a freshly-built ORCHESTRATION node captured at
+/// factory time, handed off to `suspend::spawn_run` via the thread-local
+/// below.
+pub(crate) struct PendingOrchestrationRun {
+    pub token: CancellationToken,
+    pub fanout: Arc<RwLock<Option<StepFanoutContext>>>,
+}
+
+thread_local! {
+    static PENDING_ORCHESTRATION_RUN: RefCell<Option<PendingOrchestrationRun>> =
+        const { RefCell::new(None) };
+}
+
+/// Stash `pending` for the very next `suspend::spawn_run` call on THIS
+/// thread to consume via [`take_pending_orchestration_run`]. Called once
+/// per ORCHESTRATION dispatch, from inside
+/// [`register_orchestration_with_registry`]'s factory closure.
+pub(crate) fn set_pending_orchestration_run(pending: PendingOrchestrationRun) {
+    PENDING_ORCHESTRATION_RUN.with(|cell| *cell.borrow_mut() = Some(pending));
+}
+
+/// Take (and clear) whatever [`set_pending_orchestration_run`] stashed on
+/// this thread. `None` for every non-ORCHESTRATION dispatch (nothing ever
+/// calls the setter for them), and also for the pathological case of an
+/// ORCHESTRATION dispatch and its following `spawn_run` call landing on
+/// different threads — `suspend::spawn_run` falls back to its
+/// already-correct un-injected behavior in that case; see its call site.
+pub(crate) fn take_pending_orchestration_run() -> Option<PendingOrchestrationRun> {
+    PENDING_ORCHESTRATION_RUN.with(|cell| cell.borrow_mut().take())
+}
+
+/// Build a fresh `CancellationToken` + step-progress observer for one
+/// ORCHESTRATION dispatch, and stash the handoff [`set_pending_orchestration_run`]
+/// so `suspend::spawn_run` can pick it up. Used by
+/// [`register_orchestration_with_registry`]'s factory (the production
+/// path), and directly by tests that build an `OrchestrationRunNode`
+/// without going through the full `Dispatcher`, so both exercise the exact
+/// same wiring.
+///
+/// The returned observer reads [`StepFanoutContext`] fresh on every call
+/// (via the shared `fanout` cell), so it is safe to hand to
+/// `with_step_observer` before that context exists — `spawn_run` always
+/// fills it in before the workflow this token/observer are embedded in
+/// ever runs.
+/// The step-progress observer type `with_step_observer` takes — aliased so
+/// [`build_orchestration_seams`]'s return type reads cleanly.
+type StepObserverArc = Arc<dyn Fn(&StepProgress) + Send + Sync>;
+
+pub(crate) fn build_orchestration_seams() -> (CancellationToken, StepObserverArc) {
+    let token = CancellationToken::new();
+    let fanout: Arc<RwLock<Option<StepFanoutContext>>> = Arc::new(RwLock::new(None));
+    set_pending_orchestration_run(PendingOrchestrationRun {
+        token: token.clone(),
+        fanout: fanout.clone(),
+    });
+
+    let observer_fanout = fanout.clone();
+    let step_observer: StepObserverArc = Arc::new(move |progress: &StepProgress| {
+        let ctx = observer_fanout.read().ok().and_then(|guard| guard.clone());
+        if let Some(ctx) = ctx {
+            crate::suspend::publish_step_progress(
+                ctx.run_id,
+                ctx.live.clone(),
+                ctx.durable.clone(),
+                ctx.workflow_type.clone(),
+                ctx.data.clone(),
+                progress,
+            );
+        }
+        // `fanout` is only ever empty here for a caller driving this
+        // node directly with no `spawn_run` in the loop (e.g. a test
+        // exercising `Node::process` in isolation) — the served path
+        // always fills it in before `workflow.run_with` dispatches this
+        // node. Silently dropping the emission in that case matches
+        // the no-observer default's behavior-stable contract.
+    });
+
+    (token, step_observer)
+}
 
 /// The process-global repo registry (EN.3.K): `set_repo_registry` /
 /// `repo_registry` read and write this singleton, mirroring
@@ -652,6 +772,17 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
 /// tmux session and host, not by block. [`register_orchestration`] still
 /// passes `NeverHeld` as its argument; that is a known, named gap, not an
 /// oversight.
+///
+/// `EN.ticket.orchestration-abort-and-progress` task 4: the factory also
+/// mints this run's `CancellationToken` and step-progress fan-out cell and
+/// wires them into the node via `with_cancellation_token`/`with_step_observer`,
+/// handing both off to `suspend::spawn_run` through the thread-local seam
+/// documented just above this module's imports — see that block's doc for
+/// why. `POST /events/{run_id}/abort` triggers this exact token, and each
+/// completed step's progress reaches live state, the durable writer, and
+/// SSE through the same three-way fan-out `spawn_run`'s own node-boundary
+/// `on_progress` already used (`suspend::publish_step_progress`, reusing
+/// `suspend::progress_fanout`) — never a second progress mechanism.
 pub fn register_orchestration_with_registry(
     dispatcher: &mut Dispatcher,
     repo_reg: Option<Arc<RepoRegistry>>,
@@ -685,6 +816,17 @@ pub fn register_orchestration_with_registry(
             let edge_met_gates = gates.clone();
             let block_open_gates = gates.clone();
 
+            // EN.ticket.orchestration-abort-and-progress task 4: mint this
+            // run's `CancellationToken` and step-progress observer, and hand
+            // the handoff off to `suspend::spawn_run` via the thread-local
+            // above — see [`build_orchestration_seams`]. `run_token` (not
+            // `token`, which `with_is_block_open`'s closure parameter below
+            // already shadows) is embedded directly in the node;
+            // `spawn_run` re-registers it under this run's `run_id` so
+            // `POST /events/{run_id}/abort` triggers the exact token
+            // `integrate_chain` is checking, not a discarded one.
+            let (run_token, step_observer) = build_orchestration_seams();
+
             let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);
@@ -707,7 +849,9 @@ pub fn register_orchestration_with_registry(
                     }
                     open
                 }))
-                .with_hold_source(hold_source.clone());
+                .with_hold_source(hold_source.clone())
+                .with_cancellation_token(run_token)
+                .with_step_observer(step_observer);
 
             let mut registry = engine_core::NodeRegistry::new();
             registry.register(Box::new(node));

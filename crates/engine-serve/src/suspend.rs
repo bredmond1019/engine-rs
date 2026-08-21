@@ -33,6 +33,8 @@ use engine_core::{Budget, CancellationToken, PauseSignal, Workflow};
 use futures::FutureExt;
 use uuid::Uuid;
 
+use engine_core::workflows::orchestration::integrate::StepProgress;
+
 use crate::abort::RunRegistry;
 use crate::durable::{durable_on_progress, DurableHandle};
 use crate::live_state::LiveStateStore;
@@ -298,6 +300,64 @@ fn stamp_terminal_completion(ctx: &mut TaskContext) -> &'static str {
     status
 }
 
+/// Build the reusable three-way progress fan-out — live state, the durable
+/// writer, SSE — extracted out of [`spawn_run`]'s own node-boundary
+/// `on_progress` closure (EN.ticket.orchestration-abort-and-progress task 4)
+/// so [`publish_step_progress`]'s ORCHESTRATION step-observer seam calls the
+/// exact same three sinks rather than growing a fourth/second progress
+/// mechanism.
+fn progress_fanout(
+    run_id: Uuid,
+    live: LiveStateStore,
+    durable: DurableHandle,
+    workflow_type: String,
+    data: serde_json::Value,
+) -> impl FnMut(&TaskContext) {
+    let mut durable_progress = durable_on_progress(durable, run_id, workflow_type, data);
+    move |snapshot: &TaskContext| {
+        live.record(run_id, snapshot);
+        durable_progress(snapshot);
+        // Third fan-out alongside live-state and the durable writer — not a
+        // second progress mechanism.
+        crate::stream::publish(run_id, snapshot);
+    }
+}
+
+/// Publish one ORCHESTRATION step-progress event through [`progress_fanout`]
+/// — the SAME live state / durable writer / SSE fan-out `spawn_run`'s own
+/// node-boundary `on_progress` uses — rather than a parallel progress path
+/// (EN.ticket.orchestration-abort-and-progress task 4). Called from the
+/// step observer `crate::workflows::register_orchestration_with_registry`'s
+/// factory wires into the node; `progress`'s fields (repo, block, 1-based
+/// index, total, status) are carried under `metadata.orchestration_step_progress`
+/// on a synthetic snapshot — `event`/`node_runs` are the run's own trigger
+/// data / empty, since a step event is not itself a `NodeRun` transition.
+pub(crate) fn publish_step_progress(
+    run_id: Uuid,
+    live: LiveStateStore,
+    durable: DurableHandle,
+    workflow_type: String,
+    data: serde_json::Value,
+    progress: &StepProgress,
+) {
+    let snapshot = TaskContext {
+        event: data.clone(),
+        nodes: StdHashMap::new(),
+        metadata: serde_json::json!({
+            "orchestration_step_progress": {
+                "repo": progress.repo,
+                "block_id": progress.block_id,
+                "index": progress.index,
+                "total": progress.total,
+                "status": progress.status,
+            }
+        }),
+        node_runs: StdHashMap::new(),
+    };
+    let mut fanout = progress_fanout(run_id, live, durable, workflow_type, data);
+    fanout(&snapshot);
+}
+
 fn failed_node_reason(ctx: &TaskContext) -> Option<String> {
     ctx.node_runs.iter().find_map(|(name, run)| {
         if run.status == NodeRunStatus::Failed {
@@ -345,8 +405,39 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         budget,
     } = spawned;
 
+    // EN.ticket.orchestration-abort-and-progress task 4: an ORCHESTRATION
+    // dispatch's factory (`workflows::register_orchestration_with_registry`)
+    // builds its own `CancellationToken` and step-progress fan-out cell up
+    // front — it runs *before* this run's `run_id`/`token` above even exist
+    // — and hands both off via a thread-local; see
+    // `workflows::PENDING_ORCHESTRATION_RUN`'s doc for why a thread-local
+    // (not a process-global) is what's race-safe here. When present, this
+    // run's *effective* token becomes that node-embedded one, re-registered
+    // under `run_id` so `POST /events/{run_id}/abort` triggers the exact
+    // token `integrate_chain` is checking — not the one just discarded —
+    // and the fan-out context the node's step observer needs is filled in
+    // before the workflow ever runs. Every other workflow type (and a
+    // pathological cross-thread ORCHESTRATION dispatch) never has anything
+    // pending here, so `token` stays exactly what it was before this seam
+    // existed.
+    let token = if let Some(pending) = crate::workflows::take_pending_orchestration_run() {
+        if let Ok(mut guard) = pending.fanout.write() {
+            *guard = Some(crate::workflows::StepFanoutContext {
+                run_id,
+                live: live.clone(),
+                durable: durable.clone(),
+                workflow_type: workflow_type.clone(),
+                data: data.clone(),
+            });
+        }
+        runs.register(run_id, pending.token.clone());
+        pending.token
+    } else {
+        token
+    };
+
     actix_web::rt::spawn(async move {
-        // Cloned before `durable` is moved into `durable_on_progress` below
+        // Cloned before `durable` is moved into `progress_fanout` below
         // (EN.9.C task 2): the completion stamp is applied to `final_ctx`
         // *after* `run_with`/`run_from` returns, so it can never ride the
         // node-boundary `on_progress` fan-out that closure builds. This
@@ -354,16 +445,15 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         // terminal exits (`:467`, `:485`), mirroring
         // `DurableHandle::record`'s existing convenience-wrapper contract.
         let durable_for_terminal = durable.clone();
-        let mut durable_progress =
-            durable_on_progress(durable, run_id, workflow_type.clone(), data.clone());
-        let progress_live = live.clone();
-        let on_progress: engine_core::OnProgress<'static> = Box::new(move |snapshot| {
-            progress_live.record(run_id, snapshot);
-            durable_progress(snapshot);
-            // Third fan-out alongside live-state and the durable writer —
-            // not a second progress mechanism.
-            crate::stream::publish(run_id, snapshot);
-        });
+        let mut fanout = progress_fanout(
+            run_id,
+            live.clone(),
+            durable,
+            workflow_type.clone(),
+            data.clone(),
+        );
+        let on_progress: engine_core::OnProgress<'static> =
+            Box::new(move |snapshot| fanout(snapshot));
 
         let options = engine_core::RunOptions {
             cancellation_token: Some(token),
@@ -889,5 +979,301 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let run_id = Uuid::new_v4();
         assert!(remove_suspended(run_id).is_none());
+    }
+
+    // -- ORCHESTRATION abort/progress wiring (EN.ticket.orchestration-abort-and-progress task 4) --
+
+    mod orchestration_wiring {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        use engine_core::workflows::orchestration::execute::FlowRunner;
+        use engine_core::workflows::orchestration::graph::{self, OrchestrationRunNode};
+        use engine_core::{Budget, NodeRegistry, PauseSignal};
+
+        use super::*;
+
+        fn three_block_brain_root() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+            std::fs::create_dir_all(
+                dir.path()
+                    .join("planning")
+                    .join("roadmaps")
+                    .join("my-roadmap"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("brain.toml"),
+                "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+            )
+            .unwrap();
+            for block in ["A.1", "A.2", "A.3"] {
+                let state_dir = dir
+                    .path()
+                    .join("repo-a")
+                    .join("planning")
+                    .join(block)
+                    .join("sdlc");
+                std::fs::create_dir_all(&state_dir).unwrap();
+                std::fs::write(
+                    state_dir.join("sdlc-flow-state.json"),
+                    serde_json::json!({ "status": "done" }).to_string(),
+                )
+                .unwrap();
+            }
+            dir
+        }
+
+        fn orchestration_event(dir: &std::path::Path) -> serde_json::Value {
+            serde_json::json!({
+                "brain_root": dir,
+                "roadmap_slug": "my-roadmap",
+                "blocks": [
+                    { "repo": "repo-a", "block_id": "A.1" },
+                    { "repo": "repo-a", "block_id": "A.2" },
+                    { "repo": "repo-a", "block_id": "A.3" },
+                ],
+            })
+        }
+
+        fn build_orchestration_workflow(run_flow: FlowRunner) -> Workflow {
+            let (token, observer) = crate::workflows::build_orchestration_seams();
+            let node = OrchestrationRunNode::new()
+                .with_run_flow(run_flow)
+                .with_cancellation_token(token)
+                .with_step_observer(observer);
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(node));
+            Workflow::new_validated(registry, graph::schema())
+                .expect("orchestration workflow should validate")
+        }
+
+        fn spawned_run(run_id: Uuid, workflow: Workflow, event: serde_json::Value) -> SpawnedRun {
+            SpawnedRun {
+                run_id,
+                workflow,
+                workflow_type: graph::WORKFLOW_TYPE.to_string(),
+                data: event.clone(),
+                created_at: Utc::now(),
+                start: RunStart::Fresh(event),
+                live: LiveStateStore::new(),
+                durable: crate::durable::spawn_durable_writer(None),
+                runs: RunRegistry::new(),
+                // Discarded: `spawn_run` overrides this with the token the
+                // node itself embeds (EN.ticket.orchestration-abort-and-progress
+                // task 4) — asserted below via `runs.get`.
+                token: engine_core::CancellationToken::new(),
+                pause: PauseSignal::new(),
+                budget: Budget::default(),
+            }
+        }
+
+        /// The whole point of this ticket's abort half: `POST
+        /// /events/{run_id}/abort` looks up `run_id`'s token in
+        /// `abort::RunRegistry` and cancels it — this test grabs that exact
+        /// token the same way `abort_run` would, cancels it mid-chain, and
+        /// asserts the chain actually stops before the next step, rather
+        /// than merely finishing on its own.
+        #[actix_web::test]
+        async fn a_token_cancelled_via_the_run_registry_halts_the_chain_before_the_next_step() {
+            let dir = three_block_brain_root();
+            let invocations: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+            let ready_tx = Arc::new(StdMutex::new(Some(ready_tx)));
+            let proceed_rx = Arc::new(tokio::sync::Mutex::new(Some(proceed_rx)));
+
+            let recorded = invocations.clone();
+            let run_flow: FlowRunner = Arc::new(move |invocation| {
+                let recorded = recorded.clone();
+                let ready_tx = ready_tx.clone();
+                let proceed_rx = proceed_rx.clone();
+                Box::pin(async move {
+                    recorded.lock().unwrap().push(invocation.block_id.clone());
+                    if invocation.block_id == "A.1" {
+                        // Signal the test that A.1's invocation is recorded
+                        // and about to complete, then wait for the test to
+                        // cancel the run's *registered* token before this
+                        // future is allowed to resolve — guaranteeing the
+                        // cancellation is visible before `integrate_chain`
+                        // ever reaches its loop-top check for A.2.
+                        if let Some(tx) = ready_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = proceed_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    Ok(TaskContext {
+                        event: serde_json::json!({}),
+                        nodes: StdHashMap::new(),
+                        metadata: serde_json::json!({ "ran": invocation.block_id }),
+                        node_runs: StdHashMap::new(),
+                    })
+                })
+            });
+
+            let workflow = build_orchestration_workflow(run_flow);
+            let run_id = Uuid::new_v4();
+            let live = LiveStateStore::new();
+            let runs = RunRegistry::new();
+            let mut spawned = spawned_run(run_id, workflow, orchestration_event(dir.path()));
+            spawned.live = live.clone();
+            spawned.runs = runs.clone();
+
+            spawn_run(spawned);
+
+            // A.1's invocation has been recorded and is parked waiting on
+            // `proceed_rx` — grab the SAME token `abort_run` would find and
+            // cancel it, exactly as `POST /events/{run_id}/abort` does.
+            ready_rx.await.expect("A.1 should signal readiness");
+            let token = runs
+                .get(run_id)
+                .expect("spawn_run must register this run's effective token under run_id");
+            token.cancel();
+            proceed_tx.send(()).expect("A.1 should still be waiting");
+
+            // Wait for the run to go terminal (deregistered from `runs`).
+            for _ in 0..200 {
+                if runs.get(run_id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                runs.get(run_id).is_none(),
+                "run should have gone terminal and deregistered"
+            );
+
+            assert_eq!(
+                *invocations.lock().unwrap(),
+                vec!["A.1".to_string()],
+                "A.2/A.3 must never run once the registered token is cancelled"
+            );
+
+            let final_ctx = live
+                .get(run_id)
+                .expect("terminal snapshot should still be readable");
+            assert_eq!(
+                final_ctx.nodes[graph::NODE_NAME]["cancellation"]["cancelled"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                final_ctx.nodes[graph::NODE_NAME]["cancellation"]["at_step"],
+                serde_json::json!(1)
+            );
+            assert_eq!(
+                final_ctx.metadata["cancellation"]["cancelled"],
+                serde_json::json!(true)
+            );
+        }
+
+        /// A 3-step successful chain must publish exactly 3 step-progress
+        /// events, and each one must land in ALL three of live state, the
+        /// durable writer, and SSE — the same fan-out node-boundary
+        /// `on_progress` uses — not a fourth/second mechanism.
+        #[actix_web::test]
+        async fn step_progress_reaches_live_state_durable_and_sse_once_per_step() {
+            let dir = three_block_brain_root();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let run_flow: FlowRunner = Arc::new(move |invocation| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(TaskContext {
+                        event: serde_json::json!({}),
+                        nodes: StdHashMap::new(),
+                        metadata: serde_json::json!({ "ran": invocation.block_id }),
+                        node_runs: StdHashMap::new(),
+                    })
+                })
+            });
+
+            let workflow = build_orchestration_workflow(run_flow);
+            let run_id = Uuid::new_v4();
+            let live = LiveStateStore::new();
+            let runs = RunRegistry::new();
+            let (durable, mut durable_rx) = crate::durable::test_handle();
+
+            // Subscribe to SSE before the run starts so the live broadcast
+            // channel exists and this test can observe every frame — the
+            // step-progress frames are non-terminal, exactly like
+            // node-boundary progress.
+            let mut sse_rx = crate::stream::subscribe(run_id);
+
+            let mut spawned = spawned_run(run_id, workflow, orchestration_event(dir.path()));
+            spawned.live = live.clone();
+            spawned.runs = runs.clone();
+            spawned.durable = durable;
+            spawn_run(spawned);
+
+            let mut sse_step_progress_frames = 0;
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), sse_rx.recv())
+                    .await
+                {
+                    Ok(Ok(frame)) => {
+                        if frame
+                            .task_context
+                            .metadata
+                            .get("orchestration_step_progress")
+                            .is_some()
+                        {
+                            sse_step_progress_frames += 1;
+                        }
+                        if frame.terminal {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                3,
+                "all three blocks should run"
+            );
+            assert_eq!(
+                sse_step_progress_frames, 3,
+                "exactly one step-progress SSE frame per completed step"
+            );
+
+            // The durable writer must have received one step-progress
+            // message per completed step too — the same fan-out, not a
+            // parallel one — plus the node-boundary snapshots either side
+            // of it, so only count messages actually carrying the
+            // step-progress marker, in order.
+            let mut durable_step_progress: Vec<(i64, i64)> = Vec::new();
+            while let Ok(message) = durable_rx.try_recv() {
+                if let Some(progress) = message.snapshot.metadata.get("orchestration_step_progress")
+                {
+                    let index = progress["index"].as_i64().expect("index should be an int");
+                    let total = progress["total"].as_i64().expect("total should be an int");
+                    durable_step_progress.push((index, total));
+                }
+            }
+            assert_eq!(
+                durable_step_progress,
+                vec![(1, 3), (2, 3), (3, 3)],
+                "durable writer must see one step-progress message per step, in order, \
+                 naming this step's index and the chain's total"
+            );
+
+            for _ in 0..200 {
+                if runs.get(run_id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(runs.get(run_id).is_none(), "run should have completed");
+
+            let final_ctx = live.get(run_id).expect("final snapshot must be readable");
+            assert_eq!(
+                final_ctx.nodes[graph::NODE_NAME]["steps_integrated"],
+                serde_json::json!(3)
+            );
+        }
     }
 }
