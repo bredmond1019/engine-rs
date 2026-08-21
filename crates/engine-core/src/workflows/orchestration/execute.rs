@@ -47,9 +47,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use engine_contract::TaskContext;
+use engine_contract::{NodeRunStatus, TaskContext};
 use serde_json::json;
 
+use crate::completion::derive_terminal_status;
 use crate::policy::PolicyConfigSource;
 use crate::repo_registry::{RepoRegistry, RepoRegistryError};
 use crate::workflows::sdlc_flow;
@@ -132,6 +133,19 @@ pub enum ExecuteError {
         block_id: String,
         source: WorkflowError,
     },
+    /// `run_flow` returned `Ok(ctx)` (`SDLC_FLOW`'s never-`Err` contract,
+    /// engine-rs D12), but the child run's own `ctx.node_runs` — read via the
+    /// shared [`derive_terminal_status`] rather than a second "did this run
+    /// fail?" implementation — reports `"failed"`. `Workflow::walk` breaks on
+    /// a failed node and falls through to `Ok(ctx)`, so this is the ONLY
+    /// place that failure becomes visible to the chain. Names the failing
+    /// node (its `node_runs` key) so a multi-block chain's failure is
+    /// attributable to the exact node that died, not just the step.
+    ChildFailed {
+        repo: String,
+        block_id: String,
+        failing_node: String,
+    },
 }
 
 impl fmt::Display for ExecuteError {
@@ -159,6 +173,14 @@ impl fmt::Display for ExecuteError {
                 block_id,
                 source,
             } => write!(f, "block '{block_id}' (repo '{repo}') failed: {source}"),
+            ExecuteError::ChildFailed {
+                repo,
+                block_id,
+                failing_node,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') failed: node '{failing_node}' did not succeed"
+            ),
         }
     }
 }
@@ -169,6 +191,7 @@ impl std::error::Error for ExecuteError {
             ExecuteError::RepoResolutionFailed { source, .. } => Some(source),
             ExecuteError::UnsupportedEngine { .. } => None,
             ExecuteError::StepFailed { source, .. } => Some(source),
+            ExecuteError::ChildFailed { .. } => None,
         }
     }
 }
@@ -232,6 +255,27 @@ pub async fn execute_step(
             block_id: step.block_id.clone(),
             source,
         })?;
+
+    // `run_flow` returning `Ok(ctx)` is not proof the child succeeded:
+    // `Workflow::walk` breaks on a failed node and falls through to
+    // `Ok(ctx)` (`SDLC_FLOW`'s never-`Err` contract, engine-rs D12), so the
+    // failure lives only in `ctx.node_runs`. Read it via the SHARED
+    // `derive_terminal_status` — never a second "did this run fail?" check —
+    // and stop the chain here rather than integrating a failed step as a
+    // success.
+    if derive_terminal_status(&ctx) == "failed" {
+        let failing_node = ctx
+            .node_runs
+            .iter()
+            .find(|(_, run)| run.status == NodeRunStatus::Failed)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Err(ExecuteError::ChildFailed {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            failing_node,
+        });
+    }
 
     Ok(ExecutionOutcome {
         repo: step.repo.clone(),
@@ -464,5 +508,86 @@ mod tests {
     fn engine_kind_display_names_are_stable() {
         assert_eq!(EngineKind::Task.to_string(), "task");
         assert_eq!(EngineKind::Flow.to_string(), "flow");
+    }
+
+    /// A `FlowRunner` test double that returns `Ok(ctx)` where `ctx.node_runs`
+    /// records `node_name` as [`NodeRunStatus::Failed`] — mirroring
+    /// `SDLC_FLOW`'s real never-`Err` contract (engine-rs D12): `Workflow::walk`
+    /// breaks on a failed node and falls through to `Ok(ctx)`, so a successful
+    /// `run_flow` future is not proof the child succeeded.
+    fn ok_but_child_failed_runner(node_name: &'static str) -> FlowRunner {
+        Arc::new(move |_invocation: FlowInvocation| {
+            let mut node_runs = std::collections::HashMap::new();
+            node_runs.insert(
+                node_name.to_string(),
+                engine_contract::NodeRun {
+                    status: NodeRunStatus::Failed,
+                    started_at: None,
+                    completed_at: None,
+                    error: Some("boom".to_string()),
+                    input: None,
+                    usage: None,
+                },
+            );
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: json!({}),
+                    node_runs,
+                })
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_child_that_returns_ok_but_recorded_a_failed_node_still_fails_the_step() {
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let runner = ok_but_child_failed_runner("SetupWorktreeNode");
+
+        let s = step("repo-a", "A.1");
+        let err = execute_step(&s, &resolve_engine, &registry, &runner)
+            .await
+            .expect_err("a child with a failed node_run must fail the step");
+
+        match &err {
+            ExecuteError::ChildFailed {
+                repo,
+                block_id,
+                failing_node,
+            } => {
+                assert_eq!(repo, "repo-a");
+                assert_eq!(block_id, "A.1");
+                assert_eq!(failing_node, "SetupWorktreeNode");
+            }
+            other => panic!("expected ChildFailed, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("A.1"), "message should name the block: {msg}");
+        assert!(
+            msg.contains("repo-a"),
+            "message should name the repo: {msg}"
+        );
+        assert!(
+            msg.contains("SetupWorktreeNode"),
+            "message should name the failing node: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_that_returns_ok_with_no_failed_nodes_still_integrates_as_success() {
+        // No over-correction: a genuinely successful run (recording_runner's
+        // fixed, empty, all-succeeded TaskContext) must still be integrated.
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let (runner, _calls) = recording_runner();
+
+        let s = step("repo-a", "A.1");
+        let outcome = execute_step(&s, &resolve_engine, &registry, &runner)
+            .await
+            .expect("a run with no failed nodes should be integrated as success");
+
+        assert_eq!(outcome.block_id, "A.1");
     }
 }
