@@ -917,4 +917,95 @@ mod tests {
             "one stale run must produce one item across the whole tick sequence, not one per tick"
         );
     }
+
+    // ── Fixture evidence: both directions of the threshold (task 3) ────
+    //
+    // These two tests are the declared standing fixture for the block's
+    // `gateable: false` acceptance criterion ("the sweep actually fires
+    // inside a running `bastion serve` process"). That evidence lives in
+    // another repo (bastion's boot wiring, BA.21.B) and in the Mini's
+    // INSTALLED binary — it cannot be observed from this repo's `cargo`
+    // checks. What stands in for it here is an engine-side test that
+    // drives the alarm's pure decision function (`stale_run_ids`, the same
+    // function `sweep_stale_runs_once`/`alarm_stale_runs` call) with an
+    // injected clock and asserts the enqueue decision at every tick of a
+    // simulated tick-set — never a real sleep, never a real interval.
+
+    #[test]
+    fn a_long_legitimate_chain_of_per_step_progress_is_never_flagged_stale() {
+        // Simulates `integrate_chain`'s per-step progress restamping:
+        // `OrchestrationRunNode::with_step_observer` (graph.rs:337) fans
+        // out through `engine_serve::suspend::progress_fanout` to
+        // `LiveStateStore::record`, which restamps `updated_at` once per
+        // COMPLETED STEP, not once per whole chain (see EN.12.A's
+        // amendment note in `planning/blocks/EN.12.A.json`). Because of
+        // that, the quiet window a legitimately long chain exposes to the
+        // alarm is bounded by ONE block's duration, not by chain length.
+        //
+        // This test is written to FAIL if that per-step restamping were
+        // removed: it drives `stale_run_ids` — the exact function the
+        // sweep calls — against a synthetic `updated_at` series that only
+        // stays "fresh" because it is restamped after every simulated
+        // step. Stop restamping (i.e. hold `updated_at` at the chain's
+        // start instead of advancing it per step) and the very same
+        // `stale_run_ids` call would flag the run once the cumulative gap
+        // (STEPS * PER_STEP_MAX_SECS) exceeds the derived threshold — which
+        // it does well before 8 steps (8 * 2640s = 21,120s >> 5280s).
+        let run_id = Uuid::new_v4();
+        let ctx = running_context();
+        let policy = OrphanPolicy::default();
+        let threshold = policy.stale_run_alarm_secs;
+
+        const STEPS: i64 = 8;
+        const PER_STEP_MAX_SECS: i64 =
+            engine_core::operator::orphan::OBSERVED_PER_BLOCK_MAX_SECS as i64;
+
+        let mut updated_at = Utc::now();
+        let mut clock = updated_at;
+        for step in 0..STEPS {
+            // Advance the wall clock by the measured per-block MAXIMUM
+            // before this step's progress event lands — the worst case
+            // quiet window a single in-flight block can produce.
+            clock += chrono::Duration::seconds(PER_STEP_MAX_SECS);
+
+            let records = vec![(run_id, ctx.clone(), updated_at)];
+            let stale = stale_run_ids(&records, clock, threshold);
+            assert!(
+                stale.is_empty(),
+                "step {step}: a block running at the measured per-block maximum must not trip \
+                 the alarm — quiet window {PER_STEP_MAX_SECS}s vs threshold {threshold}s"
+            );
+
+            // The step completes: its progress event restamps `updated_at`
+            // to now, exactly like `LiveStateStore::record` does in
+            // production. Without this line, the loop reproduces the
+            // pre-amendment monolithic-node model and the assertion above
+            // fails partway through the sequence.
+            updated_at = clock;
+        }
+    }
+
+    #[test]
+    fn a_run_idle_past_the_derived_threshold_with_no_step_progress_is_flagged() {
+        // The opposite direction, per carryover
+        // `gate-scope-must-be-shown-capable-of-failing`: a one-directional
+        // test (only "long legitimate chain is never flagged") would pass
+        // trivially against a threshold set to infinity. This asserts the
+        // alarm still fires when there is genuinely no step progress.
+        let run_id = Uuid::new_v4();
+        let ctx = running_context();
+        let policy = OrphanPolicy::default();
+        let threshold = policy.stale_run_alarm_secs;
+
+        let updated_at = Utc::now();
+        // No intervening step progress restamps `updated_at` — the run
+        // sits idle past the derived threshold with a single second to
+        // spare, so this fails a threshold set uselessly high too.
+        let now = updated_at + chrono::Duration::seconds(threshold as i64 + 1);
+        let records = vec![(run_id, ctx, updated_at)];
+
+        let stale = stale_run_ids(&records, now, threshold);
+
+        assert_eq!(stale, vec![run_id]);
+    }
 }
