@@ -21,6 +21,8 @@
 //!    instead of reaching into `nodes::terminal` directly.
 
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::nodes::terminal::admission::{AdmissionControl, AdmissionPermit};
 
@@ -149,6 +151,175 @@ pub fn check_dependencies(
     Ok(())
 }
 
+// ── Frontier reader ─────────────────────────────────────────────────────
+//
+// `EN.11.K` Task 1 — a reader for mev's `planning/lane-frontier.json`, used ONLY to
+// answer the narrow "is this lane's HEAD startable, and what are its `unmet_gates`"
+// question. Per the block's `what`/`why`, this artifact holds ONE entry per
+// `(roadmap, lane, segment)` — it cannot answer a per-edge `depends_on` question at
+// all (that stays `corpus_gates.rs`'s live per-edge reader), so nothing in this
+// section is wired into `check_dependencies`. Task 2 does that wiring, with the
+// explicit constraint that a frontier `startable: true` must never short-circuit
+// `check_dependencies`'s own refusal.
+
+/// One lane's current head, as mev's `lane-frontier.json` records it. Field names and
+/// types mirror `mev::brain::frontier::FrontierEntry` exactly — this module is a
+/// reader, not a re-derivation, so it must accept the artifact byte-for-shape as mev
+/// produces it rather than inventing a parallel schema.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct FrontierEntry {
+    pub roadmap: String,
+    pub lane: String,
+    pub segment: usize,
+    pub repo: String,
+    /// Canonical `"repo:id"` key.
+    pub key: String,
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    /// Unmet `depends_on` edges of the `Block` kind, rendered `"repo:id"`.
+    pub unmet_blocks: Vec<String>,
+    /// Unmet `depends_on` edges of the `Operator`/`Approval`/`External` kind, rendered
+    /// `"operator:<slug>"` / `"approval:<slug>"` / `"external:<what>"`.
+    pub unmet_gates: Vec<String>,
+    /// `true` iff both `unmet_blocks` and `unmet_gates` are empty. Per the block's
+    /// `why`, this is NOT a licence to start — see the module-level note above.
+    pub startable: bool,
+}
+
+/// One operator/approval gate's derived rank, as mev's `lane-frontier.json` records
+/// it — consumed here as opaque data, never recomputed. mev owns `gate_rank`
+/// derivation; a second implementation drifts, exactly like the two `digest_of`
+/// implementations named in seams.md seam 7.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GateRank {
+    /// `"operator"` or `"approval"`.
+    pub kind: String,
+    pub slug: String,
+    pub rank: u8,
+    /// Every block this gate blocks, rendered `"repo:id"`.
+    pub gates: Vec<String>,
+}
+
+/// The parsed shape of `planning/lane-frontier.json`: `{derived_at, entries[],
+/// gate_ranks[]}`, matching `mev::brain::frontier::FrontierArtifact` exactly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct FrontierArtifact {
+    /// RFC 3339 timestamp of the mev derivation run that produced this artifact.
+    pub derived_at: String,
+    pub entries: Vec<FrontierEntry>,
+    pub gate_ranks: Vec<GateRank>,
+}
+
+/// Everything that can go wrong reading `lane-frontier.json`. Every variant names the
+/// path — this reader never fails silently, matching `GateError`'s own discipline. A
+/// missing file and an unparsable file are kept distinct so a caller (and a test) can
+/// tell "mev has never derived this artifact here" from "the artifact is present but
+/// corrupt/stale-shaped".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontierError {
+    /// No file exists at `path` at all.
+    Missing { path: PathBuf },
+    /// A file exists at `path` but could not be parsed as a [`FrontierArtifact`].
+    Unparsable { path: PathBuf, reason: String },
+}
+
+impl fmt::Display for FrontierError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrontierError::Missing { path } => write!(
+                f,
+                "lane frontier: no file at '{}' — mev has not derived it here \
+                 (run `mev emit-state --write` or `mev frontier --json`)",
+                path.display()
+            ),
+            FrontierError::Unparsable { path, reason } => write!(
+                f,
+                "lane frontier: '{}' could not be parsed as {{derived_at, entries[], \
+                 gate_ranks[]}}: {reason}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FrontierError {}
+
+/// Read and parse `path` (typically `planning/lane-frontier.json`) as a
+/// [`FrontierArtifact`]. Fails loudly and names the path on both a missing file and
+/// an unparsable one — never returns a default/empty artifact, which would look like
+/// an ordinary "nothing in the frontier" result instead of "this could not be read".
+pub fn load_frontier(path: &Path) -> Result<FrontierArtifact, FrontierError> {
+    let contents = fs::read_to_string(path).map_err(|_| FrontierError::Missing {
+        path: path.to_path_buf(),
+    })?;
+    serde_json::from_str(&contents).map_err(|err| FrontierError::Unparsable {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    })
+}
+
+/// Find the frontier entry for `(roadmap, lane, segment)` — the ONLY key that is
+/// unique across the artifact's entries. Matching on `lane` alone is ambiguous: a
+/// lane name recurs once per roadmap (measured 2026-08-21: 24 entries, 3 for
+/// engine-rs), so `lane == "engine-rs"` alone can hit more than one entry.
+#[must_use]
+pub fn find_lane_head<'a>(
+    artifact: &'a FrontierArtifact,
+    roadmap: &str,
+    lane: &str,
+    segment: usize,
+) -> Option<&'a FrontierEntry> {
+    artifact
+        .entries
+        .iter()
+        .find(|e| e.roadmap == roadmap && e.lane == lane && e.segment == segment)
+}
+
+/// Resolve the [`FrontierEntry`] `step` refers to, by matching `step`'s own
+/// `roadmap`/`lane`/`segment` (`chain.rs`'s `EN.11.K` Task 2 addition, filled by
+/// [`resolve_lane_chain`](super::chain::resolve_lane_chain)) against `artifact`'s entries
+/// via [`find_lane_head`]. Returns `None` when `step` carries no lane identity at all —
+/// i.e. it came from [`resolve_explicit_chain`](super::chain::resolve_explicit_chain),
+/// which deliberately bypasses the lane file and so names no `(roadmap, lane, segment)`
+/// to look up.
+#[must_use]
+pub fn frontier_lane_head<'a>(
+    step: &ChainStep,
+    artifact: &'a FrontierArtifact,
+) -> Option<&'a FrontierEntry> {
+    let roadmap = step.roadmap.as_deref()?;
+    let lane = step.lane.as_deref()?;
+    let segment = step.segment?;
+    find_lane_head(artifact, roadmap, lane, segment)
+}
+
+/// Gate a step's start using **both** signals, without ever letting the frontier's
+/// `startable` substitute for the live per-edge check.
+///
+/// `check_dependencies` always runs, unconditionally — its result is computed first and
+/// returned as-is; nothing about the frontier lookup can suppress or skip it. Per the
+/// block's `why`: at spec time the frontier's own engine-rs head (`EN.11.E`) reports
+/// `startable: true` with `unmet_gates: []` while being HELD on an operator decision the
+/// graph cannot express, so treating `startable: true` as a licence to start would have
+/// launched it. This function's shape makes that impossible structurally — the returned
+/// [`FrontierEntry`] (when present) is advisory/telemetry only, never consulted to decide
+/// the `Result`.
+///
+/// `frontier` is `Option` because a caller may be resolving an explicit chain (no
+/// lane-file identity to look up) or may not have loaded a `lane-frontier.json` at all;
+/// either way the per-edge gate still runs.
+pub fn check_step_with_frontier_advice<'a>(
+    step: &ChainStep,
+    frontier: Option<&'a FrontierArtifact>,
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+) -> (Result<(), GateError>, Option<&'a FrontierEntry>) {
+    let gate_result = check_dependencies(step, resolve_depends_on, is_edge_met);
+    let head = frontier.and_then(|artifact| frontier_lane_head(step, artifact));
+    (gate_result, head)
+}
+
 // ── Admission gate ──────────────────────────────────────────────────────
 
 /// A thin, orchestration-flavoured wrapper over `EN.9.F`'s [`AdmissionControl`]: consult
@@ -210,6 +381,7 @@ mod tests {
             repo: repo.to_string(),
             block_id: block_id.to_string(),
             directives: None,
+            ..Default::default()
         }
     }
 
@@ -417,6 +589,303 @@ mod tests {
             .await
             .expect("queued block should proceed once a permit frees");
         assert_eq!(admitted.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Frontier reader tests ───────────────────────────────────────────
+
+    const SAMPLE_FRONTIER: &str = r#"{
+        "derived_at": "2026-08-21T00:00:00-07:00",
+        "entries": [
+            {
+                "roadmap": "orchestration-extensions",
+                "lane": "engine-rs",
+                "segment": 0,
+                "repo": "engine-rs",
+                "key": "engine-rs:EN.11.E",
+                "id": "EN.11.E",
+                "title": "Example head",
+                "status": "open",
+                "unmet_blocks": [],
+                "unmet_gates": [],
+                "startable": true
+            },
+            {
+                "roadmap": "orchestration-extensions",
+                "lane": "mev",
+                "segment": 0,
+                "repo": "mev",
+                "key": "mev:MV.13.B",
+                "id": "MV.13.B",
+                "title": "Frontier compute",
+                "status": "open",
+                "unmet_blocks": ["engine-rs:EN.11.A"],
+                "unmet_gates": ["operator:some-slug"],
+                "startable": false
+            },
+            {
+                "roadmap": "another-roadmap",
+                "lane": "engine-rs",
+                "segment": 0,
+                "repo": "engine-rs",
+                "key": "engine-rs:EN.12.A",
+                "id": "EN.12.A",
+                "title": "Same lane name, different roadmap",
+                "status": "open",
+                "unmet_blocks": [],
+                "unmet_gates": [],
+                "startable": true
+            }
+        ],
+        "gate_ranks": [
+            {
+                "kind": "operator",
+                "slug": "some-slug",
+                "rank": 1,
+                "gates": ["mev:MV.13.B"]
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn load_frontier_parses_the_real_artifact_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+
+        let artifact = load_frontier(&path).expect("must parse");
+        assert_eq!(artifact.derived_at, "2026-08-21T00:00:00-07:00");
+        assert_eq!(artifact.entries.len(), 3);
+        assert_eq!(artifact.gate_ranks.len(), 1);
+        assert_eq!(artifact.gate_ranks[0].slug, "some-slug");
+        assert_eq!(artifact.gate_ranks[0].gates, vec!["mev:MV.13.B"]);
+    }
+
+    #[test]
+    fn find_lane_head_matches_on_roadmap_lane_segment_not_lane_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        // Two entries share lane "engine-rs" but differ by roadmap — matching on the
+        // full tuple must disambiguate them.
+        let head = find_lane_head(&artifact, "orchestration-extensions", "engine-rs", 0)
+            .expect("must find the entry for this roadmap");
+        assert_eq!(head.id, "EN.11.E");
+        assert!(head.startable);
+
+        let other_head = find_lane_head(&artifact, "another-roadmap", "engine-rs", 0)
+            .expect("must find the entry for the other roadmap");
+        assert_eq!(other_head.id, "EN.12.A");
+
+        assert!(find_lane_head(&artifact, "orchestration-extensions", "engine-rs", 99).is_none());
+    }
+
+    #[test]
+    fn find_lane_head_passes_through_unmet_gates_and_blocks_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let head = find_lane_head(&artifact, "orchestration-extensions", "mev", 0)
+            .expect("must find mev's head");
+        assert!(!head.startable);
+        assert_eq!(head.unmet_blocks, vec!["engine-rs:EN.11.A"]);
+        assert_eq!(head.unmet_gates, vec!["operator:some-slug"]);
+    }
+
+    #[test]
+    fn missing_frontier_file_fails_loudly_naming_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.json");
+
+        let err = load_frontier(&path).unwrap_err();
+        match &err {
+            FrontierError::Missing { path: p } => assert_eq!(p, &path),
+            other => panic!("expected Missing, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "message must name the path: {msg}"
+        );
+    }
+
+    #[test]
+    fn unparsable_frontier_file_fails_loudly_naming_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, "{ not valid json").expect("write garbage");
+
+        let err = load_frontier(&path).unwrap_err();
+        match &err {
+            FrontierError::Unparsable { path: p, .. } => assert_eq!(p, &path),
+            other => panic!("expected Unparsable, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "message must name the path: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_ranks_are_consumed_as_opaque_data_not_recomputed() {
+        // This reader has no rank-derivation logic at all — it only deserializes
+        // gate_ranks[] as given. Pinning the field values round-trip is the test
+        // that a future change hasn't quietly added a re-derivation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        assert_eq!(artifact.gate_ranks[0].kind, "operator");
+        assert_eq!(artifact.gate_ranks[0].rank, 1);
+    }
+
+    // ── Task 2: wiring the frontier into gates.rs without letting it override ──
+
+    fn lane_step(
+        roadmap: &str,
+        lane: &str,
+        segment: usize,
+        repo: &str,
+        block_id: &str,
+    ) -> ChainStep {
+        ChainStep {
+            repo: repo.to_string(),
+            block_id: block_id.to_string(),
+            directives: None,
+            roadmap: Some(roadmap.to_string()),
+            lane: Some(lane.to_string()),
+            segment: Some(segment),
+        }
+    }
+
+    #[test]
+    fn frontier_lane_head_matches_a_step_from_resolve_lane_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let step = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let head = frontier_lane_head(&step, &artifact).expect("must find the matching entry");
+        assert_eq!(head.id, "EN.11.E");
+        assert!(head.startable);
+    }
+
+    #[test]
+    fn frontier_lane_head_is_none_for_an_explicit_chain_step() {
+        // resolve_explicit_chain leaves roadmap/lane/segment all None — there is no lane
+        // identity to look up, by construction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let step = step("engine-rs", "EN.11.E");
+        assert!(step.roadmap.is_none());
+        assert!(frontier_lane_head(&step, &artifact).is_none());
+    }
+
+    #[test]
+    fn frontier_startable_true_does_not_short_circuit_check_dependencies() {
+        // This is the exact live condition named in the block's Why: the frontier's own
+        // engine-rs head is startable:true with unmet_gates:[] while a per-edge check
+        // (standing in for the HELD-UNTIL operator decision the graph cannot express)
+        // still refuses. check_step_with_frontier_advice must surface the refusal, not
+        // the frontier's optimism.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let s = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let resolve_deps = |_repo: &str, _block_id: &str| {
+            vec![DependencyEdge::Operator {
+                slug: "some-other-gate".to_string(),
+            }]
+        };
+        let is_edge_met = |_repo: &str, _block_id: &str| true;
+
+        let (gate_result, head) =
+            check_step_with_frontier_advice(&s, Some(&artifact), &resolve_deps, &is_edge_met);
+
+        let head = head.expect("frontier entry must still be found");
+        assert!(
+            head.startable,
+            "the frontier itself must say startable:true"
+        );
+        assert!(head.unmet_gates.is_empty());
+        assert!(
+            gate_result.is_err(),
+            "check_dependencies must still refuse despite frontier startable:true"
+        );
+        match gate_result.unwrap_err() {
+            GateError::UnmetDependency {
+                edge: DependencyEdge::Operator { slug },
+                ..
+            } => assert_eq!(slug, "some-other-gate"),
+            other => panic!("expected an Operator UnmetDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frontier_advice_is_none_when_no_artifact_is_supplied() {
+        let s = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let resolve_deps = |_repo: &str, _block_id: &str| Vec::new();
+        let is_edge_met = |_repo: &str, _block_id: &str| true;
+
+        let (gate_result, head) =
+            check_step_with_frontier_advice(&s, None, &resolve_deps, &is_edge_met);
+        assert!(gate_result.is_ok());
+        assert!(head.is_none());
+    }
+
+    #[test]
+    fn check_dependencies_still_passes_when_frontier_agrees() {
+        // The agreement path: frontier says startable, and the live per-edge check has
+        // nothing outstanding either. Both signals concur, and the gate's own Ok(()) is
+        // what actually permits the start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lane-frontier.json");
+        std::fs::write(&path, SAMPLE_FRONTIER).expect("write fixture");
+        let artifact = load_frontier(&path).expect("must parse");
+
+        let s = lane_step(
+            "orchestration-extensions",
+            "engine-rs",
+            0,
+            "engine-rs",
+            "EN.11.E",
+        );
+        let resolve_deps = |_repo: &str, _block_id: &str| Vec::new();
+        let is_edge_met = |_repo: &str, _block_id: &str| true;
+
+        let (gate_result, head) =
+            check_step_with_frontier_advice(&s, Some(&artifact), &resolve_deps, &is_edge_met);
+        assert!(gate_result.is_ok());
+        assert!(head.expect("must find entry").startable);
     }
 
     #[tokio::test]

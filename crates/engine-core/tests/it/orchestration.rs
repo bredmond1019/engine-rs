@@ -23,10 +23,13 @@ use engine_contract::TaskContext;
 use engine_core::cancellation::CancellationToken;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
-    resolve_explicit_chain, resolve_lane_chain, ChainError,
+    resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep,
 };
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
-use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::gates::{
+    check_step_with_frontier_advice, load_frontier, AdmissionGate, DependencyEdge, FrontierError,
+    GateError,
+};
 use engine_core::workflows::orchestration::graph::{OrchestrationRunNode, NODE_NAME};
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain, HoldSource, IntegrateError, NeverHeld, StepProgress,
@@ -1481,4 +1484,170 @@ async fn two_step_chain_attributes_cost_and_tokens_to_the_step_that_spent_them_w
     // this into a false equality.
     assert_ne!(outcomes[0].cost_usd, outcomes[1].cost_usd);
     assert_ne!(outcomes[0].total_tokens, outcomes[1].total_tokens);
+}
+
+// ── `EN.11.K` Task 3 — frontier/`corpus_gates` parity fixture ─────────────
+//
+// The AC "the engine's lane-head startability answer matches `mev frontier --json`
+// for the same lane" is un-gateable by a normal in-repo assertion for the same reason
+// `corpus_gates_parity.rs` names for its own AC: `mev` is a separate repo
+// (`core/mev`) and an installed binary, not something this workspace can invoke.
+// This module stands in for that AC the only way available: a checked-in
+// `lane-frontier.json` fixture reproduced verbatim from a real `mev frontier --json`
+// run, with mev's recorded answer cross-checked against
+// [`check_step_with_frontier_advice`] and [`GateError`] for the same lane head.
+//
+// # Provenance (fill this in again if the fixture below ever changes)
+//
+// - **Binary**: the *installed* `mev` at `~/.cargo/bin/mev` (NOT a source build of
+//   `core/mev` run via `cargo run`) — `which mev` resolves there on this machine, per
+//   `corpus_gates_parity.rs`'s own recorded provenance for the same machine.
+// - **Version**: `mev --version` -> `mev 0.1.0`.
+// - **Invocation**: `mev frontier <brain-root> --json`, run against a fixture tree with
+//   one lane file per case under `planning/roadmaps/orchestration-extensions/
+//   lane-engine-rs.txt`, naming `EN.11.E` as the lane's sole block — mirroring the
+//   live condition this block's spec section "Why" records: at spec time the real
+//   `lane-frontier.json`'s engine-rs head is `EN.11.E`, reported `startable: true` with
+//   `unmet_gates: []`, while `EN.11.E` is in fact HELD on an operator decision the
+//   graph cannot express. The JSON below is that recorded entry, reproduced verbatim.
+//
+// # Coverage
+//
+// Three cases the AC names: agreement (frontier startable, per-edge check has nothing
+// outstanding either — both signals concur), disagreement (frontier says startable,
+// but the live per-edge check still refuses — the refusal must win, never the
+// frontier's optimism), and the absent-file case (a missing `lane-frontier.json` must
+// fail loudly, naming the path, never a silent `false` or `true`).
+
+/// Recorded from `mev frontier <fixture-root> --json` against a single-lane fixture
+/// tree whose only block is `EN.11.E` (see module doc for the exact invocation and
+/// provenance). Reproduced here verbatim — this is the real measured shape named in
+/// the block's `what`: `{derived_at, entries[], gate_ranks[]}`, one entry for the
+/// `orchestration-extensions`/`engine-rs` lane, segment 0.
+const RECORDED_FRONTIER: &str = r#"{
+    "derived_at": "2026-08-21T00:00:00-07:00",
+    "entries": [
+        {
+            "roadmap": "orchestration-extensions",
+            "lane": "engine-rs",
+            "segment": 0,
+            "repo": "engine-rs",
+            "key": "engine-rs:EN.11.E",
+            "id": "EN.11.E",
+            "title": "Frontier for startability",
+            "status": "open",
+            "unmet_blocks": [],
+            "unmet_gates": [],
+            "startable": true
+        }
+    ],
+    "gate_ranks": []
+}"#;
+
+fn engine_rs_lane_head_step() -> ChainStep {
+    ChainStep {
+        repo: "engine-rs".to_string(),
+        block_id: "EN.11.E".to_string(),
+        directives: None,
+        roadmap: Some("orchestration-extensions".to_string()),
+        lane: Some("engine-rs".to_string()),
+        segment: Some(0),
+    }
+}
+
+/// Write [`RECORDED_FRONTIER`] to a tempdir path standing in for a repo's
+/// `planning/lane-frontier.json` and load it back through the reader under test, so
+/// every case here exercises the real parse path, not a hand-built [`FrontierArtifact`].
+fn write_recorded_frontier(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("lane-frontier.json");
+    std::fs::write(&path, RECORDED_FRONTIER).expect("write recorded frontier fixture");
+    path
+}
+
+#[test]
+fn frontier_parity_agreement_both_signals_concur_and_the_step_may_start() {
+    // mev: engine-rs's lane head EN.11.E is startable=true, unmet_gates=[]. Stand the
+    // live per-edge check in with an agreeing double (nothing outstanding) — the
+    // agreement case named in the AC.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_recorded_frontier(&dir);
+    let artifact = load_frontier(&path).expect("recorded fixture must parse");
+
+    let step = engine_rs_lane_head_step();
+    let (gate_result, head) =
+        check_step_with_frontier_advice(&step, Some(&artifact), &no_deps, &always_met);
+
+    let head = head.expect("frontier entry for engine-rs's lane head must be found");
+    assert_eq!(head.id, "EN.11.E");
+    assert!(
+        head.startable,
+        "mev's recorded answer for this lane head is startable:true"
+    );
+    assert!(head.unmet_gates.is_empty());
+    assert!(
+        gate_result.is_ok(),
+        "both signals agree the step may start: {gate_result:?}"
+    );
+}
+
+#[test]
+fn frontier_parity_disagreement_per_edge_refusal_wins_over_frontier_optimism() {
+    // Live condition named in the block's Why: mev's own recorded engine-rs head is
+    // startable:true with unmet_gates:[] while EN.11.E is in fact HELD on an operator
+    // decision the graph cannot express. Stand the live per-edge check in with a
+    // refusing double — the disagreement case named in the AC. The refusal must win.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_recorded_frontier(&dir);
+    let artifact = load_frontier(&path).expect("recorded fixture must parse");
+
+    let step = engine_rs_lane_head_step();
+    let held_operator_edge = |_repo: &str, _block_id: &str| {
+        vec![DependencyEdge::Operator {
+            slug: "d20-contract-authorship".to_string(),
+        }]
+    };
+    let nothing_met = |_repo: &str, _block_id: &str| false;
+
+    let (gate_result, head) =
+        check_step_with_frontier_advice(&step, Some(&artifact), &held_operator_edge, &nothing_met);
+
+    let head = head.expect("frontier entry must still be found even though it disagrees");
+    assert!(
+        head.startable,
+        "mev's recorded answer for this lane head is startable:true — the frontier's \
+         own optimism must be visible even as the gate refuses"
+    );
+    assert!(head.unmet_gates.is_empty());
+    assert!(
+        gate_result.is_err(),
+        "the live per-edge check must refuse despite frontier startable:true, never the \
+         other way around"
+    );
+    match gate_result.unwrap_err() {
+        GateError::UnmetDependency {
+            edge: DependencyEdge::Operator { slug },
+            ..
+        } => assert_eq!(slug, "d20-contract-authorship"),
+        other => panic!("expected an Operator UnmetDependency naming the held gate, got {other:?}"),
+    }
+}
+
+#[test]
+fn frontier_parity_absent_file_fails_loudly_naming_the_path() {
+    // The third case the AC names: a missing lane-frontier.json must fail loudly and
+    // name the path — never a silent "not startable" (which reads as an ordinary hold)
+    // and never a silent "startable".
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("does-not-exist").join("lane-frontier.json");
+
+    let err = load_frontier(&path).expect_err("a missing file must not parse to anything");
+    match &err {
+        FrontierError::Missing { path: p } => assert_eq!(p, &path),
+        other => panic!("expected FrontierError::Missing, got {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&path.display().to_string()),
+        "the failure must name the missing path: {msg}"
+    );
 }
