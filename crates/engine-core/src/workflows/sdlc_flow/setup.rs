@@ -720,8 +720,21 @@ impl Node for LoadTaskStateNode {
             let raw = std::fs::read_to_string(&tasks_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", tasks_path.display()))
             })?;
-            let tasks: Vec<SDLCTask> = serde_json::from_str(&raw).map_err(|err| {
+            let raw_tasks: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|err| {
                 NodeError::new(format!("failed to parse {}: {err}", tasks_path.display()))
+            })?;
+            // Fresh bootstrap (no committed run state yet): seed
+            // max_attempts from the resolved policy for any task
+            // `tasks.json` does not declare its own value for. A resumed
+            // run (the `SDLCState::from_committed_state_json` branch above)
+            // already has concrete, previously-committed values and must
+            // not be re-seeded here.
+            let policy = resolved_policy(&ctx)?;
+            let tasks = seed_max_attempts(raw_tasks, policy.max_attempts).map_err(|err| {
+                NodeError::new(format!(
+                    "invalid task shape in {}: {err}",
+                    tasks_path.display()
+                ))
             })?;
             let mut bootstrapped = SDLCState::new(event.spec_slug.clone());
             bootstrapped.tasks = tasks;
@@ -761,10 +774,38 @@ impl Node for LoadTaskStateNode {
 
 /// Model output shape expected from `GenerateTasksNode`'s prompt: the task
 /// list plus its rendered `tasks.md` body.
+///
+/// `tasks` is kept as raw [`serde_json::Value`]s rather than
+/// `Vec<SDLCTask>` on purpose: [`seed_max_attempts`] needs the raw shape to
+/// tell "the model declared its own `max_attempts`" apart from "the field
+/// was absent and `SDLCTask`'s `#[serde(default)]` filled it in" — a
+/// distinction a direct `Vec<SDLCTask>` deserialize destroys.
 #[derive(Debug, Deserialize)]
 struct GeneratedTasks {
-    tasks: Vec<SDLCTask>,
+    tasks: Vec<serde_json::Value>,
     tasks_markdown: String,
+}
+
+/// Convert raw task JSON values into [`SDLCTask`]s, seeding `max_attempts`
+/// from `policy_max_attempts` for any task whose own JSON omits the field —
+/// never for one that declares it, even if the declared value equals the
+/// default. This is the SEED described on [`SdlcPolicy::max_attempts`]'s
+/// doc comment: task-declared > policy > `SDLCTask`'s built-in default.
+fn seed_max_attempts(
+    raw_tasks: Vec<serde_json::Value>,
+    policy_max_attempts: u32,
+) -> Result<Vec<SDLCTask>, serde_json::Error> {
+    raw_tasks
+        .into_iter()
+        .map(|value| {
+            let declared = value.get("max_attempts").is_some();
+            let mut task: SDLCTask = serde_json::from_value(value)?;
+            if !declared {
+                task.max_attempts = policy_max_attempts;
+            }
+            Ok(task)
+        })
+        .collect()
 }
 
 /// JSON schema matching [`GeneratedTasks`], passed as `Config.json_schema` so
@@ -924,12 +965,21 @@ impl Node for GenerateTasksNode {
                 ))
             })?;
 
+        // Seed max_attempts from the resolved policy for any task the model
+        // did not give its own value (SdlcPolicy::max_attempts's doc
+        // comment: task-declared > policy > built-in default).
+        let tasks = seed_max_attempts(generated.tasks, policy.max_attempts).map_err(|err| {
+            NodeError::new(format!(
+                "GenerateTasksNode: invalid task shape in model output: {err}"
+            ))
+        })?;
+
         std::fs::create_dir_all(&dir)
             .map_err(|err| NodeError::new(format!("failed to create {}: {err}", dir.display())))?;
 
         let tasks_json_path = dir.join("tasks.json");
         let tasks_md_path = dir.join("tasks.md");
-        let tasks_json = serde_json::to_string_pretty(&generated.tasks)
+        let tasks_json = serde_json::to_string_pretty(&tasks)
             .map_err(|err| NodeError::new(format!("failed to serialize tasks.json: {err}")))?;
         std::fs::write(&tasks_json_path, tasks_json).map_err(|err| {
             NodeError::new(format!(
@@ -950,7 +1000,7 @@ impl Node for GenerateTasksNode {
             json!({
                 "tasks_json": tasks_json_path.to_string_lossy(),
                 "tasks_md": tasks_md_path.to_string_lossy(),
-                "task_count": generated.tasks.len(),
+                "task_count": tasks.len(),
                 // Stamp the resolved knob values so `RunTelemetry` /
                 // `PolicyAggregate` can attribute this stage's observed cost
                 // to the settings that caused it (standing rule 6).
@@ -1187,6 +1237,87 @@ mod tests {
             .map(|t| t["task_id"].as_u64().unwrap())
             .collect();
         assert_eq!(task_ids, vec![1, 3]);
+    }
+
+    /// EN.ticket.sdlc-flow-dead-policy-knobs task 1, AC1: a non-default
+    /// policy `max_attempts` changes the bound a task that omits its own
+    /// value actually gets, on the bootstrap-from-`tasks.json` path.
+    #[tokio::test]
+    async fn load_seeds_max_attempts_from_policy_when_task_omits_it() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "One", "description": "d1" },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let policy = SdlcPolicy {
+            max_attempts: 7,
+            ..SdlcPolicy::default()
+        };
+        let mut ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(state["tasks"][0]["max_attempts"], 7);
+    }
+
+    /// AC2: a task that declares its own `max_attempts` keeps it even when
+    /// the policy sets a different value.
+    #[tokio::test]
+    async fn load_does_not_override_a_task_declared_max_attempts() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "One", "description": "d1", "max_attempts": 1 },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let policy = SdlcPolicy {
+            max_attempts: 7,
+            ..SdlcPolicy::default()
+        };
+        let mut ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(state["tasks"][0]["max_attempts"], 1);
+    }
+
+    /// AC3: with defaults everywhere (policy default 3, task omits the
+    /// field), behaviour is unchanged from before this task.
+    #[tokio::test]
+    async fn load_with_default_policy_leaves_max_attempts_at_three() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "One", "description": "d1" },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(state["tasks"][0]["max_attempts"], 3);
     }
 
     #[tokio::test]
@@ -2824,6 +2955,75 @@ repo_path = "alpha"
         assert!(dir.join("tasks.md").exists());
         let md = std::fs::read_to_string(dir.join("tasks.md")).unwrap();
         assert!(md.contains("Do it"));
+    }
+
+    /// EN.ticket.sdlc-flow-dead-policy-knobs task 1, AC1: a non-default
+    /// policy `max_attempts` seeds a model-generated task that does not
+    /// declare its own value.
+    #[tokio::test]
+    async fn generate_seeds_max_attempts_from_policy_when_model_omits_it() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let canned = json!({
+            "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc" }],
+            "tasks_markdown": "# Tasks\n\n1. Do it",
+        })
+        .to_string();
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text(&canned);
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let policy = SdlcPolicy {
+            max_attempts: 9,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+
+        node.process(ctx).await.expect("generate should succeed");
+
+        let dir = worktree.join("planning").join("my-spec");
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("tasks.json")).unwrap())
+                .unwrap();
+        assert_eq!(tasks[0]["max_attempts"], 9);
+    }
+
+    /// AC2: a model-generated task that declares its own `max_attempts`
+    /// keeps it, even when the policy sets a different value.
+    #[tokio::test]
+    async fn generate_does_not_override_a_model_declared_max_attempts() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let canned = json!({
+            "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc", "max_attempts": 1 }],
+            "tasks_markdown": "# Tasks\n\n1. Do it",
+        })
+        .to_string();
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text(&canned);
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let policy = SdlcPolicy {
+            max_attempts: 9,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+
+        node.process(ctx).await.expect("generate should succeed");
+
+        let dir = worktree.join("planning").join("my-spec");
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("tasks.json")).unwrap())
+                .unwrap();
+        assert_eq!(tasks[0]["max_attempts"], 1);
     }
 
     #[tokio::test]

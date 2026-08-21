@@ -272,6 +272,16 @@ pub struct SdlcPolicy {
     pub local: LocalConfig,
     pub simple_task_max_files: u32,
     pub llm_triage: bool,
+    /// Run-wide SEED for [`super::schema::SDLCTask::max_attempts`], applied
+    /// at task-creation/load time by `setup.rs`'s `GenerateTasksNode` and
+    /// `LoadTaskStateNode`'s bootstrap-from-`tasks.json` path — never an
+    /// override. **Precedence: task-declared `max_attempts` > this policy
+    /// value > `SDLCTask`'s own built-in default of `3`.** A task whose
+    /// JSON explicitly sets its own `max_attempts` always keeps that value,
+    /// even when it happens to equal the default; only a task that omits
+    /// the field is seeded from here. Distinguishing "declared" from
+    /// "defaulted" requires inspecting the raw task JSON before
+    /// `serde(default)` collapses that distinction into a concrete `u32`.
     pub max_attempts: u32,
     /// Bound on the review-retry loop that `ReviewRouterNode` closes: a
     /// `FAIL`/`PARTIAL` verdict with 1..=`STRUCTURAL_ISSUE_THRESHOLD` issues

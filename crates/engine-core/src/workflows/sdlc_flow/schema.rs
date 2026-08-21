@@ -77,6 +77,18 @@ pub struct SDLCTask {
     #[serde(default)]
     pub attempt_count: u32,
     /// Maximum number of attempts before a MAJOR_BAIL.
+    ///
+    /// **Precedence: task-declared > policy > built-in default.** A task
+    /// whose own JSON declares `max_attempts` always keeps that value; a
+    /// task that omits the field is seeded from the run's resolved
+    /// `SdlcPolicy::max_attempts` at task-creation/load time
+    /// (`setup.rs`'s `GenerateTasksNode` and `LoadTaskStateNode`), which
+    /// itself falls back to this field's `#[serde(default)]` of `3` only
+    /// when nothing set the policy either. The two same-named fields
+    /// (this one and `SdlcPolicy::max_attempts`) exist for different
+    /// audiences — this one is per-task, the policy one is the run-wide
+    /// seed for tasks that do not opt out of it — and the two must never
+    /// be conflated.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
 }
