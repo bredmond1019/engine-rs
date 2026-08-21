@@ -57,6 +57,27 @@ description: >
    docs: update docs for <spec>        docs agent
    chore: wrap up <spec>               wrap-up agent (status/log/amendment-log)
 
+ COMMIT-SAFETY GUARD (BT.ticket.worktree-run-can-commit-an-empty-tree) — run before EVERY `git commit`
+ in this pipeline, joined with `&&` in the SAME shell call as the commit (a separate preceding call
+ runs in a different process whose inherited git environment may differ, which is the whole failure
+ mode this guards against). The one exception is the worktree-init `--allow-empty` commit — its index
+ is legitimately populated right after checkout, so the guard cannot fire there. Run the identical
+ check against the vault repo (`git -C <vault planning path>` in place of `git`) before any vault
+ commit too:
+   if git rev-parse --verify -q HEAD >/dev/null; then TRACKED=$(git ls-tree -r HEAD --name-only | wc -l | tr -d ' '); STAGED=$(git ls-files -s | wc -l | tr -d ' '); if [ "$TRACKED" -gt 0 ] && [ "$STAGED" -eq 0 ]; then echo "COMMIT_GUARD_ABORT: index holds 0 entries but HEAD tracks $TRACKED files - refusing to commit a tree that deletes everything (BT.ticket.worktree-run-can-commit-an-empty-tree)"; exit 1; fi; fi
+ If this prints COMMIT_GUARD_ABORT, STOP — do not run the commit; the index is empty against a
+ non-empty HEAD, which is exactly the shape that deletes every tracked file.
+
+ GIT ENVIRONMENT STRIP (BT.ticket.worktree-run-can-commit-an-empty-tree, half (a)) — git exports
+ nine repository-scoping variables to the hooks it runs, and a hook-spawned process inherits them;
+ they OVERRIDE `-C` and cwd, so a later `git commit` can silently build its tree from a stale/foreign
+ index instead of the one you just staged. Run EVERY git command in this guide — including inside
+ `$(...)` substitutions and worktree-setup commands — through this prefix instead of a bare `git`:
+   env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git
+ e.g. `git status` becomes `env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git status`.
+ Below, commands are written as plain `git ...` for readability — always run them through this
+ prefix; only the prose mentions of git (descriptions, prohibitions) stay bare.
+
  MODEL TIERING (the token lever — see the MODEL map below)
    haiku : setup, enumerate, scout/state-load, test, state-writer
    sonnet: implement, fix, review, triage, docs, wrap-up
@@ -87,8 +108,9 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
      acceptance_criteria, validation_commands, max_attempts, files, dependsOn }` — `task_id` a
      1-indexed integer in dependency order with no gaps, `max_attempts: 3`, and never author
      `status`/`attempt_count` (engine-owned). Commit it on the current branch with an explicit
-     pathspec: `git add <tasksJsonFile>`, `git commit -m "chore: derive tasks.json from tasks.md
-     (D16 fallback)"`. Log a distinct line — `Derived tasks.json from tasks.md (D16
+     pathspec: `git add <tasksJsonFile>`, then run the COMMIT-SAFETY GUARD above and `git commit -m
+     "chore: derive tasks.json from tasks.md (D16 fallback)"` as one `&&`-joined call. Log a
+     distinct line — `Derived tasks.json from tasks.md (D16
      derive-from-tasks.md fallback) — <N> task(s), commit <hash>.`
    - **Per-task `validation_commands` scoping** — follow the convention documented at
      `.claude/commands/generate-tasks.md` (search it for "validation_commands"); do not restate the
@@ -117,14 +139,20 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
      - Implement the task following instructions.
      - Run fast validation tests.
      - Fix failures (up to 3 triage/fix attempts).
-     - Commit the task state on the branch (`feat: implement <slug> task N`).
+     - Run the COMMIT-SAFETY GUARD above, `&&`-joined with the commit itself, then commit the task
+       state on the branch (`feat: implement <slug> task N`). If a vault commit is also needed
+       (D46), run the same guard against `git -C <vault path>` before that commit too.
 4. **Consolidated End-Review**:
    - Once all tasks are complete, run the full validation/test suite.
    - Run the acceptance criteria check.
    - If PASS -> proceed to docs. If FAIL/PARTIAL -> run targeted fix loop.
 5. **Docs & Wrap-up**:
-   - If PASS, run `/update-docs --patch` to update documentation.
+   - If PASS, run `/update-docs --patch` to update documentation, running the COMMIT-SAFETY GUARD
+     `&&`-joined before the docs commit (and its vault counterpart, if any patched/created doc lives
+     under `planning/`).
    - Update the status and log.
+   - Run the COMMIT-SAFETY GUARD `&&`-joined before the wrap-up commit — both the repo-local one and,
+     in a vaulted repo, the vault one (`git -C <vault path>`) — then commit.
    - Create a pull request (PR) using git CLI or GitHub CLI (unless `--no-pr` is specified).
 
 

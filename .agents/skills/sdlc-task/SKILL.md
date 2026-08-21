@@ -81,6 +81,27 @@ description: >
    fix:  fix pass P for <stem>    fix agent (per pass)
    chore: sdlc-task bookkeep — <…>  bookkeep close-out (on a passing run)
 
+ COMMIT-SAFETY GUARD (BT.ticket.worktree-run-can-commit-an-empty-tree) — run before EVERY `git commit`
+ in this pipeline, joined with `&&` in the SAME shell call as the commit (a separate preceding call
+ runs in a different process whose inherited git environment may differ, which is the whole failure
+ mode this guards against). The one exception is the worktree-init `--allow-empty` commit — its index
+ is legitimately populated right after checkout, so the guard cannot fire there. Run the identical
+ check against the vault repo (`git -C <vault planning path>` in place of `git`) before any vault
+ commit too:
+   if git rev-parse --verify -q HEAD >/dev/null; then TRACKED=$(git ls-tree -r HEAD --name-only | wc -l | tr -d ' '); STAGED=$(git ls-files -s | wc -l | tr -d ' '); if [ "$TRACKED" -gt 0 ] && [ "$STAGED" -eq 0 ]; then echo "COMMIT_GUARD_ABORT: index holds 0 entries but HEAD tracks $TRACKED files - refusing to commit a tree that deletes everything (BT.ticket.worktree-run-can-commit-an-empty-tree)"; exit 1; fi; fi
+ If this prints COMMIT_GUARD_ABORT, STOP — do not run the commit; the index is empty against a
+ non-empty HEAD, which is exactly the shape that deletes every tracked file.
+
+ GIT ENVIRONMENT STRIP (BT.ticket.worktree-run-can-commit-an-empty-tree, half (a)) — git exports
+ nine repository-scoping variables to the hooks it runs, and a hook-spawned process inherits them;
+ they OVERRIDE `-C` and cwd, so a later `git commit` can silently build its tree from a stale/foreign
+ index instead of the one you just staged. Run EVERY git command in this guide — including inside
+ `$(...)` substitutions — through this prefix instead of a bare `git`:
+   env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git
+ e.g. `git status` becomes `env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git status`.
+ Below, commands are written as plain `git ...` for readability — always run them through this
+ prefix; only the prose mentions of git (descriptions, prohibitions) stay bare.
+
  MODEL TIERING (the token lever — see the MODEL map below)
    haiku : setup, enumerate, state-load, test, state-writer, bookkeep
    sonnet: implement, fix, triage
@@ -271,7 +292,7 @@ not persist between calls.
      copy of the record's prose, never the superseded D44 `{"tasks": [...]}` wrapper — bare array,
      1-indexed integer `task_id`, `description` a single string, `max_attempts: 3`, never author
      `status`/`attempt_count`), write it, and commit it on the current branch with an explicit
-     pathspec (`git add <tasksJsonFile>`,
+     pathspec (`git add <tasksJsonFile>`, then the COMMIT-SAFETY GUARD `&&`-joined with
      `git commit -m "chore: derive tasks.json from block record (D16 fallback)"`). Log a distinct
      line — `Derived tasks.json from block record (D16 derive-from-block-record fallback) — <N>
      task(s), commit <hash>.` — then re-run this lint. **Only if the block record is also missing,
@@ -281,7 +302,8 @@ not persist between calls.
      (`tasks.md`) exists and carries a `## Step-by-Step Tasks` / `## Step by Step Tasks` section with
      at least one numbered step, author a FRESH D45-shaped `tasks.json` from that decomposition plus
      the spec's Acceptance Criteria / Validation Commands (same D45 shape rules as above), write it,
-     and commit it on the current branch with an explicit pathspec (`git add <tasksJsonFile>`,
+     and commit it on the current branch with an explicit pathspec (`git add <tasksJsonFile>`, then
+     the COMMIT-SAFETY GUARD `&&`-joined with
      `git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"`). Log a distinct line —
      `Derived tasks.json from tasks.md (D16 derive-from-tasks.md fallback) — <N> task(s), commit
      <hash>.` — so a derived spec is distinguishable from an authored one, then re-run this lint.
@@ -368,9 +390,10 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
      path). Run the spec's validation commands for this task to confirm correctness locally — the
      `## Validation Commands` section in prose (`tasks-md` source), or the `validation_commands`
      field in the JSON block record (`block-record` source).
-   - **Commit** (never `git add -A`/`git add .` — stage files explicitly by name):
+   - **Commit** (never `git add -A`/`git add .` — stage files explicitly by name). Run the
+     COMMIT-SAFETY GUARD `&&`-joined with the commit itself, in the SAME shell call:
      ```
-     git commit -m "$(cat <<'EOF'
+     <COMMIT-SAFETY GUARD> && git commit -m "$(cat <<'EOF'
      feat: implement <stem>
      EOF
      )"
@@ -393,10 +416,10 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
      itself (not merely to `git add`), so a sibling lane's unrelated pre-staged files are never swept
      into this commit even if they happen to already be staged:
        ```
-       git -C <vault.planningPath> diff --cached --quiet -- <relpath1> <relpath2> ... || git -C <vault.planningPath> commit -m "$(cat <<'EOF'
+       git -C <vault.planningPath> diff --cached --quiet -- <relpath1> <relpath2> ... || (<COMMIT-SAFETY GUARD, using "git -C <vault.planningPath>" in place of "git"> && git -C <vault.planningPath> commit -m "$(cat <<'EOF'
      fix: fix pass <attempt-1> for <stem> (vault)
      EOF
-     )" -- <relpath1> <relpath2> ...
+     )" -- <relpath1> <relpath2> ...)
        git -C <vault.planningPath> log --oneline -1
        ```
      If NOTHING you wrote this attempt lives under planning/, skip this step entirely — do not run any
@@ -699,19 +722,20 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
      Then commit ONLY these three paths — pass them explicitly to `git commit` itself (not merely to
      `git add`), so anything a sibling lane already had staged in this same vault repo is left staged
      and untouched by this commit:
-     git -C <vaultRealPath> diff --cached --quiet -- <vaultRealPath>/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json || git -C <vaultRealPath> commit -m "$(cat <<'EOF'
+     git -C <vaultRealPath> diff --cached --quiet -- <vaultRealPath>/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json || (<COMMIT-SAFETY GUARD, using "git -C <vaultRealPath>" in place of "git"> && git -C <vaultRealPath> commit -m "$(cat <<'EOF'
      chore: sdlc-task bookkeep — <blockId>
      EOF
-     )" -- <vaultRealPath>/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json
+     )" -- <vaultRealPath>/<blockId>/tasks.md <vaultRealPath>/status.md <vaultRealPath>/state.json)
      git -C <vaultRealPath> log --oneline -1
      ```
      This must be a clean, targeted commit of just those files' changes — not a broader checkout or
      working-branch manipulation of the vault.
-   - **Non-vaulted repo (`planning/` is a plain tracked directory)**: commit together as usual —
+   - **Non-vaulted repo (`planning/` is a plain tracked directory)**: commit together as usual — run
+     the COMMIT-SAFETY GUARD `&&`-joined with the commit itself:
      ```
      git add <specFile> planning/status.md
      git add planning/state.json 2>/dev/null || true
-     git commit -m "$(cat <<'EOF'
+     <COMMIT-SAFETY GUARD> && git commit -m "$(cat <<'EOF'
      chore: sdlc-task bookkeep — <blockId>
      EOF
      )" || echo "NOTHING_TO_COMMIT"

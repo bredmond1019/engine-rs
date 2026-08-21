@@ -73,6 +73,16 @@ export const meta = {
   ]
 }
 
+// GIT_REPO_ENV_VARS (BT.ticket.worktree-run-can-commit-an-empty-tree, half (a)) — git exports these
+// nine repository-scoping variables to the hooks it runs, and a hook-spawned process (this project's
+// hooksPath = hooks) inherits them; they OVERRIDE `-C` and cwd, so a later `git commit` can silently
+// build its tree from a stale/foreign index (e.g. a hook's GIT_INDEX_FILE) instead of the one the
+// recipe actually staged, and commit a tree that deletes every tracked file behind a green PASS.
+// Ported verbatim (name, order) from core/mev/src/shared.rs GIT_REPO_ENV_VARS/git_command() — do not
+// re-derive this list. Every executable git invocation in this file's recipes must go through ${GIT},
+// never a bare `git`; prose mentions of git (descriptions, prohibitions) are left alone.
+const GIT = 'env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git'
+
 // ----------------------------------------------------------------
 // Parse args: "<spec-slug> [range] [--auto-merge] [--no-pr] [--worktree] [--resume] [--test-depth fast|full]"
 // ----------------------------------------------------------------
@@ -169,13 +179,13 @@ async function verifyVaultCommit(runDir, vault, vaultRelPaths) {
 BRAIN_ROOT=$(cd "${vault.planningPath}" && while [ ! -f brain.toml ] && [ "$PWD" != "/" ]; do cd ..; done; pwd)
 for p in ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}; do
   if [ -e "${vault.planningPath}/$p" ]; then
-    if [ -z "$(git -C ${vault.planningPath} status --porcelain -- "$p")" ] && git -C ${vault.planningPath} ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+    if [ -z "$(${GIT} -C ${vault.planningPath} status --porcelain -- "$p")" ] && ${GIT} -C ${vault.planningPath} ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
       echo "VAULT_OK:$p"
     else
       echo "UNCOMMITTED:$p"
     fi
   elif [ -e "$BRAIN_ROOT/planning/$p" ]; then
-    if [ -z "$(git -C "$BRAIN_ROOT/planning" status --porcelain -- "$p")" ] && git -C "$BRAIN_ROOT/planning" ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+    if [ -z "$(${GIT} -C "$BRAIN_ROOT/planning" status --porcelain -- "$p")" ] && ${GIT} -C "$BRAIN_ROOT/planning" ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
       echo "BRAIN_ROOT_OK:$p"
     else
       echo "UNCOMMITTED:$p"
@@ -199,6 +209,19 @@ different repo), notes (paste the raw script output).
   if (!result) return { allCommitted: false, uncommittedPaths: vaultRelPaths, brainRootExempt: [], notes: 'verification agent returned null' }
   if (!Array.isArray(result.brainRootExempt)) result.brainRootExempt = []
   return result
+}
+
+// COMMIT-SAFETY GUARD (BT.ticket.worktree-run-can-commit-an-empty-tree) — the cause-independent
+// backstop. Joined to a `git commit` with `&&` in the SAME Bash call as the commit itself: a
+// separate preceding call runs in a different process whose inherited git environment may differ,
+// which is the whole failure mode this guards against. Signal is an EMPTY INDEX against a non-empty
+// HEAD tree — deliberately NOT core.bare, which stays false in every reproduction of the data loss.
+// `gitCmd` lets a vault-repo commit run the same guard via `git -C <vault path>` against the vault's
+// own HEAD/index rather than the worktree's; the default 'git' reproduces the exact snippet verbatim.
+// Kept byte-identical with sdlc-task.js's copy — the two engines share no module, so this is
+// duplicated on purpose (see scripts/test_commit_safety_guard.py's cross-engine agreement check).
+function renderCommitSafetyGuard(gitCmd = 'git') {
+  return `if ${gitCmd} rev-parse --verify -q HEAD >/dev/null; then TRACKED=$(${gitCmd} ls-tree -r HEAD --name-only | wc -l | tr -d ' '); STAGED=$(${gitCmd} ls-files -s | wc -l | tr -d ' '); if [ "$TRACKED" -gt 0 ] && [ "$STAGED" -eq 0 ]; then echo "COMMIT_GUARD_ABORT: index holds 0 entries but HEAD tracks $TRACKED files - refusing to commit a tree that deletes everything (BT.ticket.worktree-run-can-commit-an-empty-tree)"; exit 1; fi; fi`
 }
 
 // Given a stage's self-reported filesModified (repo-root-relative) and a resolved vault, return the
@@ -1001,23 +1024,23 @@ const setupWorkdir = useWorktree ? 'trees/[branchName]' : '[repoRoot]'
 
 const worktreeRecipe = `${resumeMode ? `
 RESUME MODE IS ON — reuse the existing worktree for this spec instead of creating a fresh one.
-  a. git worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
-  b. git branch --list "${baseBranchName}"
+  a. ${GIT} worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
+  b. ${GIT} branch --list "${baseBranchName}"
   Then:
   - WT_EXISTS → REUSE verbatim. branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 3.5.
   - WT_MISSING but branch "${baseBranchName}" exists (orphan branch, dir removed) → re-attach (NO -b flag):
        mkdir -p trees
-       git worktree add --no-checkout trees/${baseBranchName} ${baseBranchName}
-       git -C trees/${baseBranchName} sparse-checkout init --cone
-       git -C trees/${baseBranchName} sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
-       git -C trees/${baseBranchName} checkout
-       git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\\.env(\\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/${baseBranchName}/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
+       ${GIT} worktree add --no-checkout trees/${baseBranchName} ${baseBranchName}
+       ${GIT} -C trees/${baseBranchName} sparse-checkout init --cone
+       ${GIT} -C trees/${baseBranchName} sparse-checkout set $(${GIT} ls-tree HEAD --name-only -d | tr '\\n' ' ')
+       ${GIT} -C trees/${baseBranchName} checkout
+       ${GIT} ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\\.env(\\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/${baseBranchName}/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
     branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 3.5.
   - Neither exists → fall through to STEP 2/3 and create a fresh worktree as normal.
 ` : ''}
 STEP 2 — Find a free worktree name. FIRST check the exact base candidate "${baseBranchName}":
-    git worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
-    git branch --list "${baseBranchName}"
+    ${GIT} worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
+    ${GIT} branch --list "${baseBranchName}"
   If EITHER exists, that is evidence of a PRIOR /sdlc-flow run on this exact spec — do NOT silently
   bump to a "-2" name and orphan it (this is how prior progress has been lost before: an agent
   restarts the pipeline after a failure/interruption without realizing --resume was needed, and a
@@ -1025,31 +1048,34 @@ STEP 2 — Find a free worktree name. FIRST check the exact base candidate "${ba
   and setupError="A branch/worktree named '${baseBranchName}' already exists from a prior /sdlc-flow
   run on this spec. Re-run with --resume to continue it — this is required even if you are restarting
   via a cached Workflow resumeFromRunId, which does NOT by itself skip already-completed tasks. If you
-  are certain you want to discard it and start over: git worktree remove trees/${baseBranchName}
-  --force && git branch -D ${baseBranchName}, then re-run without --resume." Skip to STEP 6 and return.
+  are certain you want to discard it and start over: ${GIT} worktree remove trees/${baseBranchName}
+  --force && ${GIT} branch -D ${baseBranchName}, then re-run without --resume." Skip to STEP 6 and return.
   Otherwise (the base candidate is genuinely free), for each candidate run:
-    git worktree list | grep "trees/<candidate>"
-    git branch --list "<candidate>"
+    ${GIT} worktree list | grep "trees/<candidate>"
+    ${GIT} branch --list "<candidate>"
   If BOTH return nothing → the candidate is free; use it. Otherwise try "${baseBranchName}-2",
   "${baseBranchName}-3", … up to "-10" (an unrelated name collision, not a prior attempt on this
   spec — bumping past those is fine). Store the chosen name as branchName.
 
 STEP 3 — Create the worktree (replace [branchName] / [repoRoot] with actual values):
   a. mkdir -p trees
-  b. git worktree add --no-checkout trees/[branchName] -b [branchName]
-  c. git -C trees/[branchName] sparse-checkout init --cone
+  b. ${GIT} worktree add --no-checkout trees/[branchName] -b [branchName]
+  c. ${GIT} -C trees/[branchName] sparse-checkout init --cone
   d. # Cone ALL tracked top-level directories — stack-agnostic, no project-layout assumptions (D5/P5).
-     git -C trees/[branchName] sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
-  e. git -C trees/[branchName] checkout
+     ${GIT} -C trees/[branchName] sparse-checkout set $(${GIT} ls-tree HEAD --name-only -d | tr '\\n' ' ')
+  e. ${GIT} -C trees/[branchName] checkout
   f. Discover and copy EVERY gitignored env-shaped file (.env, .env.local, .env.* in any
      directory) from repoRoot into trees/[branchName], preserving each file's path relative to
      the repo root (creating parent directories as needed — so app/.env lands at
      trees/[branchName]/app/.env). Only files git actually ignores; exclude node_modules/,
      .venv/, venv/, trees/, and vendor/; never overwrite a file that already exists in the
      worktree. Run:
-       git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/[branchName]/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
+       ${GIT} ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/[branchName]/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
      Record the list of "ENV_COPIED:" lines — report them in STEP 6.
-  g. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
+  g. # COMMIT-SAFETY GUARD EXEMPT: this is the worktree-init commit — its index is legitimately
+     # populated after checkout (it is the very first commit on the branch), so the guard's
+     # "empty index against a non-empty HEAD" signal cannot fire here; --allow-empty is orthogonal.
+     ${GIT} -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
 
 STEP 3.5 — Fix the planning/ symlink for the worktree (run from the MAIN repo root, for ALL paths —
   fresh create, re-attach, or reuse). In brain-vaulted repos the MAIN repo's \`planning\` is a
@@ -1070,7 +1096,7 @@ STEP 3.5 — Fix the planning/ symlink for the worktree (run from the MAIN repo 
   populated it — do nothing.
 
 STEP 4 — Verify:
-  Run: git worktree list
+  Run: ${GIT} worktree list
   Run: ls trees/[branchName]/
   Confirm it contains the tracked top-level directories — at minimum planning/ (real dir or the fixed
   symlink) and .claude/. Confirm planning/ resolves: ls trees/[branchName]/planning/ >/dev/null 2>&1 && echo "PLANNING_OK".
@@ -1079,14 +1105,14 @@ STEP 5 — Compute worktreePath = repoRoot + "/trees/" + branchName`
 
 const branchRecipe = `${resumeMode ? `
 RESUME MODE IS ON — reuse the existing branch for this spec instead of creating a fresh one.
-  a. git branch --list "${baseBranchName}"
+  a. ${GIT} branch --list "${baseBranchName}"
   Then:
-  - If branch "${baseBranchName}" exists → check it out: git checkout ${baseBranchName}
+  - If branch "${baseBranchName}" exists → check it out: ${GIT} checkout ${baseBranchName}
     branchName="${baseBranchName}", wasCreated=false. Skip STEP 2/3; go to STEP 4.
   - If it does NOT exist → fall through to STEP 2/3 and create a fresh branch as normal.
 ` : ''}
 STEP 2 — Find a free branch name. FIRST check the exact base candidate "${baseBranchName}":
-    git branch --list "${baseBranchName}"
+    ${GIT} branch --list "${baseBranchName}"
   If it exists, that is evidence of a PRIOR /sdlc-flow run on this exact spec — do NOT silently bump
   to a "-2" name and orphan it (this is how prior progress has been lost before: an agent restarts the
   pipeline after a failure/interruption without realizing --resume was needed, and a fresh "-2" branch
@@ -1094,26 +1120,26 @@ STEP 2 — Find a free branch name. FIRST check the exact base candidate "${base
   branch named '${baseBranchName}' already exists from a prior /sdlc-flow run on this spec. Re-run
   with --resume to continue it — this is required even if you are restarting via a cached Workflow
   resumeFromRunId, which does NOT by itself skip already-completed tasks. If you are certain you want
-  to discard it and start over: git branch -D ${baseBranchName}, then re-run without --resume." Skip
+  to discard it and start over: ${GIT} branch -D ${baseBranchName}, then re-run without --resume." Skip
   to STEP 6 and return.
   Otherwise (the base candidate is genuinely free), for each candidate run:
-    git branch --list "<candidate>"
+    ${GIT} branch --list "<candidate>"
   If it returns nothing → the candidate is free; use it. Otherwise try "${baseBranchName}-2",
   "${baseBranchName}-3", … up to "-10" (an unrelated name collision, not a prior attempt on this
   spec — bumping past those is fine). Store the chosen name as branchName.
 
 STEP 3 — Create the branch and check it out IN THE MAIN WORKING TREE (no worktree, no trees/ dir):
   a. Guard against a dirty tree — uncommitted changes would ride onto the branch and into the run's
-     commits. Run: git status --porcelain
+     commits. Run: ${GIT} status --porcelain
      If it prints ANYTHING, STOP: do NOT create the branch. Set wasCreated=false and
      setupError="Working tree is not clean — commit or stash your changes, then re-run (or use --worktree
      for an isolated checkout). Dirty paths: <the porcelain output>". Then skip to STEP 6 and return.
-  b. git checkout -b [branchName]
+  b. ${GIT} checkout -b [branchName]
   No sparse-checkout, no env copy, no init commit — this is the real repo checkout, so the working tree
   (including any relative planning/ symlink) is already fully present and intact.
 
 STEP 4 — Verify:
-  Run: git branch --show-current      (must print [branchName])
+  Run: ${GIT} branch --show-current      (must print [branchName])
   Run: ls planning/ .claude/ >/dev/null 2>&1 && echo "TREE_OK" || echo "TREE_MISSING"
 
 STEP 5 — worktreePath = repoRoot  (branch mode runs in the main working tree — there is no separate worktree dir)`
@@ -1131,11 +1157,11 @@ Target:
   Base name:  ${baseBranchName}
 
 STEP 1 — Get the absolute repo root:
-  Run: git rev-parse --show-toplevel
+  Run: ${GIT} rev-parse --show-toplevel
   Store the trimmed output as repoRoot.
   Run this too — it must reflect where /sdlc-flow was actually invoked from (e.g. a sub-brain tier
   like business/), not worktreePath, which may differ:
-    REPO_ROOT=$(git rev-parse --show-toplevel) && python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')"
+    REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')"
        (store trimmed stdout as candidateTierPrefix — "" when invoking at the git root, otherwise
        the invoking directory's path relative to repoRoot with a trailing slash, e.g. "business/")
 ${useWorktree ? worktreeRecipe : branchRecipe}
@@ -1332,10 +1358,11 @@ STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from tasks.md's
   hardcode a stack-specific command (e.g. a particular test runner invocation) into this prompt;
   that judgment belongs to the deriving agent at run time, per task.
 
-STEP 4 — Commit it on the current branch with an explicit pathspec:
-  git add ${tasksJsonFile}
-  git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
-  git log --oneline -1   (capture the short hash)
+STEP 4 — Commit it on the current branch with an explicit pathspec. Run the guard and the commit as
+  ONE Bash call, joined with &&, so the guard evaluates the exact process the commit runs in:
+  ${GIT} add ${tasksJsonFile}
+  ${renderCommitSafetyGuard()} && ${GIT} commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
+  ${GIT} log --oneline -1   (capture the short hash)
 
 Return via StructuredOutput: derivable, written, commitHash, taskCount, notes.
 `, withModel({ label: 'derive-tasks-json', schema: DERIVE_SCHEMA, phase: 'Plan' }, MODEL.derive))
@@ -1820,13 +1847,13 @@ Target:
 6. Run the spec's "## Validation Commands" for Task ${taskNum} to confirm correctness.
 
 7. Commit on the branch. Never use git add -A or git add . — stage files explicitly by name.
-   Run: cd ${worktreePath} && git status
+   Run: cd ${worktreePath} && ${GIT} status
    Stage your changed source/test files explicitly, then commit using HEREDOC:
-     cd ${worktreePath} && git commit -m "$(cat <<'EOF'
+     cd ${worktreePath} && ${renderCommitSafetyGuard()} && ${GIT} commit -m "$(cat <<'EOF'
 ${isFix ? `fix: fix pass ${attempt - 1} for ${stem}` : `feat: implement ${stem}`}
 EOF
 )"
-   Run: cd ${worktreePath} && git log --oneline -1   (capture the short hash)
+   Run: cd ${worktreePath} && ${GIT} log --oneline -1   (capture the short hash)
 ${vault.vaulted ? `
 7b. planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a DIFFERENT git
     repo, invisible to the commit you just made in step 7. If this attempt created or edited ANY file
@@ -1836,15 +1863,15 @@ ${vault.vaulted ? `
     vault repo — another lane's session may have unrelated work staged there right now; touch ONLY
     your own paths, and do not checkout/switch/branch inside it (stay on whatever branch it is
     already on). For each such file, let <relpath> be the part of its path AFTER "planning/":
-      cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
+      cd ${worktreePath} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
     Then, once every such path is staged, commit ONLY those paths — pass them explicitly to \`git commit\`
     itself (not merely to \`git add\`), so a sibling lane's unrelated pre-staged files are never swept
     into this commit even if they happen to already be staged:
-      cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+      cd ${worktreePath} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 ${isFix ? `fix: fix pass ${attempt - 1} for ${stem} (vault)` : `feat: implement ${stem} (vault)`}
 EOF
-)" -- <relpath1> <relpath2> ...
-      cd ${worktreePath} && git -C ${vault.planningPath} log --oneline -1
+)" -- <relpath1> <relpath2> ...)
+      cd ${worktreePath} && ${GIT} -C ${vault.planningPath} log --oneline -1
     If NOTHING you wrote this attempt lives under planning/, skip this step entirely — do not run any
     vault command. If a vault add/commit fails, report it PLAINLY in notes; never paper over it, and
     never "repair" it by committing on a different branch inside the vault.
@@ -2050,8 +2077,8 @@ but it does NOT replace verifying the criteria against the code:
    Run: cd ${worktreePath} && cat ${specFile}
 
 2. Read the actual integrated diff (every task's work is sequential commits on this branch):
-   Run: cd ${worktreePath} && git diff --stat ${prBase}..HEAD
-   Run: cd ${worktreePath} && git diff ${prBase}..HEAD        (read the real changes; spot-check key files)
+   Run: cd ${worktreePath} && ${GIT} diff --stat ${prBase}..HEAD
+   Run: cd ${worktreePath} && ${GIT} diff ${prBase}..HEAD        (read the real changes; spot-check key files)
 
 3. Run the FRESH AUTHORITATIVE checks (this determines the verdict — NOT the per-task tripwire):
    Re-run the FULL gating suite below in order. A fresh failure of any GATING check ALWAYS prevents PASS.
@@ -2119,11 +2146,11 @@ ${findingsBlob}
 3. Add/adjust tests as needed; no emoji; no fabricated metrics.
 4. Run the spec's "## Validation Commands" to confirm.
 5. Commit on the branch (stage files explicitly — never git add -A):
-     cd ${worktreePath} && git commit -m "$(cat <<'EOF'
+     cd ${worktreePath} && ${renderCommitSafetyGuard()} && ${GIT} commit -m "$(cat <<'EOF'
 fix: review pass ${reviewAttempts} for ${blockId}
 EOF
 )"
-   Run: cd ${worktreePath} && git log --oneline -1
+   Run: cd ${worktreePath} && ${GIT} log --oneline -1
 Return via StructuredOutput: reportFile="", success=true if applied, filesModified, commitHash, summary, notes.
 `, withModel({ label: `review-fix-${reviewAttempts}`, schema: STAGE_SCHEMA, phase: 'Review' }, fixModel))
     await writeFlowState(`review pass ${reviewAttempts}`, `## Review pass ${reviewAttempts}\nAddressed: ${findingsBlob.slice(0, 300)}`, { cwd: worktreePath })
@@ -2243,7 +2270,7 @@ the surface this run changed. All Bash from the worktree root.
 
 1. Read the committed run-state for the list of files changed across all tasks:
    Run: cd ${worktreePath} && cat ${stateFile}
-   Run: cd ${worktreePath} && git diff --stat ${prBase}..HEAD
+   Run: cd ${worktreePath} && ${GIT} diff --stat ${prBase}..HEAD
 
 2. For each changed source file, find docs/*.md that reference it (component/function/route/file names):
    Run: cd ${worktreePath} && grep -rl "<name>" docs/ 2>/dev/null
@@ -2269,12 +2296,12 @@ the surface this run changed. All Bash from the worktree root.
 
 5. Commit on the branch (stage explicitly — never git add -A):
    If docs were patched:
-     cd ${worktreePath} && git add <each doc file>
-     cd ${worktreePath} && git commit -m "$(cat <<'EOF'
+     cd ${worktreePath} && ${GIT} add <each doc file>
+     cd ${worktreePath} && ${renderCommitSafetyGuard()} && ${GIT} commit -m "$(cat <<'EOF'
 docs: update docs for ${blockId}
 EOF
 )"
-     cd ${worktreePath} && git log --oneline -1
+     cd ${worktreePath} && ${GIT} log --oneline -1
    If nothing needed changing, make no commit and report success=true with empty changed/created.
 ${vault.vaulted ? `
    This step almost never touches planning/ (docs live under docs/), but if it genuinely did — e.g. a
@@ -2282,14 +2309,14 @@ ${vault.vaulted ? `
    vaulted symlink (D46), a DIFFERENT git repo, invisible to the commit you just made. Stage + commit
    it there too, through the real path, deriving the exact set from changed[]/created[] (never a fixed
    list): for each such path, let <relpath> be the part after "planning/":
-     cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
+     cd ${worktreePath} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
      Then commit ONLY those paths — pass them explicitly to \`git commit\` itself (not merely to
      \`git add\`), so a sibling lane's unrelated pre-staged files are never swept into this commit:
-     cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+     cd ${worktreePath} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 docs: update docs for ${blockId} (vault)
 EOF
-)" -- <relpath1> <relpath2> ...
-     cd ${worktreePath} && git -C ${vault.planningPath} log --oneline -1
+)" -- <relpath1> <relpath2> ...)
+     cd ${worktreePath} && ${GIT} -C ${vault.planningPath} log --oneline -1
    NEVER git add -A, git add ., git reset, or git stash against the vault repo, and never checkout/
    switch/branch inside it. If nothing you patched/created lives under planning/, skip this entirely.
 ` : ''}
@@ -2364,7 +2391,7 @@ Target:
    cd ${worktreePath} && cat planning/status.md
    cd ${worktreePath} && cat ${specFile}
    cd ${worktreePath} && head -40 log.md
-   cd ${worktreePath} && git log --oneline -20
+   cd ${worktreePath} && ${GIT} log --oneline -20
 
 2. Update planning/status.md (Edit tool, surgical). "Current focus" is APPEND-ONLY narrative — never
    delete or rewrite any existing line under it; a prior block's narrative must survive this edit
@@ -2516,34 +2543,34 @@ ${vault.vaulted ? `
    planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a different repo.
    Stage + commit the vaulted files THERE, via \`git -C\`, on whatever branch that repo is already on.
    Do NOT cd into it and do NOT checkout/switch/branch there:
-   cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/status.md
-   cd ${worktreePath} && git -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
+   cd ${worktreePath} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/status.md
+   cd ${worktreePath} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
    Then commit ONLY those two paths — pass them explicitly to \`git commit\` itself (not merely to
    \`git add\`), so anything a sibling lane already had staged in this same vault repo is left staged
    and untouched by this commit:
-   cd ${worktreePath} && git -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/status.md ${vault.planningPath}/state.json || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+   cd ${worktreePath} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/status.md ${vault.planningPath}/state.json || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 chore: wrap up ${stem}
 EOF
-)" -- ${vault.planningPath}/status.md ${vault.planningPath}/state.json
-   cd ${worktreePath} && git -C ${vault.planningPath} log --oneline -1
+)" -- ${vault.planningPath}/status.md ${vault.planningPath}/state.json)
+   cd ${worktreePath} && ${GIT} -C ${vault.planningPath} log --oneline -1
 
    Repo-local files stay staged and committed in THIS repo, on this branch, as before:
-   cd ${worktreePath} && git add log.md
-   cd ${worktreePath} && git add ${specFile} 2>/dev/null || true
-   cd ${worktreePath} && git commit -m "$(cat <<'EOF'
+   cd ${worktreePath} && ${GIT} add log.md
+   cd ${worktreePath} && ${GIT} add ${specFile} 2>/dev/null || true
+   cd ${worktreePath} && ${renderCommitSafetyGuard()} && ${GIT} commit -m "$(cat <<'EOF'
 chore: wrap up ${stem}
 EOF
 )"
-   cd ${worktreePath} && git log --oneline -1` : `
+   cd ${worktreePath} && ${GIT} log --oneline -1` : `
    planning/ is a plain directory here (not vaulted) — everything commits together as before:
-   cd ${worktreePath} && git add planning/status.md log.md
-   cd ${worktreePath} && git add planning/state.json 2>/dev/null || true
-   cd ${worktreePath} && git add ${specFile} 2>/dev/null || true
-   cd ${worktreePath} && git commit -m "$(cat <<'EOF'
+   cd ${worktreePath} && ${GIT} add planning/status.md log.md
+   cd ${worktreePath} && ${GIT} add planning/state.json 2>/dev/null || true
+   cd ${worktreePath} && ${GIT} add ${specFile} 2>/dev/null || true
+   cd ${worktreePath} && ${renderCommitSafetyGuard()} && ${GIT} commit -m "$(cat <<'EOF'
 chore: wrap up ${stem}
 EOF
 )"
-   cd ${worktreePath} && git log --oneline -1`}
+   cd ${worktreePath} && ${GIT} log --oneline -1`}
 ${renderWrapupStateWriteRecipe(wrapupStatePayload)}
 Return via StructuredOutput: statusUpdated, devlogUpdated, nextFocus, amendments[], commitHash,
 blockStatusFlipped (the state.json block id closed in step 2b, or "" — including when the write was
@@ -2593,7 +2620,7 @@ the handoff — build it from the committed run-state.
 
 1. Check the gh CLI and the remote:
    cd ${worktreePath} && command -v gh >/dev/null 2>&1 && echo "GH_PRESENT" || echo "GH_ABSENT"
-   cd ${worktreePath} && git remote -v | head -1 || echo "NO_REMOTE"
+   cd ${worktreePath} && ${GIT} remote -v | head -1 || echo "NO_REMOTE"
 
 2. If GH_ABSENT or NO_REMOTE → do NOT fail. Set outcome="impossible", ghPresent=(GH_PRESENT?),
    pushed=false, and in notes print the branch name "${branchName}" and manual instructions:
@@ -2603,7 +2630,7 @@ the handoff — build it from the committed run-state.
    cd ${worktreePath} && cat ${stateFile}
 
 4. Push the branch:
-   cd ${worktreePath} && git push -u origin ${branchName}
+   cd ${worktreePath} && ${GIT} push -u origin ${branchName}
    If this command errors: set outcome="failed", pushed=false, ghPresent=true, put the ACTUAL error
    text in notes, and return — do not attempt step 6. Otherwise set pushed=true and continue.
 
@@ -2697,25 +2724,25 @@ Base:     ${prBase}
    If gh errors (not mergeable, checks pending), STOP — do NOT clean up. Report merged=false + the error in notes.
 
 2. Bring local ${prBase} up to date (this also moves the working tree onto ${prBase}):
-   git checkout ${prBase} && git pull --ff-only
+   ${GIT} checkout ${prBase} && ${GIT} pull --ff-only
 ${useWorktree ? `
 3. Remove the worktree + delete the local branch (mirrors /clean-worktree teardown):
-   git worktree remove ${worktreePath} --force
-   git worktree prune
-   git branch -D ${branchName} 2>/dev/null || true
+   ${GIT} worktree remove ${worktreePath} --force
+   ${GIT} worktree prune
+   ${GIT} branch -D ${branchName} 2>/dev/null || true
    Set worktreeRemoved / branchDeleted accordingly.
 
 4. Verify:
-   git worktree list
-   git branch --list ${branchName}
+   ${GIT} worktree list
+   ${GIT} branch --list ${branchName}
 ` : `
 3. Delete the merged local branch (no worktree to remove in branch mode):
-   git branch -d ${branchName} 2>/dev/null || git branch -D ${branchName} 2>/dev/null || true
+   ${GIT} branch -d ${branchName} 2>/dev/null || ${GIT} branch -D ${branchName} 2>/dev/null || true
    Set worktreeRemoved=false, branchDeleted accordingly.
 
 4. Verify:
-   git branch --show-current   (should print ${prBase})
-   git branch --list ${branchName}
+   ${GIT} branch --show-current   (should print ${prBase})
+   ${GIT} branch --list ${branchName}
 `}
 5. Regenerate derived surfaces on ${prBase} (you are now on ${prBase} in the main tree — emit-state is safe here):
    mev emit-state --write
