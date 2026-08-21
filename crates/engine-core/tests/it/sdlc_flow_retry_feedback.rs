@@ -30,6 +30,7 @@ use claude_code_rs::Outcome;
 use engine_contract::TaskContext;
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
+use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
 use engine_core::workflows::sdlc_flow::final_validation::FinalValidationNode;
@@ -248,6 +249,7 @@ fn build_workflow(worktree: &Path, prompts: Arc<Mutex<Vec<String>>>) -> Workflow
         FinalValidationNode::new().with_runner(test_runner),
     ));
     registry.register(Box::new(WrapUpNode::new()));
+    registry.register(Box::new(CloseBlockNode::new()));
     registry.register(Box::new(PullRequestNode::new()));
     registry.register(Box::new(
         EmitStateNode::new().with_runner(noop_git_runner()),

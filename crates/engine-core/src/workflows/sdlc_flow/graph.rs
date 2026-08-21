@@ -15,7 +15,7 @@
 //!                                 -> ReviewRouterNode -> UpdateTaskStatusNode
 //!                                 -> SaveStateNode -> (loop) TaskQueueRouterNode
 //!                             | FinalValidationNode -> PatchDocsNode -> WrapUpNode
-//!                                 -> PullRequestNode -> EmitStateNode }
+//!                                 -> CloseBlockNode -> PullRequestNode -> EmitStateNode }
 //!
 //! TriageRouterNode    -> { ConsolidatedReviewNode | IncrementAttemptNode | WrapUpNode }
 //! ReviewRouterNode    -> { UpdateTaskStatusNode | IncrementAttemptNode | WrapUpNode }
@@ -61,6 +61,7 @@ use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
+use super::close_block::CloseBlockNode;
 use super::docs::PatchDocsNode;
 use super::emit_state::EmitStateNode;
 use super::final_validation::FinalValidationNode;
@@ -185,7 +186,32 @@ pub fn schema() -> WorkflowSchema {
     );
     nodes.insert(
         "WrapUpNode".to_string(),
-        NodeConfig::new("WrapUpNode", vec!["PullRequestNode".to_string()]),
+        NodeConfig::new("WrapUpNode", vec!["CloseBlockNode".to_string()]),
+    );
+    // `CloseBlockNode` sits between `WrapUpNode` and `PullRequestNode` —
+    // ORDER IS LOAD-BEARING (`EN.ticket.wrap-up-closes-the-block` task 5):
+    // the close must land BEFORE `EmitStateNode` re-derives the freshness
+    // spine, matching base-template's JS `sdlc-flow.js` step 2b (close)
+    // then 2c (emit). `mev::set_block_status` itself chains into an
+    // in-process `emit_state(root, true, None)` on a successful write
+    // (`mev/src/lib.rs:977`), so by the time this graph's own
+    // `EmitStateNode` subprocess-runs `mev emit-state --write` a moment
+    // later, the derived views (master-plan tables, project caches, tier
+    // rollups, boards, …) are ALREADY fresh off `CloseBlockNode`'s call.
+    // The two do not fight: `emit_state` recomputes every derived view
+    // fully from the current authored `state.json` each time it runs, so
+    // it is idempotent — a second run just re-derives the same views from
+    // the same (now-closed) authored state and re-writes byte-identical
+    // output. `EmitStateNode`'s subprocess run is authoritative for
+    // freshness purposes (it runs last, after `PullRequestNode` may have
+    // patched the `pr` block, and its own `patch_pr_into_state` step
+    // depends on running after the write), but neither run corrupts or
+    // undoes the other — this is deliberate redundancy, not a race, since
+    // `CloseBlockNode` holds mev's own advisory `.mev-emit.lock` for the
+    // duration of its write and releases it before `EmitStateNode` starts.
+    nodes.insert(
+        "CloseBlockNode".to_string(),
+        NodeConfig::new("CloseBlockNode", vec!["PullRequestNode".to_string()]),
     );
     nodes.insert(
         "PullRequestNode".to_string(),
@@ -241,6 +267,7 @@ pub fn registry() -> NodeRegistry {
         PatchDocsNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),
     ));
     registry.register(Box::new(WrapUpNode::new()));
+    registry.register(Box::new(CloseBlockNode::new()));
     registry.register(Box::new(PullRequestNode::new()));
     registry.register(Box::new(EmitStateNode::new()));
     registry
@@ -359,7 +386,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_all_eighteen_nodes_incl_bottom_half() {
+    fn registry_contains_all_twenty_nodes_incl_bottom_half() {
+        // Was misnamed "...eighteen..." while actually asserting nineteen
+        // (`EN.ticket.wrap-up-closes-the-block` task 5 notes this rather
+        // than compounding it); now twenty with `CloseBlockNode` added
+        // between `WrapUpNode` and `PullRequestNode`.
         let registry = registry();
 
         let expected = [
@@ -380,6 +411,7 @@ mod tests {
             "FinalValidationNode",
             "PatchDocsNode",
             "WrapUpNode",
+            "CloseBlockNode",
             "PullRequestNode",
             "EmitStateNode",
         ];
@@ -538,6 +570,7 @@ mod tests {
             "FinalValidationNode",
             "PatchDocsNode",
             "WrapUpNode",
+            "CloseBlockNode",
             "PullRequestNode",
             "EmitStateNode",
         ];
