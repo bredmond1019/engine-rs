@@ -538,7 +538,9 @@ impl Node for OrchestrationRunNode {
         // `OrchestrationEventSchema::campaign_id`.
         let campaign_id = match &event.campaign_id {
             Some(raw) => Uuid::parse_str(raw).map_err(|err| {
-                NodeError::new(format!("invalid `campaign_id` on ORCHESTRATION event: {err}"))
+                NodeError::new(format!(
+                    "invalid `campaign_id` on ORCHESTRATION event: {err}"
+                ))
             })?,
             None => Uuid::new_v4(),
         };
