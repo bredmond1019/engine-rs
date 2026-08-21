@@ -6,13 +6,13 @@ doc_id: data-contract
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.7.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse, locale, rate card, investment shape]
+keywords: [data contract, orchestrator, PostgreSQL, node_runs, field mappings, v1.8.0, cancellation, abort, budget gate, engine-contract, event read api, ingest, async lifecycle, sse, run readback, recall, walk, pulse, locale, rate card, investment shape, campaign, campaign_id]
 related: [architecture, D6-cancellation-and-budget-semantics, brain:D20-shared-data-contract, brain:D78-engine-rs-owns-the-data-contract]
 ---
 
 # Data Contract
 
-**Contract Version: 1.7.0**
+**Contract Version: 1.8.0**
 
 Per [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md)
 (2026-08-21), **this document is the canonical, authoritative data contract.** D78 superseded D20's
@@ -175,6 +175,45 @@ Rust type changes shape. engine-rs's own execution path (`Workflow::run_with`) d
 `metadata.failure` on a raising run; whether it should is future work, not this re-pin — `§6`'s
 `pending|running|success|failed` `NodeRunStatus` vocabulary is unchanged either way.
 
+### Campaign identity (`§8`, new in v1.8.0, `EN.11.E`)
+
+A **campaign** is the parent identity for the N runs of one orchestration chain — the unit the
+stop button (`EN.11.F`), resume (`EN.11.H`), the journal, and `EN.11.G`'s cost rollup all need to
+address, and which had no addressable subject before this version.
+
+**`campaign_id: uuid` is a first-class, named, versioned key — it is deliberately NOT a
+`metadata` annotation**, unlike `cancellation` / `budget` / `completion` / `suspension` /
+`failure` above. Those four live in the free-form `TaskContext::metadata` field because they are
+engine-internal bookkeeping about a single run's own lifecycle. A campaign id is different in
+kind: it is the cross-run join key a consumer must be able to find and rely on without parsing an
+undocumented, unversioned free-form blob. `bastion` vendors its own budget/cost logic and reads
+this contract, not engine-rs's internals (HQ D24) — burying `campaign_id` in `metadata` alongside
+the lifecycle markers would make it undiscoverable to exactly the consumer this contract exists
+to serve. Keep it out of `metadata` on every future edit to this section, even when it would be
+mechanically convenient to add it there.
+
+- **On a child run.** Every run spawned as one step of a chain carries `campaign_id` as a
+  top-level key of its own `event` JSON (`events.data` / `task_context.event`), seeded by
+  `sdlc_flow_event` alongside the existing `repo` / `spec_slug` / `use_worktree` keys. Rust side:
+  `engine_core::workflows::orchestration::execute::FlowInvocation::campaign_id: Uuid` (non-
+  optional — every chain-spawned run states its campaign, the same discipline as `use_worktree`).
+- **On the parent run.** The single `ORCHESTRATION`-type run that drives the chain is itself an
+  ordinary HTTP-triggered run, present in `LiveStateStore` like any other. It resolves its own
+  `campaign_id` (reusing one supplied on the triggering event, so a resumed/operator-restarted
+  chain rejoins the same campaign rather than minting a second identity; otherwise a fresh v4
+  uuid) and stamps it — plus one member entry per executed step, each carrying `repo`,
+  `block_id`, `use_worktree`, `cost_usd`, and `total_tokens` — into its own `ctx.nodes` result
+  under `campaign_members`. This is what makes the parent run the addressable subject for the
+  whole campaign without a child-run registry or any relational table (`events` stays "one row
+  per workflow run").
+- **`cost_usd` stays tri-state**, `Option<f64>` end to end, in every member entry and in the
+  rolled-up total below — a step that reported no cost round-trips as JSON `null`, never `0.0`.
+  Collapsing that distinction is the exact `total_cost_usd: -0.0` bug `ExecutionOutcome::cost_usd`'s
+  doc comment warns about, and a campaign rollup is where a silent zero would do the most damage.
+  `total_tokens` sums as a plain `u64` — an absent token figure is a true zero.
+
+See `GET /campaigns/{id}` below (§ HTTP surface parity) for the read side.
+
 ---
 
 ## HTTP surface parity
@@ -193,6 +232,7 @@ canonical contract's §7, so a caller can target either runtime:
 | `POST` | `/events/{run_id}/pause` | `suspend::pause_run` (EN.6.F) — engine-rs-only extension, no canonical counterpart; `X-API-Key` gated (401); `404` for an unknown/finished run; `409` if already suspended; otherwise sets the run's `PauseSignal` and returns `202 {run_id, status: "pausing"}` (idempotent against a run that is pausing but not yet suspended) |
 | `POST` | `/events/{event_id}/resume` | `suspend::resume_run` (EN.6.F) — engine-rs-only extension, no canonical counterpart; `X-API-Key` gated (401); `404` for an unknown or non-suspended run; `409` for a concurrent resume already in flight; `422` for a policy-resolution failure or an unresolvable `resume_at`; otherwise `202 {run_id, event_id, status: "resuming", resume_at}` |
 | `GET` | `/events/suspended` | `suspend::list_suspended` (EN.6.F) — engine-rs-only extension, no canonical counterpart; `X-API-Key` gated (401); `200 [{run_id, workflow_type, created_at, suspended_at, resume_at, reason}]`, newest first; registered ahead of `{event_id}` so the literal path isn't swallowed by the uuid extractor |
+| `GET` | `/campaigns/{id}` | `http::get_campaign` (`EN.11.E` task 5) — the campaign readback (§ Campaign identity above); `X-API-Key` gated (401); `404` for a malformed id **and** for an unknown campaign, mirroring `get_event`'s convention rather than a new one; `200 {campaign_id, runs: [...], total_cost_usd, total_tokens, possibly_truncated}` — `total_cost_usd` is `null` when no member reported a cost (never `0.0`), `total_tokens` sums as `u64`, and `possibly_truncated` is `true` when the completed-run ring (`COMPLETED_RUN_RETENTION = 100`) may have evicted an earlier campaign member rather than silently presenting a short list as the whole campaign |
 
 The canonical contract's v1.2.0 route `GET /events/{event_id}` and the `event_id` field on
 `POST /events/`'s `202` body are now **ported** to `engine-serve` (EN.5.F). `POST /events/` spawns
@@ -343,6 +383,32 @@ someone else's changelog.
 
 ---
 
+## Consumer re-pin obligations
+
+This section is the fixture standing in for `EN.11.E`'s final acceptance criterion — "orchestrator/
+and bastion/ re-pin to engine-rs as consumers" — which is itself declared `gateable: false`: its
+evidence lives in two other repos' git indexes, and no engine-rs check (`cargo nextest`, `mev`,
+`bastion validate-brain`) can read across a repo boundary to confirm it (D64). engine-rs's
+obligation ends at leaving this canonical document correct and naming what the consumers owe;
+engine-rs may not edit either consumer file directly (different repos, different lanes — see
+`out_of_scope` on this block's record).
+
+As of this 1.8.0 bump, both pinning consumers still declare 1.7.0 and must re-pin:
+
+| Consumer file | Must move to | Authority |
+|---|---|---|
+| `core/orchestrator/docs/data-contract.md` (`**Contract Version: 1.7.0**` observed 2026-08-21) | `1.8.0` | [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md) |
+| `core/bastion/docs/data-contract.md` (`**Pinned Contract Version: 1.7.0**` observed 2026-08-21) | `1.8.0` | [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md) |
+
+Each re-pin must also absorb the campaign-identity addition documented above (§ Campaign identity)
+into that consumer's own field-mapping tables. The obligation is carried to the other lanes as one
+`OPEN` item per consumer repo in
+`planning/orchestration-run/autonomous-foundation/notes.md` — see that file for the exact wording
+and the observed-version disclaimer (an observation of another repo's working tree at a moment in
+time, not a gate).
+
+---
+
 ## Changelog
 
 | Version | Date | Change |
@@ -359,3 +425,4 @@ someone else's changelog.
 | 1.5.0 | 2026-08-01 | Re-pin from 1.4.0 to 1.5.0 (`OR.ticket.corpus-reconcile`, orchestrator-side; not an engine-rs block). Registers the canonical's v1.5.0 addition, orchestrator-only (§ HTTP surface parity above): `POST /ingest/proposal` and `POST /ingest/artifact` gain an optional `authored_at: datetime \| null`, threaded to the written `brain_documents` rows. Additive and backward-compatible — omitted or `null` preserves the server-side `datetime.now()` fallback exactly, so `PersistToBrainNode`'s existing payload stays valid unchanged; sending a real `authored_at` is an opt-in improvement for `EN.6.K`'s ingest-client hardening. Sits alongside the 2026-07-28 `EN.4.F` row below (structured `investment` / `authored_locale` inside `roadmap`) rather than superseding it: whoever wires the real ingest URL should send both. No `engine_contract` Rust type changed shape — these are ingest-direction routes engine-rs calls, not routes `engine-serve` serves, so no HTTP-surface-parity gap opens. |
 | 1.6.0 | 2026-08-01 | Re-pin from 1.5.0 to 1.6.0 (`OR.K2`, orchestrator-side; not an engine-rs block) — **the consequential one for `EN.6.K`**. `GET /recall`'s response semantics change (§ HTTP surface parity above): `score` is now a similarity where **higher is always better** on every path (`1.0` exact-id, `1.0 - cosine distance` semantic, unchanged fused similarity for hybrid), where 1.4.0 returned a raw cosine *distance* on the exact-id/semantic paths (`0.0` exact-id, lower-is-better); and `via`'s vocabulary widens from `exact-id \| semantic \| hybrid` to also include `structural \| keyword \| memory` (per-candidate hybrid provenance, previously collapsed to a bare `"hybrid"`). Field names, types, and the `q`/`limit`/`hybrid` query params are unchanged, and no `engine_contract` Rust type changes shape — `GET /recall` is a route engine-rs calls as a client, not one `engine-serve` serves. **`EN.6.K` (the Brain read-client seam — engine-rs's first `GET /recall` consumer, and therefore the first thing this polarity can bite) must be built against 1.6.0 semantics:** `RecallNode` sorts/thresholds `score` **descending / higher-is-better**, and any type deserializing `via` must tolerate all six values or it will fail to parse a hybrid result. A 1.4.0-era comparison direction ranks results backwards with no error — this re-pin exists specifically to close that window before `EN.6.K` runs. |
 | 1.7.0 | 2026-08-13 | `EN.9.C` (engine-rs-side) adds the `metadata.completion` run-level annotation (§ Run-level `metadata` annotations above) as canonical contract text, stamped by `crate::completion::stamp_completion` at every terminal exit in `crates/engine-serve/src/suspend.rs`, plus an `engine-store` query (`list_orphan_candidates`) and an `engine-serve` boot sweep (`crate::orphan::reconcile_orphans`) that use the marker's absence to find and fail crash-stranded runs, and a stale-run alarm on age-past-threshold `running`/`suspended` runs. Mirrors the `cancellation`/`budget`/`suspension` precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `completion` lives entirely in the existing free-form `TaskContext::metadata` field. **Corrected 2026-08-21 (D78, this task):** originally recorded as "Not a re-pin — Pinned Contract Version stays 1.6.0"; that was true only from the outgoing orchestrator-owned canonical's perspective. Engine-rs already implemented and shipped this annotation on 2026-08-13, so absorbing it into this now-canonical document is a version bump to 1.7.0, not new code. See [orphan-recovery.md](orphan-recovery.md) for the full marker shape, the sweep, the alarm, and the policy knobs. |
+| 1.8.0 | 2026-08-21 | `EN.11.E` (engine-rs-side, D78 canonical) adds campaign identity (§ Campaign identity above) — a `campaign_id: uuid` first-class key naming the parent for the N runs of one chain, and a new `GET /campaigns/{id}` route (§ HTTP surface parity above) returning the campaign's runs with an `EN.11.G` cost/token rollup. **MINOR, not MAJOR**: the addition is a new key on the run's own `event`/`nodes` shape plus a wholly new, additive route; no existing field changes shape, and `NodeRunStatus`'s `pending|running|success|failed` vocabulary is untouched — the same reasoning 1.7.0's row above records for why that bump was minor. `campaign_id` is deliberately NOT a `TaskContext::metadata` annotation, unlike `cancellation`/`budget`/`completion`/`suspension`/`failure` — see § Campaign identity for why. `engine_contract`'s typed structs (`EventsRow`, `TaskContext`, `NodeRun`, `Usage`) are unchanged; the campaign id lives in the existing free-form `event: serde_json::Value` and `nodes: HashMap<String, serde_json::Value>` fields, not in a new Rust-typed column. Both pinning consumers (`orchestrator`/Synapse, `bastion`) still declare 1.7.0 as of this bump — see § Consumer re-pin obligations above and the corresponding `OPEN` items in `planning/orchestration-run/autonomous-foundation/notes.md`. |
