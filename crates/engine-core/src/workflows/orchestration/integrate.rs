@@ -714,7 +714,12 @@ pub async fn integrate_chain(
 
         let step_lane = lane.unwrap_or(step.repo.as_str());
 
-        let outcome = match execute_step(step, resolve_engine, registry, run_flow).await {
+        // `default_use_worktree` is hardcoded `false` here — behavior-stable
+        // with today's implicit in-place default — until `EN.ticket
+        // .orchestration-isolation-passthrough` Task 3 threads the real
+        // `OrchestrationPolicy::default_use_worktree` knob through
+        // `integrate_chain` from `OrchestrationRunNode::process`.
+        let outcome = match execute_step(step, resolve_engine, registry, run_flow, false).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 let integrate_err = IntegrateError::from(err);

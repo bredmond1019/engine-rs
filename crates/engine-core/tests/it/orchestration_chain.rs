@@ -393,6 +393,7 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
             repo: "smoke-repo".to_string(),
             repo_path: repo_path.clone(),
             block_id: block_id.to_string(),
+            use_worktree: false,
         };
         (flow_runner)(invocation)
             .await
@@ -568,7 +569,7 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
     //    `ctx.node_runs` via the shared `derive_terminal_status` and fails
     //    the step itself, naming the block and the failing node, WITHOUT
     //    ever needing to reach `verify_state_write`.
-    let err = execute_step(&chain[0], &always_flow, &registry, &failing_runner)
+    let err = execute_step(&chain[0], &always_flow, &registry, &failing_runner, false)
         .await
         .expect_err("execute_step must fail a step whose node_runs record a failed node");
     match &err {

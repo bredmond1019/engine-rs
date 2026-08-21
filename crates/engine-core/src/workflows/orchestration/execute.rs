@@ -86,6 +86,14 @@ pub struct FlowInvocation {
     pub repo: String,
     pub repo_path: PathBuf,
     pub block_id: String,
+    /// Whether this step's `SDLC_FLOW` run must be isolated into a fresh
+    /// worktree (`true`) or run in place against `repo_path` (`false`) —
+    /// resolved per step by [`resolve_isolation`] in [`execute_step`].
+    /// Deliberately no `Default` and no builder on this struct (see the
+    /// module-level "no `#[derive(Default)]`" note on `execute_step`'s
+    /// construction site): an invocation with an unstated isolation is the
+    /// defect this field exists to make unrepresentable.
+    pub use_worktree: bool,
 }
 
 /// A future producing a finished run's [`TaskContext`] or a [`WorkflowError`].
@@ -279,11 +287,17 @@ pub struct ExecutionOutcome {
 /// irrelevant to the caller: both must succeed for the step to run, and
 /// either failing reports the block id and repo. `run_flow` is never
 /// called for an unsupported engine.
+///
+/// `default_use_worktree` is the resolved `OrchestrationPolicy::default_use_worktree`
+/// fallback (row 3 of [`resolve_isolation`]'s table) — this function does not
+/// read policy itself, it only consults `registry.brain_root()` (row 2) and
+/// `step.repo` (row 1) alongside whatever the caller passed in for row 3.
 pub async fn execute_step(
     step: &ChainStep,
     resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
     registry: &RepoRegistry,
     run_flow: &FlowRunner,
+    default_use_worktree: bool,
 ) -> Result<ExecutionOutcome, ExecuteError> {
     let repo_path =
         registry
@@ -303,10 +317,17 @@ pub async fn execute_step(
         });
     }
 
+    let use_worktree = resolve_isolation(
+        &step.repo,
+        &repo_path,
+        registry.brain_root(),
+        default_use_worktree,
+    );
     let invocation = FlowInvocation {
         repo: step.repo.clone(),
         repo_path: repo_path.clone(),
         block_id: step.block_id.clone(),
+        use_worktree,
     };
     let ctx = run_flow(invocation)
         .await
@@ -345,15 +366,28 @@ pub async fn execute_step(
     })
 }
 
+/// Build the `SDLC_FLOW` event JSON for one resolved [`FlowInvocation`] —
+/// factored out of [`default_flow_runner`] so the seeded shape (including
+/// `use_worktree`) is unit-testable without spinning up a real `SDLC_FLOW`
+/// `Workflow` run.
+fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
+    json!({
+        "repo": invocation.repo,
+        "spec_slug": invocation.block_id,
+        "use_worktree": invocation.use_worktree,
+    })
+}
+
 /// The production [`FlowRunner`]: for each [`FlowInvocation`], builds a
 /// **fresh** `SDLC_FLOW` `Workflow` — policy resolved from
 /// `PolicyConfigSource::Worktree(invocation.repo_path)`, `SetupWorktreeNode`
 /// re-registered with `registry` so `event.repo` resolves inside the run
 /// too — and runs it with `{"repo": invocation.repo, "spec_slug":
-/// invocation.block_id}` as the event, mirroring
-/// `engine-serve::workflows::register_sdlc_flow_with_registry`'s factory
-/// exactly, minus the `Dispatcher` registration (this seam invokes the
-/// workflow directly rather than dispatching an HTTP event).
+/// invocation.block_id, "use_worktree": invocation.use_worktree}` as the
+/// event, mirroring `engine-serve::workflows::register_sdlc_flow_with_registry`'s
+/// factory exactly — isolation included — minus the `Dispatcher`
+/// registration (this seam invokes the workflow directly rather than
+/// dispatching an HTTP event).
 ///
 /// Never reimplements `SDLC_FLOW`: every node in the run is
 /// `workflows::sdlc_flow`'s own.
@@ -362,10 +396,7 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
     Arc::new(move |invocation: FlowInvocation| {
         let registry = registry.clone();
         Box::pin(async move {
-            let event = json!({
-                "repo": invocation.repo,
-                "spec_slug": invocation.block_id,
-            });
+            let event = sdlc_flow_event(&invocation);
 
             let ctx_for_policy = TaskContext {
                 event: event.clone(),
@@ -449,10 +480,10 @@ mod tests {
         let step_a = step("repo-a", "A.1");
         let step_b = step("repo-b", "B.1");
 
-        let outcome_a = execute_step(&step_a, &resolve_engine, &registry, &runner)
+        let outcome_a = execute_step(&step_a, &resolve_engine, &registry, &runner, false)
             .await
             .expect("step a should execute");
-        let outcome_b = execute_step(&step_b, &resolve_engine, &registry, &runner)
+        let outcome_b = execute_step(&step_b, &resolve_engine, &registry, &runner, false)
             .await
             .expect("step b should execute");
 
@@ -481,7 +512,7 @@ mod tests {
         };
 
         let s = step("repo-a", "A.1");
-        execute_step(&s, &resolve_engine, &registry, &runner)
+        execute_step(&s, &resolve_engine, &registry, &runner, false)
             .await
             .expect("flow-engine step should execute");
 
@@ -496,7 +527,7 @@ mod tests {
         let resolve_engine = |_repo: &str, _id: &str| EngineKind::Task;
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner)
+        let err = execute_step(&s, &resolve_engine, &registry, &runner, false)
             .await
             .unwrap_err();
 
@@ -530,7 +561,7 @@ mod tests {
         });
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &failing_runner)
+        let err = execute_step(&s, &resolve_engine, &registry, &failing_runner, false)
             .await
             .unwrap_err();
 
@@ -556,7 +587,7 @@ mod tests {
         let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
 
         let s = step("does-not-exist", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner)
+        let err = execute_step(&s, &resolve_engine, &registry, &runner, false)
             .await
             .unwrap_err();
 
@@ -607,7 +638,7 @@ mod tests {
         let runner = ok_but_child_failed_runner("SetupWorktreeNode");
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner)
+        let err = execute_step(&s, &resolve_engine, &registry, &runner, false)
             .await
             .expect_err("a child with a failed node_run must fail the step");
 
@@ -644,7 +675,7 @@ mod tests {
         let (runner, _calls) = recording_runner();
 
         let s = step("repo-a", "A.1");
-        let outcome = execute_step(&s, &resolve_engine, &registry, &runner)
+        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false)
             .await
             .expect("a run with no failed nodes should be integrated as success");
 
@@ -722,5 +753,80 @@ mod tests {
         let repo_path = dir.path().join("repo-a");
         assert!(!resolve_isolation("repo-a", &repo_path, dir.path(), false,));
         assert!(resolve_isolation("repo-a", &repo_path, dir.path(), true,));
+    }
+
+    // ── FlowInvocation.use_worktree threading ───────────────────────────
+
+    #[test]
+    fn sdlc_flow_event_seeds_use_worktree_with_the_invocations_value() {
+        let invocation_true = FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: true,
+        };
+        assert_eq!(
+            sdlc_flow_event(&invocation_true)["use_worktree"],
+            json!(true)
+        );
+
+        let invocation_false = FlowInvocation {
+            use_worktree: false,
+            ..invocation_true
+        };
+        assert_eq!(
+            sdlc_flow_event(&invocation_false)["use_worktree"],
+            json!(false)
+        );
+    }
+
+    /// A registry with an ordinary repo AND a `base-template`-slugged repo,
+    /// so a chain step can exercise `resolve_isolation`'s row-1 override
+    /// through `execute_step` rather than only through the unit-level
+    /// `resolve_isolation` tests above.
+    fn registry_with_base_template() -> (tempfile::TempDir, RepoRegistry) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("base-template")).unwrap();
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n\
+             [[repos]]\nslug = \"base-template\"\nrepo_path = \"base-template\"\n",
+        )
+        .unwrap();
+        let registry = RepoRegistry::from_brain_root(dir.path()).expect("registry");
+        (dir, registry)
+    }
+
+    #[tokio::test]
+    async fn recording_double_observes_the_resolved_isolation_for_each_step_of_a_chain() {
+        let (_dir, registry) = registry_with_base_template();
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+
+        // `default_use_worktree` is `true` here so the ordinary step
+        // resolves to the non-default `true` and the `base-template` step's
+        // structural override (always `true`, regardless of default) is
+        // exercised alongside it in the same chain.
+        let ordinary = step("repo-a", "A.1");
+        let base_template = step("base-template", "BT.1");
+
+        execute_step(&ordinary, &resolve_engine, &registry, &runner, true)
+            .await
+            .expect("ordinary step should execute");
+        execute_step(&base_template, &resolve_engine, &registry, &runner, false)
+            .await
+            .expect("base-template step should execute");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            recorded[0].use_worktree,
+            "ordinary repo should resolve to the passed-in default_use_worktree (true)"
+        );
+        assert!(
+            recorded[1].use_worktree,
+            "base-template must resolve to worktree=true even with default_use_worktree=false"
+        );
     }
 }
