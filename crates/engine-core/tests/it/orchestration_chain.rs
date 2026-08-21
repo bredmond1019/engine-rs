@@ -8,13 +8,13 @@
 //! it against instead of re-inventing one.
 //!
 //! Every case is asserted at its **current, as-of-2026-08-21** value, never at what the
-//! behaviour "should" eventually be — see the block record's amendment note. Two of the
-//! four cases are still wrong today and are asserted wrong, each carrying an inline
-//! comment naming the block that flips it (never asserted BEFORE that block lands: this
+//! behaviour "should" eventually be — see the block record's amendment note. One of the
+//! four cases is still wrong today and is asserted wrong, carrying an inline comment
+//! naming the block that flips it (never asserted BEFORE that block lands: this
 //! is `EN.11.B` task 1, scaffolding only — cases live in later tasks of this same spec):
 //!
 //! - (a) COMPOSITION (smoke-run.md §3.4) — still WRONG. Flipped by `EN.11.C`.
-//! - (b) FAILED STEP INVISIBLE (smoke-run.md §3.2) — still WRONG. Flipped by `EN.11.D`.
+//! - (b) FAILED STEP INVISIBLE (smoke-run.md §3.2) — now FIXED, by `EN.11.D`.
 //! - (c) RED AUTHORITATIVE BUILD (smoke-run.md §3.3) — now FIXED, by
 //!   `EN.ticket.final-validation-failure-must-block` (closed 2026-08-20).
 //! - (d) LANE-LOG SHAPE (smoke-run.md §3.7) — now FIXED, by
@@ -53,14 +53,17 @@
 //!   `panicked at .../orchestration_chain.rs:456:5: WRONG-TODAY: B2's tree must NOT
 //!   contain B1's marker, because B2's branch was cut from origin/main, not from B1's
 //!   tip — flips by EN.11.C`.
-//! - **(b)** [`a_failed_setup_worktree_step_is_invisible_to_execute_step_today`] —
-//!   perturbed `execute_step` (`execute.rs`) to inspect `ctx.node_runs` after `run_flow`
-//!   returns and return `Err(ExecuteError::StepFailed { .. })` when any node run's
-//!   status is `Failed` (the inspection the case's doc comment says production never
-//!   does today). Observed failure: `panicked at .../orchestration_chain.rs:526:10:
-//!   WRONG-TODAY: execute_step must return Ok even though SetupWorktreeNode failed
-//!   inside node_runs — flips by EN.11.D: StepFailed { repo: "smoke-repo", block_id:
-//!   "B1", source: WorkflowError { message: "perturbation: a node_run failed" } }`.
+//! - **(b)** [`a_failed_setup_worktree_step_stops_the_chain_via_execute_step`] —
+//!   `EN.11.D` Task 4: perturbed `execute_step`'s `if derive_terminal_status(&ctx) ==
+//!   "failed"` guard (`execute.rs`) to `if false && derive_terminal_status(&ctx) ==
+//!   "failed"`, short-circuiting the now-shipped check so a failed `node_runs` entry is
+//!   silently ignored again, exactly like the pre-`EN.11.D` behaviour. Observed failure:
+//!   `panicked at crates/engine-core/tests/it/orchestration_chain.rs:570:10: execute_step
+//!   must fail a step whose node_runs record a failed node: ExecutionOutcome { repo:
+//!   "smoke-repo", ..., block_id: "B1", ctx: TaskContext { ..., node_runs:
+//!   {"SetupWorktreeNode": NodeRun { status: Failed, ...,
+//!   error: Some("worktree setup failed for B1"), ... }} } }`. Reverted with
+//!   `git checkout --` before this task's commit.
 //! - **(c)** [`red_authoritative_build_is_now_rejected_by_verify_state_write`] —
 //!   perturbed `verify_state_write`'s `final_validation.all_passed == Some(false)`
 //!   branch (`integrate.rs`) to `false && all_passed == Some(false)`, short-circuiting
@@ -87,7 +90,7 @@ use engine_contract::{NodeRun, NodeRunStatus};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
 use engine_core::workflows::orchestration::execute::{
-    execute_step, EngineKind, ExecutionOutcome, FlowInvocation, FlowRunner,
+    execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowInvocation, FlowRunner,
 };
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::integrate::{
@@ -515,20 +518,20 @@ async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
     );
 }
 
-// ── Case (b): FAILED STEP INVISIBLE — still WRONG today ───────────────────
+// ── Case (b): FAILED STEP INVISIBLE — now FIXED ────────────────────────────
 //
-// smoke-run.md §3.2: `Workflow::walk`'s `if failed { break; }` still falls
-// through to `Ok(ctx)` — a run whose `SetupWorktreeNode` failed is reported
-// as a *successful* `SDLC_FLOW` invocation, with the failure recorded only
-// inside `ctx.node_runs`. `execute_step` (`execute.rs`) does not inspect
-// `node_runs` at all: it only distinguishes `run_flow`'s own `Ok`/`Err`.
-// The ONLY thing that stops the chain on a failed step today is
-// `verify_state_write` failing to find the state file `wrap_up.rs` never
-// got to write.
+// smoke-run.md §3.2: `Workflow::walk`'s `if failed { break; }` falls through
+// to `Ok(ctx)` — a run whose `SetupWorktreeNode` failed is reported as a
+// *successful* `SDLC_FLOW` invocation, with the failure recorded only
+// inside `ctx.node_runs`. `execute_step` (`execute.rs`) now reads
+// `ctx.node_runs` via the shared `derive_terminal_status` and returns
+// `ExecuteError::ChildFailed` naming the failing node, so the chain stops
+// on the step itself rather than relying on `verify_state_write` to notice
+// the state file `wrap_up.rs` never got to write.
 #[tokio::test]
-// WRONG TODAY — flipped by EN.11.D (runs after this block in
-// lane-engine-rs.txt).
-async fn a_failed_setup_worktree_step_is_invisible_to_execute_step_today() {
+// FIXED by EN.11.D — see EN.11.B's original comment history for the
+// pre-fix behaviour this case used to assert.
+async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
     let (_brain_root, _bare_root, registry, repo_path) = single_repo_fixture("smoke-repo");
 
     // A `FlowRunner` double that reproduces exactly the shape
@@ -561,38 +564,58 @@ async fn a_failed_setup_worktree_step_is_invisible_to_execute_step_today() {
 
     let chain = resolve_explicit_chain(vec![("smoke-repo".to_string(), "B1".to_string())]);
 
-    // 1. `execute_step` itself cannot see the failure — it only looks at
-    //    `run_flow`'s own `Ok`/`Err`, never at `ctx.node_runs`.
-    let outcome = execute_step(&chain[0], &always_flow, &registry, &failing_runner)
+    // 1. `execute_step` now sees the failure directly: it reads
+    //    `ctx.node_runs` via the shared `derive_terminal_status` and fails
+    //    the step itself, naming the block and the failing node, WITHOUT
+    //    ever needing to reach `verify_state_write`.
+    let err = execute_step(&chain[0], &always_flow, &registry, &failing_runner)
         .await
-        .expect(
-            "WRONG-TODAY: execute_step must return Ok even though \
-             SetupWorktreeNode failed inside node_runs — flips by EN.11.D",
-        );
-    assert_eq!(
-        outcome.ctx.node_runs["SetupWorktreeNode"].status,
-        NodeRunStatus::Failed,
-        "the failure IS present in node_runs — execute_step just never looks there"
-    );
+        .expect_err("execute_step must fail a step whose node_runs record a failed node");
+    match &err {
+        ExecuteError::ChildFailed {
+            repo,
+            block_id,
+            failing_node,
+        } => {
+            assert_eq!(repo, "smoke-repo");
+            assert_eq!(block_id, "B1");
+            assert_eq!(failing_node, "SetupWorktreeNode");
+        }
+        other => panic!("expected ExecuteError::ChildFailed, got {other:?}"),
+    }
 
-    // 2. The only thing that stops the chain is verify_state_write, because
-    //    the run never reached wrap_up.rs and so never wrote the state
-    //    file `verify_state_write` looks for.
-    let err = verify_state_write(&outcome)
-        .expect_err("verify_state_write must fail: no state file was ever written");
-    assert!(
-        matches!(err, IntegrateError::StateWriteUnreadable { .. }),
-        "expected StateWriteUnreadable (absent state file), got {err:?}"
-    );
+    // 2. Driving a TWO-step chain through `integrate_chain` confirms the
+    //    chain does not merely fail — it stops before ever invoking the
+    //    second step. `combined_runner` fails only "B1"; if the chain
+    //    advanced to "B2" it would succeed, so a call count of 1 is direct
+    //    evidence the chain did not advance past the failed step.
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = call_count.clone();
+    let combined_runner: FlowRunner = Arc::new(move |invocation: FlowInvocation| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let failing_runner = failing_runner.clone();
+        Box::pin(async move {
+            if invocation.block_id == "B1" {
+                failing_runner(invocation).await
+            } else {
+                Ok(engine_contract::TaskContext {
+                    event: serde_json::json!({}),
+                    nodes: HashMap::new(),
+                    metadata: serde_json::json!({}),
+                    node_runs: HashMap::new(),
+                })
+            }
+        })
+    });
 
-    // 3. Driving the full chain through integrate_chain confirms the same
-    //    thing end to end: the chain DOES stop, but via verify_state_write's
-    //    IntegrateError, never via execute_step/ExecuteError — that is what
-    //    "invisible" means here.
+    let two_step_chain = resolve_explicit_chain(vec![
+        ("smoke-repo".to_string(), "B1".to_string()),
+        ("smoke-repo".to_string(), "B2".to_string()),
+    ]);
     let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-b-case-b");
     let admission = AdmissionGate::with_default_policy();
     let chain_err = integrate_chain(
-        &chain,
+        &two_step_chain,
         &no_deps,
         &always_met,
         &admission,
@@ -601,17 +624,32 @@ async fn a_failed_setup_worktree_step_is_invisible_to_execute_step_today() {
         None,
         &always_flow,
         &registry,
-        &failing_runner,
+        &combined_runner,
         &roadmap_dir,
         None,
         &|_: &StepProgress| {},
     )
     .await
     .expect_err("the chain must not report success for a failed SetupWorktreeNode");
-    assert!(
-        matches!(chain_err, IntegrateError::StateWriteUnreadable { .. }),
-        "the chain must stop via verify_state_write, not via ExecuteError — \
-         got {chain_err:?}"
+    match &chain_err {
+        IntegrateError::Execute(ExecuteError::ChildFailed {
+            repo,
+            block_id,
+            failing_node,
+        }) => {
+            assert_eq!(repo, "smoke-repo");
+            assert_eq!(block_id, "B1");
+            assert_eq!(failing_node, "SetupWorktreeNode");
+        }
+        other => panic!(
+            "the chain must stop via ExecuteError::ChildFailed naming the \
+             failed block and node, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the chain must NOT advance to B2 after B1 fails"
     );
 
     let _ = repo_path; // kept alive for the fixture's Drop ordering
