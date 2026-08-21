@@ -26,8 +26,16 @@
 //!   type that makes an unsanctioned runner structurally unrepresentable, plus the
 //!   `sdlc_workflow` -> `EngineKind` mapping. Re-exported from [`execute`] as
 //!   `execute::EngineKind` for every existing caller/test of this module.
+//! - [`corpus_gates`] (`EN.ticket.orchestration-production-gates-unwired` Task 1) — the
+//!   corpus-backed `resolve_depends_on` / `is_edge_met` / `is_block_open`
+//!   implementations that wire [`graph::OrchestrationRunNode`]'s gate seams to real
+//!   `planning/state.json` files via `RepoRegistry` + `okf_core::load_state`,
+//!   instead of [`graph::OrchestrationRunNode::new`]'s permissive always-proceed
+//!   defaults. `engine-serve`'s `register_orchestration_with_registry` (Task 2) is
+//!   what actually installs these into the served workflow.
 
 pub mod chain;
+pub mod corpus_gates;
 pub mod engine_kind;
 pub mod execute;
 pub mod gates;

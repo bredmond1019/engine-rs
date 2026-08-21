@@ -169,6 +169,15 @@ impl RepoRegistry {
         &self.brain_root
     }
 
+    /// Every slug this registry can currently resolve, in registry
+    /// (alphabetical) order. Used by callers that must sweep the whole
+    /// reachable corpus rather than resolve one named slug — e.g. resolving
+    /// an opaque `HELD-UNTIL` token that carries no repo of its own.
+    #[must_use]
+    pub fn known_slugs(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
     /// Resolve `slug` to its absolute repo root.
     ///
     /// Returns [`RepoRegistryError::UnknownSlug`] (naming the slug and the

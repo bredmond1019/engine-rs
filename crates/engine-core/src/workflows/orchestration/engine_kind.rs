@@ -186,6 +186,13 @@ mod tests {
         // `^\s*pub(\(crate\))? fn .*(&str|: String)` on 2026-08-18.
         const SANCTIONED_STRING_TAKING_FNS: &[(&str, &[&str])] = &[
             ("chain.rs", &[]),
+            // `resolve_depends_on`/`is_edge_met` take a repo slug + block id,
+            // `is_block_open` takes an opaque HELD-UNTIL token — corpus lookups keyed
+            // by identifier, not a runner-name escape hatch.
+            (
+                "corpus_gates.rs",
+                &["resolve_depends_on", "is_edge_met", "is_block_open"],
+            ),
             ("engine_kind.rs", &["from_sdlc_workflow"]),
             ("execute.rs", &[]),
             ("gates.rs", &[]),
