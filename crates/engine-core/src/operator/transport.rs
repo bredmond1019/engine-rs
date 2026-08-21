@@ -13,10 +13,27 @@
 //! `#[async_trait]`, object-safe trait an engine node calls to reach a
 //! human. `acknowledge` is default-implemented as a no-op `Ok(())` so a
 //! transport with no acknowledgement concept (WhatsApp, and every existing
-//! test fake) needs no change to keep compiling. `NoopTransport` and the
-//! object-safety proof land in task 3 of this same block.
+//! test fake) needs no change to keep compiling.
 //!
-//! Provenance (bastion source lines this task's types were copied from):
+//! Task 3 adds the object-safety proof and [`NoopTransport`] — a trivial
+//! test double, modeled on bastion's own at
+//! `src/serve/notify/tests.rs:143`, that implements all three methods and
+//! is reachable from other `engine-core` tests (it is `#[cfg(test)] pub`,
+//! not private to this module's own `tests` submodule, so
+//! `crate::operator::tests` and any future integration suite can build one
+//! without redefining it).
+//!
+//! Every type in this module is a **temporary duplicate**: bastion keeps
+//! its own copies of all five supporting types plus its own trait
+//! definition until `BA.21.A` ports its four existing impls
+//! (`TelegramTransport` and three test doubles at `notify/tests.rs:143`,
+//! `notify/tests.rs:257`, and `handlers/notify.rs:300`) over to this one and
+//! deletes the bastion-side originals. Until that lands, the two definitions
+//! coexisting is expected, not drift — this block (`EN.12.J`) ships the
+//! abstraction only; deleting bastion's copies is explicitly out of scope
+//! here (see the block record's `out_of_scope`).
+//!
+//! Provenance (bastion source lines this module's types were copied from):
 //!
 //! | Type | Bastion source |
 //! |---|---|
@@ -30,6 +47,12 @@
 //! | [`ResponseVerdict`] | `src/serve/notify/telegram.rs:328` (NOT `mod.rs` —
 //! |   its fields `gate_id`/`option_key`/`digest`/`decided_at` are
 //! |   channel-agnostic; only its home was channel-specific) |
+//! | [`NoopTransport`] | `src/serve/notify/tests.rs:143` (test double only —
+//! |   bastion keeps its own for its own coverage; this one exists so
+//! |   `engine-core`'s own tests have a transport to inject without a
+//! |   network dependency) |
+
+use std::fmt;
 
 use super::validate::ValidatedOperatorPayload;
 use async_trait::async_trait;
@@ -105,6 +128,18 @@ pub struct DeliveredMessage {
 /// it, only round-trip it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct UpdateCursor(pub String);
+
+impl fmt::Debug for UpdateCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The cursor is opaque and transport-specific (Telegram: a plain
+        // integer offset), not a credential — but formatted explicitly
+        // (rather than derived) so a future transport that encodes
+        // something sensitive into the cursor does not get free `Debug`
+        // access without a deliberate decision here. Matches bastion's own
+        // `impl Debug for UpdateCursor` at `src/serve/notify/mod.rs:221`.
+        f.debug_tuple("UpdateCursor").field(&self.0).finish()
+    }
+}
 
 /// Why an `OperatorTransport` operation failed. Variants split along one
 /// axis: whether the caller should retry.
@@ -266,5 +301,121 @@ pub trait OperatorTransport: Send + Sync {
         _verdict: &ResponseVerdict,
     ) -> Result<(), NotifyError> {
         Ok(())
+    }
+}
+
+/// A trivial [`OperatorTransport`] that never fails and never observes any
+/// responses — the same shape as bastion's own test double at
+/// `src/serve/notify/tests.rs:143`. `send` always succeeds with an empty
+/// [`DeliveredMessage`]; `poll_responses` always returns an empty batch and
+/// echoes back whatever cursor it was given; `acknowledge` uses the
+/// trait's no-op default.
+///
+/// `#[cfg(test)] pub` (not private, and not nested inside this module's own
+/// `tests` submodule) so it is reachable from any other `engine-core` test
+/// module — e.g. `crate::operator::tests` — without redefining it.
+#[cfg(test)]
+pub struct NoopTransport;
+
+#[cfg(test)]
+#[async_trait]
+impl OperatorTransport for NoopTransport {
+    async fn send(
+        &self,
+        _payload: &ValidatedOperatorPayload,
+    ) -> Result<DeliveredMessage, NotifyError> {
+        Ok(DeliveredMessage {
+            transport_message_id: String::new(),
+        })
+    }
+
+    async fn poll_responses(
+        &self,
+        since: Option<UpdateCursor>,
+    ) -> Result<(Vec<OperatorResponse>, Option<UpdateCursor>), NotifyError> {
+        Ok((Vec::new(), since))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Compile-time evidence that `OperatorTransport` is object-safe: a
+    /// `NoopTransport` value can be named behind both `Box<dyn
+    /// OperatorTransport>` and `Arc<dyn OperatorTransport>`. This is the
+    /// property that makes the seam usable at all (bastion injects the
+    /// same `Arc` into both its poll loop and its app state), and it
+    /// silently breaks the moment someone adds a generic method or an
+    /// associated type to the trait — so it is asserted here, not assumed.
+    #[test]
+    fn operator_transport_is_object_safe() {
+        let _boxed: Box<dyn OperatorTransport> = Box::new(NoopTransport);
+        let _arced: Arc<dyn OperatorTransport> = Arc::new(NoopTransport);
+    }
+
+    /// `NoopTransport::send` never panics and returns the documented `Ok`
+    /// shape (an empty `transport_message_id`), exercised through the
+    /// `dyn OperatorTransport` interface exactly as a real caller would use
+    /// it.
+    #[tokio::test]
+    async fn noop_transport_send_returns_documented_ok_shape() {
+        let transport: Arc<dyn OperatorTransport> = Arc::new(NoopTransport);
+        let payload = crate::operator::OperatorPayload::new(
+            "gate-1",
+            "diff summary",
+            vec![
+                crate::operator::OperatorResponseOption::new("approve", "Approve"),
+                crate::operator::OperatorResponseOption::new("reject", "Reject"),
+            ],
+        );
+        let validated =
+            crate::operator::validate(payload, &crate::operator::OperatorPayloadLimits::default())
+                .expect("payload validates");
+
+        let delivered = transport
+            .send(&validated)
+            .await
+            .expect("NoopTransport::send never fails");
+        assert_eq!(delivered.transport_message_id, "");
+    }
+
+    /// `NoopTransport::poll_responses` never observes any responses and
+    /// echoes back whatever cursor it was given, unchanged.
+    #[tokio::test]
+    async fn noop_transport_poll_responses_is_empty_and_echoes_cursor() {
+        let transport: Arc<dyn OperatorTransport> = Arc::new(NoopTransport);
+        let cursor = Some(UpdateCursor("17".to_string()));
+
+        let (responses, next_cursor) = transport
+            .poll_responses(cursor.clone())
+            .await
+            .expect("NoopTransport::poll_responses never fails");
+
+        assert!(responses.is_empty());
+        assert_eq!(next_cursor, cursor);
+    }
+
+    /// `NoopTransport` relies on the trait's default `acknowledge` — a
+    /// no-op `Ok(())` — and that default must actually be reachable and
+    /// callable through the `dyn` interface.
+    #[tokio::test]
+    async fn noop_transport_acknowledge_uses_default_noop() {
+        let transport: Arc<dyn OperatorTransport> = Arc::new(NoopTransport);
+        let response = OperatorResponse {
+            gate_id: "gate-1".to_string(),
+            digest: "abc123".to_string(),
+            option_key: "approve".to_string(),
+            received_at: chrono::Utc::now(),
+            ack: None,
+            message: None,
+        };
+        let verdict = ResponseVerdict::UnknownGate;
+
+        transport
+            .acknowledge(&response, &verdict)
+            .await
+            .expect("default acknowledge is a no-op Ok(())");
     }
 }

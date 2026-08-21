@@ -39,6 +39,8 @@ pub mod validate;
 pub use channel::OperatorChannel;
 pub use limits::OperatorPayloadLimits;
 pub use payload::{OperatorPayload, OperatorResponseOption};
+#[cfg(test)]
+pub use transport::NoopTransport;
 pub use transport::{
     AckHandle, DeliveredMessage, MessageHandle, NotifyError, OperatorResponse, OperatorTransport,
     ResponseVerdict, UpdateCursor,
