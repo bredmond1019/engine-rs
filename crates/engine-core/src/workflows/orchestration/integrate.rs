@@ -605,8 +605,10 @@ pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
 // ── The integrated loop ─────────────────────────────────────────────────
 
 /// Drive `chain` to completion, in order: for every step, gate on
-/// dependencies, gate on admission, wait out any operator hold, execute
-/// via `SDLC_FLOW`, verify the state write, and append exactly one
+/// dependencies, wait out any operator hold, gate on admission (EN.11.L —
+/// the permit is scoped to the EXECUTION window only, acquired AFTER the
+/// hold clears so a parked step never consumes a concurrency slot),
+/// execute via `SDLC_FLOW`, verify the state write, and append exactly one
 /// `lane-log.jsonl` line — then move on. Returns every step's
 /// [`ExecutionOutcome`] in order, or the first [`IntegrateError`]
 /// encountered (a chain stops at the first failing block; nothing after
@@ -694,8 +696,11 @@ pub async fn integrate_chain(
 
         check_dependencies(step, resolve_depends_on, is_edge_met)?;
 
-        let _permit = admission.acquire_for(step).await;
-
+        // Wait out any operator hold BEFORE touching admission at all —
+        // EN.11.L Task 1. The admission permit must be scoped to the
+        // EXECUTION window only, never held across an unbounded hold: a
+        // step parked here holds no semaphore slot, so every other lane
+        // at the ceiling can still start while this one waits on a human.
         wait_for_clearance(
             hold_source,
             &step.repo,
@@ -707,11 +712,20 @@ pub async fn integrate_chain(
 
         // `wait_for_clearance` can return early on a cancel win (rather
         // than because the hold actually cleared) — re-check here so a
-        // cancelled, held chain does not go on to execute the step it was
-        // waiting on.
+        // cancelled, held chain does not go on to acquire a permit or
+        // execute the step it was waiting on.
         if cancellation_token.is_some_and(|t| t.is_cancelled()) {
             break;
         }
+
+        // Ordering guarantee: `acquire_for` is called AFTER clearance, so
+        // a step that just cleared its hold joins the admission
+        // semaphore's own FIFO wait queue exactly like any other
+        // newly-ready step — it never jumps ahead of a lane that was
+        // already queued for a permit before this hold cleared. Nothing
+        // here re-orders relative to other lanes; each lane still only
+        // ever acquires one permit, once, for its own step.
+        let _permit = admission.acquire_for(step).await;
 
         let step_lane = lane.unwrap_or(step.repo.as_str());
 
@@ -1282,6 +1296,112 @@ mod tests {
         let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 2);
+    }
+
+    /// EN.11.L Task 1: a step parked on an operator hold must not hold
+    /// an admission permit — a second lane at the ceiling proceeds while
+    /// the first is still parked. Uses a capacity-1 admission gate shared
+    /// across two concurrent chains: chain A is held forever, chain B is
+    /// never held. Before the reorder in this commit, chain A's `let
+    /// _permit = admission.acquire_for(step).await` ran BEFORE
+    /// `wait_for_clearance`, so it would have consumed the single permit
+    /// and chain B would have hung; this test fails against that ordering
+    /// (observed timeout on `chain_b_done.recv()`).
+    #[tokio::test]
+    async fn a_held_step_does_not_starve_a_second_lane_of_its_admission_permit() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let admission = AdmissionGate::new(crate::nodes::terminal::AdmissionControl::new(
+            crate::nodes::terminal::admission::AdmissionPolicy {
+                max_concurrent_terminal_runs: 1,
+            },
+        ));
+
+        let held = Arc::new(AtomicBool::new(true));
+        let hold = FlagHold { held: held.clone() };
+
+        let (runner_a, _calls_a) = recording_runner();
+        let (runner_b, _calls_b) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let roadmap_dir_a = tempfile::tempdir().unwrap();
+        let roadmap_dir_b = tempfile::tempdir().unwrap();
+
+        let chain_a = vec![step("repo-a", "A.1")];
+        let chain_b = vec![step("repo-b", "B.1")];
+
+        // Both chains run concurrently on ONE task via `tokio::join!` —
+        // no `tokio::spawn` (which would require `Send` futures the test
+        // closures do not provide). Cooperative polling within a single
+        // task is enough to prove the ordering: chain A parks on its
+        // hold, the checker future observes the permit is still free and
+        // drives chain B to completion, then releases the hold so chain A
+        // can finish too.
+        let chain_a_fut = integrate_chain(
+            &chain_a,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &hold,
+            Duration::from_millis(5),
+            None,
+            &resolve_engine,
+            &registry,
+            &runner_a,
+            roadmap_dir_a.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+        );
+
+        let checker_fut = async {
+            // Give chain A every chance to (wrongly) grab the only permit
+            // before it reaches its held step.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                admission.available_permits(),
+                1,
+                "a step parked on a hold must not consume an admission permit"
+            );
+
+            // Chain B, at the same capacity-1 ceiling, must be able to
+            // proceed and finish while chain A is still parked.
+            let outcomes_b = tokio::time::timeout(
+                Duration::from_millis(500),
+                integrate_chain(
+                    &chain_b,
+                    &resolve_deps,
+                    &is_met,
+                    &admission,
+                    &NeverHeld,
+                    Duration::from_millis(5),
+                    None,
+                    &resolve_engine,
+                    &registry,
+                    &runner_b,
+                    roadmap_dir_b.path(),
+                    None,
+                    &|_: &StepProgress| {},
+                    false,
+                ),
+            )
+            .await
+            .expect("a second lane must proceed while the first is parked on a hold, not hang")
+            .expect("chain B should complete");
+            assert_eq!(outcomes_b.len(), 1);
+            assert_eq!(outcomes_b[0].block_id, "B.1");
+
+            // Now clear the hold so chain A can finish too.
+            held.store(false, Ordering::SeqCst);
+        };
+
+        let (outcomes_a, ()) = tokio::join!(chain_a_fut, checker_fut);
+        let outcomes_a = outcomes_a.expect("chain A should complete once the hold clears");
+        assert_eq!(outcomes_a.len(), 1);
+        assert_eq!(outcomes_a[0].block_id, "A.1");
     }
 
     #[tokio::test]
