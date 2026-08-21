@@ -140,6 +140,15 @@ fn state_path_for(repo_path: &Path, block_id: &str) -> PathBuf {
 /// and schema but has no equivalent guard. `final_validation` being
 /// absent or `null` (a bailed run, a pre-`EN.3.E` file, or a JS-written
 /// file) is not itself a failure — only an explicit `false` is.
+///
+/// Also cross-checks identity: if the file carries a non-null
+/// `"block_id"`, it must agree with `outcome.block_id`
+/// ([`IntegrateError::BlockIdMismatch`]) — this closes the gap where a
+/// stale state file left behind by an earlier, different run at the same
+/// path would otherwise be admitted as this block's result purely because
+/// `"status"` happened to read `"done"`. A state file with no `"block_id"`
+/// at all (an older run, or one written by the JS `/sdlc-flow`) still
+/// passes; only an actual disagreement fails.
 pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateError> {
     let path = state_path_for(&outcome.repo_path, &outcome.block_id);
     let raw =
@@ -164,6 +173,16 @@ pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateErr
             path,
             found: status.map(str::to_string),
         });
+    }
+    if let Some(found_block_id) = value.get("block_id").and_then(Value::as_str) {
+        if found_block_id != outcome.block_id {
+            return Err(IntegrateError::BlockIdMismatch {
+                repo: outcome.repo.clone(),
+                block_id: outcome.block_id.clone(),
+                path,
+                found: found_block_id.to_string(),
+            });
+        }
     }
     if let Some(final_validation) = value.get("final_validation") {
         if !final_validation.is_null() {
@@ -353,6 +372,24 @@ pub enum IntegrateError {
         path: PathBuf,
         failure_summary: String,
     },
+    /// The block's `sdlc-flow-state.json` parsed, `"status"` read `"done"`,
+    /// and the file carried a non-null `"block_id"` — but that `block_id`
+    /// disagreed with `outcome.block_id`, the block this integration run
+    /// actually executed. Closes a real gap: without this check, a stale
+    /// state file left behind in `planning/{block_id}/sdlc/` by an
+    /// earlier, *different* run (e.g. a spec directory reused across
+    /// blocks, or a leftover file from a prior chain attempt) would be
+    /// silently admitted as this block's result merely because `"status"`
+    /// read `"done"` at the expected path. A state file with no
+    /// `"block_id"` at all (an older run, or one written by the JS
+    /// `/sdlc-flow`, which does not carry this field) still passes —
+    /// this check only fires on an actual disagreement, never on absence.
+    BlockIdMismatch {
+        repo: String,
+        block_id: String,
+        path: PathBuf,
+        found: String,
+    },
     /// A `lane-log.jsonl` entry could not be serialized.
     LaneLogSerialize {
         block_id: String,
@@ -430,6 +467,18 @@ impl fmt::Display for IntegrateError {
                  \"status\": \"done\" at {} but final_validation.all_passed was false: {failure_summary}",
                 path.display()
             ),
+            IntegrateError::BlockIdMismatch {
+                repo,
+                block_id,
+                path,
+                found,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') state write verification failed: \
+                 state file at {} carries block_id '{found}', which disagrees with the \
+                 executed block '{block_id}'",
+                path.display()
+            ),
             IntegrateError::LaneLogSerialize { block_id, source } => write!(
                 f,
                 "lane-log entry for block '{block_id}' failed to serialize: {source}"
@@ -472,6 +521,7 @@ impl std::error::Error for IntegrateError {
             IntegrateError::LaneLogWriteFailed { source, .. } => Some(source),
             IntegrateError::StateWriteMismatch { .. }
             | IntegrateError::FinalValidationGateFailed { .. }
+            | IntegrateError::BlockIdMismatch { .. }
             | IntegrateError::RoadmapDirNotFound { .. }
             | IntegrateError::AmbiguousRoadmapDir { .. } => None,
         }
@@ -701,6 +751,55 @@ mod tests {
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteUnreadable { .. }));
+    }
+
+    fn write_done_state_with_block_id(repo_path: &Path, block_id: &str, found_block_id: Value) {
+        let dir = repo_path.join("planning").join(block_id).join("sdlc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sdlc-flow-state.json"),
+            json!({"status": "done", "block_id": found_block_id}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn state_write_verification_rejects_a_disagreeing_block_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_block_id(dir.path(), "A.1", json!("B.9"));
+        let outcome = outcome_for(dir.path(), "A.1");
+        let err = verify_state_write(&outcome).unwrap_err();
+        assert!(matches!(err, IntegrateError::BlockIdMismatch { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("A.1"));
+        assert!(msg.contains("B.9"));
+    }
+
+    #[test]
+    fn state_write_verification_accepts_an_agreeing_block_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_block_id(dir.path(), "A.1", json!("A.1"));
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_a_null_block_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_block_id(dir.path(), "A.1", Value::Null);
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_a_state_file_with_no_block_id_key() {
+        // A pre-task-1 state file, or one written by the JS `/sdlc-flow` —
+        // the "block_id" key is absent entirely, not merely null.
+        // `write_done_state` produces exactly this shape.
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state(dir.path(), "A.1");
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
     }
 
     fn write_done_state_with_final_validation(
