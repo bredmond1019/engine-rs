@@ -45,11 +45,11 @@ use engine_contract::{NodeRun, NodeRunStatus};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
 use engine_core::workflows::orchestration::execute::{
-    execute_step, EngineKind, FlowInvocation, FlowRunner,
+    execute_step, EngineKind, ExecutionOutcome, FlowInvocation, FlowRunner,
 };
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain, verify_state_write, IntegrateError, NeverHeld, StepProgress,
+    integrate_chain, verify_state_write, IntegrateError, LaneLogStatus, NeverHeld, StepProgress,
 };
 
 // ── Git process helpers ──────────────────────────────────────────────────
@@ -193,7 +193,6 @@ fn write_state(repo_path: &Path, block_id: &str, status: &str) {
 /// Build a tempdir roadmap directory under `planning/roadmaps/<slug>/` so
 /// `append_lane_log_line` has somewhere to write that is never a real,
 /// tracked roadmap. Mirrors `orchestration.rs`'s `fixture_roadmap_dir`.
-#[allow(dead_code)] // wired up by later tasks in this spec (case (d))
 fn fixture_roadmap_dir(slug: &str) -> (tempfile::TempDir, PathBuf) {
     let planning_root = tempfile::tempdir().expect("planning-root tempdir");
     let roadmap_dir = planning_root.path().join("roadmaps").join(slug);
@@ -232,7 +231,6 @@ impl RecordingRunner {
     /// default `"done"`. `None` skips writing the state file entirely —
     /// used by later tasks to reproduce a run that never reached
     /// `wrap_up.rs`.
-    #[allow(dead_code)] // wired up by later tasks in this spec (cases (b)/(c))
     fn set_status_override(&self, block_id: &str, status: Option<&str>) {
         self.status_overrides
             .lock()
@@ -575,4 +573,236 @@ async fn a_failed_setup_worktree_step_is_invisible_to_execute_step_today() {
     );
 
     let _ = repo_path; // kept alive for the fixture's Drop ordering
+}
+
+// ── Case (c): RED AUTHORITATIVE BUILD — now FIXED ──────────────────────────
+//
+// smoke-run.md §3.3 originally observed a `"status": "done"` state file
+// with `final_validation.all_passed: false` being admitted as a successful
+// block close. That bug is closed: `verify_state_write` now rejects such a
+// file with `IntegrateError::FinalValidationGateFailed`, independently of
+// `wrap_up.rs`'s own in-engine guard, so a state file written by an older
+// engine build or by the JS `/sdlc-flow` is still caught. This fixture
+// therefore asserts the FIXED value, never the pre-fix one — see the block
+// record's 2026-08-21 amendment.
+
+/// A synthetic [`ExecutionOutcome`] whose `repo_path` is a fresh tempdir
+/// carrying only the one state file `body` describes — `verify_state_write`
+/// reads nothing else, so this is a faithful, minimal stand-in for a real
+/// `SDLC_FLOW` run's result without driving the whole chain.
+fn outcome_with_state_file(
+    block_id: &str,
+    body: &serde_json::Value,
+) -> (tempfile::TempDir, ExecutionOutcome) {
+    let repo_root = tempfile::tempdir().expect("state-file tempdir");
+    write_state_json(repo_root.path(), block_id, body);
+    let outcome = ExecutionOutcome {
+        repo: "smoke-repo".to_string(),
+        repo_path: repo_root.path().to_path_buf(),
+        block_id: block_id.to_string(),
+        ctx: engine_contract::TaskContext {
+            event: serde_json::json!({}),
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        },
+    };
+    (repo_root, outcome)
+}
+
+/// Like [`write_state`] but takes an arbitrary JSON body instead of a bare
+/// `{"status": ..}` — needed here so a case can add `final_validation`
+/// alongside `"status"`.
+fn write_state_json(repo_path: &Path, block_id: &str, body: &serde_json::Value) {
+    let dir = repo_path.join("planning").join(block_id).join("sdlc");
+    std::fs::create_dir_all(&dir).expect("mkdir state dir");
+    std::fs::write(
+        dir.join("sdlc-flow-state.json"),
+        serde_json::to_string(body).expect("serialize state body"),
+    )
+    .expect("write state file");
+}
+
+#[tokio::test]
+// FIXED by EN.ticket.final-validation-failure-must-block (closed
+// 2026-08-20).
+async fn red_authoritative_build_is_now_rejected_by_verify_state_write() {
+    // `status: "done"` + `final_validation.all_passed: false` must now be
+    // REJECTED — this is the flip EN.ticket.final-validation-failure-must-
+    // block made. A pre-fix assertion of `Ok` here would be exactly the
+    // green-on-landing-but-wrong fixture this block's amendment exists to
+    // prevent.
+    let (_tmp, red_outcome) = outcome_with_state_file(
+        "C.1",
+        &serde_json::json!({
+            "status": "done",
+            "final_validation": {
+                "all_passed": false,
+                "failure_summary": "cargo clippy failed with 2 warnings",
+            },
+        }),
+    );
+    let err = verify_state_write(&red_outcome).expect_err(
+        "FIXED: a red authoritative build (all_passed:false) must be rejected \
+         even though status reads done — EN.ticket.final-validation-failure-must-block",
+    );
+    match err {
+        IntegrateError::FinalValidationGateFailed {
+            ref failure_summary,
+            ..
+        } => {
+            assert_eq!(failure_summary, "cargo clippy failed with 2 warnings");
+        }
+        other => panic!("expected FinalValidationGateFailed, got {other:?}"),
+    }
+
+    // Must-still-pass case 1: `all_passed: true` is a normal successful
+    // close and must still verify Ok.
+    let (_tmp2, green_outcome) = outcome_with_state_file(
+        "C.2",
+        &serde_json::json!({
+            "status": "done",
+            "final_validation": {"all_passed": true},
+        }),
+    );
+    assert!(
+        verify_state_write(&green_outcome).is_ok(),
+        "a green authoritative build (all_passed:true) must still verify Ok"
+    );
+
+    // Must-still-pass case 2: `final_validation` entirely absent (a
+    // JS-written state file, or one from before EN.3.E) must still verify
+    // Ok — only an EXPLICIT `false` is a failure, never absence.
+    let (_tmp3, no_gate_outcome) =
+        outcome_with_state_file("C.3", &serde_json::json!({"status": "done"}));
+    assert!(
+        verify_state_write(&no_gate_outcome).is_ok(),
+        "a state file with no final_validation key at all must still verify Ok \
+         — absence is not itself a failure"
+    );
+}
+
+// ── Case (d): LANE-LOG SHAPE — now FIXED ───────────────────────────────────
+//
+// smoke-run.md §3.7 originally observed lane-log lines shaped
+// `{repo, block_id, integrated_at}`. That shape is retired:
+// `EN.ticket.lane-log-entry-schema` reshaped every appended line to
+// `{ts, lane, repo, block, status, note}` with a typed `LaneLogStatus`.
+// This fixture asserts the FIXED shape by driving the real chain end to
+// end (not `LaneLogEntry` in isolation) so it also proves `integrate_chain`
+// itself appends lines in that shape, not merely that the type can be
+// constructed that way.
+#[tokio::test]
+// FIXED by EN.ticket.lane-log-entry-schema (closed 2026-08-20).
+async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
+    let (_brain_root, _bare_root, registry, _repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-b-case-d");
+    let admission = AdmissionGate::with_default_policy();
+
+    // First: a two-block chain that closes cleanly, producing two
+    // `closed` lines.
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let chain = resolve_explicit_chain(vec![
+        ("smoke-repo".to_string(), "D.1".to_string()),
+        ("smoke-repo".to_string(), "D.2".to_string()),
+    ]);
+    integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("en-11-b-lane"),
+        &|_: &StepProgress| {},
+    )
+    .await
+    .expect("two-block chain should close cleanly");
+
+    // Second: a block whose state write never happens (RecordingRunner
+    // overridden to skip it), so `verify_state_write` fails and the chain
+    // appends a `bailed` line instead of `closed`.
+    runner.set_status_override("D.3", None);
+    let chain_fail = resolve_explicit_chain(vec![("smoke-repo".to_string(), "D.3".to_string())]);
+    integrate_chain(
+        &chain_fail,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("en-11-b-lane"),
+        &|_: &StepProgress| {},
+    )
+    .await
+    .expect_err("D.3 never writes a state file, so the chain must stop");
+
+    let contents = std::fs::read_to_string(roadmap_dir.join("lane-log.jsonl"))
+        .expect("lane-log.jsonl must exist after three appended lines");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 3, "two closed lines + one bailed line");
+
+    let expected_keys: std::collections::BTreeSet<&str> =
+        ["ts", "lane", "repo", "block", "status", "note"]
+            .into_iter()
+            .collect();
+
+    let mut statuses = Vec::new();
+    for line in &lines {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("each lane-log line must be valid JSON");
+        let obj = value.as_object().expect("each line must be a JSON object");
+
+        // FIXED: the key set is EXACTLY {ts, lane, repo, block, status,
+        // note} — NOT the old {repo, block_id, integrated_at}. An added or
+        // renamed field fails this assertion.
+        let keys: std::collections::BTreeSet<&str> =
+            obj.keys().map(std::string::String::as_str).collect();
+        assert_eq!(
+            keys, expected_keys,
+            "FIXED shape only — lane-log line must carry exactly \
+             {{ts, lane, repo, block, status, note}}, got {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("block_id") && !obj.contains_key("integrated_at"),
+            "the OLD {{repo, block_id, integrated_at}} shape must not reappear: {obj:?}"
+        );
+
+        let status_str = obj["status"].as_str().expect("status must be a string");
+        let status: LaneLogStatus = serde_json::from_value(value["status"].clone())
+            .expect("status must be a LaneLogStatus");
+        statuses.push(status);
+        assert!(
+            status_str == "closed" || status_str == "bailed",
+            "unexpected status value: {status_str}"
+        );
+    }
+
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == LaneLogStatus::Closed)
+            .count(),
+        2,
+        "D.1 and D.2 each produce exactly one closed line"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == LaneLogStatus::Bailed)
+            .count(),
+        1,
+        "D.3's missing state write produces exactly one bailed line"
+    );
 }
