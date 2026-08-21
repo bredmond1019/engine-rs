@@ -19,16 +19,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use engine_contract::TaskContext;
 use engine_core::cancellation::CancellationToken;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
     resolve_explicit_chain, resolve_lane_chain, ChainError,
 };
-use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
+use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::graph::{OrchestrationRunNode, NODE_NAME};
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain, HoldSource, IntegrateError, NeverHeld, StepProgress,
 };
+use engine_core::Node;
 
 use engine_core::nodes::terminal::admission::{AdmissionControl, AdmissionPolicy};
 
@@ -1081,4 +1084,249 @@ async fn no_observer_injected_changes_nothing() {
     assert_eq!(outcomes.len(), 2);
     let lines = lane_log_lines(&roadmap_dir);
     assert_eq!(lines.len(), 2, "exactly one lane-log line per block");
+}
+
+// ── Isolation invariance matrix (EN.ticket.orchestration-isolation-passthrough) ──
+//
+// Drives the full ORCHESTRATION stack end to end (event -> `resolve_policy_for_run_from`
+// -> `execute::resolve_isolation` -> the stamped `ctx.nodes[NODE_NAME]["blocks"]`) for
+// every (repo x setting) cell of the isolation policy's invariance matrix, asserting the
+// same fact the production caller reads: the per-step resolved `use_worktree` stamped
+// into the node's result. Table-driven rather than one test per cell so the matrix shape
+// itself — three repo rows, five settings columns — reads directly off the test.
+
+/// A tempdir brain root with three repos wired for the isolation matrix:
+/// - `base-template` — row 1, always worktree, structurally unreachable by any knob.
+/// - `hq` — resolves its `repo_path` to the brain root itself (mirrors HQ, where the
+///   chain's own repo IS the brain root) — row 2, always in place.
+/// - `ordinary-repo` — row 3, follows the resolved `default_use_worktree`.
+fn isolation_matrix_brain_root() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("base-template")).unwrap();
+    std::fs::create_dir_all(dir.path().join("ordinary-repo")).unwrap();
+    std::fs::create_dir_all(
+        dir.path()
+            .join("planning")
+            .join("roadmaps")
+            .join("isolation-matrix"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        "[[repos]]\nslug = \"base-template\"\nrepo_path = \"base-template\"\n\
+         [[repos]]\nslug = \"ordinary-repo\"\nrepo_path = \"ordinary-repo\"\n\
+         [[repos]]\nslug = \"hq\"\nrepo_path = \".\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// A `FlowRunner` that satisfies `integrate_chain`'s state-write verification (writes
+/// `"done"` into the invocation's own `repo_path`) and otherwise records nothing — the
+/// matrix reads isolation off the node's stamped `ctx.nodes` result, not off this
+/// double, so it stays minimal.
+fn isolation_matrix_run_flow() -> FlowRunner {
+    Arc::new(move |invocation: FlowInvocation| {
+        Box::pin(async move {
+            write_state(&invocation.repo_path, &invocation.block_id, "done");
+            Ok(engine_contract::TaskContext {
+                event: serde_json::json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: std::collections::HashMap::new(),
+            })
+        })
+    })
+}
+
+/// Run one ORCHESTRATION step for `repo_slug` with `event_overlay` merged into the
+/// event, and return the `use_worktree` the node actually stamped for that step.
+async fn matrix_cell_use_worktree(
+    dir: &Path,
+    repo_slug: &str,
+    block_id: &str,
+    event_overlay: serde_json::Value,
+) -> bool {
+    let node = OrchestrationRunNode::new().with_run_flow(isolation_matrix_run_flow());
+    let mut event = serde_json::json!({
+        "brain_root": dir,
+        "blocks": [{ "repo": repo_slug, "block_id": block_id }],
+        "roadmap_slug": "isolation-matrix",
+    });
+    if let (Some(event_obj), Some(overlay_obj)) = (event.as_object_mut(), event_overlay.as_object())
+    {
+        for (key, value) in overlay_obj {
+            event_obj.insert(key.clone(), value.clone());
+        }
+    }
+    let ctx = TaskContext {
+        event,
+        nodes: std::collections::HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: std::collections::HashMap::new(),
+    };
+    let out = node
+        .process(ctx)
+        .await
+        .unwrap_or_else(|err| panic!("process should succeed for {repo_slug}/{block_id}: {err}"));
+    out.nodes[NODE_NAME]["blocks"][0]["use_worktree"]
+        .as_bool()
+        .expect("stamped use_worktree should be a bool")
+}
+
+/// The five ways a run can reach a resolved `default_use_worktree`, matched against the
+/// three repo rows below. `"default_false"`/`"default_true"` set the fallback via a
+/// `planning/harness.json` `orchestration.policy.default_use_worktree` entry (the
+/// `source`-read layer `resolve_policy_for_run_from` consults); the two profiles set it
+/// via the built-in bundles; the event override sets it inline on the event itself, one
+/// layer higher than every other setting here.
+enum Setting {
+    DefaultFalse,
+    DefaultTrue,
+    ProfileCheapFast,
+    ProfileThorough,
+    EventOverride(bool),
+}
+
+impl Setting {
+    fn write_harness_default(&self, dir: &Path) {
+        let harness_path = dir.join("planning").join("harness.json");
+        let value = match self {
+            Setting::DefaultFalse => Some(false),
+            Setting::DefaultTrue => Some(true),
+            // Profiles and the event override do not go through the
+            // harness.json `orchestration.policy` layer at all, so no file
+            // is written for them — leaving that layer absent proves the
+            // profile/event layers are what actually carried the setting.
+            Setting::ProfileCheapFast | Setting::ProfileThorough | Setting::EventOverride(_) => {
+                None
+            }
+        };
+        if let Some(default_use_worktree) = value {
+            std::fs::write(
+                &harness_path,
+                serde_json::json!({
+                    "orchestration": {
+                        "policy": { "default_use_worktree": default_use_worktree }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        } else if harness_path.exists() {
+            std::fs::remove_file(&harness_path).unwrap();
+        }
+    }
+
+    fn event_overlay(&self) -> serde_json::Value {
+        match self {
+            Setting::DefaultFalse | Setting::DefaultTrue => serde_json::json!({}),
+            Setting::ProfileCheapFast => serde_json::json!({ "profile": "cheap-fast" }),
+            Setting::ProfileThorough => serde_json::json!({ "profile": "thorough" }),
+            Setting::EventOverride(value) => serde_json::json!({
+                "policy": { "default_use_worktree": value }
+            }),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Setting::DefaultFalse => "default-false",
+            Setting::DefaultTrue => "default-true",
+            Setting::ProfileCheapFast => "profile-cheap-fast",
+            Setting::ProfileThorough => "profile-thorough",
+            Setting::EventOverride(true) => "event-override-true",
+            Setting::EventOverride(false) => "event-override-false",
+        }
+    }
+}
+
+/// The 15-cell invariance matrix: {`base-template`, the brain root, an ordinary repo} x
+/// {default false, default true, profile `cheap-fast`, profile `thorough`, an inline
+/// event `policy` override}. Both non-negotiable rows (`base-template`, the brain root)
+/// must resolve identically across every column — that is the assertion that
+/// distinguishes "the policy is structurally enforced" from "the default happens to
+/// agree with it today". `ordinary-repo` is expected to track the setting's resolved
+/// `default_use_worktree` exactly.
+#[tokio::test]
+async fn isolation_invariance_matrix_across_all_fifteen_cells() {
+    let dir = isolation_matrix_brain_root();
+
+    let settings = [
+        Setting::DefaultFalse,
+        Setting::DefaultTrue,
+        Setting::ProfileCheapFast,
+        Setting::ProfileThorough,
+        Setting::EventOverride(true),
+    ];
+
+    // Ordinary-repo's expected resolution per setting, in the same order as
+    // `settings` above — this is the ONE row allowed to vary across the
+    // settings axis.
+    let ordinary_expected = [false, true, false, true, true];
+
+    for (i, setting) in settings.iter().enumerate() {
+        setting.write_harness_default(dir.path());
+        let overlay = setting.event_overlay();
+        let label = setting.label();
+
+        let base_template = matrix_cell_use_worktree(
+            dir.path(),
+            "base-template",
+            &format!("BT.{i}"),
+            overlay.clone(),
+        )
+        .await;
+        assert!(
+            base_template,
+            "base-template must resolve to worktree=true under setting {label}"
+        );
+
+        let brain_root =
+            matrix_cell_use_worktree(dir.path(), "hq", &format!("HQ.{i}"), overlay.clone()).await;
+        assert!(
+            !brain_root,
+            "the brain root must resolve to worktree=false under setting {label}"
+        );
+
+        let ordinary =
+            matrix_cell_use_worktree(dir.path(), "ordinary-repo", &format!("ORD.{i}"), overlay)
+                .await;
+        assert_eq!(
+            ordinary, ordinary_expected[i],
+            "ordinary-repo should resolve to {} under setting {label}, got {ordinary}",
+            ordinary_expected[i]
+        );
+    }
+
+    // Clean up the harness.json this test wrote so it never leaks into a
+    // sibling test running against the same tempdir contents.
+    let harness_path = dir.path().join("planning").join("harness.json");
+    if harness_path.exists() {
+        std::fs::remove_file(&harness_path).unwrap();
+    }
+}
+
+/// Behavior-stability pin (CLAUDE.md standing rule 6): a chain wired with no isolation
+/// overrides at all — no `harness.json` `orchestration.policy` entry, no `profile`, no
+/// event `policy` override — seeds exactly what today's runs seed: in-place
+/// (`use_worktree: false`) for an ordinary repo. Adding the `default_use_worktree` knob
+/// must not have changed an existing, override-free run's behavior.
+#[tokio::test]
+async fn a_run_with_no_isolation_overrides_seeds_in_place_unchanged_from_today() {
+    let dir = isolation_matrix_brain_root();
+
+    let use_worktree = matrix_cell_use_worktree(
+        dir.path(),
+        "ordinary-repo",
+        "NOOVERRIDE.1",
+        serde_json::json!({}),
+    )
+    .await;
+
+    assert!(
+        !use_worktree,
+        "an override-free run against an ordinary repo must stay in-place, matching \
+         behavior before default_use_worktree existed"
+    );
 }

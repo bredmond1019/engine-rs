@@ -152,6 +152,23 @@ const ALWAYS_WORKTREE_REPO_SLUG: &str = "base-template";
 /// contract is a bool, and a step whose `repo_path` cannot be canonicalized
 /// falls through to the ordinary-repo row exactly as if the comparison had
 /// legitimately failed to match.
+///
+/// # Named seam: the lane files' `ISOLATION:` directive is NOT read here
+///
+/// 37 live lane files carry a per-lane `ISOLATION:` directive today, and
+/// nothing consumes it — this function resolves isolation purely from
+/// `repo_slug`, `repo_path`, and the policy fallback, never from a lane
+/// directive. That is deliberate, not an oversight: mev's emitted
+/// `LaneDirectives` carries only `held_until` / `budget` /
+/// `exclusive_repos`, so `ISOLATION:` cannot be consumed here without a
+/// mev-side change first to add it to that struct. Adding a second,
+/// engine-side lane-file parser to read the raw directive text would
+/// duplicate mev's parsing and drift from it within a release. The
+/// follow-on: once mev's `LaneDirectives` grows an `isolation` field, plumb
+/// it through `ChainStep::directives` (see [`super::chain::ChainStep`]) as
+/// a fourth, highest-precedence row ahead of `default_use_worktree` — it
+/// must stay subordinate to the two structural rows above, which are
+/// external contracts and must remain unreachable by any per-lane override.
 pub fn resolve_isolation(
     repo_slug: &str,
     repo_path: &Path,
