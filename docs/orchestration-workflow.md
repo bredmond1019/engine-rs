@@ -79,6 +79,23 @@ missing or duplicated line is how a sibling lane reads the wrong state. The road
 resolved by the two-location rule (`planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`;
 a slug present in both is an error, never a silent preference).
 
+## Campaign identity
+
+Every `ORCHESTRATION` run resolves a `campaign_id` (`EN.11.E`) — the event's own `campaign_id` when
+present (so a resumed or operator-restarted chain rejoins the same campaign instead of minting a
+new identity indistinguishable from a fresh one), else a fresh v4 UUID minted at run start. Each
+`execute.rs` step threads that same `campaign_id` onto the child `SDLC_FLOW` event it dispatches
+(`event.campaign_id`), and stamps it back onto its own step record so the step is attributable to
+its campaign without re-reading the child's `TaskContext`. The parent run additionally stamps
+`campaign_members` — the per-step roster — into `ctx.nodes[OrchestrationRunNode]`, next to the
+existing `steps_integrated`/`blocks`/`policy`/`cancellation` fields.
+
+`GET /campaigns/{id}` (`engine-serve`, task 5) reads this identity back: it resolves every run —
+live or completed — carrying the given `campaign_id` (via `LiveStateStore::list_campaign_runs`) and
+rolls up their cost/tokens from the parent run's `campaign_members` entry. See `docs/architecture.md`
+(HTTP surface, `LiveStateStore`) for the endpoint and store shape, and `docs/data-contract.md` §8 for
+the canonical wire shape.
+
 ## Policy
 
 One knob today, resolved through the standard four layers

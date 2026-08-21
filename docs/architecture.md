@@ -572,7 +572,14 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   (`COMPLETED_RUN_RETENTION`) instead of dropping it, and `get_record` reads back that snapshot
   plus `workflow_type`/`created_at`/`updated_at`/a `terminal` flag; `get` checks the live map
   first, then falls back to the completed ring, so a terminal run keeps serving its last snapshot,
-  while `list_active` only reads the live map so terminal runs are excluded.
+  while `list_active` only reads the live map so terminal runs are excluded. `RunRecord` also
+  carries `campaign_id: Option<Uuid>` (`EN.11.E`), resolved by `read_campaign_id` from either
+  `snapshot.event["campaign_id"]` (a child `SDLC_FLOW` run's own wire seam) or
+  `snapshot.nodes["OrchestrationRunNode"]["campaign_id"]` (the parent `ORCHESTRATION` run); `None`
+  is an honest value for a run outside any campaign, not a defect. `list_campaign_runs(campaign_id)`
+  merges the live map and the completed ring into a `CampaignLookup { runs: Vec<CampaignRun>, ... }`
+  sorted by `CampaignRun::ordering_key` ascending, with `possibly_truncated` set when the completed
+  ring is at its `COMPLETED_RUN_RETENTION` capacity (so an evicted member could be missing).
 - `DurableHandle` / `spawn_durable_writer` / `durable_on_progress` (`engine-serve::durable`) — an
   mpsc-bridged async durable-write seam mapping `on_progress` `TaskContext` snapshots to
   `engine_contract::EventsRow`: inserts the first (all-PENDING) snapshot per run via
@@ -585,7 +592,15 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   types), `GET /workflows/{type}/graph` (schema graph for a type), `POST /events/` (X-API-Key
   gated; dispatches the event, records live state, and enqueues the durable write), and (EN.5.F)
   `GET /events/{event_id}` (X-API-Key gated readback of a run's canonical shape, served from
-  `LiveStateStore` with no DB query — `404` for an unknown or malformed id).
+  `LiveStateStore` with no DB query — `404` for an unknown or malformed id). `GET /campaigns/{id}`
+  (`EN.11.E`) is the same X-API-Key gate over `LiveStateStore::list_campaign_runs`: `200
+  {campaign_id, runs: [...], total_cost_usd, total_tokens, possibly_truncated}` for a known
+  campaign, `404` for both an unknown campaign id and a malformed/non-UUID path segment. The
+  cost/token rollup is tri-state (`Option<f64>`, `null` when nothing in the campaign reported a
+  cost) and reads `campaign_members` off whichever member run's snapshot carries it — today only
+  the parent `ORCHESTRATION` run's `nodes[OrchestrationRunNode]`. This route is registered before
+  the catch-all `/events/{event_id}` matcher so a literal `/campaigns/...` path is never captured
+  by it.
   `post_events` mints the `run_id`/`event_id` (they are always equal — both the `events.id`
   primary key), then spawns the run via `actix_web::rt::spawn` and returns `202 {run_id,
   event_id}` immediately instead of awaiting `workflow.run_with` (EN.5.F; previously awaited
