@@ -78,16 +78,8 @@
       "model": "qwen2.5-coder:7b",
       "constrained_json": false
     },
-    "simple_task_max_files": 2,
     "llm_triage": false,
     "max_attempts": 3,
-    "close_out": {
-      "reuse": {
-        "validation": false,
-        "review": false,
-        "docs": false
-      }
-    },
     "retry_feedback": {
       "enabled": true,
       "max_chars": 4000

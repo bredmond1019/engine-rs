@@ -236,22 +236,6 @@ pub struct PartialTransportRetry {
     pub initial_backoff_ms: Option<u64>,
 }
 
-/// Which pipeline stages `close-out` (EN.2.x) is allowed to reuse from a
-/// prior flow record rather than re-running (lever #1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct CloseOutReuse {
-    pub validation: bool,
-    pub review: bool,
-    pub docs: bool,
-}
-
-/// The `close_out` policy block: just the reuse flags today, nested to
-/// mirror the economics-notes JSON shape and leave room to grow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct CloseOut {
-    pub reuse: CloseOutReuse,
-}
-
 /// The fully-resolved, per-run SDLC Flow policy — the merge of built-in
 /// defaults, `harness.json`'s `sdlc.policy` defaults, and any per-run event
 /// override, high->low precedence in that order.
@@ -270,7 +254,11 @@ pub struct SdlcPolicy {
     pub timeouts: CallTimeouts,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
-    pub simple_task_max_files: u32,
+    // `simple_task_max_files` was the selector for a simple-task path
+    // (paired with `ModelTiers::implement_simple`) that was never built —
+    // deleted 2026-08-21 (EN.ticket.sdlc-flow-dead-policy-knobs task 4)
+    // as a dead knob per CLAUDE.md standing rule 6. If that path is ever
+    // built, this knob and `implement_simple` come back together.
     /// Enables `TriageTaskNode`'s model-triage branch. **Precedence: the
     /// bare `event.llm_triage` field (`SDLCFlowEventSchema::llm_triage`,
     /// the pre-existing, still-supported spelling) wins when a caller sets
@@ -304,7 +292,6 @@ pub struct SdlcPolicy {
     /// a bounded one (the fix), but does not change any run that reviews
     /// clean within three passes — i.e. every run that terminates today.
     pub max_review_attempts: u32,
-    pub close_out: CloseOut,
     /// Whether the previous attempt's failure output is fed back into
     /// `ImplementTaskNode`'s retry prompt, and how large that block may get.
     pub retry_feedback: RetryFeedback,
@@ -346,13 +333,11 @@ impl Default for SdlcPolicy {
             model_tiers: ModelTiers::default(),
             timeouts: CallTimeouts::default(),
             local: LocalConfig::default(),
-            simple_task_max_files: 2,
             llm_triage: false,
             max_attempts: 3,
             // Matching JS's MAX_REVIEW_ATTEMPTS — see the field's doc
             // comment for why it is a separate counter from `max_attempts`.
             max_review_attempts: 3,
-            close_out: CloseOut::default(),
             // NOT behavior-stable, deliberately — see `RetryFeedback`'s docs.
             retry_feedback: RetryFeedback::default(),
             // Behavior-stable on the success path; NOT on the failure path,
@@ -372,8 +357,7 @@ impl Default for SdlcPolicy {
 /// All-optional mirror of [`SdlcPolicy`] used by the two override layers
 /// (`harness.json`'s `sdlc.policy` and a per-run event's `policy` field).
 /// Every field left `None` falls through to the next-lower-precedence
-/// layer; `close_out` is deep-merged field-by-field via `PartialCloseOut`
-/// rather than all-or-nothing.
+/// layer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialPolicy {
@@ -386,11 +370,9 @@ pub struct PartialPolicy {
     pub model_tiers: Option<PartialModelTiers>,
     pub timeouts: Option<PartialCallTimeouts>,
     pub local: Option<PartialLocalConfig>,
-    pub simple_task_max_files: Option<u32>,
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
     pub max_review_attempts: Option<u32>,
-    pub close_out: Option<PartialCloseOut>,
     pub retry_feedback: Option<PartialRetryFeedback>,
     pub transport_retry: Option<PartialTransportRetry>,
     pub review_diff_max_chars: Option<u32>,
@@ -418,22 +400,6 @@ pub struct PartialCallTimeouts {
     pub review: Option<u64>,
     pub generate: Option<u64>,
     pub docs: Option<u64>,
-}
-
-/// All-optional mirror of [`CloseOutReuse`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PartialCloseOutReuse {
-    pub validation: Option<bool>,
-    pub review: Option<bool>,
-    pub docs: Option<bool>,
-}
-
-/// All-optional mirror of [`CloseOut`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PartialCloseOut {
-    pub reuse: Option<PartialCloseOutReuse>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -505,26 +471,6 @@ fn merge_transport_retry(mut base: TransportRetry, over: &PartialTransportRetry)
     base
 }
 
-fn merge_close_out_reuse(mut base: CloseOutReuse, over: &PartialCloseOutReuse) -> CloseOutReuse {
-    if let Some(v) = over.validation {
-        base.validation = v;
-    }
-    if let Some(v) = over.review {
-        base.review = v;
-    }
-    if let Some(v) = over.docs {
-        base.docs = v;
-    }
-    base
-}
-
-fn merge_close_out(mut base: CloseOut, over: &PartialCloseOut) -> CloseOut {
-    if let Some(reuse) = &over.reuse {
-        base.reuse = merge_close_out_reuse(base.reuse, reuse);
-    }
-    base
-}
-
 impl crate::policy::Policy for SdlcPolicy {
     type Partial = PartialPolicy;
 
@@ -557,17 +503,9 @@ impl crate::policy::Policy for SdlcPolicy {
                 Some(l) => base.local.overlay(l),
                 None => base.local,
             },
-            simple_task_max_files: merge_opt(
-                base.simple_task_max_files,
-                over.simple_task_max_files,
-            ),
             llm_triage: merge_opt(base.llm_triage, over.llm_triage),
             max_attempts: merge_opt(base.max_attempts, over.max_attempts),
             max_review_attempts: merge_opt(base.max_review_attempts, over.max_review_attempts),
-            close_out: match &over.close_out {
-                Some(co) => merge_close_out(base.close_out, co),
-                None => base.close_out,
-            },
             retry_feedback: match &over.retry_feedback {
                 Some(rf) => merge_retry_feedback(base.retry_feedback, rf),
                 None => base.retry_feedback,
@@ -638,9 +576,6 @@ mod tests {
         // `Opus` because that is what `GenerateTasksNode` actually runs.
         assert_eq!(policy.model_tiers.generate, ModelTier::Opus);
         assert_eq!(policy.model_tiers.docs, ModelTier::Sonnet);
-        assert!(!policy.close_out.reuse.validation);
-        assert!(!policy.close_out.reuse.review);
-        assert!(!policy.close_out.reuse.docs);
         assert!(!policy.prompt_cache);
         assert!(!policy.llm_triage);
         assert_eq!(policy.max_attempts, 3);
@@ -1256,34 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn event_override_beats_harness_default_for_close_out_reuse() {
-        let harness = PartialPolicy {
-            close_out: Some(PartialCloseOut {
-                reuse: Some(PartialCloseOutReuse {
-                    validation: Some(true),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
-        };
-        let event = PartialPolicy {
-            close_out: Some(PartialCloseOut {
-                reuse: Some(PartialCloseOutReuse {
-                    review: Some(true),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
-        };
-        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, Some(&event));
-        // Deep-merge: harness's `validation: true` survives the event layer,
-        // event's `review: true` layers on top, `docs` still falls to builtin.
-        assert!(resolved.close_out.reuse.validation);
-        assert!(resolved.close_out.reuse.review);
-        assert!(!resolved.close_out.reuse.docs);
-    }
-
-    #[test]
     fn deserializes_partial_policy_from_harness_json_shape() {
         let json = r#"{
             "output_verbosity": "terse",
@@ -1407,7 +1314,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"haiku\",\"triage\":\"haiku\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"haiku\",\"triage\":\"haiku\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"llm_triage\":true,\"max_attempts\":4,\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
 
         let expected: serde_json::Value =
             serde_json::from_str(expected).expect("pinned baseline literal parses as JSON");
