@@ -1341,3 +1341,144 @@ async fn a_run_with_no_isolation_overrides_seeds_in_place_unchanged_from_today()
          behavior before default_use_worktree existed"
     );
 }
+
+// ── Per-step cost/token attribution does not bleed across steps (EN.11.G task 3) ──
+
+/// A [`FlowRunner`] test double that returns a DIFFERENT known cost/token
+/// figure per `block_id` — the smallest fixture that can catch bleed. A
+/// single-step test cannot: with only one step there is nothing for a
+/// second step's figures to leak into, so the two-step shape here is load
+/// bearing, not incidental.
+fn runner_with_per_block_usage(figures: Vec<(&'static str, f64, u64, u64)>) -> FlowRunner {
+    let figures: std::collections::HashMap<String, (f64, u64, u64)> = figures
+        .into_iter()
+        .map(|(block_id, cost, input, output)| (block_id.to_string(), (cost, input, output)))
+        .collect();
+    let figures = Arc::new(figures);
+    Arc::new(move |invocation: FlowInvocation| {
+        let figures = figures.clone();
+        Box::pin(async move {
+            let (cost_usd, input, output) = *figures
+                .get(&invocation.block_id)
+                .expect("fixture should have a figure for every block in the chain");
+            write_state(&invocation.repo_path, &invocation.block_id, "done");
+            let node_name = format!("{}Node", invocation.block_id);
+            let mut nodes = std::collections::HashMap::new();
+            nodes.insert(node_name.clone(), serde_json::json!({"cost_usd": cost_usd}));
+            let mut node_runs = std::collections::HashMap::new();
+            node_runs.insert(
+                node_name,
+                engine_contract::NodeRun {
+                    status: engine_contract::NodeRunStatus::Success,
+                    started_at: None,
+                    completed_at: None,
+                    error: None,
+                    input: None,
+                    usage: Some(engine_contract::Usage {
+                        input_tokens: Some(input),
+                        output_tokens: Some(output),
+                        model: "claude-sonnet-4-5".to_string(),
+                    }),
+                },
+            );
+            Ok(TaskContext {
+                event: serde_json::json!({}),
+                nodes,
+                metadata: serde_json::json!({}),
+                node_runs,
+            })
+        })
+    })
+}
+
+/// Proves per-step attribution over a REAL two-step chain: each step's
+/// child reports a different cost/token figure, and each step's own
+/// `ExecutionOutcome` must carry exactly its own figure — never the other
+/// step's, and never a sum of both (which would look like correct
+/// "rollup" arithmetic while actually being step-B's figure bleeding into
+/// step-A's read).
+///
+/// **Bleed-test-can-fail check (task 3 methodology, not left in the
+/// production tree — CLAUDE.md D8 completeness self-check / task AC
+/// "no production file may differ from HEAD at task end"):** to confirm
+/// this test actually catches attribution bleed rather than passing
+/// vacuously, `step_spend` in `execute.rs` was temporarily rewritten to
+/// route through a single `static` `BudgetLedger` shared across every
+/// call (i.e. step B's `step_spend` folded step A's already-recorded
+/// cost/tokens into its own reading) instead of building a fresh ledger
+/// from that step's own `ctx` each time. Run against that deliberately
+/// bugged build, this test failed with:
+///
+/// ```text
+/// assertion `left == right` failed: step B's cost must be its own figure, not \
+/// bled from step A
+///   left: Some(4.75)
+///  right: Some(3.5)
+/// ```
+///
+/// (`4.75` == `1.25 + 3.5`, i.e. step A's `1.25` had leaked into step B's
+/// reading — exactly the bleed this test exists to catch.) The temporary
+/// `execute.rs` edit was then reverted with `git checkout -- execute.rs`
+/// and the suite re-run clean; no production file differs from this
+/// task's starting `HEAD`.
+#[tokio::test]
+async fn two_step_chain_attributes_cost_and_tokens_to_the_step_that_spent_them_without_bleed() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("no-bleed");
+    let admission = AdmissionGate::with_default_policy();
+
+    let runner = runner_with_per_block_usage(vec![("A.1", 1.25, 100, 200), ("B.1", 3.50, 10, 20)]);
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+    )
+    .await
+    .expect("two-step chain with distinct per-step usage should integrate cleanly");
+
+    assert_eq!(outcomes.len(), 2);
+
+    assert_eq!(
+        outcomes[0].cost_usd,
+        Some(1.25),
+        "step A's cost must be its own figure, not padded by step B"
+    );
+    assert_eq!(
+        outcomes[0].total_tokens, 300,
+        "step A's tokens must be its own figure, not padded by step B"
+    );
+
+    assert_eq!(
+        outcomes[1].cost_usd,
+        Some(3.50),
+        "step B's cost must be its own figure, not bled from step A"
+    );
+    assert_eq!(
+        outcomes[1].total_tokens, 30,
+        "step B's tokens must be its own figure, not bled from step A"
+    );
+
+    // The two steps' figures are actually distinct — a bleed bug that
+    // duplicated step A's ledger into step B (or vice versa) would collapse
+    // this into a false equality.
+    assert_ne!(outcomes[0].cost_usd, outcomes[1].cost_usd);
+    assert_ne!(outcomes[0].total_tokens, outcomes[1].total_tokens);
+}
