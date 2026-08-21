@@ -57,6 +57,20 @@
 //!   reason}` — with nothing dispatched; a structurally malformed payload is
 //!   `400`. Both routes defer Svix signature verification — see
 //!   `crate::email_webhooks`'s module doc.
+//! - `GET /campaigns/{id}` (`EN.11.E` task 5) — requires the same
+//!   `X-API-Key` header (401 without it); `404` for an unknown campaign
+//!   **and** for a malformed/non-UUID path segment, matching
+//!   `GET /events/{event_id}`'s conventions rather than inventing new ones.
+//!   Returns `200 {campaign_id, runs: [...], total_cost_usd, total_tokens,
+//!   possibly_truncated}` — every run [`crate::live_state::LiveStateStore::list_campaign_runs`]
+//!   currently knows belongs to the campaign (both still-live and retained
+//!   completed runs), plus the `EN.11.G` per-block cost/token figures
+//!   `OrchestrationRunNode` stamps into the parent run's own
+//!   `campaign_members` (`EN.11.E` task 3), rolled up. `total_cost_usd`
+//!   stays tri-state (`null` when no member reported a cost, never `0.0`);
+//!   `total_tokens` sums as a plain `u64`. `possibly_truncated` mirrors
+//!   [`crate::live_state::CampaignLookup::possibly_truncated`] — `true`
+//!   means the completed ring may already have evicted an earlier member.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -137,7 +151,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/approvals/ledger",
             web::get().to(crate::approvals::list_ledger),
-        );
+        )
+        // `EN.11.E` task 5. No literal `/campaigns/...` segment exists yet,
+        // so `{id}` cannot shadow anything today — but per this file's
+        // established first-registration-wins trap (see `/events/suspended`
+        // and `/approvals/ledger/stats` above), any future literal segment
+        // under `/campaigns/` MUST be registered before this route.
+        .route("/campaigns/{id}", web::get().to(get_campaign));
 }
 
 async fn health() -> impl Responder {
@@ -609,6 +629,109 @@ async fn get_event(
     }
 
     HttpResponse::NotFound().json(serde_json::json!({ "error": "unknown or malformed event_id" }))
+}
+
+/// `GET /campaigns/{id}` (`EN.11.E` task 5) — the campaign readback: `200
+/// {campaign_id, runs: [...], total_cost_usd, total_tokens,
+/// possibly_truncated}`. `X-API-Key` gated (401 without it); `404` for an
+/// unknown campaign **and** for a malformed/non-UUID path segment —
+/// deliberately mirroring [`get_event`]'s convention rather than inventing
+/// a `400` for the malformed case.
+///
+/// Delegates run discovery entirely to
+/// [`crate::live_state::LiveStateStore::list_campaign_runs`] (task 4), which
+/// already consults both the live map and the completed ring. The cost/token
+/// rollup reads `campaign_members` off whichever member run's own snapshot
+/// carries it — today that is exactly the parent `ORCHESTRATION` run, which
+/// `OrchestrationRunNode::process` stamps with one entry per executed step
+/// (task 3, `EN.11.G`'s per-block figures). `total_cost_usd` stays
+/// `Option<f64>` end to end so a campaign where nothing reported a cost
+/// reads back `null`, never `0.0` — collapsing that is the exact
+/// `total_cost_usd: -0.0` bug `ExecutionOutcome::cost_usd`'s doc comment
+/// warns about, and a rollup is where it would do the most damage.
+/// `total_tokens` sums as a plain `u64` — an absent token figure is a true
+/// zero, per the same doc.
+async fn get_campaign(
+    path: web::Path<String>,
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if !check_api_key(&req, &state.api_key) {
+        return HttpResponse::Unauthorized().finish();
+    }
+
+    let raw_id = path.into_inner();
+    let campaign_id = match Uuid::parse_str(&raw_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return HttpResponse::NotFound()
+                .json(serde_json::json!({ "error": "unknown or malformed campaign_id" }));
+        }
+    };
+
+    let lookup = state.live.list_campaign_runs(campaign_id);
+    if lookup.runs.is_empty() {
+        return HttpResponse::NotFound()
+            .json(serde_json::json!({ "error": "unknown or malformed campaign_id" }));
+    }
+
+    let runs: Vec<serde_json::Value> = lookup
+        .runs
+        .iter()
+        .map(|r| {
+            let status = if r.terminal {
+                derive_terminal_status(&r.snapshot)
+            } else {
+                derive_live_status(&r.snapshot)
+            };
+            serde_json::json!({
+                "event_id": r.run_id,
+                "workflow_type": r
+                    .workflow_type
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                "status": status,
+                "created_at": r.ordering_key,
+                "updated_at": r.ordering_key,
+            })
+        })
+        .collect();
+
+    // Roll up the `EN.11.G` per-block cost/token figures `OrchestrationRunNode`
+    // stamped into the parent run's own `nodes[NODE_NAME]["campaign_members"]`
+    // (task 3). `cost_usd` stays tri-state: only fold in a member's figure
+    // when it is present, and leave `total_cost_usd` at `None` (-> JSON
+    // `null`) when nothing in the whole campaign reported one.
+    let mut total_cost_usd: Option<f64> = None;
+    let mut total_tokens: u64 = 0;
+    for r in &lookup.runs {
+        let Some(node) = r
+            .snapshot
+            .nodes
+            .get(engine_core::workflows::orchestration::graph::NODE_NAME)
+        else {
+            continue;
+        };
+        let Some(members) = node.get("campaign_members").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for member in members {
+            if let Some(cost) = member.get("cost_usd").and_then(|v| v.as_f64()) {
+                total_cost_usd = Some(total_cost_usd.unwrap_or(0.0) + cost);
+            }
+            if let Some(tokens) = member.get("total_tokens").and_then(|v| v.as_u64()) {
+                total_tokens += tokens;
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "campaign_id": campaign_id,
+        "runs": runs,
+        "total_cost_usd": total_cost_usd,
+        "total_tokens": total_tokens,
+        "possibly_truncated": lookup.possibly_truncated,
+    }))
 }
 
 #[cfg(test)]
@@ -2238,6 +2361,215 @@ mod tests {
 
             let unknown_run_id = Uuid::new_v4();
             assert_eq!(live_run_workflow_type(unknown_run_id), None);
+        }
+    }
+
+    /// `EN.11.E` task 5: `GET /campaigns/{id}` driven at the HTTP level
+    /// through `actix_web::test` against the real `configure` router — the
+    /// acceptance criterion is a REGISTERED route, so a handler-level test
+    /// would pass on a tree that built the handler but forgot to wire it
+    /// in, exactly the trap `get_event`'s own tests avoid. Runs are seeded
+    /// directly via `LiveStateStore::mark_terminal` rather than driving a
+    /// real workflow — task 4's `list_campaign_runs` and its resolution
+    /// order are already covered by `live_state.rs`'s own unit tests; this
+    /// module only has to prove the route surfaces that data correctly.
+    mod campaign_route_tests {
+        use super::*;
+
+        fn context_with_event(event: serde_json::Value) -> TaskContext {
+            TaskContext {
+                event,
+                nodes: StdHashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: StdHashMap::new(),
+            }
+        }
+
+        /// A parent `ORCHESTRATION` run's snapshot: the campaign id and the
+        /// `EN.11.G` per-block cost/token rollup live in its own
+        /// `nodes[NODE_NAME]` entry (`EN.11.E` task 3's stamp), never on
+        /// `event`.
+        fn orchestration_context_with_campaign(
+            campaign_id: Uuid,
+            members: serde_json::Value,
+        ) -> TaskContext {
+            let mut ctx = context_with_event(serde_json::Value::Null);
+            ctx.nodes.insert(
+                engine_core::workflows::orchestration::graph::NODE_NAME.to_string(),
+                serde_json::json!({
+                    "campaign_id": campaign_id.to_string(),
+                    "campaign_members": members,
+                }),
+            );
+            ctx
+        }
+
+        /// A child `SDLC_FLOW` run's snapshot: the campaign id lands on its
+        /// own `event` (`EN.11.E` task 2's wire seam), never in `nodes`.
+        fn sdlc_flow_context_with_campaign(campaign_id: Uuid) -> TaskContext {
+            context_with_event(serde_json::json!({ "campaign_id": campaign_id.to_string() }))
+        }
+
+        #[actix_web::test]
+        async fn get_campaign_without_api_key_is_rejected() {
+            let state = test_app_state();
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::get()
+                .uri(&format!("/campaigns/{}", Uuid::new_v4()))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 401);
+        }
+
+        #[actix_web::test]
+        async fn get_campaign_malformed_id_returns_404_not_500() {
+            let state = test_app_state();
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::get()
+                .uri("/campaigns/not-a-uuid")
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 404);
+        }
+
+        #[actix_web::test]
+        async fn get_campaign_unknown_id_returns_404() {
+            let state = test_app_state();
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::get()
+                .uri(&format!("/campaigns/{}", Uuid::new_v4()))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 404);
+        }
+
+        /// The headline HTTP-level test: a two-run campaign (one parent
+        /// `ORCHESTRATION` run carrying the `EN.11.G` rollup, one child
+        /// `SDLC_FLOW` run carrying only the wire-seam campaign id) comes
+        /// back under one campaign id, with the tri-state cost rollup and a
+        /// `u64` token total.
+        #[actix_web::test]
+        async fn get_campaign_returns_both_runs_with_cost_rollup() {
+            let state = test_app_state();
+            let live = state.live.clone();
+            let campaign_id = Uuid::new_v4();
+            let now = Utc::now();
+
+            let parent_id = Uuid::new_v4();
+            let parent_snapshot = orchestration_context_with_campaign(
+                campaign_id,
+                serde_json::json!([
+                    { "repo": "engine-rs", "block_id": "EN.1", "cost_usd": 1.5, "total_tokens": 100 },
+                    { "repo": "engine-rs", "block_id": "EN.2", "cost_usd": null, "total_tokens": 50 },
+                ]),
+            );
+            live.mark_terminal(parent_id, &parent_snapshot, "ORCHESTRATION", now, now);
+
+            let child_id = Uuid::new_v4();
+            let child_snapshot = sdlc_flow_context_with_campaign(campaign_id);
+            live.mark_terminal(child_id, &child_snapshot, "SDLC_FLOW", now, now);
+
+            // A run from a DIFFERENT campaign must never leak into this one.
+            let other_id = Uuid::new_v4();
+            let other_snapshot = sdlc_flow_context_with_campaign(Uuid::new_v4());
+            live.mark_terminal(other_id, &other_snapshot, "SDLC_FLOW", now, now);
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::get()
+                .uri(&format!("/campaigns/{campaign_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), 200);
+
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["campaign_id"], serde_json::json!(campaign_id));
+
+            let runs = body["runs"].as_array().expect("runs should be an array");
+            assert_eq!(runs.len(), 2, "the other campaign's run must not appear");
+            let run_ids: Vec<serde_json::Value> =
+                runs.iter().map(|r| r["event_id"].clone()).collect();
+            assert!(run_ids.contains(&serde_json::json!(parent_id)));
+            assert!(run_ids.contains(&serde_json::json!(child_id)));
+            assert!(!run_ids.contains(&serde_json::json!(other_id)));
+            for r in runs {
+                assert_eq!(r["status"], "succeeded");
+            }
+
+            // Tri-state: one member reported $1.5, the other reported
+            // nothing -- the total is the SUM of what was reported, never
+            // a silently-zeroed member.
+            assert_eq!(body["total_cost_usd"], serde_json::json!(1.5));
+            assert_eq!(body["total_tokens"], serde_json::json!(150));
+            assert_eq!(body["possibly_truncated"], serde_json::json!(false));
+        }
+
+        /// A campaign where every member's `cost_usd` was `null` must roll
+        /// up to `null`, never to `0.0` — the exact `total_cost_usd: -0.0`
+        /// collapse `ExecutionOutcome::cost_usd`'s doc comment warns
+        /// against.
+        #[actix_web::test]
+        async fn get_campaign_cost_rollup_is_null_when_nothing_reported() {
+            let state = test_app_state();
+            let live = state.live.clone();
+            let campaign_id = Uuid::new_v4();
+            let now = Utc::now();
+
+            let parent_id = Uuid::new_v4();
+            let parent_snapshot = orchestration_context_with_campaign(
+                campaign_id,
+                serde_json::json!([
+                    { "repo": "engine-rs", "block_id": "EN.1", "cost_usd": null, "total_tokens": 0 },
+                ]),
+            );
+            live.mark_terminal(parent_id, &parent_snapshot, "ORCHESTRATION", now, now);
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::get()
+                .uri(&format!("/campaigns/{campaign_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), 200);
+
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["total_cost_usd"], serde_json::Value::Null);
+            assert_eq!(body["total_tokens"], serde_json::json!(0));
         }
     }
 

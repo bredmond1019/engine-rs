@@ -1118,13 +1118,7 @@ mod tests {
         // Fill the ring to capacity with unrelated runs, then add one
         // member of the campaign under test.
         for _ in 0..COMPLETED_RUN_RETENTION {
-            store.mark_terminal(
-                Uuid::new_v4(),
-                &fixture_context("filler"),
-                "wf",
-                now,
-                now,
-            );
+            store.mark_terminal(Uuid::new_v4(), &fixture_context("filler"), "wf", now, now);
         }
         let member = Uuid::new_v4();
         store.mark_terminal(
