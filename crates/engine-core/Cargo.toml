@@ -23,6 +23,7 @@ mev = { workspace = true }
 okf-core = { workspace = true }
 sha2 = { workspace = true }
 term-core = { path = "../term-core", features = ["tokio"] }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
