@@ -269,6 +269,20 @@ impl CorpusGates {
     /// `is_edge_met(repo, block_id)`: true iff the target block's authored `status`
     /// is exactly `"closed"`.
     ///
+    /// **`wontfix` vs `closed` (`EN.11.J` Task 3):** the fleet has two different
+    /// notions of "done enough". `focus.next` (what mev surfaces as the next thing to
+    /// *work on*) accepts `closed|wontfix` — a block a human deliberately abandoned
+    /// should not keep dangling as "next up". The **frontier** (what gates whether a
+    /// *dependent* block may start — `mev lane-frontier`, and this reader) accepts
+    /// only `closed`. This method implements the frontier's notion, deliberately:
+    /// `is_edge_met` answers "is it safe for something that depends on this to
+    /// start", and a `wontfix` target means the work the dependent needed was never
+    /// done — admitting the dependent would silently launder an abandoned dependency
+    /// into a satisfied one. So `"wontfix"` is treated exactly like `"open"` or
+    /// `"deferred"`: NOT met. This is a deliberate divergence from `focus.next`, not
+    /// an oversight — do not "fix" it to also accept `wontfix` without re-reading
+    /// this comment.
+    ///
     /// `"deferred"` is NOT met — a deferred block is deliberately parked, not done.
     /// Any other authored status (`"open"`, `"in_progress"`, `None`) is likewise not
     /// met. An unknown block id (absent from every track in `repo`'s `state.json`) is
@@ -295,8 +309,11 @@ impl CorpusGates {
     /// `is_block_open(token)`: the `HELD-UNTIL` token is opaque text with no repo of
     /// its own, so this searches every repo [`RepoRegistry`] currently knows (in
     /// registry order) for a block whose id matches `token`. The first match wins:
-    /// "open" means that block's status is anything other than `"closed"` (mirroring
-    /// [`Self::is_edge_met`]'s notion of done).
+    /// "open" means that block's status is anything other than `"closed"` — including
+    /// `"wontfix"`, kept CONSISTENT with [`Self::is_edge_met`]'s frontier notion of
+    /// done (see that method's doc for the `focus.next` vs frontier distinction): a
+    /// `HELD-UNTIL` naming a `wontfix` block is still held, never treated as if the
+    /// hold had cleared.
     ///
     /// A token that matches no block id anywhere in the registered repos cannot be
     /// resolved here — it is either an operator-gate slug (which this module has no
@@ -497,6 +514,43 @@ repo_path = "repo-b"
             assert!(gates.is_edge_met("repo-b", "B.1"));
             assert!(!gates.is_edge_met("repo-b", "B.2"));
             assert!(!gates.is_edge_met("repo-b", "B.3"), "deferred is not met");
+            assert!(gates.take_error().is_none());
+        });
+    }
+
+    #[test]
+    fn is_edge_met_wontfix_is_not_met_frontier_diverges_from_focus_next() {
+        env_guarded(|| {
+            // `focus.next` accepts `closed|wontfix`; the frontier (this reader)
+            // accepts only `closed`. Pin that a `wontfix` target is NOT met — an
+            // abandoned dependency must not silently unblock a dependent block.
+            let dir = two_repo_brain_root(
+                &state_json(r#"{"id": "A.1", "title": "a1", "status": "open"}"#),
+                &state_json(r#"{"id": "B.1", "title": "b1", "status": "wontfix"}"#),
+            );
+            let gates = CorpusGates::new(registry_for(&dir));
+
+            assert!(
+                !gates.is_edge_met("repo-b", "B.1"),
+                "wontfix must not be conflated with closed"
+            );
+            assert!(gates.take_error().is_none());
+        });
+    }
+
+    #[test]
+    fn is_block_open_wontfix_still_reports_open_consistent_with_is_edge_met() {
+        env_guarded(|| {
+            let dir = two_repo_brain_root(
+                &state_json(r#"{"id": "A.1", "title": "a1", "status": "open"}"#),
+                &state_json(r#"{"id": "B.1", "title": "b1", "status": "wontfix"}"#),
+            );
+            let gates = CorpusGates::new(registry_for(&dir));
+
+            assert!(
+                gates.is_block_open("B.1"),
+                "wontfix is still 'open' for HELD-UNTIL purposes, matching is_edge_met's frontier notion"
+            );
             assert!(gates.take_error().is_none());
         });
     }
