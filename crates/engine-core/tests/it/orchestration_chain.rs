@@ -692,6 +692,8 @@ fn outcome_with_state_file(
             node_runs: HashMap::new(),
         },
         use_worktree: false,
+        cost_usd: None,
+        total_tokens: 0,
     };
     (repo_root, outcome)
 }

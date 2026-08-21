@@ -975,6 +975,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         assert!(verify_state_write(&outcome).is_ok());
     }
@@ -994,6 +996,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteMismatch { .. }));
@@ -1016,6 +1020,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteUnreadable { .. }));
@@ -1096,6 +1102,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         }
     }
 
@@ -1207,6 +1215,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         append_lane_log_line(dir.path(), &entry).unwrap();
@@ -1236,6 +1246,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         let value = serde_json::to_value(&entry).unwrap();
@@ -1266,6 +1278,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         let closed_entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         assert_eq!(closed_entry.status, LaneLogStatus::Closed);
@@ -1289,6 +1303,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         let outcome_b = ExecutionOutcome {
             repo: "repo-b".into(),
@@ -1301,6 +1317,8 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            cost_usd: None,
+            total_tokens: 0,
         };
         append_lane_log_line(
             dir.path(),

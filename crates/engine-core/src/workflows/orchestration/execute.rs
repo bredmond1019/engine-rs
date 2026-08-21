@@ -48,6 +48,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use engine_contract::{NodeRunStatus, TaskContext};
+
+use crate::budget::BudgetLedger;
+use crate::workflow::node_cost_usd;
 use serde_json::json;
 
 use crate::completion::derive_terminal_status;
@@ -296,6 +299,46 @@ pub struct ExecutionOutcome {
     /// attribute observed cost/behavior to the setting that produced it,
     /// per CLAUDE.md standing rule 6.
     pub use_worktree: bool,
+    /// This step's observed cost (USD), folded from `ctx` via
+    /// [`step_spend`] — attributable to THIS `ChainStep` alone, never
+    /// accumulated across steps (`EN.11.G` task 2).
+    ///
+    /// `Some(0.0)` means the child ran and every node that reported a
+    /// cost figure reported exactly `$0`. `None` means no node in the
+    /// child's `ctx.nodes` reported a cost figure at all — there is
+    /// nothing to distinguish that from "zero" once collapsed to a bare
+    /// `f64`, which is exactly the silently-wrong shape
+    /// smoke-run.md §3.6 recorded (`total_cost_usd: -0.0` for a child
+    /// that actually ran real nodes). Collapsing this to `f64` anywhere
+    /// downstream reintroduces that bug — keep it `Option`.
+    pub cost_usd: Option<f64>,
+    /// This step's observed `input_tokens + output_tokens` total, folded
+    /// from `ctx` via [`step_spend`]. Unlike `cost_usd`, a token total of
+    /// `0` is unambiguous — every `NodeRun.usage` that IS present carries
+    /// real token counts, so summing an empty or absent set is a true
+    /// zero, not a "we don't know".
+    pub total_tokens: u64,
+}
+
+/// Fold a completed child run's `ctx` into this step's own spend figures —
+/// never the running chain total, only what THIS step's nodes reported.
+/// Reuses [`BudgetLedger::from_context`] for the summing arithmetic (the
+/// same reader `Workflow::run`'s own budget gate and a resume's lossy
+/// ledger restore already trust) rather than re-deriving it here.
+///
+/// `cost_usd` is `None` unless at least one node identity in `ctx.nodes`
+/// carries a `"cost_usd"` number — see [`ExecutionOutcome::cost_usd`]'s
+/// doc for why this must stay a tri-state rather than collapsing "no node
+/// reported a cost" and "every node reported exactly zero" into the same
+/// bare `0.0`.
+fn step_spend(ctx: &TaskContext) -> (Option<f64>, u64) {
+    let ledger = BudgetLedger::from_context(ctx);
+    let any_cost_reported = ctx
+        .nodes
+        .keys()
+        .any(|identity| node_cost_usd(ctx, identity).is_some());
+    let cost_usd = any_cost_reported.then(|| ledger.total_cost_usd());
+    (cost_usd, ledger.total_tokens())
 }
 
 // ── Execution ────────────────────────────────────────────────────────────
@@ -380,12 +423,16 @@ pub async fn execute_step(
         });
     }
 
+    let (cost_usd, total_tokens) = step_spend(&ctx);
+
     Ok(ExecutionOutcome {
         repo: step.repo.clone(),
         repo_path,
         block_id: step.block_id.clone(),
         ctx,
         use_worktree,
+        cost_usd,
+        total_tokens,
     })
 }
 
@@ -712,6 +759,102 @@ mod tests {
             .expect("a run with no failed nodes should be integrated as success");
 
         assert_eq!(outcome.block_id, "A.1");
+    }
+
+    // ── Per-step cost/token attribution (EN.11.G task 2) ────────────────
+
+    /// A `FlowRunner` test double returning a fixed `TaskContext` whose
+    /// `nodes`/`node_runs` carry a known cost/usage shape — the smallest
+    /// fixture that lets a test assert `ExecutionOutcome.cost_usd` /
+    /// `.total_tokens` against a figure the test itself picked.
+    fn runner_with_usage(
+        node_name: &'static str,
+        cost_usd: f64,
+        input: u64,
+        output: u64,
+    ) -> FlowRunner {
+        Arc::new(move |_invocation: FlowInvocation| {
+            let mut nodes = std::collections::HashMap::new();
+            nodes.insert(node_name.to_string(), json!({"cost_usd": cost_usd}));
+            let mut node_runs = std::collections::HashMap::new();
+            node_runs.insert(
+                node_name.to_string(),
+                engine_contract::NodeRun {
+                    status: NodeRunStatus::Success,
+                    started_at: None,
+                    completed_at: None,
+                    error: None,
+                    input: None,
+                    usage: Some(engine_contract::Usage {
+                        input_tokens: Some(input),
+                        output_tokens: Some(output),
+                        model: "claude-sonnet-4-5".to_string(),
+                    }),
+                },
+            );
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes,
+                    metadata: json!({}),
+                    node_runs,
+                })
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_steps_outcome_carries_its_own_observed_cost_and_tokens() {
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let runner = runner_with_usage("SomeNode", 1.25, 100, 200);
+
+        let s = step("repo-a", "A.1");
+        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false)
+            .await
+            .expect("step should execute");
+
+        assert_eq!(outcome.cost_usd, Some(1.25));
+        assert_eq!(outcome.total_tokens, 300);
+    }
+
+    #[tokio::test]
+    async fn a_child_that_reports_no_usage_at_all_yields_an_explicit_absent_figure() {
+        // recording_runner's fixed TaskContext has empty `nodes` AND empty
+        // `node_runs` — no node ever reported a cost or usage figure. This
+        // must surface as `None`, never a bare `0.0` that reads as "spent
+        // nothing" when the truth is "we don't know" (smoke-run.md §3.6).
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let (runner, _calls) = recording_runner();
+
+        let s = step("repo-a", "A.1");
+        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false)
+            .await
+            .expect("step should execute");
+
+        assert_eq!(outcome.cost_usd, None);
+        assert_eq!(outcome.total_tokens, 0);
+    }
+
+    #[test]
+    fn step_spend_reports_an_explicit_zero_when_every_node_reported_exactly_zero() {
+        // Distinct from the "no node reported anything" case above: here a
+        // node DID report a cost figure, and that figure happens to be
+        // zero — `Some(0.0)`, never collapsed to the same `None` as "no
+        // figure at all".
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert("SomeNode".to_string(), json!({"cost_usd": 0.0}));
+        let ctx = TaskContext {
+            event: json!({}),
+            nodes,
+            metadata: json!({}),
+            node_runs: std::collections::HashMap::new(),
+        };
+
+        let (cost_usd, total_tokens) = step_spend(&ctx);
+        assert_eq!(cost_usd, Some(0.0));
+        assert_eq!(total_tokens, 0);
     }
 
     // ── resolve_isolation ────────────────────────────────────────────
