@@ -1,6 +1,7 @@
 //! `CloseBlockNode` — closes this run's block in `planning/state.json`,
-//! through mev, under mev's own guards
-//! (`EN.ticket.wrap-up-closes-the-block`, task 3).
+//! through mev, under mev's own guards, with validate-then-rollback on a
+//! net-new diagnostic
+//! (`EN.ticket.wrap-up-closes-the-block`, tasks 3-4).
 //!
 //! Nothing in this workflow ever flipped `tracks[].blocks[].status` to
 //! `"closed"`, so ORCHESTRATION's readiness resolution (which reads block
@@ -43,6 +44,35 @@
 //! (`core/mev/planning/blocks/MV.ticket.set-block-status-cli-only-guards.json`)
 //! and referenced here rather than duplicated further.
 //!
+//! ## Validate-then-rollback on the authored write, composed from mev's own
+//! ## primitives (task 4)
+//!
+//! **Confirmed by reading `mev::set_block_status` (`mev/src/lib.rs:977`):
+//! the authored `state.json` write it makes is NOT already wrapped in
+//! `apply_with_rollback_on_regression`** — that guard exists (`lib.rs:1615`)
+//! but is only ever applied, internally, to the *derived* views
+//! `set_block_status` chains into via `emit_state` on success (master-plan
+//! tables, project caches, tier rollups, boards, …). The one authored write —
+//! the block's own `status` field — goes straight through `apply_plan` with
+//! no regression check of its own. So this node's guard is NOT redundant
+//! with mev's: it covers exactly the one write mev leaves unguarded, and
+//! must NOT be widened to re-wrap the derived-view writes mev already
+//! protects — that would be a second, drifting copy of a contract mev owns.
+//!
+//! The guard: snapshot the pre-write revision counter for the target
+//! `state.json`, `mev::validate_brain_state` before, call
+//! `mev::set_block_status`, `mev::validate_brain_state` after. Attribution
+//! is by NET-NEW DELTA, never by path — a write can surface a diagnostic on
+//! a *different* file, so a path-scoped check would miss exactly the class
+//! this exists to catch, and a diagnostic present in both sets (a
+//! pre-existingly red corpus) must never trigger a rollback. On a net-new
+//! diagnostic, restore via the exact revision `apply_plan` recorded of the
+//! pre-write bytes (`mev::read_revision` + `mev::write_atomic`) — the same
+//! primitives `mev state-history --restore` itself composes
+//! (`mev/src/main.rs:1080-1099`), called in-process here rather than shelled
+//! out to. **No byte snapshot of our own is taken** — the restore source is
+//! always mev's own `.mev-history` store.
+//!
 //! ## Outcomes
 //!
 //! Every branch is a NAMED, non-error [`CloseOutcome`] stamped into
@@ -54,9 +84,9 @@
 //! - `CLOSED:<repo:id>` — the block closed cleanly.
 //! - `NOT_FOUND` — `block_id` named no registered block. Not an error: a
 //!   stale or hand-typed `block_id` must not fail the run.
-//! - `REJECTED:<repo:id>` — reserved for task 4's validate-then-rollback
-//!   wrapper (net-new `[E_`/`[W_` diagnostic after the write); not yet
-//!   produced by this task.
+//! - `REJECTED:<repo:id>` — a net-new `[E_`/`[W_` diagnostic appeared after
+//!   the write; rolled back via mev's own `.mev-history` revision, block
+//!   stays open.
 //! - `LOCK_HELD` — the advisory lock is held by another process; the
 //!   holder's pid is carried in the outcome, never silently waited out.
 //! - `OPERATOR_GATED` — the block carries an unmet D71 operator edge.
@@ -68,6 +98,7 @@
 //!   `block_id` on this run, no worktree to resolve a root from, or no
 //!   `planning/state.json` under it.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -77,7 +108,7 @@ use serde_json::json;
 use mev::brain::config::{find_brain_config, find_brain_root};
 use mev::brain::lock::{acquire_lock, LockError, DEFAULT_LOCK_TIMEOUT};
 use mev::brain::state::{discover_state_files, load_state, BlockedBy};
-use mev::{Report, Severity};
+use mev::{list_revisions, read_revision, write_atomic, Diagnostic, Report, Severity};
 
 use crate::node::{Node, NodeError};
 
@@ -102,8 +133,7 @@ pub enum CloseOutcome {
     /// `block_id` named no registered block (`E_BLOCK_NOT_FOUND`).
     NotFound { key: String },
     /// A net-new diagnostic appeared after the write and mev's own history
-    /// was used to restore; the block stayed open. Produced by task 4's
-    /// validate-then-rollback wrapper, not by this task.
+    /// was used to restore; the block stayed open.
     Rejected { key: String, net_new: Vec<String> },
     /// The advisory `.mev-emit.lock` is held by another process.
     LockHeld { holder_pid: u32, waited_secs: u64 },
@@ -288,6 +318,56 @@ fn block_has_unmet_operator_gate(root: &Path, key: &str) -> Option<bool> {
     None
 }
 
+/// Resolve the absolute path of the `state.json` this close will write:
+/// the loaded `StateSource` whose `repo_slug` matches `repo_slug`, found the
+/// same way [`block_has_unmet_operator_gate`] resolves a block's home file.
+/// `None` when no state.json is registered for that repo slug — the caller
+/// falls back to letting `mev::set_block_status`'s own diagnostics (e.g.
+/// `E_BLOCK_NOT_FOUND`) explain why, rather than failing here first.
+fn resolve_state_path(root: &Path, repo_slug: &str) -> Option<PathBuf> {
+    let config = find_brain_config(root).ok()?;
+    let (sources, _diags) = discover_state_files(root, &config);
+    sources
+        .into_iter()
+        .find(|src| src.repo_slug == repo_slug)
+        .map(|src| src.abs_path)
+}
+
+/// A diagnostic's identity for net-new comparison: severity, file, locator,
+/// and message together — `Diagnostic` carries no `PartialEq`, and identity
+/// must include `file` precisely because attribution is by delta, never by
+/// path (a write can surface a diagnostic on a *different* file than the
+/// one it touched).
+fn diagnostic_identity(d: &Diagnostic) -> String {
+    format!(
+        "{:?}|{}|{}|{}",
+        d.severity,
+        d.file.display(),
+        d.locator,
+        d.message
+    )
+}
+
+/// Human-readable rendering of a diagnostic for a `REJECTED` outcome's
+/// `net_new` list.
+fn render_diagnostic(d: &Diagnostic) -> String {
+    format!("[{}] {} ({})", d.locator, d.message, d.file.display())
+}
+
+/// Diagnostics present in `after` but not in `before`, by
+/// [`diagnostic_identity`]. A diagnostic present in both — a pre-existingly
+/// red corpus — is never net-new, so a permanently red corpus can still
+/// close a block.
+fn net_new_diagnostics(before: &Report, after: &Report) -> Vec<String> {
+    let before_ids: HashSet<String> = before.diagnostics.iter().map(diagnostic_identity).collect();
+    after
+        .diagnostics
+        .iter()
+        .filter(|d| !before_ids.contains(&diagnostic_identity(d)))
+        .map(render_diagnostic)
+        .collect()
+}
+
 /// Classify a completed `mev::set_block_status` [`Report`] into a
 /// [`CloseOutcome`]. `E_BLOCK_NOT_FOUND` maps to [`CloseOutcome::NotFound`]
 /// (not an error — see the ticket's acceptance criteria); any other
@@ -326,8 +406,23 @@ fn classify_report(key: &str, report: &Report) -> CloseOutcome {
 
 /// The guarded close itself: operator gate, then the advisory lock (held
 /// across the write, released via `LockGuard`'s `Drop` on every exit path
-/// below), then `mev::set_block_status(root, key, "closed", true)`.
-fn attempt_close(root: &Path, key: &str, lock_timeout: Duration) -> CloseOutcome {
+/// below), then `mev::set_block_status(root, key, "closed", true)` wrapped
+/// in the validate-then-rollback guard (module doc comment, "task 4").
+///
+/// Production always calls this through [`attempt_close`], which supplies
+/// real `mev::validate_brain_state` as `validate`. Tests inject a fake
+/// `validate` that returns two canned [`Report`]s (baseline, then after) so
+/// the net-new and pre-existing-diagnostic branches are reachable without
+/// needing a real corpus defect to appear as a side effect of a real close —
+/// while the write, the lock, the operator gate, and the restore itself
+/// still go through real mev calls and real files, per the testing strategy.
+fn attempt_close_with_validator(
+    root: &Path,
+    key: &str,
+    repo_slug: &str,
+    lock_timeout: Duration,
+    mut validate: impl FnMut(&Path) -> Result<Report, String>,
+) -> CloseOutcome {
     if let Some(true) = block_has_unmet_operator_gate(root, key) {
         return CloseOutcome::OperatorGated {
             key: key.to_string(),
@@ -356,12 +451,111 @@ fn attempt_close(root: &Path, key: &str, lock_timeout: Duration) -> CloseOutcome
         }
     };
 
-    match mev::set_block_status(root, key, "closed", true) {
-        Ok(report) => classify_report(key, &report),
-        Err(err) => CloseOutcome::Unvalidated {
-            reason: format!("mev::set_block_status errored: {err}"),
+    // The state.json this close will (or will not) write. `None` means no
+    // state.json is registered for this repo slug at all — fall through to
+    // `set_block_status` directly and let its own diagnostics (typically
+    // `E_BLOCK_NOT_FOUND`) explain why, rather than failing on our own
+    // resolution first.
+    let Some(state_path) = resolve_state_path(root, repo_slug) else {
+        return match mev::set_block_status(root, key, "closed", true) {
+            Ok(report) => classify_report(key, &report),
+            Err(err) => CloseOutcome::Unvalidated {
+                reason: format!("mev::set_block_status errored: {err}"),
+            },
+        };
+    };
+
+    // Revision counter before the write — if the write actually happens,
+    // `apply_plan` records the pre-write bytes as the very next revision
+    // (mev/src/brain/emit.rs:3610-3634), so this is the restore target on
+    // rollback.
+    let seq_before = list_revisions(&state_path)
+        .map(|revs| revs.last().map(|r| r.seq).unwrap_or(0))
+        .unwrap_or(0);
+
+    let baseline = match validate(root) {
+        Ok(report) => report,
+        Err(err) => {
+            return CloseOutcome::Unvalidated {
+                reason: format!("could not validate corpus before close: {err}"),
+            };
+        }
+    };
+
+    let close_report = match mev::set_block_status(root, key, "closed", true) {
+        Ok(report) => report,
+        Err(err) => {
+            return CloseOutcome::Unvalidated {
+                reason: format!("mev::set_block_status errored: {err}"),
+            };
+        }
+    };
+    let outcome = classify_report(key, &close_report);
+    let CloseOutcome::Closed { .. } = &outcome else {
+        // NotFound / Unvalidated: `set_block_status` took no action on this
+        // key, so there is nothing to have regressed and nothing to
+        // validate around.
+        return outcome;
+    };
+
+    // Did a real write happen, or was this the already-closed fixed point
+    // (no action planned, nothing on disk changed)? `set_block_status`
+    // extends its report with `apply_plan`'s own diagnostics, and
+    // `I_EMIT_WROTE` is only pushed for an action that was actually
+    // applied.
+    let wrote = close_report
+        .diagnostics
+        .iter()
+        .any(|d| d.locator == "I_EMIT_WROTE" && d.file == state_path);
+    if !wrote {
+        return outcome;
+    }
+
+    let after = match validate(root) {
+        Ok(report) => report,
+        Err(err) => {
+            return CloseOutcome::Unvalidated {
+                reason: format!("could not validate corpus after close: {err}"),
+            };
+        }
+    };
+
+    let net_new = net_new_diagnostics(&baseline, &after);
+    if net_new.is_empty() {
+        return outcome;
+    }
+
+    // Net-new diagnostic(s) — roll back via mev's own `.mev-history` undo,
+    // never a hand-rolled byte snapshot. The revision counter grew by
+    // exactly one on a real write (checked above), so `seq_before + 1` is
+    // the revision `apply_plan` recorded of the pre-write bytes.
+    let restore_seq = seq_before + 1;
+    match read_revision(&state_path, restore_seq)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| write_atomic(&state_path, &bytes).map_err(|e| e.to_string()))
+    {
+        Ok(()) => CloseOutcome::Rejected {
+            key: key.to_string(),
+            net_new,
+        },
+        Err(reason) => CloseOutcome::Unvalidated {
+            reason: format!(
+                "close of '{key}' introduced net-new diagnostic(s) but the mev-history \
+                 restore failed ({reason}) — {} may be left in the WRITTEN (not rolled \
+                 back) state; net-new: {}",
+                state_path.display(),
+                net_new.join("; ")
+            ),
         },
     }
+}
+
+/// Production entry point: [`attempt_close_with_validator`] with real
+/// `mev::validate_brain_state` as the validator.
+fn attempt_close(root: &Path, key: &str, repo_slug: &str, lock_timeout: Duration) -> CloseOutcome {
+    attempt_close_with_validator(root, key, repo_slug, lock_timeout, |root| {
+        mev::validate_brain_state(root).map_err(|e| e.to_string())
+    })
 }
 
 impl CloseBlockNode {
@@ -426,8 +620,9 @@ impl CloseBlockNode {
             }
         };
 
-        let key = format!("{}:{block_id}", repo_slug(ctx));
-        attempt_close(&root, &key, self.lock_timeout)
+        let repo = repo_slug(ctx);
+        let key = format!("{repo}:{block_id}");
+        attempt_close(&root, &key, &repo, self.lock_timeout)
     }
 }
 
@@ -863,5 +1058,109 @@ mod tests {
             block_has_unmet_operator_gate(&root, "not-a-key-shape"),
             None
         );
+    }
+
+    // --- validate-then-rollback (task 4) ---------------------------------
+    //
+    // Both tests inject the `validate` seam ([`attempt_close_with_validator`])
+    // rather than relying on a real corpus defect appearing as a side effect
+    // of a real close, per the testing strategy — the write, the lock, the
+    // operator gate, and (for the rollback case) the restore itself still
+    // go through real mev calls against real files on disk.
+
+    #[test]
+    fn net_new_diagnostic_rolls_back_and_leaves_block_open() {
+        // A second block ("AC.2") in the same track is the "unrelated
+        // authored field" the rollback must not move.
+        let (_dir, repo_dir) =
+            brain_fixture("acme", &[("AC.1", "open", false), ("AC.2", "open", false)]);
+        let root = find_brain_root(&repo_dir).expect("brain root resolves");
+        let state_path = repo_dir.join("planning").join("state.json");
+        let before_raw = std::fs::read_to_string(&state_path).expect("read before");
+
+        let call_count = std::cell::Cell::new(0u32);
+        let outcome = attempt_close_with_validator(
+            &root,
+            "acme:AC.1",
+            "acme",
+            Duration::from_secs(1),
+            |_root| {
+                let n = call_count.get();
+                call_count.set(n + 1);
+                if n == 0 {
+                    // baseline: clean corpus
+                    Ok(Report::default())
+                } else {
+                    // after: a net-new diagnostic — even on a file the write
+                    // never touched, per "attribution is by delta, never by
+                    // path".
+                    Ok(Report {
+                        diagnostics: vec![Diagnostic::error(
+                            Path::new("some/unrelated/file.md"),
+                            "E_FAKE_NET_NEW",
+                            "synthetic regression injected by this test",
+                        )],
+                    })
+                }
+            },
+        );
+
+        match &outcome {
+            CloseOutcome::Rejected { key, net_new } => {
+                assert_eq!(key, "acme:AC.1");
+                assert!(
+                    net_new.iter().any(|line| line.contains("E_FAKE_NET_NEW")),
+                    "net_new must name the diagnostic that triggered rollback, got {net_new:?}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // Restore is byte-identical to the pre-write content — the block's
+        // status is back to "open" AND no unrelated authored field (AC.2)
+        // moved, because the whole file was restored from mev's own
+        // pre-write revision rather than patched field-by-field.
+        let after_raw = std::fs::read_to_string(&state_path).expect("read after");
+        assert_eq!(
+            before_raw, after_raw,
+            "rollback must restore the exact pre-write bytes"
+        );
+        assert!(after_raw.contains(r#""id": "AC.1", "title": "AC.1", "status": "open""#));
+        assert!(!after_raw.contains(r#""id": "AC.1", "title": "AC.1", "status": "closed""#));
+    }
+
+    #[test]
+    fn pre_existing_diagnostic_does_not_roll_back() {
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let root = find_brain_root(&repo_dir).expect("brain root resolves");
+
+        // The SAME diagnostic, present both before and after the write —
+        // a pre-existingly red corpus must not block the close.
+        let outcome = attempt_close_with_validator(
+            &root,
+            "acme:AC.1",
+            "acme",
+            Duration::from_secs(1),
+            |_root| {
+                Ok(Report {
+                    diagnostics: vec![Diagnostic::error(
+                        Path::new("some/other/file.md"),
+                        "E_PRE_EXISTING",
+                        "already red before this write",
+                    )],
+                })
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            CloseOutcome::Closed {
+                key: "acme:AC.1".to_string()
+            }
+        );
+
+        let raw =
+            std::fs::read_to_string(repo_dir.join("planning").join("state.json")).expect("read");
+        assert!(raw.contains("\"closed\""));
     }
 }
