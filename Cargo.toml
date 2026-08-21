@@ -36,6 +36,8 @@ tempfile = "3"
 sha2 = "0.10"
 thiserror = "2"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Dev/test link-time speedup — engine-core alone compiles to 25+ integration-test binaries, each
 # statically linking the whole crate + its dependency graph (tokio/serde/actix-web/sqlx). Both

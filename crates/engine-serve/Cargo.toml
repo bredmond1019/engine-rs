@@ -18,6 +18,8 @@ sqlx = { workspace = true }
 actix-web = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 # Exposes `test_fixtures` (shared Node fixtures for unit + integration
