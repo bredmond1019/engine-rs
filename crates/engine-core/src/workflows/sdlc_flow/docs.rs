@@ -157,7 +157,8 @@ impl Node for PatchDocsNode {
                 );
                 crate::policy::apply_verbosity_directive(prompt, verbosity)
             },
-        );
+        )
+        .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -627,5 +628,41 @@ mod tests {
 
         let result = node.process(ctx).await;
         assert!(result.is_err());
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport for
+    /// `PatchDocsNode`.
+    #[tokio::test]
+    async fn transport_retry_nondefault_changes_observed_attempts() {
+        let policy = SdlcPolicy {
+            transport_retry: crate::workflows::sdlc_flow::policy::TransportRetry {
+                max_attempts: 4,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(&policy);
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let calls = calls.clone();
+            move |_config, _prompt| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = PatchDocsNode::new().with_transport(transport);
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 }

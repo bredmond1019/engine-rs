@@ -209,9 +209,10 @@ impl Node for EndReviewNode {
         config.cwd = Some(std::path::PathBuf::from(&worktree));
         config.json_schema = Some(review_output_schema());
 
-        let step = self
-            .transport
-            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
+        let step = self.transport.apply(
+            ClaudeCodeStep::new(NODE_NAME, config, prompt)
+                .with_retry_policy(policy.transport_retry),
+        );
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -536,6 +537,62 @@ mod tests {
         let result = &out.nodes[NODE_NAME];
         assert_eq!(result["verdict"], json!("PASS"));
         assert_eq!(result["summary"], json!("looks good"));
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport for
+    /// `EndReviewNode`.
+    #[tokio::test]
+    async fn end_only_mode_transport_retry_nondefault_changes_observed_attempts() {
+        let state = state_with_tasks(vec![SDLCTask::new(1, "t1", "d1")]);
+        let mut ctx = TaskContext {
+            event: json!({}),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "LoadTaskStateNode".to_string(),
+            serde_json::to_value(&state).expect("state serializes"),
+        );
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": ".", "branch_name": "sdlc/test", "base_sha": "abc1234" }),
+        );
+        let policy = SdlcPolicy {
+            review_mode: ReviewMode::EndOnly,
+            transport_retry: crate::workflows::sdlc_flow::policy::TransportRetry {
+                max_attempts: 4,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        crate::policy::stamp_resolved_policy(&mut ctx, &policy).expect("policy stamps");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = make_runner(calls.clone(), "diff content");
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let attempts = attempts.clone();
+            move |_config, _prompt| {
+                let attempts = attempts.clone();
+                Box::pin(async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = EndReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

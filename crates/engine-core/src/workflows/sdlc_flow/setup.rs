@@ -943,7 +943,8 @@ impl Node for GenerateTasksNode {
 
         config.json_schema = Some(generated_tasks_schema());
 
-        let mut step = ClaudeCodeStep::new("GenerateTasksNode", config, prompt);
+        let mut step = ClaudeCodeStep::new("GenerateTasksNode", config, prompt)
+            .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -2990,6 +2991,45 @@ repo_path = "alpha"
             serde_json::from_str(&std::fs::read_to_string(dir.join("tasks.json")).unwrap())
                 .unwrap();
         assert_eq!(tasks[0]["max_attempts"], 9);
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport for
+    /// `GenerateTasksNode`.
+    #[tokio::test]
+    async fn generate_transport_retry_nondefault_changes_observed_attempts() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let calls = calls.clone();
+            move |_config, _prompt| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let policy = SdlcPolicy {
+            transport_retry: crate::workflows::sdlc_flow::policy::TransportRetry {
+                max_attempts: 4,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     /// AC2: a model-generated task that declares its own `max_attempts`

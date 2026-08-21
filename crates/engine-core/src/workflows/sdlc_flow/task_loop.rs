@@ -858,7 +858,8 @@ impl Node for ImplementTaskNode {
 
         config.json_schema = Some(implement_output_schema());
 
-        let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt);
+        let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt)
+            .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -1876,9 +1877,10 @@ impl Node for TriageTaskNode {
             apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
         config.json_schema = Some(triage_output_schema());
 
-        let step = self
-            .transport
-            .apply(ClaudeCodeStep::new("TriageTaskNode", config, prompt));
+        let step = self.transport.apply(
+            ClaudeCodeStep::new("TriageTaskNode", config, prompt)
+                .with_retry_policy(policy.transport_retry),
+        );
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -2155,11 +2157,10 @@ impl Node for ConsolidatedReviewNode {
         config.cwd = Some(std::path::PathBuf::from(&worktree));
         config.json_schema = Some(review_output_schema());
 
-        let step = self.transport.apply(ClaudeCodeStep::new(
-            "ConsolidatedReviewNode",
-            config,
-            prompt,
-        ));
+        let step = self.transport.apply(
+            ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt)
+                .with_retry_policy(policy.transport_retry),
+        );
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -2622,7 +2623,7 @@ impl Node for SaveStateNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflows::sdlc_flow::policy::ModelTiers;
+    use crate::workflows::sdlc_flow::policy::{ModelTiers, TransportRetry};
     use claude_code_rs::Outcome;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -3247,6 +3248,48 @@ mod tests {
 
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport when
+    /// `TriageTaskNode` takes the model path.
+    #[tokio::test]
+    async fn triage_transport_retry_nondefault_changes_observed_attempts() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let calls = calls.clone();
+            move |_config, _prompt| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = TriageTaskNode::new().with_transport(transport);
+        let ctx = ctx_with_test_result(false, &task);
+        let policy = SdlcPolicy {
+            transport_retry: TransportRetry {
+                max_attempts: 5,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let mut ctx = ctx_with_policy(ctx, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
     /// `EN.ticket.wire-meta-transport-telemetry` task 2: a `with_meta_transport`
@@ -5174,6 +5217,58 @@ mod tests {
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["summary"], "from fence");
     }
 
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport for
+    /// `ConsolidatedReviewNode`.
+    #[tokio::test]
+    async fn review_transport_retry_nondefault_changes_observed_attempts() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        let policy = SdlcPolicy {
+            transport_retry: TransportRetry {
+                max_attempts: 4,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let calls = calls.clone();
+            move |_config, _prompt| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
     // --- Policy consumption (EN.3.C task 3) ---------------------------------
 
     /// Stamp a resolved [`SdlcPolicy`] into `ctx` under the same identity
@@ -5239,6 +5334,73 @@ mod tests {
             .clone()
             .expect("transport should have been called");
         assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    // --- transport_retry (EN.ticket.sdlc-flow-dead-policy-knobs task 3) ----
+
+    /// A transport that counts every invocation and always fails with a
+    /// retryable `claude_code_rs::Error::Timeout` — used to observe how many
+    /// attempts the resolved `transport_retry` budget actually burns.
+    fn always_failing_transport(calls: Arc<std::sync::atomic::AtomicU32>) -> ModelTransport {
+        Arc::new(move |_config, _prompt| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(claude_code_rs::Error::Timeout)
+            })
+        })
+    }
+
+    /// A default-policy `transport_retry` must reproduce exactly the attempt
+    /// count `ClaudeCodeStep`'s own built-in default already produced before
+    /// this ticket wired the policy value through — behaviour-stable, proven
+    /// rather than assumed (both are literally `TransportRetry::default()`).
+    #[tokio::test]
+    async fn implement_transport_retry_default_matches_todays_observed_count() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let node = ImplementTaskNode::new().with_transport(always_failing_transport(calls.clone()));
+        let result = node.process(ctx).await;
+
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            TransportRetry::default().max_attempts,
+            "default policy transport_retry must match ClaudeCodeStep's own \
+             built-in default attempt count"
+        );
+    }
+
+    /// A non-default `transport_retry` set on the resolved policy changes
+    /// the observed attempt count against a persistently failing transport —
+    /// proof the value actually reaches `ImplementTaskNode`'s composed
+    /// `ClaudeCodeStep`, not just that it resolves.
+    #[tokio::test]
+    async fn implement_transport_retry_nondefault_changes_observed_attempts() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+        let policy = SdlcPolicy {
+            transport_retry: TransportRetry {
+                max_attempts: 5,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let node = ImplementTaskNode::new().with_transport(always_failing_transport(calls.clone()));
+        let result = node.process(ctx).await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
     /// `output_verbosity = terse` injects the terseness directive into the
