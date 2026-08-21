@@ -54,7 +54,7 @@ use crate::completion::derive_terminal_status;
 use crate::policy::PolicyConfigSource;
 use crate::repo_registry::{RepoRegistry, RepoRegistryError};
 use crate::workflows::sdlc_flow;
-use crate::{OnProgress, Workflow, WorkflowError};
+use crate::{OnProgress, RunOptions, Workflow, WorkflowError};
 
 use super::chain::ChainStep;
 
@@ -439,7 +439,16 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
             let workflow = Workflow::new_validated(node_registry, sdlc_flow::graph::schema())
                 .map_err(|err| WorkflowError::new(err.to_string()))?;
             let on_progress: OnProgress<'_> = Box::new(|_ctx: &TaskContext| {});
-            workflow.run(event, on_progress).await
+            // `run_with` with `RunOptions` threaded from the invocation
+            // (EN.11.G task 1) — today that's `RunOptions::default()`
+            // (no cancellation/budget/pause/run_id wired from the chain
+            // yet), which is byte-for-byte behavior-identical to the bare
+            // `workflow.run(..)` call it replaces (see `RunOptions`'s own
+            // doc comment: every field `None` matches `run`'s behavior
+            // exactly). This is the seam later tasks stamp real per-step
+            // options and observed cost/tokens through.
+            let options = RunOptions::default();
+            workflow.run_with(event, on_progress, options).await
         })
     })
 }
