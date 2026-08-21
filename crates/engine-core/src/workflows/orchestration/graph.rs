@@ -464,10 +464,18 @@ pub fn schema() -> WorkflowSchema {
 
 /// Build a fresh `NodeRegistry` with the single node identity in [`schema`]
 /// registered, under its permissive default seams
-/// ([`OrchestrationRunNode::new`]). This is the only registry the
-/// `ORCHESTRATION` workflow ever runs under — unlike `sdlc_flow` /
-/// `diagnostic_intake`, no policy setting here changes which node runs, so
-/// there is no `registry_for_policy` sibling.
+/// ([`OrchestrationRunNode::new`]).
+///
+/// **This is the UNWIRED default** — every gate seam is a no-op (no declared
+/// dependencies, every edge already met, every block open, never held), which
+/// is correct for a bare constructor but was, until
+/// `EN.ticket.orchestration-production-gates-unwired`, also the *only*
+/// registry production ever got. `engine-serve`'s
+/// `register_orchestration_with_registry` is the wired entry point: it builds
+/// this same node but installs `corpus_gates::CorpusGates`-backed closures
+/// (real `planning/state.json` reads via `RepoRegistry`) instead of calling
+/// this function. Use [`registry`] directly only in tests that want the
+/// permissive default on purpose — the served workflow does not call it.
 #[must_use]
 pub fn registry() -> NodeRegistry {
     let mut registry = NodeRegistry::new();
