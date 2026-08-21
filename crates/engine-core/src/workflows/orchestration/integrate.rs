@@ -1492,4 +1492,78 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("simulated failure"), "message was: {msg}");
     }
+
+    /// A two-step chain whose first step fails must not advance to the
+    /// second: the second block's `run_flow` is never invoked, no `closed`
+    /// line is ever written, and the only lane-log line on disk is the
+    /// first step's `bailed` entry (EN.11.D Task 3).
+    #[tokio::test]
+    async fn a_failing_step_does_not_advance_to_the_next_step() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: FlowRunner = Arc::new(move |invocation| {
+            recorded.lock().unwrap().push(invocation.block_id.clone());
+            Box::pin(async move {
+                if invocation.block_id == "A.1" {
+                    Err(crate::WorkflowError::new("simulated failure for A.1"))
+                } else {
+                    Ok(engine_contract::TaskContext {
+                        event: json!({}),
+                        nodes: std::collections::HashMap::new(),
+                        metadata: json!({}),
+                        node_runs: std::collections::HashMap::new(),
+                    })
+                }
+            })
+        });
+
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+        )
+        .await
+        .expect_err("the chain must stop on the first failing step");
+
+        assert!(matches!(err, IntegrateError::Execute(_)));
+
+        // The second step's `run_flow` must never have been invoked — the
+        // chain stops, it does not skip ahead or continue past a failure.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["A.1".to_string()],
+            "the second step must never run once the first has failed"
+        );
+
+        // Exactly one line on disk, and it is `bailed` for A.1 — never a
+        // `closed` line for either step.
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "no line for the never-run second step");
+        let parsed: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["status"], json!("bailed"));
+        assert_eq!(parsed["block"], json!("A.1"));
+    }
 }
