@@ -190,18 +190,23 @@ pub fn parse_session_line(line: &str) -> Result<Session, ModelError> {
 }
 
 /// Parse the full multi-line output of `tmux list-sessions -F ...` into a
-/// `Vec<Session>`. Malformed lines are skipped with a warning to stderr.
+/// `Vec<Session>`. Malformed lines are silently skipped.
+///
+/// **EN.11.I amendment (task 4):** this used to `eprintln!` the parse error
+/// for each skipped line. `term-core` is a deliberately dependency-light
+/// leaf crate (D22 approved `tracing` for the engine, not a fleet-wide
+/// addition — see the block's `out_of_scope`), and this function has no
+/// caller anywhere in this workspace outside its own tests, so there was no
+/// engine-side `tracing` call site to route the diagnostic through either.
+/// The `eprintln!` was removed outright (route 1: dead/trivially
+/// redundant) rather than adding a new dependency to this crate — the
+/// malformed line is still dropped via `filter_map` exactly as before, only
+/// the stderr side-channel is gone.
 pub fn parse_sessions(output: &str) -> Vec<Session> {
     output
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|line| match parse_session_line(line) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("term-core: skipping malformed session line: {e}");
-                None
-            }
-        })
+        .filter_map(|line| parse_session_line(line).ok())
         .collect()
 }
 

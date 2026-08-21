@@ -153,9 +153,10 @@ pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
             let mut row = message_to_row(&message, now, now);
             touch(&mut row);
             if let Err(err) = upsert_event(pool, &row).await {
-                eprintln!(
-                    "durable write: upsert_event failed for run {}: {err}",
-                    message.run_id
+                tracing::warn!(
+                    run_id = %message.run_id,
+                    error = %err,
+                    "durable write: upsert_event failed"
                 );
             }
         }

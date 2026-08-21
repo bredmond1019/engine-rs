@@ -229,10 +229,11 @@ pub fn init_repo_registry_from_env() {
     match RepoRegistry::from_env() {
         Ok(registry) => set_repo_registry(Arc::new(registry)),
         Err(err) => {
-            eprintln!(
-                "engine-serve: repo registry not initialized ({err}); \
-                 repo-bearing SDLC_FLOW events will 422 until ENGINE_BRAIN_ROOT \
-                 resolves, absent-repo events are unaffected"
+            tracing::warn!(
+                error = %err,
+                "engine-serve: repo registry not initialized; repo-bearing SDLC_FLOW \
+                 events will 422 until ENGINE_BRAIN_ROOT resolves, absent-repo events \
+                 are unaffected"
             );
         }
     }

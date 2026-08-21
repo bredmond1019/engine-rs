@@ -508,7 +508,7 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
                 (ctx, reason)
             }
             Ok(Err(err)) => {
-                eprintln!("run {run_id} failed: {err}");
+                tracing::error!(run_id = %run_id, error = %err, "run failed");
                 let mut ctx = live
                     .get(run_id)
                     .unwrap_or_else(crate::http::empty_task_context);
@@ -518,7 +518,7 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
             }
             Err(panic_payload) => {
                 let message = crate::http::panic_message(&panic_payload);
-                eprintln!("run {run_id} panicked: {message}");
+                tracing::error!(run_id = %run_id, panic_message = %message, "run panicked");
                 let mut ctx = live
                     .get(run_id)
                     .unwrap_or_else(crate::http::empty_task_context);
