@@ -40,7 +40,7 @@ pub use channel::OperatorChannel;
 pub use limits::OperatorPayloadLimits;
 pub use payload::{OperatorPayload, OperatorResponseOption};
 pub use transport::{
-    AckHandle, DeliveredMessage, MessageHandle, NotifyError, OperatorResponse, ResponseVerdict,
-    UpdateCursor,
+    AckHandle, DeliveredMessage, MessageHandle, NotifyError, OperatorResponse, OperatorTransport,
+    ResponseVerdict, UpdateCursor,
 };
 pub use validate::{validate, OperatorValidationError, ValidatedOperatorPayload};

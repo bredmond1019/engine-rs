@@ -9,10 +9,12 @@
 //! keeps its own until `BA.21.A` ports them over — the two coexisting for
 //! that window is expected, not drift, and is called out per-type below.
 //!
-//! Task 1 moves only the supporting types (plus the two opaque handles
-//! [`OperatorResponse`] embeds, so its field set matches bastion's exactly).
-//! The `OperatorTransport` trait itself and its `NoopTransport` test double
-//! land in later tasks of this same block.
+//! Task 2 adds [`OperatorTransport`] itself — the three-method,
+//! `#[async_trait]`, object-safe trait an engine node calls to reach a
+//! human. `acknowledge` is default-implemented as a no-op `Ok(())` so a
+//! transport with no acknowledgement concept (WhatsApp, and every existing
+//! test fake) needs no change to keep compiling. `NoopTransport` and the
+//! object-safety proof land in task 3 of this same block.
 //!
 //! Provenance (bastion source lines this task's types were copied from):
 //!
@@ -24,10 +26,13 @@
 //! | [`DeliveredMessage`] | `src/serve/notify/mod.rs:90` |
 //! | [`UpdateCursor`] | `src/serve/notify/mod.rs:103` |
 //! | [`NotifyError`] | `src/serve/notify/mod.rs:118` |
+//! | [`OperatorTransport`] | `src/serve/notify/mod.rs:182` |
 //! | [`ResponseVerdict`] | `src/serve/notify/telegram.rs:328` (NOT `mod.rs` —
 //! |   its fields `gate_id`/`option_key`/`digest`/`decided_at` are
 //! |   channel-agnostic; only its home was channel-specific) |
 
+use super::validate::ValidatedOperatorPayload;
+use async_trait::async_trait;
 use thiserror::Error;
 
 /// An opaque handle a transport mints when it observes an inbound response,
@@ -212,4 +217,54 @@ pub enum ResponseVerdict {
     /// The response answers a different gate than `expected` — not this
     /// payload's response at all.
     UnknownGate,
+}
+
+/// The transport seam: deliver a validated operator payload, and long-poll
+/// for the operator's response. Implemented once per channel (Telegram
+/// first; WhatsApp is meant to be a second `impl` sharing this trait
+/// unchanged).
+///
+/// Object-safe: all three methods take `&self`, return `Result<_,
+/// NotifyError>` futures with no generic parameters, and the trait has no
+/// associated types or `Self: Sized` bounds — `Box<dyn OperatorTransport>` /
+/// `Arc<dyn OperatorTransport>` are both nameable. Marked `#[async_trait]`
+/// to keep it object-safe under stable Rust (a native `async fn` in a trait
+/// is not, without boxing the returned future by hand).
+#[async_trait]
+pub trait OperatorTransport: Send + Sync {
+    /// Deliver `payload` over this transport. Must reject (via
+    /// `NotifyError::PayloadRejected`) anything that would not survive the
+    /// narrowest target channel's limits, rather than sending a truncated
+    /// or partial rendering.
+    async fn send(
+        &self,
+        payload: &ValidatedOperatorPayload,
+    ) -> Result<DeliveredMessage, NotifyError>;
+
+    /// Long-poll for operator responses since `since` (or from the start of
+    /// the backlog if `None`). Returns the observed responses and the
+    /// cursor to pass on the next call.
+    async fn poll_responses(
+        &self,
+        since: Option<UpdateCursor>,
+    ) -> Result<(Vec<OperatorResponse>, Option<UpdateCursor>), NotifyError>;
+
+    /// Acknowledge `response`, whose verdict has already been resolved to
+    /// `verdict`, back to the transport it arrived on — so the operator's
+    /// tap stops spinning and (where the transport supports it) the
+    /// original message is edited to show the decision and drop its live
+    /// buttons.
+    ///
+    /// Default-implemented as a no-op `Ok(())`: a transport with no
+    /// acknowledgement concept (WhatsApp, and every existing test fake)
+    /// needs no change to keep compiling and behaving correctly. Telegram
+    /// overrides this to actually call `answerCallbackQuery` (and, best
+    /// effort, `editMessageText`).
+    async fn acknowledge(
+        &self,
+        _response: &OperatorResponse,
+        _verdict: &ResponseVerdict,
+    ) -> Result<(), NotifyError> {
+        Ok(())
+    }
 }
