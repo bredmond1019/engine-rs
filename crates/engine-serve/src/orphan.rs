@@ -425,6 +425,89 @@ pub fn alarm_stale_runs(live: &LiveStateStore, policy: &OrphanPolicy, now: DateT
     enqueued
 }
 
+// ── Periodic sweep: `alarm_stale_runs`'s first production caller ──────
+
+/// A handle to the background stale-run sweep loop [`spawn_stale_run_sweep`]
+/// spawned. Mirrors `crate::schedule::ScheduleLoopHandle`'s "hold or drop"
+/// shape exactly — the same boot-wiring convention bastion already knows
+/// how to call: the caller may hold this to [`abort`](Self::abort) the loop
+/// (e.g. on shutdown) or drop it — dropping does **not** stop the loop (a
+/// `tokio::task::JoinHandle` detaches on drop), matching how
+/// `spawn_schedule_loop`'s and `spawn_durable_writer`'s handles both behave.
+pub struct StaleRunSweepHandle {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StaleRunSweepHandle {
+    /// Stop the background sweep loop.
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+/// One sweep tick: alarm every stale run in `live` against `policy`'s
+/// resolved threshold, evaluated at `now`. A thin synchronous wrapper over
+/// [`alarm_stale_runs`], split out so [`spawn_stale_run_sweep`]'s loop body
+/// stays a one-line call and so tests can drive a tick directly with an
+/// INJECTED `now` — no test may sleep on a real interval to observe this.
+///
+/// Returns the number of `OperatorQueueItem`s enqueued this tick (0 for a
+/// no-stale-runs or an already-alarmed-everything tick — the once-per-run
+/// dedup in [`LiveStateStore::mark_alarmed`] is what makes a second tick
+/// over the same still-stale run enqueue nothing).
+#[must_use]
+pub fn sweep_stale_runs_once(
+    live: &LiveStateStore,
+    policy: &OrphanPolicy,
+    now: DateTime<Utc>,
+) -> usize {
+    alarm_stale_runs(live, policy, now)
+}
+
+/// The spawnable stale-run sweep bootstrap: `tokio::spawn` a background
+/// loop that calls [`sweep_stale_runs_once`] on every tick of a
+/// `tokio::time::interval(interval)`, giving [`alarm_stale_runs`] — until
+/// now dead code with zero production callers (see the module docs'
+/// "Never silent" note and this spec's Notes) — its first one.
+///
+/// **The tick stays off the async path.** [`alarm_stale_runs`] takes
+/// `live`'s operator-queue write lock synchronously
+/// (`std::sync::RwLock::write`), so each poll runs inside
+/// `tokio::task::spawn_blocking` rather than directly in the loop's async
+/// block — matching `spawn_schedule_loop`'s precedent on blocking work: a
+/// held lock must not stall every other task on this process's runtime.
+///
+/// `live` is cheap to clone (an `Arc` around each guarded map —
+/// `LiveStateStore`'s own doc comment) and `policy` is `Copy`, so both are
+/// captured by value into the spawned task with no extra synchronization.
+///
+/// The one remaining wiring step — calling this from a live process's
+/// startup path — is a different repo's change (`bastion`'s
+/// `serve/mod.rs`, alongside its existing `spawn_durable_writer` and
+/// `spawn_schedule_loop` calls) and is out of scope here; see this
+/// spec's Notes (`BA.21.B`).
+pub fn spawn_stale_run_sweep(
+    live: LiveStateStore,
+    policy: OrphanPolicy,
+    interval: std::time::Duration,
+) -> StaleRunSweepHandle {
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+
+            let live = live.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let now = Utc::now();
+                sweep_stale_runs_once(&live, &policy, now)
+            })
+            .await;
+        }
+    });
+
+    StaleRunSweepHandle { task }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +861,60 @@ mod tests {
         assert_eq!(
             queue_len, 1,
             "one stuck run must produce one item, not one per tick"
+        );
+    }
+
+    // ── Periodic sweep (task 2) ─────────────────────────────────────────
+
+    #[test]
+    fn sweep_stale_runs_once_enqueues_exactly_one_item_for_a_stale_run() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        store.record(run_id, &running_context());
+
+        let far_future = now + chrono::Duration::hours(2);
+        let policy = OrphanPolicy::default();
+        let enqueued = sweep_stale_runs_once(&store, &policy, far_future);
+
+        assert_eq!(enqueued, 1);
+        let queue_len = store
+            .operator_queue()
+            .read()
+            .expect("queue lock")
+            .pending_count();
+        assert_eq!(queue_len, 1);
+    }
+
+    #[test]
+    fn a_second_sweep_tick_over_the_same_stale_run_enqueues_nothing() {
+        // The specific thing a *periodic* caller can break that a single
+        // `alarm_stale_runs` call cannot: does `mark_alarmed`'s
+        // once-per-run dedup survive being driven by a loop, tick after
+        // tick, over the same still-stale run?
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+        store.record(run_id, &running_context());
+
+        let far_future = now + chrono::Duration::hours(2);
+        let policy = OrphanPolicy::default();
+
+        let first_tick = sweep_stale_runs_once(&store, &policy, far_future);
+        assert_eq!(first_tick, 1);
+
+        let second_tick =
+            sweep_stale_runs_once(&store, &policy, far_future + chrono::Duration::hours(1));
+        assert_eq!(second_tick, 0);
+
+        let queue_len = store
+            .operator_queue()
+            .read()
+            .expect("queue lock")
+            .pending_count();
+        assert_eq!(
+            queue_len, 1,
+            "one stale run must produce one item across the whole tick sequence, not one per tick"
         );
     }
 }
