@@ -74,6 +74,22 @@ use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError}
 pub trait HoldSource: Send + Sync {
     /// Whether `block_id` (in `repo`) is under an operator hold right now.
     fn is_held(&self, repo: &str, block_id: &str) -> bool;
+
+    /// EN.11.L Task 2: an optional notification path. Resolves when a
+    /// hold on `(repo, block_id)` may have just cleared, so
+    /// [`wait_for_clearance`] can wake immediately instead of waiting out
+    /// the next poll tick. The default never resolves (`future::pending`)
+    /// — a `HoldSource` that doesn't override this falls back to pure
+    /// poll-driven behavior, unchanged from before this knob existed.
+    /// Production wiring (the `EN.9.G` Blocked-edge bridge) is expected
+    /// to hold a `tokio::sync::Notify` per watched hold and call
+    /// `notify_waiters()` the moment its own poll observes clearance;
+    /// this trait does not mandate a `Notify` specifically, only the
+    /// future shape.
+    fn notified(&self, repo: &str, block_id: &str) -> futures::future::BoxFuture<'_, ()> {
+        let _ = (repo, block_id);
+        Box::pin(futures::future::pending())
+    }
 }
 
 /// A [`HoldSource`] that is never held — the default for a chain running
@@ -103,23 +119,81 @@ impl HoldSource for NeverHeld {
 /// re-checking `hold_source` — the caller (`integrate_chain`) is
 /// responsible for observing the cancellation afterwards and stopping the
 /// chain; this function itself never treats cancellation as clearance.
+///
+/// EN.11.L Task 2 extends this same `select!` with two more arms, added
+/// alongside the existing cancellation arm rather than replacing it:
+///
+/// - `deadline`, when given, bounds the TOTAL time this call is willing to
+///   wait (not per-poll — the clock starts once, at entry, and is not
+///   reset by any individual poll tick). Exceeding it returns
+///   [`IntegrateError::HoldDeadlineExceeded`], naming `repo` and
+///   `block_id` so a stopped chain never reads as a silent, unexplained
+///   hang — see [`IntegrateError::HoldDeadlineExceeded`]'s doc for why
+///   this is a loud, addressed error rather than a downgraded warning.
+///   `None` preserves the exact pre-Task-2 behavior: an unbounded wait.
+/// - [`HoldSource::notified`] is raced on every iteration so a hold that
+///   clears between poll ticks wakes this call immediately rather than
+///   waiting out the remainder of `poll_interval`. The default
+///   implementation never resolves, so a `HoldSource` with no
+///   notification wiring is unaffected — this is purely additive.
+///
+/// A cancel win still returns `Ok(())` immediately, exactly as before —
+/// cancellation is a pause point, never an error, and remains distinct
+/// from a deadline win (which IS an error, by design: nobody is coming
+/// back for an unanswered hold, but a cancellation is always an explicit,
+/// intentional request).
 pub async fn wait_for_clearance(
     hold_source: &dyn HoldSource,
     repo: &str,
     block_id: &str,
     poll_interval: Duration,
+    deadline: Option<Duration>,
     cancellation_token: Option<&crate::cancellation::CancellationToken>,
-) {
+) -> Result<(), IntegrateError> {
+    // The clock starts once, here, at entry — never reset by a poll tick
+    // or a notification wake, so `deadline` is a total budget for the
+    // whole wait, not a per-poll one.
+    let deadline_at = deadline.map(|d| tokio::time::Instant::now() + d);
+
     while hold_source.is_held(repo, block_id) {
+        if let (Some(at), Some(d)) = (deadline_at, deadline) {
+            if tokio::time::Instant::now() >= at {
+                return Err(IntegrateError::HoldDeadlineExceeded {
+                    repo: repo.to_string(),
+                    block_id: block_id.to_string(),
+                    deadline: d,
+                });
+            }
+        }
+
+        // Never sleep past the deadline even when the deadline is closer
+        // than `poll_interval` — otherwise a hold held right up to the
+        // deadline could sleep one whole `poll_interval` past it before
+        // the next top-of-loop check ever runs.
+        let tick_for = match deadline_at {
+            Some(at) => {
+                let remaining = at.saturating_duration_since(tokio::time::Instant::now());
+                poll_interval.min(remaining)
+            }
+            None => poll_interval,
+        };
+        let tick = tokio::time::sleep(tick_for);
+        let notified = hold_source.notified(repo, block_id);
+
         if let Some(token) = cancellation_token {
             tokio::select! {
-                _ = token.cancelled() => return,
-                () = tokio::time::sleep(poll_interval) => {}
+                _ = token.cancelled() => return Ok(()),
+                () = tick => {}
+                () = notified => {}
             }
         } else {
-            tokio::time::sleep(poll_interval).await;
+            tokio::select! {
+                () = tick => {}
+                () = notified => {}
+            }
         }
     }
+    Ok(())
 }
 
 // ── State-write verification ────────────────────────────────────────────
@@ -434,6 +508,16 @@ pub enum IntegrateError {
         new_location: PathBuf,
         legacy_location: PathBuf,
     },
+    /// EN.11.L Task 2: [`wait_for_clearance`] exceeded its `deadline`
+    /// while `(repo, block_id)` was still under an operator hold nobody
+    /// has answered. Reported loudly — never a silent forever-wait — and
+    /// names both the held block and its repo so whoever reads this stop
+    /// knows exactly where to look in the operator queue.
+    HoldDeadlineExceeded {
+        repo: String,
+        block_id: String,
+        deadline: Duration,
+    },
 }
 
 impl fmt::Display for IntegrateError {
@@ -525,6 +609,16 @@ impl fmt::Display for IntegrateError {
                 new_location.display(),
                 legacy_location.display()
             ),
+            IntegrateError::HoldDeadlineExceeded {
+                repo,
+                block_id,
+                deadline,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') operator hold deadline exceeded: \
+                 still held after {deadline:?} with no clearance — check the operator \
+                 queue for this block"
+            ),
         }
     }
 }
@@ -542,7 +636,8 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::FinalValidationGateFailed { .. }
             | IntegrateError::BlockIdMismatch { .. }
             | IntegrateError::RoadmapDirNotFound { .. }
-            | IntegrateError::AmbiguousRoadmapDir { .. } => None,
+            | IntegrateError::AmbiguousRoadmapDir { .. }
+            | IntegrateError::HoldDeadlineExceeded { .. } => None,
         }
     }
 }
@@ -675,6 +770,7 @@ pub async fn integrate_chain(
     admission: &AdmissionGate,
     hold_source: &dyn HoldSource,
     poll_interval: Duration,
+    hold_deadline: Option<Duration>,
     cancellation_token: Option<&crate::cancellation::CancellationToken>,
     resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
     registry: &RepoRegistry,
@@ -701,14 +797,26 @@ pub async fn integrate_chain(
         // EXECUTION window only, never held across an unbounded hold: a
         // step parked here holds no semaphore slot, so every other lane
         // at the ceiling can still start while this one waits on a human.
-        wait_for_clearance(
+        //
+        // EN.11.L Task 2: `hold_deadline` bounds the wait — a hold nobody
+        // is answering now fails the chain loudly instead of parking it
+        // forever. A deadline exceeded is reported exactly like any other
+        // step failure: one `bailed` lane-log line, then propagate.
+        if let Err(err) = wait_for_clearance(
             hold_source,
             &step.repo,
             &step.block_id,
             poll_interval,
+            hold_deadline,
             cancellation_token,
         )
-        .await;
+        .await
+        {
+            let entry =
+                LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string());
+            let _ = append_lane_log_line(roadmap_dir, &entry);
+            return Err(err);
+        }
 
         // `wait_for_clearance` can return early on a cancel win (rather
         // than because the hold actually cleared) — re-check here so a
@@ -1271,6 +1379,7 @@ mod tests {
             &hold,
             Duration::from_millis(1),
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1348,6 +1457,7 @@ mod tests {
             &hold,
             Duration::from_millis(5),
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner_a,
@@ -1378,6 +1488,7 @@ mod tests {
                     &admission,
                     &NeverHeld,
                     Duration::from_millis(5),
+                    None,
                     None,
                     &resolve_engine,
                     &registry,
@@ -1411,7 +1522,7 @@ mod tests {
 
         let waited = tokio::time::timeout(
             Duration::from_millis(50),
-            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None),
+            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None, None),
         )
         .await;
         assert!(waited.is_err(), "must not clear while still held");
@@ -1419,7 +1530,7 @@ mod tests {
         held.store(false, Ordering::SeqCst);
         let cleared = tokio::time::timeout(
             Duration::from_millis(200),
-            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None),
+            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None, None),
         )
         .await;
         assert!(cleared.is_ok(), "must clear promptly once unheld");
@@ -1429,7 +1540,14 @@ mod tests {
     async fn never_held_clears_immediately() {
         let cleared = tokio::time::timeout(
             Duration::from_millis(50),
-            wait_for_clearance(&NeverHeld, "repo-a", "A.1", Duration::from_millis(5), None),
+            wait_for_clearance(
+                &NeverHeld,
+                "repo-a",
+                "A.1",
+                Duration::from_millis(5),
+                None,
+                None,
+            ),
         )
         .await;
         assert!(cleared.is_ok());
@@ -1482,6 +1600,7 @@ mod tests {
             &NeverHeld,
             Duration::from_millis(1),
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1524,6 +1643,7 @@ mod tests {
             &NeverHeld,
             Duration::from_millis(1),
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1565,6 +1685,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             None,
             &resolve_engine,
             &registry,
@@ -1622,6 +1743,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             None,
             &resolve_engine,
             &registry,
@@ -1685,6 +1807,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             None,
             &resolve_engine,
             &registry,
