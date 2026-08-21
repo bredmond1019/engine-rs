@@ -774,6 +774,19 @@ pub enum TerminalSignal {
     /// The carried `String` names the unmet criteria (the review's summary,
     /// plus its issue list when non-empty).
     EndReviewFail(String),
+    /// `ReviewRouterNode`'s minor-issue back-edge (`FAIL`/`PARTIAL`, 1..=
+    /// `STRUCTURAL_ISSUE_THRESHOLD` issues) hit `policy.max_review_attempts`
+    /// (EN.ticket.review-retry-loop-unbounded task 3) — the run's per-run,
+    /// durable `telemetry.review_attempts` counter reached the bound before
+    /// the reviewer returned a clean `PASS`. Distinguished from
+    /// [`Self::ReviewFail`]/[`Self::StructuralFail`], which fire on the
+    /// FIRST structural verdict regardless of attempt count: this variant
+    /// only fires after the retry budget itself is exhausted. An explicit
+    /// [`Self::MajorBail`] or a structural review `FAIL` (checked first in
+    /// `wrap_up::derive_terminal_signal`, same precedence as today) still
+    /// wins over this one. The carried `String` is the last review verdict's
+    /// `summary`.
+    ReviewExhausted(String),
 }
 
 impl TerminalSignal {
@@ -785,7 +798,8 @@ impl TerminalSignal {
             | Self::ReviewFail(message)
             | Self::StructuralFail(message)
             | Self::FinalValidationFailed(message)
-            | Self::EndReviewFail(message) => message,
+            | Self::EndReviewFail(message)
+            | Self::ReviewExhausted(message) => message,
         }
     }
 }
@@ -857,6 +871,9 @@ pub fn derive_bail_reason(terminal_signal: Option<&TerminalSignal>) -> Option<St
     terminal_signal.map(|signal| match signal {
         TerminalSignal::FinalValidationFailed(failure_summary) => {
             format!("Final validation gate FAILED: {failure_summary}")
+        }
+        TerminalSignal::ReviewExhausted(summary) => {
+            format!("Review attempts exhausted: {summary}")
         }
         other => other.message().to_string(),
     })

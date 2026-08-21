@@ -304,6 +304,32 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
                 Some("PARTIAL") => return Some(TerminalSignal::StructuralFail(summary)),
                 _ => {}
             }
+        } else if matches!(verdict, Some("FAIL") | Some("PARTIAL")) {
+            // EN.ticket.review-retry-loop-unbounded task 3: a non-structural
+            // (minor-issue) FAIL/PARTIAL normally routes back through
+            // `IncrementAttemptNode` (`ReviewRouterNode`'s retry back-edge)
+            // and never reaches `WrapUpNode` at all — so reaching this node
+            // with a minor verdict still on the board means the router
+            // redirected here because the durable `review_attempts` counter
+            // had hit `policy.max_review_attempts`. Confirm that reading
+            // (rather than trusting routing alone, since `WrapUpNode` is
+            // also the MAJOR_BAIL/structural target and this branch must
+            // stay inert for those) before reporting exhaustion, so a
+            // genuinely under-bound minor verdict — reachable only via a
+            // test driving `WrapUpNode` directly — never gets misreported
+            // as exhaustion.
+            let review_attempts = latest_state(ctx)
+                .map(|state| state.telemetry.review_attempts)
+                .unwrap_or(0);
+            let max_review_attempts = resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
+            if matches!(max_review_attempts, Some(max) if review_attempts >= max) {
+                let summary = review
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Some(TerminalSignal::ReviewExhausted(summary));
+            }
         }
     }
 
@@ -1600,6 +1626,156 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(value["status"], json!("blocked"));
         assert_eq!(value["bail_reason"], json!("structural issues"));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// EN.ticket.review-retry-loop-unbounded task 3: a minor-issue verdict
+    /// (non-structural FAIL/PARTIAL) that reached `WrapUpNode` because the
+    /// durable `review_attempts` counter hit `policy.max_review_attempts`
+    /// yields `ReviewExhausted`, a blocked status, and a bail reason naming
+    /// review exhaustion plus the last verdict's summary.
+    #[tokio::test]
+    async fn wrap_up_populates_bail_reason_on_review_exhaustion() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-retry-loop-unbounded-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::InProgress;
+        state.tasks.push(task);
+        state.telemetry.review_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PARTIAL", "summary": "still missing the edge case", "issues": ["one small thing"] }),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts: 3,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-21"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Review attempts exhausted: still missing the edge case")
+        );
+        // The resolved `max_review_attempts` is attributable in the
+        // committed policy snapshot.
+        assert_eq!(value["policy"]["max_review_attempts"], json!(3));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// Below the bound, a minor-issue verdict reaching `WrapUpNode` directly
+    /// (e.g. a test driving the node in isolation) must NOT be misreported
+    /// as exhaustion — this arm only fires once the counter has actually
+    /// hit the bound.
+    #[tokio::test]
+    async fn wrap_up_does_not_report_exhaustion_below_the_bound() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-retry-loop-unbounded-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::InProgress;
+        state.tasks.push(task);
+        state.telemetry.review_attempts = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PARTIAL", "summary": "minor nit", "issues": ["one small thing"] }),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts: 3,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-21"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        // No terminal signal fired for this arm below the bound: the task
+        // is still in progress, so the run reports "running", not "blocked".
+        assert_eq!(value["status"], json!("running"));
+        assert!(value["bail_reason"].is_null());
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// An explicit `MAJOR_BAIL` still wins over review exhaustion, matching
+    /// the existing precedence ordering `derive_terminal_signal` documents.
+    #[tokio::test]
+    async fn wrap_up_prefers_major_bail_reason_over_review_exhaustion() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-retry-loop-unbounded-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Failed;
+        state.tasks.push(task);
+        state.telemetry.review_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({ "verdict": "MAJOR_BAIL", "reason": "max attempts reached" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PARTIAL", "summary": "minor nit", "issues": ["one small thing"] }),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts: 3,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-21"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("max attempts reached"),
+            "MAJOR_BAIL must win over review exhaustion"
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

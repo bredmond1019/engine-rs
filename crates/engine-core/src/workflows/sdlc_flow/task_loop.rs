@@ -2261,7 +2261,29 @@ impl Router for ReviewRouterNode {
                     // as `TriageRouterNode`'s `RETRYABLE` branch — route
                     // through `IncrementAttemptNode` so the retry counters
                     // advance in lockstep across both back-edges.
-                    Some("IncrementAttemptNode".to_string())
+                    //
+                    // EN.ticket.review-retry-loop-unbounded task 3: this is
+                    // the back-edge that was unbounded — `TriageTaskNode`'s
+                    // own attempt-cap check sits after its `PASS` early
+                    // return, so a passing test run never reaches it, and
+                    // the cycle Implement -> Test(pass) -> Triage(PASS) ->
+                    // Review(FAIL/PARTIAL, minor) -> IncrementAttempt ->
+                    // Implement had no exit. The bound has to close here,
+                    // where the back-edge is actually chosen: once the
+                    // durable, per-run `review_attempts` counter (bumped by
+                    // `ConsolidatedReviewNode`, task 2) reaches
+                    // `policy.max_review_attempts`, route to `WrapUpNode`
+                    // with the last verdict's summary instead of looping
+                    // again.
+                    let review_attempts = latest_state(ctx)
+                        .map(|state| state.telemetry.review_attempts)
+                        .unwrap_or(0);
+                    let max_review_attempts =
+                        resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
+                    match max_review_attempts {
+                        Some(max) if review_attempts >= max => Some("WrapUpNode".to_string()),
+                        _ => Some("IncrementAttemptNode".to_string()),
+                    }
                 }
             }
             // An unrecognized verdict must never silently halt the walk
@@ -3778,6 +3800,84 @@ mod tests {
         let ctx = empty_context(json!({}));
         let router = ReviewRouterNode;
         assert_eq!(router.route(&ctx), None);
+    }
+
+    /// `review_ctx` plus a stamped durable `review_attempts` counter and a
+    /// `max_review_attempts` policy — the shape `ReviewRouterNode::route`
+    /// reads via `latest_state`/`resolved_policy` (EN.ticket.review-retry-
+    /// loop-unbounded task 3).
+    fn review_ctx_with_bound(
+        verdict: &str,
+        issue_count: usize,
+        review_attempts: u32,
+        max_review_attempts: u32,
+    ) -> TaskContext {
+        let mut ctx = review_ctx(verdict, issue_count);
+        let mut state = SDLCState::new("my-spec");
+        state.telemetry.review_attempts = review_attempts;
+        ctx.nodes.insert(
+            "LoadTaskStateNode".to_string(),
+            serde_json::to_value(&state).unwrap(),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(policy).unwrap(),
+        );
+        ctx
+    }
+
+    /// EN.ticket.review-retry-loop-unbounded task 3: below the bound, a
+    /// minor-issue verdict still takes the retry back-edge — unchanged
+    /// behavior for every run that terminates within budget.
+    #[test]
+    fn review_router_minor_issue_under_bound_still_retries() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("FAIL", 2, 2, 3);
+        assert_eq!(router.route(&ctx), Some("IncrementAttemptNode".to_string()));
+    }
+
+    /// At the bound, the minor-issue back-edge routes to `WrapUpNode`
+    /// instead of looping again — this is the fix: the cycle
+    /// Implement -> Test(pass) -> Triage(PASS) -> Review(FAIL/PARTIAL,
+    /// minor) -> IncrementAttempt -> Implement now has an exit.
+    #[test]
+    fn review_router_minor_issue_at_bound_routes_to_wrap_up() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("PARTIAL", 2, 3, 3);
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    /// Past the bound (e.g. a stale counter read after the exact tick) still
+    /// routes to `WrapUpNode` — the gate is `>=`, not `==`.
+    #[test]
+    fn review_router_minor_issue_past_bound_routes_to_wrap_up() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("FAIL", 1, 4, 3);
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    /// `PASS` and the structural (0 or >threshold issues) arms are
+    /// unaffected by the review-attempts bound — they already route to
+    /// `WrapUpNode`/`UpdateTaskStatusNode` regardless of attempt count.
+    #[test]
+    fn review_router_pass_and_structural_arms_unaffected_by_bound() {
+        let router = ReviewRouterNode;
+        assert_eq!(
+            router.route(&review_ctx_with_bound("PASS", 0, 3, 3)),
+            Some("UpdateTaskStatusNode".to_string())
+        );
+        assert_eq!(
+            router.route(&review_ctx_with_bound("FAIL", 6, 3, 3)),
+            Some("WrapUpNode".to_string())
+        );
+        assert_eq!(
+            router.route(&review_ctx_with_bound("FAIL", 0, 0, 3)),
+            Some("WrapUpNode".to_string())
+        );
     }
 
     // --- UpdateTaskStatusNode ------------------------------------------------
