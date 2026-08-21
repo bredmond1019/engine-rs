@@ -39,9 +39,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use engine_contract::{NodeRun, NodeRunStatus};
 use engine_core::repo_registry::RepoRegistry;
-use engine_core::workflows::orchestration::execute::FlowRunner;
+use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
+use engine_core::workflows::orchestration::execute::{
+    execute_step, EngineKind, FlowInvocation, FlowRunner,
+};
+use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::integrate::{
+    integrate_chain, verify_state_write, IntegrateError, NeverHeld, StepProgress,
+};
 
 // ── Git process helpers ──────────────────────────────────────────────────
 
@@ -245,11 +254,15 @@ impl RecordingRunner {
             .count()
     }
 
-    /// The marker filename this runner writes into the branch it cuts —
-    /// exposed so a test can read it back after checking out a given
-    /// branch without duplicating the literal string.
-    #[allow(dead_code)] // wired up by later tasks in this spec (case (a))
-    const MARKER_FILE: &'static str = "MARKER.txt";
+    /// The per-block marker filename this runner writes into the branch it
+    /// cuts — `"{block_id}.marker"`, one file per block rather than one
+    /// shared name, so a branch that DID compose onto a prior block's tip
+    /// would carry every ancestor's marker file, while a branch cut fresh
+    /// from `origin/main` carries only its own. That is exactly the signal
+    /// case (a) reads.
+    fn marker_file(block_id: &str) -> String {
+        format!("{block_id}.marker")
+    }
 
     fn into_runner(self) -> FlowRunner {
         Arc::new(move |invocation| {
@@ -272,8 +285,13 @@ impl RecordingRunner {
                 );
 
                 let marker = format!("{}: marker\n", invocation.block_id);
-                std::fs::write(invocation.repo_path.join(Self::MARKER_FILE), marker)
-                    .expect("write marker file");
+                std::fs::write(
+                    invocation
+                        .repo_path
+                        .join(Self::marker_file(&invocation.block_id)),
+                    marker,
+                )
+                .expect("write marker file");
                 run_git(&invocation.repo_path, &["add", "-A"]);
                 run_git(
                     &invocation.repo_path,
@@ -364,4 +382,197 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
     let state_a_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&state_a).unwrap()).unwrap();
     assert_eq!(state_a_json["status"], "done");
+}
+
+// ── Chain-level driver helpers (shared by cases (a)-(d)) ─────────────────
+
+fn no_deps(_repo: &str, _id: &str) -> Vec<DependencyEdge> {
+    Vec::new()
+}
+
+fn always_met(_repo: &str, _id: &str) -> bool {
+    true
+}
+
+fn always_flow(_repo: &str, _id: &str) -> EngineKind {
+    EngineKind::Flow
+}
+
+// ── Case (a): COMPOSITION — still WRONG today ─────────────────────────────
+//
+// smoke-run.md §3.4: a two-block chain over the SAME repo should, in the
+// fixed world, cut block N+1's branch from block N's tip so the second
+// block's tree contains the first block's work. It does not — `EngineRunner`
+// cuts every block's branch from `origin/main`, so block N+1's tree is
+// missing block N's marker entirely. `integrate_chain` calls `execute_step`
+// per step (never chaining one step's branch into the next), and
+// `RecordingRunner` mirrors real `SDLC_FLOW`'s branch discipline exactly
+// (`checkout -B sdlc/<block> origin/main`), so this is production's actual
+// behaviour, not an artifact of the double.
+#[tokio::test]
+// WRONG TODAY — flipped by EN.11.C (not in this lane; EN.11.C depends on
+// this block).
+async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
+    let (_brain_root, _bare_root, registry, repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-b-case-a");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![
+        ("smoke-repo".to_string(), "B1".to_string()),
+        ("smoke-repo".to_string(), "B2".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+    )
+    .await
+    .expect("two-block chain over one repo should integrate cleanly");
+    assert_eq!(outcomes.len(), 2);
+
+    // Check out B2's branch and inspect its tree. In the FIXED world (once
+    // EN.11.C lands) `sdlc/B2` would be cut from `sdlc/B1`'s tip and would
+    // therefore carry B1's marker file too. Today it does not: `sdlc/B2`
+    // was cut from `origin/main`, exactly like `sdlc/B1` was, so B1's
+    // marker never reaches B2's tree.
+    run_git(&repo_path, &["checkout", "-q", "sdlc/B2"]);
+    let b2_marker = repo_path.join(RecordingRunner::marker_file("B2"));
+    let b1_marker_on_b2 = repo_path.join(RecordingRunner::marker_file("B1"));
+    assert!(
+        b2_marker.exists(),
+        "B2's own marker must exist on its own branch"
+    );
+    assert!(
+        !b1_marker_on_b2.exists(),
+        "WRONG-TODAY: B2's tree must NOT contain B1's marker, because B2's \
+         branch was cut from origin/main, not from B1's tip — flips by EN.11.C"
+    );
+
+    // Ancestry confirms the same fact at the git-graph level: B1's branch
+    // tip is not an ancestor of B2's branch tip.
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "sdlc/B1", "sdlc/B2"])
+        .current_dir(&repo_path)
+        .status()
+        .expect("spawn git merge-base --is-ancestor")
+        .success();
+    assert!(
+        !is_ancestor,
+        "WRONG-TODAY: sdlc/B1 must NOT be an ancestor of sdlc/B2 — flips by EN.11.C"
+    );
+}
+
+// ── Case (b): FAILED STEP INVISIBLE — still WRONG today ───────────────────
+//
+// smoke-run.md §3.2: `Workflow::walk`'s `if failed { break; }` still falls
+// through to `Ok(ctx)` — a run whose `SetupWorktreeNode` failed is reported
+// as a *successful* `SDLC_FLOW` invocation, with the failure recorded only
+// inside `ctx.node_runs`. `execute_step` (`execute.rs`) does not inspect
+// `node_runs` at all: it only distinguishes `run_flow`'s own `Ok`/`Err`.
+// The ONLY thing that stops the chain on a failed step today is
+// `verify_state_write` failing to find the state file `wrap_up.rs` never
+// got to write.
+#[tokio::test]
+// WRONG TODAY — flipped by EN.11.D (runs after this block in
+// lane-engine-rs.txt).
+async fn a_failed_setup_worktree_step_is_invisible_to_execute_step_today() {
+    let (_brain_root, _bare_root, registry, repo_path) = single_repo_fixture("smoke-repo");
+
+    // A `FlowRunner` double that reproduces exactly the shape
+    // `Workflow::walk` produces when a node fails: `Ok(ctx)`, with
+    // `ctx.node_runs["SetupWorktreeNode"]` recording `NodeRunStatus::Failed`
+    // — and, because the run never reached `wrap_up.rs`, no state file is
+    // written at all.
+    let failing_runner: FlowRunner = Arc::new(|invocation: FlowInvocation| {
+        Box::pin(async move {
+            let mut node_runs = HashMap::new();
+            node_runs.insert(
+                "SetupWorktreeNode".to_string(),
+                NodeRun {
+                    status: NodeRunStatus::Failed,
+                    started_at: None,
+                    completed_at: None,
+                    error: Some(format!("worktree setup failed for {}", invocation.block_id)),
+                    input: None,
+                    usage: None,
+                },
+            );
+            Ok(engine_contract::TaskContext {
+                event: serde_json::json!({}),
+                nodes: HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs,
+            })
+        })
+    });
+
+    let chain = resolve_explicit_chain(vec![("smoke-repo".to_string(), "B1".to_string())]);
+
+    // 1. `execute_step` itself cannot see the failure — it only looks at
+    //    `run_flow`'s own `Ok`/`Err`, never at `ctx.node_runs`.
+    let outcome = execute_step(&chain[0], &always_flow, &registry, &failing_runner)
+        .await
+        .expect(
+            "WRONG-TODAY: execute_step must return Ok even though \
+             SetupWorktreeNode failed inside node_runs — flips by EN.11.D",
+        );
+    assert_eq!(
+        outcome.ctx.node_runs["SetupWorktreeNode"].status,
+        NodeRunStatus::Failed,
+        "the failure IS present in node_runs — execute_step just never looks there"
+    );
+
+    // 2. The only thing that stops the chain is verify_state_write, because
+    //    the run never reached wrap_up.rs and so never wrote the state
+    //    file `verify_state_write` looks for.
+    let err = verify_state_write(&outcome)
+        .expect_err("verify_state_write must fail: no state file was ever written");
+    assert!(
+        matches!(err, IntegrateError::StateWriteUnreadable { .. }),
+        "expected StateWriteUnreadable (absent state file), got {err:?}"
+    );
+
+    // 3. Driving the full chain through integrate_chain confirms the same
+    //    thing end to end: the chain DOES stop, but via verify_state_write's
+    //    IntegrateError, never via execute_step/ExecuteError — that is what
+    //    "invisible" means here.
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-b-case-b");
+    let admission = AdmissionGate::with_default_policy();
+    let chain_err = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        &always_flow,
+        &registry,
+        &failing_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+    )
+    .await
+    .expect_err("the chain must not report success for a failed SetupWorktreeNode");
+    assert!(
+        matches!(chain_err, IntegrateError::StateWriteUnreadable { .. }),
+        "the chain must stop via verify_state_write, not via ExecuteError — \
+         got {chain_err:?}"
+    );
+
+    let _ = repo_path; // kept alive for the fixture's Drop ordering
 }
