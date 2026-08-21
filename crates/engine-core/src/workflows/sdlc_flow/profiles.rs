@@ -127,10 +127,16 @@ pub fn batch_reviewer() -> PartialPolicy {
         }),
         review_mode: Some(ReviewMode::EndOnly),
         test_depth: Some(TestDepth::Fast),
-        // The quality ceiling. `end_only` means the single review call sees
-        // the WHOLE run's accumulated diff rather than one task's, and it
-        // sees it on Sonnet — the profile with both the largest input and
-        // the most room for it.
+        // The quality ceiling. `end_only` makes `EndReviewNode` (the drain
+        // branch's single review node, `end_review.rs`) issue exactly ONE
+        // review call that sees the WHOLE run's accumulated diff rather
+        // than one task's, and it sees it on Sonnet — the profile with
+        // both the largest input and the most room for it. This is
+        // single-pass: unlike JS's end review, there is no fix loop, so a
+        // FAIL verdict blocks the run rather than retrying it (see
+        // `EndReviewRouterNode`'s doc comment for why). Proven by
+        // `end_only_full_run_makes_exactly_one_review_call_with_full_ac_and_multi_task_diff`
+        // in `crates/engine-core/tests/it/sdlc_flow_end_review_e2e.rs`.
         review_diff_max_chars: Some(200_000),
         ..Default::default()
     }

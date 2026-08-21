@@ -40,7 +40,16 @@ pub enum ReviewMode {
     /// A trivial green task (small diff, first-pass green) skips per-task
     /// review; a non-trivial task still routes to review.
     TrivialSkip,
-    /// Per-task review is collapsed into a single end-of-run review.
+    /// Per-task review is collapsed into a single end-of-run review: the
+    /// drain branch's `EndReviewNode` (`end_review.rs`) makes exactly one
+    /// review call over the whole run's accumulated diff against the
+    /// complete Acceptance Criteria, instead of `ConsolidatedReviewNode`
+    /// reviewing each task's diff separately. It is single-pass — a FAIL
+    /// verdict blocks the run with a named reason rather than looping a
+    /// fix pass the way JS's end review does. Proven by
+    /// `end_only_full_run_makes_exactly_one_review_call_with_full_ac_and_multi_task_diff`
+    /// and `end_only_fail_verdict_routes_to_wrap_up_with_blocked_status_and_bail_reason`
+    /// in `crates/engine-core/tests/it/sdlc_flow_end_review_e2e.rs`.
     EndOnly,
 }
 
