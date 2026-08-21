@@ -30,6 +30,12 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 engine-serve = { path = "../engine-serve" }
 tempfile = { workspace = true }
+# Test-only: EN.11.I task 2's instrumentation tests capture emitted tracing
+# events via `tracing_subscriber`'s `Layer`/`Registry` machinery, asserting
+# span-field propagation (`run_id`/`campaign_id`) rather than parsing a real
+# log file. `engine-core` itself never installs a subscriber in production
+# code — see `engine_serve::init_tracing` — so this stays dev-only.
+tracing-subscriber = { workspace = true }
 
 # ONE integration-test binary, not one per file. cargo builds a separate binary for every
 # `tests/*.rs`, and each statically links this crate plus its ~345-crate dependency graph — at 25

@@ -608,34 +608,56 @@ impl Node for OrchestrationRunNode {
         // `Send` boundary at all, since it never leaves that one thread.
         // The returned `JoinHandle<Result<..>>` is `Send` regardless of the
         // task it ran, which is exactly the adapter this seam needs.
+        // `EN.11.I` task 2: `tracing`'s span context is thread-local and
+        // does NOT cross a `spawn_blocking` boundary by itself — the
+        // closure below runs on a fresh blocking-pool OS thread whose span
+        // stack starts empty, so anything `integrate_chain` (or a step it
+        // drives) logs there would silently carry no `run_id`/`campaign_id`
+        // fields despite `OrchestrationRunNode::process` itself running
+        // inside `Workflow::walk`'s instrumented span. Fix: capture BOTH
+        // halves of the calling thread's tracing context before crossing —
+        // the current span (carries the recorded `run_id`/`campaign_id`
+        // fields) and the current dispatcher (the subscriber events are
+        // actually delivered to) — and re-establish both on the blocking
+        // thread. In production this dispatcher forwarding is usually a
+        // no-op (the host installs one global subscriber via
+        // `engine_serve::init_tracing`, which every thread already sees),
+        // but it also makes this call site correct under a *thread-local*
+        // test/tool subscriber (`tracing::subscriber::set_default`), which
+        // a global default alone would not reach.
+        let current_span = tracing::Span::current();
+        let current_dispatch = tracing::dispatcher::get_default(|d| d.clone());
         let outcomes = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|err| {
-                    NodeError::new(format!("failed to start orchestration runtime: {err}"))
-                })?;
-            rt.block_on(integrate_chain(
-                &chain,
-                &move |repo, block_id| resolve_depends_on(repo, block_id),
-                &move |repo, block_id| is_edge_met(repo, block_id),
-                &admission,
-                hold_source.as_ref(),
-                poll_interval,
-                hold_deadline,
-                cancellation_token.as_ref(),
-                &move |repo, block_id| resolve_engine(repo, block_id),
-                &repo_registry,
-                &run_flow,
-                &roadmap_dir,
-                resolved_lane.as_deref(),
-                step_observer.as_ref(),
-                default_use_worktree,
-                // The resolved, event-overridable campaign id (EN.11.E
-                // task 3) — replaces task 2's freshly-minted placeholder.
-                campaign_id,
-            ))
-            .map_err(|err| NodeError::new(err.to_string()))
+            tracing::dispatcher::with_default(&current_dispatch, || {
+                let _span_guard = current_span.enter();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| {
+                        NodeError::new(format!("failed to start orchestration runtime: {err}"))
+                    })?;
+                rt.block_on(integrate_chain(
+                    &chain,
+                    &move |repo, block_id| resolve_depends_on(repo, block_id),
+                    &move |repo, block_id| is_edge_met(repo, block_id),
+                    &admission,
+                    hold_source.as_ref(),
+                    poll_interval,
+                    hold_deadline,
+                    cancellation_token.as_ref(),
+                    &move |repo, block_id| resolve_engine(repo, block_id),
+                    &repo_registry,
+                    &run_flow,
+                    &roadmap_dir,
+                    resolved_lane.as_deref(),
+                    step_observer.as_ref(),
+                    default_use_worktree,
+                    // The resolved, event-overridable campaign id (EN.11.E
+                    // task 3) — replaces task 2's freshly-minted placeholder.
+                    campaign_id,
+                ))
+                .map_err(|err| NodeError::new(err.to_string()))
+            })
         })
         .await
         .map_err(|err| NodeError::new(format!("orchestration task panicked: {err}")))??;
