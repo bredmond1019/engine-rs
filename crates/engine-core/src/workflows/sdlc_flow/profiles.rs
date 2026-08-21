@@ -35,6 +35,8 @@ pub fn baseline() -> PartialPolicy {
         test_depth: Some(TestDepth::Full),
         // Restates the built-in default verbatim — baseline's no-op contract.
         review_diff_max_chars: Some(120_000),
+        // Restates the built-in default verbatim — baseline's no-op contract.
+        max_review_attempts: Some(3),
         ..Default::default()
     }
 }
@@ -78,6 +80,10 @@ pub fn cheap_fast() -> PartialPolicy {
         // Kept unchanged deliberately: it is still a defensible floor for
         // the cheapest profile, and re-tuning it is its own follow-up.
         review_diff_max_chars: Some(20_000),
+        // The cost/latency floor for the review loop too: fewer review
+        // passes before the run bails to `WrapUpNode` rather than
+        // continuing to spend on this profile's cheapest-and-fastest tiers.
+        max_review_attempts: Some(2),
         ..Default::default()
     }
 }
@@ -110,6 +116,10 @@ pub fn pragmatist() -> PartialPolicy {
         // tier and is therefore conservative for the Sonnet window it now
         // has. Left unchanged on purpose; re-tuning is a separate follow-up.
         review_diff_max_chars: Some(40_000),
+        // The middle setting — above `cheap-fast`'s floor, at the built-in
+        // default, since `pragmatist` is not the profile trading away
+        // review thoroughness.
+        max_review_attempts: Some(3),
         ..Default::default()
     }
 }
@@ -138,6 +148,13 @@ pub fn batch_reviewer() -> PartialPolicy {
         // `end_only_full_run_makes_exactly_one_review_call_with_full_ac_and_multi_task_diff`
         // in `crates/engine-core/tests/it/sdlc_flow_end_review_e2e.rs`.
         review_diff_max_chars: Some(200_000),
+        // The quality ceiling: `end_only` collapses the per-task review
+        // loop this knob bounds into one `EndReviewNode` call, so this
+        // field does not gate anything on this profile today — but
+        // standing rule 6 still requires it set explicitly, and the
+        // quality-oriented bundle wants the full built-in default rather
+        // than a truncated one.
+        max_review_attempts: Some(3),
         ..Default::default()
     }
 }
@@ -280,6 +297,32 @@ mod tests {
         assert_eq!(
             baseline().review_diff_max_chars,
             Some(super::super::policy::SdlcPolicy::default().review_diff_max_chars),
+            "baseline must restate the built-in default (its no-op contract)"
+        );
+    }
+
+    /// Standing rule 6 for `max_review_attempts` (EN.ticket.review-retry-
+    /// loop-unbounded task 1): every named profile must set it explicitly,
+    /// and `baseline` must restate the built-in default verbatim.
+    #[test]
+    fn every_named_profile_sets_max_review_attempts() {
+        let expected = [
+            ("baseline", 3),
+            ("cheap-fast", 2),
+            ("pragmatist", 3),
+            ("batch-reviewer", 3),
+        ];
+        for (name, attempts) in expected {
+            let p = profile_by_name(name).expect("known profile name");
+            assert_eq!(
+                p.max_review_attempts,
+                Some(attempts),
+                "profile `{name}` must set max_review_attempts explicitly"
+            );
+        }
+        assert_eq!(
+            baseline().max_review_attempts,
+            Some(super::super::policy::SdlcPolicy::default().max_review_attempts),
             "baseline must restate the built-in default (its no-op contract)"
         );
     }

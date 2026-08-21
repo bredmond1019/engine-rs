@@ -273,6 +273,19 @@ pub struct SdlcPolicy {
     pub simple_task_max_files: u32,
     pub llm_triage: bool,
     pub max_attempts: u32,
+    /// Bound on the review-retry loop that `ReviewRouterNode` closes: a
+    /// `FAIL`/`PARTIAL` verdict with 1..=`STRUCTURAL_ISSUE_THRESHOLD` issues
+    /// routes back to `IncrementAttemptNode` at most `max_review_attempts`
+    /// times before the run is routed to `WrapUpNode` with a terminal
+    /// `ReviewExhausted` signal instead. Counted separately from
+    /// [`Self::max_attempts`] — see `review_attempts` on the durable
+    /// telemetry (`schema.rs`) for why the two counters must never be
+    /// conflated. Built-in default `3`, matching JS's `MAX_REVIEW_ATTEMPTS`
+    /// (`base-template/.claude/workflows/sdlc-flow.js:252-253`). Behavior-
+    /// stable in the sense that matters: it changes an unbounded loop into
+    /// a bounded one (the fix), but does not change any run that reviews
+    /// clean within three passes — i.e. every run that terminates today.
+    pub max_review_attempts: u32,
     pub close_out: CloseOut,
     /// Whether the previous attempt's failure output is fed back into
     /// `ImplementTaskNode`'s retry prompt, and how large that block may get.
@@ -318,6 +331,9 @@ impl Default for SdlcPolicy {
             simple_task_max_files: 2,
             llm_triage: false,
             max_attempts: 3,
+            // Matching JS's MAX_REVIEW_ATTEMPTS — see the field's doc
+            // comment for why it is a separate counter from `max_attempts`.
+            max_review_attempts: 3,
             close_out: CloseOut::default(),
             // NOT behavior-stable, deliberately — see `RetryFeedback`'s docs.
             retry_feedback: RetryFeedback::default(),
@@ -355,6 +371,7 @@ pub struct PartialPolicy {
     pub simple_task_max_files: Option<u32>,
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
+    pub max_review_attempts: Option<u32>,
     pub close_out: Option<PartialCloseOut>,
     pub retry_feedback: Option<PartialRetryFeedback>,
     pub transport_retry: Option<PartialTransportRetry>,
@@ -528,6 +545,7 @@ impl crate::policy::Policy for SdlcPolicy {
             ),
             llm_triage: merge_opt(base.llm_triage, over.llm_triage),
             max_attempts: merge_opt(base.max_attempts, over.max_attempts),
+            max_review_attempts: merge_opt(base.max_review_attempts, over.max_review_attempts),
             close_out: match &over.close_out {
                 Some(co) => merge_close_out(base.close_out, co),
                 None => base.close_out,
@@ -608,6 +626,7 @@ mod tests {
         assert!(!policy.prompt_cache);
         assert!(!policy.llm_triage);
         assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.max_review_attempts, 3);
     }
 
     #[test]
@@ -1422,6 +1441,10 @@ mod tests {
             assert!(
                 parsed.review_diff_max_chars.is_some(),
                 "{name} must set review_diff_max_chars"
+            );
+            assert!(
+                parsed.max_review_attempts.is_some(),
+                "{name} must set max_review_attempts"
             );
         }
     }
