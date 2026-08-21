@@ -28,7 +28,9 @@ use crate::routing::Router;
 #[cfg(test)]
 use super::policy::OutputVerbosity;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
-use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
+use super::schema::{
+    RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTelemetry, SDLCTriageVerdict,
+};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
     ModelTransport, TransportSlot,
@@ -204,19 +206,35 @@ fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPoli
 /// than some other path — the two must never independently drift.
 pub(crate) const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
 
+/// The monotonically increasing logical clock `latest_state` orders
+/// candidates by: `total_attempts` (bumped by `IncrementAttemptNode`/
+/// `UpdateTaskStatusNode`) plus `review_attempts` (bumped by
+/// `ConsolidatedReviewNode`, EN.ticket.review-retry-loop-unbounded task 2).
+/// Every state-mutating node in this loop advances exactly ONE of the two
+/// counters by exactly one per write, never both — so their sum still
+/// increases by exactly one on every write and remains a valid tie-breaking
+/// clock across the whole run.
+fn logical_clock(telemetry: &SDLCTelemetry) -> u64 {
+    u64::from(telemetry.total_attempts) + u64::from(telemetry.review_attempts)
+}
+
 /// Return the most recently mutated `SDLCState` among every node identity
 /// that can write one: `IncrementAttemptNode` (the retry back-edge target,
-/// EN.3.B), `UpdateTaskStatusNode` (a task's eventual PASS/MAJOR_BAIL), and
-/// `LoadTaskStateNode` (the initial load). Mirrors the `_latest_state_dict`
-/// helper shared by `TaskQueueRouterNode`/`UpdateTaskStatusNode`/
-/// `SaveStateNode` in Python, extended for the new retry-increment source.
+/// EN.3.B), `UpdateTaskStatusNode` (a task's eventual PASS/MAJOR_BAIL),
+/// `ConsolidatedReviewNode` (its own `review_attempts` bump, EN.ticket.
+/// review-retry-loop-unbounded task 2 — nested under its result's `"state"`
+/// key rather than being the whole result, since that result is also the
+/// review verdict `ReviewRouterNode` reads), and `LoadTaskStateNode` (the
+/// initial load). Mirrors the `_latest_state_dict` helper shared by
+/// `TaskQueueRouterNode`/`UpdateTaskStatusNode`/`SaveStateNode` in Python,
+/// extended for the new retry-increment source.
 ///
 /// A fixed priority order (`IncrementAttemptNode` before `UpdateTaskStatusNode`
 /// before `LoadTaskStateNode`) is NOT correct here: across a whole run,
 /// `IncrementAttemptNode` may hold a *stale* entry from an earlier task's
 /// retries while a *later* task's `UpdateTaskStatusNode` write is actually
 /// the newest state (or vice versa, mid-retry, within the same task). Instead
-/// this compares each candidate's `telemetry.total_attempts` — a counter every
+/// this compares each candidate's [`logical_clock`] — a counter every
 /// state-mutating node in this loop increments by exactly one on every write,
 /// so it is a monotonically increasing logical clock for the whole run — and
 /// keeps whichever candidate's value is highest. No wall-clock/`node_runs`
@@ -234,16 +252,27 @@ pub(crate) fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
     for identity in [
         "IncrementAttemptNode",
         "UpdateTaskStatusNode",
+        "ConsolidatedReviewNode",
         "LoadTaskStateNode",
     ] {
-        let Some(value) = get_result(ctx, identity) else {
+        let Some(mut value) = get_result(ctx, identity).cloned() else {
             continue;
         };
-        let state: SDLCState = serde_json::from_value(value.clone())
+        // `ConsolidatedReviewNode`'s result is the review verdict
+        // (`verdict`/`summary`/`issues`/...) with the durable `SDLCState`
+        // nested under `"state"` — see its `process` impl below. Every
+        // other candidate's result IS the whole `SDLCState`.
+        if identity == "ConsolidatedReviewNode" {
+            let Some(state_value) = value.get_mut("state").map(std::mem::take) else {
+                continue;
+            };
+            value = state_value;
+        }
+        let state: SDLCState = serde_json::from_value(value)
             .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))?;
         let is_newer = best
             .as_ref()
-            .map(|current| state.telemetry.total_attempts > current.telemetry.total_attempts)
+            .map(|current| logical_clock(&state.telemetry) > logical_clock(&current.telemetry))
             .unwrap_or(true);
         if is_newer {
             best = Some(state);
@@ -2066,6 +2095,17 @@ impl Node for ConsolidatedReviewNode {
             .cloned()
             .unwrap_or_else(|| json!([]));
 
+        // Bump the durable, per-run `review_attempts` counter (EN.ticket.
+        // review-retry-loop-unbounded task 2) BEFORE the model call, same
+        // as `bump_attempt` counts the attempt regardless of its outcome —
+        // this node is about to produce a verdict, so the review pass it
+        // spends counts whether that verdict is PASS, FAIL, or PARTIAL.
+        // Deliberately NOT `attempt_count`/`total_attempts` — see
+        // `SDLCTelemetry::review_attempts`'s doc comment for why the two
+        // counters must stay independent.
+        let mut counted_state = latest_state(&ctx)?;
+        counted_state.telemetry.review_attempts += 1;
+
         // The reviewer must see the CURRENT task's actual work. Nothing in
         // this run commits code until `SaveStateNode` runs on the pass path,
         // so the reviewable delta lives in the working tree, not in a commit
@@ -2163,6 +2203,14 @@ impl Node for ConsolidatedReviewNode {
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
         }
+        // Nested under `"state"` rather than replacing this result outright
+        // — the object above IS the review verdict `ReviewRouterNode` reads
+        // via `get_result(ctx, "ConsolidatedReviewNode")`, so the durable
+        // `SDLCState` (carrying the just-bumped `review_attempts`) has to
+        // ride alongside it, not instead of it. `latest_state` (this file)
+        // knows to unwrap this key for this one node identity.
+        result["state"] = serde_json::to_value(&counted_state)
+            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
         put_result(&mut ctx, "ConsolidatedReviewNode", result);
 
         Ok(ctx)
@@ -5389,6 +5437,168 @@ mod tests {
             .clone()
             .expect("transport should have been called");
         assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    // --- review_attempts counter (EN.ticket.review-retry-loop-unbounded task 2) ---
+
+    /// Build a `ConsolidatedReviewNode` that always runs the `diff` runner
+    /// and returns a canned PASS verdict via its transport, so each test in
+    /// this section only has to vary the incoming `ctx`.
+    fn passing_review_node() -> ConsolidatedReviewNode {
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport)
+    }
+
+    fn ctx_for_review(state: &SDLCState, task: &SDLCTask) -> TaskContext {
+        let mut ctx = ctx_with_current_task(state, task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn review_node_increments_review_attempts_once_per_verdict() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_for_review(&state, &task);
+
+        let out = passing_review_node()
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
+                .expect("ConsolidatedReviewNode result carries a durable SDLCState");
+        assert_eq!(bumped.telemetry.review_attempts, 1);
+        // Independent of the attempt counters this run has not touched.
+        assert_eq!(bumped.telemetry.total_attempts, 0);
+        assert_eq!(bumped.tasks[0].attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn review_node_does_not_touch_attempt_count_or_total_attempts() {
+        // A task that has already burned two test retries (IncrementAttemptNode
+        // would have bumped both `attempt_count` and `telemetry.total_attempts`
+        // to 2 by this point) must still arrive at review with a FULL review
+        // budget — proving `review_attempts` is counted separately.
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.attempt_count = 2;
+        let mut state = state_with_tasks(vec![task.clone()]);
+        state.telemetry.total_attempts = 2;
+        let ctx = ctx_for_review(&state, &task);
+
+        let out = passing_review_node()
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
+                .expect("ConsolidatedReviewNode result carries a durable SDLCState");
+        assert_eq!(bumped.telemetry.review_attempts, 1);
+        // Untouched by the review pass.
+        assert_eq!(bumped.telemetry.total_attempts, 2);
+        assert_eq!(bumped.tasks[0].attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn review_attempts_survives_a_resume_and_keeps_accumulating() {
+        // Simulate a resumed run: the loaded state already carries an
+        // accumulated `review_attempts` from a prior process invocation
+        // (e.g. read back off disk by `LoadTaskStateNode`) — a fresh
+        // process() call must add to it, not reset it.
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut state = state_with_tasks(vec![task.clone()]);
+        state.telemetry.review_attempts = 2;
+        let ctx = ctx_for_review(&state, &task);
+
+        let out = passing_review_node()
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
+                .expect("ConsolidatedReviewNode result carries a durable SDLCState");
+        assert_eq!(bumped.telemetry.review_attempts, 3);
+    }
+
+    #[test]
+    fn latest_state_prefers_consolidated_review_node_over_a_stale_load() {
+        // `ConsolidatedReviewNode`'s bump must be visible to `latest_state`
+        // even when `LoadTaskStateNode` (the initial, now-stale load) is
+        // also present in `ctx.nodes` — proving the new candidate and its
+        // logical-clock comparison are wired in correctly.
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut load_state = state_with_tasks(vec![task.clone()]);
+        load_state.telemetry.review_attempts = 0;
+        let mut ctx = ctx_with_state(&load_state);
+
+        let mut reviewed_state = load_state.clone();
+        reviewed_state.telemetry.review_attempts = 1;
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({
+                "verdict": "FAIL",
+                "summary": "two issues",
+                "issues": ["a", "b"],
+                "state": reviewed_state,
+            }),
+        );
+
+        let resolved = latest_state(&ctx).expect("latest_state should resolve");
+        assert_eq!(resolved.telemetry.review_attempts, 1);
+    }
+
+    #[test]
+    fn latest_state_prefers_increment_attempt_node_over_a_stale_review() {
+        // The reverse ordering: an `IncrementAttemptNode` write that landed
+        // AFTER an earlier `ConsolidatedReviewNode` bump (i.e. the review's
+        // minor-issue back-edge already advanced the run) must win, proving
+        // the logical clock sums both counters rather than only comparing
+        // `review_attempts`.
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut reviewed_state = state_with_tasks(vec![task.clone()]);
+        reviewed_state.telemetry.review_attempts = 1;
+        let mut ctx = ctx_with_state(&reviewed_state);
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({
+                "verdict": "FAIL",
+                "summary": "two issues",
+                "issues": ["a", "b"],
+                "state": reviewed_state,
+            }),
+        );
+
+        let mut incremented_state = reviewed_state.clone();
+        incremented_state.telemetry.total_attempts = 1;
+        incremented_state.tasks[0].attempt_count = 1;
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&incremented_state).unwrap(),
+        );
+
+        let resolved = latest_state(&ctx).expect("latest_state should resolve");
+        assert_eq!(resolved.telemetry.total_attempts, 1);
+        assert_eq!(resolved.telemetry.review_attempts, 1);
     }
 
     // --- Review-gate policy consumption (EN.3.C task 4) ---------------------

@@ -1219,6 +1219,19 @@ async fn real_git_intent_add_surfaces_untracked_content_in_the_review_prompt() {
         "TaskQueueRouterNode".to_string(),
         json!({ "current_task_id": 1, "title": "One", "acceptance_criteria": ["it works"] }),
     );
+    // `ConsolidatedReviewNode` now bumps the durable `review_attempts`
+    // counter (EN.ticket.review-retry-loop-unbounded task 2) via
+    // `latest_state`, which requires a loaded `SDLCState` on `ctx` — same
+    // as every other `ConsolidatedReviewNode` unit test's
+    // `ctx_with_current_task` helper stamps.
+    let mut state = engine_core::workflows::sdlc_flow::schema::SDLCState::new("fixture-e2e-spec");
+    state.tasks = vec![engine_core::workflows::sdlc_flow::schema::SDLCTask::new(
+        1, "One", "d1",
+    )];
+    ctx.nodes.insert(
+        "LoadTaskStateNode".to_string(),
+        serde_json::to_value(&state).unwrap(),
+    );
     let policy = engine_core::workflows::sdlc_flow::policy::SdlcPolicy::default();
     engine_core::policy::stamp_resolved_policy(&mut ctx, &policy).unwrap();
 

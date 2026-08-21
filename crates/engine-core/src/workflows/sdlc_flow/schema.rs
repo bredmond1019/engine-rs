@@ -237,6 +237,26 @@ pub struct SDLCTelemetry {
     /// Number of tasks that reached FAILED.
     #[serde(default)]
     pub tasks_failed: u32,
+    /// Number of `ConsolidatedReviewNode` verdicts produced so far
+    /// (EN.ticket.review-retry-loop-unbounded task 2) — the durable counter
+    /// `ReviewRouterNode` bounds against, independent of `total_attempts`.
+    ///
+    /// **Scoped per-run, not per-task**, matching JS's `reviewAttempts`
+    /// (`base-template/.claude/workflows/sdlc-flow.js:252-253`), a single
+    /// loop counter for the run's review cycle — not per-task like
+    /// `SDLCTask::attempt_count`. This also matches where the field
+    /// physically lives: `SDLCTelemetry` is a whole-run aggregate on
+    /// `SDLCState`, not a per-`SDLCTask` field, so a fresh task does not
+    /// reset it. Deliberately NOT folded into `total_attempts`/
+    /// `attempt_count` (both bumped by `IncrementAttemptNode` on both
+    /// back-edges and consumed by `RunTelemetry`/`PolicyAggregate` to mean
+    /// "an implement/test attempt ran") — overloading them would make a
+    /// task that burned test retries arrive at review with a reduced review
+    /// budget, which is not the bound this ticket asks for, and would
+    /// corrupt existing attempt metrics. Same reasoning `wrap_up.rs` gives
+    /// for not letting bails increment `tasks_failed`.
+    #[serde(default)]
+    pub review_attempts: u32,
 }
 
 fn default_global_status() -> String {
@@ -1596,6 +1616,7 @@ mod tests {
             budget_spent: 0.05,
             tasks_passed: 2,
             tasks_failed: 0,
+            review_attempts: 1,
         };
         state.policy = Some(SdlcPolicy::default());
         state.outcomes = Some(RunOutcomes {
