@@ -47,6 +47,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use engine_contract::{NodeRunStatus, TaskContext};
 
 use crate::budget::BudgetLedger;
@@ -97,6 +99,14 @@ pub struct FlowInvocation {
     /// construction site): an invocation with an unstated isolation is the
     /// defect this field exists to make unrepresentable.
     pub use_worktree: bool,
+    /// The campaign this step belongs to — the parent id that spans the N
+    /// runs of one chain (`EN.11.E`). Deliberately no `Default` and no
+    /// builder on this struct, same reasoning as `use_worktree`: an
+    /// invocation with an unstated campaign is the defect this field
+    /// exists to make unrepresentable. Lands on the wire as a named,
+    /// documented, versioned `campaign_id` key of the run's `event` JSON
+    /// via [`sdlc_flow_event`] — never in `TaskContext::metadata`.
+    pub campaign_id: Uuid,
 }
 
 /// A future producing a finished run's [`TaskContext`] or a [`WorkflowError`].
@@ -299,6 +309,10 @@ pub struct ExecutionOutcome {
     /// attribute observed cost/behavior to the setting that produced it,
     /// per CLAUDE.md standing rule 6.
     pub use_worktree: bool,
+    /// The campaign this step ran under — stamped here for the same reason
+    /// as `use_worktree` (CLAUDE.md standing rule 6): a finished step must
+    /// be attributable to its campaign without re-reading the child ctx.
+    pub campaign_id: Uuid,
     /// This step's observed cost (USD), folded from `ctx` via
     /// [`step_spend`] — attributable to THIS `ChainStep` alone, never
     /// accumulated across steps (`EN.11.G` task 2).
@@ -363,6 +377,7 @@ pub async fn execute_step(
     registry: &RepoRegistry,
     run_flow: &FlowRunner,
     default_use_worktree: bool,
+    campaign_id: Uuid,
 ) -> Result<ExecutionOutcome, ExecuteError> {
     let repo_path =
         registry
@@ -393,6 +408,7 @@ pub async fn execute_step(
         repo_path: repo_path.clone(),
         block_id: step.block_id.clone(),
         use_worktree,
+        campaign_id,
     };
     let ctx = run_flow(invocation)
         .await
@@ -431,6 +447,7 @@ pub async fn execute_step(
         block_id: step.block_id.clone(),
         ctx,
         use_worktree,
+        campaign_id,
         cost_usd,
         total_tokens,
     })
@@ -445,6 +462,7 @@ fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
         "repo": invocation.repo,
         "spec_slug": invocation.block_id,
         "use_worktree": invocation.use_worktree,
+        "campaign_id": invocation.campaign_id,
     })
 }
 
@@ -453,7 +471,8 @@ fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
 /// `PolicyConfigSource::Worktree(invocation.repo_path)`, `SetupWorktreeNode`
 /// re-registered with `registry` so `event.repo` resolves inside the run
 /// too — and runs it with `{"repo": invocation.repo, "spec_slug":
-/// invocation.block_id, "use_worktree": invocation.use_worktree}` as the
+/// invocation.block_id, "use_worktree": invocation.use_worktree,
+/// "campaign_id": invocation.campaign_id}` as the
 /// event, mirroring `engine-serve::workflows::register_sdlc_flow_with_registry`'s
 /// factory exactly — isolation included — minus the `Dispatcher`
 /// registration (this seam invokes the workflow directly rather than
@@ -560,10 +579,10 @@ mod tests {
         let step_a = step("repo-a", "A.1");
         let step_b = step("repo-b", "B.1");
 
-        let outcome_a = execute_step(&step_a, &resolve_engine, &registry, &runner, false)
+        let outcome_a = execute_step(&step_a, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect("step a should execute");
-        let outcome_b = execute_step(&step_b, &resolve_engine, &registry, &runner, false)
+        let outcome_b = execute_step(&step_b, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect("step b should execute");
 
@@ -592,7 +611,7 @@ mod tests {
         };
 
         let s = step("repo-a", "A.1");
-        execute_step(&s, &resolve_engine, &registry, &runner, false)
+        execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect("flow-engine step should execute");
 
@@ -607,7 +626,7 @@ mod tests {
         let resolve_engine = |_repo: &str, _id: &str| EngineKind::Task;
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner, false)
+        let err = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .unwrap_err();
 
@@ -641,7 +660,7 @@ mod tests {
         });
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &failing_runner, false)
+        let err = execute_step(&s, &resolve_engine, &registry, &failing_runner, false, Uuid::new_v4())
             .await
             .unwrap_err();
 
@@ -667,7 +686,7 @@ mod tests {
         let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
 
         let s = step("does-not-exist", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner, false)
+        let err = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .unwrap_err();
 
@@ -718,7 +737,7 @@ mod tests {
         let runner = ok_but_child_failed_runner("SetupWorktreeNode");
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner, false)
+        let err = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect_err("a child with a failed node_run must fail the step");
 
@@ -755,7 +774,7 @@ mod tests {
         let (runner, _calls) = recording_runner();
 
         let s = step("repo-a", "A.1");
-        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false)
+        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect("a run with no failed nodes should be integrated as success");
 
@@ -811,7 +830,7 @@ mod tests {
         let runner = runner_with_usage("SomeNode", 1.25, 100, 200);
 
         let s = step("repo-a", "A.1");
-        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false)
+        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect("step should execute");
 
@@ -830,7 +849,7 @@ mod tests {
         let (runner, _calls) = recording_runner();
 
         let s = step("repo-a", "A.1");
-        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false)
+        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect("step should execute");
 
@@ -940,6 +959,7 @@ mod tests {
             repo_path: PathBuf::from("/tmp/repo-a"),
             block_id: "A.1".to_string(),
             use_worktree: true,
+            campaign_id: Uuid::new_v4(),
         };
         assert_eq!(
             sdlc_flow_event(&invocation_true)["use_worktree"],
@@ -953,6 +973,24 @@ mod tests {
         assert_eq!(
             sdlc_flow_event(&invocation_false)["use_worktree"],
             json!(false)
+        );
+    }
+
+    // ── FlowInvocation.campaign_id threading ─────────────────────────────
+
+    #[test]
+    fn sdlc_flow_event_seeds_campaign_id_with_the_invocations_value() {
+        let campaign_id = Uuid::new_v4();
+        let invocation = FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: true,
+            campaign_id,
+        };
+        assert_eq!(
+            sdlc_flow_event(&invocation)["campaign_id"],
+            json!(campaign_id)
         );
     }
 
@@ -987,10 +1025,10 @@ mod tests {
         let ordinary = step("repo-a", "A.1");
         let base_template = step("base-template", "BT.1");
 
-        execute_step(&ordinary, &resolve_engine, &registry, &runner, true)
+        execute_step(&ordinary, &resolve_engine, &registry, &runner, true, Uuid::new_v4())
             .await
             .expect("ordinary step should execute");
-        execute_step(&base_template, &resolve_engine, &registry, &runner, false)
+        execute_step(&base_template, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
             .await
             .expect("base-template step should execute");
 

@@ -779,6 +779,7 @@ pub async fn integrate_chain(
     lane: Option<&str>,
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
+    campaign_id: uuid::Uuid,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -849,6 +850,7 @@ pub async fn integrate_chain(
             registry,
             run_flow,
             default_use_worktree,
+            campaign_id,
         )
         .await
         {
@@ -976,6 +978,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -997,6 +1000,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -1021,6 +1025,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -1103,6 +1108,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         }
@@ -1216,6 +1222,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -1247,6 +1254,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -1279,6 +1287,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -1304,6 +1313,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -1318,6 +1328,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
         };
@@ -1406,6 +1417,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -1484,6 +1496,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            uuid::Uuid::new_v4(),
         );
 
         let checker_fut = async {
@@ -1516,6 +1529,7 @@ mod tests {
                     None,
                     &|_: &StepProgress| {},
                     false,
+                    uuid::Uuid::new_v4(),
                 ),
             )
             .await
@@ -1627,6 +1641,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect("chain should complete");
@@ -1670,6 +1685,7 @@ mod tests {
             Some("backend"),
             &|_: &StepProgress| {},
             false,
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect("chain should complete");
@@ -1713,6 +1729,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -1771,6 +1788,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect_err("the original step failure must still surface");
@@ -1835,6 +1853,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect_err("the chain must stop on the first failing step");

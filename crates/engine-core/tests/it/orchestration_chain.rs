@@ -86,6 +86,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use engine_contract::{NodeRun, NodeRunStatus};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
@@ -394,6 +396,7 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
             repo_path: repo_path.clone(),
             block_id: block_id.to_string(),
             use_worktree: false,
+            campaign_id: Uuid::new_v4(),
         };
         (flow_runner)(invocation)
             .await
@@ -484,6 +487,7 @@ async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
         None,
         &|_: &StepProgress| {},
         false,
+        Uuid::new_v4(),
     )
     .await
     .expect("two-block chain over one repo should integrate cleanly");
@@ -571,7 +575,14 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
     //    `ctx.node_runs` via the shared `derive_terminal_status` and fails
     //    the step itself, naming the block and the failing node, WITHOUT
     //    ever needing to reach `verify_state_write`.
-    let err = execute_step(&chain[0], &always_flow, &registry, &failing_runner, false)
+    let err = execute_step(
+        &chain[0],
+        &always_flow,
+        &registry,
+        &failing_runner,
+        false,
+        Uuid::new_v4(),
+    )
         .await
         .expect_err("execute_step must fail a step whose node_runs record a failed node");
     match &err {
@@ -633,6 +644,7 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         None,
         &|_: &StepProgress| {},
         false,
+        Uuid::new_v4(),
     )
     .await
     .expect_err("the chain must not report success for a failed SetupWorktreeNode");
@@ -692,6 +704,7 @@ fn outcome_with_state_file(
             node_runs: HashMap::new(),
         },
         use_worktree: false,
+        campaign_id: Uuid::new_v4(),
         cost_usd: None,
         total_tokens: 0,
     };
@@ -811,6 +824,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         Some("en-11-b-lane"),
         &|_: &StepProgress| {},
         false,
+        Uuid::new_v4(),
     )
     .await
     .expect("two-block chain should close cleanly");
@@ -836,6 +850,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         Some("en-11-b-lane"),
         &|_: &StepProgress| {},
         false,
+        Uuid::new_v4(),
     )
     .await
     .expect_err("D.3 never writes a state file, so the chain must stop");

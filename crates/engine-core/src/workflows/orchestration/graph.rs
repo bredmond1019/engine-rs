@@ -80,6 +80,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use engine_contract::TaskContext;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -603,6 +605,11 @@ impl Node for OrchestrationRunNode {
                 resolved_lane.as_deref(),
                 step_observer.as_ref(),
                 default_use_worktree,
+                // Task 2 threads the parameter to compile and leave
+                // behaviour unchanged; task 3 replaces this freshly-minted
+                // id with the resolved, event-overridable value and stamps
+                // it into `ctx.nodes` (EN.11.E task 3).
+                Uuid::new_v4(),
             ))
             .map_err(|err| NodeError::new(err.to_string()))
         })
