@@ -1373,4 +1373,144 @@ mod tests {
             );
         }
     }
+
+    /// Destructures `SdlcPolicy` using exactly the identifier list passed
+    /// in, then returns those identifiers' names as `&'static str`s. The
+    /// destructure has NO `..` — Rust's struct-pattern rules therefore
+    /// require this identifier list to name every field `SdlcPolicy` has,
+    /// in both directions: a field added to the struct and omitted here is
+    /// a "missing field" compile error, and a name listed here that the
+    /// struct does not have is a "no field with that name" compile error.
+    /// That is the actual guard — `every_sdlc_policy_field_has_a_declared_production_consumer`'s
+    /// runtime comparison below only checks this returned list against
+    /// `FIELD_CONSUMERS`, which by itself could drift from the struct if
+    /// nothing forced this macro's own list to stay honest.
+    macro_rules! policy_field_names {
+        ($($field:ident),+ $(,)?) => {{
+            let SdlcPolicy { $($field),+ } = SdlcPolicy::default();
+            // Consume the bindings so an unused-variable lint can't fire —
+            // this macro exists purely for its destructuring side effect.
+            let _ = ($($field,)+);
+            [$(stringify!($field)),+]
+        }};
+    }
+
+    /// Claim table: every `SdlcPolicy` field paired with the production
+    /// module(s)/function(s) that read the RESOLVED policy value for it.
+    ///
+    /// **What this table proves, and what it does not.** Exhaustiveness —
+    /// every field has *some* named entry — is enforced mechanically by
+    /// `every_sdlc_policy_field_has_a_declared_production_consumer` below,
+    /// via `policy_field_names!`'s compile-time-exhaustive destructure. It
+    /// is a CLAIM, not a proof, that the named module actually reads the
+    /// field correctly, or reads it at all — a copy-pasted or stale
+    /// consumer string would still pass this test. The real proof, for the
+    /// knobs where it matters, is an effect-observing test elsewhere in
+    /// this crate: `max_attempts` (`setup.rs` tests asserting the burned
+    /// attempt count), `llm_triage` (`task_loop.rs`'s
+    /// `resolved_policy_llm_triage_*` tests), and `transport_retry`
+    /// (`task_loop.rs`'s retry-count tests against a failing transport
+    /// double). This table's value is upstream of proof: it forces whoever
+    /// adds a knob to write down an answer to "who reads this" at the
+    /// moment the knob is added, rather than five specs later.
+    const FIELD_CONSUMERS: &[(&str, &str)] = &[
+        (
+            "output_verbosity",
+            "task_loop.rs::apply_verbosity_directive (per-stage prompt), docs.rs (PatchDocsNode)",
+        ),
+        ("prompt_cache", "task_loop.rs::apply_prompt_cache"),
+        (
+            "review_mode",
+            "end_review.rs (EndOnly branch gate), task_loop.rs (per-task review routing)",
+        ),
+        (
+            "review_skip_max_files",
+            "task_loop.rs::should_skip_review (TrivialSkip threshold)",
+        ),
+        (
+            "review_skip_max_diff_lines",
+            "task_loop.rs::should_skip_review (TrivialSkip threshold)",
+        ),
+        ("test_depth", "task_loop.rs (TestTaskNode's check-suite depth)"),
+        (
+            "model_tiers",
+            "task_loop.rs::model_tier_for_stage (all five stages), docs.rs, setup.rs (GenerateTasksNode), graph.rs (local-transport gate)",
+        ),
+        (
+            "timeouts",
+            "task_loop.rs::timeout_for_stage (all five stages), docs.rs, setup.rs (GenerateTasksNode)",
+        ),
+        (
+            "local",
+            "task_loop.rs::apply_model_tier (local model string), graph.rs (openai_compat_meta_transport_live)",
+        ),
+        ("llm_triage", "task_loop.rs::TriageTaskNode (resolved_policy fallback)"),
+        (
+            "max_attempts",
+            "setup.rs::seed_max_attempts, called from GenerateTasksNode and LoadTaskStateNode's tasks.json bootstrap",
+        ),
+        (
+            "max_review_attempts",
+            "task_loop.rs (ReviewRouterNode's review-retry bound), wrap_up.rs (ReviewExhausted signal)",
+        ),
+        (
+            "retry_feedback",
+            "task_loop.rs::prior_attempt_feedback and ::triage_failure_feedback",
+        ),
+        (
+            "transport_retry",
+            "task_loop.rs (implement/triage/review ClaudeCodeStep), docs.rs, end_review.rs, setup.rs — all five with_retry_policy call sites",
+        ),
+        (
+            "review_diff_max_chars",
+            "task_loop.rs::bound_review_diff, end_review.rs (EndReviewNode's diff budget)",
+        ),
+    ];
+
+    #[test]
+    fn every_sdlc_policy_field_has_a_declared_production_consumer() {
+        // See `policy_field_names!`'s doc comment: this call is the
+        // compile-time half of the guard. If a field is ever added to
+        // `SdlcPolicy` without being added here, this line fails to
+        // compile ("missing field in pattern"); a name here that is no
+        // longer a field fails to compile the opposite way. Either way,
+        // the guard fires before the runtime assertion below can even run.
+        let field_names = policy_field_names!(
+            output_verbosity,
+            prompt_cache,
+            review_mode,
+            review_skip_max_files,
+            review_skip_max_diff_lines,
+            test_depth,
+            model_tiers,
+            timeouts,
+            local,
+            llm_triage,
+            max_attempts,
+            max_review_attempts,
+            retry_feedback,
+            transport_retry,
+            review_diff_max_chars,
+        );
+
+        let mut actual: Vec<&str> = field_names.to_vec();
+        actual.sort_unstable();
+
+        let mut declared: Vec<&str> = FIELD_CONSUMERS.iter().map(|(name, _)| *name).collect();
+        declared.sort_unstable();
+
+        assert_eq!(
+            actual, declared,
+            "FIELD_CONSUMERS must name exactly SdlcPolicy's fields — no more, no fewer. \
+             A knob without a table entry is exactly the failure mode this test exists to \
+             catch: a policy value that is declared, settable, and silently ignored."
+        );
+
+        for (name, consumer) in FIELD_CONSUMERS {
+            assert!(
+                !consumer.trim().is_empty(),
+                "field {name} has an empty consumer entry"
+            );
+        }
+    }
 }
