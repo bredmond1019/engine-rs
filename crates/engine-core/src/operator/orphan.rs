@@ -28,7 +28,9 @@
 //!   block's whole point is the behavior change.
 //! - [`OrphanPolicy::stale_run_alarm_secs`] — how many seconds a run may sit
 //!   `running`/`suspended` past its `updated_at` before the stale-run alarm
-//!   enqueues an operator item for it. Defaults to `3600` (one hour).
+//!   enqueues an operator item for it. Derived, not a bare literal: see
+//!   [`OBSERVED_PER_BLOCK_MAX_SECS`] and [`stale_alarm_secs_for`] below —
+//!   the default is `stale_alarm_secs_for(200)` (5280s).
 //! - [`OrphanPolicy::orphan_item_priority`] — the `effective_priority` a
 //!   reconciled-orphan or stale-run alarm item carries into the
 //!   [`crate::operator::queue::OperatorQueue`], mirroring
@@ -44,6 +46,23 @@
 //! what an unconfigured run gets, and all four are set explicitly in every
 //! named profile (`baseline`, `cheap-fast`, `thorough`) — a knob absent from
 //! the profile bundles is a knob nobody will find.
+//!
+//! ## Why the quiet window is bounded by one block, not by the whole chain
+//!
+//! `EN.12.A` was authored (2026-08-19) against a since-expired premise:
+//! `integrate_chain` as a single monolithic node, under which a run's
+//! `updated_at` sat still for an entire chain and the threshold needed to
+//! scale with chain length (per-block range x chain length). That premise
+//! expired when `EN.ticket.orchestration-abort-and-progress` (closed
+//! 2026-08-21) dissolved `integrate_chain` into per-step progress:
+//! `OrchestrationRunNode::with_step_observer` (`graph.rs`) fans out through
+//! `build_orchestration_seams` (`engine-serve/src/workflows.rs`) to
+//! `suspend::publish_step_progress` -> `progress_fanout` ->
+//! `LiveStateStore::record` (`live_state.rs`), which restamps `updated_at`
+//! **once per completed step** — i.e. once per block. The live quiet window
+//! is therefore bounded by ONE block's duration, not by chain length, and
+//! the threshold is deliberately chain-length-*independent* (see the
+//! Amendment note in `planning/blocks/EN.12.A.json`).
 
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +72,23 @@ use crate::policy::{merge_opt, Policy, PolicyConfigSource};
 /// The `harness.json` section key this policy's knobs live under
 /// (`orphan_recovery.policy` / `orphan_recovery.profiles`).
 const WORKFLOW_KEY: &str = "orphan_recovery";
+
+/// The measured per-block MAXIMUM duration, in seconds, from `EN.11.G`'s
+/// production measurement of the 6-44 minute per-block range: 44 minutes.
+/// This is the base every `stale_run_alarm_secs` value derives from via
+/// [`stale_alarm_secs_for`] — see the module docs for why the window is
+/// bounded by one block rather than by chain length.
+pub const OBSERVED_PER_BLOCK_MAX_SECS: u64 = 2_640;
+
+/// Derive a `stale_run_alarm_secs` value as `margin_pct`% of
+/// [`OBSERVED_PER_BLOCK_MAX_SECS`]. Every default and named profile goes
+/// through this function so no bare literal threshold can reappear at any
+/// of the four call sites (the built-in default, `baseline`, `cheap_fast`,
+/// `thorough`).
+#[must_use]
+pub const fn stale_alarm_secs_for(margin_pct: u64) -> u64 {
+    OBSERVED_PER_BLOCK_MAX_SECS * margin_pct / 100
+}
 
 /// The fully-resolved, per-run orphan-recovery policy. See the module docs
 /// for each knob's meaning and default.
@@ -64,6 +100,12 @@ pub struct OrphanPolicy {
     pub reconcile_on_boot: bool,
     /// Seconds a `running`/`suspended` run may sit past its `updated_at`
     /// before the stale-run alarm enqueues an operator item for it.
+    /// Derived as `margin_pct% of OBSERVED_PER_BLOCK_MAX_SECS` (44 minutes,
+    /// EN.11.G's measured per-block maximum) via [`stale_alarm_secs_for`] —
+    /// never a bare literal. The window is bounded by one block, not by
+    /// chain length, because per-step progress (see the module docs)
+    /// restamps `updated_at` on every completed block regardless of chain
+    /// length.
     pub stale_run_alarm_secs: u64,
     /// The `effective_priority` a reconciled-orphan or stale-run alarm item
     /// carries into the operator queue.
@@ -79,7 +121,7 @@ impl Default for OrphanPolicy {
     fn default() -> Self {
         Self {
             reconcile_on_boot: true,
-            stale_run_alarm_secs: 3600,
+            stale_run_alarm_secs: stale_alarm_secs_for(200),
             orphan_item_priority: 0,
             orphan_scan_limit: 200,
         }
@@ -122,7 +164,7 @@ impl Policy for OrphanPolicy {
 pub fn baseline() -> PartialOrphanPolicy {
     PartialOrphanPolicy {
         reconcile_on_boot: Some(true),
-        stale_run_alarm_secs: Some(3600),
+        stale_run_alarm_secs: Some(stale_alarm_secs_for(200)),
         orphan_item_priority: Some(0),
         orphan_scan_limit: Some(200),
     }
@@ -137,7 +179,7 @@ pub fn baseline() -> PartialOrphanPolicy {
 pub fn cheap_fast() -> PartialOrphanPolicy {
     PartialOrphanPolicy {
         reconcile_on_boot: Some(true),
-        stale_run_alarm_secs: Some(1800),
+        stale_run_alarm_secs: Some(stale_alarm_secs_for(125)),
         orphan_item_priority: Some(-5),
         orphan_scan_limit: Some(100),
     }
@@ -151,7 +193,7 @@ pub fn cheap_fast() -> PartialOrphanPolicy {
 pub fn thorough() -> PartialOrphanPolicy {
     PartialOrphanPolicy {
         reconcile_on_boot: Some(true),
-        stale_run_alarm_secs: Some(7200),
+        stale_run_alarm_secs: Some(stale_alarm_secs_for(300)),
         orphan_item_priority: Some(5),
         orphan_scan_limit: Some(500),
     }
@@ -230,9 +272,35 @@ mod tests {
     fn default_matches_documented_baseline_except_reconcile_which_is_deliberately_true() {
         let policy = OrphanPolicy::default();
         assert!(policy.reconcile_on_boot);
-        assert_eq!(policy.stale_run_alarm_secs, 3600);
+        assert_eq!(policy.stale_run_alarm_secs, stale_alarm_secs_for(200));
+        assert_eq!(policy.stale_run_alarm_secs, 5280);
         assert_eq!(policy.orphan_item_priority, 0);
         assert_eq!(policy.orphan_scan_limit, 200);
+    }
+
+    #[test]
+    fn stale_alarm_secs_for_derives_from_observed_per_block_max() {
+        assert_eq!(OBSERVED_PER_BLOCK_MAX_SECS, 2_640);
+        assert_eq!(stale_alarm_secs_for(100), 2_640);
+        assert_eq!(stale_alarm_secs_for(200), 5_280);
+        assert_eq!(stale_alarm_secs_for(125), 3_300);
+        assert_eq!(stale_alarm_secs_for(300), 7_920);
+    }
+
+    #[test]
+    fn every_named_profile_derives_stale_run_alarm_secs_from_its_margin() {
+        assert_eq!(
+            baseline().stale_run_alarm_secs,
+            Some(stale_alarm_secs_for(200))
+        );
+        assert_eq!(
+            cheap_fast().stale_run_alarm_secs,
+            Some(stale_alarm_secs_for(125))
+        );
+        assert_eq!(
+            thorough().stale_run_alarm_secs,
+            Some(stale_alarm_secs_for(300))
+        );
     }
 
     #[test]
@@ -326,7 +394,7 @@ mod tests {
         };
         let resolved = crate::policy::resolve(OrphanPolicy::default(), None, None, Some(&event));
         assert!(!resolved.reconcile_on_boot);
-        assert_eq!(resolved.stale_run_alarm_secs, 3600);
+        assert_eq!(resolved.stale_run_alarm_secs, stale_alarm_secs_for(200));
         assert_eq!(resolved.orphan_item_priority, 0);
         assert_eq!(resolved.orphan_scan_limit, 200);
     }
@@ -343,7 +411,7 @@ mod tests {
         let resolved =
             resolve_policy_for_run_from(&PolicyConfigSource::Builtin, Some("cheap-fast"), None)
                 .expect("resolve should succeed");
-        assert_eq!(resolved.stale_run_alarm_secs, 1800);
+        assert_eq!(resolved.stale_run_alarm_secs, stale_alarm_secs_for(125));
         assert_eq!(resolved.orphan_item_priority, -5);
         assert_eq!(resolved.orphan_scan_limit, 100);
     }
@@ -382,7 +450,7 @@ mod tests {
         );
         assert_eq!(
             state.get("stale_run_alarm_secs").and_then(|v| v.as_u64()),
-            Some(3600)
+            Some(stale_alarm_secs_for(200))
         );
         assert_eq!(
             state.get("orphan_item_priority").and_then(|v| v.as_i64()),
