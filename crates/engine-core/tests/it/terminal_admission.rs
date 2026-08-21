@@ -428,7 +428,8 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             None,
             &|_: &StepProgress| {},
             false,
-            Uuid::new_v4(),)
+            Uuid::new_v4(),
+        )
         .await
     });
 
@@ -464,7 +465,8 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             None,
             &|_: &StepProgress| {},
             false,
-            Uuid::new_v4(),),
+            Uuid::new_v4(),
+        ),
     )
     .await
     .expect("a second lane must proceed while the first is parked on a hold, not hang")
@@ -511,7 +513,8 @@ async fn an_unanswered_hold_exceeding_its_deadline_fails_loudly_and_names_the_bl
         None,
         &|_: &StepProgress| {},
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect_err("an unanswered hold must exceed its deadline and fail loudly");
 

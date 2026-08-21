@@ -579,12 +579,26 @@ mod tests {
         let step_a = step("repo-a", "A.1");
         let step_b = step("repo-b", "B.1");
 
-        let outcome_a = execute_step(&step_a, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect("step a should execute");
-        let outcome_b = execute_step(&step_b, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect("step b should execute");
+        let outcome_a = execute_step(
+            &step_a,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("step a should execute");
+        let outcome_b = execute_step(
+            &step_b,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("step b should execute");
 
         assert_eq!(outcome_a.repo_path, dir.path().join("repo-a"));
         assert_eq!(outcome_b.repo_path, dir.path().join("repo-b"));
@@ -611,9 +625,16 @@ mod tests {
         };
 
         let s = step("repo-a", "A.1");
-        execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect("flow-engine step should execute");
+        execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("flow-engine step should execute");
 
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert_eq!(calls.lock().unwrap().len(), 1);
@@ -626,9 +647,16 @@ mod tests {
         let resolve_engine = |_repo: &str, _id: &str| EngineKind::Task;
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .unwrap_err();
+        let err = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap_err();
 
         match &err {
             ExecuteError::UnsupportedEngine {
@@ -660,9 +688,16 @@ mod tests {
         });
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &failing_runner, false, Uuid::new_v4())
-            .await
-            .unwrap_err();
+        let err = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &failing_runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap_err();
 
         match &err {
             ExecuteError::StepFailed { repo, block_id, .. } => {
@@ -686,9 +721,16 @@ mod tests {
         let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
 
         let s = step("does-not-exist", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .unwrap_err();
+        let err = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, ExecuteError::RepoResolutionFailed { .. }));
         assert!(calls.lock().unwrap().is_empty());
@@ -737,9 +779,16 @@ mod tests {
         let runner = ok_but_child_failed_runner("SetupWorktreeNode");
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect_err("a child with a failed node_run must fail the step");
+        let err = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("a child with a failed node_run must fail the step");
 
         match &err {
             ExecuteError::ChildFailed {
@@ -774,9 +823,16 @@ mod tests {
         let (runner, _calls) = recording_runner();
 
         let s = step("repo-a", "A.1");
-        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect("a run with no failed nodes should be integrated as success");
+        let outcome = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("a run with no failed nodes should be integrated as success");
 
         assert_eq!(outcome.block_id, "A.1");
     }
@@ -830,9 +886,16 @@ mod tests {
         let runner = runner_with_usage("SomeNode", 1.25, 100, 200);
 
         let s = step("repo-a", "A.1");
-        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect("step should execute");
+        let outcome = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("step should execute");
 
         assert_eq!(outcome.cost_usd, Some(1.25));
         assert_eq!(outcome.total_tokens, 300);
@@ -849,9 +912,16 @@ mod tests {
         let (runner, _calls) = recording_runner();
 
         let s = step("repo-a", "A.1");
-        let outcome = execute_step(&s, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect("step should execute");
+        let outcome = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("step should execute");
 
         assert_eq!(outcome.cost_usd, None);
         assert_eq!(outcome.total_tokens, 0);
@@ -1025,12 +1095,26 @@ mod tests {
         let ordinary = step("repo-a", "A.1");
         let base_template = step("base-template", "BT.1");
 
-        execute_step(&ordinary, &resolve_engine, &registry, &runner, true, Uuid::new_v4())
-            .await
-            .expect("ordinary step should execute");
-        execute_step(&base_template, &resolve_engine, &registry, &runner, false, Uuid::new_v4())
-            .await
-            .expect("base-template step should execute");
+        execute_step(
+            &ordinary,
+            &resolve_engine,
+            &registry,
+            &runner,
+            true,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("ordinary step should execute");
+        execute_step(
+            &base_template,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("base-template step should execute");
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);

@@ -221,7 +221,8 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         None,
         &|_: &StepProgress| {},
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect("two-repo chain should integrate cleanly");
 
@@ -277,7 +278,8 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         None,
         &|_: &StepProgress| {},
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect_err("an unmet dependency must refuse the block");
 
@@ -355,7 +357,8 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             None,
             &|_: &StepProgress| {},
             false,
-            Uuid::new_v4(),)
+            Uuid::new_v4(),
+        )
         .await;
         admitted_writer.store(true, Ordering::SeqCst);
         outcome
@@ -473,7 +476,8 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             None,
             &|_: &StepProgress| {},
             false,
-            Uuid::new_v4(),)
+            Uuid::new_v4(),
+        )
         .await
     });
 
@@ -543,7 +547,8 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         None,
         &|_: &StepProgress| {},
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect_err("a corrupted state write must fail the run");
 
@@ -686,7 +691,8 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script()
         Some("prove-readability-lane"),
         &|_: &StepProgress| {},
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect("single-block chain should integrate cleanly");
 
@@ -830,7 +836,8 @@ async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_run
             None,
             &|_: &StepProgress| {},
             false,
-            Uuid::new_v4(),)
+            Uuid::new_v4(),
+        )
         .await
     });
 
@@ -919,7 +926,8 @@ async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner
             None,
             &|_: &StepProgress| {},
             false,
-            Uuid::new_v4(),)
+            Uuid::new_v4(),
+        )
         .await
     });
 
@@ -985,7 +993,8 @@ async fn n_step_chain_calls_the_observer_exactly_n_times_with_correct_indices() 
         None,
         &observer,
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect("three-step chain should integrate cleanly");
 
@@ -1056,7 +1065,8 @@ async fn the_observer_fires_after_the_lane_log_line_is_appended() {
         None,
         &observer,
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect("two-step chain should integrate cleanly");
 }
@@ -1093,7 +1103,8 @@ async fn no_observer_injected_changes_nothing() {
         None,
         &|_: &StepProgress| {},
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect("two-repo chain should integrate cleanly");
 
@@ -1455,7 +1466,8 @@ async fn two_step_chain_attributes_cost_and_tokens_to_the_step_that_spent_them_w
         None,
         &|_: &StepProgress| {},
         false,
-        Uuid::new_v4(),)
+        Uuid::new_v4(),
+    )
     .await
     .expect("two-step chain with distinct per-step usage should integrate cleanly");
 

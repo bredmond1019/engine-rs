@@ -583,8 +583,8 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         false,
         Uuid::new_v4(),
     )
-        .await
-        .expect_err("execute_step must fail a step whose node_runs record a failed node");
+    .await
+    .expect_err("execute_step must fail a step whose node_runs record a failed node");
     match &err {
         ExecuteError::ChildFailed {
             repo,
