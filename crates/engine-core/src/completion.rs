@@ -11,6 +11,10 @@
 //! `derive_terminal_status` would otherwise read it as `succeeded`).
 
 use chrono::Utc;
+use engine_contract::{NodeRunStatus, TaskContext};
+
+use crate::cancellation::CANCELLATION_METADATA_KEY;
+use crate::workflow::BUDGET_METADATA_KEY;
 
 /// The `TaskContext::metadata` key under which a terminal run's completion
 /// marker is recorded — see [`stamp_completion`].
@@ -51,6 +55,55 @@ pub fn is_complete(metadata: &serde_json::Value) -> bool {
         .and_then(|c| c.get("terminal"))
         .and_then(|t| t.as_bool())
         .unwrap_or(false)
+}
+
+/// Derives the terminal status of a run from its final [`TaskContext`]
+/// snapshot. Moved from `engine-serve/src/http.rs` (EN.11.D task 1) so
+/// `engine-core::orchestration` and `engine-serve` share the single "did this
+/// run fail?" implementation rather than drifting apart.
+///
+/// | condition                                                            | status          |
+/// |-----------------------------------------------------------------------|-----------------|
+/// | `metadata.cancellation.cancelled == true` (`CANCELLATION_METADATA_KEY`, [`crate::cancellation::stamp_cancelled`]) | `cancelled` |
+/// | `metadata.budget.halted == true` (`BUDGET_METADATA_KEY`, [`crate::workflow::stamp_budget_halt`]) | `budget_halted` |
+/// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
+/// | none of the above                                                    | `succeeded`     |
+pub fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
+    let cancelled = snapshot
+        .metadata
+        .get(CANCELLATION_METADATA_KEY)
+        .and_then(|v| v.get("cancelled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if cancelled {
+        return "cancelled";
+    }
+
+    let budget_halted = snapshot
+        .metadata
+        .get(BUDGET_METADATA_KEY)
+        .and_then(|v| v.get("halted"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if budget_halted {
+        return "budget_halted";
+    }
+
+    let failure_marker = snapshot
+        .metadata
+        .get("failure")
+        .and_then(|v| v.get("failed"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let any_node_failed = snapshot
+        .node_runs
+        .values()
+        .any(|node_run| node_run.status == NodeRunStatus::Failed);
+    if failure_marker || any_node_failed {
+        return "failed";
+    }
+
+    "succeeded"
 }
 
 #[cfg(test)]
@@ -159,5 +212,78 @@ mod tests {
             serde_json::json!("budget_halted")
         );
         assert!(is_complete(&round_tripped.metadata));
+    }
+}
+
+#[cfg(test)]
+mod derive_terminal_status_tests {
+    use super::derive_terminal_status;
+    use engine_contract::{NodeRun, NodeRunStatus, TaskContext};
+    use std::collections::HashMap as StdHashMap;
+
+    fn empty_context(metadata: serde_json::Value) -> TaskContext {
+        TaskContext {
+            event: serde_json::Value::Null,
+            nodes: StdHashMap::new(),
+            metadata,
+            node_runs: StdHashMap::new(),
+        }
+    }
+
+    #[test]
+    fn succeeded_when_no_markers_and_no_failed_nodes() {
+        let ctx = empty_context(serde_json::json!({}));
+        assert_eq!(derive_terminal_status(&ctx), "succeeded");
+    }
+
+    #[test]
+    fn cancelled_when_cancellation_marker_is_set() {
+        let ctx = empty_context(serde_json::json!({
+            "cancellation": { "cancelled": true, "at": "2026-01-01T00:00:00Z" }
+        }));
+        assert_eq!(derive_terminal_status(&ctx), "cancelled");
+    }
+
+    #[test]
+    fn budget_halted_when_budget_marker_is_set() {
+        let ctx = empty_context(serde_json::json!({
+            "budget": { "halted": true, "reason": { "cap": "cost" } }
+        }));
+        assert_eq!(derive_terminal_status(&ctx), "budget_halted");
+    }
+
+    #[test]
+    fn failed_when_failure_marker_is_set() {
+        let ctx = empty_context(serde_json::json!({
+            "failure": { "failed": true, "error": "boom", "at": "2026-01-01T00:00:00Z" }
+        }));
+        assert_eq!(derive_terminal_status(&ctx), "failed");
+    }
+
+    #[test]
+    fn failed_when_any_node_run_failed() {
+        let mut ctx = empty_context(serde_json::json!({}));
+        ctx.node_runs.insert(
+            "SomeNode".to_string(),
+            NodeRun {
+                status: NodeRunStatus::Failed,
+                started_at: None,
+                completed_at: None,
+                error: Some("boom".to_string()),
+                input: None,
+                usage: None,
+            },
+        );
+        assert_eq!(derive_terminal_status(&ctx), "failed");
+    }
+
+    #[test]
+    fn cancellation_takes_precedence_over_budget_and_failure() {
+        let ctx = empty_context(serde_json::json!({
+            "cancellation": { "cancelled": true, "at": "2026-01-01T00:00:00Z" },
+            "budget": { "halted": true },
+            "failure": { "failed": true }
+        }));
+        assert_eq!(derive_terminal_status(&ctx), "cancelled");
     }
 }

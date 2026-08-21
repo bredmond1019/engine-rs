@@ -63,10 +63,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use chrono::{DateTime, Utc};
-use engine_contract::{NodeRunStatus, TaskContext};
-use engine_core::{
-    Budget, CancellationToken, PauseSignal, BUDGET_METADATA_KEY, CANCELLATION_METADATA_KEY,
-};
+use engine_contract::TaskContext;
+use engine_core::{Budget, CancellationToken, PauseSignal};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -323,43 +321,16 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-pub(crate) fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
-    let cancelled = snapshot
-        .metadata
-        .get(CANCELLATION_METADATA_KEY)
-        .and_then(|v| v.get("cancelled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if cancelled {
-        return "cancelled";
-    }
-
-    let budget_halted = snapshot
-        .metadata
-        .get(BUDGET_METADATA_KEY)
-        .and_then(|v| v.get("halted"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if budget_halted {
-        return "budget_halted";
-    }
-
-    let failure_marker = snapshot
-        .metadata
-        .get("failure")
-        .and_then(|v| v.get("failed"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let any_node_failed = snapshot
-        .node_runs
-        .values()
-        .any(|node_run| node_run.status == NodeRunStatus::Failed);
-    if failure_marker || any_node_failed {
-        return "failed";
-    }
-
-    "succeeded"
-}
+/// MOVED into `engine-core::completion` (EN.11.D task 1) so `engine-core`'s
+/// orchestration chain and `engine-serve` share the single "did this run
+/// fail?" implementation rather than drifting apart — `engine-serve` depends
+/// on `engine-core` and not the reverse, so the move (not an export from
+/// here) is the only direction that compiles. Re-exported here, still
+/// `pub(crate)`, so every existing in-crate call site
+/// (`crate::http::derive_terminal_status`, used from `stream.rs`,
+/// `live_state.rs`, `suspend.rs`, and this module's own tests) keeps working
+/// unmodified.
+pub(crate) use engine_core::derive_terminal_status;
 
 /// Status for a run that is still in the live map. `derive_terminal_status`
 /// is deliberately NOT extended: a suspended run is not terminal, and that
@@ -2271,8 +2242,8 @@ mod tests {
     }
 
     mod derive_terminal_status_tests {
-        use super::{derive_terminal_status, NodeRunStatus};
-        use engine_contract::{NodeRun, TaskContext};
+        use super::derive_terminal_status;
+        use engine_contract::{NodeRun, NodeRunStatus, TaskContext};
         use std::collections::HashMap as StdHashMap;
 
         fn empty_context(metadata: serde_json::Value) -> TaskContext {
