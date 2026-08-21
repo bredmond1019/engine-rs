@@ -57,6 +57,15 @@
 //! id yet to thread a cancellation into (see [`integrate::integrate_chain`]'s
 //! own doc). An operator issuing an abort stops the *next* step, not the
 //! current one.
+//!
+//! A cancelled chain is never mistaken for a failed or a completed one:
+//! [`OrchestrationRunNode::process`] stamps `ctx.nodes[NODE_NAME]["cancellation"]`
+//! with whether the run was cancelled and, if so, at which step index of
+//! how many — under the same `"cancellation"` key `crate::cancellation::stamp_cancelled`
+//! uses at the framework level (`ctx.metadata`), which is also stamped for
+//! the same event rather than left to the between-node check alone. Every
+//! step already integrated before the cancel keeps its `lane-log.jsonl`
+//! line; nothing is rolled back.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -68,7 +77,7 @@ use engine_contract::TaskContext;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::cancellation::CancellationToken;
+use crate::cancellation::{stamp_cancelled, CancellationToken};
 use crate::node::{Node, NodeError, NodeRegistry};
 use crate::policy::{read_harness_policy_defaults_from, resolve_profile_from, PolicyConfigSource};
 use crate::repo_registry::RepoRegistry;
@@ -411,6 +420,13 @@ impl Node for OrchestrationRunNode {
             .map_err(|err| NodeError::new(err.to_string()))?
         };
 
+        // Captured before `chain` is moved into the `spawn_blocking`
+        // closure below — the only way to know, after the fact, how many
+        // steps the chain was ever going to run, which is what turns
+        // "fewer outcomes than steps" into "cancelled at step k of n"
+        // rather than merely "a short chain".
+        let total_steps = chain.len();
+
         let roadmap_slug = event
             .roadmap_slug
             .clone()
@@ -441,6 +457,12 @@ impl Node for OrchestrationRunNode {
         // inside) and `Send + 'static`, so it crosses the boundary the same
         // way the rest of this node's seams do. See `with_cancellation_token`.
         let cancellation_token = self.cancellation_token.clone();
+        // A second clone kept OUTSIDE the `spawn_blocking` closure — the
+        // first is moved into the closure below and consumed there, so
+        // this is the only way `process` can still ask "was this run
+        // cancelled?" once `integrate_chain` returns. Cheap: `CancellationToken`
+        // is an `Arc` inside.
+        let cancellation_token_for_stamp = cancellation_token.clone();
 
         // `execute::FlowFuture` is deliberately not `Send` (see its own doc
         // comment: `Workflow::run`'s `OnProgress` callback is not `Send`),
@@ -480,7 +502,52 @@ impl Node for OrchestrationRunNode {
         .await
         .map_err(|err| NodeError::new(format!("orchestration task panicked: {err}")))??;
 
+        // A cancel win is only real if it actually cut the chain short —
+        // `integrate_chain` can return `outcomes.len() == total_steps` even
+        // with a cancelled token if the cancel landed after the last step's
+        // own top-of-loop check but the loop had already finished (the
+        // token was cancelled "too late to matter"). In that case the run
+        // completed and must read as COMPLETED, not CANCELLED, even though
+        // the token itself is in the cancelled state.
+        let cancelled_at_step = if outcomes.len() < total_steps
+            && cancellation_token_for_stamp
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            Some(outcomes.len())
+        } else {
+            None
+        };
+
         let mut ctx = ctx;
+        // Node-level record of the same event `crate::cancellation::stamp_cancelled`
+        // marks at the framework/`ctx.metadata` level (`workflow.rs`'s
+        // between-node check) — named under the same `"cancellation"` key
+        // rather than a rival marker, but scoped here to this node's own
+        // result so a reader with only `ctx.nodes[NODE_NAME]` can already
+        // tell COMPLETED (`cancelled: false`, `steps_integrated == total`)
+        // from CANCELLED (`cancelled: true`, stopped at `at_step` of
+        // `total_steps`) from FAILED (this branch is never reached — a
+        // failed step returns `Err` above and there is no result to stamp).
+        // Every step already integrated before the cancel keeps its
+        // `lane-log.jsonl` line; nothing here rolls anything back.
+        let cancellation = match cancelled_at_step {
+            Some(at_step) => {
+                // Also stamp the framework-level marker so a caller reading
+                // only `ctx.metadata` (e.g. `RunTelemetry`) sees the same
+                // fact `Workflow::walk`'s own between-node cancellation
+                // check would have recorded, had this graph had more than
+                // one node to check between.
+                stamp_cancelled(&mut ctx.metadata);
+                json!({
+                    "cancelled": true,
+                    "at_step": at_step,
+                    "total_steps": total_steps,
+                })
+            }
+            None => json!({ "cancelled": false }),
+        };
+
         ctx.nodes.insert(
             NODE_NAME.to_string(),
             json!({
@@ -490,6 +557,7 @@ impl Node for OrchestrationRunNode {
                     .map(|o| json!({ "repo": o.repo, "block_id": o.block_id }))
                     .collect::<Vec<_>>(),
                 "policy": { "hold_poll_interval_ms": policy.hold_poll_interval_ms },
+                "cancellation": cancellation,
             }),
         );
         Ok(ctx)
@@ -894,6 +962,148 @@ mod tests {
         // The real event lane, not the repo slug.
         assert_eq!(lines[0]["lane"], "backend");
         assert_eq!(lines[1]["lane"], "backend");
+    }
+
+    // ── Node::process — cancellation stamping (Task 2) ───────────────────
+
+    /// A [`FlowRunner`] that records every block it ran and, the moment it
+    /// finishes the one named `cancel_after`, cancels `token` -- the same
+    /// deterministic pattern `integrate.rs`'s own cancellation tests use,
+    /// duplicated here (rather than shared) because it belongs to a
+    /// different crate target (`tests/it` vs this unit-test module).
+    fn cancel_after_block(token: CancellationToken, cancel_after: &'static str) -> FlowRunner {
+        Arc::new(move |invocation| {
+            let token = token.clone();
+            Box::pin(async move {
+                let done = TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                };
+                if invocation.block_id == cancel_after {
+                    token.cancel();
+                }
+                Ok(done)
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_stamps_cancelled_true_with_the_stopping_step_and_total() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+        write_done_state(&dir.path().join("repo-a"), "A.3");
+
+        let token = CancellationToken::new();
+        let run_flow = cancel_after_block(token.clone(), "A.1");
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_cancellation_token(token);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-a", "block_id": "A.2" },
+                { "repo": "repo-a", "block_id": "A.3" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a cancelled run is Ok, not Err");
+        let recorded = &out.nodes[NODE_NAME];
+
+        // Only A.1 integrated before the cancel won.
+        assert_eq!(recorded["steps_integrated"], 1);
+        assert_eq!(recorded["cancellation"]["cancelled"], true);
+        assert_eq!(recorded["cancellation"]["at_step"], 1);
+        assert_eq!(recorded["cancellation"]["total_steps"], 3);
+
+        // The framework-level marker is also stamped, under the same key,
+        // rather than only the node-local record existing.
+        assert_eq!(out.metadata["cancellation"]["cancelled"], true);
+    }
+
+    #[tokio::test]
+    async fn a_completed_run_stamps_cancelled_false_even_with_a_token_attached() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        // A token is attached but never cancelled -- behavior must still
+        // read as a plain completion, not merely as "no cancellation
+        // detected because there was no token at all" (the other test
+        // below covers that un-injected case).
+        let token = CancellationToken::new();
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_cancellation_token(token);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["steps_integrated"], 2);
+        assert_eq!(recorded["cancellation"]["cancelled"], false);
+        assert!(out.metadata.get("cancellation").is_none());
+    }
+
+    #[tokio::test]
+    async fn no_token_injected_leaves_cancellation_reported_false() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        // No `with_cancellation_token` call at all -- the behavior-stable
+        // default path.
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["steps_integrated"], 2);
+        assert_eq!(recorded["cancellation"]["cancelled"], false);
+        assert!(out.metadata.get("cancellation").is_none());
     }
 
     #[tokio::test]
