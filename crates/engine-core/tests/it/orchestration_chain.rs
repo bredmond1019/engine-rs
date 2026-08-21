@@ -34,6 +34,48 @@
 //! Everything here is written under a `tempfile::TempDir`. Nothing is ever written under
 //! this repo's own `planning/` tree — see the `diagnostic-intake-state-json-rewritten-by-
 //! test-suite` carryover for the failure shape this fixture must not repeat.
+//!
+//! # Task 4 — the gate-scope guard: each case shown capable of failing
+//!
+//! The `gate-scope-must-be-shown-capable-of-failing` carryover names the anti-pattern
+//! this fixture is most exposed to: a check whose inputs both come from the artifact
+//! under test, and which therefore cannot fail. For each of the four cases below, the
+//! named production symbol was perturbed by hand in the working tree, the case was run
+//! and observed to fail with the message shown, and the perturbation was then reverted
+//! (`git checkout --`) before this task's commit — `git status --porcelain` scoped to
+//! `crates/engine-core/src/` was empty at that point and remains empty in this commit.
+//! No production source differs from HEAD.
+//!
+//! - **(a)** [`block_n_plus_1s_tree_lacks_block_ns_work_today`] — perturbed
+//!   `integrate_chain`'s per-step loop (`integrate.rs`) to push each step's completed
+//!   branch tip to `origin/main` and fetch it back (simulating the chaining `EN.11.C`
+//!   will add), immediately after `verify_state_write` succeeds. Observed failure:
+//!   `panicked at .../orchestration_chain.rs:456:5: WRONG-TODAY: B2's tree must NOT
+//!   contain B1's marker, because B2's branch was cut from origin/main, not from B1's
+//!   tip — flips by EN.11.C`.
+//! - **(b)** [`a_failed_setup_worktree_step_is_invisible_to_execute_step_today`] —
+//!   perturbed `execute_step` (`execute.rs`) to inspect `ctx.node_runs` after `run_flow`
+//!   returns and return `Err(ExecuteError::StepFailed { .. })` when any node run's
+//!   status is `Failed` (the inspection the case's doc comment says production never
+//!   does today). Observed failure: `panicked at .../orchestration_chain.rs:526:10:
+//!   WRONG-TODAY: execute_step must return Ok even though SetupWorktreeNode failed
+//!   inside node_runs — flips by EN.11.D: StepFailed { repo: "smoke-repo", block_id:
+//!   "B1", source: WorkflowError { message: "perturbation: a node_run failed" } }`.
+//! - **(c)** [`red_authoritative_build_is_now_rejected_by_verify_state_write`] —
+//!   perturbed `verify_state_write`'s `final_validation.all_passed == Some(false)`
+//!   branch (`integrate.rs`) to `false && all_passed == Some(false)`, short-circuiting
+//!   the gate so it never fires. Observed failure: `panicked at
+//!   .../orchestration_chain.rs:645:48: FIXED: a red authoritative build
+//!   (all_passed:false) must be rejected even though status reads done —
+//!   EN.ticket.final-validation-failure-must-block: ()`.
+//! - **(d)** [`lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape`] —
+//!   perturbed `LaneLogEntry` (`integrate.rs`) with `#[serde(rename = "block_id")]` on
+//!   the `block` field, reintroducing the retired key name. Observed failure:
+//!   `panicked at .../orchestration_chain.rs:772:9: assertion `left == right` failed:
+//!   FIXED shape only — lane-log line must carry exactly {ts, lane, repo, block,
+//!   status, note}, got {"block_id": String("D.1"), ...} left: {"block_id", "lane",
+//!   "note", "repo", "status", "ts"} right: {"block", "lane", "note", "repo", "status",
+//!   "ts"}`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
