@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-portfolio/base-template/lane.schema.json",
+  "title": "Lane Record",
+  "description": "The authored definition of one orchestration lane — an ordered chain of blocks, possibly spanning multiple repos, that /orchestrate drives together. File layout: one record per lane, at <roadmap_dir>/lane-<name>.json (a mechanical rename of the legacy lane-<name>.txt layout). Sibling to block.schema.json. Governed by D71.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lane",
+    "roadmap",
+    "blocks"
+  ],
+  "properties": {
+    "lane": {
+      "type": "string",
+      "description": "The lane's name/slug, matching the <name> in this file's own path (lane-<name>.json).",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "repo": {
+      "type": "string",
+      "description": "OPTIONAL lane-level default repo. A lane is NOT single-repo in this corpus (planning/close-the-loop/lane-substrate.txt spans seven repo prefixes), so this key is not required and carries no meaning for blocks[]: each block entry requires its own `repo` regardless of this value. Present only so a single-repo lane can name itself once.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "roadmap": {
+      "type": "string",
+      "description": "Slug of the owning roadmap directory this lane record lives under.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "blocks": {
+      "type": "array",
+      "description": "Ordered chain of blocks this lane drives. Array order IS chain order.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "origin_roadmap",
+          "repo"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Canonical block ID, matching block.schema.json's id pattern.",
+            "pattern": "^[A-Z]{2,3}\\.(\\d+[A-Z]?|ticket|chore)\\.[A-Za-z0-9][A-Za-z0-9-]*$"
+          },
+          "origin_roadmap": {
+            "type": "string",
+            "description": "Slug of the roadmap this block was originally allocated under. Required because a block can be claimed by more than one lane across roadmaps; this is what retires E_LANE_DOUBLE_CLAIM by construction.",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repo slug this block runs in. Required per-block, not inherited from the lane-level repo default — a lane is not single-repo in this corpus.",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          }
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "description": "Concurrency budget for this lane, mirroring mev's emitted shape exactly. Deliberately omits any field naming the heaviness grouping: that grouping is DERIVED by fleet_concurrency_check.py from the target repo's harness.json, never authored here. Also omits a level field.",
+      "additionalProperties": false,
+      "properties": {
+        "heavy": {
+          "type": "boolean",
+          "description": "Whether this lane is heavy for concurrency-budget purposes. Cross-checked against fleet_concurrency_check.py is-heavy for the lane's repo."
+        },
+        "not_with": {
+          "type": "array",
+          "description": "Slugs of other lanes this lane must not run concurrently with.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "held_until": {
+      "type": "string",
+      "description": "Date this lane is held until before it may start. Authored lane metadata with no state.json representation.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "isolation": {
+      "type": "string",
+      "description": "Isolation policy for this lane's execution (e.g. worktree vs in-place). Authored lane metadata with no state.json representation.",
+      "minLength": 1
+    },
+    "exclusive_repos": {
+      "type": "array",
+      "description": "Repos this lane must run exclusively in — no other lane may touch them concurrently. Authored lane metadata with no state.json representation.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "spec_source": {
+      "type": "string",
+      "description": "Where this lane's block specs were sourced from. Authored lane metadata with no state.json representation.",
+      "minLength": 1
+    },
+    "cut_blocks": {
+      "type": "array",
+      "description": "Block IDs originally planned for this lane but cut. Authored lane metadata with no state.json representation.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

@@ -73,6 +73,11 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
 
 1. **Worktree Setup**:
    - Create (or re-attach) the one shared worktree at `trees/<spec-slug>-flow` and checkout branch `sdlc-flow/<spec-slug>`.
+   - **Spec location.** Paths are `planning/<spec-slug>/...` at the git root by default. If no spec
+     exists there, ALSO check `<invoking-dir-relative-to-root>/planning/<spec-slug>/...` — a
+     sub-brain tier (e.g. `business/`) has its own `planning/` without being its own git repo. The
+     ROOT always wins when a spec exists at both locations. If found at neither, abort and name BOTH
+     paths you searched, not just one.
 2. **D16 preflight lint — do not guess the task structure.**
    - If the spec's `tasks.json` already exists, skip to task execution.
    - If it is missing but `tasks.md` has derivable step content, derive a FRESH `tasks.json` from

@@ -1,6 +1,6 @@
 {
-  "version": "6e92af9074b183e01fe7408e5f60d0c9c3da024a",
-  "generated": "2026-08-20",
+  "version": "37fa5e8ae59264d6433139f3a39f9af0a6ce70f4",
+  "generated": "2026-08-21",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
     ".claude/commands/document.md": "ea9e4d419b52935a22ab9e11091a5eb0b0e5e7c859a79bdd2d05ff5f4d39bd20",
@@ -57,10 +57,11 @@
     ".claude/commands/handoff.md": "e1f5af87a26af800c6243bab8995a672cd269009548b53070d34d310d7acfb8a",
     ".claude/commands/test_crud_api.md": "8d57ef6e1c3c9f54eb73bf762946efa93a65b0fe50d00cb1bcc0c5b987d5b5fc",
     ".claude/commands/test_error_handling.md": "6a35c2fc64ee5f0c076b07bf479373189391ea7d8d20ab2953b8800991e059be",
-    ".claude/workflows/sdlc-flow.js": "b35cec0b86f5f20455e8d8a0edb2e4586ccc071e28a0953d6430baab7222faa4",
-    ".claude/workflows/sdlc-task.js": "1c5e8dbac7673eddcaa78fa15d3ef035dd5ba39b35220a384432232a051697de",
+    ".claude/workflows/sdlc-flow.js": "e861cb0ba1c001fc987ae67900d6565ad09cd43530bb7377f2f54f7826ed44dd",
+    ".claude/workflows/sdlc-task.js": "c1333c24be6c2bc181e7d21f4004cac3b1391e45c7a607b60da7d0a575e1b11f",
     ".claude/workflows/block.schema.json": "852e41dfa841b8750a32aa2d89ebe59a0d8f9497118e6b4d85c7efbf87117872",
     ".claude/workflows/harness.schema.json": "1044b2e179962a1bae21c6f155cad14d2b9014c4fc69ebbc1769b9a4b91740ee",
+    ".claude/workflows/lane.schema.json": "3382040159d62a5f1ee456dc8171bfe833c54de5de4022da2fa2b973ecf46df7",
     ".claude/workflows/block-registration.md": "615e76f6710df55f89553801c0f300f58b9c9dca09c003663b6350ec048c0505",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
@@ -69,16 +70,17 @@
     ".claude/skills/commit-in-this-fleet/SKILL.md": "921f3582a7a5bc54afdccc5d49a1b71429121d0a9795256a864308d1015d6d17",
     ".claude/skills/derive-state-safely/SKILL.md": "d431bbf6385cd23d6a86a307e32257f241ed128a09f8ce89195110a0ac5270d0",
     ".claude/skills/run-the-gates/SKILL.md": "8e8b9fd57cc7570f22026ccb67dbcedacf6bd133d84c7699a509185fedbc61cd",
+    ".claude/skills/stop-or-continue/SKILL.md": "484938a42059e29dd65f550b906ba60d69e3bb92d61b8f35a509df62d4ca43fb",
     "scripts/check_block_records.py": "5b0bad333c00aacc26276bd42d274adbb2f8857cba16df9f7e60d7c3cb518132",
-    ".agents/skills/sdlc-task/SKILL.md": "d310d5297414f08f0807127d52fb5537d43d423bf91f11bf6700490a236ad70f",
-    ".agents/skills/sdlc-flow/SKILL.md": "c9222485e9cf3eff0d047c9e54f55fca6a49ae928c456043f7e9f1ca0fc6e9b9",
+    ".agents/skills/sdlc-task/SKILL.md": "68600df0a31bc3ecb9e89d9161b90834678d49d6a5a2b8428e1f40f5491c4e09",
+    ".agents/skills/sdlc-flow/SKILL.md": "85bca4b834bad8eaa23777ca9b892c9b039ccdde86e6f91d8b844af8b14399af",
     ".agents/skills/write-okf-markdown/SKILL.md": "5ba5dce63af971a22cdcc8e54d36e68f1559364037e4fe01b48932f9e3b99cd7",
     ".agents/skills/edit-state-json/SKILL.md": "fe2b8bece8f44840933311a24637e3368958a42179f4643440d957a445570bea",
     ".agents/skills/commit-in-this-fleet/SKILL.md": "7906b88aae7b3743c50e80fbe8ad9d5883bf6e4e164376a0d434b8d8f6694f1a",
     ".agents/skills/derive-state-safely/SKILL.md": "739dbc5444174348fe375d48a9478062cd3cc41fae0213c9feaaea00168e8935",
     ".agents/skills/run-the-gates/SKILL.md": "997de852ce33f1f1ce89eef3232fc3aa76631beb3f51b94fab43bf6e479e7b98",
     "hooks/pre-push": "c211232487efaeb034f1c333c6ebd53830bd4e4411196c5a87c2c2bddd596f8e",
-    "hooks/test_pre_push.sh": "a7f505fdd0f9ce6054a8b5b5dc87d6405bd34f73b4a7d2e6d572bfbe8bb8560b",
+    "hooks/test_pre_push.sh": "f799870cc18b52bef410eccf2a48a6b8dcad13d65345b87d3eac51deec7f8778",
     "hooks/README.md": "87411c2a68869027fe86db2e92357bf45c8c18730e509fc7123907de576e944a"
   }
 }

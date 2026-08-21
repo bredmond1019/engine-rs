@@ -101,7 +101,9 @@ only this section — not the `.js` — should end up doing exactly what the rea
 
 ### Step 0 — Parse the invocation
 
-- `<spec-slug>` (required) — call it `blockId`. Paths derived from it:
+- `<spec-slug>` (required) — call it `blockId`. Paths derived from it, initially against the git
+  root, then **re-derived under a tier prefix** in Step 1.7 if the spec is only found in a sub-brain
+  tier's own `planning/` (e.g. `business/`) — see Step 1.7 below:
   - `blockDir` = `planning/<blockId>`
   - `blockRecordFile` = `planning/blocks/<blockId>.json` — the authored block record (D65 stage 2):
     preferred spec source when present.
@@ -127,6 +129,11 @@ only this section — not the `.js` — should end up doing exactly what the rea
 Run everything below from the **main repo root** unless noted.
 
 1. `repoRoot` = `git rev-parse --show-toplevel`. `currentBranch` = `git rev-parse --abbrev-ref HEAD`.
+   **Before any other `cd`**, also compute `candidateTierPrefix` — the CURRENT working directory's
+   path relative to `repoRoot`, with a trailing slash, or `""` when you are already at `repoRoot`
+   (e.g. invoked from inside `business/` → `"business/"`). This captures where `/sdlc-task` was
+   actually invoked from, which `runDir` (computed later) does not preserve for in-place runs
+   (`runDir = repoRoot` regardless of the invoking directory).
 2. **Branch naming (worktree mode only).** There is ONE shared branch per spec run — never one branch
    per task number. Compute the base name:
    ```
@@ -201,12 +208,26 @@ Run everything below from the **main repo root** unless noted.
    `runDir = repoRoot`. Skip Steps 1b/1c entirely.
 6. **Compute `runDir`**: `repoRoot/trees/<branchName>` under `--worktree`, else `repoRoot`.
 7. **Report pipeline-start inputs**, all run from `runDir`:
-   - **Spec source (D65 stage 2)** — the block record is checked FIRST and is preferred; `tasks.md`
-     is only a fallback for a legacy spec that predates the block-record migration:
-     `ls <blockRecordFile>` then `ls <specFile>`. `specSource` = `"block-record"` if the record
-     exists (regardless of whether the legacy file also exists); else `"tasks-md"` if the legacy
-     file exists; else `"missing"`. `specFileExists` = true iff `specSource != "missing"`. When
-     `specSource == "block-record"`, reassign `specFile := blockRecordFile` for every step below.
+   - **Spec source AND location (D65 stage 2 + tier resolution)** — the block record is checked
+     FIRST and is preferred; `tasks.md` is only a fallback for a legacy spec that predates the
+     block-record migration. Check the **root** first — it always wins whenever the spec exists at
+     both locations: `ls <blockRecordFile>` then `ls <specFile>` (both root-relative, as computed in
+     Step 0). ONLY IF `candidateTierPrefix` (from Step 1.1) is non-empty, ALSO check the tier
+     location: `ls <candidateTierPrefix><blockRecordFile>` then `ls <candidateTierPrefix><specFile>`.
+     Resolve, in order:
+     - `specFoundInTier` = true ONLY when the spec exists at NEITHER root path AND exists at either
+       tier path. Otherwise false — this is what makes the root win when the spec is present at both.
+     - `specSource`, evaluated at the WINNING location (root unless `specFoundInTier`):
+       `"block-record"` if that location's block record exists; else `"tasks-md"` if that location's
+       legacy file exists; else `"missing"`.
+     - `specFileExists` = true iff `specSource != "missing"`.
+     - **If `specFoundInTier` is true**, re-derive `blockDir`, `blockRecordFile`, `specFile`,
+       `tasksJsonFile`, `breakdownFile`, `reportsDir` and `stateFile` (Step 0's list) by prefixing
+       each with `candidateTierPrefix` — e.g. `blockDir = "<candidateTierPrefix>planning/<blockId>"`
+       — BEFORE proceeding to the `specSource == "block-record"` reassignment below. Every later step
+       then reads these tier-qualified paths exactly as it would the root ones.
+     - When `specSource == "block-record"`, reassign `specFile := blockRecordFile` (using whichever
+       — root or tier — form `blockRecordFile` now holds) for every step below.
    - Block status: `grep -iE "<blockId>" planning/status.md | head -5` (title-case Status, or
      `"Unknown"` if no row found).
    - **D19 thin-spec gate** — evaluate ONLY when `specSource == "tasks-md"` (the legacy prose path —
@@ -224,8 +245,11 @@ Run everything below from the **main repo root** unless noted.
      own recorded commit SHAs against its own parent, not `baseSha..HEAD`; `baseSha` survives only
      as the cannot-scope fallback check (Step 6 below) and as `state.base_sha` for `/close-out`'s
      in-place fallback.
-- If neither the block record nor the legacy spec file is found: abort — `Missing spec`, tell the
-  user to run `/generate-tasks <blockId>` (and `/breakdown`), commit, then re-run.
+- If the spec is found at NEITHER the root nor the tier location: abort — `Missing spec`, and name
+  BOTH the root paths AND (when `candidateTierPrefix` was non-empty) the tier paths that were
+  searched — naming only the root reads as "the spec was never written" when the real cause may be
+  "the engine looked in the wrong place". Tell the user to run `/generate-tasks <blockId>` (and
+  `/breakdown`), commit, then re-run.
 
 From here on, every Bash call in every later step is prefixed with `cd <runDir> &&` — shell state does
 not persist between calls.
@@ -302,7 +326,14 @@ not persist between calls.
    - Missing/invalid → log that no valid state was found and run every selected task fresh.
    - Valid → collect every task number whose `tasks["<N>"].status == "passed"` into a skip-set; those
      tasks are skipped entirely in the per-task loop (logged, not re-run). Also read `bail_reason` for
-     context.
+     context. **Also copy the file's entire top-level `tasks` object verbatim into the in-memory
+     `state.tasks` map before the per-task loop starts** — the loop below only ever writes
+     `state.tasks[N]` for tasks it actually runs this invocation, so a skipped/already-passed task
+     never re-enters it on its own. Without this seed, the very next state write (Step 3.3) would
+     serialize `state` wholesale and silently drop every earlier-passed task from the committed file,
+     and a *second* resume would then see them as never-passed and re-run them. This is the same fix
+     `sdlc-flow.js`/its SKILL.md already carry; `tasks_run` is a different field and is NOT merged this
+     way — it stays per-invocation telemetry (see Step 3.3).
 4. **Load `planning/harness.json`** (from `runDir`) if present and valid JSON — this project's
    validation policy, `validation.checks[]`. Each check has a `kind` (default `command`; also
    `baseline-diff`, `count-delta`, `warning-scan`, `forbidden-pattern-scan`,
@@ -479,8 +510,13 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
    mode, branch, worktree_path, status, current_task, tasks_run, the per-task `tasks{}` map,
    bail_reason, and the token roll-up) to `<stateFile>` via a plain file write — `mkdir -p
    <blockDir>/sdlc` first, preserve `started_at` from the file if one already exists (else stamp now),
-   always refresh `updated_at`. **Never run `git add`/`git commit`/`git checkout`/`git switch`/`git
-   branch` on this file** — it is read back off disk only, by `--resume`, never out of git history.
+   always refresh `updated_at`. **`tasks{}` must be the merged map** — the tasks carried forward from
+   Step 2.3's resume-load (already-passed tasks from a prior invocation) union the tasks this
+   invocation actually ran, keyed by task number; never write only this invocation's tasks. `tasks_run`
+   is the opposite — it is deliberately PER-INVOCATION telemetry ("what did THIS invocation run") and
+   is never unioned with a prior invocation's `tasks_run`; only `tasks` is the cumulative resume
+   breadcrumb. **Never run `git add`/`git commit`/`git checkout`/`git switch`/`git branch` on this
+   file** — it is read back off disk only, by `--resume`, never out of git history.
 4. If this task bailed, stop the per-task loop entirely (do not proceed to the next `taskNum`).
 
 ### Step 3.5 — Terminal authoritative reconcile (D56)
@@ -522,7 +558,13 @@ check from the per-task list entirely.
 
 Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`. Otherwise:
 
-- `blockDone` = true iff `fullRun` AND `!reconcileFailed` AND every task in `taskList` passed.
+- `blockDone` = true iff `!reconcileFailed` AND every task in `allTasks` (the FULL spec, not
+  `taskList`, which is only this run's selected subset) has passed — comparing against `taskList`
+  would be trivially true on a subset run, so this is derived from `allTasks` and no longer gated by
+  `fullRun` (BT.ticket.resume-cannot-close-its-block). This is only safe because `state.tasks`
+  survives a `--resume` (BT.ticket.sdlc-task-resume-truncates-run-state) — before that fix, a
+  resumed run's `state.tasks` held only the resumed tasks and this comparison could not be trusted.
+  When declining to close, name the outstanding task numbers in the report.
 - **Re-detect the vault** (same check as Step 1c, from `runDir`):
   `[ -L planning ]` → symlink (vaulted) vs plain directory; resolve the real path via
   `python3 -c "import os; print(os.path.realpath('planning'))"`.

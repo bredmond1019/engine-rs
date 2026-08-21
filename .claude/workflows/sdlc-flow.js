@@ -239,14 +239,17 @@ if (rangeSpec) {
   selectedTasks = new Set(parsed)
 }
 
-const blockDir       = `planning/${blockId}`
-const blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
+// Resolved against the git root by default; re-derived under a tier prefix (e.g. "business/")
+// once setup reports where the spec actually lives (see setupResult.tierPrefix below) — `let`,
+// not `const`, following the same pattern specFile already uses for its own reassignment.
+let blockDir       = `planning/${blockId}`
+let blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
 let specFile         = `${blockDir}/tasks.md`                // legacy fallback for a spec with no block record (reassigned once setup reports which source exists)
-const tasksJsonFile = `${blockDir}/tasks.json`
-const breakdownFile = `${blockDir}/breakdown.md`
-const reportsDir    = `${blockDir}/sdlc/reports`
-const stateFile     = `${blockDir}/sdlc/sdlc-flow-state.json`   // COMMITTED authoritative run index (D31)
-const worklogFile   = `${blockDir}/sdlc/worklog.md`            // COMMITTED human-readable trail (D31)
+let tasksJsonFile = `${blockDir}/tasks.json`
+let breakdownFile = `${blockDir}/breakdown.md`
+let reportsDir    = `${blockDir}/sdlc/reports`
+let stateFile     = `${blockDir}/sdlc/sdlc-flow-state.json`   // COMMITTED authoritative run index (D31)
+let worklogFile   = `${blockDir}/sdlc/worklog.md`            // COMMITTED human-readable trail (D31)
 const baseBranchName = `${blockId}-flow`                        // one shared branch for the whole spec
 
 const MAX_TASK_ATTEMPTS   = 3   // implement→test→fix attempts per task before bail
@@ -266,7 +269,9 @@ const SETUP_SCHEMA = {
     worktreePath:   { type: 'string', description: 'Absolute path to the worktree directory' },
     wasCreated:     { type: 'boolean', description: 'true if a new worktree was created, false if an existing one was reused' },
     specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
-    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'" },
+    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
+    tierPrefix:     { type: 'string', description: 'The invoking directory\'s path relative to the git root, with a trailing slash (e.g. "business/"), or "" when /sdlc-flow was invoked at the git root. This is the CANDIDATE tier location checked in STEP 6a — reported regardless of whether the spec was actually found there.' },
+    specFoundInTier: { type: 'boolean', description: 'true iff the spec (block record or legacy tasks.md) exists ONLY at the tier location (<tierPrefix>planning/<blockId>), not at the root (planning/<blockId>). False when found at the root (even if ALSO present at the tier — the root always wins) or found nowhere.' },
     blockStatus:    { type: 'string', description: "This spec's Status in status.md (title-case), or 'Unknown'" },
     specThin:       { type: 'boolean', description: 'D19: true ONLY on a fresh run (wasCreated && specFileExists) with a structurally-valid but substantively-thin spec. false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
@@ -1128,15 +1133,32 @@ Target:
 STEP 1 — Get the absolute repo root:
   Run: git rev-parse --show-toplevel
   Store the trimmed output as repoRoot.
+  Run this too — it must reflect where /sdlc-flow was actually invoked from (e.g. a sub-brain tier
+  like business/), not worktreePath, which may differ:
+    REPO_ROOT=$(git rev-parse --show-toplevel) && python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')"
+       (store trimmed stdout as candidateTierPrefix — "" when invoking at the git root, otherwise
+       the invoking directory's path relative to repoRoot with a trailing slash, e.g. "business/")
 ${useWorktree ? worktreeRecipe : branchRecipe}
 
 STEP 6 — Report pipeline-start inputs (run these from the live checkout):
-  a. Spec source (D65 stage 2) — the block record is checked FIRST and is preferred; tasks.md is only
-     a fallback for a legacy spec that predates the block-record migration:
-       cd ${setupWorkdir} && ls ${blockRecordFile} 2>/dev/null && echo "RECORD_EXISTS" || echo "RECORD_MISSING"
-       cd ${setupWorkdir} && ls ${specFile} 2>/dev/null && echo "LEGACY_EXISTS" || echo "LEGACY_MISSING"
-     specSource = "block-record" if RECORD_EXISTS (regardless of the legacy file); else "tasks-md" if
-     LEGACY_EXISTS; else "missing". specFileExists = true iff specSource != "missing".
+  a. Spec source AND location (D65 stage 2 + tier resolution) — the block record is checked FIRST
+     and is preferred; tasks.md is only a fallback for a legacy spec that predates the block-record
+     migration. Check the ROOT first (it always wins when the spec exists at both locations):
+       cd ${setupWorkdir} && ls ${blockRecordFile} 2>/dev/null && echo "RECORD_ROOT_EXISTS" || echo "RECORD_ROOT_MISSING"
+       cd ${setupWorkdir} && ls ${specFile} 2>/dev/null && echo "LEGACY_ROOT_EXISTS" || echo "LEGACY_ROOT_MISSING"
+     ONLY IF candidateTierPrefix (from STEP 1) is non-empty, ALSO check the tier location:
+       cd ${setupWorkdir} && ls <candidateTierPrefix>${blockRecordFile} 2>/dev/null && echo "RECORD_TIER_EXISTS" || echo "RECORD_TIER_MISSING"
+       cd ${setupWorkdir} && ls <candidateTierPrefix>${specFile} 2>/dev/null && echo "LEGACY_TIER_EXISTS" || echo "LEGACY_TIER_MISSING"
+     Resolve, in this order:
+       - specFoundInTier = true ONLY when neither RECORD_ROOT_EXISTS nor LEGACY_ROOT_EXISTS, AND
+         either RECORD_TIER_EXISTS or LEGACY_TIER_EXISTS. Otherwise specFoundInTier = false — this
+         is what makes the root win whenever the spec exists at both locations.
+       - specSource, evaluated at the WINNING location (root unless specFoundInTier): "block-record"
+         if that location's block record exists; else "tasks-md" if that location's legacy file
+         exists; else "missing".
+       - specFileExists = true iff specSource != "missing".
+     tierPrefix = candidateTierPrefix from STEP 1 (report it as-is, even when specFoundInTier is
+     false or specSource is "missing" — it is the location that was CHECKED, not just a winner).
   b. Block status — find this spec's row in status.md:
        cd ${setupWorkdir} && grep -iE "${blockId}" planning/status.md | head -5
      blockStatus = the title-case Status value (Not started / In progress / Done / Blocked / Skipped),
@@ -1181,6 +1203,25 @@ if (useWorktree) {
   log(`Worktree path derives from the spec slug (trees/${branchName}), not any block ID — use "git worktree list" to locate it, never guess.`)
 }
 
+// Tier resolution — the candidate prefix is always reported (STEP 1); only actually applied to
+// blockDir and everything derived from it when the setup agent found the spec ONLY at the tier
+// location, never at the root (specFoundInTier). The root wins whenever the spec exists at both —
+// see SETUP_SCHEMA.specFoundInTier and the STEP 6a resolution order.
+const tierPrefixCandidate = setupResult.tierPrefix || ''
+const rootBlockRecordFile = blockRecordFile   // pre-tier root form, kept for the Missing-spec abort
+const rootSpecFile        = specFile          // pre-tier root form, kept for the Missing-spec abort
+if (tierPrefixCandidate && setupResult.specFoundInTier) {
+  blockDir        = `${tierPrefixCandidate}planning/${blockId}`
+  blockRecordFile = `${tierPrefixCandidate}planning/blocks/${blockId}.json`
+  specFile        = `${blockDir}/tasks.md`
+  tasksJsonFile   = `${blockDir}/tasks.json`
+  breakdownFile   = `${blockDir}/breakdown.md`
+  reportsDir      = `${blockDir}/sdlc/reports`
+  stateFile       = `${blockDir}/sdlc/sdlc-flow-state.json`
+  worklogFile     = `${blockDir}/sdlc/worklog.md`
+  log(`Spec resolved at tier location (${tierPrefixCandidate}) — not found at the root.`)
+}
+
 // D65 stage 2: resolve which spec source this run actually has. specSource defaults to 'tasks-md'
 // only if the setup agent omitted the field (older cached run) — never silently prefer a source
 // that was not actually checked.
@@ -1221,9 +1262,11 @@ build/test/validation from the repo root; relative paths (planning/...) resolve 
 phase('Plan')
 
 if (!setupResult.specFileExists) {
-  log(`Neither the block record (${blockRecordFile}) nor the legacy spec file (${specFile}) was found in the worktree. /sdlc-flow expects an authored spec.`)
+  const rootPaths = `${rootBlockRecordFile} or ${rootSpecFile}`
+  const tierPaths = tierPrefixCandidate ? `${tierPrefixCandidate}planning/blocks/${blockId}.json or ${tierPrefixCandidate}planning/${blockId}/tasks.md` : null
+  log(`No spec found — searched the root (${rootPaths})${tierPaths ? ` AND the tier location (${tierPaths})` : ''}. /sdlc-flow expects an authored spec.`)
   log(`Fix: run /generate-tasks ${blockId} (and /breakdown) on main, commit, then re-run /sdlc-flow ${blockId}.`)
-  return { error: 'Missing spec', blockId, specFile, blockRecordFile }
+  return { error: 'Missing spec', blockId, searchedRoot: [rootBlockRecordFile, rootSpecFile], searchedTier: tierPaths ? [`${tierPrefixCandidate}planning/blocks/${blockId}.json`, `${tierPrefixCandidate}planning/${blockId}/tasks.md`] : [] }
 }
 
 const ENUMERATE_PROMPT = `${W}

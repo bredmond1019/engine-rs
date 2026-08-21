@@ -147,13 +147,16 @@ if (rangeSpec) {
   selectedTasks = new Set(parsed)
 }
 
-const blockDir       = `planning/${blockId}`
-const blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
+// Resolved against the git root by default; re-derived under a tier prefix (e.g. "business/")
+// once setup reports where the spec actually lives (see setupResult.tierPrefix below) — `let`,
+// not `const`, following the same pattern specFile already uses for its own reassignment.
+let blockDir       = `planning/${blockId}`
+let blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
 let specFile         = `${blockDir}/tasks.md`                // legacy fallback for a spec with no block record (reassigned once setup reports which source exists)
-const tasksJsonFile = `${blockDir}/tasks.json`
-const breakdownFile = `${blockDir}/breakdown.md`
-const reportsDir    = `${blockDir}/sdlc/reports`
-const stateFile     = `${blockDir}/sdlc/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
+let tasksJsonFile = `${blockDir}/tasks.json`
+let breakdownFile = `${blockDir}/breakdown.md`
+let reportsDir    = `${blockDir}/sdlc/reports`
+let stateFile     = `${blockDir}/sdlc/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
 const baseBranchName = `${blockId}-task`.toLowerCase().replace(/[^a-z0-9.-]/g, '-')  // worktree branch base
 
 const MAX_TASK_ATTEMPTS = 3   // implement→test→fix attempts per task before bail (final on Opus)
@@ -283,7 +286,9 @@ const SETUP_SCHEMA = {
     baseSha:        { type: 'string', description: 'The HEAD short sha AFTER setup, BEFORE any task commit — the emoji-gate diff base' },
     wasCreated:     { type: 'boolean', description: 'true if a new worktree was created (--worktree only)' },
     specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
-    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'" },
+    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
+    tierPrefix:     { type: 'string', description: 'The invoking directory\'s path relative to the git root, with a trailing slash (e.g. "business/"), or "" when /sdlc-task was invoked at the git root. This is the CANDIDATE tier location checked in STEP 4a — reported regardless of whether the spec was actually found there.' },
+    specFoundInTier: { type: 'boolean', description: 'true iff the spec (block record or legacy tasks.md) exists ONLY at the tier location (<tierPrefix>planning/<blockId>), not at the root (planning/<blockId>). False when found at the root (even if ALSO present at the tier — the root always wins) or found nowhere.' },
     blockStatus:    { type: 'string', description: "This spec's Status in status.md (title-case), or 'Unknown'" },
     specThin:       { type: 'boolean', description: 'D19: true on a fresh (non-resume) run with a structurally-valid but substantively-thin spec; false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
@@ -359,6 +364,7 @@ const STATE_LOAD_SCHEMA = {
     startedAt:   { type: 'string',  description: "the file's started_at value, or '' when absent" },
     passedTasks: { type: 'array', items: { type: 'integer' }, description: 'task numbers whose status is "passed"' },
     bailReason:  { type: 'string',  description: 'the prior bail_reason, or "" when none' },
+    tasksJson:   { type: 'string',  description: 'Verbatim JSON (as a string) of the state file\'s top-level "tasks" object, so the engine can carry the full prior task history forward. "{}" when absent/no state.' },
     notes:       { type: 'string' }
   }
 }
@@ -800,6 +806,11 @@ const state = {
   worktree_path: '',
   status: 'running',
   current_task: null,
+  // DELIBERATE (ticket-sdlc-task-resume-truncates-run-state): tasks_run stays PER-INVOCATION
+  // telemetry — "what did THIS invocation run" — and is never unioned across a resume, because
+  // doing so would erase the record of which run did what. `tasks` below is the opposite: it is
+  // the resume breadcrumb and must answer "has this task ever passed?", so it is seeded from the
+  // prior state file's tasks object on --resume (see the state-load block) and is CUMULATIVE.
   tasks_run: [],
   tasks: {},        // "N": { status, attempts, summary, issues, fixes, decisions, files_changed, commit, validated }
   bail_reason: null,
@@ -911,6 +922,11 @@ ${useWorktree ? `  Base name:  ${baseBranchName}` : ''}
 STEP 1 — Get the absolute repo root and the current branch:
   Run: git rev-parse --show-toplevel        (store trimmed output as repoRoot)
   Run: git rev-parse --abbrev-ref HEAD       (store as currentBranch)
+  Run this BEFORE any other \`cd\` — it must reflect where /sdlc-task was actually invoked from
+  (e.g. a sub-brain tier like business/), not runDir, which may differ:
+    REPO_ROOT=$(git rev-parse --show-toplevel) && python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')"
+       (store trimmed stdout as candidateTierPrefix — "" when invoking at the git root, otherwise
+       the invoking directory's path relative to repoRoot with a trailing slash, e.g. "business/")
 ${useWorktree ? `
 WORKTREE MODE (--worktree) — create or reuse an isolated worktree:
 ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if present:
@@ -973,12 +989,24 @@ STEP 3 — Compute runDir:
   ${useWorktree ? 'runDir = repoRoot + "/trees/" + branchName' : 'runDir = repoRoot'}
 
 STEP 4 — Report pipeline-start inputs (run these from runDir):
-  a. Spec source (D65 stage 2) — the block record is checked FIRST and is preferred; tasks.md is only
-     a fallback for a legacy spec that predates the block-record migration:
-       cd <runDir> && ls ${blockRecordFile} 2>/dev/null && echo "RECORD_EXISTS" || echo "RECORD_MISSING"
-       cd <runDir> && ls ${specFile} 2>/dev/null && echo "LEGACY_EXISTS" || echo "LEGACY_MISSING"
-     specSource = "block-record" if RECORD_EXISTS (regardless of the legacy file); else "tasks-md" if
-     LEGACY_EXISTS; else "missing". specFileExists = true iff specSource != "missing".
+  a. Spec source AND location (D65 stage 2 + tier resolution) — the block record is checked FIRST
+     and is preferred; tasks.md is only a fallback for a legacy spec that predates the block-record
+     migration. Check the ROOT first (it always wins when the spec exists at both locations):
+       cd <runDir> && ls ${blockRecordFile} 2>/dev/null && echo "RECORD_ROOT_EXISTS" || echo "RECORD_ROOT_MISSING"
+       cd <runDir> && ls ${specFile} 2>/dev/null && echo "LEGACY_ROOT_EXISTS" || echo "LEGACY_ROOT_MISSING"
+     ONLY IF candidateTierPrefix (from STEP 1) is non-empty, ALSO check the tier location:
+       cd <runDir> && ls <candidateTierPrefix>${blockRecordFile} 2>/dev/null && echo "RECORD_TIER_EXISTS" || echo "RECORD_TIER_MISSING"
+       cd <runDir> && ls <candidateTierPrefix>${specFile} 2>/dev/null && echo "LEGACY_TIER_EXISTS" || echo "LEGACY_TIER_MISSING"
+     Resolve, in this order:
+       - specFoundInTier = true ONLY when neither RECORD_ROOT_EXISTS nor LEGACY_ROOT_EXISTS, AND
+         either RECORD_TIER_EXISTS or LEGACY_TIER_EXISTS. Otherwise specFoundInTier = false — this
+         is what makes the root win whenever the spec exists at both locations.
+       - specSource, evaluated at the WINNING location (root unless specFoundInTier): "block-record"
+         if that location's block record exists; else "tasks-md" if that location's legacy file
+         exists; else "missing".
+       - specFileExists = true iff specSource != "missing".
+     tierPrefix = candidateTierPrefix from STEP 1 (report it as-is, even when specFoundInTier is
+     false or specSource is "missing" — it is the location that was CHECKED, not just a winner).
   b. Block status — find this spec's row in status.md:
        cd <runDir> && grep -iE "${blockId}" planning/status.md | head -5
      blockStatus = the title-case Status value (Not started / In progress / Done / Blocked / Skipped),
@@ -1004,7 +1032,7 @@ STEP 5 — Capture the emoji-gate diff base — the HEAD short sha as it stands 
   cd <runDir> && git rev-parse --short HEAD     (store as baseSha)
 
 Return your result using the StructuredOutput tool:
-  runDir, branchName, baseSha, wasCreated, specFileExists, specSource, blockStatus, specThin, thinReason,${useWorktree ? ' envFilesCopied,' : ''} notes.
+  runDir, branchName, baseSha, wasCreated, specFileExists, specSource, tierPrefix, specFoundInTier, blockStatus, specThin, thinReason,${useWorktree ? ' envFilesCopied,' : ''} notes.
 `, withModel({ label: 'setup', schema: SETUP_SCHEMA, phase: 'Setup' }, MODEL.setup))
 
 if (!setupResult) {
@@ -1024,6 +1052,24 @@ if (useWorktree) {
   log(`Worktree path derives from the spec slug (trees/${branchName}), not any block ID — use "git worktree list" to locate it, never guess.`)
 }
 
+// Tier resolution — the candidate prefix is always reported (STEP 1); only actually applied to
+// blockDir and everything derived from it when the setup agent found the spec ONLY at the tier
+// location, never at the root (specFoundInTier). The root wins whenever the spec exists at both —
+// see SETUP_SCHEMA.specFoundInTier and the STEP 4a resolution order.
+const tierPrefixCandidate = setupResult.tierPrefix || ''
+const rootBlockRecordFile = blockRecordFile   // pre-tier root form, kept for the Missing-spec abort
+const rootSpecFile        = specFile          // pre-tier root form, kept for the Missing-spec abort
+if (tierPrefixCandidate && setupResult.specFoundInTier) {
+  blockDir        = `${tierPrefixCandidate}planning/${blockId}`
+  blockRecordFile = `${tierPrefixCandidate}planning/blocks/${blockId}.json`
+  specFile        = `${blockDir}/tasks.md`
+  tasksJsonFile   = `${blockDir}/tasks.json`
+  breakdownFile   = `${blockDir}/breakdown.md`
+  reportsDir      = `${blockDir}/sdlc/reports`
+  stateFile       = `${blockDir}/sdlc/sdlc-task-state.json`
+  log(`Spec resolved at tier location (${tierPrefixCandidate}) — not found at the root.`)
+}
+
 // D65 stage 2: resolve which spec source this run actually has. specSource defaults to 'tasks-md'
 // only if the setup agent omitted the field (older cached run) — never silently prefer a source
 // that was not actually checked.
@@ -1039,9 +1085,11 @@ const specDesc = specSource === 'block-record'
   : '(prose — Goal, Acceptance Criteria, Validation Commands)'
 
 if (!setupResult.specFileExists) {
-  log(`Neither the block record (${blockRecordFile}) nor the legacy spec file (${specFile}) was found. /sdlc-task expects an authored spec.`)
+  const rootPaths = `${rootBlockRecordFile} or ${rootSpecFile}`
+  const tierPaths = tierPrefixCandidate ? `${tierPrefixCandidate}planning/blocks/${blockId}.json or ${tierPrefixCandidate}planning/${blockId}/tasks.md` : null
+  log(`No spec found — searched the root (${rootPaths})${tierPaths ? ` AND the tier location (${tierPaths})` : ''}. /sdlc-task expects an authored spec.`)
   log(`Fix: run /generate-tasks ${blockId} (and /breakdown) on main, commit, then re-run /sdlc-task ${blockId}.`)
-  return { error: 'Missing spec', blockId, specFile, blockRecordFile }
+  return { error: 'Missing spec', blockId, searchedRoot: [rootBlockRecordFile, rootSpecFile], searchedTier: tierPaths ? [`${tierPrefixCandidate}planning/blocks/${blockId}.json`, `${tierPrefixCandidate}planning/${blockId}/tasks.md`] : [] }
 }
 
 // D19 — thin-spec guard for a fresh run (legacy tasks.md path only — see STEP 4c above).
@@ -1257,19 +1305,32 @@ if (taskEngineFilesMap.size) {
   log(`Engine-parse gate (hardcoded, unconditional): task(s) touching .claude/workflows/ → ${[...taskEngineFilesMap.keys()].sort((a, b) => a - b).join(', ')}.`)
 }
 
-// Resume: load the committed state.json to skip already-passed tasks.
+// Resume: load the committed state.json to skip already-passed tasks. Also seeds the in-memory
+// `state.tasks` with the FULL prior tasks object — writeTaskState() serializes `state` wholesale on
+// every write, and the per-task loop below only ever populates `state.tasks[N]` for tasks it actually
+// runs (skipped/already-passed tasks never re-enter it) — so without this seed, the first write after
+// a resume would silently drop the earlier-passed tasks from the committed file, and the *next*
+// resume would see them as never-passed and re-run them.
 const passedFromState = new Set()
 if (resumeMode) {
   const loaded = await tracedAgent(`${W}
 You read the COMMITTED run-state for an /sdlc-task resume. Do NOT modify anything.
   cd ${runDir} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-If "__NO_STATE__" or invalid JSON → exists=false. Otherwise exists=true, startedAt = its started_at,
-passedTasks = the task numbers whose tasks[N].status == "passed", bailReason = its bail_reason or "".
+If "__NO_STATE__" or invalid JSON → exists=false, tasksJson="{}". Otherwise exists=true, startedAt =
+its started_at, passedTasks = the task numbers whose tasks[N].status == "passed", bailReason = its
+bail_reason or "", tasksJson = the exact JSON (as a string) of its top-level "tasks" object, verbatim
+— this is how the engine carries the full prior task history forward across a resume.
 Return via StructuredOutput.
 `, withModel({ label: 'state-load', schema: STATE_LOAD_SCHEMA, phase: 'Plan' }, MODEL.stateLoad))
   if (loaded && loaded.exists) {
     for (const n of (loaded.passedTasks || [])) passedFromState.add(n)
     log(`Resume: ${passedFromState.size} task(s) already passed (${[...passedFromState].sort((a, b) => a - b).join(', ') || 'none'}); skipping them.`)
+    try {
+      const priorTasks = JSON.parse(loaded.tasksJson || '{}')
+      if (priorTasks && typeof priorTasks === 'object') Object.assign(state.tasks, priorTasks)
+    } catch {
+      log('(resume) could not parse prior tasks JSON from state.json — already-passed tasks may drop out of the committed history on the next write.')
+    }
   } else {
     log('Resume requested but no valid state.json found — running all selected tasks fresh.')
   }
@@ -1827,7 +1888,27 @@ Return via StructuredOutput:
 // FINAL STATE COMMIT + SUMMARY
 // ================================================================
 const passedTasks = taskList.filter(n => state.tasks[String(n)]?.status === 'passed' || passedFromState.has(n))
-const fullRun = !selectedTasks   // no explicit selection = every task in the spec ran
+const fullRun = !selectedTasks   // no explicit selection = every task in the spec ran; still used to gate
+                                  // the once-per-full-run reconcile step below (D56) — unaffected by this ticket.
+
+// BT.ticket.resume-cannot-close-its-block: the close decision is derived from every task in the
+// SPEC (allTasks), never from taskList (which is the SELECTED subset when a range/task was passed —
+// see :1212). Comparing against taskList made `passedTasks.length === taskList.length` trivially
+// true on a subset run, so `fullRun` (a proxy for "was a selection passed?") was the only thing
+// preventing a wrong close; comparing against allTasks makes the condition honest on its own and a
+// "was a selection passed?" proxy is no longer needed for it. This is safe now — and was NOT safe
+// before — because BT.ticket.sdlc-task-resume-truncates-run-state (closed 2026-08-20) made
+// state.tasks survive a --resume, so passedAll no longer leans on passedFromState (the git-derived
+// scout) as anything but the augment D37 says it must always be, not a load-bearing replacement.
+const passedAll = allTasks.filter(n => state.tasks[String(n)]?.status === 'passed' || passedFromState.has(n))
+const outstandingTasks = allTasks.filter(n => !passedAll.includes(n))
+
+// sdlc-flow.js audited 2026-08-20: it has NO fullRun/blockDone-shaped proxy to fix. It never
+// computes a single close boolean in code — the bookkeep/PR agent prompt (sdlc-flow.js:~2335) is
+// handed `selectedTasks` and `taskList` directly and told in prose to judge "if tasks remain, keep
+// status In progress ...; if this was the last, flip to Done", i.e. the "was every task passed"
+// judgment already happens per-run rather than being gated by a proxy for "was a selection passed".
+// So the defect this ticket fixes does not reproduce there, and sdlc-flow.js is left unchanged.
 
 // ----------------------------------------------------------------
 // PHASE 2.5: TERMINAL AUTHORITATIVE RECONCILE (D56) — after every task passes, before bookkeep.
@@ -1917,7 +1998,7 @@ if (reconcileFailed) state.bail_reason = `Terminal reconcile failed (D56): ${rec
 // Skipped entirely on a bail or a reconcile_failed (the block is not done) and on a partial task
 // selection (can't close the block).
 // ----------------------------------------------------------------
-const blockDone = !bailed && !reconcileFailed && fullRun && passedTasks.length === taskList.length
+const blockDone = !bailed && !reconcileFailed && passedAll.length === allTasks.length
 let bookkeepResult = null
 if (!bailed && !reconcileFailed) {
   // D46: when planning/ is a vaulted symlink, ${specFile}, planning/status.md, and planning/state.json
@@ -1936,7 +2017,8 @@ Target:
   Spec:        ${blockId}
   Tasks run:   ${taskList.join(', ')}  (passed: ${passedTasks.join(', ') || 'none'})
   Full spec run: ${fullRun ? 'yes (every task in the spec)' : 'no (a task subset — do NOT close the block)'}
-  Block done:  ${blockDone ? 'yes — the whole spec is complete this run' : 'no — keep the block open/in-progress'}
+  Spec-wide:   ${passedAll.length}/${allTasks.length} tasks passed across all runs${outstandingTasks.length ? ` | outstanding: ${outstandingTasks.join(', ')}` : ''}
+  Block done:  ${blockDone ? 'yes — every task in the spec has passed' : `no — keep the block open/in-progress (outstanding: ${outstandingTasks.join(', ') || 'none, but bailed/reconcile_failed this run'})`}
 
 1. Read the surfaces:
    cd ${runDir} && cat ${specFile}
