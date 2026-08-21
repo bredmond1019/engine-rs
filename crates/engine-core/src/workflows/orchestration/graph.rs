@@ -309,6 +309,17 @@ pub struct OrchestrationEventSchema {
     pub roadmap_slug: Option<String>,
     pub policy: Option<PartialOrchestrationPolicy>,
     pub profile: Option<String>,
+    /// The campaign this run should rejoin, so a resumed or
+    /// operator-restarted chain keeps the SAME campaign identity rather
+    /// than minting a second one (`EN.11.E` task 3). Parsed as a string on
+    /// the wire (not a native `Uuid`) so a malformed value fails LOUDLY
+    /// with a field-naming [`NodeError`] in [`OrchestrationRunNode::process`]
+    /// instead of `serde`'s generic deserialize error — a silently-new
+    /// campaign is indistinguishable from a correctly-resumed one and is
+    /// exactly the confident-wrong result CLAUDE.md's standing rules call
+    /// out. `None` (the default) mints a fresh [`Uuid::new_v4`], unchanged
+    /// from task 2's placeholder behavior.
+    pub campaign_id: Option<String>,
 }
 
 fn parse_event(ctx: &TaskContext) -> Result<OrchestrationEventSchema, NodeError> {
@@ -519,6 +530,19 @@ impl Node for OrchestrationRunNode {
         // rather than merely "a short chain".
         let total_steps = chain.len();
 
+        // Resolution order mirrors `roadmap_slug`/`roadmap` above: an
+        // explicit value on the event wins (so a resumed/operator-restarted
+        // chain rejoins the SAME campaign), else mint a fresh v4. Unlike
+        // that fallback, a *present but unparsable* value must fail loudly
+        // rather than silently fall through — see the field's own doc on
+        // `OrchestrationEventSchema::campaign_id`.
+        let campaign_id = match &event.campaign_id {
+            Some(raw) => Uuid::parse_str(raw).map_err(|err| {
+                NodeError::new(format!("invalid `campaign_id` on ORCHESTRATION event: {err}"))
+            })?,
+            None => Uuid::new_v4(),
+        };
+
         let roadmap_slug = event
             .roadmap_slug
             .clone()
@@ -605,11 +629,9 @@ impl Node for OrchestrationRunNode {
                 resolved_lane.as_deref(),
                 step_observer.as_ref(),
                 default_use_worktree,
-                // Task 2 threads the parameter to compile and leave
-                // behaviour unchanged; task 3 replaces this freshly-minted
-                // id with the resolved, event-overridable value and stamps
-                // it into `ctx.nodes` (EN.11.E task 3).
-                Uuid::new_v4(),
+                // The resolved, event-overridable campaign id (EN.11.E
+                // task 3) — replaces task 2's freshly-minted placeholder.
+                campaign_id,
             ))
             .map_err(|err| NodeError::new(err.to_string()))
         })
@@ -680,6 +702,25 @@ impl Node for OrchestrationRunNode {
                     "hold_deadline_ms": policy.hold_deadline_ms,
                 },
                 "cancellation": cancellation,
+                // The addressable subject `GET /campaigns/{id}` (task 5)
+                // answers from — this ORCHESTRATION run is itself an
+                // ordinary HTTP-triggered run in `LiveStateStore`, so
+                // stamping the campaign's members here is what lets that
+                // route work without recording every in-process child run
+                // and without any relational table (EN.11.E task 3).
+                // `cost_usd` stays `Option<f64>` end to end: a step that
+                // reported no cost is written as JSON `null`, never `0`.
+                "campaign_id": campaign_id,
+                "campaign_members": outcomes
+                    .iter()
+                    .map(|o| json!({
+                        "repo": o.repo,
+                        "block_id": o.block_id,
+                        "use_worktree": o.use_worktree,
+                        "cost_usd": o.cost_usd,
+                        "total_tokens": o.total_tokens,
+                    }))
+                    .collect::<Vec<_>>(),
             }),
         );
         Ok(ctx)
@@ -1305,5 +1346,188 @@ mod tests {
             "error should explain what was missing: {}",
             err.message
         );
+    }
+
+    // ── Node::process — campaign id resolution and stamping (Task 3) ────
+
+    #[tokio::test]
+    async fn an_event_with_no_campaign_id_mints_a_fresh_one_and_stamps_it() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+
+        let stamped = recorded["campaign_id"]
+            .as_str()
+            .expect("campaign_id should be stamped as a string");
+        Uuid::parse_str(stamped).expect("stamped campaign_id should be a valid uuid");
+
+        let members = recorded["campaign_members"]
+            .as_array()
+            .expect("campaign_members should be an array");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["repo"], "repo-a");
+        assert_eq!(members[0]["block_id"], "A.1");
+        assert_eq!(members[1]["repo"], "repo-b");
+        assert_eq!(members[1]["block_id"], "B.1");
+
+        // Whatever this node already stamped is still present alongside
+        // the new campaign fields.
+        assert_eq!(recorded["steps_integrated"], 2);
+        assert_eq!(recorded["cancellation"]["cancelled"], false);
+    }
+
+    #[tokio::test]
+    async fn an_event_with_an_explicit_campaign_id_reuses_it_rather_than_minting_a_fresh_one() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let supplied = Uuid::new_v4();
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+            "campaign_id": supplied.to_string(),
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["campaign_id"], supplied.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_campaign_id_fails_loudly_naming_the_field_instead_of_minting_fresh() {
+        let dir = two_repo_brain_root();
+        let node = OrchestrationRunNode::new();
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+            "campaign_id": "not-a-uuid",
+        }));
+
+        let err = node.process(ctx).await.unwrap_err();
+        assert!(
+            err.message.contains("campaign_id"),
+            "error should name the field: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_members_carry_tri_state_cost_usd_and_summed_total_tokens() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        // repo-a's step reports a real cost figure and token usage; repo-b's
+        // step reports NEITHER -- its ctx has no `cost_usd` anywhere in
+        // `nodes` and no `usage` on any `node_runs` entry, so
+        // `ExecutionOutcome::cost_usd` must fold to `None`, not `0.0`.
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            let block_id = invocation.block_id.clone();
+            Box::pin(async move {
+                if block_id == "A.1" {
+                    let mut nodes = HashMap::new();
+                    nodes.insert("SomeLlmNode".to_string(), json!({ "cost_usd": 1.25 }));
+                    let mut node_runs = HashMap::new();
+                    node_runs.insert(
+                        "SomeLlmNode".to_string(),
+                        engine_contract::NodeRun {
+                            status: engine_contract::NodeRunStatus::Success,
+                            started_at: None,
+                            completed_at: None,
+                            error: None,
+                            input: None,
+                            usage: Some(engine_contract::Usage {
+                                input_tokens: Some(100),
+                                output_tokens: Some(50),
+                                model: "test-model".to_string(),
+                            }),
+                        },
+                    );
+                    Ok(TaskContext {
+                        event: json!({}),
+                        nodes,
+                        metadata: json!({ "ran": block_id }),
+                        node_runs,
+                    })
+                } else {
+                    Ok(TaskContext {
+                        event: json!({}),
+                        nodes: HashMap::new(),
+                        metadata: json!({ "ran": block_id }),
+                        node_runs: HashMap::new(),
+                    })
+                }
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        let members = recorded["campaign_members"]
+            .as_array()
+            .expect("campaign_members should be an array");
+
+        assert_eq!(members[0]["repo"], "repo-a");
+        assert_eq!(members[0]["cost_usd"], 1.25);
+        assert_eq!(members[0]["total_tokens"], 150);
+
+        assert_eq!(members[1]["repo"], "repo-b");
+        assert_eq!(
+            members[1]["cost_usd"],
+            serde_json::Value::Null,
+            "a step that reported no cost must stay `null`, never collapse to 0"
+        );
+        assert_eq!(members[1]["total_tokens"], 0);
     }
 }
