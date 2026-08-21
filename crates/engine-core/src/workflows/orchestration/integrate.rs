@@ -92,14 +92,33 @@ impl HoldSource for NeverHeld {
 /// error condition; the caller resumes its own sequential loop the moment
 /// this returns, without having lost or re-run anything, because nothing
 /// prior to this await point is ever touched again.
+///
+/// `cancellation_token`, when given, is raced against every poll tick's
+/// sleep — mirroring `TerminalAwaitNode`'s own `select!` (see that node's
+/// module doc). A chain parked here for hours on a held block must abort
+/// within one poll interval of an abort request, not after the hold
+/// eventually clears on its own; a naive "check once, then sleep the whole
+/// interval" loop would miss exactly this case, since the check only runs
+/// at the top of each iteration. A cancel win returns immediately without
+/// re-checking `hold_source` — the caller (`integrate_chain`) is
+/// responsible for observing the cancellation afterwards and stopping the
+/// chain; this function itself never treats cancellation as clearance.
 pub async fn wait_for_clearance(
     hold_source: &dyn HoldSource,
     repo: &str,
     block_id: &str,
     poll_interval: Duration,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
 ) {
     while hold_source.is_held(repo, block_id) {
-        tokio::time::sleep(poll_interval).await;
+        if let Some(token) = cancellation_token {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                () = tokio::time::sleep(poll_interval) => {}
+            }
+        } else {
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 }
 
@@ -574,6 +593,25 @@ impl From<ExecuteError> for IntegrateError {
 /// append failure is swallowed and the *original* step error is what
 /// returns — a lane-log write hiccup must never replace the real reason
 /// the chain stopped.
+///
+/// # Cancellation stops the chain BETWEEN steps only
+///
+/// `cancellation_token`, when given, is checked at the top of every loop
+/// iteration (before [`check_dependencies`]) and raced against
+/// [`wait_for_clearance`]'s sleep, so a chain parked on an operator hold
+/// aborts within one poll tick rather than only at the next iteration's
+/// top. A win is **not** an error: the loop simply stops and this function
+/// returns `Ok` with whatever outcomes were already integrated — nothing
+/// is rolled back, and every step that already ran has its `lane-log.jsonl`
+/// line on disk exactly as if the chain had finished normally. The caller
+/// (`OrchestrationRunNode::process`) is what stamps the fact that a
+/// cancellation happened.
+///
+/// This does **not** reach inside a step already in flight: a step whose
+/// [`execute_step`] call (the child `SDLC_FLOW` run) has already started
+/// runs to completion regardless of the token — there is no run id to
+/// thread a cancellation into yet. Cancellation here only ever prevents
+/// the *next* step from starting.
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain(
     chain: &[ChainStep],
@@ -582,6 +620,7 @@ pub async fn integrate_chain(
     admission: &AdmissionGate,
     hold_source: &dyn HoldSource,
     poll_interval: Duration,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
     resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
     registry: &RepoRegistry,
     run_flow: &FlowRunner,
@@ -590,11 +629,33 @@ pub async fn integrate_chain(
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let mut outcomes = Vec::with_capacity(chain.len());
     for step in chain {
+        // Checked at the top of every iteration, before anything for this
+        // step starts — see the "Cancellation stops the chain BETWEEN
+        // steps only" section above.
+        if cancellation_token.is_some_and(|t| t.is_cancelled()) {
+            break;
+        }
+
         check_dependencies(step, resolve_depends_on, is_edge_met)?;
 
         let _permit = admission.acquire_for(step).await;
 
-        wait_for_clearance(hold_source, &step.repo, &step.block_id, poll_interval).await;
+        wait_for_clearance(
+            hold_source,
+            &step.repo,
+            &step.block_id,
+            poll_interval,
+            cancellation_token,
+        )
+        .await;
+
+        // `wait_for_clearance` can return early on a cancel win (rather
+        // than because the hold actually cleared) — re-check here so a
+        // cancelled, held chain does not go on to execute the step it was
+        // waiting on.
+        if cancellation_token.is_some_and(|t| t.is_cancelled()) {
+            break;
+        }
 
         let step_lane = lane.unwrap_or(step.repo.as_str());
 
@@ -1104,6 +1165,7 @@ mod tests {
             &admission,
             &hold,
             Duration::from_millis(1),
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1136,7 +1198,7 @@ mod tests {
 
         let waited = tokio::time::timeout(
             Duration::from_millis(50),
-            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5)),
+            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None),
         )
         .await;
         assert!(waited.is_err(), "must not clear while still held");
@@ -1144,7 +1206,7 @@ mod tests {
         held.store(false, Ordering::SeqCst);
         let cleared = tokio::time::timeout(
             Duration::from_millis(200),
-            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5)),
+            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None),
         )
         .await;
         assert!(cleared.is_ok(), "must clear promptly once unheld");
@@ -1154,7 +1216,7 @@ mod tests {
     async fn never_held_clears_immediately() {
         let cleared = tokio::time::timeout(
             Duration::from_millis(50),
-            wait_for_clearance(&NeverHeld, "repo-a", "A.1", Duration::from_millis(5)),
+            wait_for_clearance(&NeverHeld, "repo-a", "A.1", Duration::from_millis(5), None),
         )
         .await;
         assert!(cleared.is_ok());
@@ -1206,6 +1268,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1245,6 +1308,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1284,6 +1348,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1338,6 +1403,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             &resolve_engine,
             &registry,
             &runner,

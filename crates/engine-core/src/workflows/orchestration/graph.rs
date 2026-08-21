@@ -41,6 +41,22 @@
 //! established convention, so a caller wiring this node against the real
 //! corpus graph (or a test) supplies its own resolvers without touching this
 //! module.
+//!
+//! # Abort stops the chain BETWEEN steps, not mid-step
+//!
+//! [`OrchestrationRunNode::with_cancellation_token`] mirrors
+//! `TerminalAwaitNode::with_cancellation_token`: the token is taken through
+//! this node's OWN builder (never read from the runner's between-node
+//! check alone), threaded across the `spawn_blocking` boundary, and
+//! checked by [`integrate::integrate_chain`] at the top of every step and
+//! while parked in [`integrate::wait_for_clearance`]. A cancel win stops
+//! the chain and returns the outcomes already integrated as `Ok` —
+//! cancellation is a pause point, not a failure. **It cannot interrupt a
+//! step already in flight**: a block whose `SDLC_FLOW` run has already
+//! started runs to completion regardless, because there is no child run
+//! id yet to thread a cancellation into (see [`integrate::integrate_chain`]'s
+//! own doc). An operator issuing an abort stops the *next* step, not the
+//! current one.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -52,6 +68,7 @@ use engine_contract::TaskContext;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError, NodeRegistry};
 use crate::policy::{read_harness_policy_defaults_from, resolve_profile_from, PolicyConfigSource};
 use crate::repo_registry::RepoRegistry;
@@ -235,6 +252,10 @@ type BlockOpenFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// gate, admission gate, operator-hold pause/resume, `SDLC_FLOW` invocation
 /// per block (cwd-scoped to that block's repo), state-write verification,
 /// and exactly one `lane-log.jsonl` line per integrated block.
+///
+/// **Abort stops the chain BETWEEN steps, not mid-step** — see
+/// [`Self::with_cancellation_token`] and the module doc's "Abort stops the
+/// chain BETWEEN steps, not mid-step" section.
 pub struct OrchestrationRunNode {
     resolve_depends_on: DependsOnFn,
     is_edge_met: EdgeMetFn,
@@ -246,6 +267,12 @@ pub struct OrchestrationRunNode {
     /// from the event's own resolved [`RepoRegistry`] — tests override this
     /// with a recording double via [`Self::with_run_flow`].
     run_flow: Option<FlowRunner>,
+    /// Taken through this node's OWN builder, never read from the runner's
+    /// between-node check alone — mirrors
+    /// `TerminalAwaitNode::with_cancellation_token`. `None` (the default) is
+    /// behavior-stable: no token, no cancellation check, identical output to
+    /// today. See [`Self::with_cancellation_token`].
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -271,6 +298,7 @@ impl OrchestrationRunNode {
             hold_source: Arc::new(NeverHeld),
             admission: AdmissionGate::with_default_policy(),
             run_flow: None,
+            cancellation_token: None,
         }
     }
 
@@ -313,6 +341,21 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_run_flow(mut self, run_flow: FlowRunner) -> Self {
         self.run_flow = Some(run_flow);
+        self
+    }
+
+    /// Attach a [`CancellationToken`], checked by
+    /// [`integrate::integrate_chain`] at the top of every step and raced
+    /// against [`integrate::wait_for_clearance`]'s sleep — mirroring
+    /// `TerminalAwaitNode::with_cancellation_token`. A cancel win stops the
+    /// chain BETWEEN steps and returns `Ok` with whatever was already
+    /// integrated; it CANNOT interrupt a step already in flight (no child
+    /// run id exists yet to cancel into — see the module doc). With no
+    /// token attached (the default), behavior is unchanged from before this
+    /// builder existed.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 }
@@ -393,6 +436,11 @@ impl Node for OrchestrationRunNode {
         let resolve_engine = self.resolve_engine.clone();
         let admission = self.admission.clone();
         let hold_source = self.hold_source.clone();
+        // Cloned before the `spawn_blocking` closure like every other owned
+        // value here — `CancellationToken` is cheap to clone (an `Arc`
+        // inside) and `Send + 'static`, so it crosses the boundary the same
+        // way the rest of this node's seams do. See `with_cancellation_token`.
+        let cancellation_token = self.cancellation_token.clone();
 
         // `execute::FlowFuture` is deliberately not `Send` (see its own doc
         // comment: `Workflow::run`'s `OnProgress` callback is not `Send`),
@@ -420,6 +468,7 @@ impl Node for OrchestrationRunNode {
                 &admission,
                 hold_source.as_ref(),
                 poll_interval,
+                cancellation_token.as_ref(),
                 &move |repo, block_id| resolve_engine(repo, block_id),
                 &repo_registry,
                 &run_flow,

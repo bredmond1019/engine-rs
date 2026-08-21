@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use engine_core::cancellation::CancellationToken;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
     resolve_explicit_chain, resolve_lane_chain, ChainError,
@@ -203,6 +204,7 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         &always_flow,
         &registry,
         &flow_runner,
@@ -255,6 +257,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         &always_flow,
         &registry,
         &flow_runner,
@@ -329,6 +332,7 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             &admission2,
             &NeverHeld,
             Duration::from_millis(5),
+            None,
             &always_flow,
             &registry,
             &flow_runner2,
@@ -443,6 +447,7 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             &admission,
             &hold,
             Duration::from_millis(10),
+            None,
             &always_flow,
             &registry,
             &flow_runner,
@@ -509,6 +514,7 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         &always_flow,
         &registry,
         &flow_runner,
@@ -648,6 +654,7 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script()
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         &always_flow,
         &registry,
         &flow_runner,
@@ -715,5 +722,192 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script()
         repos.first().and_then(|v| v.as_str()),
         Some("repo-a"),
         "repos_from_lane_log must name the repo"
+    );
+}
+
+// ── Cancellation: abort stops the chain BETWEEN steps ────────────────────
+
+/// A [`FlowRunner`] that records every block it was invoked for and, the
+/// moment it finishes the one block named `cancel_after`, cancels
+/// `token` — deterministically simulating "a token cancelled after the
+/// first step's invocation is observed" without racing a real wall-clock
+/// sleep against the chain's own execution.
+fn cancel_after_block(
+    token: CancellationToken,
+    cancel_after: &'static str,
+) -> (FlowRunner, Arc<Mutex<Vec<String>>>) {
+    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let runner: FlowRunner = Arc::new(move |invocation| {
+        let token = token.clone();
+        let recorded = recorded.clone();
+        Box::pin(async move {
+            recorded.lock().unwrap().push(invocation.block_id.clone());
+            write_state(&invocation.repo_path, &invocation.block_id, "done");
+            if invocation.block_id == cancel_after {
+                token.cancel();
+            }
+            Ok(engine_contract::TaskContext {
+                event: serde_json::json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: std::collections::HashMap::new(),
+            })
+        })
+    });
+    (runner, calls)
+}
+
+#[tokio::test]
+async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_runs() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(cancellation_after_the_first_step_stops_the_chain_before_the_second_runs_inner())
+        .await;
+}
+
+// `integrate_chain`'s future is not `Send` (see the admission/hold tests'
+// own doc comments), so this drives it via `LocalSet::spawn_local`.
+async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_runs_inner() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let admission = AdmissionGate::with_default_policy();
+    let token = CancellationToken::new();
+    let (flow_runner, calls) = cancel_after_block(token.clone(), "A.1");
+
+    // Three steps in one repo so a naive implementation that only checked
+    // cancellation once, at the very top, would still (wrongly) run all
+    // three.
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-a".to_string(), "A.2".to_string()),
+        ("repo-a".to_string(), "A.3".to_string()),
+    ]);
+
+    let registry_path = registry.brain_root().to_path_buf();
+    let roadmap_dir2 = roadmap_dir.clone();
+    let handle = tokio::task::spawn_local(async move {
+        let registry = RepoRegistry::from_brain_root(&registry_path).unwrap();
+        integrate_chain(
+            &chain,
+            &no_deps,
+            &always_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(5),
+            Some(&token),
+            &always_flow,
+            &registry,
+            &flow_runner,
+            &roadmap_dir2,
+            None,
+        )
+        .await
+    });
+
+    let outcomes = tokio::time::timeout(Duration::from_millis(500), handle)
+        .await
+        .expect("chain must not hang")
+        .expect("task must not panic")
+        .expect("a cancelled chain must return Ok, not Err");
+
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "only A.1 should have integrated before the cancel"
+    );
+    let recorded = calls.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one runner invocation — A.2 and A.3 must never run"
+    );
+    assert_eq!(recorded[0], "A.1");
+
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(
+        lines.len(),
+        1,
+        "A.1's lane-log line stays; nothing after the cancel is appended"
+    );
+}
+
+/// A chain parked on an operator hold that never clears must abort
+/// promptly once cancelled — within roughly one poll tick, not after the
+/// full (here, deliberately huge) `hold_poll_interval`. This is what
+/// proves the token is *raced* against `wait_for_clearance`'s sleep
+/// (`tokio::select!`) rather than only re-checked at the top of the loop.
+struct AlwaysHeld;
+
+impl HoldSource for AlwaysHeld {
+    fn is_held(&self, _repo: &str, _block_id: &str) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner())
+        .await;
+}
+
+async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let token = CancellationToken::new();
+
+    let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
+
+    // Deliberately far longer than the timeout below asserts against —
+    // if cancellation were only checked at the top of the loop (never
+    // raced against the hold's own sleep), this test would have to wait
+    // out the whole interval and would fail the timeout.
+    let huge_poll_interval = Duration::from_secs(3600);
+
+    let registry_path = registry.brain_root().to_path_buf();
+    let roadmap_dir2 = roadmap_dir.clone();
+    let token_for_task = token.clone();
+    let handle = tokio::task::spawn_local(async move {
+        let registry = RepoRegistry::from_brain_root(&registry_path).unwrap();
+        integrate_chain(
+            &chain,
+            &no_deps,
+            &always_met,
+            &admission,
+            &AlwaysHeld,
+            huge_poll_interval,
+            Some(&token_for_task),
+            &always_flow,
+            &registry,
+            &flow_runner,
+            &roadmap_dir2,
+            None,
+        )
+        .await
+    });
+
+    // Give the chain a moment to actually park inside `wait_for_clearance`
+    // before cancelling.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    token.cancel();
+
+    let outcomes = tokio::time::timeout(Duration::from_millis(500), handle)
+        .await
+        .expect(
+            "a cancel against a held chain must return within one poll tick, not the full interval",
+        )
+        .expect("task must not panic")
+        .expect("a cancelled chain must return Ok, not Err");
+
+    assert_eq!(outcomes.len(), 0, "the held block never got to run");
+    assert_eq!(
+        runner.call_count(),
+        0,
+        "the runner must never have been invoked"
     );
 }
