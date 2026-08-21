@@ -287,7 +287,7 @@ pub(crate) fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
 /// [`super::commit_all`]'s "Blast radius" section. A binary untracked file numstats as
 /// `-\t-\t<path>`, which [`classify_trivial`]'s existing conservative arm
 /// already treats as non-trivial — correct behavior for free.
-fn stage_untracked_intent(runner: &CommandRunner, worktree: &Path) {
+pub(super) fn stage_untracked_intent(runner: &CommandRunner, worktree: &Path) {
     let _ = runner("git", &["add", "-N", "-A"], worktree);
 }
 
@@ -392,21 +392,28 @@ const TRIAGE_FAILURE_HEADER: &str = "\n\n--- FAILING CHECK OUTPUT — CLASSIFY F
 /// Marker appended in place of the characters a `max_chars` bound elides.
 const RETRY_FEEDBACK_TRUNCATED: &str = "…[truncated]";
 
-/// Loud, model-facing banner appended when `ConsolidatedReviewNode`'s diff
-/// is clipped by `policy.review_diff_max_chars`.
+/// Loud, model-facing banner appended when a review's diff is clipped by
+/// `policy.review_diff_max_chars`. Shared by `ConsolidatedReviewNode` (this
+/// module) and `end_review::EndReviewNode` — both bound their diff through
+/// [`bound_review_diff`] and both must show the reviewer the same visible
+/// truncation notice; `pub(super)` so the sibling module can reuse it rather
+/// than fork a second copy.
 ///
 /// Visibility is the whole point. A silently truncated diff would recreate
 /// the exact failure mode this train exists to eliminate — a reviewer
 /// confidently returning `PASS` over code it never saw — only with a subtler
 /// cause than the empty diff that motivated `ticket-commit-task-work-real-diffs`.
-const REVIEW_DIFF_TRUNCATED_NOTICE: &str = "\n\n--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL \
+pub(super) const REVIEW_DIFF_TRUNCATED_NOTICE: &str =
+    "\n\n--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL \
      DIFF ---\nThe diff above was clipped to this run's `review_diff_max_chars` policy bound. \
      Changes beyond the cut were NOT shown to you. Do NOT return PASS on the strength of code \
      you could not see: judge only what is visible, and if the visible excerpt is not enough to \
      decide the acceptance criteria, say so explicitly in `summary` and return PARTIAL.\n";
 
-/// Clip `diff` to at most `budget` characters for embedding in
-/// `ConsolidatedReviewNode`'s prompt, returning `(text, truncated)`.
+/// Clip `diff` to at most `budget` characters for embedding in a review
+/// prompt (`ConsolidatedReviewNode`'s per-task diff or
+/// `end_review::EndReviewNode`'s whole-run diff), returning
+/// `(text, truncated)`.
 ///
 /// Reuses [`truncate_chars`] — the same character-safe (never byte-slicing)
 /// helper the retry-feedback bound uses — and reserves the notice's own
@@ -418,7 +425,7 @@ const REVIEW_DIFF_TRUNCATED_NOTICE: &str = "\n\n--- DIFF TRUNCATED — YOU ARE S
 /// check names): a reviewer told nothing at all is the failure mode; a
 /// reviewer told "you are seeing a partial diff" and nothing else is merely
 /// useless, and it will say so.
-fn bound_review_diff(diff: &str, budget: usize) -> (String, bool) {
+pub(super) fn bound_review_diff(diff: &str, budget: usize) -> (String, bool) {
     if diff.chars().count() <= budget {
         return (diff.to_string(), false);
     }
@@ -1970,16 +1977,21 @@ pub struct ConsolidatedReviewNode {
     runner: CommandRunner,
 }
 
+/// The model's raw review reply shape — shared with `end_review::EndReviewNode`
+/// (`pub(super)`) so the per-task and end-of-run reviewers parse the same
+/// JSON and produce the same result shape; nothing downstream needs a
+/// special case for which one ran.
 #[derive(Debug, Deserialize)]
-struct ReviewOutput {
-    verdict: String,
-    summary: String,
+pub(super) struct ReviewOutput {
+    pub(super) verdict: String,
+    pub(super) summary: String,
     #[serde(default)]
-    issues: Vec<String>,
+    pub(super) issues: Vec<String>,
 }
 
-/// JSON schema matching [`ReviewOutput`].
-fn review_output_schema() -> serde_json::Value {
+/// JSON schema matching [`ReviewOutput`]. Also used by
+/// `end_review::EndReviewNode`.
+pub(super) fn review_output_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
