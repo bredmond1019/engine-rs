@@ -212,7 +212,7 @@ PHASE 0 — PRE-PLAN         ← existing system, cut not obvious. Skip for a kn
         ↓
   one repo   → /plan             → planning/<slug>/plan.md + planning/blocks/*.json
   many repos → /generate-roadmap --from planning/<slug>/sequence.md
-                                 → planning/roadmaps/<slug>/{roadmap.md,lane-*.txt,lane-log.jsonl}
+                                 → planning/roadmaps/<slug>/{roadmap.md,lane-*.json,lane-log.jsonl}
       | fresh, ONE PER LANE, held open for that lane's whole chain
                                  → /begin-orchestration --roadmap ... --lane ... → /orchestrate
 
@@ -393,8 +393,8 @@ recording the call. Flags: `--worktree` / `--no-worktree`, `--engine task|flow`,
 ### `/begin-orchestration --roadmap <path> (--lane <name|path> | --blocks <id ...>)`
 Wraps `/orchestrate` with the context a lane agent needs and the rules a **concurrent** run depends
 on: which chain, why, what may not be delegated, and who else is running. Resolves `BRAIN_ROOT`, the
-repo, the roadmap and the lane file (cross-checking the lane's `# ROADMAP:` header against the one
-given), then applies the isolation policy — `base-template` is always `--worktree` (a chain there
+repo, the roadmap and the lane record (cross-checking the lane record's `roadmap` field against the
+one given), then applies the isolation policy — `base-template` is always `--worktree` (a chain there
 edits the engines running it), the brain root is always `--no-worktree` (corpus gates cannot pass in
 a worktree) — before handing off. `--roadmap` is **required and never inferred**. Also enforces the
 heavy-gate concurrency cap, operator gates, and the same notes-file and decision-recording rules.
@@ -674,8 +674,9 @@ breadth-held-at-once case.
 other source: it is an **authored cut**, not a body of findings, so it is carried through rather
 than re-derived — wave headings become the outcomes, wave exit lines become the Definition of done
 verbatim, `candidate` blocks become Wave 0, cross-repo contracts become cross-lane edges, operator
-errands become the operator lane, and `seams.md`'s blast radius lands in the lane files' `#`
-comments where it is read at execution time. `SQ-nn` refs make the coverage crosswalk a one-liner.
+errands become the operator lane, and `seams.md`'s blast radius lands in the block record's own
+`notes`/`why` where it is read at execution time — lane records are JSON now and carry no free
+text or comments. `SQ-nn` refs make the coverage crosswalk a one-liner.
 Any departure from the authored cut must be stated with a reason, and the operator's fork answers
 may not be silently re-decided. What this command still owns: lane assignment, the heavy budget,
 isolation, Wave 0 mechanics and both crosswalks — `/sequence` decides *what* and *in what order*,
@@ -687,7 +688,7 @@ the single writer for its repo and carries block 1's lessons into block 7. Never
 session. **Model:** Opus throughout.
 
 Authors the two things `/begin-orchestration` consumes: a **roadmap document** and one
-`lane-<name>.txt` chain file per lane, written to `planning/roadmaps/<slug>/` and registered as an
+`lane-<name>.json` chain record per lane, written to `planning/roadmaps/<slug>/` and registered as an
 epic's `plan:` pointer. A roadmap is a *concurrency plan* — an assignment of work to
 parallel `/orchestrate` sessions that cannot step on each other. Encodes the rules that have cost
 real runs: the lane unit is the **repo, never the wave** (engines are serial inside a repo, so a

@@ -78,8 +78,13 @@
     },
     "held_until": {
       "type": "string",
-      "description": "Date this lane is held until before it may start. Authored lane metadata with no state.json representation.",
-      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+      "description": "What this lane is held until before it may start: a block ID (this lane waits for that block to land) or an operator-gate slug (this lane waits on that operator/approval edge). RETYPED, not renamed: the retired `.txt` `# HELD-UNTIL:` directive never carried a date in any of the 70 live files (the field was latent, so the drift was never observed) and the name `held_until` already reads correctly for either referent (\"held until BT.5.B\", \"held until operator-foo\") — renaming would only launder the same ambiguity into a new key. Accepts either block.schema.json's id pattern or an `operator-`-prefixed kebab-case slug per the operator-edge convention (CLAUDE.md standing rule 7).",
+      "pattern": "^(operator-[a-z0-9][a-z0-9-]*|[A-Z]{2,3}\\.(\\d+[A-Z]?|ticket|chore)\\.[A-Za-z0-9][A-Za-z0-9-]*)$"
+    },
+    "notes": {
+      "type": "string",
+      "description": "LANE-LEVEL constraints and context — the class of prose the retired `.txt` format carried as SPEC / RISK / EXCEPTION / MERGE-DO-NOT-INSTALL / TRAPS comments: cross-lane warnings, sequencing rationale, known traps, anything an operator or agent driving this whole lane needs before running it. Free text, no fixed structure. PER-BLOCK briefings do NOT go here — they route to the individual block record's `notes`/`why` fields in `planning/blocks/<ID>.json`, because the SDLC engines (`sdlc-task`/`sdlc-flow`) read block records and have never opened a lane file. A per-block `note` property is deliberately absent from `blocks[]` items below; do not add one.",
+      "minLength": 1
     },
     "isolation": {
       "type": "string",

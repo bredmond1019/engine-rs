@@ -11,9 +11,11 @@ One `/orchestrate` session drives one repo. Run several repos at once — that i
 $ARGUMENTS — one of:
 - **Inline list:** ordered block IDs or spec slugs, space- or comma-separated.
   `/orchestrate OK.3.A OK.3.B`
-- **File path:** a file with one block ID or spec slug per line. `#` comments and blank lines are
-  ignored; file order is execution order.
-  `/orchestrate planning/bullet-proof-software/lane-okf-core.txt`
+- **Lane-file path:** a single `lane-<name>.json` path, authored against
+  `.claude/workflows/lane.schema.json` (D71). Read its `blocks[]` array — **array order IS chain
+  order** — and take each entry's `id`. The argument stays a single path; there is no second
+  argument for a lane file.
+  `/orchestrate planning/bullet-proof-software/lane-okf-core.json`
 - **Flags:**
   - `--worktree` — **require** worktree isolation for every block in the chain. See step 5.
   - `--no-worktree` — force plain-branch/in-place for every block, overriding any per-repo default.
@@ -24,7 +26,7 @@ $ARGUMENTS — one of:
 If `$ARGUMENTS` is empty, stop and print:
 ```
 Usage: /orchestrate <block-id> [block-id ...]
-       /orchestrate <path-to-list-file>
+       /orchestrate <path-to-lane-name.json>
        Flags: --worktree --no-worktree --engine <task|flow> --dry-run --continue-on-fail
 ```
 
@@ -179,8 +181,13 @@ rather than launching anything.
 ## Steps
 
 ### 1. Parse the chain
-Resolve `$ARGUMENTS` to an ordered list. For a file, read it and strip comments/blanks. Print the
-chain with positions so the operator can confirm the order before anything runs.
+Resolve `$ARGUMENTS` to an ordered list. For a lane-file path, read the JSON, validate it against
+`.claude/workflows/lane.schema.json` at a glance (required top-level keys `lane`, `roadmap`,
+`blocks`), and take the `id` of each entry in `blocks[]` in array order — **array order IS chain
+order**; there is no comment syntax or line order to strip, because the file is structured data,
+not a directive list. A per-block briefing that used to live as lane-file prose now lives on the
+block's own record (`notes`/`why`); read it there, not from this file. Print the chain with
+positions so the operator can confirm the order before anything runs.
 
 ### 2. Check readiness against the live graph
 For each block, find it in the repo's `planning/state.json` `tracks[].blocks[]` and resolve every
