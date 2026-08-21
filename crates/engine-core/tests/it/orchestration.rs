@@ -248,7 +248,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
 
     let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
     let resolve_deps = |_repo: &str, _id: &str| {
-        vec![DependencyEdge {
+        vec![DependencyEdge::Block {
             repo: "engine-rs".to_string(),
             block_id: "EN.9.F".to_string(),
         }]

@@ -28,11 +28,35 @@ use super::chain::ChainStep;
 
 // ── Dependency gate ─────────────────────────────────────────────────────
 
-/// One `depends_on` edge a block declares: the repo and block id it depends on.
+/// One `depends_on` edge a block declares. Widened (`EN.11.J` Task 1) beyond the
+/// original block-only shape so an operator/approval/external edge is representable
+/// too, instead of being structurally undroppable-but-unrepresentable — which is why
+/// `corpus_gates.rs` used to drop them rather than pass them through.
+///
+/// Deliberately an enum, not a struct with optional fields: an operator/approval gate
+/// is *targetless* (`OperatorDep`/`ApprovalDep` in okf-core carry no `repo`/`block_id`
+/// at all, only a `slug`), so giving every edge a `repo`/`block_id` pair would invent
+/// meaningless values for three of the four variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DependencyEdge {
-    pub repo: String,
-    pub block_id: String,
+pub enum DependencyEdge {
+    /// A dependency on another block, possibly cross-repo. Met when
+    /// `is_edge_met(repo, block_id)` reports the target block as done.
+    Block { repo: String, block_id: String },
+    /// An operator working session that gates this block, named by its slug.
+    ///
+    /// Always treated as **unmet** while it appears in `resolve_depends_on`'s
+    /// result — there is no runtime check that could make it "met" without an
+    /// engine self-clearing an operator gate, which HQ D71 forbids at any
+    /// priority. The gate clears by the edge being removed from the corpus'
+    /// `state.json` (the mev CLI is the single writer), not by this reader
+    /// re-evaluating anything.
+    Operator { slug: String },
+    /// A pending approval gating this block, named by its slug. Same
+    /// always-unmet-while-present contract as `Operator`.
+    Approval { slug: String },
+    /// An external/environmental fact gating this block, described by `what`.
+    /// Same always-unmet-while-present contract as `Operator`.
+    External { what: String },
 }
 
 /// Everything that can go wrong gating a step's start. Every variant names the block and
@@ -56,12 +80,31 @@ impl fmt::Display for GateError {
                 repo,
                 block_id,
                 edge,
-            } => write!(
-                f,
-                "block '{block_id}' (repo '{repo}') cannot start: dependency '{}' \
-                 (repo '{}') is not yet met",
-                edge.block_id, edge.repo
-            ),
+            } => match edge {
+                DependencyEdge::Block {
+                    repo: dep_repo,
+                    block_id: dep_id,
+                } => write!(
+                    f,
+                    "block '{block_id}' (repo '{repo}') cannot start: dependency '{dep_id}' \
+                     (repo '{dep_repo}') is not yet met"
+                ),
+                DependencyEdge::Operator { slug } => write!(
+                    f,
+                    "block '{block_id}' (repo '{repo}') cannot start: operator gate \
+                     '{slug}' is not yet cleared"
+                ),
+                DependencyEdge::Approval { slug } => write!(
+                    f,
+                    "block '{block_id}' (repo '{repo}') cannot start: approval gate \
+                     '{slug}' is not yet granted"
+                ),
+                DependencyEdge::External { what } => write!(
+                    f,
+                    "block '{block_id}' (repo '{repo}') cannot start: external \
+                     dependency '{what}' is not yet met"
+                ),
+            },
         }
     }
 }
@@ -73,8 +116,11 @@ impl std::error::Error for GateError {}
 /// `resolve_depends_on(repo, block_id)` returns the block's declared dependency edges —
 /// this module never derives them itself, since the block record (and the live graph it
 /// lives in) is owned elsewhere. `is_edge_met(repo, block_id)` reports whether a given
-/// edge is satisfied (e.g. the target block's state is `done`/`closed`) — again supplied
-/// by the caller so this module stays independent of how "met" is determined.
+/// **block** edge is satisfied (e.g. the target block's state is `done`/`closed`) —
+/// again supplied by the caller so this module stays independent of how "met" is
+/// determined. Operator/approval/external edges never reach `is_edge_met` at all: per
+/// [`DependencyEdge`]'s doc, they are unmet for as long as they are present in
+/// `resolve_depends_on`'s result, by construction.
 ///
 /// Edges are checked in the order `resolve_depends_on` returns them; the first unmet edge
 /// short-circuits the check and is the one named in the returned error. A block with no
@@ -86,7 +132,13 @@ pub fn check_dependencies(
 ) -> Result<(), GateError> {
     let edges = resolve_depends_on(&step.repo, &step.block_id);
     for edge in edges {
-        if !is_edge_met(&edge.repo, &edge.block_id) {
+        let met = match &edge {
+            DependencyEdge::Block { repo, block_id } => is_edge_met(repo, block_id),
+            DependencyEdge::Operator { .. }
+            | DependencyEdge::Approval { .. }
+            | DependencyEdge::External { .. } => false,
+        };
+        if !met {
             return Err(GateError::UnmetDependency {
                 repo: step.repo.clone(),
                 block_id: step.block_id.clone(),
@@ -165,7 +217,7 @@ mod tests {
     fn unmet_edge_blocks_the_start_and_names_the_edge_and_repo() {
         let s = step("engine-rs", "EN.10.B");
         let resolve_deps = |_repo: &str, _id: &str| {
-            vec![DependencyEdge {
+            vec![DependencyEdge::Block {
                 repo: "engine-rs".to_string(),
                 block_id: "EN.9.F".to_string(),
             }]
@@ -182,8 +234,13 @@ mod tests {
             } => {
                 assert_eq!(repo, "engine-rs");
                 assert_eq!(block_id, "EN.10.B");
-                assert_eq!(edge.repo, "engine-rs");
-                assert_eq!(edge.block_id, "EN.9.F");
+                match edge {
+                    DependencyEdge::Block { repo, block_id } => {
+                        assert_eq!(repo, "engine-rs");
+                        assert_eq!(block_id, "EN.9.F");
+                    }
+                    other => panic!("expected a Block edge, got {other:?}"),
+                }
             }
         }
         let msg = err.to_string();
@@ -201,7 +258,7 @@ mod tests {
     fn met_dependency_block_starts_immediately() {
         let s = step("engine-rs", "EN.10.B");
         let resolve_deps = |_repo: &str, _id: &str| {
-            vec![DependencyEdge {
+            vec![DependencyEdge::Block {
                 repo: "engine-rs".to_string(),
                 block_id: "EN.9.F".to_string(),
             }]
@@ -225,11 +282,11 @@ mod tests {
         let s = step("engine-rs", "EN.10.B");
         let resolve_deps = |_repo: &str, _id: &str| {
             vec![
-                DependencyEdge {
+                DependencyEdge::Block {
                     repo: "engine-rs".to_string(),
                     block_id: "FIRST".to_string(),
                 },
-                DependencyEdge {
+                DependencyEdge::Block {
                     repo: "engine-rs".to_string(),
                     block_id: "SECOND".to_string(),
                 },
@@ -240,10 +297,81 @@ mod tests {
 
         let err = check_dependencies(&s, &resolve_deps, &is_met).unwrap_err();
         match err {
-            GateError::UnmetDependency { edge, .. } => {
-                assert_eq!(edge.block_id, "FIRST");
-            }
+            GateError::UnmetDependency { edge, .. } => match edge {
+                DependencyEdge::Block { block_id, .. } => assert_eq!(block_id, "FIRST"),
+                other => panic!("expected a Block edge, got {other:?}"),
+            },
         }
+    }
+
+    #[test]
+    fn unmet_operator_edge_is_refused_and_names_the_slug() {
+        let s = step("engine-rs", "EN.11.K");
+        let resolve_deps = |_repo: &str, _id: &str| {
+            vec![DependencyEdge::Operator {
+                slug: "operator-mac-mini-visit".to_string(),
+            }]
+        };
+        // is_edge_met must never even be consulted for a non-Block edge.
+        let is_met =
+            |_repo: &str, _id: &str| panic!("is_edge_met must not be called for an operator edge");
+
+        let err = check_dependencies(&s, &resolve_deps, &is_met).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("operator-mac-mini-visit"),
+            "message should name the operator gate slug: {msg}"
+        );
+    }
+
+    #[test]
+    fn unmet_approval_edge_is_refused_and_names_the_slug() {
+        let s = step("engine-rs", "EN.11.K");
+        let resolve_deps = |_repo: &str, _id: &str| {
+            vec![DependencyEdge::Approval {
+                slug: "approve-release".to_string(),
+            }]
+        };
+        let is_met =
+            |_repo: &str, _id: &str| panic!("is_edge_met must not be called for an approval edge");
+
+        let err = check_dependencies(&s, &resolve_deps, &is_met).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("approve-release"),
+            "message should name the approval gate slug: {msg}"
+        );
+    }
+
+    #[test]
+    fn unmet_external_edge_is_refused_and_names_what() {
+        let s = step("engine-rs", "EN.11.K");
+        let resolve_deps = |_repo: &str, _id: &str| {
+            vec![DependencyEdge::External {
+                what: "DNS cutover complete".to_string(),
+            }]
+        };
+        let is_met =
+            |_repo: &str, _id: &str| panic!("is_edge_met must not be called for an external edge");
+
+        let err = check_dependencies(&s, &resolve_deps, &is_met).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DNS cutover complete"),
+            "message should name the external dependency: {msg}"
+        );
+    }
+
+    #[test]
+    fn clearing_the_operator_gate_by_no_longer_returning_it_makes_the_block_admissible() {
+        // The gate clears when the edge is removed from `resolve_depends_on`'s
+        // result (mirroring mev removing it from `state.json`), not via any
+        // runtime re-check of the operator edge itself.
+        let s = step("engine-rs", "EN.11.K");
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| false;
+
+        assert!(check_dependencies(&s, &resolve_deps, &is_met).is_ok());
     }
 
     #[tokio::test]

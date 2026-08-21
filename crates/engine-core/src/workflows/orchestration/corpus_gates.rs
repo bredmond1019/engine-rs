@@ -249,7 +249,7 @@ impl CorpusGates {
             .depends_on
             .iter()
             .filter_map(|dep| match dep {
-                BlockedBy::Block(b) => Some(DependencyEdge {
+                BlockedBy::Block(b) => Some(DependencyEdge::Block {
                     repo: b.repo.clone(),
                     block_id: b.id.clone(),
                 }),
@@ -388,7 +388,7 @@ repo_path = "repo-b"
             let edges = gates.resolve_depends_on("repo-a", "A.1");
             assert_eq!(
                 edges,
-                vec![DependencyEdge {
+                vec![DependencyEdge::Block {
                     repo: "repo-b".to_string(),
                     block_id: "B.1".to_string(),
                 }]
