@@ -43,7 +43,7 @@
 
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -104,6 +104,66 @@ pub type FlowFuture = Pin<Box<dyn Future<Output = Result<TaskContext, WorkflowEr
 /// [`FlowInvocation`]s it was called with, so a step's resolved cwd is
 /// asserted directly rather than inferred from intent.
 pub type FlowRunner = Arc<dyn Fn(FlowInvocation) -> FlowFuture + Send + Sync>;
+
+// ── Isolation policy ─────────────────────────────────────────────────────
+
+/// The repo slug the `/begin-orchestration` Step 2 isolation table treats as
+/// "always worktree" — a chain there edits `.claude/workflows/sdlc-*.js`
+/// while those very engines are executing it, so an in-place run would be
+/// editing the machinery driving it.
+const ALWAYS_WORKTREE_REPO_SLUG: &str = "base-template";
+
+/// Resolve whether one step should run `SDLC_FLOW` in a worktree (`true`)
+/// or in place against the live checkout (`false`), per `/begin-orchestration`
+/// Step 2's three-row table:
+///
+/// 1. `base-template` (matched by slug) -> **always** `true`. A chain there
+///    edits `.claude/workflows/sdlc-*.js` while those very engines drive it
+///    — running in place would rewrite the machinery mid-run.
+/// 2. the brain root (matched by canonicalized `repo_path`, **not** slug —
+///    HQ's slug varies by how a chain names it) -> **always** `false`.
+///    `validate-brain` inside a worktree resolves the gitignored sub-repos
+///    against the worktree's own `brain.toml`; measured 64 structure / 601
+///    state errors versus 0/0 in the main tree, so a worktree there cannot
+///    pass its own gates.
+/// 3. anything else -> `default_use_worktree`, the resolved
+///    `OrchestrationPolicy::default_use_worktree` knob.
+///
+/// Rows 1 and 2 are external contracts (standing rule 6's "fixed by an
+/// external contract" qualifier), **not** policy knobs — they are matched
+/// before `default_use_worktree` is ever consulted, so no combination of
+/// policy, profile, or per-run event override can reach them. Both are
+/// covered by a test that sets `default_use_worktree` the wrong way for
+/// each row and still gets the right answer; that is what distinguishes
+/// "the policy is implemented" from "the default happens to be right
+/// today".
+///
+/// Canonicalization failure (a path that does not exist, e.g. an
+/// as-yet-unresolved fixture path in a test) is treated as "does not match
+/// the brain root" rather than propagated as an error — this function's
+/// contract is a bool, and a step whose `repo_path` cannot be canonicalized
+/// falls through to the ordinary-repo row exactly as if the comparison had
+/// legitimately failed to match.
+pub fn resolve_isolation(
+    repo_slug: &str,
+    repo_path: &Path,
+    brain_root: &Path,
+    default_use_worktree: bool,
+) -> bool {
+    if repo_slug == ALWAYS_WORKTREE_REPO_SLUG {
+        return true;
+    }
+
+    let canonical_repo_path = repo_path.canonicalize();
+    let canonical_brain_root = brain_root.canonicalize();
+    if let (Ok(repo_path), Ok(brain_root)) = (canonical_repo_path, canonical_brain_root) {
+        if repo_path == brain_root {
+            return false;
+        }
+    }
+
+    default_use_worktree
+}
 
 // ── Errors ───────────────────────────────────────────────────────────────
 
@@ -589,5 +649,78 @@ mod tests {
             .expect("a run with no failed nodes should be integrated as success");
 
         assert_eq!(outcome.block_id, "A.1");
+    }
+
+    // ── resolve_isolation ────────────────────────────────────────────
+
+    #[test]
+    fn base_template_always_resolves_to_worktree_even_with_default_false() {
+        let (dir, _registry) = two_repo_registry();
+        let repo_path = dir.path().join("repo-a");
+        assert!(resolve_isolation(
+            "base-template",
+            &repo_path,
+            dir.path(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn base_template_always_resolves_to_worktree_even_with_default_true() {
+        let (dir, _registry) = two_repo_registry();
+        let repo_path = dir.path().join("repo-a");
+        assert!(resolve_isolation(
+            "base-template",
+            &repo_path,
+            dir.path(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn brain_root_always_resolves_to_in_place_even_with_default_true() {
+        let (dir, _registry) = two_repo_registry();
+        // The step's resolved repo_path IS the brain root itself here —
+        // mirrors HQ, where the chain's own repo resolves to the brain
+        // root path.
+        assert!(!resolve_isolation(
+            "agentic-portfolio",
+            dir.path(),
+            dir.path(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn brain_root_always_resolves_to_in_place_even_with_default_false() {
+        let (dir, _registry) = two_repo_registry();
+        assert!(!resolve_isolation(
+            "agentic-portfolio",
+            dir.path(),
+            dir.path(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn brain_root_is_matched_by_canonicalized_path_not_by_slug() {
+        let (dir, _registry) = two_repo_registry();
+        // A slug that has nothing to do with "brain" or "hq" must still be
+        // recognized as the brain root purely by path — the whole point of
+        // canonicalized-path matching over slug matching.
+        assert!(!resolve_isolation(
+            "whatever-this-chain-calls-it",
+            dir.path(),
+            dir.path(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn ordinary_repo_resolves_to_the_default_both_ways() {
+        let (dir, _registry) = two_repo_registry();
+        let repo_path = dir.path().join("repo-a");
+        assert!(!resolve_isolation("repo-a", &repo_path, dir.path(), false,));
+        assert!(resolve_isolation("repo-a", &repo_path, dir.path(), true,));
     }
 }
