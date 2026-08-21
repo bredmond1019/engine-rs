@@ -559,6 +559,49 @@ impl From<ExecuteError> for IntegrateError {
     }
 }
 
+// ── Per-step progress ────────────────────────────────────────────────────
+
+/// One completed step's progress, handed to the injected step observer
+/// (`Task 3`) exactly once per integrated step — after that step's
+/// `lane-log.jsonl` line is appended, so an observed step is always a
+/// recorded step.
+///
+/// `index` is **1-based**: the first completed step reports `index: 1`,
+/// matching the human "4 of 30" phrasing a watcher reads it as, rather
+/// than the 0-based offset into `chain`. `total` is the chain's full
+/// length, resolved once before the loop starts (not the number of steps
+/// integrated so far), so a watcher can always tell `index` of `total`
+/// (e.g. 4-of-30 from 29-of-30) regardless of whether the chain later
+/// stops early.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepProgress {
+    pub repo: String,
+    pub block_id: String,
+    /// 1-based position of this completed step in the chain.
+    pub index: usize,
+    /// The chain's total step count.
+    pub total: usize,
+    /// The step's outcome status. Only ever `"completed"` today — the
+    /// observer is called exactly once per *completed* step (see this
+    /// struct's doc); a step that bails returns an `Err` from
+    /// [`integrate_chain`] before reaching the observer call, and a
+    /// cancelled chain simply stops calling it, so there is no "failed" or
+    /// "cancelled" status to carry here as of Task 3. Kept as an owned
+    /// `String` rather than a fixed enum so a later status does not need a
+    /// struct-shape change (CLAUDE.md standing rule 6: keep the shape
+    /// invariant).
+    pub status: String,
+}
+
+/// An injected observer called once per completed step, wired by
+/// `OrchestrationRunNode::with_step_observer`. `Node::process` has no
+/// access to `on_progress` — it is framework-owned and only fires at node
+/// boundaries — so per-step progress for a single-node chain like this one
+/// can only ever be an explicitly injected seam, never a call into the
+/// framework. `Send + Sync` because it crosses the `spawn_blocking`
+/// boundary alongside every other closure this node owns.
+pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
+
 // ── The integrated loop ─────────────────────────────────────────────────
 
 /// Drive `chain` to completion, in order: for every step, gate on
@@ -612,6 +655,16 @@ impl From<ExecuteError> for IntegrateError {
 /// runs to completion regardless of the token — there is no run id to
 /// thread a cancellation into yet. Cancellation here only ever prevents
 /// the *next* step from starting.
+///
+/// # Per-step progress
+///
+/// `step_observer` is called **exactly once per completed step**,
+/// immediately after that step's `lane-log.jsonl` line is appended (so an
+/// observed step is always a recorded step) — never before, and never for
+/// a step that bails. See [`StepProgress`] for the payload and its 1-based
+/// index convention. A no-op observer (e.g. `&|_| {}`) makes this
+/// parameter behavior-stable: nothing about the loop's control flow or
+/// return value depends on it.
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain(
     chain: &[ChainStep],
@@ -626,7 +679,9 @@ pub async fn integrate_chain(
     run_flow: &FlowRunner,
     roadmap_dir: &Path,
     lane: Option<&str>,
+    step_observer: &StepObserverFn,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
     for step in chain {
         // Checked at the top of every iteration, before anything for this
@@ -683,6 +738,18 @@ pub async fn integrate_chain(
         append_lane_log_line(roadmap_dir, &entry)?;
 
         outcomes.push(outcome);
+
+        // Called exactly once per completed step, after this step's
+        // lane-log line is on disk — see `integrate_chain`'s "Per-step
+        // progress" doc. `index` is 1-based (`outcomes.len()` is already
+        // the count including the step just pushed).
+        step_observer(&StepProgress {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            index: outcomes.len(),
+            total: total_steps,
+            status: "completed".to_string(),
+        });
     }
     Ok(outcomes)
 }
@@ -1171,6 +1238,7 @@ mod tests {
             &runner,
             roadmap_dir.path(),
             None,
+            &|_: &StepProgress| {},
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -1274,6 +1342,7 @@ mod tests {
             &runner,
             roadmap_dir.path(),
             None,
+            &|_: &StepProgress| {},
         )
         .await
         .expect("chain should complete");
@@ -1314,6 +1383,7 @@ mod tests {
             &runner,
             roadmap_dir.path(),
             Some("backend"),
+            &|_: &StepProgress| {},
         )
         .await
         .expect("chain should complete");
@@ -1354,6 +1424,7 @@ mod tests {
             &runner,
             roadmap_dir.path(),
             None,
+            &|_: &StepProgress| {},
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -1409,6 +1480,7 @@ mod tests {
             &runner,
             &missing_roadmap_dir,
             None,
+            &|_: &StepProgress| {},
         )
         .await
         .expect_err("the original step failure must still surface");

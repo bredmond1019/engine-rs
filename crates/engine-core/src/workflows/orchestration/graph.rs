@@ -87,7 +87,7 @@ use crate::workflow::Workflow;
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
 use super::execute::{default_flow_runner, EngineKind, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
-use super::integrate::{integrate_chain, resolve_roadmap_dir, HoldSource, NeverHeld};
+use super::integrate::{integrate_chain, resolve_roadmap_dir, HoldSource, NeverHeld, StepProgress};
 
 /// The registered workflow type string, used both to register the workflow
 /// (`engine-serve`, this task) and as `WorkflowSchema::workflow_type`.
@@ -255,6 +255,10 @@ type DependsOnFn = Arc<dyn Fn(&str, &str) -> Vec<DependencyEdge> + Send + Sync>;
 type EdgeMetFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 type EngineFn = Arc<dyn Fn(&str, &str) -> EngineKind + Send + Sync>;
 type BlockOpenFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// A per-step observer, called once per completed step — see
+/// [`OrchestrationRunNode::with_step_observer`] and
+/// [`integrate::StepProgress`].
+type StepObserverArc = Arc<dyn Fn(&StepProgress) + Send + Sync>;
 
 /// The sole node in the `ORCHESTRATION` graph: resolves a lane chain, then
 /// drives it end to end via [`integrate::integrate_chain`] — dependency
@@ -282,6 +286,11 @@ pub struct OrchestrationRunNode {
     /// behavior-stable: no token, no cancellation check, identical output to
     /// today. See [`Self::with_cancellation_token`].
     cancellation_token: Option<CancellationToken>,
+    /// Called exactly once per completed step by [`integrate::integrate_chain`]
+    /// — see [`Self::with_step_observer`]. Defaults to a no-op, so an
+    /// un-injected run emits nothing and behaves exactly as before this
+    /// seam existed (CLAUDE.md standing rule 6).
+    step_observer: StepObserverArc,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -308,6 +317,7 @@ impl OrchestrationRunNode {
             admission: AdmissionGate::with_default_policy(),
             run_flow: None,
             cancellation_token: None,
+            step_observer: Arc::new(|_progress: &StepProgress| {}),
         }
     }
 
@@ -365,6 +375,21 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = Some(token);
+        self
+    }
+
+    /// Attach a per-step observer, called by
+    /// [`integrate::integrate_chain`] exactly once per completed step —
+    /// after that step's `lane-log.jsonl` line is appended. `Node::process`
+    /// has no access to the framework's own `on_progress` (it only fires at
+    /// node boundaries, and this workflow is a single node), so this
+    /// builder is the only way per-step progress reaches a caller. With no
+    /// observer attached (the default), behavior is unchanged: no
+    /// emissions, no other side effect. See [`integrate::StepProgress`] for
+    /// the payload and its 1-based index convention.
+    #[must_use]
+    pub fn with_step_observer(mut self, observer: StepObserverArc) -> Self {
+        self.step_observer = observer;
         self
     }
 }
@@ -463,6 +488,9 @@ impl Node for OrchestrationRunNode {
         // cancelled?" once `integrate_chain` returns. Cheap: `CancellationToken`
         // is an `Arc` inside.
         let cancellation_token_for_stamp = cancellation_token.clone();
+        // Cloned before the `spawn_blocking` closure like every other owned
+        // seam here — `Arc` clone, `Send + Sync + 'static`.
+        let step_observer = self.step_observer.clone();
 
         // `execute::FlowFuture` is deliberately not `Send` (see its own doc
         // comment: `Workflow::run`'s `OnProgress` callback is not `Send`),
@@ -496,6 +524,7 @@ impl Node for OrchestrationRunNode {
                 &run_flow,
                 &roadmap_dir,
                 resolved_lane.as_deref(),
+                step_observer.as_ref(),
             ))
             .map_err(|err| NodeError::new(err.to_string()))
         })

@@ -27,7 +27,7 @@ use engine_core::workflows::orchestration::chain::{
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain, HoldSource, IntegrateError, NeverHeld,
+    integrate_chain, HoldSource, IntegrateError, NeverHeld, StepProgress,
 };
 
 use engine_core::nodes::terminal::admission::{AdmissionControl, AdmissionPolicy};
@@ -210,6 +210,7 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         &flow_runner,
         &roadmap_dir,
         None,
+        &|_: &StepProgress| {},
     )
     .await
     .expect("two-repo chain should integrate cleanly");
@@ -263,6 +264,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         &flow_runner,
         &roadmap_dir,
         None,
+        &|_: &StepProgress| {},
     )
     .await
     .expect_err("an unmet dependency must refuse the block");
@@ -338,6 +340,7 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             &flow_runner2,
             &roadmap_dir2,
             None,
+            &|_: &StepProgress| {},
         )
         .await;
         admitted_writer.store(true, Ordering::SeqCst);
@@ -453,6 +456,7 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             &flow_runner,
             &roadmap_dir2,
             None,
+            &|_: &StepProgress| {},
         )
         .await
     });
@@ -520,6 +524,7 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         &flow_runner,
         &roadmap_dir,
         None,
+        &|_: &StepProgress| {},
     )
     .await
     .expect_err("a corrupted state write must fail the run");
@@ -660,6 +665,7 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script()
         &flow_runner,
         &roadmap_dir,
         Some("prove-readability-lane"),
+        &|_: &StepProgress| {},
     )
     .await
     .expect("single-block chain should integrate cleanly");
@@ -801,6 +807,7 @@ async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_run
             &flow_runner,
             &roadmap_dir2,
             None,
+            &|_: &StepProgress| {},
         )
         .await
     });
@@ -887,6 +894,7 @@ async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner
             &flow_runner,
             &roadmap_dir2,
             None,
+            &|_: &StepProgress| {},
         )
         .await
     });
@@ -910,4 +918,156 @@ async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner
         0,
         "the runner must never have been invoked"
     );
+}
+
+// ── Per-step progress observer (Task 3) ──────────────────────────────────
+
+/// A 3-step chain calls the observer exactly three times, in order, with
+/// each `StepProgress` naming the right repo, block, 1-based index and the
+/// chain's fixed total — a watcher must be able to tell 2-of-3 from 3-of-3.
+#[tokio::test]
+async fn n_step_chain_calls_the_observer_exactly_n_times_with_correct_indices() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-a".to_string(), "A.2".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let emitted: Arc<Mutex<Vec<StepProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_for_closure = emitted.clone();
+    let observer = move |progress: &StepProgress| {
+        emitted_for_closure.lock().unwrap().push(progress.clone());
+    };
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &observer,
+    )
+    .await
+    .expect("three-step chain should integrate cleanly");
+
+    assert_eq!(outcomes.len(), 3);
+
+    let progress = emitted.lock().unwrap();
+    assert_eq!(progress.len(), 3, "exactly one emission per completed step");
+
+    assert_eq!(progress[0].repo, "repo-a");
+    assert_eq!(progress[0].block_id, "A.1");
+    assert_eq!(progress[0].index, 1);
+    assert_eq!(progress[0].total, 3);
+    assert_eq!(progress[0].status, "completed");
+
+    assert_eq!(progress[1].repo, "repo-a");
+    assert_eq!(progress[1].block_id, "A.2");
+    assert_eq!(progress[1].index, 2);
+    assert_eq!(progress[1].total, 3);
+
+    assert_eq!(progress[2].repo, "repo-b");
+    assert_eq!(progress[2].block_id, "B.1");
+    assert_eq!(progress[2].index, 3);
+    assert_eq!(progress[2].total, 3);
+}
+
+/// The observer fires only after the step's `lane-log.jsonl` line is on
+/// disk — an observed step is always a recorded step. Asserted by reading
+/// the lane log from inside the observer callback itself: at the moment
+/// step k's observer runs, the log must already have k lines.
+#[tokio::test]
+async fn the_observer_fires_after_the_lane_log_line_is_appended() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let roadmap_dir_for_observer = roadmap_dir.clone();
+    let observer = move |progress: &StepProgress| {
+        let lines = lane_log_lines(&roadmap_dir_for_observer);
+        assert_eq!(
+            lines.len(),
+            progress.index,
+            "at step {}'s observer call, the lane log must already carry {} line(s)",
+            progress.index,
+            progress.index
+        );
+    };
+
+    integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &observer,
+    )
+    .await
+    .expect("two-step chain should integrate cleanly");
+}
+
+/// With no observer injected (a no-op closure), the chain's outcomes and
+/// lane-log output are unchanged from any other run — the seam adds no
+/// side effect on its own.
+#[tokio::test]
+async fn no_observer_injected_changes_nothing() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+    )
+    .await
+    .expect("two-repo chain should integrate cleanly");
+
+    assert_eq!(outcomes.len(), 2);
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 2, "exactly one lane-log line per block");
 }
