@@ -144,9 +144,10 @@ impl QueueSource for BlockedEdgeSource {
                     // producer) is skipped, never a panic and never a
                     // whole-read failure — the surrounding valid records
                     // must still load.
-                    eprintln!(
-                        "warning: skipping malformed blocked-edge sink line in {}: {err}",
-                        self.path.display()
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %err,
+                        "skipping malformed blocked-edge sink line"
                     );
                 }
             }

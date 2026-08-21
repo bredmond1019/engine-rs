@@ -1335,7 +1335,7 @@ mod tests {
     fn repo_harness_json_deserializes_every_sdlc_policy_and_profile() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../planning/harness.json");
         let Ok(raw) = std::fs::read_to_string(path) else {
-            eprintln!("skipping: {path} not present (planning/ vault not mounted)");
+            tracing::debug!(path = %path, "skipping: planning/ vault not mounted");
             return;
         };
         let root: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");

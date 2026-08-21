@@ -667,6 +667,11 @@ async fn node_context(
                 run.completed_at = Some(Utc::now());
                 run.error = Some(err.message.clone());
             }
+            tracing::error!(
+                node = %identity,
+                error = %err.message,
+                "node failed"
+            );
             on_progress(&err_ctx);
             (err_ctx, true)
         }

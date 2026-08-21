@@ -197,7 +197,7 @@ pub(crate) fn commit_all(runner: &CommandRunner, worktree: &Path, message: &str)
 /// (re-saving an unchanged file), `false` for anything else (a genuine
 /// failure). Split out as a small pure function — rather than folded into
 /// [`log_noop_commit`] — so tests can assert on the classification directly
-/// instead of capturing `eprintln!` output.
+/// instead of capturing `tracing` output.
 pub(crate) fn is_noop_commit(stderr: &str, stdout: &str) -> bool {
     let haystack = format!("{stdout}\n{stderr}").to_lowercase();
     haystack.contains("nothing to commit")
@@ -220,25 +220,25 @@ pub(crate) fn is_noop_commit(stderr: &str, stdout: &str) -> bool {
 /// set, while a genuine failure always prints (with the stderr text and the
 /// state path) regardless.
 ///
-/// Uses `eprintln!`, not a logging facade: the workspace carries no
-/// `tracing`/`log` dependency in any `crates/*/Cargo.toml` nor the workspace
-/// root (verified during EN.3.G authoring), and adding one for a single call
-/// site is out of scope here.
+/// Uses `tracing`'s `debug!`/`warn!` (EN.11.I migrated this off `eprintln!`;
+/// the workspace now carries `tracing` as a workspace dependency).
 /// `label` is a human-readable identifier for the commit that no-opped — the
 /// commit message since the widening to [`commit_all`], the state file's path
 /// before it. It exists only for this diagnostic; nothing parses it.
 fn log_noop_commit(label: &str, output: &CommandOutput) {
     if is_noop_commit(&output.stderr, &output.stdout) {
         if std::env::var("ENGINE_DEBUG").is_ok() {
-            eprintln!(
-                "sdlc_flow: state commit no-op ({label}): {}",
-                output.stderr.trim()
+            tracing::debug!(
+                label = %label,
+                stderr = %output.stderr.trim(),
+                "sdlc_flow: state commit no-op"
             );
         }
     } else {
-        eprintln!(
-            "sdlc_flow: WARNING state commit failed ({label}): {}",
-            output.stderr.trim()
+        tracing::warn!(
+            label = %label,
+            stderr = %output.stderr.trim(),
+            "sdlc_flow: state commit failed"
         );
     }
 }

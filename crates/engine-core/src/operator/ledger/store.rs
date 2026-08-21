@@ -124,9 +124,10 @@ impl ApprovalLedger for FileApprovalLedger {
                     // a killed process) is skipped, never a panic and
                     // never a whole-read failure — the surrounding valid
                     // rows must still come back.
-                    eprintln!(
-                        "warning: skipping malformed approval ledger line in {}: {err}",
-                        self.path.display()
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %err,
+                        "skipping malformed approval ledger line"
                     );
                 }
             }
