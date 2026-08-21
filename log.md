@@ -18,6 +18,45 @@ related: [status, context]
 
 ## [run: 2026-08-21]
 
+### Structured logging — one greppable line per node, with run and campaign ids — closes `EN.11.I`
+
+- **What:** `tracing`/`tracing-subscriber` added to the workspace dependency table, consumed only by
+  `engine-core` and `engine-serve`; `engine-serve` gained an idempotent `init_tracing()` (JSON layer,
+  `flatten_event(true)`, `ENGINE_LOG` env-var filter knob defaulting to `info`) (task 1). `Workflow::
+  walk` and the `node_context` dispatch site carry `#[instrument]` spans recording `run_id`/
+  `campaign_id`, propagated across `OrchestrationRunNode`'s `spawn_blocking` boundary by explicitly
+  re-capturing the current span and dispatcher inside the closure (task 2). All real production
+  `eprintln!` call sites in `engine-core`'s 5 named src files migrated to structured `tracing` events,
+  and a `tracing::error!` naming the node and failure added at the dispatch `Err` branch to satisfy
+  the "a failing node emits a structured event" acceptance criterion, since no prior call site covered
+  it (task 3). `engine-serve`'s 4 src `eprintln!` sites migrated to structured events; `term-core`'s
+  sole site was removed rather than routed, since `parse_sessions` has no in-workspace caller (task 4).
+  The JSON wire shape was pinned — `node_context` now emits an explicit `run_id`/`campaign_id`/`node`
+  event per dispatch (span fields alone don't flatten to event top-level) — via a new
+  `crates/engine-core/tests/it/structured_logging.rs` suite covering dispatch order, failure events,
+  `spawn_blocking` propagation over the real JSON writer, and a self-verifying zero-`eprintln!` count
+  check (task 5). Full validation gate green — fmt, clippy `--all-features -D warnings`, nextest
+  `--workspace --all-features` (2749/2749 passed, 17 skipped), release build, cargo audit (task 6,
+  validate-only, no code changes). All 6 tasks passed, PASS review. This closes `EN.11.I` — the
+  observability gap seams.md flagged as the binding constraint on Wave 2-3 orchestration gates is now
+  closed: every node dispatch and failure produces one greppable structured line carrying its run and
+  campaign identity. Docs updated: `docs/deployment-launchd.md`. Next: `EN.5.B2`, `EN.5.C`, `EN.6.K`,
+  `EN.5.G`, `EN.4.D`, `EN.11.M`, `EN.12.A`, `EN.12.B`, `EN.12.D` per the `next` frontmatter list.
+
+```
+54fe8de feat: implement EN.11.I-task5
+4e0c875 feat: implement EN.11.I-task4
+dab7455 feat: implement EN.11.I-task3
+3a2595d feat: implement EN.11.I-task2
+a68757e feat: implement EN.11.I-task1
+e830f03 docs: update docs for EN.11.I
+f4a54f9 chore: init worktree EN.11.I-flow
+```
+
+---
+
+## [run: 2026-08-21]
+
 ### Campaign identity — a chain of runs has an address — closes `EN.11.E`
 
 - **What:** `docs/data-contract.md` re-framed as the canonical data contract per D78, absorbing
