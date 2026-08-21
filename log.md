@@ -16,6 +16,44 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-21]
+
+### Campaign identity — a chain of runs has an address — closes `EN.11.E`
+
+- **What:** `docs/data-contract.md` re-framed as the canonical data contract per D78, absorbing
+  the outgoing 1.7.0 canonical content before authoring anything new (task 1); `campaign_id:
+  Option<String>` threaded through `execute.rs`/`graph.rs`/`integrate.rs`'s `FlowInvocation`/child
+  run seam so a run knows which campaign it belongs to (tasks 2-3); `crates/engine-serve/src/
+  live_state.rs` gained `RunRecord.campaign_id` and `list_campaign_runs`, merging the live map and
+  completed ring with deterministic ordering and a `possibly_truncated` flag for ring eviction
+  (task 4); `GET /campaigns/{id}` registered in `crates/engine-serve/src/http.rs`, returning the
+  campaign's runs plus a cost/token rollup read from `OrchestrationRunNode`'s `campaign_members`,
+  verified by 5 HTTP-level `actix_web::test` cases against the real router (task 5); `docs/
+  data-contract.md` bumped to Contract Version 1.8.0 documenting campaign identity and the new
+  route, plus a Consumer re-pin obligations section naming orchestrator's and bastion's observed
+  versions (task 6); full validation gate green — fmt, clippy `--all-features -D warnings`,
+  `cargo nextest run --workspace --all-features`, release build, cargo audit (task 7). All 7 tasks
+  passed, PASS review. This closes `EN.11.E` and unblocks `EN.11.G`'s campaign-wide cost rollup
+  (previously scoped out for want of an identity to roll up to). The campaign id is a first-class
+  field on the wire, never hidden in free-form `metadata`, per seams.md seam 11. Cross-repo re-pin
+  in `orchestrator`/`bastion` is out of scope for this block — filed as follow-ups on those lanes
+  per D78's Consequences section. Docs updated: `docs/architecture.md`, `docs/
+  orchestration-workflow.md`. Next: `EN.11.F` (the stop button) and `EN.11.H` (crash recovery),
+  both previously blocked, are candidates now that a campaign has an address.
+
+```
+07cc84b docs: update docs for EN.11.E
+738a2ff feat: implement EN.11.E-task6
+15d45e0 feat: implement EN.11.E-task5
+fdf8da8 feat: implement EN.11.E-task4
+29cd67e fix: fix pass 1 for EN.11.E-task3
+fbc7320 feat: implement EN.11.E-task3
+28870aa fix: fix pass 1 for EN.11.E-task2
+8e4f6a0 feat: implement EN.11.E-task2
+```
+
+---
+
 ## [run: 2026-08-19]
 
 ### OTel telemetry on the pane-launch command — closes `EN.ticket.otel-pane-telemetry`
