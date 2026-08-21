@@ -224,15 +224,15 @@ impl CorpusGates {
     /// `resolve_depends_on(repo, block_id)`: the block's authored `depends_on`,
     /// mapped from `BlockedBy` to [`DependencyEdge`].
     ///
-    /// Only `BlockedBy::Block` is a block dependency the dependency gate can check.
-    /// `External`, `Operator`, and `Approval` edges are deliberately dropped here,
-    /// not defaulted into a bogus block edge: an external/environmental fact, an
-    /// operator working session, and a pending approval each gate a block through a
-    /// different mechanism entirely (none of them is "another block that must reach
-    /// `closed`"), and `gates::check_dependencies` only knows how to check block
-    /// edges. A block with no `BlockedBy::Block` entries at all — including one whose
-    /// only edges are operator/approval/external — correctly resolves to no
-    /// dependency edges, exactly like a block with an empty `depends_on`.
+    /// Every `BlockedBy` variant now survives resolution (`EN.11.J` Task 2):
+    /// `BlockedBy::Block` maps to [`DependencyEdge::Block`], and
+    /// `BlockedBy::Operator`/`Approval`/`External` map to their widened
+    /// [`DependencyEdge`] counterparts by slug (or `what`, for `External`) — they
+    /// are no longer dropped. Each of those three is *targetless* (no `repo`/
+    /// `block_id` of its own) and, per [`DependencyEdge`]'s own doc, is unmet for as
+    /// long as it appears in this result: `gates::check_dependencies` never even
+    /// consults `is_edge_met` for them. A block with no `depends_on` entries at all
+    /// resolves to an empty vec, exactly as before.
     ///
     /// An unknown `block_id` resolves to no edges (there is nothing to resolve a
     /// dependency list *from*) rather than an error — [`Self::is_edge_met`] is where
@@ -248,12 +248,20 @@ impl CorpusGates {
         block
             .depends_on
             .iter()
-            .filter_map(|dep| match dep {
-                BlockedBy::Block(b) => Some(DependencyEdge::Block {
+            .map(|dep| match dep {
+                BlockedBy::Block(b) => DependencyEdge::Block {
                     repo: b.repo.clone(),
                     block_id: b.id.clone(),
-                }),
-                BlockedBy::External(_) | BlockedBy::Operator(_) | BlockedBy::Approval(_) => None,
+                },
+                BlockedBy::Operator(op) => DependencyEdge::Operator {
+                    slug: op.slug.clone(),
+                },
+                BlockedBy::Approval(ap) => DependencyEdge::Approval {
+                    slug: ap.slug.clone(),
+                },
+                BlockedBy::External(ext) => DependencyEdge::External {
+                    what: ext.what.clone(),
+                },
             })
             .collect()
     }
@@ -371,13 +379,14 @@ repo_path = "repo-b"
     }
 
     #[test]
-    fn resolve_depends_on_maps_block_edges_and_drops_non_block_edges() {
+    fn resolve_depends_on_maps_block_edges_and_non_block_edges_alike() {
         env_guarded(|| {
             let dir = two_repo_brain_root(
                 &state_json(
                     r#"{"id": "A.1", "title": "a1", "status": "open", "depends_on": [
                         {"type": "block", "repo": "repo-b", "id": "B.1"},
                         {"type": "operator", "slug": "op", "exit": "x", "start": "y"},
+                        {"type": "approval", "slug": "approve-it", "what": "ship it", "digest": "abc123"},
                         {"type": "external", "what": "env thing"}
                     ]}"#,
                 ),
@@ -388,12 +397,73 @@ repo_path = "repo-b"
             let edges = gates.resolve_depends_on("repo-a", "A.1");
             assert_eq!(
                 edges,
-                vec![DependencyEdge::Block {
-                    repo: "repo-b".to_string(),
-                    block_id: "B.1".to_string(),
-                }]
+                vec![
+                    DependencyEdge::Block {
+                        repo: "repo-b".to_string(),
+                        block_id: "B.1".to_string(),
+                    },
+                    DependencyEdge::Operator {
+                        slug: "op".to_string(),
+                    },
+                    DependencyEdge::Approval {
+                        slug: "approve-it".to_string(),
+                    },
+                    DependencyEdge::External {
+                        what: "env thing".to_string(),
+                    },
+                ]
             );
             assert!(gates.take_error().is_none());
+        });
+    }
+
+    #[test]
+    fn block_gated_only_by_an_operator_edge_is_refused_and_clearing_it_admits() {
+        env_guarded(|| {
+            let dir = two_repo_brain_root(
+                &state_json(
+                    r#"{"id": "A.1", "title": "a1", "status": "open", "depends_on": [
+                        {"type": "operator", "slug": "op-visit", "exit": "x", "start": "y"}
+                    ]}"#,
+                ),
+                &state_json(r#"{"id": "B.1", "title": "b1", "status": "closed"}"#),
+            );
+            let gates = CorpusGates::new(registry_for(&dir));
+
+            let is_edge_met = |repo: &str, block_id: &str| gates.is_edge_met(repo, block_id);
+            let resolve_deps =
+                |repo: &str, block_id: &str| gates.resolve_depends_on(repo, block_id);
+            let step = super::super::chain::ChainStep {
+                repo: "repo-a".to_string(),
+                block_id: "A.1".to_string(),
+                directives: None,
+            };
+
+            let err = super::super::gates::check_dependencies(&step, &resolve_deps, &is_edge_met)
+                .expect_err("open operator gate must refuse the block");
+            match err {
+                super::super::gates::GateError::UnmetDependency {
+                    edge: DependencyEdge::Operator { slug },
+                    ..
+                } => assert_eq!(slug, "op-visit"),
+                other => panic!("expected an unmet Operator edge, got {other:?}"),
+            }
+
+            // Clearing the gate (mev removing the edge from state.json) is simulated
+            // by re-reading a fixture with no depends_on at all.
+            let dir2 = two_repo_brain_root(
+                &state_json(r#"{"id": "A.1", "title": "a1", "status": "open"}"#),
+                &state_json(r#"{"id": "B.1", "title": "b1", "status": "closed"}"#),
+            );
+            let gates2 = CorpusGates::new(registry_for(&dir2));
+            let is_edge_met2 = |repo: &str, block_id: &str| gates2.is_edge_met(repo, block_id);
+            let resolve_deps2 =
+                |repo: &str, block_id: &str| gates2.resolve_depends_on(repo, block_id);
+            assert!(
+                super::super::gates::check_dependencies(&step, &resolve_deps2, &is_edge_met2)
+                    .is_ok(),
+                "clearing the operator gate must make the block admissible"
+            );
         });
     }
 
