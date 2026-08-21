@@ -16,15 +16,19 @@
 //!
 //! # Policy
 //!
-//! This workflow carries two knobs: `hold_poll_interval_ms` — how often
+//! This workflow carries three knobs: `hold_poll_interval_ms` — how often
 //! [`integrate::wait_for_clearance`] re-polls an operator hold while paused
-//! — and `default_use_worktree` — the row-3 fallback
+//! — `default_use_worktree` — the row-3 fallback
 //! [`execute::resolve_isolation`] consults for any repo that isn't one of
 //! the two non-negotiable rows (`base-template` always `true`, the brain
-//! root always `false`). Both are pure latency/overhead/isolation trades
-//! that never change the declared node set, so — unlike
-//! `sdlc_flow`/`diagnostic_intake` — there is no `registry_for_policy`:
-//! [`registry`] alone is what every profile runs.
+//! root always `false`) — and (EN.11.L Task 3) `hold_deadline_ms` — the
+//! total budget [`integrate::wait_for_clearance`] allows a single hold
+//! before it fails the chain loudly (`None`, the built-in default,
+//! preserves the pre-Task-2 unbounded wait). All three are pure
+//! latency/overhead/isolation/reliability trades that never change the
+//! declared node set, so — unlike `sdlc_flow`/`diagnostic_intake` — there
+//! is no `registry_for_policy`: [`registry`] alone is what every profile
+//! runs.
 //! [`OrchestrationRunNode::process`] resolves the four-layer policy
 //! (`crate::policy::resolve`) itself, exactly where `diagnostic_intake`'s
 //! sole `IntakeExtractNode` does, since there is likewise no dedicated setup
@@ -122,26 +126,43 @@ pub struct OrchestrationPolicy {
     /// to `false`: today every orchestrated run is in-place, and standing
     /// rule 6 requires a new knob to be behavior-stable.
     pub default_use_worktree: bool,
+    /// EN.11.L Task 3: the TOTAL budget [`integrate::wait_for_clearance`]
+    /// allows a single operator hold to consume before it fails the chain
+    /// loudly with [`integrate::IntegrateError::HoldDeadlineExceeded`].
+    /// `None` (the built-in default) preserves the pre-Task-2 behavior
+    /// exactly — an unbounded wait — so adding this knob does not change
+    /// what an existing run does, per CLAUDE.md standing rule 6.
+    pub hold_deadline_ms: Option<u64>,
 }
 
 impl Default for OrchestrationPolicy {
     /// The behavior-stable baseline: poll every 2s while held, run every
-    /// ordinary repo in-place.
+    /// ordinary repo in-place, and never time out a hold (`hold_deadline_ms:
+    /// None`) — exactly the pre-Task-2 behavior.
     fn default() -> Self {
         Self {
             hold_poll_interval_ms: 2_000,
             default_use_worktree: false,
+            hold_deadline_ms: None,
         }
     }
 }
 
 /// All-optional mirror of [`OrchestrationPolicy`] used by the override
 /// layers.
+///
+/// `hold_deadline_ms` is itself an `Option<u64>` in the resolved policy
+/// (`None` = no deadline), so its override field is the nested
+/// `Option<Option<u64>>` [`crate::policy::merge_opt`] already handles
+/// generically: `None` here means "not overridden by this layer" (fall
+/// through), `Some(None)` means "override to no deadline", and
+/// `Some(Some(ms))` pins an explicit deadline.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialOrchestrationPolicy {
     pub hold_poll_interval_ms: Option<u64>,
     pub default_use_worktree: Option<bool>,
+    pub hold_deadline_ms: Option<Option<u64>>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -157,6 +178,10 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.default_use_worktree,
                 over.default_use_worktree,
             ),
+            hold_deadline_ms: crate::policy::merge_opt(
+                self.hold_deadline_ms,
+                over.hold_deadline_ms,
+            ),
         }
     }
 }
@@ -170,6 +195,9 @@ pub fn baseline() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(2_000),
         default_use_worktree: Some(false),
+        // Restates the built-in default verbatim (no deadline) — baseline's
+        // no-op contract, per EN.11.L Task 3.
+        hold_deadline_ms: Some(None),
     }
 }
 
@@ -177,11 +205,18 @@ pub fn baseline() -> PartialOrchestrationPolicy {
 /// cost of noticing an operator clearance later. Also runs in-place: a
 /// worktree is a fresh checkout plus a second target dir, the expensive
 /// option, not the cheap one.
+///
+/// EN.11.L Task 3: a bounded 15-minute hold deadline — the cost floor this
+/// profile is already tuned for extends to holds too: a lane parked on an
+/// unanswered 3am hold burns a blocking-pool thread and a lane-log slot for
+/// as long as it waits, so "cheap" means failing that loudly and fast
+/// rather than tying it up indefinitely.
 #[must_use]
 pub fn cheap_fast() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(10_000),
         default_use_worktree: Some(false),
+        hold_deadline_ms: Some(Some(15 * 60 * 1_000)),
     }
 }
 
@@ -189,11 +224,17 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
 /// noticed almost immediately, at the cost of more wake-ups. Also
 /// quarantines every ordinary repo into its own worktree, the highest-safety
 /// isolation option.
+///
+/// EN.11.L Task 3: a generous 24-hour hold deadline — long enough to survive
+/// a full off-hours cycle without falsely declaring an operator absent, but
+/// still bounded: "thorough" means giving a run every reasonable chance to
+/// succeed, not literally forever.
 #[must_use]
 pub fn thorough() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(500),
         default_use_worktree: Some(true),
+        hold_deadline_ms: Some(Some(24 * 60 * 60 * 1_000)),
     }
 }
 
@@ -495,6 +536,12 @@ impl Node for OrchestrationRunNode {
             .clone()
             .unwrap_or_else(|| default_flow_runner(repo_registry.clone()));
         let poll_interval = Duration::from_millis(policy.hold_poll_interval_ms);
+        // EN.11.L Task 3: `hold_deadline_ms` resolves through the same four
+        // policy layers as `poll_interval` above, rather than the previous
+        // hardcoded `None` at the `integrate_chain` call site below. `None`
+        // (the built-in default) still means "no deadline" — unchanged
+        // pre-Task-2 behavior.
+        let hold_deadline = policy.hold_deadline_ms.map(Duration::from_millis);
         // The row-3 fallback `execute::resolve_isolation` consults for any
         // repo that isn't one of the two non-negotiable rows. `bool` is
         // `Copy`, so this is captured into the `spawn_blocking` closure by
@@ -547,7 +594,7 @@ impl Node for OrchestrationRunNode {
                 &admission,
                 hold_source.as_ref(),
                 poll_interval,
-                None,
+                hold_deadline,
                 cancellation_token.as_ref(),
                 &move |repo, block_id| resolve_engine(repo, block_id),
                 &repo_registry,
@@ -623,6 +670,7 @@ impl Node for OrchestrationRunNode {
                 "policy": {
                     "hold_poll_interval_ms": policy.hold_poll_interval_ms,
                     "default_use_worktree": policy.default_use_worktree,
+                    "hold_deadline_ms": policy.hold_deadline_ms,
                 },
                 "cancellation": cancellation,
             }),
@@ -741,6 +789,10 @@ mod tests {
     fn builtin_default_is_behavior_stable_baseline() {
         assert_eq!(OrchestrationPolicy::default().hold_poll_interval_ms, 2_000);
         assert!(!OrchestrationPolicy::default().default_use_worktree);
+        // EN.11.L Task 3: the built-in default must preserve the
+        // pre-Task-2 unbounded wait exactly — adding this knob must not
+        // change what an existing run does (CLAUDE.md standing rule 6).
+        assert_eq!(OrchestrationPolicy::default().hold_deadline_ms, None);
     }
 
     #[test]
@@ -748,6 +800,50 @@ mod tests {
         assert_eq!(baseline().default_use_worktree, Some(false));
         assert_eq!(cheap_fast().default_use_worktree, Some(false));
         assert_eq!(thorough().default_use_worktree, Some(true));
+    }
+
+    /// EN.11.L Task 3: every named profile explicitly sets
+    /// `hold_deadline_ms` — a knob absent from the profile bundles is a
+    /// knob nobody will find (standing rule 6).
+    #[test]
+    fn all_three_profiles_set_hold_deadline_ms_explicitly() {
+        // baseline restates the built-in default verbatim: no deadline.
+        assert_eq!(baseline().hold_deadline_ms, Some(None));
+        assert_eq!(cheap_fast().hold_deadline_ms, Some(Some(15 * 60 * 1_000)));
+        assert_eq!(
+            thorough().hold_deadline_ms,
+            Some(Some(24 * 60 * 60 * 1_000))
+        );
+    }
+
+    #[test]
+    fn hold_deadline_ms_resolves_through_the_policy_layers() {
+        let event_override = PartialOrchestrationPolicy {
+            hold_deadline_ms: Some(Some(1_234)),
+            ..Default::default()
+        };
+        let resolved = crate::policy::resolve(
+            OrchestrationPolicy::default(),
+            None,
+            Some(&cheap_fast()),
+            Some(&event_override),
+        );
+        // Event override beats the profile.
+        assert_eq!(resolved.hold_deadline_ms, Some(1_234));
+
+        // With no event override, the profile's value wins.
+        let resolved = crate::policy::resolve(
+            OrchestrationPolicy::default(),
+            None,
+            Some(&cheap_fast()),
+            None,
+        );
+        assert_eq!(resolved.hold_deadline_ms, Some(15 * 60 * 1_000));
+
+        // With nothing set at all, the behavior-stable built-in default
+        // (no deadline) is what resolves.
+        let resolved = crate::policy::resolve(OrchestrationPolicy::default(), None, None, None);
+        assert_eq!(resolved.hold_deadline_ms, None);
     }
 
     #[test]
@@ -810,12 +906,13 @@ mod tests {
         assert_eq!(resolved.hold_poll_interval_ms, 42);
     }
 
-    /// Every named profile only ever changes `hold_poll_interval_ms` and
-    /// `default_use_worktree` — the declared node set ([`registry`]) is
-    /// identical regardless of which profile a run selects, since neither
-    /// policy knob rewires which node runs (CLAUDE.md standing rule 6: "a
-    /// policy knob may change a bound or a tier; it must not change... a
-    /// declared node set").
+    /// Every named profile only ever changes `hold_poll_interval_ms`,
+    /// `default_use_worktree`, and (EN.11.L Task 3) `hold_deadline_ms` —
+    /// the declared node set ([`registry`]) is identical regardless of
+    /// which profile a run selects, since none of these policy knobs
+    /// rewires which node runs (CLAUDE.md standing rule 6: "a policy knob
+    /// may change a bound or a tier; it must not change... a declared node
+    /// set").
     #[test]
     fn every_named_profile_leaves_the_declared_node_set_identical() {
         let default_registry = registry();
@@ -944,6 +1041,13 @@ mod tests {
         let recorded = &out.nodes[NODE_NAME];
         assert_eq!(recorded["steps_integrated"], 2);
         assert_eq!(recorded["policy"]["hold_poll_interval_ms"], 2_000);
+        // EN.11.L Task 3: the resolved `hold_deadline_ms` is stamped into
+        // `ctx.nodes` alongside the other policy values so telemetry can
+        // attribute observed behavior to the setting that caused it.
+        assert_eq!(
+            recorded["policy"]["hold_deadline_ms"],
+            serde_json::Value::Null
+        );
 
         let lane_log = std::fs::read_to_string(
             dir.path()
