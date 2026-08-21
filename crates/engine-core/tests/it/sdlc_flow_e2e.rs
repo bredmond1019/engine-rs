@@ -45,6 +45,7 @@ use engine_core::workflow::Workflow;
 use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
+use engine_core::workflows::sdlc_flow::end_review::{EndReviewNode, EndReviewRouterNode};
 use engine_core::workflows::sdlc_flow::final_validation::FinalValidationNode;
 use engine_core::workflows::sdlc_flow::graph;
 use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
@@ -438,6 +439,8 @@ fn build_workflow_with_docs(
     registry.register(Box::new(
         FinalValidationNode::new().with_runner(test_runner),
     ));
+    registry.register(Box::new(EndReviewNode::new()));
+    registry.register(Box::new(EndReviewRouterNode));
     registry.register(Box::new(WrapUpNode::new().with_runner(git_runner.clone())));
     registry.register(Box::new(CloseBlockNode::new()));
     registry.register(Box::new(PullRequestNode::new().with_runner(git_runner)));

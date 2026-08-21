@@ -48,6 +48,7 @@ use engine_core::workflows::sdlc_flow::aggregate;
 use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
+use engine_core::workflows::sdlc_flow::end_review::{EndReviewNode, EndReviewRouterNode};
 use engine_core::workflows::sdlc_flow::graph;
 use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
 use engine_core::workflows::sdlc_flow::setup::{
@@ -345,6 +346,12 @@ fn build_experiment_workflow(worktree: &Path) -> Workflow {
         },
     ))));
     registry.register(Box::new(IncrementAttemptNode));
+    // `EndReviewNode`/`EndReviewRouterNode`: this suite never selects
+    // `ReviewMode::EndOnly`, so the default pass-through never issues a
+    // model call — registered only so `EndReviewRouterNode`'s router
+    // classification satisfies `WorkflowValidator`'s fan-out check.
+    registry.register(Box::new(EndReviewNode::new()));
+    registry.register(Box::new(EndReviewRouterNode));
     registry.register(Box::new(WrapUpNode::new()));
     registry.register(Box::new(CloseBlockNode::new()));
     registry.register(Box::new(PullRequestNode::new().with_runner(noop_runner())));
