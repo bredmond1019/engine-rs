@@ -27,8 +27,8 @@
 //! Module layout (mirrors `sdlc_flow`'s one-concern-per-file convention):
 //! - `schema` — `SdlcTaskEventSchema`, plus re-exports of the `sdlc_flow`
 //!   state types this workflow reuses as-is.
-//! - `task_triage_router` — `TaskTriageRouterNode` (added by a later task
-//!   in this spec).
+//! - `task_triage_router` — `TaskTriageRouterNode`, the three-arm triage
+//!   fork (port design T6).
 //! - `lean_bookkeep` — `LeanBookkeepNode` (added by a later task in this
 //!   spec).
 //! - `graph` — assembles the declared `WorkflowSchema` + `NodeRegistry`
@@ -36,6 +36,7 @@
 //!   unreachable-but-tested module with no graph yet).
 
 pub mod schema;
+pub mod task_triage_router;
 
 #[allow(unused_imports)]
 pub(crate) use super::{
