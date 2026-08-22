@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-portfolio/base-template/message.schema.json",
+  "title": "Cross-Lane Message Envelope",
+  "description": "One durable, at-least-once-delivered message between lanes, written as a file under queue/inbox/<ts>-<uuid>.json and drained by atomic rename through queue/processing/ to queue/done/. Exists because a run record read 'bastion:BA.21.A is now unblocked on the engine side' only by a human noticing it in prose, never signalled, so the waiting lane idled; because the corpus's one real cross-lane ping (base-template/planning/orchestration-run/autonomous-foundation/notes.md, 2026-08-21) had no typed carrier; because a rendezvous need ('the D62 downstream check against bastion is DEFERRED until this lane is idle') had no primitive to express it; and because the four sweep incidents behind BT.6.A (lease.schema.json) need a durable RELEASE signal, not just a durable claim. This schema deliberately carries NO priority or urgency property: a sender-declared priority inflates to always-urgent and forks a second rubric alongside D43, which owns priority in this fleet. Sibling to lane-agent.schema.json and lease.schema.json. This block ships the envelope shape only; sending, receiving, responding and draining are BT.6.C and BT.6.D.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message_id",
+    "sender",
+    "sent_at",
+    "kind",
+    "subject",
+    "body",
+    "durable_home"
+  ],
+  "properties": {
+    "message_id": {
+      "type": "string",
+      "description": "The uuid half of the message's filename stem (queue/inbox/<ts>-<uuid>.json), duplicated here so a drain can assert exactly-once delivery by identity rather than by path. A filename whose uuid half disagrees with this value is an error.",
+      "minLength": 1
+    },
+    "sender": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The BT.6.A registry key (lane-agent.schema.json's agent_name/repo/lane/roadmap) identifying who sent this message, so a receiver can address a reply without calling ListAgents.",
+      "required": ["agent_name", "repo", "lane", "roadmap"],
+      "properties": {
+        "agent_name": {
+          "type": "string",
+          "description": "The ListAgents nickname the sender was reachable at when this message was sent, matching lane-agent.schema.json's agent_name.",
+          "minLength": 1
+        },
+        "repo": {
+          "type": "string",
+          "description": "Repo slug the sending lane is driving, as registered in brain.toml.",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "lane": {
+          "type": "string",
+          "description": "The sending lane's name/slug, matching the <name> in its lane-<name>.json record.",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "roadmap": {
+          "type": "string",
+          "description": "Slug of the roadmap directory the sending lane runs under.",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        }
+      }
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp with timezone marking when this message was written to the inbox.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "kind": {
+      "type": "string",
+      "description": "Exactly five kinds, each derived from a measured incident, no others: EDGE_RELEASED (a dependency edge is now clear on the sender's side and the receiver's lane may have been idling on it, unsignalled, as in the bastion:BA.21.A incident); FINDING (a cross-lane observation worth relaying, the corpus's one measured real-world case); RENDEZVOUS (a need for two lanes to synchronize before either proceeds, e.g. a downstream check deferred until a sibling lane goes idle); LEASE_RELEASE (one kind covering both taking and releasing a repo lease per lease.schema.json, discriminated in the body — kept as one kind, not two, so the enum stays at exactly five); QUERY (a read-only question that implies no action by the receiver, kept separate so questions are never dressed up as findings). Drain-routing rule (consumed by BT.6.D, stated here next to the kinds it discriminates): RENDEZVOUS and LEASE_RELEASE may trigger an immediate drain on their kind alone, because they concern the tree and are objectively time-critical; FINDING never triggers a drain.",
+      "enum": ["EDGE_RELEASED", "FINDING", "RENDEZVOUS", "LEASE_RELEASE", "QUERY"]
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What this message is about: the subject block or repo, per the block record. block is optional because some messages (e.g. a repo-wide RENDEZVOUS) are not about any single block.",
+      "required": ["repo"],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "description": "Repo slug this message concerns, as registered in brain.toml.",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "block": {
+          "type": "string",
+          "description": "Optional block id this message concerns (e.g. 'BT.6.A'), when the message is about a specific block rather than the repo as a whole.",
+          "minLength": 1
+        }
+      }
+    },
+    "body": {
+      "type": "string",
+      "description": "The message content itself. Free text; for LEASE_RELEASE this is where taking vs releasing is discriminated.",
+      "minLength": 1
+    },
+    "durable_home": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Names where the same item was already, or is about to be, written to disk (lane log, state.json edge, or carryover slug), so that a lost message is never a lost item — the message is a signal about durable state, not the durable state itself.",
+      "required": ["channel", "ref"],
+      "properties": {
+        "channel": {
+          "type": "string",
+          "description": "Which durable-record kind holds this item.",
+          "enum": ["lane-log", "state-edge", "carryover", "run-record"]
+        },
+        "ref": {
+          "type": "string",
+          "description": "A locator within that channel (e.g. a lane-log line id, a state.json edge slug, a carryover slug, or a run-record path) precise enough for a receiver to go find the durable item itself.",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

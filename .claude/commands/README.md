@@ -127,6 +127,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
 | Backlog | `/backlog-ticket`, `/initial-research` |
 | Distribution | `/sync-downstream-harness`, `/sync-all`, `/sync-global-commands`, `/sync-global-skills`, `/sync-brain-skills` |
+| Skills | `.claude/skills/` — authoring skills loaded by name rather than invoked as commands: `commit-in-this-fleet`, `derive-state-safely`, `edit-state-json`, `ping-agent` (send/receive/respond a cross-lane message — verify before acting, always also to disk, only RENDEZVOUS/LEASE_RELEASE interrupt), `report-to-the-operator`, `run-the-gates`, `stop-or-continue`, `write-okf-markdown` |
 
 ### `brain/` — Reference Only
 

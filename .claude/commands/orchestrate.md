@@ -22,12 +22,29 @@ $ARGUMENTS — one of:
   - `--engine <task|flow>` — force one engine for every block, overriding recommendations.
   - `--dry-run` — resolve the chain, generate the specs, print the plan. Run no engines.
   - `--stop-on-fail` (default) / `--continue-on-fail`.
+  - `--stop-after <N>` — stop the chain cleanly after `N` blocks have integrated, releasing the
+    repo lease and registry claim exactly as at ordinary lane close (`begin-orchestration.md`'s
+    lane-close release), then reporting the remaining chain the way an early stop already does.
+    Nothing today stops a lane at all — that gap is why the last run stopped for an ad-hoc reason
+    (a stale global-command snapshot, base-template standing rule 10) instead of a decision. This
+    flag and `--autonomy` below are the two honest, nameable stop conditions: "stop after this many
+    blocks" and "stop when this needs a human." **These are flags, not lane-record fields**, because
+    they describe *this run*, not the lane: `.claude/workflows/lane.schema.json` is validated by
+    mev's `LaneRecord`, which is `deny_unknown_fields` — every field added to it is a cross-repo
+    add-then-install before any lane can read it, the exact cost
+    `base-template:BT.ticket.lane-schema-has-no-home-for-the-briefing` already paid. A per-run
+    knob belongs on the invocation, not on data a sibling lane's tooling must also parse.
+  - `--autonomy <level>` — how far this lane may go without the operator before stopping. Same
+    per-run reasoning as `--stop-after`: it governs this invocation, not the lane, so it is a flag.
+    This command does not define the level vocabulary; take whatever the operator passes and stop
+    at the next point rule 11's "not yours to decide alone" list would otherwise require a call.
 
 If `$ARGUMENTS` is empty, stop and print:
 ```
 Usage: /orchestrate <block-id> [block-id ...]
        /orchestrate <path-to-lane-name.json>
        Flags: --worktree --no-worktree --engine <task|flow> --dry-run --continue-on-fail
+              --stop-after <N> --autonomy <level>
 ```
 
 ---
@@ -140,7 +157,31 @@ Each of these exists because it has already caused a real failure in this fleet.
    Keep it a *log*, not a second `status.md`. If an item turns into real work it becomes a ticket
    and the entry points at it.
 
-10. **Resolve what you can; record the call.** A chain that halts at every ambiguity is worthless,
+10. **Hold the repo lease across a block, never across a boundary; drain the inbox only at the
+    boundary.** `/begin-orchestration` Step 4 takes the repo lease
+    (`<lock_dir>/leases/lease-<repo>.json`) and the registry claim
+    (`<lock_dir>/lane-agents/agent-<agent_name>.json`) before this chain starts. At the block
+    boundary — step 10 below, "Re-check the next block's dependencies, then launch it" — **release
+    the lease, drain this lane's inbox, then re-take the lease before launching the next block**.
+    The boundary and not mid-block, because a lane stopped mid-block loses exactly the context
+    that cannot be written down (base-template standing rule 10) — the lease release and the
+    drain both wait for a point where nothing is in flight.
+
+    **Draining**: this lane's queue is `<lock_dir>/queue/<repo>/<lane>/{inbox,processing,done}`.
+    Use `scripts/check_messages.py`'s `drain_queue()` to move everything from `inbox/` to
+    `processing/`, then `complete_message()` per message once triaged — do not restate the queue
+    layout or receipts ledger here, `BT.6.B` owns both.
+
+    **Interrupt discipline**: only `RENDEZVOUS` and `LEASE_RELEASE` may interrupt a block in
+    flight — both concern the tree and are objectively time-critical. Every other kind
+    (`EDGE_RELEASED`, `FINDING`, `QUERY`) is triaged at the next block boundary, never before. See
+    the `ping-agent` skill for the verify-before-acting rule and the four-verdict response
+    contract (ACK plus ACCEPTED / VERIFIED-FALSE / DEFERRED / DECLINED) — do not restate them here.
+
+    `--stop-after`/`--autonomy` (see Variables) stop the chain at exactly this same boundary — a
+    stop releases the lease and registry claim the same way ordinary lane close does.
+
+11. **Resolve what you can; record the call.** A chain that halts at every ambiguity is worthless,
     and one that halts at none is dangerous. Decide the ordinary things inline — an imperfect spec
     slug, which plan file `--from` means, whether a surfaced defect is in scope, how to resolve a
     merge conflict — state the assumption, and keep the chain moving. **Every such decision goes in
@@ -151,6 +192,14 @@ Each of these exists because it has already caused a real failure in this fleet.
     genuinely disagree about the same behaviour, a `BROKEN DOWNSTREAM` consumer (report, never fix),
     an operator gate, and anything requiring a spec slug you cannot resolve confidently (step 3
     says stop and ask — that still stands).
+
+12. **Urgent-item adoption.** A P0 raised mid-run may jump this chain; the full three-step
+    procedure — file the block, write the ledger row **at adoption time** with `origin_roadmap` set
+    explicitly (Rule 9's ledger contract), then ping the owning lane per the `ping-agent` skill — is
+    defined once, in `/begin-orchestration`'s standing rules; do not restate it here. Priority still
+    comes from `planning/decisions/D43-cross-domain-priority-graph.md`, never from the sender, and
+    this is not licence to reorder the chain for anything below P0. No field was added to
+    `.claude/workflows/lane.schema.json` for it, and no role enum exists in this fleet.
 
 ---
 
@@ -361,7 +410,7 @@ checks downstream *code* consumers; nothing else checks the *corpus*, so this be
 
 Commit the `state.json` and its regenerated surfaces as their own commit, then append **both** the
 lane-log line and this block's `planning/orchestration-run/<roadmap-slug>/notes.md` entries (rule 9
-— including any decision you took under rule 10) and commit those together. **Only then** launch
+— including any decision you took under rule 11) and commit those together. **Only then** launch
 the next engine.
 
 > **`planning/state.json` is written with `ensure_ascii=False`.** If you edit it with a script,
@@ -425,7 +474,14 @@ isolation (no other lane's cargo command in flight) before reporting it as **BRO
 as a clean pass.
 
 ### 10. Re-check the next block's dependencies, then launch it
-Cheap, and it catches anything that changed outside the chain. Then return to step 6.
+Cheap, and it catches anything that changed outside the chain.
+
+**This is the block boundary — release the lease, drain the inbox, re-take the lease** (rule 10):
+release `<lock_dir>/leases/lease-<repo>.json`, drain `<lock_dir>/queue/<repo>/<lane>/` via
+`drain_queue()`/`complete_message()`, then re-take the lease before launching the next engine. If
+`--stop-after` has been reached, or `--autonomy` says this is a stopping point, release the lease
+and registry claim as at lane close and stop here instead of continuing to step 6. Otherwise
+return to step 6.
 
 ### 11. Repeat until the chain is done or stopped.
 

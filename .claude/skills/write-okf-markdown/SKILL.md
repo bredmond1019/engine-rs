@@ -1,6 +1,6 @@
 ---
 name: write-okf-markdown
-description: How to create or edit a markdown file in this brain without red-gating the fleet — whether the file needs OKF frontmatter at all, the four traps that break YAML parsing, the index.md row Standing Rule 7 requires, and the cross-repo `related:` prefix. Use BEFORE writing any new `.md` file anywhere in agentic-portfolio or a sub-repo, before adding frontmatter to an existing one, and when `bastion validate-brain` reports E_STRUCT_ORPHAN_FILE, E_GRAPH_DANGLING_RELATED, W_GRAPH_ISOLATED_NODE, or "mapping values are not allowed in this context".
+description: How to create or edit a markdown file in this brain without red-gating the fleet — whether the file needs OKF frontmatter at all, the four traps that break YAML parsing, the index.md row Standing Rule 7 requires, the cross-repo `related:` prefix, and why a relative markdown link that climbs out of `planning/` resolves against the vault instead of the repo. Use BEFORE writing any new `.md` file anywhere in agentic-portfolio or a sub-repo, before adding frontmatter to an existing one, before linking from a planning doc to anything outside `planning/`, and when `bastion validate-brain` reports E_STRUCT_ORPHAN_FILE, E_GRAPH_DANGLING_RELATED, W_GRAPH_ISOLATED_NODE, E_LINK_DEAD_MARKDOWN, or "mapping values are not allowed in this context".
 allowed-tools: Bash(bastion:*) Bash(mev:*) Bash(python3:*) Bash(grep:*) Bash(ls:*) Bash(test:*)
 ---
 
@@ -155,6 +155,50 @@ directory's** `index.md`, and every index row must point at a file that exists.
 
 ---
 
+### Linking out of `planning/` — the symlink trap
+
+**Never write a relative markdown link that climbs above `planning/`.** Every `planning/` is a
+symlink into the brain's `_planning/` vault, and `validate-brain --links` resolves link targets
+**physically**, through the symlink — so `..` walks out of the *vault*, not out of the repo.
+
+```
+learn-ai/planning/decisions/D12.md      # where you are reading the file
+_planning/learn-ai/decisions/D12.md     # where it physically lives
+
+[`docs/voice.md`](../../docs/voice.md)  # you meant  learn-ai/docs/voice.md
+                                        # it resolves _planning/docs/voice.md  -> E_LINK_DEAD_MARKDOWN
+```
+
+The error message makes this genuinely hard to read, because it prints the *lexical* path it was
+given while having resolved the *physical* one:
+
+```
+error [E_LINK_DEAD_MARKDOWN] learn-ai/planning/decisions/D12-....md
+  — dead markdown link: '../../docs/voice.md' does not exist
+    (resolved: '/Users/brandon/.../learn-ai/planning/decisions/../../docs/voice.md')
+```
+
+Collapse that printed path by hand and it reads `learn-ai/docs/voice.md`, which **does** exist — so
+the natural conclusion is that the checker is broken. It is not. Trust the error, not the path in it.
+
+**What to write instead**, in order of preference:
+
+| Target | Write |
+|---|---|
+| Another file **inside** `planning/` | A normal relative link — `[notes](../voice-fingerprint/notes.md)`. These are fine; both ends are in the vault. |
+| A file **outside** `planning/` (`docs/`, `src/`, `content/`) | A **bare path in backticks**, not a link — `` `learn-ai/docs/voice.md` `` |
+| A file in another repo | Repo-qualified bare path — `` `core/mev/src/learn_ai/voice_tells.rs` `` |
+| A `related:` frontmatter edge | A `doc_id`, cross-repo-prefixed if needed — that layer is symlink-safe (see above) |
+
+A bare path costs the reader one copy-paste and costs the corpus nothing. A `file://` absolute link
+also passes, but it hardcodes one machine's home directory — use it only where the surrounding file
+already does.
+
+**Say why, in the file.** When you drop a link to a bare path for this reason, add a one-line note —
+otherwise the next author "fixes" your path back into a link and re-breaks the gate.
+
+---
+
 ## Step 4 — Validate
 
 **One flag per invocation.** `validate-brain`'s flags do **not** compose — the dispatch is an
@@ -232,7 +276,8 @@ separately, in that order, and re-run both after each fix.
 - [ ] Controlled fields (`layer` / `project` / `status`) use real vocabulary values — check the schema doc
 - [ ] Cross-scope `related:` targets carry a `<scope>:` prefix
 - [ ] A row exists in the directory's `index.md`
-- [ ] `--structure` and `--graph` both run clean
+- [ ] No relative markdown link climbs **out of** `planning/` — bare backticked path instead
+- [ ] `--structure`, `--graph` and `--links` all run clean
 
 `hooks/pre-commit` catches trap #1 at commit time — but only if hooks are enabled
 (`git config core.hooksPath hooks`), and it **degrades silently to a pass** when `python3` or PyYAML is
