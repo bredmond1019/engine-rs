@@ -1681,7 +1681,10 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode::new().process(ctx).await.expect("first restart");
+        LoadTaskStateNode::new()
+            .process(ctx)
+            .await
+            .expect("first restart");
 
         // Re-seed a state file carrying the SAME stamped run_id, then
         // restart again — the discriminator collides.
@@ -1713,7 +1716,10 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode::new().process(ctx).await.expect("restart");
+        LoadTaskStateNode::new()
+            .process(ctx)
+            .await
+            .expect("restart");
 
         let names = archived_names(&sdlc_dir);
         assert_eq!(names.len(), 1, "exactly one archive, got {names:?}");
