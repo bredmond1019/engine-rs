@@ -107,6 +107,7 @@ pub trait TerminalDriver: Send + Sync {
 pub struct TmuxDriver {
     timeout: Duration,
     capture_cache: CaptureCache,
+    socket: Option<String>,
 }
 
 impl Default for TmuxDriver {
@@ -114,6 +115,7 @@ impl Default for TmuxDriver {
         Self {
             timeout: DEFAULT_TMUX_TIMEOUT,
             capture_cache: CaptureCache::new(),
+            socket: None,
         }
     }
 }
@@ -127,6 +129,7 @@ impl TmuxDriver {
         Self {
             timeout,
             capture_cache: CaptureCache::new(),
+            socket: None,
         }
     }
 
@@ -138,59 +141,110 @@ impl TmuxDriver {
         self.capture_cache = CaptureCache::with_ttl(ttl);
         self
     }
+
+    /// Build a driver whose every tmux invocation targets a dedicated
+    /// `-L <name>` socket instead of the default server — how a test suite
+    /// (or any caller that must not touch the operator's default tmux
+    /// server) gets a private tmux server that only it can see. Production
+    /// argv is unchanged unless this is called: [`Self::scoped`] returns
+    /// its input untouched when `socket` is `None`.
+    #[must_use]
+    pub fn with_socket(mut self, socket: impl Into<String>) -> Self {
+        self.socket = Some(socket.into());
+        self
+    }
+
+    /// Insert `-L <socket>` immediately after `args[0]` (always the literal
+    /// `"tmux"`) and before the subcommand, or return `args` unchanged when
+    /// no socket was configured. `tmux -L <name> <subcommand> ...` is the
+    /// only argv position where `-L` is honored; after the subcommand it is
+    /// a different (and wrong) thing.
+    fn scoped(&self, args: Vec<String>) -> Vec<String> {
+        match &self.socket {
+            None => args,
+            Some(socket) => {
+                let mut scoped = Vec::with_capacity(args.len() + 2);
+                let mut iter = args.into_iter();
+                if let Some(first) = iter.next() {
+                    scoped.push(first);
+                }
+                scoped.push("-L".to_string());
+                scoped.push(socket.clone());
+                scoped.extend(iter);
+                scoped
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl TerminalDriver for TmuxDriver {
     async fn list_sessions(&self) -> Result<String, TmuxError> {
-        tmux::run_tmux_async(&list_sessions_args(), self.timeout).await
+        tmux::run_tmux_async(&self.scoped(list_sessions_args()), self.timeout).await
     }
 
     async fn capture_pane(&self, session_name: &str) -> Result<String, TmuxError> {
         let timeout = self.timeout;
+        let args = self.scoped(capture_pane_args(session_name));
         self.capture_cache
             .get_or_capture(session_name, || async move {
-                tmux::run_tmux_async(&capture_pane_args(session_name), timeout).await
+                tmux::run_tmux_async(&args, timeout).await
             })
             .await
     }
 
     async fn new_session(&self, session_name: &str, dir: Option<&str>) -> Result<(), TmuxError> {
-        tmux::run_tmux_async(&new_session_args(session_name, dir), self.timeout).await?;
+        tmux::run_tmux_async(
+            &self.scoped(new_session_args(session_name, dir)),
+            self.timeout,
+        )
+        .await?;
         Ok(())
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), TmuxError> {
-        tmux::run_tmux_async(&kill_session_args(session_name), self.timeout).await?;
+        tmux::run_tmux_async(&self.scoped(kill_session_args(session_name)), self.timeout).await?;
         Ok(())
     }
 
     async fn send_literal(&self, session_name: &str, keys: &str) -> Result<(), TmuxError> {
-        tmux::run_tmux_async(&send_keys_args(session_name, keys), self.timeout).await?;
+        tmux::run_tmux_async(
+            &self.scoped(send_keys_args(session_name, keys)),
+            self.timeout,
+        )
+        .await?;
         Ok(())
     }
 
     async fn send_enter(&self, session_name: &str) -> Result<(), TmuxError> {
-        tmux::run_tmux_async(&send_enter_args(session_name), self.timeout).await?;
+        tmux::run_tmux_async(&self.scoped(send_enter_args(session_name)), self.timeout).await?;
         Ok(())
     }
 
     async fn send_named_key(&self, session_name: &str, key: &str) -> Result<(), TmuxError> {
-        tmux::run_tmux_async(&send_named_key_args(session_name, key), self.timeout).await?;
+        tmux::run_tmux_async(
+            &self.scoped(send_named_key_args(session_name, key)),
+            self.timeout,
+        )
+        .await?;
         Ok(())
     }
 
     async fn set_option(&self, name: &str, value: &str) -> Result<(), TmuxError> {
-        tmux::run_tmux_async(&set_option_args(name, value), self.timeout).await?;
+        tmux::run_tmux_async(&self.scoped(set_option_args(name, value)), self.timeout).await?;
         Ok(())
     }
 
     async fn show_option(&self, name: &str) -> Result<String, TmuxError> {
-        tmux::run_tmux_async(&show_option_args(name), self.timeout).await
+        tmux::run_tmux_async(&self.scoped(show_option_args(name)), self.timeout).await
     }
 
     async fn display_message(&self, session_name: &str, format: &str) -> Result<String, TmuxError> {
-        tmux::run_tmux_async(&display_message_args(session_name, format), self.timeout).await
+        tmux::run_tmux_async(
+            &self.scoped(display_message_args(session_name, format)),
+            self.timeout,
+        )
+        .await
     }
 }
 
@@ -663,6 +717,33 @@ mod tests {
     /// TerminalDriver>`, matching how Phase-2 nodes will hold it.
     fn as_trait_object(stub: StubTerminalDriver) -> Arc<dyn TerminalDriver> {
         Arc::new(stub)
+    }
+
+    #[test]
+    fn new_and_default_have_no_socket() {
+        assert_eq!(TmuxDriver::new(DEFAULT_TMUX_TIMEOUT).socket, None);
+        assert_eq!(TmuxDriver::default().socket, None);
+    }
+
+    #[test]
+    fn scoped_is_identity_when_no_socket_is_configured() {
+        let driver = TmuxDriver::new(DEFAULT_TMUX_TIMEOUT);
+        let args = list_sessions_args();
+        assert_eq!(driver.scoped(args.clone()), args);
+    }
+
+    #[test]
+    fn scoped_inserts_dash_l_and_socket_name_right_after_tmux() {
+        let driver = TmuxDriver::new(DEFAULT_TMUX_TIMEOUT).with_socket("my-sock");
+        let args = new_session_args("proj-abc", None);
+        let scoped = driver.scoped(args.clone());
+
+        assert_eq!(scoped[0], "tmux");
+        assert_eq!(scoped[1], "-L");
+        assert_eq!(scoped[2], "my-sock");
+        // The subcommand and everything after it is shifted right by two,
+        // otherwise unchanged.
+        assert_eq!(&scoped[3..], &args[1..]);
     }
 
     #[tokio::test]
