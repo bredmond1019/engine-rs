@@ -16,6 +16,23 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-22]
+
+`EN.11.N` — SDLC_TASK graph and schema — done via `/sdlc-flow` on branch `EN.11.N-flow`, PASS review, all 7 tasks passed. Ported base-template's `sdlc-task.js` into `crates/engine-core/src/workflows/sdlc_task/`: the module root, event schema, and `TerminalSignal::ReconcileFailed` with its `derive_committed_status` arm plus a `CloseBlockNode` skip on `reconcile_failed` per D56 (task 1); `TaskTriageRouterNode` — the three-arm deterministic fork (PASS → `UpdateTaskStatusNode`, RETRYABLE-under-budget → `IncrementAttemptNode`, MAJOR_BAIL/exhausted/unknown → `LeanBookkeepNode`), fail-closed on missing upstream results (task 2); `SpecExistsRouterNode`/`LoadTaskStateNode` promoted to real structs with `with_state_filename` builders and `SetupWorktreeNode` gained `with_branch_prefix`, so SDLC_TASK reuses SDLC_FLOW's setup nodes under its own filename/branch prefix without forking them (task 3); the D56 reconcile scope (`select_reconcile_checks`, `FinalValidationNode::with_scope`) verified already complete from a prior pass (task 4); `LeanBookkeepNode` — the lean close-out, widening `wrap_up`'s durable state helpers to `pub(crate)` for reuse, deriving bailed/reconcile_failed/done status, enforcing the fullRun guard from `event.task_range`, with `CloseBlockNode::with_state_source` reading its stamp instead of forking a second closer (task 5); `graph.rs` assembling `WORKFLOW_TYPE`/`schema()`/`registry()`/`registry_for_policy()`/`workflow()` into a `Workflow::new_validated` graph — the first point SDLC_TASK validates end to end — verified already complete from an earlier interrupted attempt (task 6); `docs/sdlc-task-workflow.md` added with its `docs/index.md` row (task 7). Full validation gate green throughout (fmt, clippy `-D warnings`, `nextest --workspace --all-features`, release build). Closes `EN.11.N` — `EngineKind::Task` is now representable AND runnable — unblocking `EN.11.O` (SDLC_TASK policy and profiles) and contributing to `EN.11.P` (task blocks are orchestratable). Next: `EN.11.O`.
+
+```
+b1666cf feat: implement EN.11.N-task7
+6e82871 style: cargo fmt after the EN.11.N bail
+f77dc68 feat: implement EN.11.N-task6
+b85b585 feat: implement EN.11.N-task5
+8ed7cae chore(harness): pull base-template dfbb9a6 — state skills cover mev's other write verbs
+0efb146 feat: implement EN.11.N-task4
+f43b816 feat: implement EN.11.N-task3
+d56787b feat: implement EN.11.N-task2
+```
+
+---
+
 ## [run: 2026-08-21]
 
 ### Structured logging — one greppable line per node, with run and campaign ids — closes `EN.11.I`
