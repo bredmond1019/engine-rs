@@ -174,4 +174,26 @@ mod tests {
         // Proves the force-push rule doesn't over-match a plain push.
         assert_allowed("git push origin main");
     }
+
+    #[test]
+    fn denied_from_its_new_home_via_the_full_crate_path() {
+        // EN.11.M task 3: the floor moved from `workflows::sdlc_flow` to
+        // `crate::policy::command_floor` in task 1. A move that silently
+        // stopped enforcing would still compile and still show green in
+        // every other test here, because they all reach `evaluate_command`
+        // through the local `use super::*;` import rather than the fully
+        // qualified path an external caller (e.g. `nodes/terminal/send.rs`
+        // or `workflows::default_command_runner`) actually uses. Reaching
+        // through the crate-root path proves the floor is really live at
+        // its new public address, not merely present in this module.
+        match crate::policy::command_floor::evaluate_command("git push --force") {
+            CommandDecision::Deny { reason, matched } => {
+                assert_eq!(reason, "force push");
+                assert!(!matched.is_empty());
+            }
+            CommandDecision::Allow => {
+                panic!("expected `git push --force` denied via crate::policy::command_floor, got Allow")
+            }
+        }
+    }
 }
