@@ -37,6 +37,8 @@ use super::schema::{
     SDLCState, TerminalSignal,
 };
 use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
+#[cfg(test)]
+use super::DEFAULT_STATE_FILENAME;
 use super::{commit_all, get_result, put_result, CommandRunner};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
@@ -418,11 +420,18 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
     None
 }
 
-/// `planning/{spec_slug}/sdlc/sdlc-flow-state.json` inside `worktree` — the
+/// `planning/{spec_slug}/sdlc/{state_filename}` inside `worktree` — the
 /// D31-committed path (see `D10-committed-state-path-schema-alignment.md`)
 /// `task_loop::SaveStateNode` also writes to. Creates the `sdlc/`
-/// intermediate directory if needed.
-fn state_path_for(worktree: &str, spec_slug: &str) -> Result<std::path::PathBuf, NodeError> {
+/// intermediate directory if needed. `state_filename` is
+/// [`super::DEFAULT_STATE_FILENAME`] for every existing caller (`WrapUpNode`
+/// defaults its stored filename to that const), so behaviour is
+/// byte-identical after `EN.11.M` task 4 parameterized this site.
+fn state_path_for(
+    worktree: &str,
+    spec_slug: &str,
+    state_filename: &str,
+) -> Result<std::path::PathBuf, NodeError> {
     let state_dir = std::path::Path::new(worktree)
         .join("planning")
         .join(spec_slug)
@@ -430,7 +439,7 @@ fn state_path_for(worktree: &str, spec_slug: &str) -> Result<std::path::PathBuf,
     std::fs::create_dir_all(&state_dir).map_err(|err| {
         NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
     })?;
-    Ok(state_dir.join("sdlc-flow-state.json"))
+    Ok(state_dir.join(state_filename))
 }
 
 /// Persist `state` (already stamped with `policy`/`outcomes`) to
@@ -505,8 +514,18 @@ fn persist_state(
 /// `tasks.md` Notes for the rationale: this runs from `engine-serve`'s
 /// post-walk cleanup, outside any node, where there is no `CommandRunner`
 /// seam).
+///
+/// `state_filename` is a parameter rather than a stored field (`EN.11.M`
+/// task 4) because this is a free function called from outside any node
+/// instance — `engine-serve`'s post-walk cleanup has no `WrapUpNode` to
+/// carry a builder-set filename on. Every existing caller passes
+/// [`super::DEFAULT_STATE_FILENAME`], so behaviour is byte-identical.
 #[must_use]
-pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<String> {
+pub fn write_terminal_blocked_state(
+    ctx: &TaskContext,
+    reason: &str,
+    state_filename: &str,
+) -> Option<String> {
     let worktree = worktree_path(ctx)?;
     let state = latest_state(ctx).ok()?;
     let spec_slug = state.spec_slug.clone();
@@ -518,7 +537,7 @@ pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<S
     if !state_dir.is_dir() {
         return None;
     }
-    let state_path = state_dir.join("sdlc-flow-state.json");
+    let state_path = state_dir.join(state_filename);
 
     let run_meta = build_run_meta(ctx, &worktree, &state_path);
     let review = committed_review(ctx);
@@ -663,6 +682,7 @@ fn finalize_outcomes(
 pub struct WrapUpNode {
     clock: ClockFn,
     runner: CommandRunner,
+    state_filename: &'static str,
 }
 
 impl WrapUpNode {
@@ -671,6 +691,7 @@ impl WrapUpNode {
         Self {
             clock: default_clock(),
             runner: super::default_command_runner(),
+            state_filename: super::DEFAULT_STATE_FILENAME,
         }
     }
 
@@ -688,6 +709,16 @@ impl WrapUpNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the state filename this node reads/writes. Defaults to
+    /// [`super::DEFAULT_STATE_FILENAME`]; `EN.11.M` task 4 adds this so a
+    /// second engine can reuse the node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
         self
     }
 }
@@ -829,7 +860,7 @@ impl Node for WrapUpNode {
         // real run, so there is nothing to persist to.
         let saved_to = match worktree_path(&ctx) {
             Some(worktree) => {
-                let state_path = state_path_for(&worktree, spec_slug)?;
+                let state_path = state_path_for(&worktree, spec_slug, self.state_filename)?;
                 let run_meta = build_run_meta(&ctx, &worktree, &state_path);
                 let review = committed_review(&ctx);
                 let docs = committed_docs(&ctx);
@@ -1253,8 +1284,12 @@ mod tests {
             serde_json::to_value(&incremented_state).unwrap(),
         );
 
-        let written_path = write_terminal_blocked_state(&ctx, "MAJOR_BAIL: too many retries")
-            .expect("should write a terminal state");
+        let written_path = write_terminal_blocked_state(
+            &ctx,
+            "MAJOR_BAIL: too many retries",
+            DEFAULT_STATE_FILENAME,
+        )
+        .expect("should write a terminal state");
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(written_path).unwrap()).unwrap();
 
@@ -2347,8 +2382,12 @@ mod tests {
             json!({ "worktree_path": worktree.to_string_lossy() }),
         );
 
-        let saved_to = write_terminal_blocked_state(&ctx, "node ImplementTaskNode failed: boom")
-            .expect("worktree + loaded state present, parent dir exists");
+        let saved_to = write_terminal_blocked_state(
+            &ctx,
+            "node ImplementTaskNode failed: boom",
+            DEFAULT_STATE_FILENAME,
+        )
+        .expect("worktree + loaded state present, parent dir exists");
 
         let on_disk = std::fs::read_to_string(&saved_to).unwrap();
         let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
@@ -2369,7 +2408,10 @@ mod tests {
         let state = SDLCState::new("EN.6.J-terminal-fixture");
         let ctx = ctx_with_state(&state);
 
-        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+        assert_eq!(
+            write_terminal_blocked_state(&ctx, "boom", DEFAULT_STATE_FILENAME),
+            None
+        );
     }
 
     #[test]
@@ -2387,7 +2429,10 @@ mod tests {
             json!({ "worktree_path": worktree.to_string_lossy() }),
         );
 
-        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+        assert_eq!(
+            write_terminal_blocked_state(&ctx, "boom", DEFAULT_STATE_FILENAME),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }
@@ -2406,7 +2451,10 @@ mod tests {
             json!({ "worktree_path": worktree.to_string_lossy() }),
         );
 
-        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+        assert_eq!(
+            write_terminal_blocked_state(&ctx, "boom", DEFAULT_STATE_FILENAME),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

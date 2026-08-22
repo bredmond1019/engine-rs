@@ -23,7 +23,10 @@ use engine_contract::TaskContext;
 use crate::node::{Node, NodeError};
 use crate::policy::emit_state::{CommandOutputLike, EmitStateNode as GenericEmitStateNode};
 
-use super::{commit_all, default_command_runner, get_result, CommandOutput, CommandRunner};
+use super::{
+    commit_all, default_command_runner, get_result, CommandOutput, CommandRunner,
+    DEFAULT_STATE_FILENAME,
+};
 
 use serde_json::json;
 
@@ -100,7 +103,7 @@ fn spec_slug(ctx: &TaskContext) -> Option<String> {
 ///   run — its `pr_url` is `null` and must stay `null` on disk);
 /// - `ctx` has no `SetupWorktreeNode`/`spec_slug`, or the state file does
 ///   not exist at the derived path.
-fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
+fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner, state_filename: &str) {
     let Some(pr_result) = get_result(ctx, "PullRequestNode") else {
         return;
     };
@@ -125,7 +128,7 @@ fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
         .join("planning")
         .join(&slug)
         .join("sdlc")
-        .join("sdlc-flow-state.json");
+        .join(state_filename);
     if !state_path.is_file() {
         return;
     }
@@ -181,7 +184,7 @@ fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
 ///   `EmitStateNode` unit test, or a graph shape without that node);
 /// - `ctx` has no `SetupWorktreeNode`/`spec_slug`, or the state file does
 ///   not exist at the derived path.
-fn patch_close_block_into_state(ctx: &TaskContext, runner: &CommandRunner) {
+fn patch_close_block_into_state(ctx: &TaskContext, runner: &CommandRunner, state_filename: &str) {
     let Some(close_result) = get_result(ctx, "CloseBlockNode") else {
         return;
     };
@@ -204,7 +207,7 @@ fn patch_close_block_into_state(ctx: &TaskContext, runner: &CommandRunner) {
         .join("planning")
         .join(&slug)
         .join("sdlc")
-        .join("sdlc-flow-state.json");
+        .join(state_filename);
     if !state_path.is_file() {
         return;
     }
@@ -234,6 +237,7 @@ fn patch_close_block_into_state(ctx: &TaskContext, runner: &CommandRunner) {
 /// Deterministic node: runs `mev emit-state --write` in the worktree.
 pub struct EmitStateNode {
     runner: CommandRunner,
+    state_filename: &'static str,
 }
 
 impl EmitStateNode {
@@ -241,6 +245,7 @@ impl EmitStateNode {
     pub fn new() -> Self {
         Self {
             runner: default_command_runner(),
+            state_filename: DEFAULT_STATE_FILENAME,
         }
     }
 
@@ -249,6 +254,16 @@ impl EmitStateNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the state filename this node's patch helpers read/write.
+    /// Defaults to [`DEFAULT_STATE_FILENAME`]; `EN.11.M` task 4 adds
+    /// this so a second engine can reuse the node under its own filename
+    /// without forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
         self
     }
 }
@@ -273,13 +288,13 @@ impl Node for EmitStateNode {
         // outcome into the already-committed state file's
         // `state_write_validated`/`state_write_rejected` keys, best-effort —
         // never fails the node, same rationale as the PR patch below.
-        patch_close_block_into_state(&ctx, &self.runner);
+        patch_close_block_into_state(&ctx, &self.runner, self.state_filename);
 
         // EN.3.G task 6: patch PullRequestNode's result into the already-
         // committed state file's `pr` block, best-effort — never fails the
         // node (the flow's terminal state is already written; this is
         // enrichment, not a required step).
-        patch_pr_into_state(&ctx, &self.runner);
+        patch_pr_into_state(&ctx, &self.runner, self.state_filename);
 
         Ok(ctx)
     }
@@ -444,7 +459,7 @@ mod tests {
             spec_slug,
             json!({ "pr_url": "https://github.com/o/r/pull/42", "skipped": false }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         let after_value: serde_json::Value = serde_json::from_str(&after).unwrap();
@@ -476,7 +491,7 @@ mod tests {
             spec_slug,
             json!({ "pr_url": null, "skipped": true }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         assert_eq!(before, after);
@@ -500,7 +515,7 @@ mod tests {
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": worktree.to_str().unwrap() }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         assert_eq!(before, after);
@@ -518,7 +533,7 @@ mod tests {
             spec_slug,
             json!({ "pr_url": "https://github.com/o/r/pull/not-a-number", "skipped": false }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let state_path = worktree
             .join("planning")
@@ -573,7 +588,7 @@ mod tests {
                 "state_write_rejected": false,
             }),
         );
-        patch_close_block_into_state(&ctx, &noop_runner());
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         let after_value: serde_json::Value = serde_json::from_str(&after).unwrap();
@@ -612,7 +627,7 @@ mod tests {
                 "state_write_rejected": true,
             }),
         );
-        patch_close_block_into_state(&ctx, &noop_runner());
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
@@ -646,7 +661,7 @@ mod tests {
                 "state_write_rejected": false,
             }),
         );
-        patch_close_block_into_state(&ctx, &noop_runner());
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
@@ -672,7 +687,7 @@ mod tests {
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": worktree.to_str().unwrap() }),
         );
-        patch_close_block_into_state(&ctx, &noop_runner());
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         assert_eq!(before, after);

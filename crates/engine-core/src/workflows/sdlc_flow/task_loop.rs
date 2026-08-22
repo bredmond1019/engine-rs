@@ -2549,6 +2549,7 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMe
 /// `to_committed_state_json` with `None` for all four.
 pub struct SaveStateNode {
     runner: CommandRunner,
+    state_filename: &'static str,
 }
 
 impl SaveStateNode {
@@ -2556,6 +2557,7 @@ impl SaveStateNode {
     pub fn new() -> Self {
         Self {
             runner: super::default_command_runner(),
+            state_filename: super::DEFAULT_STATE_FILENAME,
         }
     }
 
@@ -2564,6 +2566,16 @@ impl SaveStateNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the state filename this node writes to. Defaults to
+    /// [`super::DEFAULT_STATE_FILENAME`]; `EN.11.M` task 4 adds this so a
+    /// second engine can reuse the node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
         self
     }
 }
@@ -2587,7 +2599,7 @@ impl Node for SaveStateNode {
         std::fs::create_dir_all(&state_dir).map_err(|err| {
             NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
         })?;
-        let state_path = state_dir.join("sdlc-flow-state.json");
+        let state_path = state_dir.join(self.state_filename);
         let run_meta = build_run_meta(&ctx, &worktree, &state_path);
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         let json = serde_json::to_string_pretty(&committed)

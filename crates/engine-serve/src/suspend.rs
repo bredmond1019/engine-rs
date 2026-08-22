@@ -542,7 +542,9 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         if !suspended && workflow_type == engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE {
             if let Some(reason) = &failure_reason {
                 let _ = engine_core::workflows::sdlc_flow::wrap_up::write_terminal_blocked_state(
-                    &final_ctx, reason,
+                    &final_ctx,
+                    reason,
+                    engine_core::workflows::sdlc_flow::DEFAULT_STATE_FILENAME,
                 );
             }
         }

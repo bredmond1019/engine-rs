@@ -30,7 +30,7 @@ use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
 use super::task_loop::{apply_policy, resolved_policy, worktree_path, Stage};
-use super::{get_result, parse_structured_or_fenced, put_result};
+use super::{get_result, parse_structured_or_fenced, put_result, DEFAULT_STATE_FILENAME};
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
 /// downstream node reads one resolved value rather than re-deriving it.
@@ -543,7 +543,7 @@ impl Router for SpecExistsRouterNode {
     fn route(&self, ctx: &TaskContext) -> Option<String> {
         let spec_slug = ctx.event.get("spec_slug")?.as_str()?;
         let dir = spec_dir(ctx, spec_slug);
-        if dir.join("sdlc").join("sdlc-flow-state.json").exists() || dir.join("tasks.json").exists()
+        if dir.join("sdlc").join(DEFAULT_STATE_FILENAME).exists() || dir.join("tasks.json").exists()
         {
             Some("LoadTaskStateNode".to_string())
         } else {
@@ -651,7 +651,7 @@ fn archive_superseded_state(
 ) -> Result<PathBuf, NodeError> {
     let dir = state_path.parent().unwrap_or_else(|| Path::new("."));
     let discriminator = superseded_discriminator(old_state);
-    let base = format!("sdlc-flow-state.json.superseded-{discriminator}");
+    let base = format!("{DEFAULT_STATE_FILENAME}.superseded-{discriminator}");
 
     let mut candidate = dir.join(format!("{base}.bak"));
     let mut suffix = 2u32;
@@ -683,7 +683,7 @@ impl Node for LoadTaskStateNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let event = parse_event(&ctx)?;
         let dir = spec_dir(&ctx, &event.spec_slug);
-        let state_path = dir.join("sdlc").join("sdlc-flow-state.json");
+        let state_path = dir.join("sdlc").join(DEFAULT_STATE_FILENAME);
         let tasks_path = dir.join("tasks.json");
 
         // Parse the existing state (if any) up front: both the "resume it"
@@ -828,7 +828,7 @@ fn generated_tasks_schema() -> serde_json::Value {
 /// Mirrors the Python `_gather_context` helper. Missing/unreadable entries
 /// are skipped rather than failing the whole gather.
 fn gather_context(dir: &Path) -> String {
-    let excluded = ["tasks.md", "tasks.json", "sdlc-flow-state.json"];
+    let excluded = ["tasks.md", "tasks.json", DEFAULT_STATE_FILENAME];
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()

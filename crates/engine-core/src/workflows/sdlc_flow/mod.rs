@@ -70,3 +70,17 @@ pub(crate) use super::{commit_all, is_noop_commit};
 /// depending on this module. Re-exported here so every existing
 /// `super::`/`sdlc_flow::` import site keeps resolving unchanged.
 pub use super::{default_command_runner, CommandOutput, CommandRunner};
+
+/// The bare filename every SDLC_FLOW state writer/reader resolves through.
+///
+/// `EN.11.M` task 4 parameterizes the nine sites across `task_loop.rs` /
+/// `wrap_up.rs` / `emit_state.rs` / `setup.rs` that previously hardcoded the
+/// literal `"sdlc-flow-state.json"` behind this one const, so a forked
+/// writer (the defect class this repo has already paid for once) cannot
+/// recur. The three WRITER nodes (`SaveStateNode`, `WrapUpNode`,
+/// `EmitStateNode`) expose a `with_state_filename(&'static str)` builder
+/// that defaults to this value; `SpecExistsRouterNode` and
+/// `LoadTaskStateNode` read the const directly and stay unit structs
+/// (converting them to carry their own field is `EN.11.N`'s, per the scope
+/// call recorded in this block's amendments).
+pub const DEFAULT_STATE_FILENAME: &str = "sdlc-flow-state.json";
