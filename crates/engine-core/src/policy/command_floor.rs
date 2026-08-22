@@ -1,10 +1,14 @@
-//! The non-overridable command-policy safety floor for SDLC-run subprocess
-//! execution (`ticket-sdlc-command-policy-floor`, task 1).
+//! `engine-core::policy::command_floor` — the non-overridable command-policy
+//! safety floor for SDLC-run subprocess execution
+//! (`ticket-sdlc-command-policy-floor`, task 1). Lifted out of
+//! `workflows::sdlc_flow` (`EN.11.M` task 1) so a second engine can reach it
+//! without importing `sdlc_flow`.
 //!
 //! Ports qm's `ORG_FLOOR_RULES` (`example-repo/qm/src/policy/command-policy.ts`)
 //! as a plain, case-insensitive regex denylist over the joined
 //! `program`+`args` (or raw `sh -c` payload) string — the literal command
-//! that would otherwise reach [`super::default_command_runner`] unchecked.
+//! that would otherwise reach [`crate::workflows::default_command_runner`]
+//! unchecked.
 //!
 //! Deliberately narrower than the qm source: no de-obfuscation normalizer
 //! (`scannableCommand`/`scanShell`) and no `require_approval` tier — every

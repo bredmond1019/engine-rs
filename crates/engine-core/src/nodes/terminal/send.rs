@@ -1,7 +1,7 @@
 //! `TerminalSendNode` — the guarded, floor-checked terminal write node
 //! (`EN.9.E` task 2).
 //!
-//! One send goes through, in order: `super::super::sdlc_flow::command_floor`
+//! One send goes through, in order: `crate::policy::command_floor`
 //! (a fixed 5-regex denylist floor against ACCIDENTS, never described here
 //! as an authorization boundary — it has no de-obfuscation normalizer and
 //! known-obfuscated variants pass it; see `command_floor`'s own module doc),
@@ -38,8 +38,8 @@ use term_core::lease::SessionLease;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::node::{InputBinding, Node, NodeError};
+use crate::policy::command_floor::{self, CommandDecision};
 use crate::workflow::read_run_id;
-use crate::workflows::sdlc_flow::command_floor::{self, CommandDecision};
 use crate::workflows::{get_result, put_result};
 
 use super::identity::HasSessionInput;
