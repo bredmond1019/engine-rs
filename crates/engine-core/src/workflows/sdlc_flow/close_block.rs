@@ -220,11 +220,20 @@ impl CloseOutcome {
     }
 }
 
-/// Deterministic node: closes `WrapUpNode`'s block through
-/// `mev::set_block_status`, under the advisory lock and the D71 operator
-/// gate, both taken explicitly (see module doc comment).
+/// The node identity [`CloseBlockNode`] reads the committed `SDLCState`
+/// from by default — `WrapUpNode`, SDLC_FLOW's wrap-up node. `EN.11.N`
+/// task 5 parameterizes this (see [`CloseBlockNode::with_state_source`])
+/// so SDLC_TASK's registry can point the SAME node at `LeanBookkeepNode`
+/// instead, without forking a second close-block implementation.
+pub const DEFAULT_STATE_SOURCE: &str = "WrapUpNode";
+
+/// Deterministic node: closes `WrapUpNode`'s (or, under
+/// [`CloseBlockNode::with_state_source`], another engine's terminal node's)
+/// block through `mev::set_block_status`, under the advisory lock and the
+/// D71 operator gate, both taken explicitly (see module doc comment).
 pub struct CloseBlockNode {
     lock_timeout: Duration,
+    state_source: &'static str,
 }
 
 impl CloseBlockNode {
@@ -232,6 +241,7 @@ impl CloseBlockNode {
     pub fn new() -> Self {
         Self {
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
+            state_source: DEFAULT_STATE_SOURCE,
         }
     }
 
@@ -242,6 +252,20 @@ impl CloseBlockNode {
         self.lock_timeout = timeout;
         self
     }
+
+    /// Override the `ctx.nodes` identity this node reads its committed
+    /// `SDLCState` (and, for the full-run guard, the sibling `full_run`
+    /// flag) from. Defaults to [`DEFAULT_STATE_SOURCE`] (`"WrapUpNode"`),
+    /// preserving every existing `sdlc_flow` caller's behavior exactly.
+    /// `EN.11.N`'s SDLC_TASK registry constructs this with
+    /// `"LeanBookkeepNode"` — `LeanBookkeepNode` is not `WrapUpNode`, so
+    /// without this override `CloseBlockNode` would find nothing under the
+    /// default identity and every SDLC_TASK close would silently no-op.
+    #[must_use]
+    pub fn with_state_source(mut self, source: &'static str) -> Self {
+        self.state_source = source;
+        self
+    }
 }
 
 impl Default for CloseBlockNode {
@@ -250,14 +274,27 @@ impl Default for CloseBlockNode {
     }
 }
 
-/// Read `WrapUpNode`'s stamped `SDLCState` back out of `ctx` — "the state
-/// `WrapUpNode` just wrote", per this task's spec. `None` when
-/// `WrapUpNode` has not run (e.g. a unit test driving this node in
+/// Read `self.state_source`'s stamped `SDLCState` back out of `ctx` — "the
+/// state [the terminal node] just wrote", per this task's spec. `None`
+/// when that node has not run (e.g. a unit test driving this node in
 /// isolation) or its `state` field fails to parse.
-fn wrap_up_state(ctx: &TaskContext) -> Option<SDLCState> {
-    let wrap_up = get_result(ctx, "WrapUpNode")?;
-    let state_value = wrap_up.get("state")?.clone();
+fn state_from_source(ctx: &TaskContext, state_source: &str) -> Option<SDLCState> {
+    let result = get_result(ctx, state_source)?;
+    let state_value = result.get("state")?.clone();
     serde_json::from_value(state_value).ok()
+}
+
+/// Read `self.state_source`'s stamped `full_run` flag, if present.
+/// Defaults `true` when absent — every `sdlc_flow` `WrapUpNode` stamp
+/// (today) carries no such field, and `sdlc_flow`'s own runs have no
+/// partial-run guard to preserve, so an absent flag must mean "proceed",
+/// not "skip". Only `LeanBookkeepNode` (`EN.11.N` task 5) stamps this key,
+/// `false` for a partial `task_range` run.
+fn full_run_from_source(ctx: &TaskContext, state_source: &str) -> bool {
+    get_result(ctx, state_source)
+        .and_then(|result| result.get("full_run"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
 }
 
 /// Read the worktree path stamped by `SetupWorktreeNode`, if present.
@@ -564,9 +601,9 @@ impl CloseBlockNode {
     /// makes the skip/outcome logic trivially unit-testable without a
     /// `#[tokio::test]`.
     fn evaluate(&self, ctx: &TaskContext) -> CloseOutcome {
-        let Some(state) = wrap_up_state(ctx) else {
+        let Some(state) = state_from_source(ctx, self.state_source) else {
             return CloseOutcome::Skipped {
-                reason: "WrapUpNode has not run — nothing to close".to_string(),
+                reason: format!("{} has not run — nothing to close", self.state_source),
             };
         };
 
@@ -597,6 +634,21 @@ impl CloseBlockNode {
                      terminal; a failed reconcile must not close its block",
                     state.bail_reason.as_deref().unwrap_or("no reason recorded")
                 ),
+            };
+        }
+
+        // A partial `task_range` run must not close its block either — the
+        // JS engine's `fullRun` guard (`sdlc-task.js`): "the reconcile and
+        // the block close only happen on a run covering EVERY task in the
+        // spec". `LeanBookkeepNode` (`EN.11.N` task 5) is the only stamper
+        // of this flag today; every `sdlc_flow` `WrapUpNode` stamp carries
+        // no `full_run` key at all, so [`full_run_from_source`] defaults
+        // `true` there and this branch stays inert for SDLC_FLOW runs.
+        if !full_run_from_source(ctx, self.state_source) {
+            return CloseOutcome::Skipped {
+                reason: "run covered only a task_range subset, not the full spec — a partial \
+                         run must not close its block"
+                    .to_string(),
             };
         }
 

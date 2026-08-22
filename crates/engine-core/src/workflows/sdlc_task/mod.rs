@@ -29,12 +29,16 @@
 //!   state types this workflow reuses as-is.
 //! - `task_triage_router` — `TaskTriageRouterNode`, the three-arm triage
 //!   fork (port design T6).
-//! - `lean_bookkeep` — `LeanBookkeepNode` (added by a later task in this
-//!   spec).
+//! - `lean_bookkeep` — `LeanBookkeepNode`, the lean close-out (port design
+//!   T8): persists + commits the durable run state and derives the
+//!   terminal status. Ships no block-status flip of its own — that is
+//!   `sdlc_flow::close_block::CloseBlockNode`'s job, wired in by a later
+//!   task in this spec via `CloseBlockNode::with_state_source`.
 //! - `graph` — assembles the declared `WorkflowSchema` + `NodeRegistry`
 //!   (added by a later task in this spec — this task lands as an
 //!   unreachable-but-tested module with no graph yet).
 
+pub mod lean_bookkeep;
 pub mod schema;
 pub mod task_triage_router;
 

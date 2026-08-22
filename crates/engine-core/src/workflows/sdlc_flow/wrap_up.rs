@@ -80,7 +80,7 @@ fn civil_from_days(z: i64) -> String {
 /// through it. Absent in unit tests that drive `WrapUpNode` directly (no
 /// `SetupWorktreeNode` in `ctx`) — those skip the on-disk persist below,
 /// mirroring how `task_loop.rs`'s node tests operate without a worktree.
-fn worktree_path(ctx: &TaskContext) -> Option<String> {
+pub(crate) fn worktree_path(ctx: &TaskContext) -> Option<String> {
     get_result(ctx, "SetupWorktreeNode")
         .and_then(|value| value.get("worktree_path"))
         .and_then(|value| value.as_str())
@@ -123,7 +123,7 @@ fn existing_started_at(state_path: &std::path::Path) -> Option<String> {
 /// stamp `Workflow::run_with`/`run_from` write before the walk starts
 /// (`None` when the run carried no `RunOptions::run_id`, e.g. any run driven
 /// through base-template's JS engine or a unit test with empty metadata).
-fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Path) -> RunMeta {
+pub(crate) fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Path) -> RunMeta {
     let now = chrono::Utc::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         .to_string();
@@ -244,7 +244,7 @@ fn committed_pr(_ctx: &TaskContext) -> Option<CommittedPr> {
 /// `FinalValidationNode` never ran this walk (a bailed run routes straight
 /// to `WrapUpNode` from a router and never reaches the drain branch) or if
 /// its stamped result somehow fails to parse as [`CommittedFinalValidation`].
-fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidation> {
+pub(crate) fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidation> {
     let result = get_result(ctx, "FinalValidationNode")?;
     serde_json::from_value(result.clone()).ok()
 }
@@ -427,7 +427,7 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
 /// [`super::DEFAULT_STATE_FILENAME`] for every existing caller (`WrapUpNode`
 /// defaults its stored filename to that const), so behaviour is
 /// byte-identical after `EN.11.M` task 4 parameterized this site.
-fn state_path_for(
+pub(crate) fn state_path_for(
     worktree: &str,
     spec_slug: &str,
     state_filename: &str,
@@ -450,7 +450,7 @@ fn state_path_for(
 /// and never re-runs after `WrapUpNode`, so without this write those blocks
 /// are computed here and then discarded when the run ends.
 #[allow(clippy::too_many_arguments)]
-fn persist_state(
+pub(crate) fn persist_state(
     state_path: &std::path::Path,
     state: &SDLCState,
     run_meta: &RunMeta,
