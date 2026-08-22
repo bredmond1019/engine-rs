@@ -293,9 +293,9 @@ fn build_experiment_workflow(worktree: &Path) -> Workflow {
     registry.register(Box::new(ExperimentSetupNode {
         worktree_path: worktree.to_string_lossy().to_string(),
     }));
-    registry.register(Box::new(SpecExistsRouterNode));
+    registry.register(Box::new(SpecExistsRouterNode::new()));
     registry.register(Box::new(GenerateTasksNode::new()));
-    registry.register(Box::new(LoadTaskStateNode));
+    registry.register(Box::new(LoadTaskStateNode::new()));
     registry.register(Box::new(TaskQueueRouterNode));
 
     // Real call: dangerously_skip_permissions is required in headless `-p`

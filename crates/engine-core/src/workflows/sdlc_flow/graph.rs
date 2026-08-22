@@ -260,9 +260,9 @@ pub fn schema() -> WorkflowSchema {
 pub fn registry() -> NodeRegistry {
     let mut registry = NodeRegistry::new();
     registry.register(Box::new(SetupWorktreeNode::new()));
-    registry.register(Box::new(SpecExistsRouterNode));
+    registry.register(Box::new(SpecExistsRouterNode::new()));
     registry.register(Box::new(GenerateTasksNode::new()));
-    registry.register(Box::new(LoadTaskStateNode));
+    registry.register(Box::new(LoadTaskStateNode::new()));
     registry.register(Box::new(TaskQueueRouterNode));
     registry.register(Box::new(
         ImplementTaskNode::new().with_config(agentic_write_config("claude-sonnet-4-5")),

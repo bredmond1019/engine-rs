@@ -190,9 +190,9 @@ fn build_workflow(worktree: &Path, review_calls: Arc<AtomicUsize>) -> Workflow {
     registry.register(Box::new(FixtureSetupNode {
         worktree_path: worktree.to_string_lossy().to_string(),
     }));
-    registry.register(Box::new(SpecExistsRouterNode));
+    registry.register(Box::new(SpecExistsRouterNode::new()));
     registry.register(Box::new(GenerateTasksNode::new()));
-    registry.register(Box::new(LoadTaskStateNode));
+    registry.register(Box::new(LoadTaskStateNode::new()));
     registry.register(Box::new(TaskQueueRouterNode));
 
     registry.register(Box::new(ImplementTaskNode::new().with_transport(Arc::new(

@@ -206,7 +206,13 @@ fn spec_dir(ctx: &TaskContext, spec_slug: &str) -> PathBuf {
 pub struct SetupWorktreeNode {
     runner: CommandRunner,
     registry: Option<Arc<RepoRegistry>>,
+    branch_prefix: &'static str,
 }
+
+/// Default branch-name prefix (`"sdlc/{spec_slug}"`) — unchanged from
+/// today's hardcoded behavior. `EN.11.N` task 3 adds `with_branch_prefix`
+/// so `SDLC_TASK` can reuse this node under `"task/"` without forking it.
+const DEFAULT_BRANCH_PREFIX: &str = "sdlc/";
 
 impl SetupWorktreeNode {
     #[must_use]
@@ -214,6 +220,7 @@ impl SetupWorktreeNode {
         Self {
             runner: default_command_runner(),
             registry: None,
+            branch_prefix: DEFAULT_BRANCH_PREFIX,
         }
     }
 
@@ -236,6 +243,16 @@ impl SetupWorktreeNode {
         self.registry = Some(registry);
         self
     }
+
+    /// Override the branch-name prefix used when `event.branch_name` is
+    /// absent. Defaults to `"sdlc/"`, producing `sdlc/<spec_slug>` exactly
+    /// as before this builder existed. `SDLC_TASK` passes `"task/"`. An
+    /// explicit `event.branch_name` still wins over the prefix either way.
+    #[must_use]
+    pub fn with_branch_prefix(mut self, branch_prefix: &'static str) -> Self {
+        self.branch_prefix = branch_prefix;
+        self
+    }
 }
 
 impl Default for SetupWorktreeNode {
@@ -251,7 +268,7 @@ impl Node for SetupWorktreeNode {
         let branch = event
             .branch_name
             .clone()
-            .unwrap_or_else(|| format!("sdlc/{}", event.spec_slug));
+            .unwrap_or_else(|| format!("{}{}", self.branch_prefix, event.spec_slug));
 
         // EN.3.K: every relative path this node produces is anchored to
         // `root` — `resolve_target_root` returns `current_dir()` verbatim
@@ -516,7 +533,34 @@ impl Node for SetupWorktreeNode {
 /// D31-committed path — see
 /// `D10-committed-state-path-schema-alignment.md`) or `tasks.json`, else to
 /// `GenerateTasksNode`.
-pub struct SpecExistsRouterNode;
+pub struct SpecExistsRouterNode {
+    state_filename: &'static str,
+}
+
+impl SpecExistsRouterNode {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state_filename: DEFAULT_STATE_FILENAME,
+        }
+    }
+
+    /// Override the state filename this router checks for. Defaults to
+    /// [`DEFAULT_STATE_FILENAME`]; `EN.11.N` task 3 adds this so
+    /// `SDLC_TASK` can reuse this node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
+        self
+    }
+}
+
+impl Default for SpecExistsRouterNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait::async_trait]
 impl Node for SpecExistsRouterNode {
@@ -543,8 +587,7 @@ impl Router for SpecExistsRouterNode {
     fn route(&self, ctx: &TaskContext) -> Option<String> {
         let spec_slug = ctx.event.get("spec_slug")?.as_str()?;
         let dir = spec_dir(ctx, spec_slug);
-        if dir.join("sdlc").join(DEFAULT_STATE_FILENAME).exists() || dir.join("tasks.json").exists()
-        {
+        if dir.join("sdlc").join(self.state_filename).exists() || dir.join("tasks.json").exists() {
             Some("LoadTaskStateNode".to_string())
         } else {
             Some("GenerateTasksNode".to_string())
@@ -575,7 +618,34 @@ impl Router for SpecExistsRouterNode {
 ///
 /// The old state is never deleted or overwritten: the corpse is forensics.
 /// See [`archive_superseded_state`] for the naming/collision rules.
-pub struct LoadTaskStateNode;
+pub struct LoadTaskStateNode {
+    state_filename: &'static str,
+}
+
+impl LoadTaskStateNode {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state_filename: DEFAULT_STATE_FILENAME,
+        }
+    }
+
+    /// Override the state filename this node reads/archives. Defaults to
+    /// [`DEFAULT_STATE_FILENAME`]; `EN.11.N` task 3 adds this so
+    /// `SDLC_TASK` can reuse this node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
+        self
+    }
+}
+
+impl Default for LoadTaskStateNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Deterministic discriminator naming an archived state file, derived from
 /// the *old file's own* contents so the same file always archives to the same
@@ -648,10 +718,11 @@ fn sanitize_path_component(raw: &str) -> String {
 fn archive_superseded_state(
     state_path: &Path,
     old_state: &serde_json::Value,
+    state_filename: &str,
 ) -> Result<PathBuf, NodeError> {
     let dir = state_path.parent().unwrap_or_else(|| Path::new("."));
     let discriminator = superseded_discriminator(old_state);
-    let base = format!("{DEFAULT_STATE_FILENAME}.superseded-{discriminator}");
+    let base = format!("{state_filename}.superseded-{discriminator}");
 
     let mut candidate = dir.join(format!("{base}.bak"));
     let mut suffix = 2u32;
@@ -683,7 +754,7 @@ impl Node for LoadTaskStateNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let event = parse_event(&ctx)?;
         let dir = spec_dir(&ctx, &event.spec_slug);
-        let state_path = dir.join("sdlc").join(DEFAULT_STATE_FILENAME);
+        let state_path = dir.join("sdlc").join(self.state_filename);
         let tasks_path = dir.join("tasks.json");
 
         // Parse the existing state (if any) up front: both the "resume it"
@@ -709,7 +780,7 @@ impl Node for LoadTaskStateNode {
             let old = existing_state
                 .as_ref()
                 .expect("restarting implies an existing state");
-            archive_superseded_state(&state_path, old)?;
+            archive_superseded_state(&state_path, old, self.state_filename)?;
         }
 
         let resumed_state = if restarting { None } else { existing_state };
@@ -1162,7 +1233,7 @@ mod tests {
         std::fs::write(dir.join("tasks.json"), "[]").unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("LoadTaskStateNode".to_string()));
     }
 
@@ -1172,7 +1243,7 @@ mod tests {
         std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("GenerateTasksNode".to_string()));
     }
 
@@ -1184,7 +1255,7 @@ mod tests {
         std::fs::write(dir.join("sdlc-flow-state.json"), "{}").unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("LoadTaskStateNode".to_string()));
     }
 
@@ -1199,7 +1270,7 @@ mod tests {
         std::fs::write(dir.join("sdlc-flow-state.json"), "{}").unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("GenerateTasksNode".to_string()));
     }
 
@@ -1224,7 +1295,7 @@ mod tests {
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "task_range": "1,3" });
 
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let out = node.process(ctx).await.expect("load should succeed");
 
         let state = out
@@ -1264,7 +1335,7 @@ mod tests {
         let mut ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
         ctx.event = json!({ "spec_slug": "my-spec" });
 
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let state = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(state["tasks"][0]["max_attempts"], 7);
     }
@@ -1292,7 +1363,7 @@ mod tests {
         let mut ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
         ctx.event = json!({ "spec_slug": "my-spec" });
 
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let state = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(state["tasks"][0]["max_attempts"], 1);
     }
@@ -1316,7 +1387,7 @@ mod tests {
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec" });
 
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let state = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(state["tasks"][0]["max_attempts"], 3);
     }
@@ -1346,7 +1417,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let out = node.process(ctx).await.expect("load should succeed");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["spec_slug"], "my-spec");
@@ -1370,7 +1441,7 @@ mod tests {
             "phase_id": "EN.3",
         });
 
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["block_id"], "EN.3.A");
         assert_eq!(loaded["phase_id"], "EN.3");
@@ -1386,7 +1457,7 @@ mod tests {
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec" });
 
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert!(loaded["block_id"].is_null());
         assert!(loaded["phase_id"].is_null());
@@ -1427,7 +1498,7 @@ mod tests {
             "phase_id": "EN.9",
         });
 
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["block_id"], "EN.3.A");
         assert_eq!(loaded["phase_id"], "EN.3");
@@ -1500,7 +1571,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
 
         let attempts: Vec<u64> = loaded["tasks"]
@@ -1528,7 +1599,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec" }); // resume defaults to false
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
 
         let attempts: Vec<u64> = loaded["tasks"]
@@ -1575,7 +1646,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["tasks"].as_array().unwrap().len(), 1);
         assert_eq!(loaded["tasks"][0]["attempt_count"], 0);
@@ -1597,7 +1668,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["tasks"].as_array().unwrap().len(), 1);
         assert_eq!(loaded["tasks"][0]["status"], "pending");
@@ -1610,14 +1681,14 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode.process(ctx).await.expect("first restart");
+        LoadTaskStateNode::new().process(ctx).await.expect("first restart");
 
         // Re-seed a state file carrying the SAME stamped run_id, then
         // restart again — the discriminator collides.
         seed_bailed_spec(&worktree, "my-spec", 1, Some("run-aaaa"));
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode
+        LoadTaskStateNode::new()
             .process(ctx)
             .await
             .expect("second restart");
@@ -1642,7 +1713,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode.process(ctx).await.expect("restart");
+        LoadTaskStateNode::new().process(ctx).await.expect("restart");
 
         let names = archived_names(&sdlc_dir);
         assert_eq!(names.len(), 1, "exactly one archive, got {names:?}");
@@ -1679,7 +1750,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         assert_eq!(
             out.nodes.get("LoadTaskStateNode").unwrap()["spec_slug"],
             "my-spec"
@@ -1695,7 +1766,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false, "task_range": "2-3" });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         let ids: Vec<u64> = loaded["tasks"]
             .as_array()
@@ -1719,7 +1790,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        let err = LoadTaskStateNode
+        let err = LoadTaskStateNode::new()
             .process(ctx)
             .await
             .expect_err("should fail");
@@ -1751,7 +1822,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("bailed-spec", &worktree);
         ctx.event = json!({ "spec_slug": "bailed-spec" });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let state: SDLCState =
             serde_json::from_value(out.nodes.get("LoadTaskStateNode").unwrap().clone()).unwrap();
 
@@ -1803,7 +1874,7 @@ mod tests {
         .unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let out = node.process(ctx).await.expect("load should succeed");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         let task_ids: Vec<u64> = loaded["tasks"]
@@ -1821,7 +1892,7 @@ mod tests {
         std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("no state or tasks file found"));
     }
@@ -1851,6 +1922,51 @@ mod tests {
         let result = out.nodes.get("SetupWorktreeNode").expect("output present");
         assert_eq!(result["branch_name"], "sdlc/my-spec");
         assert_eq!(result["worktree_path"], "trees/sdlc/my-spec");
+    }
+
+    /// `EN.11.N` task 3 acceptance criterion: `with_branch_prefix("task/")`
+    /// produces `task/<spec_slug>`.
+    #[tokio::test]
+    async fn setup_with_branch_prefix_produces_prefixed_branch() {
+        let node = SetupWorktreeNode::new()
+            .with_runner(stub_runner(0))
+            .with_branch_prefix("task/");
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["branch_name"], "task/my-spec");
+    }
+
+    /// `EN.11.N` task 3 acceptance criterion: the default (no
+    /// `with_branch_prefix` call) still produces `sdlc/<spec_slug>` —
+    /// behaviour-stable with today.
+    #[tokio::test]
+    async fn setup_default_branch_prefix_is_unchanged() {
+        let node = SetupWorktreeNode::new().with_runner(stub_runner(0));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["branch_name"], "sdlc/my-spec");
+    }
+
+    /// `EN.11.N` task 3 acceptance criterion: an explicit
+    /// `event.branch_name` still overrides `with_branch_prefix`.
+    #[tokio::test]
+    async fn setup_explicit_branch_name_overrides_branch_prefix() {
+        let node = SetupWorktreeNode::new()
+            .with_runner(stub_runner(0))
+            .with_branch_prefix("task/");
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "use_worktree": true,
+            "branch_name": "custom/explicit-branch",
+        }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["branch_name"], "custom/explicit-branch");
     }
 
     #[tokio::test]
