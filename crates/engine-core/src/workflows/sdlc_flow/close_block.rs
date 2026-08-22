@@ -443,7 +443,7 @@ fn classify_report(key: &str, report: &Report) -> CloseOutcome {
 
 /// The guarded close itself: operator gate, then the advisory lock (held
 /// across the write, released via `LockGuard`'s `Drop` on every exit path
-/// below), then `mev::set_block_status(root, key, "closed", true)` wrapped
+/// below), then `mev::set_block_status(root, key, "closed", true, None)` wrapped
 /// in the validate-then-rollback guard (module doc comment, "task 4").
 ///
 /// Production always calls this through [`attempt_close`], which supplies
@@ -494,7 +494,18 @@ fn attempt_close_with_validator(
     // `E_BLOCK_NOT_FOUND`) explain why, rather than failing on our own
     // resolution first.
     let Some(state_path) = resolve_state_path(root, repo_slug) else {
-        return match mev::set_block_status(root, key, "closed", true) {
+        return match mev::set_block_status(
+            root, key, "closed", true,
+            // `scope: None` — the unscoped, fleet-wide regeneration this call has
+            // always performed. mev `MV.14.A` added this parameter; it narrows only
+            // which repo's DERIVED surfaces the chained `emit_state` regenerates,
+            // never the write itself nor which block is closed — `filter_plan_by_scope`
+            // is a documented no-op when `scope` is `None` (mev/src/lib.rs:1337). So
+            // this is byte-identical to the pre-MV.14.A behaviour. Passing a real
+            // `ScopeDependencySet` is deliberate follow-up work on this side; MV.14.A
+            // only makes the flag exist.
+            None,
+        ) {
             Ok(report) => classify_report(key, &report),
             Err(err) => CloseOutcome::Unvalidated {
                 reason: format!("mev::set_block_status errored: {err}"),
@@ -519,7 +530,18 @@ fn attempt_close_with_validator(
         }
     };
 
-    let close_report = match mev::set_block_status(root, key, "closed", true) {
+    let close_report = match mev::set_block_status(
+        root, key, "closed", true,
+        // `scope: None` — the unscoped, fleet-wide regeneration this call has
+        // always performed. mev `MV.14.A` added this parameter; it narrows only
+        // which repo's DERIVED surfaces the chained `emit_state` regenerates,
+        // never the write itself nor which block is closed — `filter_plan_by_scope`
+        // is a documented no-op when `scope` is `None` (mev/src/lib.rs:1337). So
+        // this is byte-identical to the pre-MV.14.A behaviour. Passing a real
+        // `ScopeDependencySet` is deliberate follow-up work on this side; MV.14.A
+        // only makes the flag exist.
+        None,
+    ) {
         Ok(report) => report,
         Err(err) => {
             return CloseOutcome::Unvalidated {
