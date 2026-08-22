@@ -799,6 +799,14 @@ pub enum TerminalSignal {
     /// wins over this one. The carried `String` is the last review verdict's
     /// `summary`.
     ReviewExhausted(String),
+    /// The D56 terminal reconcile (base-template D56 CALL 2) stamped
+    /// `all_passed: false` on the SDLC_TASK reconcile gate. Distinct from
+    /// [`Self::FinalValidationFailed`]: the per-task commits STAND (they
+    /// are not rolled back) and bookkeep is SKIPPED rather than run. This
+    /// variant is TERMINAL — the chain stops here — and only SDLC_TASK can
+    /// produce it; `sdlc_flow` never constructs this variant. The carried
+    /// `String` is the reconcile gate's `failure_summary`.
+    ReconcileFailed(String),
 }
 
 impl TerminalSignal {
@@ -811,18 +819,21 @@ impl TerminalSignal {
             | Self::StructuralFail(message)
             | Self::FinalValidationFailed(message)
             | Self::EndReviewFail(message)
-            | Self::ReviewExhausted(message) => message,
+            | Self::ReviewExhausted(message)
+            | Self::ReconcileFailed(message) => message,
         }
     }
 }
 
 /// Derive the D31 committed-state `status` string
-/// (`"running"|"review"|"docs"|"wrapup"|"blocked"|"done"`) from a state
-/// snapshot and an optional [`TerminalSignal`].
+/// (`"running"|"review"|"docs"|"wrapup"|"blocked"|"done"|"reconcile_failed"`)
+/// from a state snapshot and an optional [`TerminalSignal`].
 ///
-/// A `Some` terminal signal (of any variant) always yields `"blocked"` — the
-/// one real terminal-failure value this engine ever writes (there is no
-/// `"bailed"` anywhere in the codebase; see `run-sdlc-flow.sh`). Absent a
+/// A `Some(TerminalSignal::ReconcileFailed(_))` yields `"reconcile_failed"`
+/// (base-template D56 CALL 2) — only SDLC_TASK's reconcile gate produces
+/// this variant. Every other `Some` terminal signal yields `"blocked"` — the
+/// one other real terminal-failure value this engine ever writes (there is
+/// no `"bailed"` anywhere in the codebase; see `run-sdlc-flow.sh`). Absent a
 /// terminal signal, every task reaching `Done`/`Skipped` yields `"done"`;
 /// anything else yields `"running"`.
 ///
@@ -840,6 +851,9 @@ pub fn derive_committed_status(
     state: &SDLCState,
     terminal_signal: Option<&TerminalSignal>,
 ) -> &'static str {
+    if let Some(TerminalSignal::ReconcileFailed(_)) = terminal_signal {
+        return "reconcile_failed";
+    }
     if terminal_signal.is_some() {
         return "blocked";
     }
@@ -1524,6 +1538,16 @@ mod tests {
         state.tasks = vec![task(1, SDLCTaskStatus::Done)];
         let signal = TerminalSignal::MajorBail("bail".to_string());
         assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
+
+        // `ReconcileFailed` is the one variant that does NOT map to
+        // "blocked" — it maps to its own "reconcile_failed" status (D56
+        // CALL 2), asserted separately from the loop above.
+        let reconcile_signal =
+            TerminalSignal::ReconcileFailed("cargo nextest run --workspace".to_string());
+        assert_eq!(
+            derive_committed_status(&state, Some(&reconcile_signal)),
+            "reconcile_failed"
+        );
     }
 
     #[test]

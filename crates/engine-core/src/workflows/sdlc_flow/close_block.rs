@@ -584,6 +584,22 @@ impl CloseBlockNode {
             };
         }
 
+        // A failed SDLC_TASK reconcile must not close its block either —
+        // base-template D56 CALL 2 makes `reconcile_failed` TERMINAL, and
+        // closing the block on it would be exactly what that call
+        // forbids. Distinct branch (not folded into the `"blocked"` arm
+        // above) so the skip reason names D56 rather than reusing the
+        // generic "run ended blocked" wording.
+        if state.global_status == "reconcile_failed" {
+            return CloseOutcome::Skipped {
+                reason: format!(
+                    "run ended reconcile_failed ({}) — base-template D56 CALL 2 makes this \
+                     terminal; a failed reconcile must not close its block",
+                    state.bail_reason.as_deref().unwrap_or("no reason recorded")
+                ),
+            };
+        }
+
         let Some(block_id) = state.block_id.clone() else {
             return CloseOutcome::Skipped {
                 reason: "no block_id on this run".to_string(),
@@ -906,6 +922,36 @@ mod tests {
         let raw = std::fs::read_to_string(repo_dir.join("planning/state.json")).unwrap();
         assert!(raw.contains("\"open\""));
         assert!(!raw.contains("\"closed\""));
+    }
+
+    #[tokio::test]
+    async fn skips_a_reconcile_failed_run_and_does_not_close() {
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "reconcile_failed");
+        let node = CloseBlockNode::new();
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+        assert_eq!(result["outcome"], json!("SKIPPED"));
+
+        // Verify on disk: the block must still be "open".
+        let raw = std::fs::read_to_string(repo_dir.join("planning/state.json")).unwrap();
+        assert!(raw.contains("\"open\""));
+        assert!(!raw.contains("\"closed\""));
+    }
+
+    #[test]
+    fn evaluate_skips_reconcile_failed_with_a_reason_naming_d56() {
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "reconcile_failed");
+        let node = CloseBlockNode::new();
+        let outcome = node.evaluate(&ctx);
+        match outcome {
+            CloseOutcome::Skipped { reason } => {
+                assert!(reason.contains("D56"), "reason should name D56: {reason}");
+                assert!(reason.contains("reconcile_failed"));
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
     }
 
     #[tokio::test]
