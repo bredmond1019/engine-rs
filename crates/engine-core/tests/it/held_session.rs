@@ -9,10 +9,11 @@
 //! hung node) are all real-process behaviours a mock can never reproduce,
 //! since a mock only proves the mock holds the state it was told to hold.
 //!
-//! Every test acquires a uniquely-named, throwaway session (pid + a
-//! monotonic counter, mirroring `term_core::lease`'s own real-tmux tests
-//! in `crates/term-core/src/lease.rs`) and kills it before returning, on
-//! every path including a failing assertion (via a `Drop` guard).
+//! Every test runs on its own private tmux socket (pid + a nanosecond
+//! stamp, one per OS process — see `test_socket_name`), so no test or
+//! human session anywhere else on the machine can observe or disturb it,
+//! and kills that socket's whole server before returning, on every path
+//! including a failing assertion (via the `KillOnDrop` guard).
 //!
 //! **tmux version pinning.** No test in this file asserts on verbatim
 //! tmux output — every assertion here is either on this crate's own typed
@@ -74,49 +75,74 @@ fn lease_option_name(session_name: &str) -> String {
     format!("{LEASE_OPTION}@{session_name}")
 }
 
-/// Kills `session_name` best-effort on drop, regardless of how the test
-/// exits (pass or a failing `assert!`/`panic!`) — mirrors
-/// `crates/term-core/src/lease.rs`'s real-tmux tests, which kill inline on
-/// every path; a `Drop` guard gets the same coverage for a panicking
-/// assertion too.
+/// Kills the WHOLE per-process tmux socket's server on drop, regardless
+/// of how the test exits (pass, a failing `assert!`/`panic!`, or an early
+/// return) — this is safe and cheap because every driver in this suite is
+/// now built on [`test_socket_name`], a socket private to this OS process
+/// that no other test or human process ever touches (see that function's
+/// doc). Killing the server rather than a single named session is what
+/// makes cleanup panic-proof: a leaked session on a shared default server
+/// used to keep that server alive for the next unrelated test (the exact
+/// self-masking defect this block exists to remove); on a private socket
+/// there is nothing left to leak into.
 struct KillOnDrop {
-    driver: Arc<TmuxDriver>,
-    session_name: String,
+    socket: String,
 }
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        let driver = self.driver.clone();
-        let session_name = self.session_name.clone();
-        // `Drop` cannot be async; spawn a detached kill so a panicking
-        // test still cleans up its throwaway session instead of leaking
-        // it into subsequent runs.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = driver.kill_session(&session_name).await;
-            });
-        }
+        // `Drop` cannot be async, and there is no requirement that it be:
+        // `tmux -L <socket> kill-server` is a short-lived synchronous
+        // process call, so it runs directly here rather than needing a
+        // tokio runtime handle to still be alive during unwind.
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &self.socket, "kill-server"])
+            .output();
     }
 }
 
-/// `cargo nextest` gives every test its own process, but the underlying
-/// tmux server is one shared OS-level daemon — `list-sessions`/
-/// `show-option` fail with `TmuxError::NoServer` ("no server running")
-/// against a socket nothing has ever connected to yet, which
-/// `HeldSessionNode::process`'s own first driver call (`list_sessions`,
-/// before it knows whether to create anything) treats as a hard node
-/// error, exactly like a genuine driver failure. Bootstrap a throwaway,
-/// unrelated session first (ignoring errors — a concurrent test process
-/// may have already started the server) so every real assertion below
-/// exercises the actual behaviour under test, not host boot order.
-async fn ensure_tmux_server(driver: &TmuxDriver, tag: &str) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let boot = format!("en10a-boot-{tag}-{}-{nanos}", std::process::id());
-    let _ = driver.new_session(&boot, None).await;
-    let _ = driver.kill_session(&boot).await;
+/// One tmux socket name per OS PROCESS, unique and collision-proof
+/// (pid + a nanosecond stamp, the same derivation `unique_run_id` uses for
+/// session names). `cargo nextest` forks a process per test, so every
+/// test in this file gets its own private tmux server on this socket —
+/// nothing else on the machine, concurrent test process or human session,
+/// can ever observe or disturb it. A `new_session` call against this
+/// socket boots its server itself (see [`bootstrap_socket`]), so there is
+/// no retry/probe dance to get right the way this file's old
+/// boot-then-kill helper tried to — just one create, left running until
+/// the whole socket is torn down at teardown.
+fn test_socket_name() -> String {
+    static SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOCKET
+        .get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("eng-en10a-held-session-it-{}-{nanos}", std::process::id())
+        })
+        .clone()
+}
+
+/// Starts this test's private socket's tmux server WITHOUT touching the
+/// name the test itself is about to acquire: creates a throwaway session
+/// under an unrelated name and — unlike this file's old boot-then-kill
+/// helper — leaves it running instead of killing it right back.
+/// `HeldSessionNode::process`'s own first driver call is `list_sessions`,
+/// and (like every tmux subcommand except `new-session`) that errors
+/// against a socket whose server has never started, so a bare
+/// `TmuxDriver::new(..).with_socket(..)` still needs exactly one
+/// `new_session` before the node's own logic can run. Killing that boot
+/// session immediately was the actual defect this block removes (killing
+/// the last session on a socket terminates its server); leaving it alone
+/// and letting the whole-socket [`KillOnDrop`] guard reap it at teardown
+/// is what makes this safe on a socket the test privately owns.
+async fn bootstrap_socket(driver: &TmuxDriver, tag: &str) {
+    let boot = format!("{tag}-boot");
+    driver
+        .new_session(&boot, None)
+        .await
+        .expect("bootstrapping this test's private tmux socket must succeed");
 }
 
 /// Whether `session_name` appears in a real `list-sessions -F` listing,
@@ -146,14 +172,12 @@ async fn read_lease(driver: &TmuxDriver, session_name: &str) -> Option<Lease> {
 
 #[tokio::test]
 async fn real_tmux_two_consecutive_nodes_reuse_one_session_with_identical_id() {
-    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT));
+    let socket = test_socket_name();
+    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT).with_socket(socket.clone()));
     let run_id = unique_run_id("identity");
     let session_name = session_name_for(&run_id, NODE_NAME);
-    let _guard = KillOnDrop {
-        driver: driver.clone(),
-        session_name: session_name.clone(),
-    };
-    ensure_tmux_server(&driver, "identity").await;
+    let _guard = KillOnDrop { socket };
+    bootstrap_socket(&driver, "identity").await;
 
     let node = HeldSessionNode::new(driver.clone() as Arc<dyn TerminalDriver>);
 
@@ -197,14 +221,12 @@ async fn real_tmux_two_consecutive_nodes_reuse_one_session_with_identical_id() {
 
 #[tokio::test]
 async fn real_tmux_held_session_renews_its_lease_before_expiry() {
-    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT));
+    let socket = test_socket_name();
+    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT).with_socket(socket.clone()));
     let run_id = unique_run_id("renew");
     let session_name = session_name_for(&run_id, NODE_NAME);
-    let _guard = KillOnDrop {
-        driver: driver.clone(),
-        session_name: session_name.clone(),
-    };
-    ensure_tmux_server(&driver, "renew").await;
+    let _guard = KillOnDrop { socket };
+    bootstrap_socket(&driver, "renew").await;
 
     let node = HeldSessionNode::new(driver.clone() as Arc<dyn TerminalDriver>);
     node.process(fast_policy_ctx(&run_id))
@@ -248,14 +270,11 @@ async fn real_tmux_held_session_renews_its_lease_before_expiry() {
 /// supplies) — never a silent, always-on reacquire.
 #[tokio::test]
 async fn real_tmux_abandoned_lease_is_fail_closed_then_reconciled_via_steal_after() {
-    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT));
+    let socket = test_socket_name();
+    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT).with_socket(socket.clone()));
     let run_id = unique_run_id("orphan");
     let session_name = session_name_for(&run_id, NODE_NAME);
-    let _guard = KillOnDrop {
-        driver: driver.clone(),
-        session_name: session_name.clone(),
-    };
-    ensure_tmux_server(&driver, "orphan").await;
+    let _guard = KillOnDrop { socket };
 
     driver
         .new_session(&session_name, None)
@@ -338,14 +357,19 @@ async fn real_tmux_abandoned_lease_is_fail_closed_then_reconciled_via_steal_afte
 
 #[tokio::test]
 async fn real_tmux_external_kill_surfaces_a_node_error_within_a_bounded_time_not_a_hang() {
-    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT));
+    let socket = test_socket_name();
+    let driver = Arc::new(TmuxDriver::new(DRIVER_TIMEOUT).with_socket(socket.clone()));
     let run_id = unique_run_id("ext-kill");
     let session_name = session_name_for(&run_id, NODE_NAME);
-    // No `KillOnDrop` here: the session is killed for real mid-test as
-    // the scenario itself, and a second kill on a session that no longer
-    // exists is a harmless no-op via `kill_session`'s own error handling
-    // in the (never reached on the happy path) cleanup below.
-    ensure_tmux_server(&driver, "ext-kill").await;
+    // The session itself is killed for real mid-test as the scenario
+    // itself (and that alone tears down this test's private socket
+    // server too, since it is the only session on it — killing the last
+    // session on a socket terminates that socket's server). The guard
+    // below still runs unconditionally on drop so a panic anywhere
+    // before that point — or the loop below timing out — cannot leave
+    // this test's socket server behind.
+    let _guard = KillOnDrop { socket };
+    bootstrap_socket(&driver, "ext-kill").await;
 
     let node = HeldSessionNode::new(driver.clone() as Arc<dyn TerminalDriver>);
     node.process(fast_policy_ctx(&run_id))
