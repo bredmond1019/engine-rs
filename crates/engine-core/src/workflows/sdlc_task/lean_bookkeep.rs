@@ -214,8 +214,7 @@ impl Node for LeanBookkeepNode {
         };
 
         state.bail_reason = derive_bail_reason(terminal_signal.as_ref());
-        state.global_status =
-            derive_committed_status(&state, terminal_signal.as_ref()).to_string();
+        state.global_status = derive_committed_status(&state, terminal_signal.as_ref()).to_string();
 
         let state_value = serde_json::to_value(&state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
@@ -307,8 +306,7 @@ mod tests {
 
     fn result_state(out: &TaskContext) -> SDLCState {
         let result = get_result(out, "LeanBookkeepNode").expect("LeanBookkeepNode stamped");
-        serde_json::from_value(result.get("state").unwrap().clone())
-            .expect("stamped state parses")
+        serde_json::from_value(result.get("state").unwrap().clone()).expect("stamped state parses")
     }
 
     #[tokio::test]
@@ -370,16 +368,19 @@ mod tests {
             }),
         );
 
-        let node = LeanBookkeepNode::new().with_runner(std::sync::Arc::new(|_program, _args, _cwd| {
-            Ok(CommandOutput {
-                status: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        }));
+        let node =
+            LeanBookkeepNode::new().with_runner(std::sync::Arc::new(|_program, _args, _cwd| {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }));
 
         let out = node.process(ctx).await.expect("process should succeed");
-        let result = get_result(&out, "LeanBookkeepNode").expect("stamped").clone();
+        let result = get_result(&out, "LeanBookkeepNode")
+            .expect("stamped")
+            .clone();
         let committed_state = result_state(&out);
 
         // 1. status is reconcile_failed
@@ -393,8 +394,7 @@ mod tests {
         // 3. the bookkeep flip is skipped — CloseBlockNode reads this
         //    stamped state and refuses to close, never touching mev at all.
         let close_ctx = out;
-        let close_node =
-            CloseBlockNode::new().with_state_source("LeanBookkeepNode");
+        let close_node = CloseBlockNode::new().with_state_source("LeanBookkeepNode");
         let close_out = close_node
             .process(close_ctx)
             .await
@@ -434,13 +434,14 @@ mod tests {
             }),
         );
 
-        let node = LeanBookkeepNode::new().with_runner(std::sync::Arc::new(|_program, _args, _cwd| {
-            Ok(CommandOutput {
-                status: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        }));
+        let node =
+            LeanBookkeepNode::new().with_runner(std::sync::Arc::new(|_program, _args, _cwd| {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }));
 
         let out = node.process(ctx).await.expect("process should succeed");
         let result = get_result(&out, "LeanBookkeepNode").expect("stamped");
@@ -452,8 +453,7 @@ mod tests {
 
         // CloseBlockNode must refuse to close a partial run's block too.
         let close_ctx = out;
-        let close_node =
-            CloseBlockNode::new().with_state_source("LeanBookkeepNode");
+        let close_node = CloseBlockNode::new().with_state_source("LeanBookkeepNode");
         let close_out = close_node
             .process(close_ctx)
             .await
@@ -461,10 +461,7 @@ mod tests {
         let close_result =
             get_result(&close_out, "CloseBlockNode").expect("CloseBlockNode stamped");
         assert_eq!(close_result["outcome"], json!("SKIPPED"));
-        assert!(close_result["detail"]
-            .as_str()
-            .unwrap()
-            .contains("partial"));
+        assert!(close_result["detail"].as_str().unwrap().contains("partial"));
     }
 
     #[test]

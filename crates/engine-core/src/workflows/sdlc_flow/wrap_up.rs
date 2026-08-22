@@ -123,7 +123,11 @@ fn existing_started_at(state_path: &std::path::Path) -> Option<String> {
 /// stamp `Workflow::run_with`/`run_from` write before the walk starts
 /// (`None` when the run carried no `RunOptions::run_id`, e.g. any run driven
 /// through base-template's JS engine or a unit test with empty metadata).
-pub(crate) fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Path) -> RunMeta {
+pub(crate) fn build_run_meta(
+    ctx: &TaskContext,
+    worktree: &str,
+    state_path: &std::path::Path,
+) -> RunMeta {
     let now = chrono::Utc::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         .to_string();
