@@ -28,6 +28,7 @@ explicit, registry-resolved `repo` slug.
 | `ENGINE_EVENTS_API_KEY` | Already required (pre-EN.3.K) | The `X-API-Key` value `check_api_key` gates `POST /events/` (and friends) against; read by `WorkflowTriggerDispatch`/channel egress (`crates/engine-core/src/nodes/channel_transport.rs`). |
 | `ENGINE_EVENTS_URL` | Already required (pre-EN.3.K) | The deployment-configured base URL for the server's own `/events/` endpoint, used by egress nodes that loop back through HTTP (`crates/engine-serve/src/workflows.rs`). |
 | `ENGINE_REPO_ALLOWLIST` | Optional | Comma-separated slugs narrowing the repo registry (see [`sdlc-flow-workflow.md`](sdlc-flow-workflow.md)). Unset — the default, and what the Mac Mini runs — means every `brain.toml` slug is reachable. |
+| `ENGINE_LOG` | Optional | `tracing_subscriber::EnvFilter` string controlling log verbosity for the JSON tracing subscriber `engine_serve::init_tracing()` installs (e.g. `debug`, `engine_core=debug,info`). Unset defaults to `info`, matching pre-tracing `eprintln!` visibility. |
 
 `DATABASE_URL` and `BASTION_ENGINE_API_KEY` remain required for `bastion serve` to mount the
 engine routes at all (`decide_engine_mount`, `core/bastion/src/serve/mod.rs`) — unrelated to
@@ -62,8 +63,9 @@ the brain tree (an interactive shell, a dev loop). Under launchd, with a `Workin
 may sit outside the brain tree entirely, that walk-up fails — and per `brain_root.rs`'s own design
 (never a silent `.` fallback), the failure is loud: **every `repo`-bearing `SDLC_FLOW` event 422s**
 until `ENGINE_BRAIN_ROOT` is set correctly in the plist. `init_repo_registry_from_env`
-(`crates/engine-serve/src/workflows.rs`) logs the reason to stderr at startup and leaves the
-process-global registry unset rather than failing to boot — absent-`repo` events are unaffected,
+(`crates/engine-serve/src/workflows.rs`) emits a structured `tracing::warn!` event with the reason
+at startup and leaves the process-global registry unset rather than failing to boot — absent-`repo`
+events are unaffected,
 but every `repo`-bearing one fails until the plist is fixed.
 
 This makes deploying this plist correctly a **hard prerequisite** for using the `repo` field at

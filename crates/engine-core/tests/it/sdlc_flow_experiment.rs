@@ -45,8 +45,10 @@ use engine_contract::TaskContext;
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
 use engine_core::workflows::sdlc_flow::aggregate;
+use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
+use engine_core::workflows::sdlc_flow::end_review::{EndReviewNode, EndReviewRouterNode};
 use engine_core::workflows::sdlc_flow::graph;
 use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
 use engine_core::workflows::sdlc_flow::setup::{
@@ -291,9 +293,9 @@ fn build_experiment_workflow(worktree: &Path) -> Workflow {
     registry.register(Box::new(ExperimentSetupNode {
         worktree_path: worktree.to_string_lossy().to_string(),
     }));
-    registry.register(Box::new(SpecExistsRouterNode));
+    registry.register(Box::new(SpecExistsRouterNode::new()));
     registry.register(Box::new(GenerateTasksNode::new()));
-    registry.register(Box::new(LoadTaskStateNode));
+    registry.register(Box::new(LoadTaskStateNode::new()));
     registry.register(Box::new(TaskQueueRouterNode));
 
     // Real call: dangerously_skip_permissions is required in headless `-p`
@@ -344,7 +346,14 @@ fn build_experiment_workflow(worktree: &Path) -> Workflow {
         },
     ))));
     registry.register(Box::new(IncrementAttemptNode));
+    // `EndReviewNode`/`EndReviewRouterNode`: this suite never selects
+    // `ReviewMode::EndOnly`, so the default pass-through never issues a
+    // model call — registered only so `EndReviewRouterNode`'s router
+    // classification satisfies `WorkflowValidator`'s fan-out check.
+    registry.register(Box::new(EndReviewNode::new()));
+    registry.register(Box::new(EndReviewRouterNode));
     registry.register(Box::new(WrapUpNode::new()));
+    registry.register(Box::new(CloseBlockNode::new()));
     registry.register(Box::new(PullRequestNode::new().with_runner(noop_runner())));
     registry.register(Box::new(EmitStateNode::new().with_runner(noop_runner())));
 

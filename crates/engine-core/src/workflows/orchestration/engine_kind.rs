@@ -186,6 +186,13 @@ mod tests {
         // `^\s*pub(\(crate\))? fn .*(&str|: String)` on 2026-08-18.
         const SANCTIONED_STRING_TAKING_FNS: &[(&str, &[&str])] = &[
             ("chain.rs", &[]),
+            // `resolve_depends_on`/`is_edge_met` take a repo slug + block id,
+            // `is_block_open` takes an opaque HELD-UNTIL token — corpus lookups keyed
+            // by identifier, not a runner-name escape hatch.
+            (
+                "corpus_gates.rs",
+                &["resolve_depends_on", "is_edge_met", "is_block_open"],
+            ),
             ("engine_kind.rs", &["from_sdlc_workflow"]),
             ("execute.rs", &[]),
             ("gates.rs", &[]),
@@ -193,8 +200,10 @@ mod tests {
             // its `PartialOrchestrationPolicy` bundle — a config lookup, not a runner.
             ("graph.rs", &["profile_by_name"]),
             // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
-            // a path lookup, not a runner.
-            ("integrate.rs", &["resolve_roadmap_dir"]),
+            // a path lookup, not a runner. `closed`/`bailed` are `LaneLogEntry`
+            // constructors taking a `lane: &str` and a `note: impl Into<String>` —
+            // building a log line, not selecting or invoking a runner.
+            ("integrate.rs", &["resolve_roadmap_dir", "closed", "bailed"]),
             ("mod.rs", &[]),
         ];
 

@@ -37,6 +37,8 @@ use super::schema::{
     SDLCState, TerminalSignal,
 };
 use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
+#[cfg(test)]
+use super::DEFAULT_STATE_FILENAME;
 use super::{commit_all, get_result, put_result, CommandRunner};
 
 /// Injectable "today" clock seam so the rendered date is deterministic
@@ -78,7 +80,7 @@ fn civil_from_days(z: i64) -> String {
 /// through it. Absent in unit tests that drive `WrapUpNode` directly (no
 /// `SetupWorktreeNode` in `ctx`) — those skip the on-disk persist below,
 /// mirroring how `task_loop.rs`'s node tests operate without a worktree.
-fn worktree_path(ctx: &TaskContext) -> Option<String> {
+pub(crate) fn worktree_path(ctx: &TaskContext) -> Option<String> {
     get_result(ctx, "SetupWorktreeNode")
         .and_then(|value| value.get("worktree_path"))
         .and_then(|value| value.as_str())
@@ -121,7 +123,11 @@ fn existing_started_at(state_path: &std::path::Path) -> Option<String> {
 /// stamp `Workflow::run_with`/`run_from` write before the walk starts
 /// (`None` when the run carried no `RunOptions::run_id`, e.g. any run driven
 /// through base-template's JS engine or a unit test with empty metadata).
-fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Path) -> RunMeta {
+pub(crate) fn build_run_meta(
+    ctx: &TaskContext,
+    worktree: &str,
+    state_path: &std::path::Path,
+) -> RunMeta {
     let now = chrono::Utc::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         .to_string();
@@ -143,7 +149,38 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &std::path::Pat
 /// how many times review itself was attempted, so there is no real
 /// per-review attempt counter to report here today — `1` reflects "review
 /// ran and this is its outcome" rather than a meaningful retry count.
+///
+/// `EndReviewNode` (`EN.ticket.review-mode-endonly-reviews-nothing`) is
+/// checked FIRST: under `ReviewMode::EndOnly`, `ConsolidatedReviewNode`
+/// never runs at all (`TriageRouterNode` routes every `PASS` straight to
+/// `UpdateTaskStatusNode`, skipping it), so the end review is the run's
+/// ONLY review record — without this precedence the committed state's
+/// `review` block would be `None` and falsely claim no review happened.
+/// Under `PerTask`/`TrivialSkip`, `EndReviewNode` is a zero-call
+/// pass-through that writes no `ctx.nodes` entry, so `get_result` returns
+/// `None` here and this falls through to `ConsolidatedReviewNode` exactly
+/// as before this ticket.
 fn committed_review(ctx: &TaskContext) -> Option<CommittedReview> {
+    if let Some(review) = get_result(ctx, "EndReviewNode") {
+        if let Some(verdict) = review.get("verdict").and_then(|v| v.as_str()) {
+            let findings = review
+                .get("issues")
+                .and_then(|value| value.as_array())
+                .map(|issues| {
+                    issues
+                        .iter()
+                        .filter_map(|issue| issue.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Some(CommittedReview {
+                verdict: verdict.to_string(),
+                findings,
+                attempts: 1,
+            });
+        }
+    }
+
     let review = get_result(ctx, "ConsolidatedReviewNode")?;
     let verdict = review.get("verdict")?.as_str()?.to_string();
     let findings = review
@@ -211,7 +248,7 @@ fn committed_pr(_ctx: &TaskContext) -> Option<CommittedPr> {
 /// `FinalValidationNode` never ran this walk (a bailed run routes straight
 /// to `WrapUpNode` from a router and never reaches the drain branch) or if
 /// its stamped result somehow fails to parse as [`CommittedFinalValidation`].
-fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidation> {
+pub(crate) fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidation> {
     let result = get_result(ctx, "FinalValidationNode")?;
     serde_json::from_value(result.clone()).ok()
 }
@@ -230,6 +267,18 @@ fn committed_final_validation(ctx: &TaskContext) -> Option<CommittedFinalValidat
 /// An explicit `MAJOR_BAIL` / structural review fail is checked first and
 /// wins over an `unrecognized_verdict` where both are somehow present, so a
 /// real bail signal is never masked by the router-fallback bookkeeping.
+///
+/// After those two model-judgment stages, and before the `unrecognized_verdict`
+/// fallback, this also consults `committed_final_validation`: a stamped
+/// `FinalValidationNode` result with `all_passed: false` returns
+/// `TerminalSignal::FinalValidationFailed`. A run that bailed before the
+/// drain branch never ran `FinalValidationNode`, so `committed_final_validation`
+/// is `None` and this arm is inert for it; a passing gate likewise returns
+/// `None`. The ordering matters for the same reason `MAJOR_BAIL` is checked
+/// before the router-fallback arms: an explicit model-judged bail must never
+/// be masked by the gate signal, so the gate check sits strictly after both
+/// model-judgment arms and strictly before the `unrecognized_verdict`
+/// catch-alls (which only fire when nothing more specific already matched).
 fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
     if let Some(triage) = get_result(ctx, "TriageTaskNode") {
         if triage.get("verdict").and_then(|v| v.as_str()) == Some("MAJOR_BAIL") {
@@ -261,6 +310,83 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
                 Some("PARTIAL") => return Some(TerminalSignal::StructuralFail(summary)),
                 _ => {}
             }
+        } else if matches!(verdict, Some("FAIL") | Some("PARTIAL")) {
+            // EN.ticket.review-retry-loop-unbounded task 3: a non-structural
+            // (minor-issue) FAIL/PARTIAL normally routes back through
+            // `IncrementAttemptNode` (`ReviewRouterNode`'s retry back-edge)
+            // and never reaches `WrapUpNode` at all — so reaching this node
+            // with a minor verdict still on the board means the router
+            // redirected here because the durable `review_attempts` counter
+            // had hit `policy.max_review_attempts`. Confirm that reading
+            // (rather than trusting routing alone, since `WrapUpNode` is
+            // also the MAJOR_BAIL/structural target and this branch must
+            // stay inert for those) before reporting exhaustion, so a
+            // genuinely under-bound minor verdict — reachable only via a
+            // test driving `WrapUpNode` directly — never gets misreported
+            // as exhaustion.
+            let review_attempts = latest_state(ctx)
+                .map(|state| state.telemetry.review_attempts)
+                .unwrap_or(0);
+            let max_review_attempts = resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
+            if matches!(max_review_attempts, Some(max) if review_attempts >= max) {
+                let summary = review
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Some(TerminalSignal::ReviewExhausted(summary));
+            }
+        }
+    }
+
+    // End-of-run review (`EN.ticket.review-mode-endonly-reviews-nothing`):
+    // only reachable under `ReviewMode::EndOnly` — `EndReviewNode` is a
+    // zero-call pass-through under `PerTask`/`TrivialSkip` and writes no
+    // `ctx.nodes` entry there, so `get_result` returns `None` and this arm
+    // is inert for those modes. Checked after the two model-judgment arms
+    // above (an explicit MAJOR_BAIL always wins) and before the
+    // `FinalValidationFailed` gate check below, since the end review is the
+    // more specific signal — it names the unmet Acceptance Criteria, not
+    // just a failing command.
+    if let Some(end_review) = get_result(ctx, "EndReviewNode") {
+        let verdict = end_review.get("verdict").and_then(|v| v.as_str());
+        if matches!(verdict, Some("FAIL") | Some("PARTIAL")) {
+            let summary = end_review
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let issues: Vec<String> = end_review
+                .get("issues")
+                .and_then(|v| v.as_array())
+                .map(|issues| {
+                    issues
+                        .iter()
+                        .filter_map(|issue| issue.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let message = if issues.is_empty() {
+                summary
+            } else {
+                format!("{summary} ({})", issues.join("; "))
+            };
+            return Some(TerminalSignal::EndReviewFail(message));
+        }
+    }
+
+    // Run-level gate (this ticket): the tasks themselves may all have
+    // passed their own loops, but a failed `FinalValidationNode` full-suite
+    // gate is still a terminal signal — `verify_state_write` (ORCHESTRATION)
+    // treats a written `"done"` as admission for the next block in a chain,
+    // so a red build must not be reported as clean. Checked after the two
+    // model-judgment arms above (a real bail always wins) and before the
+    // `unrecognized_verdict` fallback below.
+    if let Some(final_validation) = committed_final_validation(ctx) {
+        if !final_validation.all_passed {
+            return Some(TerminalSignal::FinalValidationFailed(
+                final_validation.failure_summary,
+            ));
         }
     }
 
@@ -284,15 +410,32 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
             )));
         }
     }
+    if let Some(end_review) = get_result(ctx, "EndReviewNode") {
+        if let Some(verdict) = end_review
+            .get("unrecognized_verdict")
+            .and_then(|v| v.as_str())
+        {
+            return Some(TerminalSignal::MajorBail(format!(
+                "unrecognized end-review verdict: {verdict}"
+            )));
+        }
+    }
 
     None
 }
 
-/// `planning/{spec_slug}/sdlc/sdlc-flow-state.json` inside `worktree` — the
+/// `planning/{spec_slug}/sdlc/{state_filename}` inside `worktree` — the
 /// D31-committed path (see `D10-committed-state-path-schema-alignment.md`)
 /// `task_loop::SaveStateNode` also writes to. Creates the `sdlc/`
-/// intermediate directory if needed.
-fn state_path_for(worktree: &str, spec_slug: &str) -> Result<std::path::PathBuf, NodeError> {
+/// intermediate directory if needed. `state_filename` is
+/// [`super::DEFAULT_STATE_FILENAME`] for every existing caller (`WrapUpNode`
+/// defaults its stored filename to that const), so behaviour is
+/// byte-identical after `EN.11.M` task 4 parameterized this site.
+pub(crate) fn state_path_for(
+    worktree: &str,
+    spec_slug: &str,
+    state_filename: &str,
+) -> Result<std::path::PathBuf, NodeError> {
     let state_dir = std::path::Path::new(worktree)
         .join("planning")
         .join(spec_slug)
@@ -300,7 +443,7 @@ fn state_path_for(worktree: &str, spec_slug: &str) -> Result<std::path::PathBuf,
     std::fs::create_dir_all(&state_dir).map_err(|err| {
         NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
     })?;
-    Ok(state_dir.join("sdlc-flow-state.json"))
+    Ok(state_dir.join(state_filename))
 }
 
 /// Persist `state` (already stamped with `policy`/`outcomes`) to
@@ -311,7 +454,7 @@ fn state_path_for(worktree: &str, spec_slug: &str) -> Result<std::path::PathBuf,
 /// and never re-runs after `WrapUpNode`, so without this write those blocks
 /// are computed here and then discarded when the run ends.
 #[allow(clippy::too_many_arguments)]
-fn persist_state(
+pub(crate) fn persist_state(
     state_path: &std::path::Path,
     state: &SDLCState,
     run_meta: &RunMeta,
@@ -375,8 +518,18 @@ fn persist_state(
 /// `tasks.md` Notes for the rationale: this runs from `engine-serve`'s
 /// post-walk cleanup, outside any node, where there is no `CommandRunner`
 /// seam).
+///
+/// `state_filename` is a parameter rather than a stored field (`EN.11.M`
+/// task 4) because this is a free function called from outside any node
+/// instance — `engine-serve`'s post-walk cleanup has no `WrapUpNode` to
+/// carry a builder-set filename on. Every existing caller passes
+/// [`super::DEFAULT_STATE_FILENAME`], so behaviour is byte-identical.
 #[must_use]
-pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<String> {
+pub fn write_terminal_blocked_state(
+    ctx: &TaskContext,
+    reason: &str,
+    state_filename: &str,
+) -> Option<String> {
     let worktree = worktree_path(ctx)?;
     let state = latest_state(ctx).ok()?;
     let spec_slug = state.spec_slug.clone();
@@ -388,7 +541,7 @@ pub fn write_terminal_blocked_state(ctx: &TaskContext, reason: &str) -> Option<S
     if !state_dir.is_dir() {
         return None;
     }
-    let state_path = state_dir.join("sdlc-flow-state.json");
+    let state_path = state_dir.join(state_filename);
 
     let run_meta = build_run_meta(ctx, &worktree, &state_path);
     let review = committed_review(ctx);
@@ -533,6 +686,7 @@ fn finalize_outcomes(
 pub struct WrapUpNode {
     clock: ClockFn,
     runner: CommandRunner,
+    state_filename: &'static str,
 }
 
 impl WrapUpNode {
@@ -541,6 +695,7 @@ impl WrapUpNode {
         Self {
             clock: default_clock(),
             runner: super::default_command_runner(),
+            state_filename: super::DEFAULT_STATE_FILENAME,
         }
     }
 
@@ -558,6 +713,16 @@ impl WrapUpNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the state filename this node reads/writes. Defaults to
+    /// [`super::DEFAULT_STATE_FILENAME`]; `EN.11.M` task 4 adds this so a
+    /// second engine can reuse the node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
         self
     }
 }
@@ -585,13 +750,20 @@ impl Node for WrapUpNode {
             super::schema::derive_committed_status(&state, terminal_signal.as_ref()).to_string();
 
         // `FinalValidationNode`'s outcome (if the run reached the drain
-        // branch — a bailed run never does) is reported, never converted
-        // into a bail: the tasks themselves already passed their own
-        // tripwires and reviews, so a failed run-level gate is a degraded
-        // terminal status, not a `TerminalSignal::MajorBail` (see this
-        // spec's `tasks.md` Notes and `D12-per-task-vs-final-check-depth.md`
-        // for why `derive_terminal_signal`/`derive_committed_status` above
-        // deliberately never consult it).
+        // branch — a bailed run never does) used to be reported only, never
+        // converted into a bail (`D12-per-task-vs-final-check-depth.md`):
+        // the tasks themselves already passed their own tripwires and
+        // reviews, so a failed run-level gate was treated as a degraded
+        // terminal status rather than a `TerminalSignal`. D12 was chosen for
+        // a human-driven single run where a degraded-wording report is read
+        // by a person. It does not survive contact with ORCHESTRATION's
+        // `verify_state_write`, whose entire admission decision for the next
+        // block in a chain is `status == "done"` — a chain advancing on a
+        // red build is not a reporting problem. `derive_terminal_signal`
+        // above now consults this same gate via `committed_final_validation`
+        // (see its doc comment), so `state.global_status`/`state.bail_reason`
+        // already reflect a failed gate by the time we read it again here
+        // purely to render the prose below.
         let final_validation = committed_final_validation(&ctx);
 
         let spec_slug = &state.spec_slug;
@@ -692,7 +864,7 @@ impl Node for WrapUpNode {
         // real run, so there is nothing to persist to.
         let saved_to = match worktree_path(&ctx) {
             Some(worktree) => {
-                let state_path = state_path_for(&worktree, spec_slug)?;
+                let state_path = state_path_for(&worktree, spec_slug, self.state_filename)?;
                 let run_meta = build_run_meta(&ctx, &worktree, &state_path);
                 let review = committed_review(&ctx);
                 let docs = committed_docs(&ctx);
@@ -1116,8 +1288,12 @@ mod tests {
             serde_json::to_value(&incremented_state).unwrap(),
         );
 
-        let written_path = write_terminal_blocked_state(&ctx, "MAJOR_BAIL: too many retries")
-            .expect("should write a terminal state");
+        let written_path = write_terminal_blocked_state(
+            &ctx,
+            "MAJOR_BAIL: too many retries",
+            DEFAULT_STATE_FILENAME,
+        )
+        .expect("should write a terminal state");
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(written_path).unwrap()).unwrap();
 
@@ -1493,6 +1669,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
+    /// EN.ticket.review-retry-loop-unbounded task 3: a minor-issue verdict
+    /// (non-structural FAIL/PARTIAL) that reached `WrapUpNode` because the
+    /// durable `review_attempts` counter hit `policy.max_review_attempts`
+    /// yields `ReviewExhausted`, a blocked status, and a bail reason naming
+    /// review exhaustion plus the last verdict's summary.
+    #[tokio::test]
+    async fn wrap_up_populates_bail_reason_on_review_exhaustion() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-retry-loop-unbounded-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::InProgress;
+        state.tasks.push(task);
+        state.telemetry.review_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PARTIAL", "summary": "still missing the edge case", "issues": ["one small thing"] }),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts: 3,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-21"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Review attempts exhausted: still missing the edge case")
+        );
+        // The resolved `max_review_attempts` is attributable in the
+        // committed policy snapshot.
+        assert_eq!(value["policy"]["max_review_attempts"], json!(3));
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// Below the bound, a minor-issue verdict reaching `WrapUpNode` directly
+    /// (e.g. a test driving the node in isolation) must NOT be misreported
+    /// as exhaustion — this arm only fires once the counter has actually
+    /// hit the bound.
+    #[tokio::test]
+    async fn wrap_up_does_not_report_exhaustion_below_the_bound() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-retry-loop-unbounded-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::InProgress;
+        state.tasks.push(task);
+        state.telemetry.review_attempts = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PARTIAL", "summary": "minor nit", "issues": ["one small thing"] }),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts: 3,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-21"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        // No terminal signal fired for this arm below the bound: the task
+        // is still in progress, so the run reports "running", not "blocked".
+        assert_eq!(value["status"], json!("running"));
+        assert!(value["bail_reason"].is_null());
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// An explicit `MAJOR_BAIL` still wins over review exhaustion, matching
+    /// the existing precedence ordering `derive_terminal_signal` documents.
+    #[tokio::test]
+    async fn wrap_up_prefers_major_bail_reason_over_review_exhaustion() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-retry-loop-unbounded-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Failed;
+        state.tasks.push(task);
+        state.telemetry.review_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({ "verdict": "MAJOR_BAIL", "reason": "max attempts reached" }),
+        );
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({ "verdict": "PARTIAL", "summary": "minor nit", "issues": ["one small thing"] }),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts: 3,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-21"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+        let saved_to = result["saved_to"].as_str().unwrap();
+
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("max attempts reached"),
+            "MAJOR_BAIL must win over review exhaustion"
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
     /// EN.3.G task 1: a ctx carrying `unrecognized_verdict` (stamped by
     /// `TriageTaskNode`/`ConsolidatedReviewNode` when the model's reply is
     /// garbage) still yields a `MajorBail` terminal signal whose message
@@ -1681,8 +2007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrap_up_writes_failing_final_validation_with_degraded_wording_but_non_blocked_status()
-    {
+    async fn wrap_up_writes_failing_final_validation_as_blocked_status() {
         let worktree = temp_worktree();
 
         let mut state = SDLCState::new("EN.3.E-fixture");
@@ -1711,10 +2036,17 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         let result = &out.nodes["WrapUpNode"];
 
-        // Reported, not converted into a bail: no task itself failed, so
-        // `status` stays out of `"blocked"` even though the run-level gate
-        // failed (see `derive_terminal_signal`/`derive_committed_status`,
-        // which never consult `FinalValidationNode`).
+        // Renamed from
+        // `wrap_up_writes_failing_final_validation_with_degraded_wording_but_non_blocked_status`,
+        // which pinned `D12-per-task-vs-final-check-depth.md`'s
+        // reporting-only stance: no task itself failed, so `status` stayed
+        // `"done"` even though the run-level gate failed. This ticket
+        // reverses that decision on purpose — ORCHESTRATION's
+        // `verify_state_write` treats a written `"done"` as admission for
+        // the next block in a chain, and D12's human-read-single-run
+        // rationale does not survive contact with that automated gate. The
+        // degraded wording is still expected; only the status assertions
+        // below are inverted.
         let status_suggestion = result["status_suggestion"].as_str().unwrap();
         assert!(status_suggestion.contains("FAILED"));
         assert!(status_suggestion.contains("Failed checks: build"));
@@ -1727,8 +2059,212 @@ mod tests {
             value["final_validation"]["failure_summary"],
             json!("Failed checks: build")
         );
-        assert_ne!(value["status"], json!("blocked"));
+        assert_eq!(value["status"], json!("blocked"));
+        assert_ne!(value["status"], json!("done"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Final validation gate FAILED: Failed checks: build")
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// `EndReviewNode`'s FAIL verdict (`EN.ticket.review-mode-endonly-reviews-nothing`)
+    /// must produce a blocked terminal status with a `bail_reason` naming
+    /// the unmet criteria — the review's summary and issue list — and the
+    /// end review's verdict/summary/issues must land in the committed
+    /// state's `review` block, since under `EndOnly` it is the run's ONLY
+    /// review record.
+    #[tokio::test]
+    async fn wrap_up_writes_end_review_fail_as_blocked_status_with_review_block() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-mode-endonly-reviews-nothing-fixture");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "EndReviewNode".to_string(),
+            json!({
+                "verdict": "FAIL",
+                "summary": "criteria unmet",
+                "issues": ["task 1's criterion X was not satisfied"],
+                "review_diff_max_chars": 200_000,
+                "review_diff_truncated": false,
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-20"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+
+        let saved_to = result["saved_to"].as_str().unwrap();
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+
+        assert_eq!(value["status"], json!("blocked"));
+        let bail_reason = value["bail_reason"].as_str().unwrap();
+        assert!(bail_reason.contains("criteria unmet"));
+        assert!(bail_reason.contains("task 1's criterion X was not satisfied"));
+
+        assert_eq!(value["review"]["verdict"], json!("FAIL"));
+        assert_eq!(
+            value["review"]["findings"],
+            json!(["task 1's criterion X was not satisfied"])
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// `EndReviewNode`'s zero-call pass-through under `PerTask`/`TrivialSkip`
+    /// (no `ctx.nodes["EndReviewNode"]` entry) must never be mistaken for a
+    /// FAIL — the happy path stays `"done"`.
+    #[tokio::test]
+    async fn wrap_up_ignores_absent_end_review_result() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-mode-endonly-reviews-nothing-fixture-2");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+        state.telemetry.tasks_passed = 1;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-20"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let saved_to = out.nodes["WrapUpNode"]["saved_to"].as_str().unwrap();
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+
         assert_eq!(value["status"], json!("done"));
+        assert!(value["bail_reason"].is_null());
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// A real model-judged bail must never be masked by the gate signal
+    /// (this ticket's ordering rule in `derive_terminal_signal`): a
+    /// `MAJOR_BAIL` triage verdict wins even when `FinalValidationNode` also
+    /// failed, so the `bail_reason` names the triage reason, not the gate's.
+    #[tokio::test]
+    async fn wrap_up_prefers_major_bail_reason_over_failed_gate() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.3.E-fixture");
+        state.telemetry.tasks_passed = 0;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({
+                "verdict": "MAJOR_BAIL",
+                "reason": "Max attempts (3) reached without a passing run.",
+            }),
+        );
+        ctx.nodes.insert(
+            "FinalValidationNode".to_string(),
+            json!({
+                "all_passed": false,
+                "check_results": [
+                    { "name": "build", "kind": "command", "passed": false },
+                ],
+                "failure_summary": "Failed checks: build",
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-02"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+
+        let saved_to = result["saved_to"].as_str().unwrap();
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Max attempts (3) reached without a passing run.")
+        );
+        // The gate's own failure summary must not have won the bail_reason.
+        assert_ne!(
+            value["bail_reason"],
+            json!("Final validation gate FAILED: Failed checks: build")
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// The same precedence rule, pinned specifically against the new
+    /// `EndReviewNode` FAIL signal (`EN.ticket.review-mode-endonly-reviews-nothing`
+    /// task 2 acceptance criterion: "An explicit MAJOR_BAIL still wins over
+    /// an end-review FAIL"): an explicit `MAJOR_BAIL` triage verdict must
+    /// win even when `EndReviewNode` also stamped a FAIL, so the
+    /// `bail_reason` names the triage reason, not the end review's.
+    #[tokio::test]
+    async fn wrap_up_prefers_major_bail_reason_over_end_review_fail() {
+        let worktree = temp_worktree();
+
+        let mut state = SDLCState::new("EN.ticket.review-mode-endonly-reviews-nothing-fixture-3");
+        state.telemetry.tasks_passed = 0;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({
+                "verdict": "MAJOR_BAIL",
+                "reason": "Max attempts (3) reached without a passing run.",
+            }),
+        );
+        ctx.nodes.insert(
+            "EndReviewNode".to_string(),
+            json!({
+                "verdict": "FAIL",
+                "summary": "criteria unmet",
+                "issues": ["some criterion not met"],
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-20"));
+        let out = node.process(ctx).await.expect("process should succeed");
+        let result = &out.nodes["WrapUpNode"];
+
+        let saved_to = result["saved_to"].as_str().unwrap();
+        let on_disk = std::fs::read_to_string(saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+
+        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(
+            value["bail_reason"],
+            json!("Max attempts (3) reached without a passing run.")
+        );
+        assert!(!value["bail_reason"]
+            .as_str()
+            .unwrap()
+            .contains("criteria unmet"));
 
         let _ = std::fs::remove_dir_all(&worktree);
     }
@@ -1850,8 +2386,12 @@ mod tests {
             json!({ "worktree_path": worktree.to_string_lossy() }),
         );
 
-        let saved_to = write_terminal_blocked_state(&ctx, "node ImplementTaskNode failed: boom")
-            .expect("worktree + loaded state present, parent dir exists");
+        let saved_to = write_terminal_blocked_state(
+            &ctx,
+            "node ImplementTaskNode failed: boom",
+            DEFAULT_STATE_FILENAME,
+        )
+        .expect("worktree + loaded state present, parent dir exists");
 
         let on_disk = std::fs::read_to_string(&saved_to).unwrap();
         let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
@@ -1872,7 +2412,10 @@ mod tests {
         let state = SDLCState::new("EN.6.J-terminal-fixture");
         let ctx = ctx_with_state(&state);
 
-        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+        assert_eq!(
+            write_terminal_blocked_state(&ctx, "boom", DEFAULT_STATE_FILENAME),
+            None
+        );
     }
 
     #[test]
@@ -1890,7 +2433,10 @@ mod tests {
             json!({ "worktree_path": worktree.to_string_lossy() }),
         );
 
-        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+        assert_eq!(
+            write_terminal_blocked_state(&ctx, "boom", DEFAULT_STATE_FILENAME),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }
@@ -1909,7 +2455,10 @@ mod tests {
             json!({ "worktree_path": worktree.to_string_lossy() }),
         );
 
-        assert_eq!(write_terminal_blocked_state(&ctx, "boom"), None);
+        assert_eq!(
+            write_terminal_blocked_state(&ctx, "boom", DEFAULT_STATE_FILENAME),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&worktree);
     }

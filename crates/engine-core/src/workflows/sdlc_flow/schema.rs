@@ -77,6 +77,18 @@ pub struct SDLCTask {
     #[serde(default)]
     pub attempt_count: u32,
     /// Maximum number of attempts before a MAJOR_BAIL.
+    ///
+    /// **Precedence: task-declared > policy > built-in default.** A task
+    /// whose own JSON declares `max_attempts` always keeps that value; a
+    /// task that omits the field is seeded from the run's resolved
+    /// `SdlcPolicy::max_attempts` at task-creation/load time
+    /// (`setup.rs`'s `GenerateTasksNode` and `LoadTaskStateNode`), which
+    /// itself falls back to this field's `#[serde(default)]` of `3` only
+    /// when nothing set the policy either. The two same-named fields
+    /// (this one and `SdlcPolicy::max_attempts`) exist for different
+    /// audiences — this one is per-task, the policy one is the run-wide
+    /// seed for tasks that do not opt out of it — and the two must never
+    /// be conflated.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
 }
@@ -164,6 +176,23 @@ pub struct SDLCFlowEventSchema {
     /// layer down.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Optional owning program block identifier (e.g. `"EN.3.A"`), carried
+    /// onto the created [`SDLCState`] (`LoadTaskStateNode`) so a later
+    /// `CloseBlockNode` (EN.ticket.wrap-up-closes-the-block) knows which
+    /// block this run is for without re-deriving it from the spec
+    /// directory name. `None`/absent preserves today's behavior exactly:
+    /// `SDLCState::block_id` stays `None`, same as before this field
+    /// existed. Only consulted when a state file does not already exist for
+    /// this spec — a resumed run keeps whatever `block_id` was already
+    /// committed to disk rather than letting a differing event value
+    /// silently rewrite it.
+    #[serde(default)]
+    pub block_id: Option<String>,
+    /// Optional owning phase identifier (e.g. `"EN.3"`), carried onto the
+    /// created [`SDLCState`] the same way and under the same rules as
+    /// [`Self::block_id`].
+    #[serde(default)]
+    pub phase_id: Option<String>,
 }
 
 /// Parse a task-range string like `"1-3,5"` into a sorted, deduplicated list
@@ -220,6 +249,26 @@ pub struct SDLCTelemetry {
     /// Number of tasks that reached FAILED.
     #[serde(default)]
     pub tasks_failed: u32,
+    /// Number of `ConsolidatedReviewNode` verdicts produced so far
+    /// (EN.ticket.review-retry-loop-unbounded task 2) — the durable counter
+    /// `ReviewRouterNode` bounds against, independent of `total_attempts`.
+    ///
+    /// **Scoped per-run, not per-task**, matching JS's `reviewAttempts`
+    /// (`base-template/.claude/workflows/sdlc-flow.js:252-253`), a single
+    /// loop counter for the run's review cycle — not per-task like
+    /// `SDLCTask::attempt_count`. This also matches where the field
+    /// physically lives: `SDLCTelemetry` is a whole-run aggregate on
+    /// `SDLCState`, not a per-`SDLCTask` field, so a fresh task does not
+    /// reset it. Deliberately NOT folded into `total_attempts`/
+    /// `attempt_count` (both bumped by `IncrementAttemptNode` on both
+    /// back-edges and consumed by `RunTelemetry`/`PolicyAggregate` to mean
+    /// "an implement/test attempt ran") — overloading them would make a
+    /// task that burned test retries arrive at review with a reduced review
+    /// budget, which is not the bound this ticket asks for, and would
+    /// corrupt existing attempt metrics. Same reasoning `wrap_up.rs` gives
+    /// for not letting bails increment `tasks_failed`.
+    #[serde(default)]
+    pub review_attempts: u32,
 }
 
 fn default_global_status() -> String {
@@ -718,6 +767,46 @@ pub enum TerminalSignal {
     /// routing gate as [`Self::ReviewFail`], distinguished only by the
     /// upstream verdict string.
     StructuralFail(String),
+    /// `FinalValidationNode` stamped `all_passed: false` on the run-level,
+    /// full-depth harness gate. Unlike the other three variants, this one is
+    /// not a model judgment about a single task or review pass — it is
+    /// derived from a RUN-LEVEL gate that runs once, after every task's own
+    /// loop already reported success, and it is the only variant that can
+    /// fire on a run where every task passed. The carried `String` is the
+    /// gate's `failure_summary` (the failing check names).
+    FinalValidationFailed(String),
+    /// `EndReviewNode` (`EN.ticket.review-mode-endonly-reviews-nothing`)
+    /// returned a `FAIL`/`PARTIAL` verdict over the whole run's diff against
+    /// the complete Acceptance Criteria, and `EndReviewRouterNode` routed
+    /// straight to `WrapUpNode` rather than `PatchDocsNode`. Only reachable
+    /// under `ReviewMode::EndOnly` — `EndReviewNode` is a zero-call
+    /// pass-through under `PerTask`/`TrivialSkip`, so this variant never
+    /// fires for those modes. An explicit [`Self::MajorBail`] (checked
+    /// first in `wrap_up::derive_terminal_signal`) still wins over this one.
+    /// The carried `String` names the unmet criteria (the review's summary,
+    /// plus its issue list when non-empty).
+    EndReviewFail(String),
+    /// `ReviewRouterNode`'s minor-issue back-edge (`FAIL`/`PARTIAL`, 1..=
+    /// `STRUCTURAL_ISSUE_THRESHOLD` issues) hit `policy.max_review_attempts`
+    /// (EN.ticket.review-retry-loop-unbounded task 3) — the run's per-run,
+    /// durable `telemetry.review_attempts` counter reached the bound before
+    /// the reviewer returned a clean `PASS`. Distinguished from
+    /// [`Self::ReviewFail`]/[`Self::StructuralFail`], which fire on the
+    /// FIRST structural verdict regardless of attempt count: this variant
+    /// only fires after the retry budget itself is exhausted. An explicit
+    /// [`Self::MajorBail`] or a structural review `FAIL` (checked first in
+    /// `wrap_up::derive_terminal_signal`, same precedence as today) still
+    /// wins over this one. The carried `String` is the last review verdict's
+    /// `summary`.
+    ReviewExhausted(String),
+    /// The D56 terminal reconcile (base-template D56 CALL 2) stamped
+    /// `all_passed: false` on the SDLC_TASK reconcile gate. Distinct from
+    /// [`Self::FinalValidationFailed`]: the per-task commits STAND (they
+    /// are not rolled back) and bookkeep is SKIPPED rather than run. This
+    /// variant is TERMINAL — the chain stops here — and only SDLC_TASK can
+    /// produce it; `sdlc_flow` never constructs this variant. The carried
+    /// `String` is the reconcile gate's `failure_summary`.
+    ReconcileFailed(String),
 }
 
 impl TerminalSignal {
@@ -727,18 +816,24 @@ impl TerminalSignal {
         match self {
             Self::MajorBail(message)
             | Self::ReviewFail(message)
-            | Self::StructuralFail(message) => message,
+            | Self::StructuralFail(message)
+            | Self::FinalValidationFailed(message)
+            | Self::EndReviewFail(message)
+            | Self::ReviewExhausted(message)
+            | Self::ReconcileFailed(message) => message,
         }
     }
 }
 
 /// Derive the D31 committed-state `status` string
-/// (`"running"|"review"|"docs"|"wrapup"|"blocked"|"done"`) from a state
-/// snapshot and an optional [`TerminalSignal`].
+/// (`"running"|"review"|"docs"|"wrapup"|"blocked"|"done"|"reconcile_failed"`)
+/// from a state snapshot and an optional [`TerminalSignal`].
 ///
-/// A `Some` terminal signal (of any variant) always yields `"blocked"` — the
-/// one real terminal-failure value this engine ever writes (there is no
-/// `"bailed"` anywhere in the codebase; see `run-sdlc-flow.sh`). Absent a
+/// A `Some(TerminalSignal::ReconcileFailed(_))` yields `"reconcile_failed"`
+/// (base-template D56 CALL 2) — only SDLC_TASK's reconcile gate produces
+/// this variant. Every other `Some` terminal signal yields `"blocked"` — the
+/// one other real terminal-failure value this engine ever writes (there is
+/// no `"bailed"` anywhere in the codebase; see `run-sdlc-flow.sh`). Absent a
 /// terminal signal, every task reaching `Done`/`Skipped` yields `"done"`;
 /// anything else yields `"running"`.
 ///
@@ -756,6 +851,9 @@ pub fn derive_committed_status(
     state: &SDLCState,
     terminal_signal: Option<&TerminalSignal>,
 ) -> &'static str {
+    if let Some(TerminalSignal::ReconcileFailed(_)) = terminal_signal {
+        return "reconcile_failed";
+    }
     if terminal_signal.is_some() {
         return "blocked";
     }
@@ -789,9 +887,22 @@ pub fn derive_current_task(tasks: &[SDLCTask]) -> u32 {
 
 /// Derive the D31 committed-state `bail_reason`: `Some(message)` for a
 /// `Some` [`TerminalSignal`] of any variant, `None` on the happy path.
+///
+/// [`TerminalSignal::FinalValidationFailed`] is formatted as
+/// `Final validation gate FAILED: <failure_summary>` — the same wording
+/// [`super::wrap_up::WrapUpNode`]'s `gate_note` already renders, so the
+/// prose and this machine-readable field cannot disagree.
 #[must_use]
 pub fn derive_bail_reason(terminal_signal: Option<&TerminalSignal>) -> Option<String> {
-    terminal_signal.map(|signal| signal.message().to_string())
+    terminal_signal.map(|signal| match signal {
+        TerminalSignal::FinalValidationFailed(failure_summary) => {
+            format!("Final validation gate FAILED: {failure_summary}")
+        }
+        TerminalSignal::ReviewExhausted(summary) => {
+            format!("Review attempts exhausted: {summary}")
+        }
+        other => other.message().to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1416,6 +1527,8 @@ mod tests {
             TerminalSignal::MajorBail("max attempts reached".to_string()),
             TerminalSignal::ReviewFail("review FAIL, 0 issues".to_string()),
             TerminalSignal::StructuralFail("review PARTIAL, 12 issues".to_string()),
+            TerminalSignal::FinalValidationFailed("cargo clippy".to_string()),
+            TerminalSignal::EndReviewFail("criterion X not met".to_string()),
         ] {
             assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
         }
@@ -1425,6 +1538,16 @@ mod tests {
         state.tasks = vec![task(1, SDLCTaskStatus::Done)];
         let signal = TerminalSignal::MajorBail("bail".to_string());
         assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
+
+        // `ReconcileFailed` is the one variant that does NOT map to
+        // "blocked" — it maps to its own "reconcile_failed" status (D56
+        // CALL 2), asserted separately from the loop above.
+        let reconcile_signal =
+            TerminalSignal::ReconcileFailed("cargo nextest run --workspace".to_string());
+        assert_eq!(
+            derive_committed_status(&state, Some(&reconcile_signal)),
+            "reconcile_failed"
+        );
     }
 
     #[test]
@@ -1502,6 +1625,28 @@ mod tests {
             derive_bail_reason(Some(&TerminalSignal::StructuralFail("s".to_string()))),
             Some("s".to_string())
         );
+        assert_eq!(
+            derive_bail_reason(Some(&TerminalSignal::EndReviewFail("e".to_string()))),
+            Some("e".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_bail_reason_final_validation_failed_matches_gate_note_wording() {
+        assert_eq!(
+            derive_bail_reason(Some(&TerminalSignal::FinalValidationFailed(
+                "cargo clippy, cargo nextest".to_string()
+            ))),
+            Some("Final validation gate FAILED: cargo clippy, cargo nextest".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_committed_status_blocked_for_final_validation_failed() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![task(1, SDLCTaskStatus::Done)];
+        let signal = TerminalSignal::FinalValidationFailed("cargo build --release".to_string());
+        assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
     }
 
     #[test]
@@ -1524,6 +1669,7 @@ mod tests {
             budget_spent: 0.05,
             tasks_passed: 2,
             tasks_failed: 0,
+            review_attempts: 1,
         };
         state.policy = Some(SdlcPolicy::default());
         state.outcomes = Some(RunOutcomes {

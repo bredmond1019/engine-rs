@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-portfolio/base-template/lease.schema.json",
+  "title": "Repo Lease",
+  "description": "A claim on a repo's working tree, taken before any commit and released at block boundaries. Exists to fix the largest measured incident class in the corpus — verbatim from fleet orchestration-run records: 'INCIDENT · I discarded another lane's uncommitted files'; 'A sibling lane swept this lane's spec edits into its commit — OPEN (4th instance today)'; and `emit-state` named as 'the exact mechanism by which one lane sweeps three other lanes' work into its commit'. Nothing today lets a lane discover that another holds the tree it is about to write to; this record is that discovery mechanism. Sibling to lane-agent.schema.json, lane.schema.json and block.schema.json. This block ships the shape, checker and read helpers only; taking or releasing leases is BT.6.E.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "repo",
+    "lane",
+    "agent",
+    "acquired_at",
+    "kind"
+  ],
+  "properties": {
+    "repo": {
+      "type": "string",
+      "description": "Repo slug whose working tree this lease covers, as registered in brain.toml. Duplicate-exclusive-lease detection groups leases by this field.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "lane": {
+      "type": "string",
+      "description": "The lane holding this lease, matching the <name> in its lane-<name>.json record (lane.schema.json). Lets a duplicate-claim error name which lane, not just which agent, holds each conflicting lease.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "agent": {
+      "type": "string",
+      "description": "The ListAgents nickname currently holding this lease, matching lane-agent.schema.json's agent_name. Recorded so a duplicate-claim error can name the actual claimant to contact, not just the lane slug.",
+      "minLength": 1
+    },
+    "acquired_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp with timezone marking when this lease was taken. Doubles as the lease's heartbeat: a lease held far past a normal block duration without release is the stale-lease signal the checker flags.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "kind": {
+      "type": "string",
+      "description": "Whether this lease excludes other claimants. Two 'shared' leases on the same repo are legal — read-only or non-conflicting concurrent work — but two 'exclusive' leases on the same repo are not: exclusive means this lane is about to write to the tree and no one else may hold any lease on it at the same time. This asymmetry is the entire reason the field exists.",
+      "enum": ["exclusive", "shared"]
+    }
+  }
+}

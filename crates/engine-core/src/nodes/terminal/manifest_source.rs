@@ -37,9 +37,7 @@
 //! An override file that fails to read or fails to parse/compile does NOT
 //! propagate an error to the caller. [`ManifestSource::resolve`] instead:
 //!
-//! 1. Logs loudly (`eprintln!` — this workspace carries no `tracing`/`log`
-//!    dependency; see `crate::workflows::sdlc_flow::log_noop_commit`'s doc
-//!    comment for the same precedent).
+//! 1. Logs loudly via `tracing::warn!` (structured logging, EN.11.I).
 //! 2. Keeps serving the last-good compiled override, if one has ever been
 //!    loaded successfully from this same path.
 //! 3. Only when there is no last-good override yet does it fall back to the
@@ -179,32 +177,32 @@ impl ManifestSource {
                             resolved
                         }
                         Err(err) => {
-                            eprintln!(
-                                "terminal::manifest_source: WARNING override manifest at \
-                                 '{}' failed to compile ({err}); {}",
-                                path.display(),
-                                Self::fallback_reason(&cache, &path)
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %err,
+                                fallback = Self::fallback_reason(&cache, &path),
+                                "terminal::manifest_source: override manifest failed to compile"
                             );
                             Self::fallback_after_bad_override(&mut cache, &path)
                         }
                     },
                     Err(err) => {
-                        eprintln!(
-                            "terminal::manifest_source: WARNING override manifest at \
-                             '{}' could not be read ({err}); {}",
-                            path.display(),
-                            Self::fallback_reason(&cache, &path)
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            fallback = Self::fallback_reason(&cache, &path),
+                            "terminal::manifest_source: override manifest could not be read"
                         );
                         Self::fallback_after_bad_override(&mut cache, &path)
                     }
                 }
             }
             Err(err) => {
-                eprintln!(
-                    "terminal::manifest_source: WARNING override manifest path \
-                     '{}' has no metadata ({err}); {}",
-                    path.display(),
-                    Self::fallback_reason(&cache, &path)
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    fallback = Self::fallback_reason(&cache, &path),
+                    "terminal::manifest_source: override manifest path has no metadata"
                 );
                 Self::fallback_after_bad_override(&mut cache, &path)
             }
@@ -224,7 +222,7 @@ impl ManifestSource {
     /// On a bad override read/compile: keep serving the last-good compiled
     /// override for this same path if one exists, otherwise fall back to
     /// the embedded manifest. Both branches were already announced by the
-    /// caller's `eprintln!` — this never falls back *silently*.
+    /// caller's `tracing::warn!` — this never falls back *silently*.
     fn fallback_after_bad_override(cache: &mut Cache, path: &Path) -> ResolvedManifest {
         if let Some(oc) = &cache.override_state {
             if oc.path == path {

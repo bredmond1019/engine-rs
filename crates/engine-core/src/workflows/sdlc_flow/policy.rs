@@ -40,7 +40,16 @@ pub enum ReviewMode {
     /// A trivial green task (small diff, first-pass green) skips per-task
     /// review; a non-trivial task still routes to review.
     TrivialSkip,
-    /// Per-task review is collapsed into a single end-of-run review.
+    /// Per-task review is collapsed into a single end-of-run review: the
+    /// drain branch's `EndReviewNode` (`end_review.rs`) makes exactly one
+    /// review call over the whole run's accumulated diff against the
+    /// complete Acceptance Criteria, instead of `ConsolidatedReviewNode`
+    /// reviewing each task's diff separately. It is single-pass — a FAIL
+    /// verdict blocks the run with a named reason rather than looping a
+    /// fix pass the way JS's end review does. Proven by
+    /// `end_only_full_run_makes_exactly_one_review_call_with_full_ac_and_multi_task_diff`
+    /// and `end_only_fail_verdict_routes_to_wrap_up_with_blocked_status_and_bail_reason`
+    /// in `crates/engine-core/tests/it/sdlc_flow_end_review_e2e.rs`.
     EndOnly,
 }
 
@@ -227,22 +236,6 @@ pub struct PartialTransportRetry {
     pub initial_backoff_ms: Option<u64>,
 }
 
-/// Which pipeline stages `close-out` (EN.2.x) is allowed to reuse from a
-/// prior flow record rather than re-running (lever #1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct CloseOutReuse {
-    pub validation: bool,
-    pub review: bool,
-    pub docs: bool,
-}
-
-/// The `close_out` policy block: just the reuse flags today, nested to
-/// mirror the economics-notes JSON shape and leave room to grow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct CloseOut {
-    pub reuse: CloseOutReuse,
-}
-
 /// The fully-resolved, per-run SDLC Flow policy — the merge of built-in
 /// defaults, `harness.json`'s `sdlc.policy` defaults, and any per-run event
 /// override, high->low precedence in that order.
@@ -261,10 +254,44 @@ pub struct SdlcPolicy {
     pub timeouts: CallTimeouts,
     /// Configuration for the `local` model tier, when any stage uses it.
     pub local: LocalConfig,
-    pub simple_task_max_files: u32,
+    // `simple_task_max_files` was the selector for a simple-task path
+    // (paired with `ModelTiers::implement_simple`) that was never built —
+    // deleted 2026-08-21 (EN.ticket.sdlc-flow-dead-policy-knobs task 4)
+    // as a dead knob per CLAUDE.md standing rule 6. If that path is ever
+    // built, this knob and `implement_simple` come back together.
+    /// Enables `TriageTaskNode`'s model-triage branch. **Precedence: the
+    /// bare `event.llm_triage` field (`SDLCFlowEventSchema::llm_triage`,
+    /// the pre-existing, still-supported spelling) wins when a caller sets
+    /// it explicitly; otherwise this resolved policy value applies** (a
+    /// per-run `policy` override, then a named `profile`, then
+    /// `harness.json`, then this built-in default of `false`). This is the
+    /// canonical spelling going forward — see `TriageTaskNode` in
+    /// `task_loop.rs`.
     pub llm_triage: bool,
+    /// Run-wide SEED for [`super::schema::SDLCTask::max_attempts`], applied
+    /// at task-creation/load time by `setup.rs`'s `GenerateTasksNode` and
+    /// `LoadTaskStateNode`'s bootstrap-from-`tasks.json` path — never an
+    /// override. **Precedence: task-declared `max_attempts` > this policy
+    /// value > `SDLCTask`'s own built-in default of `3`.** A task whose
+    /// JSON explicitly sets its own `max_attempts` always keeps that value,
+    /// even when it happens to equal the default; only a task that omits
+    /// the field is seeded from here. Distinguishing "declared" from
+    /// "defaulted" requires inspecting the raw task JSON before
+    /// `serde(default)` collapses that distinction into a concrete `u32`.
     pub max_attempts: u32,
-    pub close_out: CloseOut,
+    /// Bound on the review-retry loop that `ReviewRouterNode` closes: a
+    /// `FAIL`/`PARTIAL` verdict with 1..=`STRUCTURAL_ISSUE_THRESHOLD` issues
+    /// routes back to `IncrementAttemptNode` at most `max_review_attempts`
+    /// times before the run is routed to `WrapUpNode` with a terminal
+    /// `ReviewExhausted` signal instead. Counted separately from
+    /// [`Self::max_attempts`] — see `review_attempts` on the durable
+    /// telemetry (`schema.rs`) for why the two counters must never be
+    /// conflated. Built-in default `3`, matching JS's `MAX_REVIEW_ATTEMPTS`
+    /// (`base-template/.claude/workflows/sdlc-flow.js:252-253`). Behavior-
+    /// stable in the sense that matters: it changes an unbounded loop into
+    /// a bounded one (the fix), but does not change any run that reviews
+    /// clean within three passes — i.e. every run that terminates today.
+    pub max_review_attempts: u32,
     /// Whether the previous attempt's failure output is fed back into
     /// `ImplementTaskNode`'s retry prompt, and how large that block may get.
     pub retry_feedback: RetryFeedback,
@@ -306,10 +333,11 @@ impl Default for SdlcPolicy {
             model_tiers: ModelTiers::default(),
             timeouts: CallTimeouts::default(),
             local: LocalConfig::default(),
-            simple_task_max_files: 2,
             llm_triage: false,
             max_attempts: 3,
-            close_out: CloseOut::default(),
+            // Matching JS's MAX_REVIEW_ATTEMPTS — see the field's doc
+            // comment for why it is a separate counter from `max_attempts`.
+            max_review_attempts: 3,
             // NOT behavior-stable, deliberately — see `RetryFeedback`'s docs.
             retry_feedback: RetryFeedback::default(),
             // Behavior-stable on the success path; NOT on the failure path,
@@ -329,8 +357,7 @@ impl Default for SdlcPolicy {
 /// All-optional mirror of [`SdlcPolicy`] used by the two override layers
 /// (`harness.json`'s `sdlc.policy` and a per-run event's `policy` field).
 /// Every field left `None` falls through to the next-lower-precedence
-/// layer; `close_out` is deep-merged field-by-field via `PartialCloseOut`
-/// rather than all-or-nothing.
+/// layer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialPolicy {
@@ -343,10 +370,9 @@ pub struct PartialPolicy {
     pub model_tiers: Option<PartialModelTiers>,
     pub timeouts: Option<PartialCallTimeouts>,
     pub local: Option<PartialLocalConfig>,
-    pub simple_task_max_files: Option<u32>,
     pub llm_triage: Option<bool>,
     pub max_attempts: Option<u32>,
-    pub close_out: Option<PartialCloseOut>,
+    pub max_review_attempts: Option<u32>,
     pub retry_feedback: Option<PartialRetryFeedback>,
     pub transport_retry: Option<PartialTransportRetry>,
     pub review_diff_max_chars: Option<u32>,
@@ -374,22 +400,6 @@ pub struct PartialCallTimeouts {
     pub review: Option<u64>,
     pub generate: Option<u64>,
     pub docs: Option<u64>,
-}
-
-/// All-optional mirror of [`CloseOutReuse`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PartialCloseOutReuse {
-    pub validation: Option<bool>,
-    pub review: Option<bool>,
-    pub docs: Option<bool>,
-}
-
-/// All-optional mirror of [`CloseOut`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PartialCloseOut {
-    pub reuse: Option<PartialCloseOutReuse>,
 }
 
 fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
@@ -461,26 +471,6 @@ fn merge_transport_retry(mut base: TransportRetry, over: &PartialTransportRetry)
     base
 }
 
-fn merge_close_out_reuse(mut base: CloseOutReuse, over: &PartialCloseOutReuse) -> CloseOutReuse {
-    if let Some(v) = over.validation {
-        base.validation = v;
-    }
-    if let Some(v) = over.review {
-        base.review = v;
-    }
-    if let Some(v) = over.docs {
-        base.docs = v;
-    }
-    base
-}
-
-fn merge_close_out(mut base: CloseOut, over: &PartialCloseOut) -> CloseOut {
-    if let Some(reuse) = &over.reuse {
-        base.reuse = merge_close_out_reuse(base.reuse, reuse);
-    }
-    base
-}
-
 impl crate::policy::Policy for SdlcPolicy {
     type Partial = PartialPolicy;
 
@@ -513,16 +503,9 @@ impl crate::policy::Policy for SdlcPolicy {
                 Some(l) => base.local.overlay(l),
                 None => base.local,
             },
-            simple_task_max_files: merge_opt(
-                base.simple_task_max_files,
-                over.simple_task_max_files,
-            ),
             llm_triage: merge_opt(base.llm_triage, over.llm_triage),
             max_attempts: merge_opt(base.max_attempts, over.max_attempts),
-            close_out: match &over.close_out {
-                Some(co) => merge_close_out(base.close_out, co),
-                None => base.close_out,
-            },
+            max_review_attempts: merge_opt(base.max_review_attempts, over.max_review_attempts),
             retry_feedback: match &over.retry_feedback {
                 Some(rf) => merge_retry_feedback(base.retry_feedback, rf),
                 None => base.retry_feedback,
@@ -593,12 +576,10 @@ mod tests {
         // `Opus` because that is what `GenerateTasksNode` actually runs.
         assert_eq!(policy.model_tiers.generate, ModelTier::Opus);
         assert_eq!(policy.model_tiers.docs, ModelTier::Sonnet);
-        assert!(!policy.close_out.reuse.validation);
-        assert!(!policy.close_out.reuse.review);
-        assert!(!policy.close_out.reuse.docs);
         assert!(!policy.prompt_cache);
         assert!(!policy.llm_triage);
         assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.max_review_attempts, 3);
     }
 
     #[test]
@@ -1210,34 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn event_override_beats_harness_default_for_close_out_reuse() {
-        let harness = PartialPolicy {
-            close_out: Some(PartialCloseOut {
-                reuse: Some(PartialCloseOutReuse {
-                    validation: Some(true),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
-        };
-        let event = PartialPolicy {
-            close_out: Some(PartialCloseOut {
-                reuse: Some(PartialCloseOutReuse {
-                    review: Some(true),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
-        };
-        let resolved = resolve(SdlcPolicy::default(), Some(&harness), None, Some(&event));
-        // Deep-merge: harness's `validation: true` survives the event layer,
-        // event's `review: true` layers on top, `docs` still falls to builtin.
-        assert!(resolved.close_out.reuse.validation);
-        assert!(resolved.close_out.reuse.review);
-        assert!(!resolved.close_out.reuse.docs);
-    }
-
-    #[test]
     fn deserializes_partial_policy_from_harness_json_shape() {
         let json = r#"{
             "output_verbosity": "terse",
@@ -1361,7 +1314,7 @@ mod tests {
             Some(&event),
         );
 
-        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"haiku\",\"triage\":\"haiku\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"simple_task_max_files\":2,\"llm_triage\":true,\"max_attempts\":4,\"close_out\":{\"reuse\":{\"validation\":false,\"review\":false,\"docs\":false}},\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
+        let expected = "{\"output_verbosity\":\"terse\",\"prompt_cache\":false,\"review_mode\":\"trivial_skip\",\"review_skip_max_files\":2,\"review_skip_max_diff_lines\":40,\"test_depth\":\"fast\",\"model_tiers\":{\"implement\":\"haiku\",\"implement_simple\":\"sonnet\",\"review\":\"haiku\",\"triage\":\"haiku\",\"generate\":\"haiku\",\"docs\":\"haiku\"},\"timeouts\":{\"implement\":null,\"triage\":null,\"review\":null,\"generate\":null,\"docs\":null},\"local\":{\"endpoint\":\"http://localhost:11434\",\"model\":\"qwen2.5-coder:7b\",\"constrained_json\":false},\"llm_triage\":true,\"max_attempts\":4,\"retry_feedback\":{\"enabled\":true,\"max_chars\":4000}}";
 
         let expected: serde_json::Value =
             serde_json::from_str(expected).expect("pinned baseline literal parses as JSON");
@@ -1382,7 +1335,7 @@ mod tests {
     fn repo_harness_json_deserializes_every_sdlc_policy_and_profile() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../planning/harness.json");
         let Ok(raw) = std::fs::read_to_string(path) else {
-            eprintln!("skipping: {path} not present (planning/ vault not mounted)");
+            tracing::debug!(path = %path, "skipping: planning/ vault not mounted");
             return;
         };
         let root: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -1413,6 +1366,150 @@ mod tests {
             assert!(
                 parsed.review_diff_max_chars.is_some(),
                 "{name} must set review_diff_max_chars"
+            );
+            assert!(
+                parsed.max_review_attempts.is_some(),
+                "{name} must set max_review_attempts"
+            );
+        }
+    }
+
+    /// Destructures `SdlcPolicy` using exactly the identifier list passed
+    /// in, then returns those identifiers' names as `&'static str`s. The
+    /// destructure has NO `..` — Rust's struct-pattern rules therefore
+    /// require this identifier list to name every field `SdlcPolicy` has,
+    /// in both directions: a field added to the struct and omitted here is
+    /// a "missing field" compile error, and a name listed here that the
+    /// struct does not have is a "no field with that name" compile error.
+    /// That is the actual guard — `every_sdlc_policy_field_has_a_declared_production_consumer`'s
+    /// runtime comparison below only checks this returned list against
+    /// `FIELD_CONSUMERS`, which by itself could drift from the struct if
+    /// nothing forced this macro's own list to stay honest.
+    macro_rules! policy_field_names {
+        ($($field:ident),+ $(,)?) => {{
+            let SdlcPolicy { $($field),+ } = SdlcPolicy::default();
+            // Consume the bindings so an unused-variable lint can't fire —
+            // this macro exists purely for its destructuring side effect.
+            let _ = ($($field,)+);
+            [$(stringify!($field)),+]
+        }};
+    }
+
+    /// Claim table: every `SdlcPolicy` field paired with the production
+    /// module(s)/function(s) that read the RESOLVED policy value for it.
+    ///
+    /// **What this table proves, and what it does not.** Exhaustiveness —
+    /// every field has *some* named entry — is enforced mechanically by
+    /// `every_sdlc_policy_field_has_a_declared_production_consumer` below,
+    /// via `policy_field_names!`'s compile-time-exhaustive destructure. It
+    /// is a CLAIM, not a proof, that the named module actually reads the
+    /// field correctly, or reads it at all — a copy-pasted or stale
+    /// consumer string would still pass this test. The real proof, for the
+    /// knobs where it matters, is an effect-observing test elsewhere in
+    /// this crate: `max_attempts` (`setup.rs` tests asserting the burned
+    /// attempt count), `llm_triage` (`task_loop.rs`'s
+    /// `resolved_policy_llm_triage_*` tests), and `transport_retry`
+    /// (`task_loop.rs`'s retry-count tests against a failing transport
+    /// double). This table's value is upstream of proof: it forces whoever
+    /// adds a knob to write down an answer to "who reads this" at the
+    /// moment the knob is added, rather than five specs later.
+    const FIELD_CONSUMERS: &[(&str, &str)] = &[
+        (
+            "output_verbosity",
+            "task_loop.rs::apply_verbosity_directive (per-stage prompt), docs.rs (PatchDocsNode)",
+        ),
+        ("prompt_cache", "task_loop.rs::apply_prompt_cache"),
+        (
+            "review_mode",
+            "end_review.rs (EndOnly branch gate), task_loop.rs (per-task review routing)",
+        ),
+        (
+            "review_skip_max_files",
+            "task_loop.rs::should_skip_review (TrivialSkip threshold)",
+        ),
+        (
+            "review_skip_max_diff_lines",
+            "task_loop.rs::should_skip_review (TrivialSkip threshold)",
+        ),
+        ("test_depth", "task_loop.rs (TestTaskNode's check-suite depth)"),
+        (
+            "model_tiers",
+            "task_loop.rs::model_tier_for_stage (all five stages), docs.rs, setup.rs (GenerateTasksNode), graph.rs (local-transport gate)",
+        ),
+        (
+            "timeouts",
+            "task_loop.rs::timeout_for_stage (all five stages), docs.rs, setup.rs (GenerateTasksNode)",
+        ),
+        (
+            "local",
+            "task_loop.rs::apply_model_tier (local model string), graph.rs (openai_compat_meta_transport_live)",
+        ),
+        ("llm_triage", "task_loop.rs::TriageTaskNode (resolved_policy fallback)"),
+        (
+            "max_attempts",
+            "setup.rs::seed_max_attempts, called from GenerateTasksNode and LoadTaskStateNode's tasks.json bootstrap",
+        ),
+        (
+            "max_review_attempts",
+            "task_loop.rs (ReviewRouterNode's review-retry bound), wrap_up.rs (ReviewExhausted signal)",
+        ),
+        (
+            "retry_feedback",
+            "task_loop.rs::prior_attempt_feedback and ::triage_failure_feedback",
+        ),
+        (
+            "transport_retry",
+            "task_loop.rs (implement/triage/review ClaudeCodeStep), docs.rs, end_review.rs, setup.rs — all five with_retry_policy call sites",
+        ),
+        (
+            "review_diff_max_chars",
+            "task_loop.rs::bound_review_diff, end_review.rs (EndReviewNode's diff budget)",
+        ),
+    ];
+
+    #[test]
+    fn every_sdlc_policy_field_has_a_declared_production_consumer() {
+        // See `policy_field_names!`'s doc comment: this call is the
+        // compile-time half of the guard. If a field is ever added to
+        // `SdlcPolicy` without being added here, this line fails to
+        // compile ("missing field in pattern"); a name here that is no
+        // longer a field fails to compile the opposite way. Either way,
+        // the guard fires before the runtime assertion below can even run.
+        let field_names = policy_field_names!(
+            output_verbosity,
+            prompt_cache,
+            review_mode,
+            review_skip_max_files,
+            review_skip_max_diff_lines,
+            test_depth,
+            model_tiers,
+            timeouts,
+            local,
+            llm_triage,
+            max_attempts,
+            max_review_attempts,
+            retry_feedback,
+            transport_retry,
+            review_diff_max_chars,
+        );
+
+        let mut actual: Vec<&str> = field_names.to_vec();
+        actual.sort_unstable();
+
+        let mut declared: Vec<&str> = FIELD_CONSUMERS.iter().map(|(name, _)| *name).collect();
+        declared.sort_unstable();
+
+        assert_eq!(
+            actual, declared,
+            "FIELD_CONSUMERS must name exactly SdlcPolicy's fields — no more, no fewer. \
+             A knob without a table entry is exactly the failure mode this test exists to \
+             catch: a policy value that is declared, settable, and silently ignored."
+        );
+
+        for (name, consumer) in FIELD_CONSUMERS {
+            assert!(
+                !consumer.trim().is_empty(),
+                "field {name} has an empty consumer entry"
             );
         }
     }

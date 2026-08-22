@@ -1,10 +1,14 @@
-//! The non-overridable command-policy safety floor for SDLC-run subprocess
-//! execution (`ticket-sdlc-command-policy-floor`, task 1).
+//! `engine-core::policy::command_floor` — the non-overridable command-policy
+//! safety floor for SDLC-run subprocess execution
+//! (`ticket-sdlc-command-policy-floor`, task 1). Lifted out of
+//! `workflows::sdlc_flow` (`EN.11.M` task 1) so a second engine can reach it
+//! without importing `sdlc_flow`.
 //!
 //! Ports qm's `ORG_FLOOR_RULES` (`example-repo/qm/src/policy/command-policy.ts`)
 //! as a plain, case-insensitive regex denylist over the joined
 //! `program`+`args` (or raw `sh -c` payload) string — the literal command
-//! that would otherwise reach [`super::default_command_runner`] unchecked.
+//! that would otherwise reach [`crate::workflows::default_command_runner`]
+//! unchecked.
 //!
 //! Deliberately narrower than the qm source: no de-obfuscation normalizer
 //! (`scannableCommand`/`scanShell`) and no `require_approval` tier — every
@@ -169,5 +173,27 @@ mod tests {
     fn allows_plain_git_push_without_force() {
         // Proves the force-push rule doesn't over-match a plain push.
         assert_allowed("git push origin main");
+    }
+
+    #[test]
+    fn denied_from_its_new_home_via_the_full_crate_path() {
+        // EN.11.M task 3: the floor moved from `workflows::sdlc_flow` to
+        // `crate::policy::command_floor` in task 1. A move that silently
+        // stopped enforcing would still compile and still show green in
+        // every other test here, because they all reach `evaluate_command`
+        // through the local `use super::*;` import rather than the fully
+        // qualified path an external caller (e.g. `nodes/terminal/send.rs`
+        // or `workflows::default_command_runner`) actually uses. Reaching
+        // through the crate-root path proves the floor is really live at
+        // its new public address, not merely present in this module.
+        match crate::policy::command_floor::evaluate_command("git push --force") {
+            CommandDecision::Deny { reason, matched } => {
+                assert_eq!(reason, "force push");
+                assert!(!matched.is_empty());
+            }
+            CommandDecision::Allow => {
+                panic!("expected `git push --force` denied via crate::policy::command_floor, got Allow")
+            }
+        }
     }
 }

@@ -24,7 +24,7 @@ Naming it costs one flag and removes a hidden coupling to epic status.
 | Flag | Required | Default | What it does |
 |---|---|---|---|
 | `--roadmap <path\|slug>` | **yes** | — | The roadmap this lane belongs to. A path is absolute or relative to `BRAIN_ROOT` and is honoured as given; a bare slug is resolved per Step 1C. |
-| `--lane <path\|name>` | one of | — | Lane chain file. A bare name (`gtm`) resolves to `<roadmap-dir>/lane-<name>.txt`. |
+| `--lane <path\|name>` | one of | — | Lane record. A bare name (`gtm`) resolves to `<roadmap-dir>/lane-<name>.json`, authored against `.claude/workflows/lane.schema.json` (D71). |
 | `--blocks <id ...>` | one of | — | Inline block IDs instead of a lane file. Space- or comma-separated. |
 | `--repo <slug>` | no | inferred from cwd | Override only when inference is wrong. |
 | `--isolation <worktree\|no-worktree\|auto>` | no | `auto` | `auto` applies the policy table below. |
@@ -85,26 +85,40 @@ ledger's `origin_roadmap` column are specified once, in Rule 5 below, per
 `planning/decisions/D57-orchestration-run-artifact-contract.md` — **cited as the deciding
 authority; not paraphrased here.** Print `run_record_dir` alongside the other Step 1 resolutions.
 
-**F. The chain** — `--blocks` verbatim, or the lane file:
+**F. The chain** — `--blocks` verbatim, or the lane record:
 - `--lane <path>` → that path.
-- `--lane <name>` (bare) → `<roadmap_dir>/lane-<name>.txt`. Missing → stop and list what
-  `lane-*.txt` files do exist there.
+- `--lane <name>` (bare) → `<roadmap_dir>/lane-<name>.json`. Missing → stop and list what
+  `lane-*.json` files do exist there.
 
-**G. Cross-check** — if the resolved lane file carries a `# ROADMAP:` header and it disagrees with
-the roadmap resolved in C, **stop and report both.** That mismatch means the lane belongs to a
-different run than the one you were told, and it is the cheapest available check that `--roadmap`
-was typed correctly.
+**G. Cross-check** — parse the resolved `lane-<name>.json` and compare its top-level `roadmap`
+field against the roadmap resolved in C. If they disagree, **stop and report both.** That mismatch
+means the lane belongs to a different run than the one you were told, and it is the cheapest
+available check that `--roadmap` was typed correctly. Keep this check even though the format
+changed — the schema makes `roadmap` a required field, so the cross-check is now against structured
+data instead of an optional header comment, but the stop-and-report behaviour on mismatch is
+unchanged.
 
-Read the lane file with `#` comments and blanks stripped **when extracting the chain / block list**;
-file order is execution order. Lane files may cover several repos in one running order — **take only
-your repo's section.** If the file has section markers for other repos and you cannot tell which is
-yours, stop and ask.
+Read the chain from the lane record's `blocks[]` array — **array order is chain order.** Each entry
+carries its own required `repo`; a lane is not single-repo in this corpus, so **take only the
+entries whose `repo` matches the repo resolved in B.** If you cannot tell which entries are yours,
+stop and ask.
 
-**Comments are binding context for your own section, not decoration.** Stripping applies only to
-parsing the block list out of the file. The prose in your section's `#` comments — isolation
-rationale, prior-run gotchas, "do not touch X" — is the per-repo briefing for this run and must be
-honored exactly like the block list itself. `carryover-improvements`' lane files carry their entire
-per-repo briefing this way; an agent that strips comments before reading drops all of it.
+**There is no prose in a lane record — the JSON schema has no field for it.** Everything that used
+to live in a lane file's `#` comments now lives in a container that is actually read by the thing
+that needs it, and this command must use those containers instead of looking for binding text in
+the lane file itself:
+- **Per-block briefing** (isolation rationale, prior-run gotchas, "do not touch X") — read from
+  each block's own record (`why` / `notes`), not from the lane. Neither SDLC engine has ever
+  opened a lane file; the block record is what they actually read.
+- **Holds and intra-lane dependencies** — read from `state.json` `depends_on` on the block, not
+  from a HOLDS section.
+- **Operator gates** — read from an `operator` edge in `depends_on`, not from a TRAPS section or
+  free-text warning.
+- **Cross-roadmap adoption** — each `blocks[]` entry's own `origin_roadmap` field names the
+  roadmap the block was originally allocated under. Use it wherever this command used to read an
+  `# ORIGIN: <roadmap path>` comment above an adopted block; a block entry whose `origin_roadmap`
+  differs from the lane record's own top-level `roadmap` field is an adopted block, and the
+  per-block ledger row in Rule 5 below records that `origin_roadmap`, not the lane's.
 
 Print what you resolved. A lane driven against the wrong roadmap is worse than one driven against
 none.
@@ -172,7 +186,7 @@ behavior this replaces, never a hard failure. Full design:
 
 Print, and stop for confirmation unless `--execute`:
 
-- repo · roadmap · lane file (and section) · resolved chain in order
+- repo · roadmap · lane record · resolved chain in order (this repo's `blocks[]` entries only)
 - isolation, and whether it was forced by policy or chosen
 - per-block: engine, spec status (`tasks.md` present, or which `/generate-tasks` invocation will
   create it), and any `--from` plan file
@@ -355,8 +369,9 @@ per-program `orchestrate-prompt.md` (`close-the-loop`'s and `carryover-improveme
 near-duplicates of each other, pasted by the operator because neither command knew they existed).
 **It lives here now, once, and nowhere else — `/generate-roadmap` must stop being a place this
 convention gets authored per-program.** A program-specific rule (a repo's own "no `blocking:
-bool`"-style constraint) still belongs in that program's lane file; only the universal shape below
-moves here.
+bool`"-style constraint) still belongs in that program's roadmap document or the affected block's
+own record — a lane record has no free-text field for it (per its schema); only the universal
+shape below moves here.
 
 At the end of every lane, alongside the report and `review.md`:
 

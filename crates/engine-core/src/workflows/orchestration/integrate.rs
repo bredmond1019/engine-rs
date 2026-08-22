@@ -28,7 +28,13 @@
 //!    mismatch is [`IntegrateError::StateWriteMismatch`] and **fails the
 //!    run loudly** — this module never downgrades a mismatch to a
 //!    warning, which would recreate exactly the unreliability it exists
-//!    to replace.
+//!    to replace. It also independently rejects a state file whose
+//!    `final_validation.all_passed` reads `false` even when `"status"`
+//!    reads `"done"` ([`IntegrateError::FinalValidationGateFailed`]) — the
+//!    second end of `EN.ticket.final-validation-failure-must-block`'s fix,
+//!    defence in depth for a state file written by an older engine build
+//!    or by the JS `/sdlc-flow`, neither of which carries the in-engine
+//!    guard `wrap_up.rs`'s `derive_terminal_signal` now applies.
 //! 3. [`resolve_roadmap_dir`] / [`append_lane_log_line`] — resolve the
 //!    roadmap directory by `/begin-orchestration`'s Step 1C rule
 //!    (`planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`;
@@ -46,8 +52,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::Utc;
-use serde::Serialize;
+use chrono::{DateTime, FixedOffset, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::repo_registry::RepoRegistry;
@@ -68,6 +74,22 @@ use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError}
 pub trait HoldSource: Send + Sync {
     /// Whether `block_id` (in `repo`) is under an operator hold right now.
     fn is_held(&self, repo: &str, block_id: &str) -> bool;
+
+    /// EN.11.L Task 2: an optional notification path. Resolves when a
+    /// hold on `(repo, block_id)` may have just cleared, so
+    /// [`wait_for_clearance`] can wake immediately instead of waiting out
+    /// the next poll tick. The default never resolves (`future::pending`)
+    /// — a `HoldSource` that doesn't override this falls back to pure
+    /// poll-driven behavior, unchanged from before this knob existed.
+    /// Production wiring (the `EN.9.G` Blocked-edge bridge) is expected
+    /// to hold a `tokio::sync::Notify` per watched hold and call
+    /// `notify_waiters()` the moment its own poll observes clearance;
+    /// this trait does not mandate a `Notify` specifically, only the
+    /// future shape.
+    fn notified(&self, repo: &str, block_id: &str) -> futures::future::BoxFuture<'_, ()> {
+        let _ = (repo, block_id);
+        Box::pin(futures::future::pending())
+    }
 }
 
 /// A [`HoldSource`] that is never held — the default for a chain running
@@ -86,15 +108,92 @@ impl HoldSource for NeverHeld {
 /// error condition; the caller resumes its own sequential loop the moment
 /// this returns, without having lost or re-run anything, because nothing
 /// prior to this await point is ever touched again.
+///
+/// `cancellation_token`, when given, is raced against every poll tick's
+/// sleep — mirroring `TerminalAwaitNode`'s own `select!` (see that node's
+/// module doc). A chain parked here for hours on a held block must abort
+/// within one poll interval of an abort request, not after the hold
+/// eventually clears on its own; a naive "check once, then sleep the whole
+/// interval" loop would miss exactly this case, since the check only runs
+/// at the top of each iteration. A cancel win returns immediately without
+/// re-checking `hold_source` — the caller (`integrate_chain`) is
+/// responsible for observing the cancellation afterwards and stopping the
+/// chain; this function itself never treats cancellation as clearance.
+///
+/// EN.11.L Task 2 extends this same `select!` with two more arms, added
+/// alongside the existing cancellation arm rather than replacing it:
+///
+/// - `deadline`, when given, bounds the TOTAL time this call is willing to
+///   wait (not per-poll — the clock starts once, at entry, and is not
+///   reset by any individual poll tick). Exceeding it returns
+///   [`IntegrateError::HoldDeadlineExceeded`], naming `repo` and
+///   `block_id` so a stopped chain never reads as a silent, unexplained
+///   hang — see [`IntegrateError::HoldDeadlineExceeded`]'s doc for why
+///   this is a loud, addressed error rather than a downgraded warning.
+///   `None` preserves the exact pre-Task-2 behavior: an unbounded wait.
+/// - [`HoldSource::notified`] is raced on every iteration so a hold that
+///   clears between poll ticks wakes this call immediately rather than
+///   waiting out the remainder of `poll_interval`. The default
+///   implementation never resolves, so a `HoldSource` with no
+///   notification wiring is unaffected — this is purely additive.
+///
+/// A cancel win still returns `Ok(())` immediately, exactly as before —
+/// cancellation is a pause point, never an error, and remains distinct
+/// from a deadline win (which IS an error, by design: nobody is coming
+/// back for an unanswered hold, but a cancellation is always an explicit,
+/// intentional request).
 pub async fn wait_for_clearance(
     hold_source: &dyn HoldSource,
     repo: &str,
     block_id: &str,
     poll_interval: Duration,
-) {
+    deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+) -> Result<(), IntegrateError> {
+    // The clock starts once, here, at entry — never reset by a poll tick
+    // or a notification wake, so `deadline` is a total budget for the
+    // whole wait, not a per-poll one.
+    let deadline_at = deadline.map(|d| tokio::time::Instant::now() + d);
+
     while hold_source.is_held(repo, block_id) {
-        tokio::time::sleep(poll_interval).await;
+        if let (Some(at), Some(d)) = (deadline_at, deadline) {
+            if tokio::time::Instant::now() >= at {
+                return Err(IntegrateError::HoldDeadlineExceeded {
+                    repo: repo.to_string(),
+                    block_id: block_id.to_string(),
+                    deadline: d,
+                });
+            }
+        }
+
+        // Never sleep past the deadline even when the deadline is closer
+        // than `poll_interval` — otherwise a hold held right up to the
+        // deadline could sleep one whole `poll_interval` past it before
+        // the next top-of-loop check ever runs.
+        let tick_for = match deadline_at {
+            Some(at) => {
+                let remaining = at.saturating_duration_since(tokio::time::Instant::now());
+                poll_interval.min(remaining)
+            }
+            None => poll_interval,
+        };
+        let tick = tokio::time::sleep(tick_for);
+        let notified = hold_source.notified(repo, block_id);
+
+        if let Some(token) = cancellation_token {
+            tokio::select! {
+                _ = token.cancelled() => return Ok(()),
+                () = tick => {}
+                () = notified => {}
+            }
+        } else {
+            tokio::select! {
+                () = tick => {}
+                () = notified => {}
+            }
+        }
     }
+    Ok(())
 }
 
 // ── State-write verification ────────────────────────────────────────────
@@ -122,6 +221,27 @@ fn state_path_for(repo_path: &Path, block_id: &str) -> PathBuf {
 /// missing file, unparsable JSON, missing `"status"` key, or any value
 /// other than `"done"`; a mismatch on any of those is exactly the class of
 /// silent unreliability this verification step exists to close out.
+///
+/// Belt to `wrap_up.rs`'s brace: also rejects a state file whose
+/// `final_validation.all_passed` reads `false`, even though `"status"`
+/// itself reads `"done"`. `wrap_up.rs`'s `derive_terminal_signal` now
+/// consults the same gate and stops an in-engine run from ever writing
+/// `"done"` on a failed gate (`EN.ticket.final-validation-failure-must-block`
+/// Task 2) — but that guard lives inside one engine build. This assertion
+/// is the only one that also catches a state file written by an older
+/// engine build, or by the JS `/sdlc-flow`, which shares this exact path
+/// and schema but has no equivalent guard. `final_validation` being
+/// absent or `null` (a bailed run, a pre-`EN.3.E` file, or a JS-written
+/// file) is not itself a failure — only an explicit `false` is.
+///
+/// Also cross-checks identity: if the file carries a non-null
+/// `"block_id"`, it must agree with `outcome.block_id`
+/// ([`IntegrateError::BlockIdMismatch`]) — this closes the gap where a
+/// stale state file left behind by an earlier, different run at the same
+/// path would otherwise be admitted as this block's result purely because
+/// `"status"` happened to read `"done"`. A state file with no `"block_id"`
+/// at all (an older run, or one written by the JS `/sdlc-flow`) still
+/// passes; only an actual disagreement fails.
 pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateError> {
     let path = state_path_for(&outcome.repo_path, &outcome.block_id);
     let raw =
@@ -146,6 +266,34 @@ pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateErr
             path,
             found: status.map(str::to_string),
         });
+    }
+    if let Some(found_block_id) = value.get("block_id").and_then(Value::as_str) {
+        if found_block_id != outcome.block_id {
+            return Err(IntegrateError::BlockIdMismatch {
+                repo: outcome.repo.clone(),
+                block_id: outcome.block_id.clone(),
+                path,
+                found: found_block_id.to_string(),
+            });
+        }
+    }
+    if let Some(final_validation) = value.get("final_validation") {
+        if !final_validation.is_null() {
+            let all_passed = final_validation.get("all_passed").and_then(Value::as_bool);
+            if all_passed == Some(false) {
+                let failure_summary = final_validation
+                    .get("failure_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no failure_summary in state file)")
+                    .to_string();
+                return Err(IntegrateError::FinalValidationGateFailed {
+                    repo: outcome.repo.clone(),
+                    block_id: outcome.block_id.clone(),
+                    path,
+                    failure_summary,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -182,23 +330,64 @@ pub fn resolve_roadmap_dir(planning_root: &Path, slug: &str) -> Result<PathBuf, 
 // ── Lane-log append ─────────────────────────────────────────────────────
 
 /// One `lane-log.jsonl` line — the cross-lane channel a sibling lane reads
-/// to learn what this lane has already integrated. Field names are
-/// deliberately plain and stable; this is a durable on-disk artifact other
-/// repos' agents parse.
-#[derive(Debug, Clone, Serialize)]
+/// to learn what this lane has already integrated. Field names AND field
+/// order are the durable on-disk contract other repos' agents parse:
+/// `{ts, lane, repo, block, status, note}`, exactly and in that order,
+/// since the file is read by humans as often as by machines. See
+/// `scripts/roadmap_status_discovery.py`'s `read_lane_log`.
+///
+/// `ts` is `DateTime<FixedOffset>` rather than `DateTime<Utc>` so that a
+/// fixture line written with a non-UTC offset (e.g. `-03:00`, as most of
+/// the fleet's hand-written lines are) round-trips byte-for-byte through
+/// serde instead of being silently normalized to `Z` — the offset is part
+/// of what is on disk, not lost information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneLogEntry {
+    pub ts: DateTime<FixedOffset>,
+    pub lane: String,
     pub repo: String,
-    pub block_id: String,
-    pub integrated_at: chrono::DateTime<Utc>,
+    pub block: String,
+    pub status: LaneLogStatus,
+    pub note: String,
+}
+
+/// The closed vocabulary of outcomes a lane-log line can record. No
+/// string-typed escape variant: this type is only ever constructed by
+/// this crate, so an unknown status is a bug here, not data to carry
+/// through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneLogStatus {
+    Closed,
+    Bailed,
+    Held,
 }
 
 impl LaneLogEntry {
+    /// A block that finished successfully.
     #[must_use]
-    pub fn for_outcome(outcome: &ExecutionOutcome) -> Self {
+    pub fn closed(outcome: &ExecutionOutcome, lane: &str, note: impl Into<String>) -> Self {
         Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
             repo: outcome.repo.clone(),
-            block_id: outcome.block_id.clone(),
-            integrated_at: Utc::now(),
+            block: outcome.block_id.clone(),
+            status: LaneLogStatus::Closed,
+            note: note.into(),
+        }
+    }
+
+    /// A block whose step failed before it could complete — recorded so a
+    /// sibling lane sees the attempt rather than silence.
+    #[must_use]
+    pub fn bailed(step: &ChainStep, lane: &str, note: impl Into<String>) -> Self {
+        Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
+            repo: step.repo.clone(),
+            block: step.block_id.clone(),
+            status: LaneLogStatus::Bailed,
+            note: note.into(),
         }
     }
 }
@@ -214,7 +403,7 @@ pub fn append_lane_log_line(
 ) -> Result<(), IntegrateError> {
     let path = roadmap_dir.join("lane-log.jsonl");
     let line = serde_json::to_string(entry).map_err(|source| IntegrateError::LaneLogSerialize {
-        block_id: entry.block_id.clone(),
+        block_id: entry.block.clone(),
         source,
     })?;
     let mut file = OpenOptions::new()
@@ -264,6 +453,36 @@ pub enum IntegrateError {
         path: PathBuf,
         found: Option<String>,
     },
+    /// The block's `sdlc-flow-state.json` parsed and `"status"` read
+    /// `"done"`, but `final_validation.all_passed` read `false` — the run
+    /// finished, but on a red build. Deliberately distinct from
+    /// [`IntegrateError::StateWriteMismatch`]: that variant says the run
+    /// did not finish; this one says it finished with a failing full-suite
+    /// gate, and an operator reading a stopped chain needs to know which.
+    FinalValidationGateFailed {
+        repo: String,
+        block_id: String,
+        path: PathBuf,
+        failure_summary: String,
+    },
+    /// The block's `sdlc-flow-state.json` parsed, `"status"` read `"done"`,
+    /// and the file carried a non-null `"block_id"` — but that `block_id`
+    /// disagreed with `outcome.block_id`, the block this integration run
+    /// actually executed. Closes a real gap: without this check, a stale
+    /// state file left behind in `planning/{block_id}/sdlc/` by an
+    /// earlier, *different* run (e.g. a spec directory reused across
+    /// blocks, or a leftover file from a prior chain attempt) would be
+    /// silently admitted as this block's result merely because `"status"`
+    /// read `"done"` at the expected path. A state file with no
+    /// `"block_id"` at all (an older run, or one written by the JS
+    /// `/sdlc-flow`, which does not carry this field) still passes —
+    /// this check only fires on an actual disagreement, never on absence.
+    BlockIdMismatch {
+        repo: String,
+        block_id: String,
+        path: PathBuf,
+        found: String,
+    },
     /// A `lane-log.jsonl` entry could not be serialized.
     LaneLogSerialize {
         block_id: String,
@@ -288,6 +507,16 @@ pub enum IntegrateError {
         slug: String,
         new_location: PathBuf,
         legacy_location: PathBuf,
+    },
+    /// EN.11.L Task 2: [`wait_for_clearance`] exceeded its `deadline`
+    /// while `(repo, block_id)` was still under an operator hold nobody
+    /// has answered. Reported loudly — never a silent forever-wait — and
+    /// names both the held block and its repo so whoever reads this stop
+    /// knows exactly where to look in the operator queue.
+    HoldDeadlineExceeded {
+        repo: String,
+        block_id: String,
+        deadline: Duration,
     },
 }
 
@@ -330,6 +559,29 @@ impl fmt::Display for IntegrateError {
                 path.display(),
                 found
             ),
+            IntegrateError::FinalValidationGateFailed {
+                repo,
+                block_id,
+                path,
+                failure_summary,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') state write verification failed: \
+                 \"status\": \"done\" at {} but final_validation.all_passed was false: {failure_summary}",
+                path.display()
+            ),
+            IntegrateError::BlockIdMismatch {
+                repo,
+                block_id,
+                path,
+                found,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') state write verification failed: \
+                 state file at {} carries block_id '{found}', which disagrees with the \
+                 executed block '{block_id}'",
+                path.display()
+            ),
             IntegrateError::LaneLogSerialize { block_id, source } => write!(
                 f,
                 "lane-log entry for block '{block_id}' failed to serialize: {source}"
@@ -357,6 +609,16 @@ impl fmt::Display for IntegrateError {
                 new_location.display(),
                 legacy_location.display()
             ),
+            IntegrateError::HoldDeadlineExceeded {
+                repo,
+                block_id,
+                deadline,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') operator hold deadline exceeded: \
+                 still held after {deadline:?} with no clearance — check the operator \
+                 queue for this block"
+            ),
         }
     }
 }
@@ -371,8 +633,11 @@ impl std::error::Error for IntegrateError {
             IntegrateError::LaneLogSerialize { source, .. } => Some(source),
             IntegrateError::LaneLogWriteFailed { source, .. } => Some(source),
             IntegrateError::StateWriteMismatch { .. }
+            | IntegrateError::FinalValidationGateFailed { .. }
+            | IntegrateError::BlockIdMismatch { .. }
             | IntegrateError::RoadmapDirNotFound { .. }
-            | IntegrateError::AmbiguousRoadmapDir { .. } => None,
+            | IntegrateError::AmbiguousRoadmapDir { .. }
+            | IntegrateError::HoldDeadlineExceeded { .. } => None,
         }
     }
 }
@@ -389,11 +654,56 @@ impl From<ExecuteError> for IntegrateError {
     }
 }
 
+// ── Per-step progress ────────────────────────────────────────────────────
+
+/// One completed step's progress, handed to the injected step observer
+/// (`Task 3`) exactly once per integrated step — after that step's
+/// `lane-log.jsonl` line is appended, so an observed step is always a
+/// recorded step.
+///
+/// `index` is **1-based**: the first completed step reports `index: 1`,
+/// matching the human "4 of 30" phrasing a watcher reads it as, rather
+/// than the 0-based offset into `chain`. `total` is the chain's full
+/// length, resolved once before the loop starts (not the number of steps
+/// integrated so far), so a watcher can always tell `index` of `total`
+/// (e.g. 4-of-30 from 29-of-30) regardless of whether the chain later
+/// stops early.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepProgress {
+    pub repo: String,
+    pub block_id: String,
+    /// 1-based position of this completed step in the chain.
+    pub index: usize,
+    /// The chain's total step count.
+    pub total: usize,
+    /// The step's outcome status. Only ever `"completed"` today — the
+    /// observer is called exactly once per *completed* step (see this
+    /// struct's doc); a step that bails returns an `Err` from
+    /// [`integrate_chain`] before reaching the observer call, and a
+    /// cancelled chain simply stops calling it, so there is no "failed" or
+    /// "cancelled" status to carry here as of Task 3. Kept as an owned
+    /// `String` rather than a fixed enum so a later status does not need a
+    /// struct-shape change (CLAUDE.md standing rule 6: keep the shape
+    /// invariant).
+    pub status: String,
+}
+
+/// An injected observer called once per completed step, wired by
+/// `OrchestrationRunNode::with_step_observer`. `Node::process` has no
+/// access to `on_progress` — it is framework-owned and only fires at node
+/// boundaries — so per-step progress for a single-node chain like this one
+/// can only ever be an explicitly injected seam, never a call into the
+/// framework. `Send + Sync` because it crosses the `spawn_blocking`
+/// boundary alongside every other closure this node owns.
+pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
+
 // ── The integrated loop ─────────────────────────────────────────────────
 
 /// Drive `chain` to completion, in order: for every step, gate on
-/// dependencies, gate on admission, wait out any operator hold, execute
-/// via `SDLC_FLOW`, verify the state write, and append exactly one
+/// dependencies, wait out any operator hold, gate on admission (EN.11.L —
+/// the permit is scoped to the EXECUTION window only, acquired AFTER the
+/// hold clears so a parked step never consumes a concurrency slot),
+/// execute via `SDLC_FLOW`, verify the state write, and append exactly one
 /// `lane-log.jsonl` line — then move on. Returns every step's
 /// [`ExecutionOutcome`] in order, or the first [`IntegrateError`]
 /// encountered (a chain stops at the first failing block; nothing after
@@ -406,6 +716,52 @@ impl From<ExecuteError> for IntegrateError {
 /// lane-log line is already on disk), and the loop resumes at exactly the
 /// held step the moment [`HoldSource::is_held`] reports clear, never
 /// re-visiting an earlier step.
+///
+/// `lane` is the ORCHESTRATION event's real lane name for a roadmap+lane
+/// chain. An explicit `blocks` chain has no lane by construction (there is
+/// no lane file to have parsed one from) — pass `None` and each step's
+/// lane-log line falls back to that step's own repo slug, matching how the
+/// fleet's hand-written lines already read `lane == repo` for a
+/// single-repo lane. The fallback is resolved per step (not once for the
+/// whole chain) so a mixed-repo explicit chain still gets a truthful lane
+/// per line rather than one step's repo borrowed for another's.
+///
+/// A step that fails — either [`execute_step`] itself or
+/// [`verify_state_write`] afterwards — still gets exactly one `bailed`
+/// line recorded before the error propagates, so a sibling lane sees the
+/// attempt rather than silence. If the bailed append itself fails, that
+/// append failure is swallowed and the *original* step error is what
+/// returns — a lane-log write hiccup must never replace the real reason
+/// the chain stopped.
+///
+/// # Cancellation stops the chain BETWEEN steps only
+///
+/// `cancellation_token`, when given, is checked at the top of every loop
+/// iteration (before [`check_dependencies`]) and raced against
+/// [`wait_for_clearance`]'s sleep, so a chain parked on an operator hold
+/// aborts within one poll tick rather than only at the next iteration's
+/// top. A win is **not** an error: the loop simply stops and this function
+/// returns `Ok` with whatever outcomes were already integrated — nothing
+/// is rolled back, and every step that already ran has its `lane-log.jsonl`
+/// line on disk exactly as if the chain had finished normally. The caller
+/// (`OrchestrationRunNode::process`) is what stamps the fact that a
+/// cancellation happened.
+///
+/// This does **not** reach inside a step already in flight: a step whose
+/// [`execute_step`] call (the child `SDLC_FLOW` run) has already started
+/// runs to completion regardless of the token — there is no run id to
+/// thread a cancellation into yet. Cancellation here only ever prevents
+/// the *next* step from starting.
+///
+/// # Per-step progress
+///
+/// `step_observer` is called **exactly once per completed step**,
+/// immediately after that step's `lane-log.jsonl` line is appended (so an
+/// observed step is always a recorded step) — never before, and never for
+/// a step that bails. See [`StepProgress`] for the payload and its 1-based
+/// index convention. A no-op observer (e.g. `&|_| {}`) makes this
+/// parameter behavior-stable: nothing about the loop's control flow or
+/// return value depends on it.
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain(
     chain: &[ChainStep],
@@ -414,26 +770,125 @@ pub async fn integrate_chain(
     admission: &AdmissionGate,
     hold_source: &dyn HoldSource,
     poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
     resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
     registry: &RepoRegistry,
     run_flow: &FlowRunner,
     roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    campaign_id: uuid::Uuid,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
     for step in chain {
+        // Checked at the top of every iteration, before anything for this
+        // step starts — see the "Cancellation stops the chain BETWEEN
+        // steps only" section above.
+        if cancellation_token.is_some_and(|t| t.is_cancelled()) {
+            break;
+        }
+
         check_dependencies(step, resolve_depends_on, is_edge_met)?;
 
+        // Wait out any operator hold BEFORE touching admission at all —
+        // EN.11.L Task 1. The admission permit must be scoped to the
+        // EXECUTION window only, never held across an unbounded hold: a
+        // step parked here holds no semaphore slot, so every other lane
+        // at the ceiling can still start while this one waits on a human.
+        //
+        // EN.11.L Task 2: `hold_deadline` bounds the wait — a hold nobody
+        // is answering now fails the chain loudly instead of parking it
+        // forever. A deadline exceeded is reported exactly like any other
+        // step failure: one `bailed` lane-log line, then propagate.
+        if let Err(err) = wait_for_clearance(
+            hold_source,
+            &step.repo,
+            &step.block_id,
+            poll_interval,
+            hold_deadline,
+            cancellation_token,
+        )
+        .await
+        {
+            let entry =
+                LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string());
+            let _ = append_lane_log_line(roadmap_dir, &entry);
+            return Err(err);
+        }
+
+        // `wait_for_clearance` can return early on a cancel win (rather
+        // than because the hold actually cleared) — re-check here so a
+        // cancelled, held chain does not go on to acquire a permit or
+        // execute the step it was waiting on.
+        if cancellation_token.is_some_and(|t| t.is_cancelled()) {
+            break;
+        }
+
+        // Ordering guarantee: `acquire_for` is called AFTER clearance, so
+        // a step that just cleared its hold joins the admission
+        // semaphore's own FIFO wait queue exactly like any other
+        // newly-ready step — it never jumps ahead of a lane that was
+        // already queued for a permit before this hold cleared. Nothing
+        // here re-orders relative to other lanes; each lane still only
+        // ever acquires one permit, once, for its own step.
         let _permit = admission.acquire_for(step).await;
 
-        wait_for_clearance(hold_source, &step.repo, &step.block_id, poll_interval).await;
+        let step_lane = lane.unwrap_or(step.repo.as_str());
 
-        let outcome = execute_step(step, resolve_engine, registry, run_flow).await?;
-        verify_state_write(&outcome)?;
+        // `default_use_worktree` is the resolved `OrchestrationPolicy
+        // ::default_use_worktree` fallback, threaded in from
+        // `OrchestrationRunNode::process` — the row-3 case of
+        // `execute::resolve_isolation`'s table. Rows 1/2 (base-template
+        // always worktree, the brain root never) are resolved inside
+        // `execute_step` itself and are unreachable from this value.
+        let outcome = match execute_step(
+            step,
+            resolve_engine,
+            registry,
+            run_flow,
+            default_use_worktree,
+            campaign_id,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let integrate_err = IntegrateError::from(err);
+                let entry = LaneLogEntry::bailed(step, step_lane, integrate_err.to_string());
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                return Err(integrate_err);
+            }
+        };
 
-        let entry = LaneLogEntry::for_outcome(&outcome);
+        if let Err(err) = verify_state_write(&outcome) {
+            let entry = LaneLogEntry::bailed(step, step_lane, err.to_string());
+            let _ = append_lane_log_line(roadmap_dir, &entry);
+            return Err(err);
+        }
+
+        let entry = LaneLogEntry::closed(
+            &outcome,
+            step_lane,
+            format!("block {} closed via SDLC_FLOW", step.block_id),
+        );
         append_lane_log_line(roadmap_dir, &entry)?;
 
         outcomes.push(outcome);
+
+        // Called exactly once per completed step, after this step's
+        // lane-log line is on disk — see `integrate_chain`'s "Per-step
+        // progress" doc. `index` is 1-based (`outcomes.len()` is already
+        // the count including the step just pushed).
+        step_observer(&StepProgress {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            index: outcomes.len(),
+            total: total_steps,
+            status: "completed".to_string(),
+        });
     }
     Ok(outcomes)
 }
@@ -451,6 +906,7 @@ mod tests {
             repo: repo.to_string(),
             block_id: block_id.to_string(),
             directives: None,
+            ..Default::default()
         }
     }
 
@@ -521,6 +977,10 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
         };
         assert!(verify_state_write(&outcome).is_ok());
     }
@@ -539,6 +999,10 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteMismatch { .. }));
@@ -560,9 +1024,152 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
         };
         let err = verify_state_write(&outcome).unwrap_err();
         assert!(matches!(err, IntegrateError::StateWriteUnreadable { .. }));
+    }
+
+    fn write_done_state_with_block_id(repo_path: &Path, block_id: &str, found_block_id: Value) {
+        let dir = repo_path.join("planning").join(block_id).join("sdlc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sdlc-flow-state.json"),
+            json!({"status": "done", "block_id": found_block_id}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn state_write_verification_rejects_a_disagreeing_block_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_block_id(dir.path(), "A.1", json!("B.9"));
+        let outcome = outcome_for(dir.path(), "A.1");
+        let err = verify_state_write(&outcome).unwrap_err();
+        assert!(matches!(err, IntegrateError::BlockIdMismatch { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("A.1"));
+        assert!(msg.contains("B.9"));
+    }
+
+    #[test]
+    fn state_write_verification_accepts_an_agreeing_block_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_block_id(dir.path(), "A.1", json!("A.1"));
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_a_null_block_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_block_id(dir.path(), "A.1", Value::Null);
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_a_state_file_with_no_block_id_key() {
+        // A pre-task-1 state file, or one written by the JS `/sdlc-flow` —
+        // the "block_id" key is absent entirely, not merely null.
+        // `write_done_state` produces exactly this shape.
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state(dir.path(), "A.1");
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    fn write_done_state_with_final_validation(
+        repo_path: &Path,
+        block_id: &str,
+        final_validation: Value,
+    ) {
+        let dir = repo_path.join("planning").join(block_id).join("sdlc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sdlc-flow-state.json"),
+            json!({"status": "done", "final_validation": final_validation}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn outcome_for(repo_path: &Path, block_id: &str) -> ExecutionOutcome {
+        ExecutionOutcome {
+            repo: "repo-a".into(),
+            repo_path: repo_path.to_path_buf(),
+            block_id: block_id.into(),
+            ctx: engine_contract::TaskContext {
+                event: json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn state_write_verification_rejects_done_status_with_failed_final_validation_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_final_validation(
+            dir.path(),
+            "A.1",
+            json!({
+                "all_passed": false,
+                "check_results": [],
+                "failure_summary": "Failed checks: build, clippy",
+            }),
+        );
+        let outcome = outcome_for(dir.path(), "A.1");
+        let err = verify_state_write(&outcome).unwrap_err();
+        assert!(matches!(
+            err,
+            IntegrateError::FinalValidationGateFailed { .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("Failed checks: build, clippy"));
+        assert!(msg.contains("A.1"));
+    }
+
+    #[test]
+    fn state_write_verification_accepts_done_status_with_passing_final_validation_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_final_validation(
+            dir.path(),
+            "A.1",
+            json!({
+                "all_passed": true,
+                "check_results": [],
+                "failure_summary": "",
+            }),
+        );
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_null_final_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state_with_final_validation(dir.path(), "A.1", Value::Null);
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn state_write_verification_accepts_state_file_with_no_final_validation_key() {
+        // A pre-EN.3.E state file — the "final_validation" key is absent
+        // entirely, not merely null. `write_done_state` produces exactly
+        // this shape.
+        let dir = tempfile::tempdir().unwrap();
+        write_done_state(dir.path(), "A.1");
+        let outcome = outcome_for(dir.path(), "A.1");
+        assert!(verify_state_write(&outcome).is_ok());
     }
 
     // ── Roadmap directory resolution ────────────────────────────────────
@@ -614,8 +1221,12 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
         };
-        let entry = LaneLogEntry::for_outcome(&outcome);
+        let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
         append_lane_log_line(dir.path(), &entry).unwrap();
 
         let contents = std::fs::read_to_string(dir.path().join("lane-log.jsonl")).unwrap();
@@ -623,7 +1234,69 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let parsed: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed["repo"], json!("repo-a"));
-        assert_eq!(parsed["block_id"], json!("A.1"));
+        assert_eq!(parsed["block"], json!("A.1"));
+    }
+
+    /// Guard against a future field being added and silently breaking
+    /// every reader again: the serialized key set must be exactly
+    /// `{ts, lane, repo, block, status, note}`, no more, no fewer.
+    #[test]
+    fn serialized_key_set_is_exactly_the_six_contract_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = ExecutionOutcome {
+            repo: "repo-a".into(),
+            repo_path: dir.path().to_path_buf(),
+            block_id: "A.1".into(),
+            ctx: engine_contract::TaskContext {
+                event: json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
+        };
+        let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
+        let value = serde_json::to_value(&entry).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("entry must serialize to a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["block", "lane", "note", "repo", "status", "ts"]);
+    }
+
+    /// No constructor can produce an entry without an explicit status —
+    /// `closed` and `bailed` are the only ways to build one, and each
+    /// bakes in its own [`LaneLogStatus`] variant.
+    #[test]
+    fn constructors_bake_in_their_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = ExecutionOutcome {
+            repo: "repo-a".into(),
+            repo_path: dir.path().to_path_buf(),
+            block_id: "A.1".into(),
+            ctx: engine_contract::TaskContext {
+                event: json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
+        };
+        let closed_entry = LaneLogEntry::closed(&outcome, "repo-a", "closed");
+        assert_eq!(closed_entry.status, LaneLogStatus::Closed);
+
+        let failing_step = step("repo-a", "A.1");
+        let bailed_entry = LaneLogEntry::bailed(&failing_step, "repo-a", "boom");
+        assert_eq!(bailed_entry.status, LaneLogStatus::Bailed);
     }
 
     #[test]
@@ -639,6 +1312,10 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
         };
         let outcome_b = ExecutionOutcome {
             repo: "repo-b".into(),
@@ -650,19 +1327,31 @@ mod tests {
                 metadata: json!({}),
                 node_runs: std::collections::HashMap::new(),
             },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
         };
-        append_lane_log_line(dir.path(), &LaneLogEntry::for_outcome(&outcome_a)).unwrap();
-        append_lane_log_line(dir.path(), &LaneLogEntry::for_outcome(&outcome_b)).unwrap();
+        append_lane_log_line(
+            dir.path(),
+            &LaneLogEntry::closed(&outcome_a, "repo-a", "closed"),
+        )
+        .unwrap();
+        append_lane_log_line(
+            dir.path(),
+            &LaneLogEntry::closed(&outcome_b, "repo-b", "closed"),
+        )
+        .unwrap();
 
         let contents = std::fs::read_to_string(dir.path().join("lane-log.jsonl")).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(
-            serde_json::from_str::<Value>(lines[0]).unwrap()["block_id"],
+            serde_json::from_str::<Value>(lines[0]).unwrap()["block"],
             json!("A.1")
         );
         assert_eq!(
-            serde_json::from_str::<Value>(lines[1]).unwrap()["block_id"],
+            serde_json::from_str::<Value>(lines[1]).unwrap()["block"],
             json!("B.1")
         );
     }
@@ -719,10 +1408,16 @@ mod tests {
             &admission,
             &hold,
             Duration::from_millis(1),
+            None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
             roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -743,6 +1438,116 @@ mod tests {
         assert_eq!(lines.len(), 2);
     }
 
+    /// EN.11.L Task 1: a step parked on an operator hold must not hold
+    /// an admission permit — a second lane at the ceiling proceeds while
+    /// the first is still parked. Uses a capacity-1 admission gate shared
+    /// across two concurrent chains: chain A is held forever, chain B is
+    /// never held. Before the reorder in this commit, chain A's `let
+    /// _permit = admission.acquire_for(step).await` ran BEFORE
+    /// `wait_for_clearance`, so it would have consumed the single permit
+    /// and chain B would have hung; this test fails against that ordering
+    /// (observed timeout on `chain_b_done.recv()`).
+    #[tokio::test]
+    async fn a_held_step_does_not_starve_a_second_lane_of_its_admission_permit() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let admission = AdmissionGate::new(crate::nodes::terminal::AdmissionControl::new(
+            crate::nodes::terminal::admission::AdmissionPolicy {
+                max_concurrent_terminal_runs: 1,
+            },
+        ));
+
+        let held = Arc::new(AtomicBool::new(true));
+        let hold = FlagHold { held: held.clone() };
+
+        let (runner_a, _calls_a) = recording_runner();
+        let (runner_b, _calls_b) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let roadmap_dir_a = tempfile::tempdir().unwrap();
+        let roadmap_dir_b = tempfile::tempdir().unwrap();
+
+        let chain_a = vec![step("repo-a", "A.1")];
+        let chain_b = vec![step("repo-b", "B.1")];
+
+        // Both chains run concurrently on ONE task via `tokio::join!` —
+        // no `tokio::spawn` (which would require `Send` futures the test
+        // closures do not provide). Cooperative polling within a single
+        // task is enough to prove the ordering: chain A parks on its
+        // hold, the checker future observes the permit is still free and
+        // drives chain B to completion, then releases the hold so chain A
+        // can finish too.
+        let chain_a_fut = integrate_chain(
+            &chain_a,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &hold,
+            Duration::from_millis(5),
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner_a,
+            roadmap_dir_a.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        );
+
+        let checker_fut = async {
+            // Give chain A every chance to (wrongly) grab the only permit
+            // before it reaches its held step.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                admission.available_permits(),
+                1,
+                "a step parked on a hold must not consume an admission permit"
+            );
+
+            // Chain B, at the same capacity-1 ceiling, must be able to
+            // proceed and finish while chain A is still parked.
+            let outcomes_b = tokio::time::timeout(
+                Duration::from_millis(500),
+                integrate_chain(
+                    &chain_b,
+                    &resolve_deps,
+                    &is_met,
+                    &admission,
+                    &NeverHeld,
+                    Duration::from_millis(5),
+                    None,
+                    None,
+                    &resolve_engine,
+                    &registry,
+                    &runner_b,
+                    roadmap_dir_b.path(),
+                    None,
+                    &|_: &StepProgress| {},
+                    false,
+                    uuid::Uuid::new_v4(),
+                ),
+            )
+            .await
+            .expect("a second lane must proceed while the first is parked on a hold, not hang")
+            .expect("chain B should complete");
+            assert_eq!(outcomes_b.len(), 1);
+            assert_eq!(outcomes_b[0].block_id, "B.1");
+
+            // Now clear the hold so chain A can finish too.
+            held.store(false, Ordering::SeqCst);
+        };
+
+        let (outcomes_a, ()) = tokio::join!(chain_a_fut, checker_fut);
+        let outcomes_a = outcomes_a.expect("chain A should complete once the hold clears");
+        assert_eq!(outcomes_a.len(), 1);
+        assert_eq!(outcomes_a[0].block_id, "A.1");
+    }
+
     #[tokio::test]
     async fn while_held_the_run_does_not_proceed() {
         let held = Arc::new(AtomicBool::new(true));
@@ -750,7 +1555,7 @@ mod tests {
 
         let waited = tokio::time::timeout(
             Duration::from_millis(50),
-            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5)),
+            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None, None),
         )
         .await;
         assert!(waited.is_err(), "must not clear while still held");
@@ -758,7 +1563,7 @@ mod tests {
         held.store(false, Ordering::SeqCst);
         let cleared = tokio::time::timeout(
             Duration::from_millis(200),
-            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5)),
+            wait_for_clearance(&hold, "repo-a", "A.1", Duration::from_millis(5), None, None),
         )
         .await;
         assert!(cleared.is_ok(), "must clear promptly once unheld");
@@ -768,9 +1573,308 @@ mod tests {
     async fn never_held_clears_immediately() {
         let cleared = tokio::time::timeout(
             Duration::from_millis(50),
-            wait_for_clearance(&NeverHeld, "repo-a", "A.1", Duration::from_millis(5)),
+            wait_for_clearance(
+                &NeverHeld,
+                "repo-a",
+                "A.1",
+                Duration::from_millis(5),
+                None,
+                None,
+            ),
         )
         .await;
         assert!(cleared.is_ok());
+    }
+
+    // ── Lane threading (EN.ticket.lane-log-entry-schema Task 3) ─────────
+
+    fn failing_runner(fail_block: &'static str) -> FlowRunner {
+        Arc::new(move |invocation| {
+            Box::pin(async move {
+                if invocation.block_id == fail_block {
+                    Err(crate::WorkflowError::new(format!(
+                        "simulated failure for {}",
+                        invocation.block_id
+                    )))
+                } else {
+                    Ok(engine_contract::TaskContext {
+                        event: json!({}),
+                        nodes: std::collections::HashMap::new(),
+                        metadata: json!({}),
+                        node_runs: std::collections::HashMap::new(),
+                    })
+                }
+            })
+        })
+    }
+
+    /// An explicit `blocks` chain has no lane by construction: passing
+    /// `lane: None` must make every appended line's `lane` fall back to
+    /// that step's own repo slug — matching how the fleet's hand-written
+    /// single-repo lines already read `lane == repo`.
+    #[tokio::test]
+    async fn no_lane_falls_back_to_the_step_repo_slug() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("chain should complete");
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let parsed: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["lane"], json!("repo-a"));
+        assert_eq!(parsed["repo"], json!("repo-a"));
+        assert_eq!(parsed["status"], json!("closed"));
+    }
+
+    /// A real lane, when given, is used as-is rather than falling back to
+    /// the repo slug.
+    #[tokio::test]
+    async fn a_real_lane_is_threaded_into_every_line() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-b", "B.1")];
+
+        integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            Some("backend"),
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("chain should complete");
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        for line in contents.lines() {
+            let parsed: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["lane"], json!("backend"));
+        }
+    }
+
+    /// A failing step appends exactly one `bailed` line carrying the
+    /// error's text as its `note`, and the chain still returns that
+    /// error.
+    #[tokio::test]
+    async fn a_failing_step_appends_a_bailed_line_and_still_returns_the_error() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect_err("a failing step must propagate its error");
+
+        assert!(matches!(err, IntegrateError::Execute(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("simulated failure"), "message was: {msg}");
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one bailed line for the attempt");
+        let parsed: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["status"], json!("bailed"));
+        assert_eq!(parsed["block"], json!("A.1"));
+        assert!(
+            parsed["note"]
+                .as_str()
+                .unwrap()
+                .contains("simulated failure"),
+            "note should carry the error text: {parsed}"
+        );
+    }
+
+    /// If the bailed append itself fails (here: the roadmap directory does
+    /// not exist, so the lane-log append cannot open the file), the
+    /// *original* step error is still what returns — a lane-log write
+    /// hiccup must never replace the real reason the chain stopped.
+    #[tokio::test]
+    async fn a_lane_log_append_failure_during_the_bail_path_does_not_mask_the_original_error() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        // A roadmap dir that does not exist: `append_lane_log_line` will
+        // fail to open the file, since there is no parent directory.
+        let missing_roadmap_dir = dir.path().join("no-such-roadmap-dir");
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            &missing_roadmap_dir,
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect_err("the original step failure must still surface");
+
+        assert!(
+            matches!(err, IntegrateError::Execute(_)),
+            "a masked lane-log write failure would surface as LaneLogWriteFailed instead: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("simulated failure"), "message was: {msg}");
+    }
+
+    /// A two-step chain whose first step fails must not advance to the
+    /// second: the second block's `run_flow` is never invoked, no `closed`
+    /// line is ever written, and the only lane-log line on disk is the
+    /// first step's `bailed` entry (EN.11.D Task 3).
+    #[tokio::test]
+    async fn a_failing_step_does_not_advance_to_the_next_step() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: FlowRunner = Arc::new(move |invocation| {
+            recorded.lock().unwrap().push(invocation.block_id.clone());
+            Box::pin(async move {
+                if invocation.block_id == "A.1" {
+                    Err(crate::WorkflowError::new("simulated failure for A.1"))
+                } else {
+                    Ok(engine_contract::TaskContext {
+                        event: json!({}),
+                        nodes: std::collections::HashMap::new(),
+                        metadata: json!({}),
+                        node_runs: std::collections::HashMap::new(),
+                    })
+                }
+            })
+        });
+
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect_err("the chain must stop on the first failing step");
+
+        assert!(matches!(err, IntegrateError::Execute(_)));
+
+        // The second step's `run_flow` must never have been invoked — the
+        // chain stops, it does not skip ahead or continue past a failure.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["A.1".to_string()],
+            "the second step must never run once the first has failed"
+        );
+
+        // Exactly one line on disk, and it is `bailed` for A.1 — never a
+        // `closed` line for either step.
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "no line for the never-run second step");
+        let parsed: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["status"], json!("bailed"));
+        assert_eq!(parsed["block"], json!("A.1"));
     }
 }

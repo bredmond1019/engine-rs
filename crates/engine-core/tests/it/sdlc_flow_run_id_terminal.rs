@@ -214,8 +214,12 @@ async fn forced_node_error_leaves_terminal_blocked_status_with_run_id() {
         .clone()
         .expect("a FAILED NodeRun should carry an error message");
 
-    let saved_to = write_terminal_blocked_state(&final_ctx, &reason)
-        .expect("worktree + loaded state present and the sdlc/ dir already exists");
+    let saved_to = write_terminal_blocked_state(
+        &final_ctx,
+        &reason,
+        engine_core::workflows::sdlc_flow::DEFAULT_STATE_FILENAME,
+    )
+    .expect("worktree + loaded state present and the sdlc/ dir already exists");
 
     let on_disk = std::fs::read_to_string(&saved_to).unwrap();
     let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();

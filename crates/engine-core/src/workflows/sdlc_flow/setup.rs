@@ -30,7 +30,7 @@ use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
 use super::task_loop::{apply_policy, resolved_policy, worktree_path, Stage};
-use super::{get_result, parse_structured_or_fenced, put_result};
+use super::{get_result, parse_structured_or_fenced, put_result, DEFAULT_STATE_FILENAME};
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
 /// downstream node reads one resolved value rather than re-deriving it.
@@ -206,7 +206,13 @@ fn spec_dir(ctx: &TaskContext, spec_slug: &str) -> PathBuf {
 pub struct SetupWorktreeNode {
     runner: CommandRunner,
     registry: Option<Arc<RepoRegistry>>,
+    branch_prefix: &'static str,
 }
+
+/// Default branch-name prefix (`"sdlc/{spec_slug}"`) — unchanged from
+/// today's hardcoded behavior. `EN.11.N` task 3 adds `with_branch_prefix`
+/// so `SDLC_TASK` can reuse this node under `"task/"` without forking it.
+const DEFAULT_BRANCH_PREFIX: &str = "sdlc/";
 
 impl SetupWorktreeNode {
     #[must_use]
@@ -214,6 +220,7 @@ impl SetupWorktreeNode {
         Self {
             runner: default_command_runner(),
             registry: None,
+            branch_prefix: DEFAULT_BRANCH_PREFIX,
         }
     }
 
@@ -236,6 +243,16 @@ impl SetupWorktreeNode {
         self.registry = Some(registry);
         self
     }
+
+    /// Override the branch-name prefix used when `event.branch_name` is
+    /// absent. Defaults to `"sdlc/"`, producing `sdlc/<spec_slug>` exactly
+    /// as before this builder existed. `SDLC_TASK` passes `"task/"`. An
+    /// explicit `event.branch_name` still wins over the prefix either way.
+    #[must_use]
+    pub fn with_branch_prefix(mut self, branch_prefix: &'static str) -> Self {
+        self.branch_prefix = branch_prefix;
+        self
+    }
 }
 
 impl Default for SetupWorktreeNode {
@@ -251,7 +268,7 @@ impl Node for SetupWorktreeNode {
         let branch = event
             .branch_name
             .clone()
-            .unwrap_or_else(|| format!("sdlc/{}", event.spec_slug));
+            .unwrap_or_else(|| format!("{}{}", self.branch_prefix, event.spec_slug));
 
         // EN.3.K: every relative path this node produces is anchored to
         // `root` — `resolve_target_root` returns `current_dir()` verbatim
@@ -516,7 +533,34 @@ impl Node for SetupWorktreeNode {
 /// D31-committed path — see
 /// `D10-committed-state-path-schema-alignment.md`) or `tasks.json`, else to
 /// `GenerateTasksNode`.
-pub struct SpecExistsRouterNode;
+pub struct SpecExistsRouterNode {
+    state_filename: &'static str,
+}
+
+impl SpecExistsRouterNode {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state_filename: DEFAULT_STATE_FILENAME,
+        }
+    }
+
+    /// Override the state filename this router checks for. Defaults to
+    /// [`DEFAULT_STATE_FILENAME`]; `EN.11.N` task 3 adds this so
+    /// `SDLC_TASK` can reuse this node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
+        self
+    }
+}
+
+impl Default for SpecExistsRouterNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait::async_trait]
 impl Node for SpecExistsRouterNode {
@@ -543,8 +587,7 @@ impl Router for SpecExistsRouterNode {
     fn route(&self, ctx: &TaskContext) -> Option<String> {
         let spec_slug = ctx.event.get("spec_slug")?.as_str()?;
         let dir = spec_dir(ctx, spec_slug);
-        if dir.join("sdlc").join("sdlc-flow-state.json").exists() || dir.join("tasks.json").exists()
-        {
+        if dir.join("sdlc").join(self.state_filename).exists() || dir.join("tasks.json").exists() {
             Some("LoadTaskStateNode".to_string())
         } else {
             Some("GenerateTasksNode".to_string())
@@ -575,7 +618,34 @@ impl Router for SpecExistsRouterNode {
 ///
 /// The old state is never deleted or overwritten: the corpse is forensics.
 /// See [`archive_superseded_state`] for the naming/collision rules.
-pub struct LoadTaskStateNode;
+pub struct LoadTaskStateNode {
+    state_filename: &'static str,
+}
+
+impl LoadTaskStateNode {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state_filename: DEFAULT_STATE_FILENAME,
+        }
+    }
+
+    /// Override the state filename this node reads/archives. Defaults to
+    /// [`DEFAULT_STATE_FILENAME`]; `EN.11.N` task 3 adds this so
+    /// `SDLC_TASK` can reuse this node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
+        self
+    }
+}
+
+impl Default for LoadTaskStateNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Deterministic discriminator naming an archived state file, derived from
 /// the *old file's own* contents so the same file always archives to the same
@@ -648,10 +718,11 @@ fn sanitize_path_component(raw: &str) -> String {
 fn archive_superseded_state(
     state_path: &Path,
     old_state: &serde_json::Value,
+    state_filename: &str,
 ) -> Result<PathBuf, NodeError> {
     let dir = state_path.parent().unwrap_or_else(|| Path::new("."));
     let discriminator = superseded_discriminator(old_state);
-    let base = format!("sdlc-flow-state.json.superseded-{discriminator}");
+    let base = format!("{state_filename}.superseded-{discriminator}");
 
     let mut candidate = dir.join(format!("{base}.bak"));
     let mut suffix = 2u32;
@@ -683,7 +754,7 @@ impl Node for LoadTaskStateNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let event = parse_event(&ctx)?;
         let dir = spec_dir(&ctx, &event.spec_slug);
-        let state_path = dir.join("sdlc").join("sdlc-flow-state.json");
+        let state_path = dir.join("sdlc").join(self.state_filename);
         let tasks_path = dir.join("tasks.json");
 
         // Parse the existing state (if any) up front: both the "resume it"
@@ -709,7 +780,7 @@ impl Node for LoadTaskStateNode {
             let old = existing_state
                 .as_ref()
                 .expect("restarting implies an existing state");
-            archive_superseded_state(&state_path, old)?;
+            archive_superseded_state(&state_path, old, self.state_filename)?;
         }
 
         let resumed_state = if restarting { None } else { existing_state };
@@ -720,11 +791,34 @@ impl Node for LoadTaskStateNode {
             let raw = std::fs::read_to_string(&tasks_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", tasks_path.display()))
             })?;
-            let tasks: Vec<SDLCTask> = serde_json::from_str(&raw).map_err(|err| {
+            let raw_tasks: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|err| {
                 NodeError::new(format!("failed to parse {}: {err}", tasks_path.display()))
+            })?;
+            // Fresh bootstrap (no committed run state yet): seed
+            // max_attempts from the resolved policy for any task
+            // `tasks.json` does not declare its own value for. A resumed
+            // run (the `SDLCState::from_committed_state_json` branch above)
+            // already has concrete, previously-committed values and must
+            // not be re-seeded here.
+            let policy = resolved_policy(&ctx)?;
+            let tasks = seed_max_attempts(raw_tasks, policy.max_attempts).map_err(|err| {
+                NodeError::new(format!(
+                    "invalid task shape in {}: {err}",
+                    tasks_path.display()
+                ))
             })?;
             let mut bootstrapped = SDLCState::new(event.spec_slug.clone());
             bootstrapped.tasks = tasks;
+            // Carry block_id/phase_id from the event onto the freshly
+            // created state (EN.ticket.wrap-up-closes-the-block task 1).
+            // Only done here, on the no-prior-state path: a resumed run
+            // (`resumed_state` above, loaded via
+            // `SDLCState::from_committed_state_json`) already preserves
+            // whatever block_id/phase_id were committed to disk, and must
+            // not have them silently overwritten by a differing event
+            // value on reattach.
+            bootstrapped.block_id = event.block_id.clone();
+            bootstrapped.phase_id = event.phase_id.clone();
             bootstrapped
         } else {
             return Err(NodeError::new(format!(
@@ -751,10 +845,38 @@ impl Node for LoadTaskStateNode {
 
 /// Model output shape expected from `GenerateTasksNode`'s prompt: the task
 /// list plus its rendered `tasks.md` body.
+///
+/// `tasks` is kept as raw [`serde_json::Value`]s rather than
+/// `Vec<SDLCTask>` on purpose: [`seed_max_attempts`] needs the raw shape to
+/// tell "the model declared its own `max_attempts`" apart from "the field
+/// was absent and `SDLCTask`'s `#[serde(default)]` filled it in" — a
+/// distinction a direct `Vec<SDLCTask>` deserialize destroys.
 #[derive(Debug, Deserialize)]
 struct GeneratedTasks {
-    tasks: Vec<SDLCTask>,
+    tasks: Vec<serde_json::Value>,
     tasks_markdown: String,
+}
+
+/// Convert raw task JSON values into [`SDLCTask`]s, seeding `max_attempts`
+/// from `policy_max_attempts` for any task whose own JSON omits the field —
+/// never for one that declares it, even if the declared value equals the
+/// default. This is the SEED described on [`SdlcPolicy::max_attempts`]'s
+/// doc comment: task-declared > policy > `SDLCTask`'s built-in default.
+fn seed_max_attempts(
+    raw_tasks: Vec<serde_json::Value>,
+    policy_max_attempts: u32,
+) -> Result<Vec<SDLCTask>, serde_json::Error> {
+    raw_tasks
+        .into_iter()
+        .map(|value| {
+            let declared = value.get("max_attempts").is_some();
+            let mut task: SDLCTask = serde_json::from_value(value)?;
+            if !declared {
+                task.max_attempts = policy_max_attempts;
+            }
+            Ok(task)
+        })
+        .collect()
 }
 
 /// JSON schema matching [`GeneratedTasks`], passed as `Config.json_schema` so
@@ -777,7 +899,7 @@ fn generated_tasks_schema() -> serde_json::Value {
 /// Mirrors the Python `_gather_context` helper. Missing/unreadable entries
 /// are skipped rather than failing the whole gather.
 fn gather_context(dir: &Path) -> String {
-    let excluded = ["tasks.md", "tasks.json", "sdlc-flow-state.json"];
+    let excluded = ["tasks.md", "tasks.json", DEFAULT_STATE_FILENAME];
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -892,7 +1014,8 @@ impl Node for GenerateTasksNode {
 
         config.json_schema = Some(generated_tasks_schema());
 
-        let mut step = ClaudeCodeStep::new("GenerateTasksNode", config, prompt);
+        let mut step = ClaudeCodeStep::new("GenerateTasksNode", config, prompt)
+            .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -914,12 +1037,21 @@ impl Node for GenerateTasksNode {
                 ))
             })?;
 
+        // Seed max_attempts from the resolved policy for any task the model
+        // did not give its own value (SdlcPolicy::max_attempts's doc
+        // comment: task-declared > policy > built-in default).
+        let tasks = seed_max_attempts(generated.tasks, policy.max_attempts).map_err(|err| {
+            NodeError::new(format!(
+                "GenerateTasksNode: invalid task shape in model output: {err}"
+            ))
+        })?;
+
         std::fs::create_dir_all(&dir)
             .map_err(|err| NodeError::new(format!("failed to create {}: {err}", dir.display())))?;
 
         let tasks_json_path = dir.join("tasks.json");
         let tasks_md_path = dir.join("tasks.md");
-        let tasks_json = serde_json::to_string_pretty(&generated.tasks)
+        let tasks_json = serde_json::to_string_pretty(&tasks)
             .map_err(|err| NodeError::new(format!("failed to serialize tasks.json: {err}")))?;
         std::fs::write(&tasks_json_path, tasks_json).map_err(|err| {
             NodeError::new(format!(
@@ -940,7 +1072,7 @@ impl Node for GenerateTasksNode {
             json!({
                 "tasks_json": tasks_json_path.to_string_lossy(),
                 "tasks_md": tasks_md_path.to_string_lossy(),
-                "task_count": generated.tasks.len(),
+                "task_count": tasks.len(),
                 // Stamp the resolved knob values so `RunTelemetry` /
                 // `PolicyAggregate` can attribute this stage's observed cost
                 // to the settings that caused it (standing rule 6).
@@ -1101,7 +1233,7 @@ mod tests {
         std::fs::write(dir.join("tasks.json"), "[]").unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("LoadTaskStateNode".to_string()));
     }
 
@@ -1111,7 +1243,7 @@ mod tests {
         std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("GenerateTasksNode".to_string()));
     }
 
@@ -1123,7 +1255,7 @@ mod tests {
         std::fs::write(dir.join("sdlc-flow-state.json"), "{}").unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("LoadTaskStateNode".to_string()));
     }
 
@@ -1138,7 +1270,7 @@ mod tests {
         std::fs::write(dir.join("sdlc-flow-state.json"), "{}").unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let router = SpecExistsRouterNode;
+        let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("GenerateTasksNode".to_string()));
     }
 
@@ -1163,7 +1295,7 @@ mod tests {
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "task_range": "1,3" });
 
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let out = node.process(ctx).await.expect("load should succeed");
 
         let state = out
@@ -1177,6 +1309,87 @@ mod tests {
             .map(|t| t["task_id"].as_u64().unwrap())
             .collect();
         assert_eq!(task_ids, vec![1, 3]);
+    }
+
+    /// EN.ticket.sdlc-flow-dead-policy-knobs task 1, AC1: a non-default
+    /// policy `max_attempts` changes the bound a task that omits its own
+    /// value actually gets, on the bootstrap-from-`tasks.json` path.
+    #[tokio::test]
+    async fn load_seeds_max_attempts_from_policy_when_task_omits_it() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "One", "description": "d1" },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let policy = SdlcPolicy {
+            max_attempts: 7,
+            ..SdlcPolicy::default()
+        };
+        let mut ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(state["tasks"][0]["max_attempts"], 7);
+    }
+
+    /// AC2: a task that declares its own `max_attempts` keeps it even when
+    /// the policy sets a different value.
+    #[tokio::test]
+    async fn load_does_not_override_a_task_declared_max_attempts() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "One", "description": "d1", "max_attempts": 1 },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let policy = SdlcPolicy {
+            max_attempts: 7,
+            ..SdlcPolicy::default()
+        };
+        let mut ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(state["tasks"][0]["max_attempts"], 1);
+    }
+
+    /// AC3: with defaults everywhere (policy default 3, task omits the
+    /// field), behaviour is unchanged from before this task.
+    #[tokio::test]
+    async fn load_with_default_policy_leaves_max_attempts_at_three() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = json!([
+            { "task_id": 1, "title": "One", "description": "d1" },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let state = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(state["tasks"][0]["max_attempts"], 3);
     }
 
     #[tokio::test]
@@ -1204,7 +1417,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let out = node.process(ctx).await.expect("load should succeed");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["spec_slug"], "my-spec");
@@ -1212,6 +1425,83 @@ mod tests {
             sdlc_dir.join("sdlc-flow-state.json").exists(),
             "a resume must leave the state file where it is"
         );
+    }
+
+    #[tokio::test]
+    async fn load_carries_block_id_and_phase_id_from_event_onto_fresh_state() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({
+            "spec_slug": "my-spec",
+            "block_id": "EN.3.A",
+            "phase_id": "EN.3",
+        });
+
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(loaded["block_id"], "EN.3.A");
+        assert_eq!(loaded["phase_id"], "EN.3");
+    }
+
+    #[tokio::test]
+    async fn load_leaves_block_id_and_phase_id_null_when_event_supplies_neither() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" });
+
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert!(loaded["block_id"].is_null());
+        assert!(loaded["phase_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_block_id_and_phase_id_from_the_state_file() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+
+        let mut state = SDLCState::new("my-spec");
+        state.block_id = Some("EN.3.A".to_string());
+        state.phase_id = Some("EN.3".to_string());
+        let run_meta = super::super::schema::RunMeta {
+            branch: "sdlc/my-spec".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-07-25T00:00:00Z".to_string(),
+            updated_at: "2026-07-25T00:00:00Z".to_string(),
+            run_id: None,
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
+        std::fs::write(
+            sdlc_dir.join("sdlc-flow-state.json"),
+            serde_json::to_string(&committed).unwrap(),
+        )
+        .unwrap();
+
+        // A resume must not let a differing event value silently rewrite
+        // what was already committed to disk.
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({
+            "spec_slug": "my-spec",
+            "resume": true,
+            "block_id": "EN.9.Z",
+            "phase_id": "EN.9",
+        });
+
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+        assert_eq!(loaded["block_id"], "EN.3.A");
+        assert_eq!(loaded["phase_id"], "EN.3");
     }
 
     // --- resume / restart semantics ---------------------------------------
@@ -1281,7 +1571,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
 
         let attempts: Vec<u64> = loaded["tasks"]
@@ -1309,7 +1599,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec" }); // resume defaults to false
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
 
         let attempts: Vec<u64> = loaded["tasks"]
@@ -1356,7 +1646,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["tasks"].as_array().unwrap().len(), 1);
         assert_eq!(loaded["tasks"][0]["attempt_count"], 0);
@@ -1378,7 +1668,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["tasks"].as_array().unwrap().len(), 1);
         assert_eq!(loaded["tasks"][0]["status"], "pending");
@@ -1391,14 +1681,17 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode.process(ctx).await.expect("first restart");
+        LoadTaskStateNode::new()
+            .process(ctx)
+            .await
+            .expect("first restart");
 
         // Re-seed a state file carrying the SAME stamped run_id, then
         // restart again — the discriminator collides.
         seed_bailed_spec(&worktree, "my-spec", 1, Some("run-aaaa"));
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode
+        LoadTaskStateNode::new()
             .process(ctx)
             .await
             .expect("second restart");
@@ -1423,7 +1716,10 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        LoadTaskStateNode.process(ctx).await.expect("restart");
+        LoadTaskStateNode::new()
+            .process(ctx)
+            .await
+            .expect("restart");
 
         let names = archived_names(&sdlc_dir);
         assert_eq!(names.len(), 1, "exactly one archive, got {names:?}");
@@ -1460,7 +1756,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         assert_eq!(
             out.nodes.get("LoadTaskStateNode").unwrap()["spec_slug"],
             "my-spec"
@@ -1476,7 +1772,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false, "task_range": "2-3" });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         let ids: Vec<u64> = loaded["tasks"]
             .as_array()
@@ -1500,7 +1796,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("my-spec", &worktree);
         ctx.event = json!({ "spec_slug": "my-spec", "resume": false });
-        let err = LoadTaskStateNode
+        let err = LoadTaskStateNode::new()
             .process(ctx)
             .await
             .expect_err("should fail");
@@ -1532,7 +1828,7 @@ mod tests {
 
         let mut ctx = ctx_with_worktree("bailed-spec", &worktree);
         ctx.event = json!({ "spec_slug": "bailed-spec" });
-        let out = LoadTaskStateNode.process(ctx).await.expect("load");
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
         let state: SDLCState =
             serde_json::from_value(out.nodes.get("LoadTaskStateNode").unwrap().clone()).unwrap();
 
@@ -1584,7 +1880,7 @@ mod tests {
         .unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let out = node.process(ctx).await.expect("load should succeed");
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         let task_ids: Vec<u64> = loaded["tasks"]
@@ -1602,7 +1898,7 @@ mod tests {
         std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
 
         let ctx = ctx_with_worktree("my-spec", &worktree);
-        let node = LoadTaskStateNode;
+        let node = LoadTaskStateNode::new();
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("no state or tasks file found"));
     }
@@ -1632,6 +1928,51 @@ mod tests {
         let result = out.nodes.get("SetupWorktreeNode").expect("output present");
         assert_eq!(result["branch_name"], "sdlc/my-spec");
         assert_eq!(result["worktree_path"], "trees/sdlc/my-spec");
+    }
+
+    /// `EN.11.N` task 3 acceptance criterion: `with_branch_prefix("task/")`
+    /// produces `task/<spec_slug>`.
+    #[tokio::test]
+    async fn setup_with_branch_prefix_produces_prefixed_branch() {
+        let node = SetupWorktreeNode::new()
+            .with_runner(stub_runner(0))
+            .with_branch_prefix("task/");
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["branch_name"], "task/my-spec");
+    }
+
+    /// `EN.11.N` task 3 acceptance criterion: the default (no
+    /// `with_branch_prefix` call) still produces `sdlc/<spec_slug>` —
+    /// behaviour-stable with today.
+    #[tokio::test]
+    async fn setup_default_branch_prefix_is_unchanged() {
+        let node = SetupWorktreeNode::new().with_runner(stub_runner(0));
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["branch_name"], "sdlc/my-spec");
+    }
+
+    /// `EN.11.N` task 3 acceptance criterion: an explicit
+    /// `event.branch_name` still overrides `with_branch_prefix`.
+    #[tokio::test]
+    async fn setup_explicit_branch_name_overrides_branch_prefix() {
+        let node = SetupWorktreeNode::new()
+            .with_runner(stub_runner(0))
+            .with_branch_prefix("task/");
+        let ctx = empty_context(json!({
+            "spec_slug": "my-spec",
+            "use_worktree": true,
+            "branch_name": "custom/explicit-branch",
+        }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let result = out.nodes.get("SetupWorktreeNode").expect("output present");
+        assert_eq!(result["branch_name"], "custom/explicit-branch");
     }
 
     #[tokio::test]
@@ -2737,6 +3078,114 @@ repo_path = "alpha"
         assert!(dir.join("tasks.md").exists());
         let md = std::fs::read_to_string(dir.join("tasks.md")).unwrap();
         assert!(md.contains("Do it"));
+    }
+
+    /// EN.ticket.sdlc-flow-dead-policy-knobs task 1, AC1: a non-default
+    /// policy `max_attempts` seeds a model-generated task that does not
+    /// declare its own value.
+    #[tokio::test]
+    async fn generate_seeds_max_attempts_from_policy_when_model_omits_it() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let canned = json!({
+            "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc" }],
+            "tasks_markdown": "# Tasks\n\n1. Do it",
+        })
+        .to_string();
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text(&canned);
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let policy = SdlcPolicy {
+            max_attempts: 9,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+
+        node.process(ctx).await.expect("generate should succeed");
+
+        let dir = worktree.join("planning").join("my-spec");
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("tasks.json")).unwrap())
+                .unwrap();
+        assert_eq!(tasks[0]["max_attempts"], 9);
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport for
+    /// `GenerateTasksNode`.
+    #[tokio::test]
+    async fn generate_transport_retry_nondefault_changes_observed_attempts() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let calls = calls.clone();
+            move |_config, _prompt| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let policy = SdlcPolicy {
+            transport_retry: crate::workflows::sdlc_flow::policy::TransportRetry {
+                max_attempts: 4,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// AC2: a model-generated task that declares its own `max_attempts`
+    /// keeps it, even when the policy sets a different value.
+    #[tokio::test]
+    async fn generate_does_not_override_a_model_declared_max_attempts() {
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let canned = json!({
+            "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc", "max_attempts": 1 }],
+            "tasks_markdown": "# Tasks\n\n1. Do it",
+        })
+        .to_string();
+
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome = stub_outcome_with_text(&canned);
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let policy = SdlcPolicy {
+            max_attempts: 9,
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_worktree_and_policy("my-spec", &worktree, &policy);
+
+        node.process(ctx).await.expect("generate should succeed");
+
+        let dir = worktree.join("planning").join("my-spec");
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("tasks.json")).unwrap())
+                .unwrap();
+        assert_eq!(tasks[0]["max_attempts"], 1);
     }
 
     #[tokio::test]

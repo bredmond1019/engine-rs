@@ -502,6 +502,53 @@ MEV_CHECK_CONSUMERS_MODE=no-brain BASTION_SHIM_ERRORS="0 0 0 0 0" run_hook "$R25
 { [ "$HOOK_RC" -eq 0 ] && printf '%s' "$HOOK_OUT" | grep -q "no HQ tree here"; }
 check "consumer gate: missing brain.toml skips rather than blocks" $?
 
+# =========================================================================================
+# HQ.7.B — the stray-`./~`-tree predicate is wired through stage 2's harness.json read, not
+# a native hook stage (that's the whole point of registering it there instead of adding a
+# fourth native stage). These cases prove stage 2 actually BLOCKS on the predicate rather
+# than merely that scripts/check_no_stray_tilde.sh works standalone (already covered by the
+# script's own red baseline in planning/HQ.7.B/tasks.md). The fixture's harness.json check
+# mirrors the real script's own predicate (`test ! -e './~'`, filesystem-only, no git) so the
+# fixture repo never needs scripts/lib.sh or HQ_ROOT resolution — only the wiring is under
+# test here. The fixture's `~` lives under $WORK (a mktemp dir), never near the real repo root.
+# =========================================================================================
+
+# --- Case 26: registered check + a stray `~` present in the fixture repo -> BLOCKS ---
+R26="$WORK/r26"; new_repo "$R26"
+echo '{"errors": 0}' > "$R26/hooks/validate-baseline.json"
+mkdir -p "$R26/planning"
+cat > "$R26/planning/harness.json" <<'JSON'
+{
+  "stack": "nextjs",
+  "validation": { "checks": [
+    { "name": "no-stray-tilde-tree", "command": "test ! -e './~'", "gates": true }
+  ] }
+}
+JSON
+touch "$R26/package.json"
+mkdir -p "$R26/~"; touch "$R26/~/SKILL.md"
+run_hook "$R26"
+{ [ "$HOOK_RC" -eq 1 ]; }; check "stray-tilde gate: registered check + tree present -> exit 1" $?
+printf '%s' "$HOOK_OUT" | grep -q "no-stray-tilde-tree"; check "stray-tilde gate: block names the check" $?
+printf '%s' "$HOOK_OUT" | grep -q "BLOCKED (stage 2)"; check "stray-tilde gate: block message names stage 2" $?
+
+# --- Case 27: same registered check, no `~` present -> exit 0 ---
+R27="$WORK/r27"; new_repo "$R27"
+echo '{"errors": 0}' > "$R27/hooks/validate-baseline.json"
+mkdir -p "$R27/planning"
+cat > "$R27/planning/harness.json" <<'JSON'
+{
+  "stack": "nextjs",
+  "validation": { "checks": [
+    { "name": "no-stray-tilde-tree", "command": "test ! -e './~'", "gates": true }
+  ] }
+}
+JSON
+touch "$R27/package.json"
+run_hook "$R27"
+{ [ "$HOOK_RC" -eq 0 ]; }; check "stray-tilde gate: registered check + tree absent -> exit 0" $?
+printf '%s' "$HOOK_OUT" | grep -q "no-stray-tilde-tree (test ! -e './~') ... passed"; check "stray-tilde gate: passing check reported" $?
+
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$fail"

@@ -297,3 +297,32 @@ the real error text. Cut reasoning narration, unasked-for next steps, and self-a
 Full rationale, the complete cut-list, and worked before/after examples: the
 **`report-to-the-operator`** skill.
 <!-- END:response-style -->
+
+<!-- BEGIN:session-continuity -->
+## Stopping, continuing, and handing off
+
+Decide in this order. Only the third question is about tokens, and most of the time you never reach
+it. Raise this proactively when it applies — do not wait to be asked.
+
+1. **Is there a correctness reason to restart?** This overrides everything and holds at any context
+   size. An engine, command file, installed binary (`mev`, `bastion`), hook or `settings.json`
+   changed this session; or the operator edited a `CLAUDE.md` you already read. The running session
+   is a launch-time snapshot (standing rule 10), so it keeps producing pre-change results that read
+   as an unreliable agent rather than a stale snapshot. **Name the trigger; do not present it as a
+   cost decision.**
+2. **Does the next chunk of work have a written entry point?** The gate is the artifact, not the
+   number. If the next agent can start from `status.md`, `handoff.md`, a spec's `tasks.json`, or an
+   orchestration-run `notes.md`, clearing is nearly free. If not, **suggest writing that artifact
+   first, then clearing** — and never clear mid-debug, mid-block, or mid-decision, where the
+   valuable context is the part that cannot be written down. If clearing feels expensive, that is a
+   signal the handoff is thin, not a reason to stay.
+3. **Only then, the context size.** The real signal is what fraction is finished tool output rather
+   than active understanding. Rough bands: under ~100k don't raise it · 100–200k keep going ·
+   200–300k finish the unit in flight then suggest clearing, and don't start a new one · over ~300k
+   suggest clearing at the next boundary. These prompt you to *raise* it, never to abandon work in
+   flight. **In an orchestration lane the rule is structural: clear at block boundaries, never
+   mid-block** — budget ~20–40k of context per block.
+
+Full rationale, the correctness-trigger table, and what to actually say: the **`stop-or-continue`**
+skill.
+<!-- END:session-continuity -->

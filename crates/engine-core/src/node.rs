@@ -77,6 +77,18 @@ pub trait Node: Send + Sync {
     /// Transform the context. The framework-owned envelope (see
     /// `crate::workflow::node_context`) handles `NodeRun` status/timing
     /// around this call — the node itself only does the work.
+    ///
+    /// **Tracing (`EN.11.I` task 2):** `process` itself carries no
+    /// `#[instrument]` — `crate::workflow::node_context`, the single
+    /// dispatch site every node passes through on every walk, is
+    /// instrumented instead, with a `node` field. Instrumenting the trait
+    /// method would mean touching every one of the ~6 in-tree `impl Node`
+    /// blocks (plus every workflow node registered across the crate) for no
+    /// gain: the dispatch site already sees every call. Any event a node's
+    /// own `process()` emits inherits that span's `node` field, and its
+    /// ancestor `Workflow::walk` span's `run_id`/`campaign_id` fields, for
+    /// free — nothing inside a node implementation needs its own
+    /// instrumentation to get a fully-attributed structured log line.
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError>;
 
     /// The node's identity — its type name, used as the registry/map key.

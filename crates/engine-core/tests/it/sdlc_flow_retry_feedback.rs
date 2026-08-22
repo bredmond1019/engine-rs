@@ -30,8 +30,10 @@ use claude_code_rs::Outcome;
 use engine_contract::TaskContext;
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::workflow::Workflow;
+use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
 use engine_core::workflows::sdlc_flow::docs::PatchDocsNode;
 use engine_core::workflows::sdlc_flow::emit_state::EmitStateNode;
+use engine_core::workflows::sdlc_flow::end_review::{EndReviewNode, EndReviewRouterNode};
 use engine_core::workflows::sdlc_flow::final_validation::FinalValidationNode;
 use engine_core::workflows::sdlc_flow::graph;
 use engine_core::workflows::sdlc_flow::pr::PullRequestNode;
@@ -191,9 +193,9 @@ fn build_workflow(worktree: &Path, prompts: Arc<Mutex<Vec<String>>>) -> Workflow
     registry.register(Box::new(FixtureSetupNode {
         worktree_path: worktree.to_string_lossy().to_string(),
     }));
-    registry.register(Box::new(SpecExistsRouterNode));
+    registry.register(Box::new(SpecExistsRouterNode::new()));
     registry.register(Box::new(GenerateTasksNode::new()));
-    registry.register(Box::new(LoadTaskStateNode));
+    registry.register(Box::new(LoadTaskStateNode::new()));
     registry.register(Box::new(TaskQueueRouterNode));
 
     registry.register(Box::new(ImplementTaskNode::new().with_transport(Arc::new(
@@ -247,7 +249,10 @@ fn build_workflow(worktree: &Path, prompts: Arc<Mutex<Vec<String>>>) -> Workflow
     registry.register(Box::new(
         FinalValidationNode::new().with_runner(test_runner),
     ));
+    registry.register(Box::new(EndReviewNode::new()));
+    registry.register(Box::new(EndReviewRouterNode));
     registry.register(Box::new(WrapUpNode::new()));
+    registry.register(Box::new(CloseBlockNode::new()));
     registry.register(Box::new(PullRequestNode::new()));
     registry.register(Box::new(
         EmitStateNode::new().with_runner(noop_git_runner()),

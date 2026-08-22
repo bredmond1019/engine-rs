@@ -23,7 +23,10 @@ use engine_contract::TaskContext;
 use crate::node::{Node, NodeError};
 use crate::policy::emit_state::{CommandOutputLike, EmitStateNode as GenericEmitStateNode};
 
-use super::{commit_all, default_command_runner, get_result, CommandOutput, CommandRunner};
+use super::{
+    commit_all, default_command_runner, get_result, CommandOutput, CommandRunner,
+    DEFAULT_STATE_FILENAME,
+};
 
 use serde_json::json;
 
@@ -76,11 +79,13 @@ fn spec_slug(ctx: &TaskContext) -> Option<String> {
 ///
 /// This is the only site in the current graph that can see BOTH
 /// `PullRequestNode`'s output and the on-disk committed state: the declared
-/// graph runs `WrapUpNode -> PullRequestNode -> EmitStateNode`
-/// (`graph.rs:165-176`), so `WrapUpNode` writes the file before the PR
-/// exists, and `EmitStateNode` — which already runs last and already holds
-/// a [`CommandRunner`] — is the correct patch site (see `wrap_up.rs`'s
-/// `committed_pr` doc comment, which points here).
+/// graph runs `WrapUpNode -> CloseBlockNode -> PullRequestNode ->
+/// EmitStateNode` (`graph.rs`), so `WrapUpNode` writes the file before the
+/// PR exists, and `EmitStateNode` — which already runs last and already
+/// holds a [`CommandRunner`] — is the correct patch site (see
+/// `wrap_up.rs`'s `committed_pr` doc comment, which points here). Same
+/// reasoning applies one node earlier to `CloseBlockNode`'s own result —
+/// see [`patch_close_block_into_state`] below.
 ///
 /// Patches the JSON object in place (parse to [`serde_json::Value`], set
 /// the key, re-serialize) rather than round-tripping through `SDLCState`,
@@ -98,7 +103,7 @@ fn spec_slug(ctx: &TaskContext) -> Option<String> {
 ///   run — its `pr_url` is `null` and must stay `null` on disk);
 /// - `ctx` has no `SetupWorktreeNode`/`spec_slug`, or the state file does
 ///   not exist at the derived path.
-fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
+fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner, state_filename: &str) {
     let Some(pr_result) = get_result(ctx, "PullRequestNode") else {
         return;
     };
@@ -123,7 +128,7 @@ fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
         .join("planning")
         .join(&slug)
         .join("sdlc")
-        .join("sdlc-flow-state.json");
+        .join(state_filename);
     if !state_path.is_file() {
         return;
     }
@@ -150,9 +155,89 @@ fn patch_pr_into_state(ctx: &TaskContext, runner: &CommandRunner) {
     let _ = commit_all(runner, Path::new(&worktree), "chore: flow state update");
 }
 
+/// Patches the already-written `sdlc-flow-state.json`'s top-level
+/// `"state_write_validated"`/`"state_write_rejected"` keys with
+/// `CloseBlockNode`'s own outcome (`EN.ticket.wrap-up-closes-the-block`
+/// task 5).
+///
+/// Same rationale as [`patch_pr_into_state`]: `CloseBlockNode`'s result is
+/// a transient, per-write output that only exists after `WrapUpNode` has
+/// already written the state file (the declared graph order is
+/// `WrapUpNode -> CloseBlockNode -> PullRequestNode -> EmitStateNode`), so
+/// there is no earlier point in the walk where a writer could stamp these
+/// two booleans onto the committed JSON directly — this node, which
+/// already runs last and already holds a [`CommandRunner`], is the correct
+/// patch site.
+///
+/// **Never inferred.** These two booleans come straight off
+/// `CloseBlockNode`'s own stamped outcome, not derived from `outcome`'s
+/// label string or from whether the close "looks like" it succeeded:
+/// `state_write_validated=false` alongside an otherwise-successful-looking
+/// run is precisely the `UNVALIDATED` degrade this exists to make
+/// distinguishable from a validated `CLOSED` write. Patches both keys
+/// together so the JSON never carries a state where one was written and the
+/// other wasn't.
+///
+/// A clean no-op (the file is left byte-for-byte untouched, and is never
+/// even opened) when:
+/// - `ctx` carries no `CloseBlockNode` result at all (e.g. a bare
+///   `EmitStateNode` unit test, or a graph shape without that node);
+/// - `ctx` has no `SetupWorktreeNode`/`spec_slug`, or the state file does
+///   not exist at the derived path.
+fn patch_close_block_into_state(ctx: &TaskContext, runner: &CommandRunner, state_filename: &str) {
+    let Some(close_result) = get_result(ctx, "CloseBlockNode") else {
+        return;
+    };
+    let validated = close_result
+        .get("state_write_validated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let rejected = close_result
+        .get("state_write_rejected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let Some(worktree) = worktree_path(ctx) else {
+        return;
+    };
+    let Some(slug) = spec_slug(ctx) else {
+        return;
+    };
+    let state_path = Path::new(&worktree)
+        .join("planning")
+        .join(&slug)
+        .join("sdlc")
+        .join(state_filename);
+    if !state_path.is_file() {
+        return;
+    }
+
+    let Ok(content) = std::fs::read_to_string(&state_path) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    object.insert("state_write_validated".to_string(), json!(validated));
+    object.insert("state_write_rejected".to_string(), json!(rejected));
+
+    let Ok(patched) = serde_json::to_string_pretty(&value) else {
+        return;
+    };
+    if std::fs::write(&state_path, patched).is_err() {
+        return;
+    }
+    let _ = commit_all(runner, Path::new(&worktree), "chore: flow state update");
+}
+
 /// Deterministic node: runs `mev emit-state --write` in the worktree.
 pub struct EmitStateNode {
     runner: CommandRunner,
+    state_filename: &'static str,
 }
 
 impl EmitStateNode {
@@ -160,6 +245,7 @@ impl EmitStateNode {
     pub fn new() -> Self {
         Self {
             runner: default_command_runner(),
+            state_filename: DEFAULT_STATE_FILENAME,
         }
     }
 
@@ -168,6 +254,16 @@ impl EmitStateNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the state filename this node's patch helpers read/write.
+    /// Defaults to [`DEFAULT_STATE_FILENAME`]; `EN.11.M` task 4 adds
+    /// this so a second engine can reuse the node under its own filename
+    /// without forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
         self
     }
 }
@@ -188,11 +284,17 @@ impl Node for EmitStateNode {
             .process(ctx)
             .await?;
 
+        // EN.ticket.wrap-up-closes-the-block task 5: patch CloseBlockNode's
+        // outcome into the already-committed state file's
+        // `state_write_validated`/`state_write_rejected` keys, best-effort —
+        // never fails the node, same rationale as the PR patch below.
+        patch_close_block_into_state(&ctx, &self.runner, self.state_filename);
+
         // EN.3.G task 6: patch PullRequestNode's result into the already-
         // committed state file's `pr` block, best-effort — never fails the
         // node (the flow's terminal state is already written; this is
         // enrichment, not a required step).
-        patch_pr_into_state(&ctx, &self.runner);
+        patch_pr_into_state(&ctx, &self.runner, self.state_filename);
 
         Ok(ctx)
     }
@@ -357,7 +459,7 @@ mod tests {
             spec_slug,
             json!({ "pr_url": "https://github.com/o/r/pull/42", "skipped": false }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         let after_value: serde_json::Value = serde_json::from_str(&after).unwrap();
@@ -389,7 +491,7 @@ mod tests {
             spec_slug,
             json!({ "pr_url": null, "skipped": true }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         assert_eq!(before, after);
@@ -413,7 +515,7 @@ mod tests {
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": worktree.to_str().unwrap() }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let after = std::fs::read_to_string(&state_path).unwrap();
         assert_eq!(before, after);
@@ -431,7 +533,7 @@ mod tests {
             spec_slug,
             json!({ "pr_url": "https://github.com/o/r/pull/not-a-number", "skipped": false }),
         );
-        patch_pr_into_state(&ctx, &noop_runner());
+        patch_pr_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
 
         let state_path = worktree
             .join("planning")
@@ -445,5 +547,149 @@ mod tests {
             json!("https://github.com/o/r/pull/not-a-number")
         );
         assert_eq!(after["pr"]["number"], json!(0));
+    }
+
+    // --- patch_close_block_into_state (EN.ticket.wrap-up-closes-the-block task 5) ---
+
+    fn ctx_with_close_block(
+        worktree_path: &str,
+        spec_slug: &str,
+        close_result: serde_json::Value,
+    ) -> TaskContext {
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree_path }),
+        );
+        ctx.nodes.insert("CloseBlockNode".to_string(), close_result);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn patches_a_validated_close_into_an_existing_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        let spec_slug = "EN.3.G-terminal-path-robustness";
+        let state_path = seed_state_file(worktree, spec_slug);
+        let before = std::fs::read_to_string(&state_path).unwrap();
+        let before_value: serde_json::Value = serde_json::from_str(&before).unwrap();
+
+        let ctx = ctx_with_close_block(
+            worktree.to_str().unwrap(),
+            spec_slug,
+            json!({
+                "outcome": "CLOSED:engine-rs:EN.9",
+                "state_write_validated": true,
+                "state_write_rejected": false,
+            }),
+        );
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
+
+        let after = std::fs::read_to_string(&state_path).unwrap();
+        let after_value: serde_json::Value = serde_json::from_str(&after).unwrap();
+
+        assert_eq!(after_value["state_write_validated"], json!(true));
+        assert_eq!(after_value["state_write_rejected"], json!(false));
+
+        // Every other top-level key is byte-identical to before the patch.
+        let mut before_minus = before_value.as_object().unwrap().clone();
+        let mut after_minus = after_value.as_object().unwrap().clone();
+        before_minus.remove("state_write_validated");
+        before_minus.remove("state_write_rejected");
+        after_minus.remove("state_write_validated");
+        after_minus.remove("state_write_rejected");
+        assert_eq!(before_minus, after_minus);
+    }
+
+    #[tokio::test]
+    async fn patches_a_rejected_close_distinctly_from_unvalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        let spec_slug = "EN.3.G-terminal-path-robustness";
+        seed_state_file(worktree, spec_slug);
+        let state_path = worktree
+            .join("planning")
+            .join(spec_slug)
+            .join("sdlc")
+            .join("sdlc-flow-state.json");
+
+        let ctx = ctx_with_close_block(
+            worktree.to_str().unwrap(),
+            spec_slug,
+            json!({
+                "outcome": "REJECTED:engine-rs:EN.9",
+                "state_write_validated": false,
+                "state_write_rejected": true,
+            }),
+        );
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(after["state_write_validated"], json!(false));
+        assert_eq!(after["state_write_rejected"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn an_unvalidated_degrade_is_distinguishable_from_a_validated_close() {
+        // `state_write_validated=false` alongside neither a rejection nor a
+        // successful close is the UNVALIDATED degrade — both booleans false
+        // is a distinct on-disk shape from `validated=true` (CLOSED) and
+        // from `rejected=true` (REJECTED), never inferred from the outcome
+        // label.
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        let spec_slug = "EN.3.G-terminal-path-robustness";
+        seed_state_file(worktree, spec_slug);
+        let state_path = worktree
+            .join("planning")
+            .join(spec_slug)
+            .join("sdlc")
+            .join("sdlc-flow-state.json");
+
+        let ctx = ctx_with_close_block(
+            worktree.to_str().unwrap(),
+            spec_slug,
+            json!({
+                "outcome": "UNVALIDATED:no brain.toml found",
+                "state_write_validated": false,
+                "state_write_rejected": false,
+            }),
+        );
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(after["state_write_validated"], json!(false));
+        assert_eq!(after["state_write_rejected"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn no_close_block_node_result_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        let spec_slug = "EN.3.G-terminal-path-robustness";
+        let state_path = seed_state_file(worktree, spec_slug);
+        let before = std::fs::read_to_string(&state_path).unwrap();
+
+        let mut ctx = TaskContext {
+            event: json!({ "spec_slug": spec_slug }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_str().unwrap() }),
+        );
+        patch_close_block_into_state(&ctx, &noop_runner(), DEFAULT_STATE_FILENAME);
+
+        let after = std::fs::read_to_string(&state_path).unwrap();
+        assert_eq!(before, after);
     }
 }

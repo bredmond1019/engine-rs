@@ -11,8 +11,10 @@
 //! Model/deterministic split (per the spec's Context Pointers):
 //! `ImplementTaskNode` and `ConsolidatedReviewNode` always call a model;
 //! `TriageTaskNode` is deterministic by default and only calls a model when
-//! `event.llm_triage` is true. Everything else here — the routers,
-//! `TestTaskNode`, `UpdateTaskStatusNode`, `SaveStateNode` — is pure Rust.
+//! triage is enabled — the bare `event.llm_triage` field if set, else the
+//! resolved policy's `llm_triage` (profile / `harness.json` / per-run
+//! `policy` override). Everything else here — the routers, `TestTaskNode`,
+//! `UpdateTaskStatusNode`, `SaveStateNode` — is pure Rust.
 
 use std::path::Path;
 
@@ -28,7 +30,9 @@ use crate::routing::Router;
 #[cfg(test)]
 use super::policy::OutputVerbosity;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
-use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTriageVerdict};
+use super::schema::{
+    RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTelemetry, SDLCTriageVerdict,
+};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
     ModelTransport, TransportSlot,
@@ -204,19 +208,35 @@ fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPoli
 /// than some other path — the two must never independently drift.
 pub(crate) const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
 
+/// The monotonically increasing logical clock `latest_state` orders
+/// candidates by: `total_attempts` (bumped by `IncrementAttemptNode`/
+/// `UpdateTaskStatusNode`) plus `review_attempts` (bumped by
+/// `ConsolidatedReviewNode`, EN.ticket.review-retry-loop-unbounded task 2).
+/// Every state-mutating node in this loop advances exactly ONE of the two
+/// counters by exactly one per write, never both — so their sum still
+/// increases by exactly one on every write and remains a valid tie-breaking
+/// clock across the whole run.
+fn logical_clock(telemetry: &SDLCTelemetry) -> u64 {
+    u64::from(telemetry.total_attempts) + u64::from(telemetry.review_attempts)
+}
+
 /// Return the most recently mutated `SDLCState` among every node identity
 /// that can write one: `IncrementAttemptNode` (the retry back-edge target,
-/// EN.3.B), `UpdateTaskStatusNode` (a task's eventual PASS/MAJOR_BAIL), and
-/// `LoadTaskStateNode` (the initial load). Mirrors the `_latest_state_dict`
-/// helper shared by `TaskQueueRouterNode`/`UpdateTaskStatusNode`/
-/// `SaveStateNode` in Python, extended for the new retry-increment source.
+/// EN.3.B), `UpdateTaskStatusNode` (a task's eventual PASS/MAJOR_BAIL),
+/// `ConsolidatedReviewNode` (its own `review_attempts` bump, EN.ticket.
+/// review-retry-loop-unbounded task 2 — nested under its result's `"state"`
+/// key rather than being the whole result, since that result is also the
+/// review verdict `ReviewRouterNode` reads), and `LoadTaskStateNode` (the
+/// initial load). Mirrors the `_latest_state_dict` helper shared by
+/// `TaskQueueRouterNode`/`UpdateTaskStatusNode`/`SaveStateNode` in Python,
+/// extended for the new retry-increment source.
 ///
 /// A fixed priority order (`IncrementAttemptNode` before `UpdateTaskStatusNode`
 /// before `LoadTaskStateNode`) is NOT correct here: across a whole run,
 /// `IncrementAttemptNode` may hold a *stale* entry from an earlier task's
 /// retries while a *later* task's `UpdateTaskStatusNode` write is actually
 /// the newest state (or vice versa, mid-retry, within the same task). Instead
-/// this compares each candidate's `telemetry.total_attempts` — a counter every
+/// this compares each candidate's [`logical_clock`] — a counter every
 /// state-mutating node in this loop increments by exactly one on every write,
 /// so it is a monotonically increasing logical clock for the whole run — and
 /// keeps whichever candidate's value is highest. No wall-clock/`node_runs`
@@ -234,16 +254,27 @@ pub(crate) fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
     for identity in [
         "IncrementAttemptNode",
         "UpdateTaskStatusNode",
+        "ConsolidatedReviewNode",
         "LoadTaskStateNode",
     ] {
-        let Some(value) = get_result(ctx, identity) else {
+        let Some(mut value) = get_result(ctx, identity).cloned() else {
             continue;
         };
-        let state: SDLCState = serde_json::from_value(value.clone())
+        // `ConsolidatedReviewNode`'s result is the review verdict
+        // (`verdict`/`summary`/`issues`/...) with the durable `SDLCState`
+        // nested under `"state"` — see its `process` impl below. Every
+        // other candidate's result IS the whole `SDLCState`.
+        if identity == "ConsolidatedReviewNode" {
+            let Some(state_value) = value.get_mut("state").map(std::mem::take) else {
+                continue;
+            };
+            value = state_value;
+        }
+        let state: SDLCState = serde_json::from_value(value)
             .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))?;
         let is_newer = best
             .as_ref()
-            .map(|current| state.telemetry.total_attempts > current.telemetry.total_attempts)
+            .map(|current| logical_clock(&state.telemetry) > logical_clock(&current.telemetry))
             .unwrap_or(true);
         if is_newer {
             best = Some(state);
@@ -287,7 +318,7 @@ pub(crate) fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
 /// [`super::commit_all`]'s "Blast radius" section. A binary untracked file numstats as
 /// `-\t-\t<path>`, which [`classify_trivial`]'s existing conservative arm
 /// already treats as non-trivial — correct behavior for free.
-fn stage_untracked_intent(runner: &CommandRunner, worktree: &Path) {
+pub(super) fn stage_untracked_intent(runner: &CommandRunner, worktree: &Path) {
     let _ = runner("git", &["add", "-N", "-A"], worktree);
 }
 
@@ -392,21 +423,28 @@ const TRIAGE_FAILURE_HEADER: &str = "\n\n--- FAILING CHECK OUTPUT — CLASSIFY F
 /// Marker appended in place of the characters a `max_chars` bound elides.
 const RETRY_FEEDBACK_TRUNCATED: &str = "…[truncated]";
 
-/// Loud, model-facing banner appended when `ConsolidatedReviewNode`'s diff
-/// is clipped by `policy.review_diff_max_chars`.
+/// Loud, model-facing banner appended when a review's diff is clipped by
+/// `policy.review_diff_max_chars`. Shared by `ConsolidatedReviewNode` (this
+/// module) and `end_review::EndReviewNode` — both bound their diff through
+/// [`bound_review_diff`] and both must show the reviewer the same visible
+/// truncation notice; `pub(super)` so the sibling module can reuse it rather
+/// than fork a second copy.
 ///
 /// Visibility is the whole point. A silently truncated diff would recreate
 /// the exact failure mode this train exists to eliminate — a reviewer
 /// confidently returning `PASS` over code it never saw — only with a subtler
 /// cause than the empty diff that motivated `ticket-commit-task-work-real-diffs`.
-const REVIEW_DIFF_TRUNCATED_NOTICE: &str = "\n\n--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL \
+pub(super) const REVIEW_DIFF_TRUNCATED_NOTICE: &str =
+    "\n\n--- DIFF TRUNCATED — YOU ARE SEEING A PARTIAL \
      DIFF ---\nThe diff above was clipped to this run's `review_diff_max_chars` policy bound. \
      Changes beyond the cut were NOT shown to you. Do NOT return PASS on the strength of code \
      you could not see: judge only what is visible, and if the visible excerpt is not enough to \
      decide the acceptance criteria, say so explicitly in `summary` and return PARTIAL.\n";
 
-/// Clip `diff` to at most `budget` characters for embedding in
-/// `ConsolidatedReviewNode`'s prompt, returning `(text, truncated)`.
+/// Clip `diff` to at most `budget` characters for embedding in a review
+/// prompt (`ConsolidatedReviewNode`'s per-task diff or
+/// `end_review::EndReviewNode`'s whole-run diff), returning
+/// `(text, truncated)`.
 ///
 /// Reuses [`truncate_chars`] — the same character-safe (never byte-slicing)
 /// helper the retry-feedback bound uses — and reserves the notice's own
@@ -418,7 +456,7 @@ const REVIEW_DIFF_TRUNCATED_NOTICE: &str = "\n\n--- DIFF TRUNCATED — YOU ARE S
 /// check names): a reviewer told nothing at all is the failure mode; a
 /// reviewer told "you are seeing a partial diff" and nothing else is merely
 /// useless, and it will say so.
-fn bound_review_diff(diff: &str, budget: usize) -> (String, bool) {
+pub(super) fn bound_review_diff(diff: &str, budget: usize) -> (String, bool) {
     if diff.chars().count() <= budget {
         return (diff.to_string(), false);
     }
@@ -820,7 +858,8 @@ impl Node for ImplementTaskNode {
 
         config.json_schema = Some(implement_output_schema());
 
-        let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt);
+        let mut step = ClaudeCodeStep::new("ImplementTaskNode", config, prompt)
+            .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
@@ -1635,7 +1674,9 @@ impl Node for TestTaskNode {
 /// `PASS`/`RETRYABLE`/`MAJOR_BAIL`. Deterministic by default (a passing test
 /// forces `PASS`; an over-budget task forces `MAJOR_BAIL`; a failing task
 /// still under budget is deterministically `RETRYABLE`), consulting a
-/// `ClaudeCodeStep` (Sonnet) only when `event.llm_triage` is true.
+/// `ClaudeCodeStep` (Sonnet) only when triage is enabled: the bare
+/// `event.llm_triage` field wins if set, else the resolved policy's
+/// `llm_triage` (see `resolved_policy` above).
 pub struct TriageTaskNode {
     config: Config,
     transport: TransportSlot,
@@ -1772,11 +1813,18 @@ impl Node for TriageTaskNode {
             return Ok(ctx);
         }
 
-        let llm_triage = ctx
-            .event
-            .get("llm_triage")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Precedence: the bare `event.llm_triage` field (the pre-existing,
+        // still-supported spelling — `SDLCFlowEventSchema::llm_triage`,
+        // `schema.rs:157`) wins when a caller sets it explicitly; otherwise
+        // fall through to the resolved policy's `llm_triage` (profile /
+        // `harness.json` / per-run `policy` override), which is the
+        // canonical spelling going forward. Both are read via `resolved_policy`
+        // above so a bad policy layer still errors loudly rather than being
+        // silently ignored the way it was before this knob was wired.
+        let llm_triage = match ctx.event.get("llm_triage").and_then(|v| v.as_bool()) {
+            Some(bare) => bare,
+            None => resolved_policy(&ctx)?.llm_triage,
+        };
 
         if !llm_triage {
             put_result(
@@ -1829,9 +1877,10 @@ impl Node for TriageTaskNode {
             apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
         config.json_schema = Some(triage_output_schema());
 
-        let step = self
-            .transport
-            .apply(ClaudeCodeStep::new("TriageTaskNode", config, prompt));
+        let step = self.transport.apply(
+            ClaudeCodeStep::new("TriageTaskNode", config, prompt)
+                .with_retry_policy(policy.transport_retry),
+        );
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -1970,16 +2019,21 @@ pub struct ConsolidatedReviewNode {
     runner: CommandRunner,
 }
 
+/// The model's raw review reply shape — shared with `end_review::EndReviewNode`
+/// (`pub(super)`) so the per-task and end-of-run reviewers parse the same
+/// JSON and produce the same result shape; nothing downstream needs a
+/// special case for which one ran.
 #[derive(Debug, Deserialize)]
-struct ReviewOutput {
-    verdict: String,
-    summary: String,
+pub(super) struct ReviewOutput {
+    pub(super) verdict: String,
+    pub(super) summary: String,
     #[serde(default)]
-    issues: Vec<String>,
+    pub(super) issues: Vec<String>,
 }
 
-/// JSON schema matching [`ReviewOutput`].
-fn review_output_schema() -> serde_json::Value {
+/// JSON schema matching [`ReviewOutput`]. Also used by
+/// `end_review::EndReviewNode`.
+pub(super) fn review_output_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
@@ -2054,6 +2108,17 @@ impl Node for ConsolidatedReviewNode {
             .cloned()
             .unwrap_or_else(|| json!([]));
 
+        // Bump the durable, per-run `review_attempts` counter (EN.ticket.
+        // review-retry-loop-unbounded task 2) BEFORE the model call, same
+        // as `bump_attempt` counts the attempt regardless of its outcome —
+        // this node is about to produce a verdict, so the review pass it
+        // spends counts whether that verdict is PASS, FAIL, or PARTIAL.
+        // Deliberately NOT `attempt_count`/`total_attempts` — see
+        // `SDLCTelemetry::review_attempts`'s doc comment for why the two
+        // counters must stay independent.
+        let mut counted_state = latest_state(&ctx)?;
+        counted_state.telemetry.review_attempts += 1;
+
         // The reviewer must see the CURRENT task's actual work. Nothing in
         // this run commits code until `SaveStateNode` runs on the pass path,
         // so the reviewable delta lives in the working tree, not in a commit
@@ -2092,11 +2157,10 @@ impl Node for ConsolidatedReviewNode {
         config.cwd = Some(std::path::PathBuf::from(&worktree));
         config.json_schema = Some(review_output_schema());
 
-        let step = self.transport.apply(ClaudeCodeStep::new(
-            "ConsolidatedReviewNode",
-            config,
-            prompt,
-        ));
+        let step = self.transport.apply(
+            ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt)
+                .with_retry_policy(policy.transport_retry),
+        );
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -2151,6 +2215,14 @@ impl Node for ConsolidatedReviewNode {
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
         }
+        // Nested under `"state"` rather than replacing this result outright
+        // — the object above IS the review verdict `ReviewRouterNode` reads
+        // via `get_result(ctx, "ConsolidatedReviewNode")`, so the durable
+        // `SDLCState` (carrying the just-bumped `review_attempts`) has to
+        // ride alongside it, not instead of it. `latest_state` (this file)
+        // knows to unwrap this key for this one node identity.
+        result["state"] = serde_json::to_value(&counted_state)
+            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
         put_result(&mut ctx, "ConsolidatedReviewNode", result);
 
         Ok(ctx)
@@ -2201,7 +2273,29 @@ impl Router for ReviewRouterNode {
                     // as `TriageRouterNode`'s `RETRYABLE` branch — route
                     // through `IncrementAttemptNode` so the retry counters
                     // advance in lockstep across both back-edges.
-                    Some("IncrementAttemptNode".to_string())
+                    //
+                    // EN.ticket.review-retry-loop-unbounded task 3: this is
+                    // the back-edge that was unbounded — `TriageTaskNode`'s
+                    // own attempt-cap check sits after its `PASS` early
+                    // return, so a passing test run never reaches it, and
+                    // the cycle Implement -> Test(pass) -> Triage(PASS) ->
+                    // Review(FAIL/PARTIAL, minor) -> IncrementAttempt ->
+                    // Implement had no exit. The bound has to close here,
+                    // where the back-edge is actually chosen: once the
+                    // durable, per-run `review_attempts` counter (bumped by
+                    // `ConsolidatedReviewNode`, task 2) reaches
+                    // `policy.max_review_attempts`, route to `WrapUpNode`
+                    // with the last verdict's summary instead of looping
+                    // again.
+                    let review_attempts = latest_state(ctx)
+                        .map(|state| state.telemetry.review_attempts)
+                        .unwrap_or(0);
+                    let max_review_attempts =
+                        resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
+                    match max_review_attempts {
+                        Some(max) if review_attempts >= max => Some("WrapUpNode".to_string()),
+                        _ => Some("IncrementAttemptNode".to_string()),
+                    }
                 }
             }
             // An unrecognized verdict must never silently halt the walk
@@ -2455,6 +2549,7 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMe
 /// `to_committed_state_json` with `None` for all four.
 pub struct SaveStateNode {
     runner: CommandRunner,
+    state_filename: &'static str,
 }
 
 impl SaveStateNode {
@@ -2462,6 +2557,7 @@ impl SaveStateNode {
     pub fn new() -> Self {
         Self {
             runner: super::default_command_runner(),
+            state_filename: super::DEFAULT_STATE_FILENAME,
         }
     }
 
@@ -2470,6 +2566,16 @@ impl SaveStateNode {
     #[must_use]
     pub fn with_runner(mut self, runner: CommandRunner) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Override the state filename this node writes to. Defaults to
+    /// [`super::DEFAULT_STATE_FILENAME`]; `EN.11.M` task 4 adds this so a
+    /// second engine can reuse the node under its own filename without
+    /// forking it.
+    #[must_use]
+    pub fn with_state_filename(mut self, filename: &'static str) -> Self {
+        self.state_filename = filename;
         self
     }
 }
@@ -2493,7 +2599,7 @@ impl Node for SaveStateNode {
         std::fs::create_dir_all(&state_dir).map_err(|err| {
             NodeError::new(format!("failed to create {}: {err}", state_dir.display()))
         })?;
-        let state_path = state_dir.join("sdlc-flow-state.json");
+        let state_path = state_dir.join(self.state_filename);
         let run_meta = build_run_meta(&ctx, &worktree, &state_path);
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         let json = serde_json::to_string_pretty(&committed)
@@ -2529,7 +2635,7 @@ impl Node for SaveStateNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflows::sdlc_flow::policy::ModelTiers;
+    use crate::workflows::sdlc_flow::policy::{ModelTiers, TransportRetry};
     use claude_code_rs::Outcome;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -3086,6 +3192,116 @@ mod tests {
         let out = node.process(ctx).await.expect("process should succeed");
         assert!(*called.lock().unwrap());
         assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 2: the resolved policy's
+    /// `llm_triage` must reach `TriageTaskNode` even when the bare
+    /// `event.llm_triage` field is absent — that is the whole point of
+    /// wiring the policy layer instead of leaving it dead. Companion to
+    /// [`triage_llm_gate_invokes_model_when_enabled`] above, which proves
+    /// the bare event field alone (against a default `llm_triage: false`
+    /// policy) still works — together they cover both spellings per the
+    /// task's acceptance criteria.
+    #[tokio::test]
+    async fn triage_llm_gate_invokes_model_when_only_policy_sets_it() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let called = Arc::new(Mutex::new(false));
+        let called_clone = called.clone();
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            *called_clone.lock().unwrap() = true;
+            let outcome = Outcome {
+                cost_usd: 0.0,
+                usage: claude_code_rs::parse::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                model_usage: std::collections::BTreeMap::new(),
+                text: json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string(),
+                is_error: false,
+                api_error_status: None,
+                structured_output: None,
+            };
+            Box::pin(async move { Ok(outcome) })
+        });
+
+        let node = TriageTaskNode::new().with_transport(transport);
+        let ctx = ctx_with_test_result(false, &task);
+        // No `event.llm_triage` field at all — only the resolved policy
+        // enables triage.
+        let mut policy = SdlcPolicy::default();
+        policy.llm_triage = true;
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert!(*called.lock().unwrap());
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+    }
+
+    /// The bare `event.llm_triage` field is the top-precedence layer: an
+    /// explicit `false` on the event must gate the model branch off even
+    /// when the resolved policy has `llm_triage: true`.
+    #[tokio::test]
+    async fn triage_bare_event_field_false_overrides_policy_true() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let node = TriageTaskNode::new().with_transport(panicking_transport());
+        let mut ctx = ctx_with_test_result(false, &task);
+        let mut policy = SdlcPolicy::default();
+        policy.llm_triage = true;
+        ctx = ctx_with_policy(ctx, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": false });
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+    }
+
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport when
+    /// `TriageTaskNode` takes the model path.
+    #[tokio::test]
+    async fn triage_transport_retry_nondefault_changes_observed_attempts() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let calls = calls.clone();
+            move |_config, _prompt| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = TriageTaskNode::new().with_transport(transport);
+        let ctx = ctx_with_test_result(false, &task);
+        let policy = SdlcPolicy {
+            transport_retry: TransportRetry {
+                max_attempts: 5,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let mut ctx = ctx_with_policy(ctx, &policy);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
     /// `EN.ticket.wire-meta-transport-telemetry` task 2: a `with_meta_transport`
@@ -3718,6 +3934,84 @@ mod tests {
         let ctx = empty_context(json!({}));
         let router = ReviewRouterNode;
         assert_eq!(router.route(&ctx), None);
+    }
+
+    /// `review_ctx` plus a stamped durable `review_attempts` counter and a
+    /// `max_review_attempts` policy — the shape `ReviewRouterNode::route`
+    /// reads via `latest_state`/`resolved_policy` (EN.ticket.review-retry-
+    /// loop-unbounded task 3).
+    fn review_ctx_with_bound(
+        verdict: &str,
+        issue_count: usize,
+        review_attempts: u32,
+        max_review_attempts: u32,
+    ) -> TaskContext {
+        let mut ctx = review_ctx(verdict, issue_count);
+        let mut state = SDLCState::new("my-spec");
+        state.telemetry.review_attempts = review_attempts;
+        ctx.nodes.insert(
+            "LoadTaskStateNode".to_string(),
+            serde_json::to_value(&state).unwrap(),
+        );
+        let policy = SdlcPolicy {
+            max_review_attempts,
+            ..SdlcPolicy::default()
+        };
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(policy).unwrap(),
+        );
+        ctx
+    }
+
+    /// EN.ticket.review-retry-loop-unbounded task 3: below the bound, a
+    /// minor-issue verdict still takes the retry back-edge — unchanged
+    /// behavior for every run that terminates within budget.
+    #[test]
+    fn review_router_minor_issue_under_bound_still_retries() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("FAIL", 2, 2, 3);
+        assert_eq!(router.route(&ctx), Some("IncrementAttemptNode".to_string()));
+    }
+
+    /// At the bound, the minor-issue back-edge routes to `WrapUpNode`
+    /// instead of looping again — this is the fix: the cycle
+    /// Implement -> Test(pass) -> Triage(PASS) -> Review(FAIL/PARTIAL,
+    /// minor) -> IncrementAttempt -> Implement now has an exit.
+    #[test]
+    fn review_router_minor_issue_at_bound_routes_to_wrap_up() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("PARTIAL", 2, 3, 3);
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    /// Past the bound (e.g. a stale counter read after the exact tick) still
+    /// routes to `WrapUpNode` — the gate is `>=`, not `==`.
+    #[test]
+    fn review_router_minor_issue_past_bound_routes_to_wrap_up() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("FAIL", 1, 4, 3);
+        assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
+    }
+
+    /// `PASS` and the structural (0 or >threshold issues) arms are
+    /// unaffected by the review-attempts bound — they already route to
+    /// `WrapUpNode`/`UpdateTaskStatusNode` regardless of attempt count.
+    #[test]
+    fn review_router_pass_and_structural_arms_unaffected_by_bound() {
+        let router = ReviewRouterNode;
+        assert_eq!(
+            router.route(&review_ctx_with_bound("PASS", 0, 3, 3)),
+            Some("UpdateTaskStatusNode".to_string())
+        );
+        assert_eq!(
+            router.route(&review_ctx_with_bound("FAIL", 6, 3, 3)),
+            Some("WrapUpNode".to_string())
+        );
+        assert_eq!(
+            router.route(&review_ctx_with_bound("FAIL", 0, 0, 3)),
+            Some("WrapUpNode".to_string())
+        );
     }
 
     // --- UpdateTaskStatusNode ------------------------------------------------
@@ -4935,6 +5229,58 @@ mod tests {
         assert_eq!(out.nodes["ConsolidatedReviewNode"]["summary"], "from fence");
     }
 
+    /// `EN.ticket.sdlc-flow-dead-policy-knobs` task 3: a non-default
+    /// `transport_retry` on the resolved policy changes the observed
+    /// attempt count against a persistently failing transport for
+    /// `ConsolidatedReviewNode`.
+    #[tokio::test]
+    async fn review_transport_retry_nondefault_changes_observed_attempts() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        let policy = SdlcPolicy {
+            transport_retry: TransportRetry {
+                max_attempts: 4,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let transport: ModelTransport = Arc::new({
+            let calls = calls.clone();
+            move |_config, _prompt| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(claude_code_rs::Error::Timeout)
+                })
+            }
+        });
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        let result = node.process(ctx).await;
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
     // --- Policy consumption (EN.3.C task 3) ---------------------------------
 
     /// Stamp a resolved [`SdlcPolicy`] into `ctx` under the same identity
@@ -5000,6 +5346,73 @@ mod tests {
             .clone()
             .expect("transport should have been called");
         assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    // --- transport_retry (EN.ticket.sdlc-flow-dead-policy-knobs task 3) ----
+
+    /// A transport that counts every invocation and always fails with a
+    /// retryable `claude_code_rs::Error::Timeout` — used to observe how many
+    /// attempts the resolved `transport_retry` budget actually burns.
+    fn always_failing_transport(calls: Arc<std::sync::atomic::AtomicU32>) -> ModelTransport {
+        Arc::new(move |_config, _prompt| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(claude_code_rs::Error::Timeout)
+            })
+        })
+    }
+
+    /// A default-policy `transport_retry` must reproduce exactly the attempt
+    /// count `ClaudeCodeStep`'s own built-in default already produced before
+    /// this ticket wired the policy value through — behaviour-stable, proven
+    /// rather than assumed (both are literally `TransportRetry::default()`).
+    #[tokio::test]
+    async fn implement_transport_retry_default_matches_todays_observed_count() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let node = ImplementTaskNode::new().with_transport(always_failing_transport(calls.clone()));
+        let result = node.process(ctx).await;
+
+        assert!(
+            result.is_err(),
+            "persistent failure must still halt the walk"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            TransportRetry::default().max_attempts,
+            "default policy transport_retry must match ClaudeCodeStep's own \
+             built-in default attempt count"
+        );
+    }
+
+    /// A non-default `transport_retry` set on the resolved policy changes
+    /// the observed attempt count against a persistently failing transport —
+    /// proof the value actually reaches `ImplementTaskNode`'s composed
+    /// `ClaudeCodeStep`, not just that it resolves.
+    #[tokio::test]
+    async fn implement_transport_retry_nondefault_changes_observed_attempts() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+        let policy = SdlcPolicy {
+            transport_retry: TransportRetry {
+                max_attempts: 5,
+                initial_backoff_ms: 0,
+            },
+            ..SdlcPolicy::default()
+        };
+        let ctx = ctx_with_policy(ctx, &policy);
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let node = ImplementTaskNode::new().with_transport(always_failing_transport(calls.clone()));
+        let result = node.process(ctx).await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
     /// `output_verbosity = terse` injects the terseness directive into the
@@ -5377,6 +5790,168 @@ mod tests {
             .clone()
             .expect("transport should have been called");
         assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    // --- review_attempts counter (EN.ticket.review-retry-loop-unbounded task 2) ---
+
+    /// Build a `ConsolidatedReviewNode` that always runs the `diff` runner
+    /// and returns a canned PASS verdict via its transport, so each test in
+    /// this section only has to vary the incoming `ctx`.
+    fn passing_review_node() -> ConsolidatedReviewNode {
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({ "verdict": "PASS", "summary": "ok", "issues": [] }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport)
+    }
+
+    fn ctx_for_review(state: &SDLCState, task: &SDLCTask) -> TaskContext {
+        let mut ctx = ctx_with_current_task(state, task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn review_node_increments_review_attempts_once_per_verdict() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_for_review(&state, &task);
+
+        let out = passing_review_node()
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
+                .expect("ConsolidatedReviewNode result carries a durable SDLCState");
+        assert_eq!(bumped.telemetry.review_attempts, 1);
+        // Independent of the attempt counters this run has not touched.
+        assert_eq!(bumped.telemetry.total_attempts, 0);
+        assert_eq!(bumped.tasks[0].attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn review_node_does_not_touch_attempt_count_or_total_attempts() {
+        // A task that has already burned two test retries (IncrementAttemptNode
+        // would have bumped both `attempt_count` and `telemetry.total_attempts`
+        // to 2 by this point) must still arrive at review with a FULL review
+        // budget — proving `review_attempts` is counted separately.
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.attempt_count = 2;
+        let mut state = state_with_tasks(vec![task.clone()]);
+        state.telemetry.total_attempts = 2;
+        let ctx = ctx_for_review(&state, &task);
+
+        let out = passing_review_node()
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
+                .expect("ConsolidatedReviewNode result carries a durable SDLCState");
+        assert_eq!(bumped.telemetry.review_attempts, 1);
+        // Untouched by the review pass.
+        assert_eq!(bumped.telemetry.total_attempts, 2);
+        assert_eq!(bumped.tasks[0].attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn review_attempts_survives_a_resume_and_keeps_accumulating() {
+        // Simulate a resumed run: the loaded state already carries an
+        // accumulated `review_attempts` from a prior process invocation
+        // (e.g. read back off disk by `LoadTaskStateNode`) — a fresh
+        // process() call must add to it, not reset it.
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut state = state_with_tasks(vec![task.clone()]);
+        state.telemetry.review_attempts = 2;
+        let ctx = ctx_for_review(&state, &task);
+
+        let out = passing_review_node()
+            .process(ctx)
+            .await
+            .expect("process should succeed");
+
+        let bumped: SDLCState =
+            serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
+                .expect("ConsolidatedReviewNode result carries a durable SDLCState");
+        assert_eq!(bumped.telemetry.review_attempts, 3);
+    }
+
+    #[test]
+    fn latest_state_prefers_consolidated_review_node_over_a_stale_load() {
+        // `ConsolidatedReviewNode`'s bump must be visible to `latest_state`
+        // even when `LoadTaskStateNode` (the initial, now-stale load) is
+        // also present in `ctx.nodes` — proving the new candidate and its
+        // logical-clock comparison are wired in correctly.
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut load_state = state_with_tasks(vec![task.clone()]);
+        load_state.telemetry.review_attempts = 0;
+        let mut ctx = ctx_with_state(&load_state);
+
+        let mut reviewed_state = load_state.clone();
+        reviewed_state.telemetry.review_attempts = 1;
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({
+                "verdict": "FAIL",
+                "summary": "two issues",
+                "issues": ["a", "b"],
+                "state": reviewed_state,
+            }),
+        );
+
+        let resolved = latest_state(&ctx).expect("latest_state should resolve");
+        assert_eq!(resolved.telemetry.review_attempts, 1);
+    }
+
+    #[test]
+    fn latest_state_prefers_increment_attempt_node_over_a_stale_review() {
+        // The reverse ordering: an `IncrementAttemptNode` write that landed
+        // AFTER an earlier `ConsolidatedReviewNode` bump (i.e. the review's
+        // minor-issue back-edge already advanced the run) must win, proving
+        // the logical clock sums both counters rather than only comparing
+        // `review_attempts`.
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut reviewed_state = state_with_tasks(vec![task.clone()]);
+        reviewed_state.telemetry.review_attempts = 1;
+        let mut ctx = ctx_with_state(&reviewed_state);
+        ctx.nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            json!({
+                "verdict": "FAIL",
+                "summary": "two issues",
+                "issues": ["a", "b"],
+                "state": reviewed_state,
+            }),
+        );
+
+        let mut incremented_state = reviewed_state.clone();
+        incremented_state.telemetry.total_attempts = 1;
+        incremented_state.tasks[0].attempt_count = 1;
+        ctx.nodes.insert(
+            "IncrementAttemptNode".to_string(),
+            serde_json::to_value(&incremented_state).unwrap(),
+        );
+
+        let resolved = latest_state(&ctx).expect("latest_state should resolve");
+        assert_eq!(resolved.telemetry.total_attempts, 1);
+        assert_eq!(resolved.telemetry.review_attempts, 1);
     }
 
     // --- Review-gate policy consumption (EN.3.C task 4) ---------------------

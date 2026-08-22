@@ -19,15 +19,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use uuid::Uuid;
+
+use engine_contract::TaskContext;
+use engine_core::cancellation::CancellationToken;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
-    resolve_explicit_chain, resolve_lane_chain, ChainError,
+    resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep,
 };
-use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
-use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
+use engine_core::workflows::orchestration::gates::{
+    check_step_with_frontier_advice, load_frontier, AdmissionGate, DependencyEdge, FrontierError,
+    GateError,
+};
+use engine_core::workflows::orchestration::graph::{OrchestrationRunNode, NODE_NAME};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain, HoldSource, IntegrateError, NeverHeld,
+    integrate_chain, HoldSource, IntegrateError, NeverHeld, StepProgress,
 };
+use engine_core::Node;
 
 use engine_core::nodes::terminal::admission::{AdmissionControl, AdmissionPolicy};
 
@@ -203,10 +212,16 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
+        None,
         &always_flow,
         &registry,
         &flow_runner,
         &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
     )
     .await
     .expect("two-repo chain should integrate cleanly");
@@ -222,9 +237,9 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
 
     let lines = lane_log_lines(&roadmap_dir);
     assert_eq!(lines.len(), 2, "exactly one lane-log line per block");
-    assert_eq!(lines[0]["block_id"], "A.1");
+    assert_eq!(lines[0]["block"], "A.1");
     assert_eq!(lines[0]["repo"], "repo-a");
-    assert_eq!(lines[1]["block_id"], "B.1");
+    assert_eq!(lines[1]["block"], "B.1");
     assert_eq!(lines[1]["repo"], "repo-b");
 }
 
@@ -240,7 +255,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
 
     let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
     let resolve_deps = |_repo: &str, _id: &str| {
-        vec![DependencyEdge {
+        vec![DependencyEdge::Block {
             repo: "engine-rs".to_string(),
             block_id: "EN.9.F".to_string(),
         }]
@@ -254,10 +269,16 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
+        None,
         &always_flow,
         &registry,
         &flow_runner,
         &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
     )
     .await
     .expect_err("an unmet dependency must refuse the block");
@@ -327,10 +348,16 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             &admission2,
             &NeverHeld,
             Duration::from_millis(5),
+            None,
+            None,
             &always_flow,
             &registry,
             &flow_runner2,
             &roadmap_dir2,
+            None,
+            &|_: &StepProgress| {},
+            false,
+            Uuid::new_v4(),
         )
         .await;
         admitted_writer.store(true, Ordering::SeqCst);
@@ -440,10 +467,16 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             &admission,
             &hold,
             Duration::from_millis(10),
+            None,
+            None,
             &always_flow,
             &registry,
             &flow_runner,
             &roadmap_dir2,
+            None,
+            &|_: &StepProgress| {},
+            false,
+            Uuid::new_v4(),
         )
         .await
     });
@@ -505,10 +538,16 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
+        None,
         &always_flow,
         &registry,
         &flow_runner,
         &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
     )
     .await
     .expect_err("a corrupted state write must fail the run");
@@ -517,7 +556,1112 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
     let msg = err.to_string();
     assert!(msg.contains("A.1"));
 
-    // The run stops loudly rather than logging a line for an unverified
-    // block.
-    assert!(lane_log_lines(&roadmap_dir).is_empty());
+    // The run still stops loudly, but a `bailed` line is recorded for the
+    // attempt (EN.ticket.lane-log-entry-schema Task 3) — a sibling lane
+    // must see that this block was tried and failed, not silence.
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["status"], "bailed");
+    assert_eq!(lines[0]["block"], "A.1");
+    assert!(lines[0]["note"].as_str().unwrap().contains("A.1"));
+}
+
+// ── Lane-log on-disk contract (EN.ticket.lane-log-entry-schema Task 1) ───
+//
+// `crates/engine-core/tests/fixtures/lane-log-contract.jsonl` holds real
+// lines copied verbatim from `planning/roadmaps/*/lane-log.jsonl` — one
+// `closed`, one `held`, two `bailed` — covering every status value the
+// fleet's real lane logs carry. `LaneLogEntry` must deserialize every one
+// of them with no field loss. As of Task 1 this is deliberately RED: the
+// current struct is `{repo, block_id, integrated_at}` and Serialize-only
+// (no `Deserialize` impl at all), while the fixture lines are
+// `{ts, lane, repo, block, status, note}`. Task 2 reshapes the struct and
+// turns this GREEN.
+#[test]
+fn lane_log_contract_fixture_round_trips_into_lane_log_entry() {
+    let fixture = include_str!("../fixtures/lane-log-contract.jsonl");
+    let mut saw_closed = false;
+    let mut saw_held = false;
+    let mut saw_bailed = false;
+
+    for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+        let entry: engine_core::workflows::orchestration::integrate::LaneLogEntry =
+            serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("fixture line failed to deserialize into LaneLogEntry: {e}\nline: {line}")
+            });
+
+        // No field loss: re-serialize and compare the parsed JSON values
+        // (not raw text, since key order/whitespace need not round-trip
+        // byte-for-byte) so every field on disk survives the round trip.
+        let original: serde_json::Value = serde_json::from_str(line).unwrap();
+        let round_tripped: serde_json::Value =
+            serde_json::to_value(&entry).expect("entry must re-serialize");
+        assert_eq!(
+            original, round_tripped,
+            "round trip must preserve every field with no loss"
+        );
+
+        match entry.status {
+            engine_core::workflows::orchestration::integrate::LaneLogStatus::Closed => {
+                saw_closed = true;
+            }
+            engine_core::workflows::orchestration::integrate::LaneLogStatus::Held => {
+                saw_held = true;
+            }
+            engine_core::workflows::orchestration::integrate::LaneLogStatus::Bailed => {
+                saw_bailed = true;
+            }
+        }
+    }
+
+    assert!(saw_closed, "fixture must cover status: closed");
+    assert!(saw_held, "fixture must cover status: held");
+    assert!(saw_bailed, "fixture must cover status: bailed");
+}
+
+// ── Task 4: readable by the REAL reader, not a reimplementation ─────────
+//
+// The defect this whole ticket closes is that the writer's shape and the
+// reader's expectations were verified separately — the struct's own doc
+// comment claimed "deliberately plain and stable" while
+// `roadmap_status_discovery.py`'s `read_lane_log` silently skipped every
+// line it produced. Proving that closed means driving `integrate_chain`
+// (the real writer, through its real public API — a stub `FlowRunner`
+// stands in for `SDLC_FLOW` itself, exactly as the other tests in this
+// suite do) to write a real `lane-log.jsonl`, then shelling out to the
+// REAL `scripts/roadmap_status_discovery.py`'s `read_lane_log` /
+// `repos_from_lane_log` via `scripts/verify_lane_log_readable.py` (a thin,
+// checked-in import-and-call wrapper — never a Rust reimplementation of
+// the reader) and asserting on what that script actually returns.
+//
+// BEFORE/AFTER, recorded by hand against the same script (not asserted
+// here, since the old struct no longer exists to construct — this is the
+// direct evidence the defect existed and is now closed):
+//   BEFORE (old `{repo, block_id, integrated_at}` line):
+//     `{"entries": [{"repo": "repo-a", "block_id": "A.1", "integrated_at": "...”}],
+//       "repos": ["repo-a"]}`
+//     -- `repo` survives (as the ticket's own evidence said), but the
+//        entry carries no `lane`, `block`, or `status` key at all: any
+//        reader keying on those fields (which `/roadmap-status` and
+//        `/consolidate-run` both do) sees nothing usable.
+//   AFTER (new `{ts, lane, repo, block, status, note}` line):
+//     `{"entries": [{"ts": "...", "lane": "repo-a", "repo": "repo-a",
+//        "block": "A.1", "status": "closed", "note": "..."}],
+//       "repos": ["repo-a"]}`
+//     -- every field the readers key on is present and non-empty.
+
+/// Locate `scripts/verify_lane_log_readable.py` relative to this crate —
+/// `CARGO_MANIFEST_DIR` is `crates/engine-core`; the repo root (and its
+/// `scripts/`) is two levels up.
+fn verify_lane_log_readable_script() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/verify_lane_log_readable.py")
+}
+
+#[tokio::test]
+async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script() {
+    let script = verify_lane_log_readable_script();
+    assert!(
+        script.is_file(),
+        "expected {} to exist (checked into this repo)",
+        script.display()
+    );
+
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("prove-readability");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
+
+    integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("prove-readability-lane"),
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("single-block chain should integrate cleanly");
+
+    // Sanity: exactly one line was actually written before we ask the real
+    // reader about it.
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 1, "expected exactly one engine-written line");
+
+    // Now hand the REAL reader the directory the engine just wrote into —
+    // no Rust-side reimplementation of `read_lane_log` in this test.
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(&roadmap_dir)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn python3 {}: {e}", script.display()));
+
+    assert!(
+        output.status.success(),
+        "verify_lane_log_readable.py failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "reader output was not valid JSON: {e}\nstdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+
+    let entries = parsed["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the real reader must see exactly one entry"
+    );
+
+    let entry = &entries[0];
+    for field in ["repo", "lane", "block", "status"] {
+        let value = entry
+            .get(field)
+            .unwrap_or_else(|| panic!("real reader's entry is missing '{field}'"))
+            .as_str()
+            .unwrap_or_else(|| panic!("real reader's entry field '{field}' is not a string"));
+        assert!(
+            !value.is_empty(),
+            "real reader's entry field '{field}' must be non-empty, got {value:?}"
+        );
+    }
+    assert_eq!(entry["repo"], "repo-a");
+    assert_eq!(entry["lane"], "prove-readability-lane");
+    assert_eq!(entry["block"], "A.1");
+    assert_eq!(entry["status"], "closed");
+
+    let repos = parsed["repos"].as_array().expect("repos must be an array");
+    assert_eq!(
+        repos.first().and_then(|v| v.as_str()),
+        Some("repo-a"),
+        "repos_from_lane_log must name the repo"
+    );
+}
+
+// ── Cancellation: abort stops the chain BETWEEN steps ────────────────────
+
+/// A [`FlowRunner`] that records every block it was invoked for and, the
+/// moment it finishes the one block named `cancel_after`, cancels
+/// `token` — deterministically simulating "a token cancelled after the
+/// first step's invocation is observed" without racing a real wall-clock
+/// sleep against the chain's own execution.
+fn cancel_after_block(
+    token: CancellationToken,
+    cancel_after: &'static str,
+) -> (FlowRunner, Arc<Mutex<Vec<String>>>) {
+    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let runner: FlowRunner = Arc::new(move |invocation| {
+        let token = token.clone();
+        let recorded = recorded.clone();
+        Box::pin(async move {
+            recorded.lock().unwrap().push(invocation.block_id.clone());
+            write_state(&invocation.repo_path, &invocation.block_id, "done");
+            if invocation.block_id == cancel_after {
+                token.cancel();
+            }
+            Ok(engine_contract::TaskContext {
+                event: serde_json::json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: std::collections::HashMap::new(),
+            })
+        })
+    });
+    (runner, calls)
+}
+
+#[tokio::test]
+async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_runs() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(cancellation_after_the_first_step_stops_the_chain_before_the_second_runs_inner())
+        .await;
+}
+
+// `integrate_chain`'s future is not `Send` (see the admission/hold tests'
+// own doc comments), so this drives it via `LocalSet::spawn_local`.
+async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_runs_inner() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let admission = AdmissionGate::with_default_policy();
+    let token = CancellationToken::new();
+    let (flow_runner, calls) = cancel_after_block(token.clone(), "A.1");
+
+    // Three steps in one repo so a naive implementation that only checked
+    // cancellation once, at the very top, would still (wrongly) run all
+    // three.
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-a".to_string(), "A.2".to_string()),
+        ("repo-a".to_string(), "A.3".to_string()),
+    ]);
+
+    let registry_path = registry.brain_root().to_path_buf();
+    let roadmap_dir2 = roadmap_dir.clone();
+    let handle = tokio::task::spawn_local(async move {
+        let registry = RepoRegistry::from_brain_root(&registry_path).unwrap();
+        integrate_chain(
+            &chain,
+            &no_deps,
+            &always_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(5),
+            None,
+            Some(&token),
+            &always_flow,
+            &registry,
+            &flow_runner,
+            &roadmap_dir2,
+            None,
+            &|_: &StepProgress| {},
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+    });
+
+    let outcomes = tokio::time::timeout(Duration::from_millis(500), handle)
+        .await
+        .expect("chain must not hang")
+        .expect("task must not panic")
+        .expect("a cancelled chain must return Ok, not Err");
+
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "only A.1 should have integrated before the cancel"
+    );
+    let recorded = calls.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one runner invocation — A.2 and A.3 must never run"
+    );
+    assert_eq!(recorded[0], "A.1");
+
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(
+        lines.len(),
+        1,
+        "A.1's lane-log line stays; nothing after the cancel is appended"
+    );
+}
+
+/// A chain parked on an operator hold that never clears must abort
+/// promptly once cancelled — within roughly one poll tick, not after the
+/// full (here, deliberately huge) `hold_poll_interval`. This is what
+/// proves the token is *raced* against `wait_for_clearance`'s sleep
+/// (`tokio::select!`) rather than only re-checked at the top of the loop.
+struct AlwaysHeld;
+
+impl HoldSource for AlwaysHeld {
+    fn is_held(&self, _repo: &str, _block_id: &str) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner())
+        .await;
+}
+
+async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let token = CancellationToken::new();
+
+    let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
+
+    // Deliberately far longer than the timeout below asserts against —
+    // if cancellation were only checked at the top of the loop (never
+    // raced against the hold's own sleep), this test would have to wait
+    // out the whole interval and would fail the timeout.
+    let huge_poll_interval = Duration::from_secs(3600);
+
+    let registry_path = registry.brain_root().to_path_buf();
+    let roadmap_dir2 = roadmap_dir.clone();
+    let token_for_task = token.clone();
+    let handle = tokio::task::spawn_local(async move {
+        let registry = RepoRegistry::from_brain_root(&registry_path).unwrap();
+        integrate_chain(
+            &chain,
+            &no_deps,
+            &always_met,
+            &admission,
+            &AlwaysHeld,
+            huge_poll_interval,
+            None,
+            Some(&token_for_task),
+            &always_flow,
+            &registry,
+            &flow_runner,
+            &roadmap_dir2,
+            None,
+            &|_: &StepProgress| {},
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+    });
+
+    // Give the chain a moment to actually park inside `wait_for_clearance`
+    // before cancelling.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    token.cancel();
+
+    let outcomes = tokio::time::timeout(Duration::from_millis(500), handle)
+        .await
+        .expect(
+            "a cancel against a held chain must return within one poll tick, not the full interval",
+        )
+        .expect("task must not panic")
+        .expect("a cancelled chain must return Ok, not Err");
+
+    assert_eq!(outcomes.len(), 0, "the held block never got to run");
+    assert_eq!(
+        runner.call_count(),
+        0,
+        "the runner must never have been invoked"
+    );
+}
+
+// ── Per-step progress observer (Task 3) ──────────────────────────────────
+
+/// A 3-step chain calls the observer exactly three times, in order, with
+/// each `StepProgress` naming the right repo, block, 1-based index and the
+/// chain's fixed total — a watcher must be able to tell 2-of-3 from 3-of-3.
+#[tokio::test]
+async fn n_step_chain_calls_the_observer_exactly_n_times_with_correct_indices() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-a".to_string(), "A.2".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let emitted: Arc<Mutex<Vec<StepProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_for_closure = emitted.clone();
+    let observer = move |progress: &StepProgress| {
+        emitted_for_closure.lock().unwrap().push(progress.clone());
+    };
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &observer,
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("three-step chain should integrate cleanly");
+
+    assert_eq!(outcomes.len(), 3);
+
+    let progress = emitted.lock().unwrap();
+    assert_eq!(progress.len(), 3, "exactly one emission per completed step");
+
+    assert_eq!(progress[0].repo, "repo-a");
+    assert_eq!(progress[0].block_id, "A.1");
+    assert_eq!(progress[0].index, 1);
+    assert_eq!(progress[0].total, 3);
+    assert_eq!(progress[0].status, "completed");
+
+    assert_eq!(progress[1].repo, "repo-a");
+    assert_eq!(progress[1].block_id, "A.2");
+    assert_eq!(progress[1].index, 2);
+    assert_eq!(progress[1].total, 3);
+
+    assert_eq!(progress[2].repo, "repo-b");
+    assert_eq!(progress[2].block_id, "B.1");
+    assert_eq!(progress[2].index, 3);
+    assert_eq!(progress[2].total, 3);
+}
+
+/// The observer fires only after the step's `lane-log.jsonl` line is on
+/// disk — an observed step is always a recorded step. Asserted by reading
+/// the lane log from inside the observer callback itself: at the moment
+/// step k's observer runs, the log must already have k lines.
+#[tokio::test]
+async fn the_observer_fires_after_the_lane_log_line_is_appended() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let roadmap_dir_for_observer = roadmap_dir.clone();
+    let observer = move |progress: &StepProgress| {
+        let lines = lane_log_lines(&roadmap_dir_for_observer);
+        assert_eq!(
+            lines.len(),
+            progress.index,
+            "at step {}'s observer call, the lane log must already carry {} line(s)",
+            progress.index,
+            progress.index
+        );
+    };
+
+    integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &observer,
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("two-step chain should integrate cleanly");
+}
+
+/// With no observer injected (a no-op closure), the chain's outcomes and
+/// lane-log output are unchanged from any other run — the seam adds no
+/// side effect on its own.
+#[tokio::test]
+async fn no_observer_injected_changes_nothing() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("close-the-loop");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("two-repo chain should integrate cleanly");
+
+    assert_eq!(outcomes.len(), 2);
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 2, "exactly one lane-log line per block");
+}
+
+// ── Isolation invariance matrix (EN.ticket.orchestration-isolation-passthrough) ──
+//
+// Drives the full ORCHESTRATION stack end to end (event -> `resolve_policy_for_run_from`
+// -> `execute::resolve_isolation` -> the stamped `ctx.nodes[NODE_NAME]["blocks"]`) for
+// every (repo x setting) cell of the isolation policy's invariance matrix, asserting the
+// same fact the production caller reads: the per-step resolved `use_worktree` stamped
+// into the node's result. Table-driven rather than one test per cell so the matrix shape
+// itself — three repo rows, five settings columns — reads directly off the test.
+
+/// A tempdir brain root with three repos wired for the isolation matrix:
+/// - `base-template` — row 1, always worktree, structurally unreachable by any knob.
+/// - `hq` — resolves its `repo_path` to the brain root itself (mirrors HQ, where the
+///   chain's own repo IS the brain root) — row 2, always in place.
+/// - `ordinary-repo` — row 3, follows the resolved `default_use_worktree`.
+fn isolation_matrix_brain_root() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("base-template")).unwrap();
+    std::fs::create_dir_all(dir.path().join("ordinary-repo")).unwrap();
+    std::fs::create_dir_all(
+        dir.path()
+            .join("planning")
+            .join("roadmaps")
+            .join("isolation-matrix"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        "[[repos]]\nslug = \"base-template\"\nrepo_path = \"base-template\"\n\
+         [[repos]]\nslug = \"ordinary-repo\"\nrepo_path = \"ordinary-repo\"\n\
+         [[repos]]\nslug = \"hq\"\nrepo_path = \".\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// A `FlowRunner` that satisfies `integrate_chain`'s state-write verification (writes
+/// `"done"` into the invocation's own `repo_path`) and otherwise records nothing — the
+/// matrix reads isolation off the node's stamped `ctx.nodes` result, not off this
+/// double, so it stays minimal.
+fn isolation_matrix_run_flow() -> FlowRunner {
+    Arc::new(move |invocation: FlowInvocation| {
+        Box::pin(async move {
+            write_state(&invocation.repo_path, &invocation.block_id, "done");
+            Ok(engine_contract::TaskContext {
+                event: serde_json::json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: serde_json::json!({}),
+                node_runs: std::collections::HashMap::new(),
+            })
+        })
+    })
+}
+
+/// Run one ORCHESTRATION step for `repo_slug` with `event_overlay` merged into the
+/// event, and return the `use_worktree` the node actually stamped for that step.
+async fn matrix_cell_use_worktree(
+    dir: &Path,
+    repo_slug: &str,
+    block_id: &str,
+    event_overlay: serde_json::Value,
+) -> bool {
+    let node = OrchestrationRunNode::new().with_run_flow(isolation_matrix_run_flow());
+    let mut event = serde_json::json!({
+        "brain_root": dir,
+        "blocks": [{ "repo": repo_slug, "block_id": block_id }],
+        "roadmap_slug": "isolation-matrix",
+    });
+    if let (Some(event_obj), Some(overlay_obj)) = (event.as_object_mut(), event_overlay.as_object())
+    {
+        for (key, value) in overlay_obj {
+            event_obj.insert(key.clone(), value.clone());
+        }
+    }
+    let ctx = TaskContext {
+        event,
+        nodes: std::collections::HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: std::collections::HashMap::new(),
+    };
+    let out = node
+        .process(ctx)
+        .await
+        .unwrap_or_else(|err| panic!("process should succeed for {repo_slug}/{block_id}: {err}"));
+    out.nodes[NODE_NAME]["blocks"][0]["use_worktree"]
+        .as_bool()
+        .expect("stamped use_worktree should be a bool")
+}
+
+/// The five ways a run can reach a resolved `default_use_worktree`, matched against the
+/// three repo rows below. `"default_false"`/`"default_true"` set the fallback via a
+/// `planning/harness.json` `orchestration.policy.default_use_worktree` entry (the
+/// `source`-read layer `resolve_policy_for_run_from` consults); the two profiles set it
+/// via the built-in bundles; the event override sets it inline on the event itself, one
+/// layer higher than every other setting here.
+enum Setting {
+    DefaultFalse,
+    DefaultTrue,
+    ProfileCheapFast,
+    ProfileThorough,
+    EventOverride(bool),
+}
+
+impl Setting {
+    fn write_harness_default(&self, dir: &Path) {
+        let harness_path = dir.join("planning").join("harness.json");
+        let value = match self {
+            Setting::DefaultFalse => Some(false),
+            Setting::DefaultTrue => Some(true),
+            // Profiles and the event override do not go through the
+            // harness.json `orchestration.policy` layer at all, so no file
+            // is written for them — leaving that layer absent proves the
+            // profile/event layers are what actually carried the setting.
+            Setting::ProfileCheapFast | Setting::ProfileThorough | Setting::EventOverride(_) => {
+                None
+            }
+        };
+        if let Some(default_use_worktree) = value {
+            std::fs::write(
+                &harness_path,
+                serde_json::json!({
+                    "orchestration": {
+                        "policy": { "default_use_worktree": default_use_worktree }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        } else if harness_path.exists() {
+            std::fs::remove_file(&harness_path).unwrap();
+        }
+    }
+
+    fn event_overlay(&self) -> serde_json::Value {
+        match self {
+            Setting::DefaultFalse | Setting::DefaultTrue => serde_json::json!({}),
+            Setting::ProfileCheapFast => serde_json::json!({ "profile": "cheap-fast" }),
+            Setting::ProfileThorough => serde_json::json!({ "profile": "thorough" }),
+            Setting::EventOverride(value) => serde_json::json!({
+                "policy": { "default_use_worktree": value }
+            }),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Setting::DefaultFalse => "default-false",
+            Setting::DefaultTrue => "default-true",
+            Setting::ProfileCheapFast => "profile-cheap-fast",
+            Setting::ProfileThorough => "profile-thorough",
+            Setting::EventOverride(true) => "event-override-true",
+            Setting::EventOverride(false) => "event-override-false",
+        }
+    }
+}
+
+/// The 15-cell invariance matrix: {`base-template`, the brain root, an ordinary repo} x
+/// {default false, default true, profile `cheap-fast`, profile `thorough`, an inline
+/// event `policy` override}. Both non-negotiable rows (`base-template`, the brain root)
+/// must resolve identically across every column — that is the assertion that
+/// distinguishes "the policy is structurally enforced" from "the default happens to
+/// agree with it today". `ordinary-repo` is expected to track the setting's resolved
+/// `default_use_worktree` exactly.
+#[tokio::test]
+async fn isolation_invariance_matrix_across_all_fifteen_cells() {
+    let dir = isolation_matrix_brain_root();
+
+    let settings = [
+        Setting::DefaultFalse,
+        Setting::DefaultTrue,
+        Setting::ProfileCheapFast,
+        Setting::ProfileThorough,
+        Setting::EventOverride(true),
+    ];
+
+    // Ordinary-repo's expected resolution per setting, in the same order as
+    // `settings` above — this is the ONE row allowed to vary across the
+    // settings axis.
+    let ordinary_expected = [false, true, false, true, true];
+
+    for (i, setting) in settings.iter().enumerate() {
+        setting.write_harness_default(dir.path());
+        let overlay = setting.event_overlay();
+        let label = setting.label();
+
+        let base_template = matrix_cell_use_worktree(
+            dir.path(),
+            "base-template",
+            &format!("BT.{i}"),
+            overlay.clone(),
+        )
+        .await;
+        assert!(
+            base_template,
+            "base-template must resolve to worktree=true under setting {label}"
+        );
+
+        let brain_root =
+            matrix_cell_use_worktree(dir.path(), "hq", &format!("HQ.{i}"), overlay.clone()).await;
+        assert!(
+            !brain_root,
+            "the brain root must resolve to worktree=false under setting {label}"
+        );
+
+        let ordinary =
+            matrix_cell_use_worktree(dir.path(), "ordinary-repo", &format!("ORD.{i}"), overlay)
+                .await;
+        assert_eq!(
+            ordinary, ordinary_expected[i],
+            "ordinary-repo should resolve to {} under setting {label}, got {ordinary}",
+            ordinary_expected[i]
+        );
+    }
+
+    // Clean up the harness.json this test wrote so it never leaks into a
+    // sibling test running against the same tempdir contents.
+    let harness_path = dir.path().join("planning").join("harness.json");
+    if harness_path.exists() {
+        std::fs::remove_file(&harness_path).unwrap();
+    }
+}
+
+/// Behavior-stability pin (CLAUDE.md standing rule 6): a chain wired with no isolation
+/// overrides at all — no `harness.json` `orchestration.policy` entry, no `profile`, no
+/// event `policy` override — seeds exactly what today's runs seed: in-place
+/// (`use_worktree: false`) for an ordinary repo. Adding the `default_use_worktree` knob
+/// must not have changed an existing, override-free run's behavior.
+#[tokio::test]
+async fn a_run_with_no_isolation_overrides_seeds_in_place_unchanged_from_today() {
+    let dir = isolation_matrix_brain_root();
+
+    let use_worktree = matrix_cell_use_worktree(
+        dir.path(),
+        "ordinary-repo",
+        "NOOVERRIDE.1",
+        serde_json::json!({}),
+    )
+    .await;
+
+    assert!(
+        !use_worktree,
+        "an override-free run against an ordinary repo must stay in-place, matching \
+         behavior before default_use_worktree existed"
+    );
+}
+
+// ── Per-step cost/token attribution does not bleed across steps (EN.11.G task 3) ──
+
+/// A [`FlowRunner`] test double that returns a DIFFERENT known cost/token
+/// figure per `block_id` — the smallest fixture that can catch bleed. A
+/// single-step test cannot: with only one step there is nothing for a
+/// second step's figures to leak into, so the two-step shape here is load
+/// bearing, not incidental.
+fn runner_with_per_block_usage(figures: Vec<(&'static str, f64, u64, u64)>) -> FlowRunner {
+    let figures: std::collections::HashMap<String, (f64, u64, u64)> = figures
+        .into_iter()
+        .map(|(block_id, cost, input, output)| (block_id.to_string(), (cost, input, output)))
+        .collect();
+    let figures = Arc::new(figures);
+    Arc::new(move |invocation: FlowInvocation| {
+        let figures = figures.clone();
+        Box::pin(async move {
+            let (cost_usd, input, output) = *figures
+                .get(&invocation.block_id)
+                .expect("fixture should have a figure for every block in the chain");
+            write_state(&invocation.repo_path, &invocation.block_id, "done");
+            let node_name = format!("{}Node", invocation.block_id);
+            let mut nodes = std::collections::HashMap::new();
+            nodes.insert(node_name.clone(), serde_json::json!({"cost_usd": cost_usd}));
+            let mut node_runs = std::collections::HashMap::new();
+            node_runs.insert(
+                node_name,
+                engine_contract::NodeRun {
+                    status: engine_contract::NodeRunStatus::Success,
+                    started_at: None,
+                    completed_at: None,
+                    error: None,
+                    input: None,
+                    usage: Some(engine_contract::Usage {
+                        input_tokens: Some(input),
+                        output_tokens: Some(output),
+                        model: "claude-sonnet-4-5".to_string(),
+                    }),
+                },
+            );
+            Ok(TaskContext {
+                event: serde_json::json!({}),
+                nodes,
+                metadata: serde_json::json!({}),
+                node_runs,
+            })
+        })
+    })
+}
+
+/// Proves per-step attribution over a REAL two-step chain: each step's
+/// child reports a different cost/token figure, and each step's own
+/// `ExecutionOutcome` must carry exactly its own figure — never the other
+/// step's, and never a sum of both (which would look like correct
+/// "rollup" arithmetic while actually being step-B's figure bleeding into
+/// step-A's read).
+///
+/// **Bleed-test-can-fail check (task 3 methodology, not left in the
+/// production tree — CLAUDE.md D8 completeness self-check / task AC
+/// "no production file may differ from HEAD at task end"):** to confirm
+/// this test actually catches attribution bleed rather than passing
+/// vacuously, `step_spend` in `execute.rs` was temporarily rewritten to
+/// route through a single `static` `BudgetLedger` shared across every
+/// call (i.e. step B's `step_spend` folded step A's already-recorded
+/// cost/tokens into its own reading) instead of building a fresh ledger
+/// from that step's own `ctx` each time. Run against that deliberately
+/// bugged build, this test failed with:
+///
+/// ```text
+/// assertion `left == right` failed: step B's cost must be its own figure, not \
+/// bled from step A
+///   left: Some(4.75)
+///  right: Some(3.5)
+/// ```
+///
+/// (`4.75` == `1.25 + 3.5`, i.e. step A's `1.25` had leaked into step B's
+/// reading — exactly the bleed this test exists to catch.) The temporary
+/// `execute.rs` edit was then reverted with `git checkout -- execute.rs`
+/// and the suite re-run clean; no production file differs from this
+/// task's starting `HEAD`.
+#[tokio::test]
+async fn two_step_chain_attributes_cost_and_tokens_to_the_step_that_spent_them_without_bleed() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("no-bleed");
+    let admission = AdmissionGate::with_default_policy();
+
+    let runner = runner_with_per_block_usage(vec![("A.1", 1.25, 100, 200), ("B.1", 3.50, 10, 20)]);
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("two-step chain with distinct per-step usage should integrate cleanly");
+
+    assert_eq!(outcomes.len(), 2);
+
+    assert_eq!(
+        outcomes[0].cost_usd,
+        Some(1.25),
+        "step A's cost must be its own figure, not padded by step B"
+    );
+    assert_eq!(
+        outcomes[0].total_tokens, 300,
+        "step A's tokens must be its own figure, not padded by step B"
+    );
+
+    assert_eq!(
+        outcomes[1].cost_usd,
+        Some(3.50),
+        "step B's cost must be its own figure, not bled from step A"
+    );
+    assert_eq!(
+        outcomes[1].total_tokens, 30,
+        "step B's tokens must be its own figure, not bled from step A"
+    );
+
+    // The two steps' figures are actually distinct — a bleed bug that
+    // duplicated step A's ledger into step B (or vice versa) would collapse
+    // this into a false equality.
+    assert_ne!(outcomes[0].cost_usd, outcomes[1].cost_usd);
+    assert_ne!(outcomes[0].total_tokens, outcomes[1].total_tokens);
+}
+
+// ── `EN.11.K` Task 3 — frontier/`corpus_gates` parity fixture ─────────────
+//
+// The AC "the engine's lane-head startability answer matches `mev frontier --json`
+// for the same lane" is un-gateable by a normal in-repo assertion for the same reason
+// `corpus_gates_parity.rs` names for its own AC: `mev` is a separate repo
+// (`core/mev`) and an installed binary, not something this workspace can invoke.
+// This module stands in for that AC the only way available: a checked-in
+// `lane-frontier.json` fixture reproduced verbatim from a real `mev frontier --json`
+// run, with mev's recorded answer cross-checked against
+// [`check_step_with_frontier_advice`] and [`GateError`] for the same lane head.
+//
+// # Provenance (fill this in again if the fixture below ever changes)
+//
+// - **Binary**: the *installed* `mev` at `~/.cargo/bin/mev` (NOT a source build of
+//   `core/mev` run via `cargo run`) — `which mev` resolves there on this machine, per
+//   `corpus_gates_parity.rs`'s own recorded provenance for the same machine.
+// - **Version**: `mev --version` -> `mev 0.1.0`.
+// - **Invocation**: `mev frontier <brain-root> --json`, run against a fixture tree with
+//   one lane file per case under `planning/roadmaps/orchestration-extensions/
+//   lane-engine-rs.txt`, naming `EN.11.E` as the lane's sole block — mirroring the
+//   live condition this block's spec section "Why" records: at spec time the real
+//   `lane-frontier.json`'s engine-rs head is `EN.11.E`, reported `startable: true` with
+//   `unmet_gates: []`, while `EN.11.E` is in fact HELD on an operator decision the
+//   graph cannot express. The JSON below is that recorded entry, reproduced verbatim.
+//
+// # Coverage
+//
+// Three cases the AC names: agreement (frontier startable, per-edge check has nothing
+// outstanding either — both signals concur), disagreement (frontier says startable,
+// but the live per-edge check still refuses — the refusal must win, never the
+// frontier's optimism), and the absent-file case (a missing `lane-frontier.json` must
+// fail loudly, naming the path, never a silent `false` or `true`).
+
+/// Recorded from `mev frontier <fixture-root> --json` against a single-lane fixture
+/// tree whose only block is `EN.11.E` (see module doc for the exact invocation and
+/// provenance). Reproduced here verbatim — this is the real measured shape named in
+/// the block's `what`: `{derived_at, entries[], gate_ranks[]}`, one entry for the
+/// `orchestration-extensions`/`engine-rs` lane, segment 0.
+const RECORDED_FRONTIER: &str = r#"{
+    "derived_at": "2026-08-21T00:00:00-07:00",
+    "entries": [
+        {
+            "roadmap": "orchestration-extensions",
+            "lane": "engine-rs",
+            "segment": 0,
+            "repo": "engine-rs",
+            "key": "engine-rs:EN.11.E",
+            "id": "EN.11.E",
+            "title": "Frontier for startability",
+            "status": "open",
+            "unmet_blocks": [],
+            "unmet_gates": [],
+            "startable": true
+        }
+    ],
+    "gate_ranks": []
+}"#;
+
+fn engine_rs_lane_head_step() -> ChainStep {
+    ChainStep {
+        repo: "engine-rs".to_string(),
+        block_id: "EN.11.E".to_string(),
+        directives: None,
+        roadmap: Some("orchestration-extensions".to_string()),
+        lane: Some("engine-rs".to_string()),
+        segment: Some(0),
+    }
+}
+
+/// Write [`RECORDED_FRONTIER`] to a tempdir path standing in for a repo's
+/// `planning/lane-frontier.json` and load it back through the reader under test, so
+/// every case here exercises the real parse path, not a hand-built [`FrontierArtifact`].
+fn write_recorded_frontier(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("lane-frontier.json");
+    std::fs::write(&path, RECORDED_FRONTIER).expect("write recorded frontier fixture");
+    path
+}
+
+#[test]
+fn frontier_parity_agreement_both_signals_concur_and_the_step_may_start() {
+    // mev: engine-rs's lane head EN.11.E is startable=true, unmet_gates=[]. Stand the
+    // live per-edge check in with an agreeing double (nothing outstanding) — the
+    // agreement case named in the AC.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_recorded_frontier(&dir);
+    let artifact = load_frontier(&path).expect("recorded fixture must parse");
+
+    let step = engine_rs_lane_head_step();
+    let (gate_result, head) =
+        check_step_with_frontier_advice(&step, Some(&artifact), &no_deps, &always_met);
+
+    let head = head.expect("frontier entry for engine-rs's lane head must be found");
+    assert_eq!(head.id, "EN.11.E");
+    assert!(
+        head.startable,
+        "mev's recorded answer for this lane head is startable:true"
+    );
+    assert!(head.unmet_gates.is_empty());
+    assert!(
+        gate_result.is_ok(),
+        "both signals agree the step may start: {gate_result:?}"
+    );
+}
+
+#[test]
+fn frontier_parity_disagreement_per_edge_refusal_wins_over_frontier_optimism() {
+    // Live condition named in the block's Why: mev's own recorded engine-rs head is
+    // startable:true with unmet_gates:[] while EN.11.E is in fact HELD on an operator
+    // decision the graph cannot express. Stand the live per-edge check in with a
+    // refusing double — the disagreement case named in the AC. The refusal must win.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_recorded_frontier(&dir);
+    let artifact = load_frontier(&path).expect("recorded fixture must parse");
+
+    let step = engine_rs_lane_head_step();
+    let held_operator_edge = |_repo: &str, _block_id: &str| {
+        vec![DependencyEdge::Operator {
+            slug: "d20-contract-authorship".to_string(),
+        }]
+    };
+    let nothing_met = |_repo: &str, _block_id: &str| false;
+
+    let (gate_result, head) =
+        check_step_with_frontier_advice(&step, Some(&artifact), &held_operator_edge, &nothing_met);
+
+    let head = head.expect("frontier entry must still be found even though it disagrees");
+    assert!(
+        head.startable,
+        "mev's recorded answer for this lane head is startable:true — the frontier's \
+         own optimism must be visible even as the gate refuses"
+    );
+    assert!(head.unmet_gates.is_empty());
+    assert!(
+        gate_result.is_err(),
+        "the live per-edge check must refuse despite frontier startable:true, never the \
+         other way around"
+    );
+    match gate_result.unwrap_err() {
+        GateError::UnmetDependency {
+            edge: DependencyEdge::Operator { slug },
+            ..
+        } => assert_eq!(slug, "d20-contract-authorship"),
+        other => panic!("expected an Operator UnmetDependency naming the held gate, got {other:?}"),
+    }
+}
+
+#[test]
+fn frontier_parity_absent_file_fails_loudly_naming_the_path() {
+    // The third case the AC names: a missing lane-frontier.json must fail loudly and
+    // name the path — never a silent "not startable" (which reads as an ordinary hold)
+    // and never a silent "startable".
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("does-not-exist").join("lane-frontier.json");
+
+    let err = load_frontier(&path).expect_err("a missing file must not parse to anything");
+    match &err {
+        FrontierError::Missing { path: p } => assert_eq!(p, &path),
+        other => panic!("expected FrontierError::Missing, got {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&path.display().to_string()),
+        "the failure must name the missing path: {msg}"
+    );
 }

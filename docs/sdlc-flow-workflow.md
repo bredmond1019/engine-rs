@@ -32,8 +32,8 @@ SetupWorktreeNode -> SpecExistsRouterNode -> { GenerateTasksNode -> LoadTaskStat
                                 -> TriageRouterNode -> ConsolidatedReviewNode
                                 -> ReviewRouterNode -> UpdateTaskStatusNode
                                 -> SaveStateNode -> (loop) TaskQueueRouterNode
-                            | FinalValidationNode -> PatchDocsNode -> WrapUpNode -> PullRequestNode
-                                -> EmitStateNode }
+                            | FinalValidationNode -> PatchDocsNode -> WrapUpNode -> CloseBlockNode
+                                -> PullRequestNode -> EmitStateNode }
 
 TriageRouterNode     -> { ConsolidatedReviewNode | IncrementAttemptNode | WrapUpNode }
 ReviewRouterNode      -> { UpdateTaskStatusNode | IncrementAttemptNode | WrapUpNode }

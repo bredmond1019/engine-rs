@@ -16,6 +16,100 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-22]
+
+`EN.11.N` — SDLC_TASK graph and schema — done via `/sdlc-flow` on branch `EN.11.N-flow`, PASS review, all 7 tasks passed. Ported base-template's `sdlc-task.js` into `crates/engine-core/src/workflows/sdlc_task/`: the module root, event schema, and `TerminalSignal::ReconcileFailed` with its `derive_committed_status` arm plus a `CloseBlockNode` skip on `reconcile_failed` per D56 (task 1); `TaskTriageRouterNode` — the three-arm deterministic fork (PASS → `UpdateTaskStatusNode`, RETRYABLE-under-budget → `IncrementAttemptNode`, MAJOR_BAIL/exhausted/unknown → `LeanBookkeepNode`), fail-closed on missing upstream results (task 2); `SpecExistsRouterNode`/`LoadTaskStateNode` promoted to real structs with `with_state_filename` builders and `SetupWorktreeNode` gained `with_branch_prefix`, so SDLC_TASK reuses SDLC_FLOW's setup nodes under its own filename/branch prefix without forking them (task 3); the D56 reconcile scope (`select_reconcile_checks`, `FinalValidationNode::with_scope`) verified already complete from a prior pass (task 4); `LeanBookkeepNode` — the lean close-out, widening `wrap_up`'s durable state helpers to `pub(crate)` for reuse, deriving bailed/reconcile_failed/done status, enforcing the fullRun guard from `event.task_range`, with `CloseBlockNode::with_state_source` reading its stamp instead of forking a second closer (task 5); `graph.rs` assembling `WORKFLOW_TYPE`/`schema()`/`registry()`/`registry_for_policy()`/`workflow()` into a `Workflow::new_validated` graph — the first point SDLC_TASK validates end to end — verified already complete from an earlier interrupted attempt (task 6); `docs/sdlc-task-workflow.md` added with its `docs/index.md` row (task 7). Full validation gate green throughout (fmt, clippy `-D warnings`, `nextest --workspace --all-features`, release build). Closes `EN.11.N` — `EngineKind::Task` is now representable AND runnable — unblocking `EN.11.O` (SDLC_TASK policy and profiles) and contributing to `EN.11.P` (task blocks are orchestratable). Next: `EN.11.O`.
+
+```
+b1666cf feat: implement EN.11.N-task7
+6e82871 style: cargo fmt after the EN.11.N bail
+f77dc68 feat: implement EN.11.N-task6
+b85b585 feat: implement EN.11.N-task5
+8ed7cae chore(harness): pull base-template dfbb9a6 — state skills cover mev's other write verbs
+0efb146 feat: implement EN.11.N-task4
+f43b816 feat: implement EN.11.N-task3
+d56787b feat: implement EN.11.N-task2
+```
+
+---
+
+## [run: 2026-08-21]
+
+### Structured logging — one greppable line per node, with run and campaign ids — closes `EN.11.I`
+
+- **What:** `tracing`/`tracing-subscriber` added to the workspace dependency table, consumed only by
+  `engine-core` and `engine-serve`; `engine-serve` gained an idempotent `init_tracing()` (JSON layer,
+  `flatten_event(true)`, `ENGINE_LOG` env-var filter knob defaulting to `info`) (task 1). `Workflow::
+  walk` and the `node_context` dispatch site carry `#[instrument]` spans recording `run_id`/
+  `campaign_id`, propagated across `OrchestrationRunNode`'s `spawn_blocking` boundary by explicitly
+  re-capturing the current span and dispatcher inside the closure (task 2). All real production
+  `eprintln!` call sites in `engine-core`'s 5 named src files migrated to structured `tracing` events,
+  and a `tracing::error!` naming the node and failure added at the dispatch `Err` branch to satisfy
+  the "a failing node emits a structured event" acceptance criterion, since no prior call site covered
+  it (task 3). `engine-serve`'s 4 src `eprintln!` sites migrated to structured events; `term-core`'s
+  sole site was removed rather than routed, since `parse_sessions` has no in-workspace caller (task 4).
+  The JSON wire shape was pinned — `node_context` now emits an explicit `run_id`/`campaign_id`/`node`
+  event per dispatch (span fields alone don't flatten to event top-level) — via a new
+  `crates/engine-core/tests/it/structured_logging.rs` suite covering dispatch order, failure events,
+  `spawn_blocking` propagation over the real JSON writer, and a self-verifying zero-`eprintln!` count
+  check (task 5). Full validation gate green — fmt, clippy `--all-features -D warnings`, nextest
+  `--workspace --all-features` (2749/2749 passed, 17 skipped), release build, cargo audit (task 6,
+  validate-only, no code changes). All 6 tasks passed, PASS review. This closes `EN.11.I` — the
+  observability gap seams.md flagged as the binding constraint on Wave 2-3 orchestration gates is now
+  closed: every node dispatch and failure produces one greppable structured line carrying its run and
+  campaign identity. Docs updated: `docs/deployment-launchd.md`. Next: `EN.5.B2`, `EN.5.C`, `EN.6.K`,
+  `EN.5.G`, `EN.4.D`, `EN.11.M`, `EN.12.A`, `EN.12.B`, `EN.12.D` per the `next` frontmatter list.
+
+```
+54fe8de feat: implement EN.11.I-task5
+4e0c875 feat: implement EN.11.I-task4
+dab7455 feat: implement EN.11.I-task3
+3a2595d feat: implement EN.11.I-task2
+a68757e feat: implement EN.11.I-task1
+e830f03 docs: update docs for EN.11.I
+f4a54f9 chore: init worktree EN.11.I-flow
+```
+
+---
+
+## [run: 2026-08-21]
+
+### Campaign identity — a chain of runs has an address — closes `EN.11.E`
+
+- **What:** `docs/data-contract.md` re-framed as the canonical data contract per D78, absorbing
+  the outgoing 1.7.0 canonical content before authoring anything new (task 1); `campaign_id:
+  Option<String>` threaded through `execute.rs`/`graph.rs`/`integrate.rs`'s `FlowInvocation`/child
+  run seam so a run knows which campaign it belongs to (tasks 2-3); `crates/engine-serve/src/
+  live_state.rs` gained `RunRecord.campaign_id` and `list_campaign_runs`, merging the live map and
+  completed ring with deterministic ordering and a `possibly_truncated` flag for ring eviction
+  (task 4); `GET /campaigns/{id}` registered in `crates/engine-serve/src/http.rs`, returning the
+  campaign's runs plus a cost/token rollup read from `OrchestrationRunNode`'s `campaign_members`,
+  verified by 5 HTTP-level `actix_web::test` cases against the real router (task 5); `docs/
+  data-contract.md` bumped to Contract Version 1.8.0 documenting campaign identity and the new
+  route, plus a Consumer re-pin obligations section naming orchestrator's and bastion's observed
+  versions (task 6); full validation gate green — fmt, clippy `--all-features -D warnings`,
+  `cargo nextest run --workspace --all-features`, release build, cargo audit (task 7). All 7 tasks
+  passed, PASS review. This closes `EN.11.E` and unblocks `EN.11.G`'s campaign-wide cost rollup
+  (previously scoped out for want of an identity to roll up to). The campaign id is a first-class
+  field on the wire, never hidden in free-form `metadata`, per seams.md seam 11. Cross-repo re-pin
+  in `orchestrator`/`bastion` is out of scope for this block — filed as follow-ups on those lanes
+  per D78's Consequences section. Docs updated: `docs/architecture.md`, `docs/
+  orchestration-workflow.md`. Next: `EN.11.F` (the stop button) and `EN.11.H` (crash recovery),
+  both previously blocked, are candidates now that a campaign has an address.
+
+```
+07cc84b docs: update docs for EN.11.E
+738a2ff feat: implement EN.11.E-task6
+15d45e0 feat: implement EN.11.E-task5
+fdf8da8 feat: implement EN.11.E-task4
+29cd67e fix: fix pass 1 for EN.11.E-task3
+fbc7320 feat: implement EN.11.E-task3
+28870aa fix: fix pass 1 for EN.11.E-task2
+8e4f6a0 feat: implement EN.11.E-task2
+```
+
+---
+
 ## [run: 2026-08-19]
 
 ### OTel telemetry on the pane-launch command — closes `EN.ticket.otel-pane-telemetry`

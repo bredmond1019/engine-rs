@@ -6,9 +6,14 @@
 //!
 //! `sdlc_flow` remains the sole owner of `CommandRunner`/
 //! `default_command_runner` (subprocess execution) and its four concrete
-//! named profiles — this module only generalizes the *mechanism*.
+//! named profiles — this module only generalizes the *mechanism*. The
+//! non-overridable command-policy safety floor (`command_floor`) lives here
+//! instead, lifted out of `workflows::sdlc_flow` (`EN.11.M` task 1) so a
+//! second engine, and `nodes::terminal::send`, can reach it without
+//! importing `sdlc_flow`.
 
 pub mod aggregate;
+pub mod command_floor;
 pub mod emit_state;
 pub mod overlay;
 pub mod profiles;

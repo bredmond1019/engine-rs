@@ -95,6 +95,18 @@ export const meta = {
   ]
 }
 
+// GIT_REPO_ENV_VARS (BT.ticket.worktree-run-can-commit-an-empty-tree, half (a)) — git exports these
+// nine repository-scoping variables to the hooks it runs, and a hook-spawned process (this project's
+// hooksPath = hooks) inherits them; they OVERRIDE `-C` and cwd, so a later `git commit` can silently
+// build its tree from a stale/foreign index (e.g. a hook's GIT_INDEX_FILE) instead of the one the
+// recipe actually staged, and commit a tree that deletes every tracked file behind a green PASS.
+// Ported verbatim (name, order) from core/mev/src/shared.rs GIT_REPO_ENV_VARS/git_command() — do not
+// re-derive this list. Every executable git invocation in this file's recipes must go through ${GIT},
+// never a bare `git`; prose mentions of git (descriptions, prohibitions) are left alone. Kept
+// byte-identical with sdlc-flow.js's copy — the two engines share no module, so this is duplicated on
+// purpose (see scripts/test_git_env_strip.py's cross-engine agreement check).
+const GIT = 'env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git'
+
 // ----------------------------------------------------------------
 // Parse args: "<spec-slug> [task|range] [--worktree] [--resume] [--test-depth fast|full]"
 // ----------------------------------------------------------------
@@ -147,13 +159,16 @@ if (rangeSpec) {
   selectedTasks = new Set(parsed)
 }
 
-const blockDir       = `planning/${blockId}`
-const blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
+// Resolved against the git root by default; re-derived under a tier prefix (e.g. "business/")
+// once setup reports where the spec actually lives (see setupResult.tierPrefix below) — `let`,
+// not `const`, following the same pattern specFile already uses for its own reassignment.
+let blockDir       = `planning/${blockId}`
+let blockRecordFile = `planning/blocks/${blockId}.json`   // D65: the authored block record — preferred spec source
 let specFile         = `${blockDir}/tasks.md`                // legacy fallback for a spec with no block record (reassigned once setup reports which source exists)
-const tasksJsonFile = `${blockDir}/tasks.json`
-const breakdownFile = `${blockDir}/breakdown.md`
-const reportsDir    = `${blockDir}/sdlc/reports`
-const stateFile     = `${blockDir}/sdlc/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
+let tasksJsonFile = `${blockDir}/tasks.json`
+let breakdownFile = `${blockDir}/breakdown.md`
+let reportsDir    = `${blockDir}/sdlc/reports`
+let stateFile     = `${blockDir}/sdlc/sdlc-task-state.json`   // COMMITTED authoritative run index (Block A)
 const baseBranchName = `${blockId}-task`.toLowerCase().replace(/[^a-z0-9.-]/g, '-')  // worktree branch base
 
 const MAX_TASK_ATTEMPTS = 3   // implement→test→fix attempts per task before bail (final on Opus)
@@ -225,13 +240,13 @@ async function verifyVaultCommit(runDir, vault, vaultRelPaths) {
 BRAIN_ROOT=$(cd "${vault.planningPath}" && while [ ! -f brain.toml ] && [ "$PWD" != "/" ]; do cd ..; done; pwd)
 for p in ${vaultRelPaths.map(p => JSON.stringify(p)).join(' ')}; do
   if [ -e "${vault.planningPath}/$p" ]; then
-    if [ -z "$(git -C ${vault.planningPath} status --porcelain -- "$p")" ] && git -C ${vault.planningPath} ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+    if [ -z "$(${GIT} -C ${vault.planningPath} status --porcelain -- "$p")" ] && ${GIT} -C ${vault.planningPath} ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
       echo "VAULT_OK:$p"
     else
       echo "UNCOMMITTED:$p"
     fi
   elif [ -e "$BRAIN_ROOT/planning/$p" ]; then
-    if [ -z "$(git -C "$BRAIN_ROOT/planning" status --porcelain -- "$p")" ] && git -C "$BRAIN_ROOT/planning" ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+    if [ -z "$(${GIT} -C "$BRAIN_ROOT/planning" status --porcelain -- "$p")" ] && ${GIT} -C "$BRAIN_ROOT/planning" ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
       echo "BRAIN_ROOT_OK:$p"
     else
       echo "UNCOMMITTED:$p"
@@ -255,6 +270,19 @@ different repo), notes (paste the raw script output).
   if (!result) return { allCommitted: false, uncommittedPaths: vaultRelPaths, brainRootExempt: [], notes: 'verification agent returned null' }
   if (!Array.isArray(result.brainRootExempt)) result.brainRootExempt = []
   return result
+}
+
+// COMMIT-SAFETY GUARD (BT.ticket.worktree-run-can-commit-an-empty-tree) — the cause-independent
+// backstop. Joined to a `git commit` with `&&` in the SAME Bash call as the commit itself: a
+// separate preceding call runs in a different process whose inherited git environment may differ,
+// which is the whole failure mode this guards against. Signal is an EMPTY INDEX against a non-empty
+// HEAD tree — deliberately NOT core.bare, which stays false in every reproduction of the data loss.
+// `gitCmd` lets a vault-repo commit run the same guard via `git -C <vault path>` against the vault's
+// own HEAD/index rather than the worktree's; the default 'git' reproduces the exact snippet verbatim.
+// Kept byte-identical with sdlc-flow.js's copy — the two engines share no module, so this is
+// duplicated on purpose (see scripts/test_commit_safety_guard.py's cross-engine agreement check).
+function renderCommitSafetyGuard(gitCmd = 'git') {
+  return `if ${gitCmd} rev-parse --verify -q HEAD >/dev/null; then TRACKED=$(${gitCmd} ls-tree -r HEAD --name-only | wc -l | tr -d ' '); STAGED=$(${gitCmd} ls-files -s | wc -l | tr -d ' '); if [ "$TRACKED" -gt 0 ] && [ "$STAGED" -eq 0 ]; then echo "COMMIT_GUARD_ABORT: index holds 0 entries but HEAD tracks $TRACKED files - refusing to commit a tree that deletes everything (BT.ticket.worktree-run-can-commit-an-empty-tree)"; exit 1; fi; fi`
 }
 
 // Given a task stage's self-reported filesModified (repo-root-relative) and a resolved vault, return
@@ -283,7 +311,9 @@ const SETUP_SCHEMA = {
     baseSha:        { type: 'string', description: 'The HEAD short sha AFTER setup, BEFORE any task commit — the emoji-gate diff base' },
     wasCreated:     { type: 'boolean', description: 'true if a new worktree was created (--worktree only)' },
     specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
-    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'" },
+    specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
+    tierPrefix:     { type: 'string', description: 'The invoking directory\'s path relative to the git root, with a trailing slash (e.g. "business/"), or "" when /sdlc-task was invoked at the git root. This is the CANDIDATE tier location checked in STEP 4a — reported regardless of whether the spec was actually found there.' },
+    specFoundInTier: { type: 'boolean', description: 'true iff the spec (block record or legacy tasks.md) exists ONLY at the tier location (<tierPrefix>planning/<blockId>), not at the root (planning/<blockId>). False when found at the root (even if ALSO present at the tier — the root always wins) or found nowhere.' },
     blockStatus:    { type: 'string', description: "This spec's Status in status.md (title-case), or 'Unknown'" },
     specThin:       { type: 'boolean', description: 'D19: true on a fresh (non-resume) run with a structurally-valid but substantively-thin spec; false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
@@ -359,6 +389,7 @@ const STATE_LOAD_SCHEMA = {
     startedAt:   { type: 'string',  description: "the file's started_at value, or '' when absent" },
     passedTasks: { type: 'array', items: { type: 'integer' }, description: 'task numbers whose status is "passed"' },
     bailReason:  { type: 'string',  description: 'the prior bail_reason, or "" when none' },
+    tasksJson:   { type: 'string',  description: 'Verbatim JSON (as a string) of the state file\'s top-level "tasks" object, so the engine can carry the full prior task history forward. "{}" when absent/no state.' },
     notes:       { type: 'string' }
   }
 }
@@ -800,6 +831,11 @@ const state = {
   worktree_path: '',
   status: 'running',
   current_task: null,
+  // DELIBERATE (ticket-sdlc-task-resume-truncates-run-state): tasks_run stays PER-INVOCATION
+  // telemetry — "what did THIS invocation run" — and is never unioned across a resume, because
+  // doing so would erase the record of which run did what. `tasks` below is the opposite: it is
+  // the resume breadcrumb and must answer "has this task ever passed?", so it is seeded from the
+  // prior state file's tasks object on --resume (see the state-load block) and is CUMULATIVE.
   tasks_run: [],
   tasks: {},        // "N": { status, attempts, summary, issues, fixes, decisions, files_changed, commit, validated }
   bail_reason: null,
@@ -909,45 +945,53 @@ Target:
 ${useWorktree ? `  Base name:  ${baseBranchName}` : ''}
 
 STEP 1 — Get the absolute repo root and the current branch:
-  Run: git rev-parse --show-toplevel        (store trimmed output as repoRoot)
-  Run: git rev-parse --abbrev-ref HEAD       (store as currentBranch)
+  Run: ${GIT} rev-parse --show-toplevel        (store trimmed output as repoRoot)
+  Run: ${GIT} rev-parse --abbrev-ref HEAD       (store as currentBranch)
+  Run this BEFORE any other \`cd\` — it must reflect where /sdlc-task was actually invoked from
+  (e.g. a sub-brain tier like business/), not runDir, which may differ:
+    REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')"
+       (store trimmed stdout as candidateTierPrefix — "" when invoking at the git root, otherwise
+       the invoking directory's path relative to repoRoot with a trailing slash, e.g. "business/")
 ${useWorktree ? `
 WORKTREE MODE (--worktree) — create or reuse an isolated worktree:
 ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if present:
-    a. git worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
-    b. git branch --list "${baseBranchName}"
+    a. ${GIT} worktree list | grep "trees/${baseBranchName}" && echo "WT_EXISTS" || echo "WT_MISSING"
+    b. ${GIT} branch --list "${baseBranchName}"
     - WT_EXISTS → REUSE verbatim. branchName="${baseBranchName}", wasCreated=false. Skip to STEP 2c.
     - WT_MISSING but branch "${baseBranchName}" exists (orphan branch, dir removed) → re-attach (NO -b flag):
         mkdir -p trees
-        git worktree add --no-checkout trees/${baseBranchName} ${baseBranchName}
-        git -C trees/${baseBranchName} sparse-checkout init --cone
-        git -C trees/${baseBranchName} sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
-        git -C trees/${baseBranchName} checkout
-        git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\\.env(\\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/${baseBranchName}/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
+        ${GIT} worktree add --no-checkout trees/${baseBranchName} ${baseBranchName}
+        ${GIT} -C trees/${baseBranchName} sparse-checkout init --cone
+        ${GIT} -C trees/${baseBranchName} sparse-checkout set $(${GIT} ls-tree HEAD --name-only -d | tr '\\n' ' ')
+        ${GIT} -C trees/${baseBranchName} checkout
+        ${GIT} ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\\.env(\\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/${baseBranchName}/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
       branchName="${baseBranchName}", wasCreated=false. Skip to STEP 2c.
     - Neither exists → fall through and create a fresh worktree as normal.
 ` : ''}  STEP 2 — Find a free worktree name. Start with candidate "${baseBranchName}"; for each candidate run:
-      git worktree list | grep "trees/<candidate>"
-      git branch --list "<candidate>"
+      ${GIT} worktree list | grep "trees/<candidate>"
+      ${GIT} branch --list "<candidate>"
     If BOTH return nothing → the candidate is free; use it. Otherwise try "${baseBranchName}-2",
     "${baseBranchName}-3", … up to "-10". Store the chosen name as branchName.
 
   STEP 2b — Create the worktree (replace [branchName] with the chosen name):
     a. mkdir -p trees
-    b. git worktree add --no-checkout trees/[branchName] -b [branchName]
-    c. git -C trees/[branchName] sparse-checkout init --cone
+    b. ${GIT} worktree add --no-checkout trees/[branchName] -b [branchName]
+    c. ${GIT} -C trees/[branchName] sparse-checkout init --cone
     d. # Cone ALL tracked top-level directories — stack-agnostic, no project-layout assumptions (D5/P5).
-       git -C trees/[branchName] sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\\n' ' ')
-    e. git -C trees/[branchName] checkout
+       ${GIT} -C trees/[branchName] sparse-checkout set $(${GIT} ls-tree HEAD --name-only -d | tr '\\n' ' ')
+    e. ${GIT} -C trees/[branchName] checkout
     f. Discover and copy EVERY gitignored env-shaped file (.env, .env.local, .env.* in any
        directory) from repoRoot into trees/[branchName], preserving each file's path relative to
        the repo root (creating parent directories as needed — so app/.env lands at
        trees/[branchName]/app/.env). Only files git actually ignores; exclude node_modules/,
        .venv/, venv/, trees/, and vendor/; never overwrite a file that already exists in the
        worktree. Run:
-         git ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/[branchName]/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
+         ${GIT} ls-files --others --ignored --exclude-standard -- . | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -Ev '(^|/)(node_modules|\.venv|venv|trees|vendor)/' | while IFS= read -r f; do dest="trees/[branchName]/$f"; if [ ! -f "$dest" ]; then mkdir -p "$(dirname "$dest")"; cp "$f" "$dest"; echo "ENV_COPIED: $f"; fi; done
        Record the list of "ENV_COPIED:" lines — report them in STEP 4.
-    g. git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
+    g. # COMMIT-SAFETY GUARD EXEMPT: this is the worktree-init commit — its index is legitimately
+       # populated after checkout (it is the very first commit on the branch), so the guard's
+       # "empty index against a non-empty HEAD" signal cannot fire here; --allow-empty is orthogonal.
+       ${GIT} -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
     Set wasCreated=true.
 
   STEP 2c — Fix the planning/ symlink for the worktree (run from the MAIN repo root, for ALL worktree
@@ -973,12 +1017,24 @@ STEP 3 — Compute runDir:
   ${useWorktree ? 'runDir = repoRoot + "/trees/" + branchName' : 'runDir = repoRoot'}
 
 STEP 4 — Report pipeline-start inputs (run these from runDir):
-  a. Spec source (D65 stage 2) — the block record is checked FIRST and is preferred; tasks.md is only
-     a fallback for a legacy spec that predates the block-record migration:
-       cd <runDir> && ls ${blockRecordFile} 2>/dev/null && echo "RECORD_EXISTS" || echo "RECORD_MISSING"
-       cd <runDir> && ls ${specFile} 2>/dev/null && echo "LEGACY_EXISTS" || echo "LEGACY_MISSING"
-     specSource = "block-record" if RECORD_EXISTS (regardless of the legacy file); else "tasks-md" if
-     LEGACY_EXISTS; else "missing". specFileExists = true iff specSource != "missing".
+  a. Spec source AND location (D65 stage 2 + tier resolution) — the block record is checked FIRST
+     and is preferred; tasks.md is only a fallback for a legacy spec that predates the block-record
+     migration. Check the ROOT first (it always wins when the spec exists at both locations):
+       cd <runDir> && ls ${blockRecordFile} 2>/dev/null && echo "RECORD_ROOT_EXISTS" || echo "RECORD_ROOT_MISSING"
+       cd <runDir> && ls ${specFile} 2>/dev/null && echo "LEGACY_ROOT_EXISTS" || echo "LEGACY_ROOT_MISSING"
+     ONLY IF candidateTierPrefix (from STEP 1) is non-empty, ALSO check the tier location:
+       cd <runDir> && ls <candidateTierPrefix>${blockRecordFile} 2>/dev/null && echo "RECORD_TIER_EXISTS" || echo "RECORD_TIER_MISSING"
+       cd <runDir> && ls <candidateTierPrefix>${specFile} 2>/dev/null && echo "LEGACY_TIER_EXISTS" || echo "LEGACY_TIER_MISSING"
+     Resolve, in this order:
+       - specFoundInTier = true ONLY when neither RECORD_ROOT_EXISTS nor LEGACY_ROOT_EXISTS, AND
+         either RECORD_TIER_EXISTS or LEGACY_TIER_EXISTS. Otherwise specFoundInTier = false — this
+         is what makes the root win whenever the spec exists at both locations.
+       - specSource, evaluated at the WINNING location (root unless specFoundInTier): "block-record"
+         if that location's block record exists; else "tasks-md" if that location's legacy file
+         exists; else "missing".
+       - specFileExists = true iff specSource != "missing".
+     tierPrefix = candidateTierPrefix from STEP 1 (report it as-is, even when specFoundInTier is
+     false or specSource is "missing" — it is the location that was CHECKED, not just a winner).
   b. Block status — find this spec's row in status.md:
        cd <runDir> && grep -iE "${blockId}" planning/status.md | head -5
      blockStatus = the title-case Status value (Not started / In progress / Done / Blocked / Skipped),
@@ -1001,10 +1057,10 @@ ${useWorktree ? `  d. Env files seeded — collect the "ENV_COPIED: <path>" line
      program/block ID — anything discovering it externally must use \`git worktree list\`, not guess.
 ` : ''}
 STEP 5 — Capture the emoji-gate diff base — the HEAD short sha as it stands NOW, before any task commit:
-  cd <runDir> && git rev-parse --short HEAD     (store as baseSha)
+  cd <runDir> && ${GIT} rev-parse --short HEAD     (store as baseSha)
 
 Return your result using the StructuredOutput tool:
-  runDir, branchName, baseSha, wasCreated, specFileExists, specSource, blockStatus, specThin, thinReason,${useWorktree ? ' envFilesCopied,' : ''} notes.
+  runDir, branchName, baseSha, wasCreated, specFileExists, specSource, tierPrefix, specFoundInTier, blockStatus, specThin, thinReason,${useWorktree ? ' envFilesCopied,' : ''} notes.
 `, withModel({ label: 'setup', schema: SETUP_SCHEMA, phase: 'Setup' }, MODEL.setup))
 
 if (!setupResult) {
@@ -1024,6 +1080,24 @@ if (useWorktree) {
   log(`Worktree path derives from the spec slug (trees/${branchName}), not any block ID — use "git worktree list" to locate it, never guess.`)
 }
 
+// Tier resolution — the candidate prefix is always reported (STEP 1); only actually applied to
+// blockDir and everything derived from it when the setup agent found the spec ONLY at the tier
+// location, never at the root (specFoundInTier). The root wins whenever the spec exists at both —
+// see SETUP_SCHEMA.specFoundInTier and the STEP 4a resolution order.
+const tierPrefixCandidate = setupResult.tierPrefix || ''
+const rootBlockRecordFile = blockRecordFile   // pre-tier root form, kept for the Missing-spec abort
+const rootSpecFile        = specFile          // pre-tier root form, kept for the Missing-spec abort
+if (tierPrefixCandidate && setupResult.specFoundInTier) {
+  blockDir        = `${tierPrefixCandidate}planning/${blockId}`
+  blockRecordFile = `${tierPrefixCandidate}planning/blocks/${blockId}.json`
+  specFile        = `${blockDir}/tasks.md`
+  tasksJsonFile   = `${blockDir}/tasks.json`
+  breakdownFile   = `${blockDir}/breakdown.md`
+  reportsDir      = `${blockDir}/sdlc/reports`
+  stateFile       = `${blockDir}/sdlc/sdlc-task-state.json`
+  log(`Spec resolved at tier location (${tierPrefixCandidate}) — not found at the root.`)
+}
+
 // D65 stage 2: resolve which spec source this run actually has. specSource defaults to 'tasks-md'
 // only if the setup agent omitted the field (older cached run) — never silently prefer a source
 // that was not actually checked.
@@ -1039,9 +1113,11 @@ const specDesc = specSource === 'block-record'
   : '(prose — Goal, Acceptance Criteria, Validation Commands)'
 
 if (!setupResult.specFileExists) {
-  log(`Neither the block record (${blockRecordFile}) nor the legacy spec file (${specFile}) was found. /sdlc-task expects an authored spec.`)
+  const rootPaths = `${rootBlockRecordFile} or ${rootSpecFile}`
+  const tierPaths = tierPrefixCandidate ? `${tierPrefixCandidate}planning/blocks/${blockId}.json or ${tierPrefixCandidate}planning/${blockId}/tasks.md` : null
+  log(`No spec found — searched the root (${rootPaths})${tierPaths ? ` AND the tier location (${tierPaths})` : ''}. /sdlc-task expects an authored spec.`)
   log(`Fix: run /generate-tasks ${blockId} (and /breakdown) on main, commit, then re-run /sdlc-task ${blockId}.`)
-  return { error: 'Missing spec', blockId, specFile, blockRecordFile }
+  return { error: 'Missing spec', blockId, searchedRoot: [rootBlockRecordFile, rootSpecFile], searchedTier: tierPaths ? [`${tierPrefixCandidate}planning/blocks/${blockId}.json`, `${tierPrefixCandidate}planning/${blockId}/tasks.md`] : [] }
 }
 
 // D19 — thin-spec guard for a fresh run (legacy tasks.md path only — see STEP 4c above).
@@ -1132,9 +1208,9 @@ STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from the block 
   that judgment belongs to the deriving agent at run time, per task.
 
 STEP 4 — Commit it on the current branch with an explicit pathspec:
-  git add ${tasksJsonFile}
-  git commit -m "chore: derive tasks.json from block record (D16 fallback)"
-  git log --oneline -1   (capture the short hash)
+  ${GIT} add ${tasksJsonFile}
+  ${renderCommitSafetyGuard()} && ${GIT} commit -m "chore: derive tasks.json from block record (D16 fallback)"
+  ${GIT} log --oneline -1   (capture the short hash)
 
 Return via StructuredOutput: derivable, written, commitHash, taskCount, notes.
 `, withModel({ label: 'derive-tasks-json-from-record', schema: DERIVE_SCHEMA, phase: 'Plan' }, MODEL.derive))
@@ -1181,9 +1257,9 @@ STEP 3 — Otherwise, author a FRESH decomposed ${tasksJsonFile} from tasks.md's
   that judgment belongs to the deriving agent at run time, per task.
 
 STEP 4 — Commit it on the current branch with an explicit pathspec:
-  git add ${tasksJsonFile}
-  git commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
-  git log --oneline -1   (capture the short hash)
+  ${GIT} add ${tasksJsonFile}
+  ${renderCommitSafetyGuard()} && ${GIT} commit -m "chore: derive tasks.json from tasks.md (D16 fallback)"
+  ${GIT} log --oneline -1   (capture the short hash)
 
 Return via StructuredOutput: derivable, written, commitHash, taskCount, notes.
 `, withModel({ label: 'derive-tasks-json', schema: DERIVE_SCHEMA, phase: 'Plan' }, MODEL.derive))
@@ -1257,19 +1333,32 @@ if (taskEngineFilesMap.size) {
   log(`Engine-parse gate (hardcoded, unconditional): task(s) touching .claude/workflows/ → ${[...taskEngineFilesMap.keys()].sort((a, b) => a - b).join(', ')}.`)
 }
 
-// Resume: load the committed state.json to skip already-passed tasks.
+// Resume: load the committed state.json to skip already-passed tasks. Also seeds the in-memory
+// `state.tasks` with the FULL prior tasks object — writeTaskState() serializes `state` wholesale on
+// every write, and the per-task loop below only ever populates `state.tasks[N]` for tasks it actually
+// runs (skipped/already-passed tasks never re-enter it) — so without this seed, the first write after
+// a resume would silently drop the earlier-passed tasks from the committed file, and the *next*
+// resume would see them as never-passed and re-run them.
 const passedFromState = new Set()
 if (resumeMode) {
   const loaded = await tracedAgent(`${W}
 You read the COMMITTED run-state for an /sdlc-task resume. Do NOT modify anything.
   cd ${runDir} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-If "__NO_STATE__" or invalid JSON → exists=false. Otherwise exists=true, startedAt = its started_at,
-passedTasks = the task numbers whose tasks[N].status == "passed", bailReason = its bail_reason or "".
+If "__NO_STATE__" or invalid JSON → exists=false, tasksJson="{}". Otherwise exists=true, startedAt =
+its started_at, passedTasks = the task numbers whose tasks[N].status == "passed", bailReason = its
+bail_reason or "", tasksJson = the exact JSON (as a string) of its top-level "tasks" object, verbatim
+— this is how the engine carries the full prior task history forward across a resume.
 Return via StructuredOutput.
 `, withModel({ label: 'state-load', schema: STATE_LOAD_SCHEMA, phase: 'Plan' }, MODEL.stateLoad))
   if (loaded && loaded.exists) {
     for (const n of (loaded.passedTasks || [])) passedFromState.add(n)
     log(`Resume: ${passedFromState.size} task(s) already passed (${[...passedFromState].sort((a, b) => a - b).join(', ') || 'none'}); skipping them.`)
+    try {
+      const priorTasks = JSON.parse(loaded.tasksJson || '{}')
+      if (priorTasks && typeof priorTasks === 'object') Object.assign(state.tasks, priorTasks)
+    } catch {
+      log('(resume) could not parse prior tasks JSON from state.json — already-passed tasks may drop out of the committed history on the next write.')
+    }
   } else {
     log('Resume requested but no valid state.json found — running all selected tasks fresh.')
   }
@@ -1640,13 +1729,13 @@ Target:
 6. Run the spec's "## Validation Commands" for Task ${taskNum} to confirm correctness.
 
 7. Commit on the branch. Never use git add -A or git add . — stage files explicitly by name.
-   Run: cd ${runDir} && git status
+   Run: cd ${runDir} && ${GIT} status
    Stage your changed source/test files explicitly, then commit using HEREDOC:
-     cd ${runDir} && git commit -m "$(cat <<'EOF'
+     cd ${runDir} && ${renderCommitSafetyGuard()} && ${GIT} commit -m "$(cat <<'EOF'
 ${isFix ? `fix: fix pass ${attempt - 1} for ${stem}` : `feat: implement ${stem}`}
 EOF
 )"
-   Run: cd ${runDir} && git log --oneline -1   (capture the short hash)
+   Run: cd ${runDir} && ${GIT} log --oneline -1   (capture the short hash)
 ${vault.vaulted ? `
 7b. planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a DIFFERENT git
     repo, invisible to the commit you just made in step 7. If this attempt created or edited ANY file
@@ -1656,15 +1745,15 @@ ${vault.vaulted ? `
     vault repo — another lane's session may have unrelated work staged there right now; touch ONLY
     your own paths, and do not checkout/switch/branch inside it (stay on whatever branch it is
     already on). For each such file, let <relpath> be the part of its path AFTER "planning/":
-      cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
+      cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/<relpath>
     Then, once every such path is staged, commit ONLY those paths — pass them explicitly to \`git commit\`
     itself (not merely to \`git add\`), so a sibling lane's unrelated pre-staged files are never swept
     into this commit even if they happen to already be staged:
-      cd ${runDir} && git -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+      cd ${runDir} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- <relpath1> <relpath2> ... || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 ${isFix ? `fix: fix pass ${attempt - 1} for ${stem} (vault)` : `feat: implement ${stem} (vault)`}
 EOF
-)" -- <relpath1> <relpath2> ...
-      cd ${runDir} && git -C ${vault.planningPath} log --oneline -1
+)" -- <relpath1> <relpath2> ...)
+      cd ${runDir} && ${GIT} -C ${vault.planningPath} log --oneline -1
     If NOTHING you wrote this attempt lives under planning/, skip this step entirely — do not run any
     vault command. If a vault add/commit fails, report it PLAINLY in notes; never paper over it, and
     never "repair" it by committing on a different branch inside the vault.
@@ -1827,7 +1916,27 @@ Return via StructuredOutput:
 // FINAL STATE COMMIT + SUMMARY
 // ================================================================
 const passedTasks = taskList.filter(n => state.tasks[String(n)]?.status === 'passed' || passedFromState.has(n))
-const fullRun = !selectedTasks   // no explicit selection = every task in the spec ran
+const fullRun = !selectedTasks   // no explicit selection = every task in the spec ran; still used to gate
+                                  // the once-per-full-run reconcile step below (D56) — unaffected by this ticket.
+
+// BT.ticket.resume-cannot-close-its-block: the close decision is derived from every task in the
+// SPEC (allTasks), never from taskList (which is the SELECTED subset when a range/task was passed —
+// see :1212). Comparing against taskList made `passedTasks.length === taskList.length` trivially
+// true on a subset run, so `fullRun` (a proxy for "was a selection passed?") was the only thing
+// preventing a wrong close; comparing against allTasks makes the condition honest on its own and a
+// "was a selection passed?" proxy is no longer needed for it. This is safe now — and was NOT safe
+// before — because BT.ticket.sdlc-task-resume-truncates-run-state (closed 2026-08-20) made
+// state.tasks survive a --resume, so passedAll no longer leans on passedFromState (the git-derived
+// scout) as anything but the augment D37 says it must always be, not a load-bearing replacement.
+const passedAll = allTasks.filter(n => state.tasks[String(n)]?.status === 'passed' || passedFromState.has(n))
+const outstandingTasks = allTasks.filter(n => !passedAll.includes(n))
+
+// sdlc-flow.js audited 2026-08-20: it has NO fullRun/blockDone-shaped proxy to fix. It never
+// computes a single close boolean in code — the bookkeep/PR agent prompt (sdlc-flow.js:~2335) is
+// handed `selectedTasks` and `taskList` directly and told in prose to judge "if tasks remain, keep
+// status In progress ...; if this was the last, flip to Done", i.e. the "was every task passed"
+// judgment already happens per-run rather than being gated by a proxy for "was a selection passed".
+// So the defect this ticket fixes does not reproduce there, and sdlc-flow.js is left unchanged.
 
 // ----------------------------------------------------------------
 // PHASE 2.5: TERMINAL AUTHORITATIVE RECONCILE (D56) — after every task passes, before bookkeep.
@@ -1917,7 +2026,7 @@ if (reconcileFailed) state.bail_reason = `Terminal reconcile failed (D56): ${rec
 // Skipped entirely on a bail or a reconcile_failed (the block is not done) and on a partial task
 // selection (can't close the block).
 // ----------------------------------------------------------------
-const blockDone = !bailed && !reconcileFailed && fullRun && passedTasks.length === taskList.length
+const blockDone = !bailed && !reconcileFailed && passedAll.length === allTasks.length
 let bookkeepResult = null
 if (!bailed && !reconcileFailed) {
   // D46: when planning/ is a vaulted symlink, ${specFile}, planning/status.md, and planning/state.json
@@ -1936,7 +2045,8 @@ Target:
   Spec:        ${blockId}
   Tasks run:   ${taskList.join(', ')}  (passed: ${passedTasks.join(', ') || 'none'})
   Full spec run: ${fullRun ? 'yes (every task in the spec)' : 'no (a task subset — do NOT close the block)'}
-  Block done:  ${blockDone ? 'yes — the whole spec is complete this run' : 'no — keep the block open/in-progress'}
+  Spec-wide:   ${passedAll.length}/${allTasks.length} tasks passed across all runs${outstandingTasks.length ? ` | outstanding: ${outstandingTasks.join(', ')}` : ''}
+  Block done:  ${blockDone ? 'yes — every task in the spec has passed' : `no — keep the block open/in-progress (outstanding: ${outstandingTasks.join(', ') || 'none, but bailed/reconcile_failed this run'})`}
 
 1. Read the surfaces:
    cd ${runDir} && cat ${specFile}
@@ -2084,25 +2194,25 @@ ${vault.vaulted ? `
    file this step touches (the spec, status.md, state.json) lives under planning/, so stage + commit them
    ALL there, via \`git -C\`, on whatever branch that repo is already on. Do NOT cd into it and do NOT
    checkout/switch/branch there:
-   cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/${blockId}/tasks.md 2>/dev/null || true
-   cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/status.md
-   cd ${runDir} && git -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/${blockId}/tasks.md 2>/dev/null || true
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/status.md
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} add ${vault.planningPath}/state.json 2>/dev/null || true
    Then commit ONLY these three paths — pass them explicitly to \`git commit\` itself (not merely to
    \`git add\`), so anything a sibling lane already had staged in this same vault repo is left staged
    and untouched by this commit:
-   cd ${runDir} && git -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json || git -C ${vault.planningPath} commit -m "$(cat <<'EOF'
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} diff --cached --quiet -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json || (${renderCommitSafetyGuard('git -C ' + vault.planningPath)} && ${GIT} -C ${vault.planningPath} commit -m "$(cat <<'EOF'
 chore: sdlc-task bookkeep — ${blockId}
 EOF
-)" -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json
-   cd ${runDir} && git -C ${vault.planningPath} log --oneline -1` : `
+)" -- ${vault.planningPath}/${blockId}/tasks.md ${vault.planningPath}/status.md ${vault.planningPath}/state.json)
+   cd ${runDir} && ${GIT} -C ${vault.planningPath} log --oneline -1` : `
    planning/ is a plain directory here (not vaulted) — everything commits together as before:
-   cd ${runDir} && git add ${specFile} planning/status.md
-   cd ${runDir} && git add planning/state.json 2>/dev/null || true
-   cd ${runDir} && git commit -m "$(cat <<'EOF'
+   cd ${runDir} && ${GIT} add ${specFile} planning/status.md
+   cd ${runDir} && ${GIT} add planning/state.json 2>/dev/null || true
+   cd ${runDir} && ${renderCommitSafetyGuard()} && ${GIT} commit -m "$(cat <<'EOF'
 chore: sdlc-task bookkeep — ${blockId}
 EOF
 )" || echo "NOTHING_TO_COMMIT"
-   cd ${runDir} && git log --oneline -1`}
+   cd ${runDir} && ${GIT} log --oneline -1`}
 
 Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emitStateRan, commitHash, notes.
 `, withModel({ label: 'bookkeep', schema: BOOKKEEP_SCHEMA }, MODEL.bookkeep))

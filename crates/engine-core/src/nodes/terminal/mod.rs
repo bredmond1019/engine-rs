@@ -20,7 +20,7 @@
 //! `TerminalAwaitNode` (task 3) polls against.
 //!
 //! `send` (`EN.9.E` task 2) is `TerminalSendNode` — the guarded,
-//! floor-checked write node: `sdlc_flow::command_floor`, `send_id`
+//! floor-checked write node: `crate::policy::command_floor`, `send_id`
 //! back-edge idempotency, and lease re-verification, all under a
 //! per-session mutex.
 //!

@@ -63,6 +63,55 @@ pub struct RunRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub terminal: bool,
+    /// The campaign id this run belongs to, if any (`EN.11.E` task 4).
+    /// `Option` — unlike `FlowInvocation`'s non-optional field (task 2) —
+    /// because `RunRecord` describes EVERY run the server has seen, and the
+    /// overwhelming majority (a bare `POST /events/` of any other
+    /// `workflow_type`) genuinely belongs to no campaign. Absent is the
+    /// honest value, not a defect. Resolved by [`read_campaign_id`] from
+    /// the snapshot the store is already handed: a child `SDLC_FLOW` run
+    /// carries it at `snapshot.event["campaign_id"]` (task 2's wire seam);
+    /// the parent `ORCHESTRATION` run carries it in its
+    /// `OrchestrationRunNode` entry in `snapshot.nodes` (task 3).
+    pub campaign_id: Option<Uuid>,
+}
+
+/// One run's membership in a campaign, resolved by
+/// [`LiveStateStore::list_campaign_runs`] (`EN.11.E` task 4) from either the
+/// live map or the completed ring.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CampaignRun {
+    pub run_id: RunId,
+    pub snapshot: TaskContext,
+    /// `Some` for a completed run (from its retained [`RunRecord`]); `None`
+    /// for a still-live run, which this store has no separate
+    /// `workflow_type` for until it goes terminal.
+    pub workflow_type: Option<String>,
+    /// The deterministic ordering key [`LiveStateStore::list_campaign_runs`]
+    /// sorts by: a completed run's `created_at`, or — for a still-live run,
+    /// which has no `created_at` in this store — the wall-clock time its
+    /// snapshot was last [`LiveStateStore::record`]ed.
+    pub ordering_key: DateTime<Utc>,
+    pub terminal: bool,
+}
+
+/// The result of [`LiveStateStore::list_campaign_runs`]: every run this
+/// store currently knows belongs to a campaign, plus whether the completed
+/// ring's bounded retention may have already evicted an earlier member.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CampaignLookup {
+    /// Matching runs from both the live map and the completed ring, sorted
+    /// by [`CampaignRun::ordering_key`] ascending.
+    pub runs: Vec<CampaignRun>,
+    /// `true` when the completed ring was at its [`COMPLETED_RUN_RETENTION`]
+    /// cap at lookup time, meaning FIFO eviction may have already dropped
+    /// an earlier step of a long-running campaign — this store has no
+    /// per-campaign counter, so a full ring is the honest, conservative
+    /// signal that `runs` might not be the campaign's complete history.
+    /// `false` proves the ring has never reached capacity, so nothing has
+    /// ever been evicted from it — the ring only ever shrinks a specific
+    /// entry via [`CompletedRing::insert`]'s eviction, never on its own.
+    pub possibly_truncated: bool,
 }
 
 /// Bounded FIFO ring of completed-run records, keyed by run id.
@@ -198,6 +247,61 @@ impl LiveStateStore {
         guard.entries.get(&run_id).cloned()
     }
 
+    /// Every run this store currently knows belongs to `campaign_id` —
+    /// consulting **both** the live map and the completed ring, since a
+    /// campaign's earlier steps are typically terminal while later ones are
+    /// still running, and a lookup that consulted only one side would
+    /// report a truthful-looking but partial campaign (`EN.11.E` task 4).
+    /// Sorted by [`CampaignRun::ordering_key`] ascending so the result is
+    /// stable across calls. See [`CampaignLookup::possibly_truncated`] for
+    /// the completed-ring retention caveat.
+    pub fn list_campaign_runs(&self, campaign_id: Uuid) -> CampaignLookup {
+        let mut runs = Vec::new();
+
+        {
+            let guard = self
+                .inner
+                .read()
+                .expect("live state store lock poisoned on read");
+            for (run_id, (snapshot, recorded_at)) in guard.iter() {
+                if read_campaign_id(snapshot) == Some(campaign_id) {
+                    runs.push(CampaignRun {
+                        run_id: *run_id,
+                        snapshot: snapshot.clone(),
+                        workflow_type: None,
+                        ordering_key: *recorded_at,
+                        terminal: false,
+                    });
+                }
+            }
+        }
+
+        let possibly_truncated = {
+            let guard = self
+                .completed
+                .read()
+                .expect("completed run ring lock poisoned on read");
+            for (run_id, record) in guard.entries.iter() {
+                if record.campaign_id == Some(campaign_id) {
+                    runs.push(CampaignRun {
+                        run_id: *run_id,
+                        snapshot: record.snapshot.clone(),
+                        workflow_type: Some(record.workflow_type.clone()),
+                        ordering_key: record.created_at,
+                        terminal: true,
+                    });
+                }
+            }
+            guard.order.len() >= COMPLETED_RUN_RETENTION
+        };
+
+        runs.sort_by_key(|r| r.ordering_key);
+        CampaignLookup {
+            runs,
+            possibly_truncated,
+        }
+    }
+
     /// The run ids currently tracked as **live** by the store. Terminal
     /// runs — retained in the completed ring for readback — are excluded.
     pub fn list_active(&self) -> Vec<RunId> {
@@ -281,6 +385,7 @@ impl LiveStateStore {
             created_at,
             updated_at,
             terminal: true,
+            campaign_id: read_campaign_id(snapshot),
         };
         // Insert into the completed ring *before* removing from the live
         // map: `inner` and `completed` are separate locks, so a `get`/
@@ -406,6 +511,34 @@ fn collect_failed_nodes(snapshot: &TaskContext) -> Vec<FailedNode> {
             FailedNode::new(name.clone(), error)
         })
         .collect()
+}
+
+/// Resolve the campaign id a snapshot belongs to, if any (`EN.11.E` task 4).
+///
+/// Checked in order:
+/// 1. `snapshot.event["campaign_id"]` — a child `SDLC_FLOW` run's wire seam
+///    (task 2), written by `execute::sdlc_flow_event`.
+/// 2. `snapshot.nodes["OrchestrationRunNode"]["campaign_id"]` — the parent
+///    `ORCHESTRATION` run's own node result (task 3).
+///
+/// A non-string or unparsable value reads as `None` and never panics —
+/// mirrors `engine_core::workflow::read_run_id`'s defensive shape exactly.
+fn read_campaign_id(snapshot: &TaskContext) -> Option<Uuid> {
+    parse_campaign_id_value(snapshot.event.get("campaign_id")).or_else(|| {
+        snapshot
+            .nodes
+            .get(engine_core::workflows::orchestration::graph::NODE_NAME)
+            .and_then(|node| parse_campaign_id_value(node.get("campaign_id")))
+    })
+}
+
+/// Parse a single `campaign_id` JSON value into a `Uuid`. `None` for a
+/// missing key, a non-string value, or a string that fails to parse as a
+/// UUID — never panics.
+fn parse_campaign_id_value(value: Option<&serde_json::Value>) -> Option<Uuid> {
+    value
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
 }
 
 #[cfg(test)]
@@ -810,5 +943,217 @@ mod tests {
 
         assert_eq!(expected_status, actual_status);
         assert_eq!(expected_status, "failed");
+    }
+
+    // --- EN.11.E task 4: campaign id on RunRecord -----------------------
+
+    fn sdlc_flow_context_with_campaign(marker: &str, campaign_id: Uuid) -> TaskContext {
+        let mut ctx = fixture_context(marker);
+        ctx.event = serde_json::json!({ "campaign_id": campaign_id.to_string() });
+        ctx
+    }
+
+    fn orchestration_context_with_campaign(marker: &str, campaign_id: Uuid) -> TaskContext {
+        let mut ctx = fixture_context(marker);
+        ctx.nodes.insert(
+            engine_core::workflows::orchestration::graph::NODE_NAME.to_string(),
+            serde_json::json!({ "campaign_id": campaign_id.to_string() }),
+        );
+        ctx
+    }
+
+    #[test]
+    fn campaign_id_resolves_from_a_child_sdlc_flow_events_wire_seam() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let campaign_id = Uuid::new_v4();
+        let snapshot = sdlc_flow_context_with_campaign("child", campaign_id);
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "sdlc_flow", now, now);
+
+        let record = store.get_record(run_id).expect("record present");
+        assert_eq!(record.campaign_id, Some(campaign_id));
+    }
+
+    #[test]
+    fn campaign_id_resolves_from_the_parent_orchestration_run_nodes_entry() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let campaign_id = Uuid::new_v4();
+        let snapshot = orchestration_context_with_campaign("parent", campaign_id);
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "orchestration", now, now);
+
+        let record = store.get_record(run_id).expect("record present");
+        assert_eq!(record.campaign_id, Some(campaign_id));
+    }
+
+    #[test]
+    fn a_run_with_no_campaign_id_reads_as_none_and_never_panics() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let snapshot = fixture_context("no-campaign");
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let record = store.get_record(run_id).expect("record present");
+        assert_eq!(record.campaign_id, None);
+    }
+
+    #[test]
+    fn a_malformed_campaign_id_reads_as_none_and_never_panics() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let mut snapshot = fixture_context("bad-campaign");
+        snapshot.event = serde_json::json!({ "campaign_id": "not-a-uuid" });
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let record = store.get_record(run_id).expect("record present");
+        assert_eq!(record.campaign_id, None);
+    }
+
+    #[test]
+    fn a_non_string_campaign_id_reads_as_none_and_never_panics() {
+        let store = LiveStateStore::new();
+        let run_id = Uuid::new_v4();
+        let mut snapshot = fixture_context("numeric-campaign");
+        snapshot.event = serde_json::json!({ "campaign_id": 12345 });
+        let now = Utc::now();
+
+        store.mark_terminal(run_id, &snapshot, "wf", now, now);
+
+        let record = store.get_record(run_id).expect("record present");
+        assert_eq!(record.campaign_id, None);
+    }
+
+    #[test]
+    fn campaign_lookup_returns_runs_from_both_the_live_map_and_the_completed_ring() {
+        let store = LiveStateStore::new();
+        let campaign_id = Uuid::new_v4();
+
+        let live_run = Uuid::new_v4();
+        store.record(
+            live_run,
+            &sdlc_flow_context_with_campaign("still-running", campaign_id),
+        );
+
+        let done_run = Uuid::new_v4();
+        let now = Utc::now();
+        store.mark_terminal(
+            done_run,
+            &sdlc_flow_context_with_campaign("done", campaign_id),
+            "sdlc_flow",
+            now,
+            now,
+        );
+
+        let other_campaign_run = Uuid::new_v4();
+        store.mark_terminal(
+            other_campaign_run,
+            &sdlc_flow_context_with_campaign("other", Uuid::new_v4()),
+            "sdlc_flow",
+            now,
+            now,
+        );
+
+        let lookup = store.list_campaign_runs(campaign_id);
+        let run_ids: Vec<Uuid> = lookup.runs.iter().map(|r| r.run_id).collect();
+
+        assert_eq!(lookup.runs.len(), 2);
+        assert!(run_ids.contains(&live_run));
+        assert!(run_ids.contains(&done_run));
+        assert!(!run_ids.contains(&other_campaign_run));
+        assert!(!lookup.possibly_truncated);
+    }
+
+    #[test]
+    fn campaign_lookup_orders_results_deterministically_by_created_at() {
+        let store = LiveStateStore::new();
+        let campaign_id = Uuid::new_v4();
+        let base = Utc::now();
+
+        let earliest = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let latest = Uuid::new_v4();
+
+        store.mark_terminal(
+            latest,
+            &sdlc_flow_context_with_campaign("latest", campaign_id),
+            "sdlc_flow",
+            base + chrono::Duration::seconds(20),
+            base + chrono::Duration::seconds(20),
+        );
+        store.mark_terminal(
+            earliest,
+            &sdlc_flow_context_with_campaign("earliest", campaign_id),
+            "sdlc_flow",
+            base,
+            base,
+        );
+        store.mark_terminal(
+            middle,
+            &sdlc_flow_context_with_campaign("middle", campaign_id),
+            "sdlc_flow",
+            base + chrono::Duration::seconds(10),
+            base + chrono::Duration::seconds(10),
+        );
+
+        let lookup = store.list_campaign_runs(campaign_id);
+        let run_ids: Vec<Uuid> = lookup.runs.iter().map(|r| r.run_id).collect();
+
+        assert_eq!(run_ids, vec![earliest, middle, latest]);
+    }
+
+    #[test]
+    fn campaign_lookup_reports_possibly_truncated_once_the_completed_ring_is_full() {
+        let store = LiveStateStore::new();
+        let campaign_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Fill the ring to capacity with unrelated runs, then add one
+        // member of the campaign under test.
+        for _ in 0..COMPLETED_RUN_RETENTION {
+            store.mark_terminal(Uuid::new_v4(), &fixture_context("filler"), "wf", now, now);
+        }
+        let member = Uuid::new_v4();
+        store.mark_terminal(
+            member,
+            &sdlc_flow_context_with_campaign("member", campaign_id),
+            "sdlc_flow",
+            now,
+            now,
+        );
+
+        let lookup = store.list_campaign_runs(campaign_id);
+
+        assert_eq!(lookup.runs.len(), 1);
+        assert_eq!(lookup.runs[0].run_id, member);
+        assert!(
+            lookup.possibly_truncated,
+            "a full completed ring must be surfaced as possibly-truncated"
+        );
+    }
+
+    #[test]
+    fn campaign_lookup_is_not_truncated_when_the_ring_has_room_to_spare() {
+        let store = LiveStateStore::new();
+        let campaign_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        store.mark_terminal(
+            Uuid::new_v4(),
+            &sdlc_flow_context_with_campaign("member", campaign_id),
+            "sdlc_flow",
+            now,
+            now,
+        );
+
+        let lookup = store.list_campaign_runs(campaign_id);
+        assert!(!lookup.possibly_truncated);
     }
 }

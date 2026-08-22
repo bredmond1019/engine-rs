@@ -65,9 +65,9 @@ of 9. Check the `sdlc_workflow` field of every block in a chain before assuming 
 | Stage | Module | What it does |
 |---|---|---|
 | Resolve | `chain.rs` | Turns a (roadmap, lane) pair or an explicit block list into ordered `(repo, block_id)` steps. Reads mev's structured `HELD-UNTIL` / `BUDGET` / `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json` — it does not re-derive segments. |
-| Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** and refuses to start a block with an unmet edge, naming the edge and its repo. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail. |
+| Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** (backed by `corpus_gates.rs`, which reads each repo's real `planning/state.json` through `okf_core::load_state`) and refuses to start a block with an unmet edge, naming the edge and its repo. `DependencyEdge` is an enum — `Block` · `Operator { slug }` · `Approval { slug }` · `External { what }` — so an **operator gate is always unmet while present** and clears only by removal from the corpus (mev is the single writer); the engine can never self-clear one. Also reads mev's `lane-frontier.json` for lane-head startability, but `startable: true` never short-circuits the per-edge check. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail, and a block parked on an operator hold releases its permit rather than starving the ceiling. |
 | Execute | `execute.rs` | Builds and runs a **fresh in-process Rust `SDLC_FLOW` `Workflow`** with the repo resolved through `RepoRegistry` and `event.repo` seeded. Selects the engine from the block's own authored `sdlc_workflow` field — `Flow` only; `Task` errors (see above). |
-| Integrate | `integrate.rs` | Verifies the state write after the engine returns and **fails the run loudly on a mismatch**. Appends exactly one line to the roadmap's `lane-log.jsonl`. An operator hold pauses and resumes without re-running completed blocks. |
+| Integrate | `integrate.rs` | Verifies the state write after the engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. Appends exactly one `lane-log.jsonl` line per step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
 
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
 an authored snapshot and has been wrong; the `depends_on` edges are the fact.
@@ -78,6 +78,23 @@ Exactly one line per integrated block — not zero, not two. The log is the cros
 missing or duplicated line is how a sibling lane reads the wrong state. The roadmap directory is
 resolved by the two-location rule (`planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`;
 a slug present in both is an error, never a silent preference).
+
+## Campaign identity
+
+Every `ORCHESTRATION` run resolves a `campaign_id` (`EN.11.E`) — the event's own `campaign_id` when
+present (so a resumed or operator-restarted chain rejoins the same campaign instead of minting a
+new identity indistinguishable from a fresh one), else a fresh v4 UUID minted at run start. Each
+`execute.rs` step threads that same `campaign_id` onto the child `SDLC_FLOW` event it dispatches
+(`event.campaign_id`), and stamps it back onto its own step record so the step is attributable to
+its campaign without re-reading the child's `TaskContext`. The parent run additionally stamps
+`campaign_members` — the per-step roster — into `ctx.nodes[OrchestrationRunNode]`, next to the
+existing `steps_integrated`/`blocks`/`policy`/`cancellation` fields.
+
+`GET /campaigns/{id}` (`engine-serve`, task 5) reads this identity back: it resolves every run —
+live or completed — carrying the given `campaign_id` (via `LiveStateStore::list_campaign_runs`) and
+rolls up their cost/tokens from the parent run's `campaign_members` entry. See `docs/architecture.md`
+(HTTP surface, `LiveStateStore`) for the endpoint and store shape, and `docs/data-contract.md` §8 for
+the canonical wire shape.
 
 ## Policy
 

@@ -2,13 +2,16 @@
 name: edit-state-json
 description: >
   How to write correct blocks[], carryover[], reference[] and depends_on edges in a repo's
-  planning/state.json — which container an item belongs in, the four edge shapes, the
-  authored-vs-derived status trap, the scope object's exactly-one-of rule, the two very
-  different failures that share the code E_STATE_SCHEMA_MALFORMED_SCOPE, and the byte-for-byte
-  round-trip that avoids 130 lines of conflict churn. Use BEFORE hand-editing any state.json,
-  before adding or closing a block, and when validation reports E_STATE_MALFORMED_JSON,
+  planning/state.json — which mev verb to use instead of a hand edit, which container an item
+  belongs in, the four edge shapes, the authored-vs-derived status trap, the scope object's
+  exactly-one-of rule, the two very different failures that share the code
+  E_STATE_SCHEMA_MALFORMED_SCOPE, and the byte-for-byte round-trip that avoids 130 lines of
+  conflict churn. Use BEFORE hand-editing any state.json, before adding or closing a block,
+  before running mev set-block-status / defer-epic / resume-epic / complete-epic / sync-epics /
+  close-operator-gate / approve / reject, and when validation reports E_STATE_MALFORMED_JSON,
   E_STATE_SCHEMA_MALFORMED_SCOPE, E_STATE_SCHEMA_BAD_BLOCKED_BY, E_BLOCK_BAD_KEY,
-  E_BLOCK_BAD_STATUS, or W_STATE_LEGACY_KIND.
+  E_BLOCK_BAD_STATUS, E_BLOCK_OPERATOR_GATED, E_APPROVAL_DIGEST_MISMATCH, E_EMIT_LOCK_HELD, or
+  W_STATE_LEGACY_KIND.
 ---
 
 # Editing `state.json`
@@ -22,9 +25,40 @@ on no board. An item living only in a plan, a review, a handoff, or an `## Open 
 **lost, not deferred**. Where a document and the graph disagree, the graph wins.
 
 **Prefer the tools over a hand edit.** `/update-state` performs the edit per the canonical schema, and
-`mev set-block-status <repo:id> <status>` moves exactly one block and nothing else. Hand-edit only
-when no verb covers the field you need (`description`, `note`, a new `depends_on` edge) — and then
-follow the round-trip rule in Step 4.
+`mev` has a verb for most structural moves. Hand-edit only when no verb covers the field you need
+(`description`, `note`, a new `depends_on` edge) — and then follow the round-trip rule in Step 4.
+
+| To do this | Use | Not a hand edit because |
+|---|---|---|
+| Move one block's `status` | `mev set-block-status <repo:id> <status> --write` | validates the status, refuses `blocked`, no-ops if already there |
+| Park / un-park an initiative | `mev defer-epic <slug> --write` · `resume-epic` | cascades `deferred` onto member blocks and skips `in_progress` ones |
+| Declare an initiative finished | `mev complete-epic <slug> --write` | sets registry status the boards read |
+| Fix epic/block status disagreement | `mev sync-epics --write` | reconciles both directions; never un-defers |
+| Clear an operator gate | `mev close-operator-gate <slug> --exit-verified` | removes the edge from **every** block carrying the slug, fleet-wide |
+| Clear an approval gate | `mev approve <slug> --digest <d>` · `mev reject <slug>` | verifies the digest still matches the reviewed payload |
+
+Three shape rules worth knowing before you reach for one:
+
+- **Dry-run is the default** for `set-block-status` and the four epic verbs — the change is printed,
+  not applied, until you add `--write`. Run it once without the flag and read the plan.
+- **`close-operator-gate` has no dry-run.** It refuses outright unless `--exit-verified` is passed:
+  mev never checks the filesystem for the edge's `exit` artifact, so that flag is your assertion
+  that you looked. Refusing rather than defaulting to a preview is what keeps it a human gate.
+- **`approve` is digest-bound and alarms on mismatch.** A digest that no longer matches means the
+  payload changed since review, so the approval is void: nothing is removed, the edge re-queues, and
+  mev raises `E_APPROVAL_DIGEST_MISMATCH` rather than failing quietly.
+
+**An agent cannot clear its own operator gate, by construction.** `set-block-status --write` to
+`in_progress` on a block still carrying an unmet `operator` edge is refused with
+`E_BLOCK_OPERATOR_GATED`. The only override, `--force-operator-gate`, is itself refused whenever
+stdin is not a TTY (`E_FORCE_OPERATOR_GATE_NOT_TTY`). There is no priority threshold or other bypass.
+If you are blocked here, the answer is `/begin-session <slug>` with the operator — not a hand edit
+of the `depends_on` array, which is the same bypass wearing a different hat.
+
+> **Every verb in that table re-runs `emit-state --write` on success**, so each one is a
+> whole-corpus derived-surface rewrite, not a one-field poke. Read the **`derive-state-safely`**
+> skill before using any of them with `--write` — a stale binary regresses boards fleet-wide
+> identically whether you typed `emit-state` or `set-block-status`.
 
 Field tables: `docs/state/state-schema.md` and `docs/state/reference-container-schema.md`.
 Routing table: `base-template/.claude/workflows/block-registration.md`.
@@ -256,6 +290,18 @@ Preserve the existing field order when adding keys to a block. The convention is
 3 of 5 entries reported CLEARED were still live, because an unanchored `file_contains` matched its own
 target file's prose and a proxy string landed while the finding got worse.
 
+**Check it instead of trusting it.** The sweep is read-only and safe to run at any time, so evaluate
+the predicate you just wrote before committing it:
+
+```bash
+mev carryover --repo <slug>                # your entry must NOT be in the CLEARED lane
+mev carryover --repo <slug> --allow-exec   # only this executes command_exits_zero predicates
+```
+
+Without `--allow-exec` a `command_exits_zero` entry reports **not-evaluable** rather than running
+anything — so a sweep that looks clean may simply never have run your predicate. That is the
+positive-control trap: confirm which lane your entry actually landed in, don't infer it from silence.
+
 **Flip block status *before* deriving.** `emit-state` never infers completion from `status.md` — the
 sync is one-way by design. Set `status` to `closed` in `tracks[].blocks[]` first; that authored field
 is the *input* the derivation reads. Skipping it leaves `focus` and every generated surface stale
@@ -295,6 +341,12 @@ Two consequences:
 - **Concurrent agents contend on `state.json`.** The working pattern: each agent *reports* the state
   change it wants; **one writer applies them centrally**. Do not have several agents write the same
   file.
+- **For `mev`'s write verbs that convention is enforced, not merely advised.** Each takes an advisory
+  lock at `<root>/.mev-emit.lock` before touching anything; a live holder fails the call with
+  `E_EMIT_LOCK_HELD` naming its pid and writes **nothing**, while a stale lock from a dead pid is
+  reclaimed automatically. Retry after the other lane finishes — never delete the lock file to get
+  past it. **A hand edit takes no lock at all**, which is exactly why the report-then-one-writer
+  pattern still governs the hand-edit path.
 - **Always commit with an explicit pathspec** — `git commit -o <path1> <path2>`. Never `git add -A`,
   `git add .`, `git reset`, or `git stash` here: a bare commit sweeps another session's staged work
   into yours. This has happened multiple times.
@@ -310,7 +362,11 @@ Two consequences:
 - [ ] `kind` / `class` from the closed vocabulary; no newly-minted legacy value
 - [ ] `scope` is an object with **exactly one** of `repo` / `tier` / `cross_repo` set
 - [ ] `cross_repo` is a **boolean**, not the string `"true"`
-- [ ] Any `clears_when` is **not** already satisfied
+- [ ] Any `clears_when` is **not** already satisfied — confirmed with `mev carryover --repo <slug>`
+      (plus `--allow-exec` if it is a `command_exits_zero`), not assumed
+- [ ] Used the `mev` verb where one exists (Step 1's table) rather than hand-editing the field
+- [ ] If a verb ran with `--write`: read `derive-state-safely` first — it re-ran `emit-state --write`
+      across the whole corpus
 - [ ] `git diff --stat` shows the size of your edit, not a whole-file reserialization
 - [ ] `mev validate-state <path>` clean, then `bastion validate-brain --state` clean
 - [ ] Explicit pathspec on the commit

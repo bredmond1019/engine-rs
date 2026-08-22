@@ -50,15 +50,135 @@
 //! delegates to it using the process-global, so `bastion` compiles
 //! unchanged.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use engine_contract::TaskContext;
 use engine_core::policy::{PolicyConfigSource, RESOLVED_POLICY_IDENTITY};
 use engine_core::repo_registry::RepoRegistry;
+use engine_core::workflows::orchestration::integrate::StepProgress;
 use engine_core::workflows::sdlc_flow::setup::SetupWorktreeNode;
-use engine_core::Workflow;
+use engine_core::{CancellationToken, Workflow};
 use serde::Serialize;
+
+// ── ORCHESTRATION abort/progress handoff (EN.ticket.orchestration-abort-and-progress task 4) ──
+//
+// `register_orchestration_with_registry`'s factory (below) builds a fresh
+// `OrchestrationRunNode` -- including its `CancellationToken` and
+// step-progress observer -- *before* `POST /events/`'s `post_events`
+// handler (`http.rs`) has minted a `run_id` or cloned this run's
+// `LiveStateStore`/`DurableHandle`: `Dispatcher::dispatch_with_event` runs
+// first, and only afterward does `post_events` mint `run_id`, register a
+// token in `abort::RunRegistry`, and call `suspend::spawn_run`. Neither
+// `http.rs` nor `Dispatcher`'s factory signature is this ticket's to change
+// (see the top-level spec's file list), so the token this node embeds and
+// the fan-out context its observer needs cross that gap via a **thread-local**
+// handoff, not a process-global one: `post_events`' whole
+// `dispatch_with_event -> mint run_id -> spawn_run` sequence is synchronous
+// (no `.await` anywhere in it), so it never yields its OS thread to another
+// request's handler mid-sequence. A `OnceLock`/process-global equivalent
+// would race under two concurrent `POST /events/` calls for ORCHESTRATION
+// landing on different worker threads; this cannot, because each request's
+// un-awaited segment owns its thread for the whole handoff.
+//
+// Every other workflow type never calls [`set_pending_orchestration_run`],
+// so [`take_pending_orchestration_run`] returns `None` for them and
+// `suspend::spawn_run` falls back to exactly its pre-existing behavior.
+
+/// Everything an ORCHESTRATION step-progress observer needs to publish
+/// through `suspend.rs`'s three-way fan-out (live state, the durable
+/// writer, SSE), but cannot know at factory-build time. Filled in by
+/// `suspend::spawn_run` — via [`take_pending_orchestration_run`] — before
+/// the workflow it is embedded in ever runs.
+#[derive(Clone)]
+pub(crate) struct StepFanoutContext {
+    pub run_id: uuid::Uuid,
+    pub live: crate::live_state::LiveStateStore,
+    pub durable: crate::durable::DurableHandle,
+    pub workflow_type: String,
+    pub data: serde_json::Value,
+}
+
+/// The token + fan-out cell a freshly-built ORCHESTRATION node captured at
+/// factory time, handed off to `suspend::spawn_run` via the thread-local
+/// below.
+pub(crate) struct PendingOrchestrationRun {
+    pub token: CancellationToken,
+    pub fanout: Arc<RwLock<Option<StepFanoutContext>>>,
+}
+
+thread_local! {
+    static PENDING_ORCHESTRATION_RUN: RefCell<Option<PendingOrchestrationRun>> =
+        const { RefCell::new(None) };
+}
+
+/// Stash `pending` for the very next `suspend::spawn_run` call on THIS
+/// thread to consume via [`take_pending_orchestration_run`]. Called once
+/// per ORCHESTRATION dispatch, from inside
+/// [`register_orchestration_with_registry`]'s factory closure.
+pub(crate) fn set_pending_orchestration_run(pending: PendingOrchestrationRun) {
+    PENDING_ORCHESTRATION_RUN.with(|cell| *cell.borrow_mut() = Some(pending));
+}
+
+/// Take (and clear) whatever [`set_pending_orchestration_run`] stashed on
+/// this thread. `None` for every non-ORCHESTRATION dispatch (nothing ever
+/// calls the setter for them), and also for the pathological case of an
+/// ORCHESTRATION dispatch and its following `spawn_run` call landing on
+/// different threads — `suspend::spawn_run` falls back to its
+/// already-correct un-injected behavior in that case; see its call site.
+pub(crate) fn take_pending_orchestration_run() -> Option<PendingOrchestrationRun> {
+    PENDING_ORCHESTRATION_RUN.with(|cell| cell.borrow_mut().take())
+}
+
+/// Build a fresh `CancellationToken` + step-progress observer for one
+/// ORCHESTRATION dispatch, and stash the handoff [`set_pending_orchestration_run`]
+/// so `suspend::spawn_run` can pick it up. Used by
+/// [`register_orchestration_with_registry`]'s factory (the production
+/// path), and directly by tests that build an `OrchestrationRunNode`
+/// without going through the full `Dispatcher`, so both exercise the exact
+/// same wiring.
+///
+/// The returned observer reads [`StepFanoutContext`] fresh on every call
+/// (via the shared `fanout` cell), so it is safe to hand to
+/// `with_step_observer` before that context exists — `spawn_run` always
+/// fills it in before the workflow this token/observer are embedded in
+/// ever runs.
+/// The step-progress observer type `with_step_observer` takes — aliased so
+/// [`build_orchestration_seams`]'s return type reads cleanly.
+type StepObserverArc = Arc<dyn Fn(&StepProgress) + Send + Sync>;
+
+pub(crate) fn build_orchestration_seams() -> (CancellationToken, StepObserverArc) {
+    let token = CancellationToken::new();
+    let fanout: Arc<RwLock<Option<StepFanoutContext>>> = Arc::new(RwLock::new(None));
+    set_pending_orchestration_run(PendingOrchestrationRun {
+        token: token.clone(),
+        fanout: fanout.clone(),
+    });
+
+    let observer_fanout = fanout.clone();
+    let step_observer: StepObserverArc = Arc::new(move |progress: &StepProgress| {
+        let ctx = observer_fanout.read().ok().and_then(|guard| guard.clone());
+        if let Some(ctx) = ctx {
+            crate::suspend::publish_step_progress(
+                ctx.run_id,
+                ctx.live.clone(),
+                ctx.durable.clone(),
+                ctx.workflow_type.clone(),
+                ctx.data.clone(),
+                progress,
+            );
+        }
+        // `fanout` is only ever empty here for a caller driving this
+        // node directly with no `spawn_run` in the loop (e.g. a test
+        // exercising `Node::process` in isolation) — the served path
+        // always fills it in before `workflow.run_with` dispatches this
+        // node. Silently dropping the emission in that case matches
+        // the no-observer default's behavior-stable contract.
+    });
+
+    (token, step_observer)
+}
 
 /// The process-global repo registry (EN.3.K): `set_repo_registry` /
 /// `repo_registry` read and write this singleton, mirroring
@@ -109,10 +229,11 @@ pub fn init_repo_registry_from_env() {
     match RepoRegistry::from_env() {
         Ok(registry) => set_repo_registry(Arc::new(registry)),
         Err(err) => {
-            eprintln!(
-                "engine-serve: repo registry not initialized ({err}); \
-                 repo-bearing SDLC_FLOW events will 422 until ENGINE_BRAIN_ROOT \
-                 resolves, absent-repo events are unaffected"
+            tracing::warn!(
+                error = %err,
+                "engine-serve: repo registry not initialized; repo-bearing SDLC_FLOW \
+                 events will 422 until ENGINE_BRAIN_ROOT resolves, absent-repo events \
+                 are unaffected"
             );
         }
     }
@@ -588,17 +709,159 @@ pub fn register_terminal_probe(dispatcher: &mut Dispatcher) {
 /// terminal node does), and — unlike `sdlc_flow`/`diagnostic_intake` —
 /// `ORCHESTRATION`'s one policy knob (`hold_poll_interval_ms`) never
 /// rewires which node runs, so there is no `registry_for_policy` variant to
-/// choose between here; [`engine_core::workflows::orchestration::graph::registry`]
-/// is the only registry this workflow ever runs under. See
-/// `planning/EN.10.B/tasks.md`, Task 5.
+/// choose between here. See `planning/EN.10.B/tasks.md`, Task 5.
+///
+/// Delegates to [`register_orchestration_with_registry`] using whatever repo
+/// registry (EN.3.K) is currently installed via [`repo_registry`] and
+/// [`NeverHeld`](engine_core::workflows::orchestration::integrate::NeverHeld)
+/// as the hold source — see that function's doc for why `NeverHeld` is still
+/// the production default. **`EN.ticket.orchestration-production-gates-unwired`
+/// Task 2: this is now the wired registration** — `graph::registry()`'s bare
+/// [`OrchestrationRunNode::new`](engine_core::workflows::orchestration::graph::OrchestrationRunNode::new)
+/// is no longer what production runs.
 pub fn register_orchestration(dispatcher: &mut Dispatcher) {
+    register_orchestration_with_registry(
+        dispatcher,
+        repo_registry(),
+        Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+    );
+}
+
+/// Register the `ORCHESTRATION` workflow with an explicit repo registry and
+/// hold source (`EN.ticket.orchestration-production-gates-unwired` Task 2),
+/// bypassing the process-global seam — the entry point tests use to install a
+/// tempdir registry with no `ENGINE_BRAIN_ROOT` race, mirroring
+/// [`register_sdlc_flow_with_registry`] deliberately: a per-event factory
+/// closure, the wired node built fresh per event, and an explicit-registry
+/// variant so tests recognise the shape.
+///
+/// Per event: parses the event into
+/// [`OrchestrationEventSchema`](engine_core::workflows::orchestration::graph::OrchestrationEventSchema)
+/// to read its `brain_root`, then resolves the [`RepoRegistry`] the gate
+/// resolvers will read `state.json` through — `repo_reg` when installed,
+/// otherwise built fresh from the event's own `brain_root` (the same
+/// resolution [`OrchestrationRunNode::process`](engine_core::workflows::orchestration::graph::OrchestrationRunNode)
+/// already does for its own `RepoRegistry`, so an absent process-global
+/// registry still serves a self-contained event correctly). Builds a
+/// [`CorpusGates`](engine_core::workflows::orchestration::corpus_gates::CorpusGates)
+/// over that registry and wires
+/// [`OrchestrationRunNode::new`](engine_core::workflows::orchestration::graph::OrchestrationRunNode::new)'s
+/// `with_resolve_depends_on` / `with_is_edge_met` / `with_is_block_open` /
+/// `with_hold_source` seams to it, registers the wired node into a fresh
+/// `NodeRegistry`, and validates.
+///
+/// Every wired closure checks
+/// [`CorpusGates::take_error`](engine_core::workflows::orchestration::corpus_gates::CorpusGates::take_error)
+/// immediately after calling into the gates and **panics** if it is set — the
+/// closures the workflow consumes return plain `Vec`/`bool`, not `Result`
+/// (fixed by `gates::check_dependencies` / `chain::resolve_lane_chain`,
+/// which this ticket does not touch), so a captured `panic!` is the only
+/// channel available to fail the run loudly instead of reading a missing or
+/// malformed `state.json` as "no edges, proceed". `OrchestrationRunNode::process`
+/// already runs its chain inside a `tokio::task::spawn_blocking`, and its
+/// existing `.await.map_err(|err| NodeError::new(format!("orchestration task
+/// panicked: {err}")))` turns that panic into a named `NodeError` — tokio's
+/// `JoinError::Display` includes the panic payload verbatim when it is a
+/// `String` (as `panic!("{err}")` produces here), so the surfaced error still
+/// names the repo and path [`CorpusGatesError`](engine_core::workflows::orchestration::corpus_gates::CorpusGatesError)
+/// carries.
+///
+/// `hold_source` is a parameter rather than a hardcoded [`NeverHeld`]
+/// because no production `HoldSource` exists yet, and none can be written
+/// until there is a `(repo, block_id)`-keyed hold surface — the blocked-edge
+/// sink `engine-core` already reads (`operator/queue/source.rs`) is keyed by
+/// tmux session and host, not by block. [`register_orchestration`] still
+/// passes `NeverHeld` as its argument; that is a known, named gap, not an
+/// oversight.
+///
+/// `EN.ticket.orchestration-abort-and-progress` task 4: the factory also
+/// mints this run's `CancellationToken` and step-progress fan-out cell and
+/// wires them into the node via `with_cancellation_token`/`with_step_observer`,
+/// handing both off to `suspend::spawn_run` through the thread-local seam
+/// documented just above this module's imports — see that block's doc for
+/// why. `POST /events/{run_id}/abort` triggers this exact token, and each
+/// completed step's progress reaches live state, the durable writer, and
+/// SSE through the same three-way fan-out `spawn_run`'s own node-boundary
+/// `on_progress` already used (`suspend::publish_step_progress`, reusing
+/// `suspend::progress_fanout`) — never a second progress mechanism.
+pub fn register_orchestration_with_registry(
+    dispatcher: &mut Dispatcher,
+    repo_reg: Option<Arc<RepoRegistry>>,
+    hold_source: Arc<dyn engine_core::workflows::orchestration::integrate::HoldSource>,
+) {
     dispatcher.register(
         engine_core::workflows::orchestration::graph::schema(),
-        Box::new(|_event: &serde_json::Value| {
-            Ok(Workflow::new(
-                engine_core::workflows::orchestration::graph::registry(),
+        Box::new(move |event: &serde_json::Value| {
+            let orch_event: engine_core::workflows::orchestration::graph::OrchestrationEventSchema =
+                serde_json::from_value(event.clone())
+                    .map_err(|err| format!("invalid ORCHESTRATION event: {err}"))?;
+
+            let gates_repo_registry = match repo_reg.clone() {
+                Some(reg) => reg,
+                None => Arc::new(
+                    RepoRegistry::from_brain_root(&orch_event.brain_root).map_err(|err| {
+                        format!(
+                            "orchestration gates: repo registry for brain root '{}': {err}",
+                            orch_event.brain_root.display()
+                        )
+                    })?,
+                ),
+            };
+            let gates = Arc::new(
+                engine_core::workflows::orchestration::corpus_gates::CorpusGates::new(
+                    gates_repo_registry,
+                ),
+            );
+
+            let depends_on_gates = gates.clone();
+            let edge_met_gates = gates.clone();
+            let block_open_gates = gates.clone();
+
+            // EN.ticket.orchestration-abort-and-progress task 4: mint this
+            // run's `CancellationToken` and step-progress observer, and hand
+            // the handoff off to `suspend::spawn_run` via the thread-local
+            // above — see [`build_orchestration_seams`]. `run_token` (not
+            // `token`, which `with_is_block_open`'s closure parameter below
+            // already shadows) is embedded directly in the node;
+            // `spawn_run` re-registers it under this run's `run_id` so
+            // `POST /events/{run_id}/abort` triggers the exact token
+            // `integrate_chain` is checking, not a discarded one.
+            let (run_token, step_observer) = build_orchestration_seams();
+
+            let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
+                .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
+                    let edges = depends_on_gates.resolve_depends_on(repo, block_id);
+                    if let Some(err) = depends_on_gates.take_error() {
+                        panic!("{err}");
+                    }
+                    edges
+                }))
+                .with_is_edge_met(Arc::new(move |repo: &str, block_id: &str| {
+                    let met = edge_met_gates.is_edge_met(repo, block_id);
+                    if let Some(err) = edge_met_gates.take_error() {
+                        panic!("{err}");
+                    }
+                    met
+                }))
+                .with_is_block_open(Arc::new(move |token: &str| {
+                    let open = block_open_gates.is_block_open(token);
+                    if let Some(err) = block_open_gates.take_error() {
+                        panic!("{err}");
+                    }
+                    open
+                }))
+                .with_hold_source(hold_source.clone())
+                .with_cancellation_token(run_token)
+                .with_step_observer(step_observer);
+
+            let mut registry = engine_core::NodeRegistry::new();
+            registry.register(Box::new(node));
+
+            Workflow::new_validated(
+                registry,
                 engine_core::workflows::orchestration::graph::schema(),
-            ))
+            )
+            .map_err(|err| err.to_string())
         }),
     );
 }
@@ -1674,5 +1937,176 @@ mod tests {
             .expect("read opportunities dir")
             .count();
         assert_eq!(entries, 0, "malformed payload must write no file");
+    }
+
+    // --- ORCHESTRATION registration (EN.ticket.orchestration-production-gates-unwired task 2) ---
+
+    /// A tempdir brain root with a single repo (`repo-a`) carrying a real
+    /// `planning/state.json`, for structural registration tests — the
+    /// behavioural gate cases (unmet edge / met edge / held / closed /
+    /// missing / malformed state.json) belong to Task 3's dedicated
+    /// `engine-serve/tests/` suite, which drives the same registered
+    /// factory end to end. These tests only confirm the registration itself
+    /// is the wired one.
+    fn orchestration_brain_root(state_json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let planning = dir.path().join("repo-a").join("planning");
+        std::fs::create_dir_all(&planning).expect("mkdir repo-a/planning");
+        std::fs::write(planning.join("state.json"), state_json).expect("write state.json");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+        )
+        .expect("write brain.toml");
+        dir
+    }
+
+    fn open_block_state_json() -> &'static str {
+        r#"{
+    "repo": "repo-a",
+    "kind": "project",
+    "updated": "2026-08-18",
+    "tracks": [
+        { "title": "wave 1", "blocks": [
+            { "id": "A.1", "title": "a1", "status": "open" }
+        ] }
+    ]
+}"#
+    }
+
+    #[test]
+    fn register_orchestration_registers_the_workflow_type() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_orchestration(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("ORCHESTRATION"));
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_orchestration() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("ORCHESTRATION"));
+    }
+
+    #[test]
+    fn register_orchestration_with_registry_dispatches_a_runnable_workflow() {
+        let dir = orchestration_brain_root(open_block_state_json());
+        let mut dispatcher = Dispatcher::new();
+        register_orchestration_with_registry(
+            &mut dispatcher,
+            None,
+            Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+        );
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "ORCHESTRATION",
+                &serde_json::json!({
+                    "brain_root": dir.path(),
+                    "roadmap_slug": "test-roadmap",
+                    "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+                }),
+            )
+            .expect("ORCHESTRATION should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_orchestration_with_registry_accepts_an_installed_repo_registry() {
+        let dir = orchestration_brain_root(open_block_state_json());
+        let repo_reg =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+        let mut dispatcher = Dispatcher::new();
+        register_orchestration_with_registry(
+            &mut dispatcher,
+            Some(repo_reg),
+            Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+        );
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "ORCHESTRATION",
+                &serde_json::json!({
+                    "brain_root": dir.path(),
+                    "roadmap_slug": "test-roadmap",
+                    "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+                }),
+            )
+            .expect("ORCHESTRATION should dispatch with an explicitly installed repo registry");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_orchestration_with_registry_accepts_a_custom_hold_source() {
+        // Structural check that `hold_source` really is a parameter the
+        // caller controls, not a hardcoded `NeverHeld` — Task 3 drives a
+        // real run to observe a held chain pause; this just confirms an
+        // arbitrary `HoldSource` implementation is accepted and the
+        // registration still dispatches.
+        struct AlwaysHeld;
+        impl engine_core::workflows::orchestration::integrate::HoldSource for AlwaysHeld {
+            fn is_held(&self, _repo: &str, _block_id: &str) -> bool {
+                true
+            }
+        }
+
+        let dir = orchestration_brain_root(open_block_state_json());
+        let mut dispatcher = Dispatcher::new();
+        register_orchestration_with_registry(&mut dispatcher, None, Arc::new(AlwaysHeld));
+
+        let workflow = dispatcher.dispatch_with_event(
+            "ORCHESTRATION",
+            &serde_json::json!({
+                "brain_root": dir.path(),
+                "roadmap_slug": "test-roadmap",
+                "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            }),
+        );
+
+        assert!(
+            workflow.is_ok(),
+            "a custom HoldSource must be accepted by the registration"
+        );
+    }
+
+    #[test]
+    fn register_orchestration_with_registry_with_no_registry_and_unresolvable_brain_root_fails_loudly(
+    ) {
+        // No repo registry installed, and `brain_root` points nowhere real —
+        // `RepoRegistry::from_brain_root` must fail, and that failure must
+        // surface through dispatch rather than silently building a
+        // permissive default registry.
+        let mut dispatcher = Dispatcher::new();
+        register_orchestration_with_registry(
+            &mut dispatcher,
+            None,
+            Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+        );
+
+        let result = dispatcher.dispatch_with_event(
+            "ORCHESTRATION",
+            &serde_json::json!({
+                "brain_root": "/definitely/not/a/real/brain/root/for/this/test",
+                "roadmap_slug": "test-roadmap",
+                "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            }),
+        );
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(
+                    message.contains("not/a/real/brain/root"),
+                    "error should name the unresolvable brain root, got: {message}"
+                );
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
     }
 }

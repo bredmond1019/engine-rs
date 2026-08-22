@@ -16,12 +16,19 @@
 //!
 //! # Policy
 //!
-//! This workflow introduces exactly one knob so far: `hold_poll_interval_ms`
-//! — how often [`integrate::wait_for_clearance`] re-polls an operator hold
-//! while paused. It is a pure latency/overhead trade (a busier poll notices
-//! clearance sooner at the cost of more wake-ups) and never changes the
-//! declared node set, so — unlike `sdlc_flow`/`diagnostic_intake` — there is
-//! no `registry_for_policy`: [`registry`] alone is what every profile runs.
+//! This workflow carries three knobs: `hold_poll_interval_ms` — how often
+//! [`integrate::wait_for_clearance`] re-polls an operator hold while paused
+//! — `default_use_worktree` — the row-3 fallback
+//! [`execute::resolve_isolation`] consults for any repo that isn't one of
+//! the two non-negotiable rows (`base-template` always `true`, the brain
+//! root always `false`) — and (EN.11.L Task 3) `hold_deadline_ms` — the
+//! total budget [`integrate::wait_for_clearance`] allows a single hold
+//! before it fails the chain loudly (`None`, the built-in default,
+//! preserves the pre-Task-2 unbounded wait). All three are pure
+//! latency/overhead/isolation/reliability trades that never change the
+//! declared node set, so — unlike `sdlc_flow`/`diagnostic_intake` — there
+//! is no `registry_for_policy`: [`registry`] alone is what every profile
+//! runs.
 //! [`OrchestrationRunNode::process`] resolves the four-layer policy
 //! (`crate::policy::resolve`) itself, exactly where `diagnostic_intake`'s
 //! sole `IntakeExtractNode` does, since there is likewise no dedicated setup
@@ -41,6 +48,31 @@
 //! established convention, so a caller wiring this node against the real
 //! corpus graph (or a test) supplies its own resolvers without touching this
 //! module.
+//!
+//! # Abort stops the chain BETWEEN steps, not mid-step
+//!
+//! [`OrchestrationRunNode::with_cancellation_token`] mirrors
+//! `TerminalAwaitNode::with_cancellation_token`: the token is taken through
+//! this node's OWN builder (never read from the runner's between-node
+//! check alone), threaded across the `spawn_blocking` boundary, and
+//! checked by [`integrate::integrate_chain`] at the top of every step and
+//! while parked in [`integrate::wait_for_clearance`]. A cancel win stops
+//! the chain and returns the outcomes already integrated as `Ok` —
+//! cancellation is a pause point, not a failure. **It cannot interrupt a
+//! step already in flight**: a block whose `SDLC_FLOW` run has already
+//! started runs to completion regardless, because there is no child run
+//! id yet to thread a cancellation into (see [`integrate::integrate_chain`]'s
+//! own doc). An operator issuing an abort stops the *next* step, not the
+//! current one.
+//!
+//! A cancelled chain is never mistaken for a failed or a completed one:
+//! [`OrchestrationRunNode::process`] stamps `ctx.nodes[NODE_NAME]["cancellation"]`
+//! with whether the run was cancelled and, if so, at which step index of
+//! how many — under the same `"cancellation"` key `crate::cancellation::stamp_cancelled`
+//! uses at the framework level (`ctx.metadata`), which is also stamped for
+//! the same event rather than left to the between-node check alone. Every
+//! step already integrated before the cancel keeps its `lane-log.jsonl`
+//! line; nothing is rolled back.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -48,10 +80,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use engine_contract::TaskContext;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::cancellation::{stamp_cancelled, CancellationToken};
 use crate::node::{Node, NodeError, NodeRegistry};
 use crate::policy::{read_harness_policy_defaults_from, resolve_profile_from, PolicyConfigSource};
 use crate::repo_registry::RepoRegistry;
@@ -61,7 +96,7 @@ use crate::workflow::Workflow;
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
 use super::execute::{default_flow_runner, EngineKind, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
-use super::integrate::{integrate_chain, resolve_roadmap_dir, HoldSource, NeverHeld};
+use super::integrate::{integrate_chain, resolve_roadmap_dir, HoldSource, NeverHeld, StepProgress};
 
 /// The registered workflow type string, used both to register the workflow
 /// (`engine-serve`, this task) and as `WorkflowSchema::workflow_type`.
@@ -86,23 +121,50 @@ pub struct OrchestrationPolicy {
     /// How often [`integrate::wait_for_clearance`] re-polls an operator
     /// hold while the chain is paused.
     pub hold_poll_interval_ms: u64,
+    /// The row-3 fallback [`execute::resolve_isolation`] consults for any
+    /// repo that is neither `base-template` (always `true`) nor the brain
+    /// root (always `false`) — those two rows are external contracts and
+    /// are NOT reachable through this knob, whatever it is set to. Defaults
+    /// to `false`: today every orchestrated run is in-place, and standing
+    /// rule 6 requires a new knob to be behavior-stable.
+    pub default_use_worktree: bool,
+    /// EN.11.L Task 3: the TOTAL budget [`integrate::wait_for_clearance`]
+    /// allows a single operator hold to consume before it fails the chain
+    /// loudly with [`integrate::IntegrateError::HoldDeadlineExceeded`].
+    /// `None` (the built-in default) preserves the pre-Task-2 behavior
+    /// exactly — an unbounded wait — so adding this knob does not change
+    /// what an existing run does, per CLAUDE.md standing rule 6.
+    pub hold_deadline_ms: Option<u64>,
 }
 
 impl Default for OrchestrationPolicy {
-    /// The behavior-stable baseline: poll every 2s while held.
+    /// The behavior-stable baseline: poll every 2s while held, run every
+    /// ordinary repo in-place, and never time out a hold (`hold_deadline_ms:
+    /// None`) — exactly the pre-Task-2 behavior.
     fn default() -> Self {
         Self {
             hold_poll_interval_ms: 2_000,
+            default_use_worktree: false,
+            hold_deadline_ms: None,
         }
     }
 }
 
 /// All-optional mirror of [`OrchestrationPolicy`] used by the override
 /// layers.
+///
+/// `hold_deadline_ms` is itself an `Option<u64>` in the resolved policy
+/// (`None` = no deadline), so its override field is the nested
+/// `Option<Option<u64>>` [`crate::policy::merge_opt`] already handles
+/// generically: `None` here means "not overridden by this layer" (fall
+/// through), `Some(None)` means "override to no deadline", and
+/// `Some(Some(ms))` pins an explicit deadline.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialOrchestrationPolicy {
     pub hold_poll_interval_ms: Option<u64>,
+    pub default_use_worktree: Option<bool>,
+    pub hold_deadline_ms: Option<Option<u64>>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -113,6 +175,14 @@ impl crate::policy::Policy for OrchestrationPolicy {
             hold_poll_interval_ms: crate::policy::merge_opt(
                 self.hold_poll_interval_ms,
                 over.hold_poll_interval_ms,
+            ),
+            default_use_worktree: crate::policy::merge_opt(
+                self.default_use_worktree,
+                over.default_use_worktree,
+            ),
+            hold_deadline_ms: crate::policy::merge_opt(
+                self.hold_deadline_ms,
+                over.hold_deadline_ms,
             ),
         }
     }
@@ -126,24 +196,47 @@ impl crate::policy::Policy for OrchestrationPolicy {
 pub fn baseline() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(2_000),
+        default_use_worktree: Some(false),
+        // Restates the built-in default verbatim (no deadline) — baseline's
+        // no-op contract, per EN.11.L Task 3.
+        hold_deadline_ms: Some(None),
     }
 }
 
 /// Cheapest/fastest profile: poll far less often — fewer wake-ups, at the
-/// cost of noticing an operator clearance later.
+/// cost of noticing an operator clearance later. Also runs in-place: a
+/// worktree is a fresh checkout plus a second target dir, the expensive
+/// option, not the cheap one.
+///
+/// EN.11.L Task 3: a bounded 15-minute hold deadline — the cost floor this
+/// profile is already tuned for extends to holds too: a lane parked on an
+/// unanswered 3am hold burns a blocking-pool thread and a lane-log slot for
+/// as long as it waits, so "cheap" means failing that loudly and fast
+/// rather than tying it up indefinitely.
 #[must_use]
 pub fn cheap_fast() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(10_000),
+        default_use_worktree: Some(false),
+        hold_deadline_ms: Some(Some(15 * 60 * 1_000)),
     }
 }
 
 /// Highest-responsiveness profile: poll far more often — a cleared hold is
-/// noticed almost immediately, at the cost of more wake-ups.
+/// noticed almost immediately, at the cost of more wake-ups. Also
+/// quarantines every ordinary repo into its own worktree, the highest-safety
+/// isolation option.
+///
+/// EN.11.L Task 3: a generous 24-hour hold deadline — long enough to survive
+/// a full off-hours cycle without falsely declaring an operator absent, but
+/// still bounded: "thorough" means giving a run every reasonable chance to
+/// succeed, not literally forever.
 #[must_use]
 pub fn thorough() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(500),
+        default_use_worktree: Some(true),
+        hold_deadline_ms: Some(Some(24 * 60 * 60 * 1_000)),
     }
 }
 
@@ -216,6 +309,17 @@ pub struct OrchestrationEventSchema {
     pub roadmap_slug: Option<String>,
     pub policy: Option<PartialOrchestrationPolicy>,
     pub profile: Option<String>,
+    /// The campaign this run should rejoin, so a resumed or
+    /// operator-restarted chain keeps the SAME campaign identity rather
+    /// than minting a second one (`EN.11.E` task 3). Parsed as a string on
+    /// the wire (not a native `Uuid`) so a malformed value fails LOUDLY
+    /// with a field-naming [`NodeError`] in [`OrchestrationRunNode::process`]
+    /// instead of `serde`'s generic deserialize error — a silently-new
+    /// campaign is indistinguishable from a correctly-resumed one and is
+    /// exactly the confident-wrong result CLAUDE.md's standing rules call
+    /// out. `None` (the default) mints a fresh [`Uuid::new_v4`], unchanged
+    /// from task 2's placeholder behavior.
+    pub campaign_id: Option<String>,
 }
 
 fn parse_event(ctx: &TaskContext) -> Result<OrchestrationEventSchema, NodeError> {
@@ -229,12 +333,20 @@ type DependsOnFn = Arc<dyn Fn(&str, &str) -> Vec<DependencyEdge> + Send + Sync>;
 type EdgeMetFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 type EngineFn = Arc<dyn Fn(&str, &str) -> EngineKind + Send + Sync>;
 type BlockOpenFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// A per-step observer, called once per completed step — see
+/// [`OrchestrationRunNode::with_step_observer`] and
+/// [`integrate::StepProgress`].
+type StepObserverArc = Arc<dyn Fn(&StepProgress) + Send + Sync>;
 
 /// The sole node in the `ORCHESTRATION` graph: resolves a lane chain, then
 /// drives it end to end via [`integrate::integrate_chain`] — dependency
 /// gate, admission gate, operator-hold pause/resume, `SDLC_FLOW` invocation
 /// per block (cwd-scoped to that block's repo), state-write verification,
 /// and exactly one `lane-log.jsonl` line per integrated block.
+///
+/// **Abort stops the chain BETWEEN steps, not mid-step** — see
+/// [`Self::with_cancellation_token`] and the module doc's "Abort stops the
+/// chain BETWEEN steps, not mid-step" section.
 pub struct OrchestrationRunNode {
     resolve_depends_on: DependsOnFn,
     is_edge_met: EdgeMetFn,
@@ -246,6 +358,17 @@ pub struct OrchestrationRunNode {
     /// from the event's own resolved [`RepoRegistry`] — tests override this
     /// with a recording double via [`Self::with_run_flow`].
     run_flow: Option<FlowRunner>,
+    /// Taken through this node's OWN builder, never read from the runner's
+    /// between-node check alone — mirrors
+    /// `TerminalAwaitNode::with_cancellation_token`. `None` (the default) is
+    /// behavior-stable: no token, no cancellation check, identical output to
+    /// today. See [`Self::with_cancellation_token`].
+    cancellation_token: Option<CancellationToken>,
+    /// Called exactly once per completed step by [`integrate::integrate_chain`]
+    /// — see [`Self::with_step_observer`]. Defaults to a no-op, so an
+    /// un-injected run emits nothing and behaves exactly as before this
+    /// seam existed (CLAUDE.md standing rule 6).
+    step_observer: StepObserverArc,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -271,6 +394,8 @@ impl OrchestrationRunNode {
             hold_source: Arc::new(NeverHeld),
             admission: AdmissionGate::with_default_policy(),
             run_flow: None,
+            cancellation_token: None,
+            step_observer: Arc::new(|_progress: &StepProgress| {}),
         }
     }
 
@@ -315,6 +440,36 @@ impl OrchestrationRunNode {
         self.run_flow = Some(run_flow);
         self
     }
+
+    /// Attach a [`CancellationToken`], checked by
+    /// [`integrate::integrate_chain`] at the top of every step and raced
+    /// against [`integrate::wait_for_clearance`]'s sleep — mirroring
+    /// `TerminalAwaitNode::with_cancellation_token`. A cancel win stops the
+    /// chain BETWEEN steps and returns `Ok` with whatever was already
+    /// integrated; it CANNOT interrupt a step already in flight (no child
+    /// run id exists yet to cancel into — see the module doc). With no
+    /// token attached (the default), behavior is unchanged from before this
+    /// builder existed.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    /// Attach a per-step observer, called by
+    /// [`integrate::integrate_chain`] exactly once per completed step —
+    /// after that step's `lane-log.jsonl` line is appended. `Node::process`
+    /// has no access to the framework's own `on_progress` (it only fires at
+    /// node boundaries, and this workflow is a single node), so this
+    /// builder is the only way per-step progress reaches a caller. With no
+    /// observer attached (the default), behavior is unchanged: no
+    /// emissions, no other side effect. See [`integrate::StepProgress`] for
+    /// the payload and its 1-based index convention.
+    #[must_use]
+    pub fn with_step_observer(mut self, observer: StepObserverArc) -> Self {
+        self.step_observer = observer;
+        self
+    }
 }
 
 impl Default for OrchestrationRunNode {
@@ -337,6 +492,14 @@ impl Node for OrchestrationRunNode {
                 .map_err(|err| NodeError::new(format!("repo registry: {err}")))?,
         );
 
+        // The event's real lane for a roadmap+lane chain — threaded into
+        // every appended lane-log line. An explicit `blocks` chain has no
+        // lane by construction (there is no lane file to have parsed one
+        // from): `None` here means `integrate_chain` falls back to each
+        // step's own repo slug, matching the fleet's hand-written
+        // single-repo lines where `lane == repo`.
+        let mut resolved_lane: Option<String> = None;
+
         let chain: Vec<ChainStep> = if let Some(blocks) = &event.blocks {
             resolve_explicit_chain(
                 blocks
@@ -351,12 +514,35 @@ impl Node for OrchestrationRunNode {
             let lane = event.lane.clone().ok_or_else(|| {
                 NodeError::new("ORCHESTRATION event needs `lane` alongside `roadmap`")
             })?;
+            resolved_lane = Some(lane.clone());
             let lane_segments_path = event.brain_root.join("planning").join("lane-segments.json");
             let is_block_open = self.is_block_open.clone();
             resolve_lane_chain(&lane_segments_path, &roadmap, &lane, &move |token| {
                 is_block_open(token)
             })
             .map_err(|err| NodeError::new(err.to_string()))?
+        };
+
+        // Captured before `chain` is moved into the `spawn_blocking`
+        // closure below — the only way to know, after the fact, how many
+        // steps the chain was ever going to run, which is what turns
+        // "fewer outcomes than steps" into "cancelled at step k of n"
+        // rather than merely "a short chain".
+        let total_steps = chain.len();
+
+        // Resolution order mirrors `roadmap_slug`/`roadmap` above: an
+        // explicit value on the event wins (so a resumed/operator-restarted
+        // chain rejoins the SAME campaign), else mint a fresh v4. Unlike
+        // that fallback, a *present but unparsable* value must fail loudly
+        // rather than silently fall through — see the field's own doc on
+        // `OrchestrationEventSchema::campaign_id`.
+        let campaign_id = match &event.campaign_id {
+            Some(raw) => Uuid::parse_str(raw).map_err(|err| {
+                NodeError::new(format!(
+                    "invalid `campaign_id` on ORCHESTRATION event: {err}"
+                ))
+            })?,
+            None => Uuid::new_v4(),
         };
 
         let roadmap_slug = event
@@ -378,12 +564,37 @@ impl Node for OrchestrationRunNode {
             .clone()
             .unwrap_or_else(|| default_flow_runner(repo_registry.clone()));
         let poll_interval = Duration::from_millis(policy.hold_poll_interval_ms);
+        // EN.11.L Task 3: `hold_deadline_ms` resolves through the same four
+        // policy layers as `poll_interval` above, rather than the previous
+        // hardcoded `None` at the `integrate_chain` call site below. `None`
+        // (the built-in default) still means "no deadline" — unchanged
+        // pre-Task-2 behavior.
+        let hold_deadline = policy.hold_deadline_ms.map(Duration::from_millis);
+        // The row-3 fallback `execute::resolve_isolation` consults for any
+        // repo that isn't one of the two non-negotiable rows. `bool` is
+        // `Copy`, so this is captured into the `spawn_blocking` closure by
+        // value like `poll_interval` above — no `Arc`/clone needed.
+        let default_use_worktree = policy.default_use_worktree;
 
         let resolve_depends_on = self.resolve_depends_on.clone();
         let is_edge_met = self.is_edge_met.clone();
         let resolve_engine = self.resolve_engine.clone();
         let admission = self.admission.clone();
         let hold_source = self.hold_source.clone();
+        // Cloned before the `spawn_blocking` closure like every other owned
+        // value here — `CancellationToken` is cheap to clone (an `Arc`
+        // inside) and `Send + 'static`, so it crosses the boundary the same
+        // way the rest of this node's seams do. See `with_cancellation_token`.
+        let cancellation_token = self.cancellation_token.clone();
+        // A second clone kept OUTSIDE the `spawn_blocking` closure — the
+        // first is moved into the closure below and consumed there, so
+        // this is the only way `process` can still ask "was this run
+        // cancelled?" once `integrate_chain` returns. Cheap: `CancellationToken`
+        // is an `Arc` inside.
+        let cancellation_token_for_stamp = cancellation_token.clone();
+        // Cloned before the `spawn_blocking` closure like every other owned
+        // seam here — `Arc` clone, `Send + Sync + 'static`.
+        let step_observer = self.step_observer.clone();
 
         // `execute::FlowFuture` is deliberately not `Send` (see its own doc
         // comment: `Workflow::run`'s `OnProgress` callback is not `Send`),
@@ -397,40 +608,143 @@ impl Node for OrchestrationRunNode {
         // `Send` boundary at all, since it never leaves that one thread.
         // The returned `JoinHandle<Result<..>>` is `Send` regardless of the
         // task it ran, which is exactly the adapter this seam needs.
+        // `EN.11.I` task 2: `tracing`'s span context is thread-local and
+        // does NOT cross a `spawn_blocking` boundary by itself — the
+        // closure below runs on a fresh blocking-pool OS thread whose span
+        // stack starts empty, so anything `integrate_chain` (or a step it
+        // drives) logs there would silently carry no `run_id`/`campaign_id`
+        // fields despite `OrchestrationRunNode::process` itself running
+        // inside `Workflow::walk`'s instrumented span. Fix: capture BOTH
+        // halves of the calling thread's tracing context before crossing —
+        // the current span (carries the recorded `run_id`/`campaign_id`
+        // fields) and the current dispatcher (the subscriber events are
+        // actually delivered to) — and re-establish both on the blocking
+        // thread. In production this dispatcher forwarding is usually a
+        // no-op (the host installs one global subscriber via
+        // `engine_serve::init_tracing`, which every thread already sees),
+        // but it also makes this call site correct under a *thread-local*
+        // test/tool subscriber (`tracing::subscriber::set_default`), which
+        // a global default alone would not reach.
+        let current_span = tracing::Span::current();
+        let current_dispatch = tracing::dispatcher::get_default(|d| d.clone());
         let outcomes = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|err| {
-                    NodeError::new(format!("failed to start orchestration runtime: {err}"))
-                })?;
-            rt.block_on(integrate_chain(
-                &chain,
-                &move |repo, block_id| resolve_depends_on(repo, block_id),
-                &move |repo, block_id| is_edge_met(repo, block_id),
-                &admission,
-                hold_source.as_ref(),
-                poll_interval,
-                &move |repo, block_id| resolve_engine(repo, block_id),
-                &repo_registry,
-                &run_flow,
-                &roadmap_dir,
-            ))
-            .map_err(|err| NodeError::new(err.to_string()))
+            tracing::dispatcher::with_default(&current_dispatch, || {
+                let _span_guard = current_span.enter();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| {
+                        NodeError::new(format!("failed to start orchestration runtime: {err}"))
+                    })?;
+                rt.block_on(integrate_chain(
+                    &chain,
+                    &move |repo, block_id| resolve_depends_on(repo, block_id),
+                    &move |repo, block_id| is_edge_met(repo, block_id),
+                    &admission,
+                    hold_source.as_ref(),
+                    poll_interval,
+                    hold_deadline,
+                    cancellation_token.as_ref(),
+                    &move |repo, block_id| resolve_engine(repo, block_id),
+                    &repo_registry,
+                    &run_flow,
+                    &roadmap_dir,
+                    resolved_lane.as_deref(),
+                    step_observer.as_ref(),
+                    default_use_worktree,
+                    // The resolved, event-overridable campaign id (EN.11.E
+                    // task 3) — replaces task 2's freshly-minted placeholder.
+                    campaign_id,
+                ))
+                .map_err(|err| NodeError::new(err.to_string()))
+            })
         })
         .await
         .map_err(|err| NodeError::new(format!("orchestration task panicked: {err}")))??;
 
+        // A cancel win is only real if it actually cut the chain short —
+        // `integrate_chain` can return `outcomes.len() == total_steps` even
+        // with a cancelled token if the cancel landed after the last step's
+        // own top-of-loop check but the loop had already finished (the
+        // token was cancelled "too late to matter"). In that case the run
+        // completed and must read as COMPLETED, not CANCELLED, even though
+        // the token itself is in the cancelled state.
+        let cancelled_at_step = if outcomes.len() < total_steps
+            && cancellation_token_for_stamp
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            Some(outcomes.len())
+        } else {
+            None
+        };
+
         let mut ctx = ctx;
+        // Node-level record of the same event `crate::cancellation::stamp_cancelled`
+        // marks at the framework/`ctx.metadata` level (`workflow.rs`'s
+        // between-node check) — named under the same `"cancellation"` key
+        // rather than a rival marker, but scoped here to this node's own
+        // result so a reader with only `ctx.nodes[NODE_NAME]` can already
+        // tell COMPLETED (`cancelled: false`, `steps_integrated == total`)
+        // from CANCELLED (`cancelled: true`, stopped at `at_step` of
+        // `total_steps`) from FAILED (this branch is never reached — a
+        // failed step returns `Err` above and there is no result to stamp).
+        // Every step already integrated before the cancel keeps its
+        // `lane-log.jsonl` line; nothing here rolls anything back.
+        let cancellation = match cancelled_at_step {
+            Some(at_step) => {
+                // Also stamp the framework-level marker so a caller reading
+                // only `ctx.metadata` (e.g. `RunTelemetry`) sees the same
+                // fact `Workflow::walk`'s own between-node cancellation
+                // check would have recorded, had this graph had more than
+                // one node to check between.
+                stamp_cancelled(&mut ctx.metadata);
+                json!({
+                    "cancelled": true,
+                    "at_step": at_step,
+                    "total_steps": total_steps,
+                })
+            }
+            None => json!({ "cancelled": false }),
+        };
+
         ctx.nodes.insert(
             NODE_NAME.to_string(),
             json!({
                 "steps_integrated": outcomes.len(),
                 "blocks": outcomes
                     .iter()
-                    .map(|o| json!({ "repo": o.repo, "block_id": o.block_id }))
+                    .map(|o| json!({
+                        "repo": o.repo,
+                        "block_id": o.block_id,
+                        "use_worktree": o.use_worktree,
+                    }))
                     .collect::<Vec<_>>(),
-                "policy": { "hold_poll_interval_ms": policy.hold_poll_interval_ms },
+                "policy": {
+                    "hold_poll_interval_ms": policy.hold_poll_interval_ms,
+                    "default_use_worktree": policy.default_use_worktree,
+                    "hold_deadline_ms": policy.hold_deadline_ms,
+                },
+                "cancellation": cancellation,
+                // The addressable subject `GET /campaigns/{id}` (task 5)
+                // answers from — this ORCHESTRATION run is itself an
+                // ordinary HTTP-triggered run in `LiveStateStore`, so
+                // stamping the campaign's members here is what lets that
+                // route work without recording every in-process child run
+                // and without any relational table (EN.11.E task 3).
+                // `cost_usd` stays `Option<f64>` end to end: a step that
+                // reported no cost is written as JSON `null`, never `0`.
+                "campaign_id": campaign_id,
+                "campaign_members": outcomes
+                    .iter()
+                    .map(|o| json!({
+                        "repo": o.repo,
+                        "block_id": o.block_id,
+                        "use_worktree": o.use_worktree,
+                        "cost_usd": o.cost_usd,
+                        "total_tokens": o.total_tokens,
+                    }))
+                    .collect::<Vec<_>>(),
             }),
         );
         Ok(ctx)
@@ -454,10 +768,18 @@ pub fn schema() -> WorkflowSchema {
 
 /// Build a fresh `NodeRegistry` with the single node identity in [`schema`]
 /// registered, under its permissive default seams
-/// ([`OrchestrationRunNode::new`]). This is the only registry the
-/// `ORCHESTRATION` workflow ever runs under — unlike `sdlc_flow` /
-/// `diagnostic_intake`, no policy setting here changes which node runs, so
-/// there is no `registry_for_policy` sibling.
+/// ([`OrchestrationRunNode::new`]).
+///
+/// **This is the UNWIRED default** — every gate seam is a no-op (no declared
+/// dependencies, every edge already met, every block open, never held), which
+/// is correct for a bare constructor but was, until
+/// `EN.ticket.orchestration-production-gates-unwired`, also the *only*
+/// registry production ever got. `engine-serve`'s
+/// `register_orchestration_with_registry` is the wired entry point: it builds
+/// this same node but installs `corpus_gates::CorpusGates`-backed closures
+/// (real `planning/state.json` reads via `RepoRegistry`) instead of calling
+/// this function. Use [`registry`] directly only in tests that want the
+/// permissive default on purpose — the served workflow does not call it.
 #[must_use]
 pub fn registry() -> NodeRegistry {
     let mut registry = NodeRegistry::new();
@@ -538,6 +860,62 @@ mod tests {
     #[test]
     fn builtin_default_is_behavior_stable_baseline() {
         assert_eq!(OrchestrationPolicy::default().hold_poll_interval_ms, 2_000);
+        assert!(!OrchestrationPolicy::default().default_use_worktree);
+        // EN.11.L Task 3: the built-in default must preserve the
+        // pre-Task-2 unbounded wait exactly — adding this knob must not
+        // change what an existing run does (CLAUDE.md standing rule 6).
+        assert_eq!(OrchestrationPolicy::default().hold_deadline_ms, None);
+    }
+
+    #[test]
+    fn all_three_profiles_set_default_use_worktree_explicitly() {
+        assert_eq!(baseline().default_use_worktree, Some(false));
+        assert_eq!(cheap_fast().default_use_worktree, Some(false));
+        assert_eq!(thorough().default_use_worktree, Some(true));
+    }
+
+    /// EN.11.L Task 3: every named profile explicitly sets
+    /// `hold_deadline_ms` — a knob absent from the profile bundles is a
+    /// knob nobody will find (standing rule 6).
+    #[test]
+    fn all_three_profiles_set_hold_deadline_ms_explicitly() {
+        // baseline restates the built-in default verbatim: no deadline.
+        assert_eq!(baseline().hold_deadline_ms, Some(None));
+        assert_eq!(cheap_fast().hold_deadline_ms, Some(Some(15 * 60 * 1_000)));
+        assert_eq!(
+            thorough().hold_deadline_ms,
+            Some(Some(24 * 60 * 60 * 1_000))
+        );
+    }
+
+    #[test]
+    fn hold_deadline_ms_resolves_through_the_policy_layers() {
+        let event_override = PartialOrchestrationPolicy {
+            hold_deadline_ms: Some(Some(1_234)),
+            ..Default::default()
+        };
+        let resolved = crate::policy::resolve(
+            OrchestrationPolicy::default(),
+            None,
+            Some(&cheap_fast()),
+            Some(&event_override),
+        );
+        // Event override beats the profile.
+        assert_eq!(resolved.hold_deadline_ms, Some(1_234));
+
+        // With no event override, the profile's value wins.
+        let resolved = crate::policy::resolve(
+            OrchestrationPolicy::default(),
+            None,
+            Some(&cheap_fast()),
+            None,
+        );
+        assert_eq!(resolved.hold_deadline_ms, Some(15 * 60 * 1_000));
+
+        // With nothing set at all, the behavior-stable built-in default
+        // (no deadline) is what resolves.
+        let resolved = crate::policy::resolve(OrchestrationPolicy::default(), None, None, None);
+        assert_eq!(resolved.hold_deadline_ms, None);
     }
 
     #[test]
@@ -589,6 +967,7 @@ mod tests {
     fn event_override_beats_profile() {
         let event_override = PartialOrchestrationPolicy {
             hold_poll_interval_ms: Some(42),
+            ..Default::default()
         };
         let resolved = crate::policy::resolve(
             OrchestrationPolicy::default(),
@@ -599,12 +978,13 @@ mod tests {
         assert_eq!(resolved.hold_poll_interval_ms, 42);
     }
 
-    /// Every named profile only ever changes `hold_poll_interval_ms` — the
-    /// declared node set ([`registry`]) is identical regardless of which
-    /// profile a run selects, since this workflow's sole policy knob never
+    /// Every named profile only ever changes `hold_poll_interval_ms`,
+    /// `default_use_worktree`, and (EN.11.L Task 3) `hold_deadline_ms` —
+    /// the declared node set ([`registry`]) is identical regardless of
+    /// which profile a run selects, since none of these policy knobs
     /// rewires which node runs (CLAUDE.md standing rule 6: "a policy knob
-    /// may change a bound or a tier; it must not change... a declared
-    /// node set").
+    /// may change a bound or a tier; it must not change... a declared node
+    /// set").
     #[test]
     fn every_named_profile_leaves_the_declared_node_set_identical() {
         let default_registry = registry();
@@ -733,6 +1113,13 @@ mod tests {
         let recorded = &out.nodes[NODE_NAME];
         assert_eq!(recorded["steps_integrated"], 2);
         assert_eq!(recorded["policy"]["hold_poll_interval_ms"], 2_000);
+        // EN.11.L Task 3: the resolved `hold_deadline_ms` is stamped into
+        // `ctx.nodes` alongside the other policy values so telemetry can
+        // attribute observed behavior to the setting that caused it.
+        assert_eq!(
+            recorded["policy"]["hold_deadline_ms"],
+            serde_json::Value::Null
+        );
 
         let lane_log = std::fs::read_to_string(
             dir.path()
@@ -742,7 +1129,233 @@ mod tests {
                 .join("lane-log.jsonl"),
         )
         .expect("lane-log.jsonl should exist");
-        assert_eq!(lane_log.lines().count(), 2);
+        let lines: Vec<serde_json::Value> = lane_log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        // An explicit `blocks` chain has no lane by construction: every
+        // appended line's `lane` falls back to that step's own repo slug,
+        // asserted explicitly rather than left incidental.
+        assert_eq!(lines[0]["lane"], lines[0]["repo"]);
+        assert_eq!(lines[1]["lane"], lines[1]["repo"]);
+        assert_eq!(lines[0]["repo"], "repo-a");
+        assert_eq!(lines[1]["repo"], "repo-b");
+    }
+
+    #[tokio::test]
+    async fn process_drives_a_roadmap_lane_chain_end_to_end_and_writes_the_real_lane() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        std::fs::write(
+            dir.path().join("planning").join("lane-segments.json"),
+            json!({
+                "blocks": [
+                    {
+                        "roadmap": "my-roadmap",
+                        "lane": "backend",
+                        "repo": "repo-a",
+                        "id": "A.1",
+                        "segment": 0,
+                        "position": 0
+                    },
+                    {
+                        "roadmap": "my-roadmap",
+                        "lane": "backend",
+                        "repo": "repo-b",
+                        "id": "B.1",
+                        "segment": 0,
+                        "position": 1
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "roadmap": "my-roadmap",
+            "roadmap_slug": "my-roadmap",
+            "lane": "backend",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["steps_integrated"], 2);
+
+        let lane_log = std::fs::read_to_string(
+            dir.path()
+                .join("planning")
+                .join("roadmaps")
+                .join("my-roadmap")
+                .join("lane-log.jsonl"),
+        )
+        .expect("lane-log.jsonl should exist");
+        let lines: Vec<serde_json::Value> = lane_log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        // The real event lane, not the repo slug.
+        assert_eq!(lines[0]["lane"], "backend");
+        assert_eq!(lines[1]["lane"], "backend");
+    }
+
+    // ── Node::process — cancellation stamping (Task 2) ───────────────────
+
+    /// A [`FlowRunner`] that records every block it ran and, the moment it
+    /// finishes the one named `cancel_after`, cancels `token` -- the same
+    /// deterministic pattern `integrate.rs`'s own cancellation tests use,
+    /// duplicated here (rather than shared) because it belongs to a
+    /// different crate target (`tests/it` vs this unit-test module).
+    fn cancel_after_block(token: CancellationToken, cancel_after: &'static str) -> FlowRunner {
+        Arc::new(move |invocation| {
+            let token = token.clone();
+            Box::pin(async move {
+                let done = TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                };
+                if invocation.block_id == cancel_after {
+                    token.cancel();
+                }
+                Ok(done)
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_stamps_cancelled_true_with_the_stopping_step_and_total() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+        write_done_state(&dir.path().join("repo-a"), "A.3");
+
+        let token = CancellationToken::new();
+        let run_flow = cancel_after_block(token.clone(), "A.1");
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_cancellation_token(token);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-a", "block_id": "A.2" },
+                { "repo": "repo-a", "block_id": "A.3" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a cancelled run is Ok, not Err");
+        let recorded = &out.nodes[NODE_NAME];
+
+        // Only A.1 integrated before the cancel won.
+        assert_eq!(recorded["steps_integrated"], 1);
+        assert_eq!(recorded["cancellation"]["cancelled"], true);
+        assert_eq!(recorded["cancellation"]["at_step"], 1);
+        assert_eq!(recorded["cancellation"]["total_steps"], 3);
+
+        // The framework-level marker is also stamped, under the same key,
+        // rather than only the node-local record existing.
+        assert_eq!(out.metadata["cancellation"]["cancelled"], true);
+    }
+
+    #[tokio::test]
+    async fn a_completed_run_stamps_cancelled_false_even_with_a_token_attached() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        // A token is attached but never cancelled -- behavior must still
+        // read as a plain completion, not merely as "no cancellation
+        // detected because there was no token at all" (the other test
+        // below covers that un-injected case).
+        let token = CancellationToken::new();
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_cancellation_token(token);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["steps_integrated"], 2);
+        assert_eq!(recorded["cancellation"]["cancelled"], false);
+        assert!(out.metadata.get("cancellation").is_none());
+    }
+
+    #[tokio::test]
+    async fn no_token_injected_leaves_cancellation_reported_false() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        // No `with_cancellation_token` call at all -- the behavior-stable
+        // default path.
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["steps_integrated"], 2);
+        assert_eq!(recorded["cancellation"]["cancelled"], false);
+        assert!(out.metadata.get("cancellation").is_none());
     }
 
     #[tokio::test]
@@ -757,5 +1370,188 @@ mod tests {
             "error should explain what was missing: {}",
             err.message
         );
+    }
+
+    // ── Node::process — campaign id resolution and stamping (Task 3) ────
+
+    #[tokio::test]
+    async fn an_event_with_no_campaign_id_mints_a_fresh_one_and_stamps_it() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+
+        let stamped = recorded["campaign_id"]
+            .as_str()
+            .expect("campaign_id should be stamped as a string");
+        Uuid::parse_str(stamped).expect("stamped campaign_id should be a valid uuid");
+
+        let members = recorded["campaign_members"]
+            .as_array()
+            .expect("campaign_members should be an array");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["repo"], "repo-a");
+        assert_eq!(members[0]["block_id"], "A.1");
+        assert_eq!(members[1]["repo"], "repo-b");
+        assert_eq!(members[1]["block_id"], "B.1");
+
+        // Whatever this node already stamped is still present alongside
+        // the new campaign fields.
+        assert_eq!(recorded["steps_integrated"], 2);
+        assert_eq!(recorded["cancellation"]["cancelled"], false);
+    }
+
+    #[tokio::test]
+    async fn an_event_with_an_explicit_campaign_id_reuses_it_rather_than_minting_a_fresh_one() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let supplied = Uuid::new_v4();
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+            "campaign_id": supplied.to_string(),
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        assert_eq!(recorded["campaign_id"], supplied.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_campaign_id_fails_loudly_naming_the_field_instead_of_minting_fresh() {
+        let dir = two_repo_brain_root();
+        let node = OrchestrationRunNode::new();
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+            "campaign_id": "not-a-uuid",
+        }));
+
+        let err = node.process(ctx).await.unwrap_err();
+        assert!(
+            err.message.contains("campaign_id"),
+            "error should name the field: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_members_carry_tri_state_cost_usd_and_summed_total_tokens() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        // repo-a's step reports a real cost figure and token usage; repo-b's
+        // step reports NEITHER -- its ctx has no `cost_usd` anywhere in
+        // `nodes` and no `usage` on any `node_runs` entry, so
+        // `ExecutionOutcome::cost_usd` must fold to `None`, not `0.0`.
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            let block_id = invocation.block_id.clone();
+            Box::pin(async move {
+                if block_id == "A.1" {
+                    let mut nodes = HashMap::new();
+                    nodes.insert("SomeLlmNode".to_string(), json!({ "cost_usd": 1.25 }));
+                    let mut node_runs = HashMap::new();
+                    node_runs.insert(
+                        "SomeLlmNode".to_string(),
+                        engine_contract::NodeRun {
+                            status: engine_contract::NodeRunStatus::Success,
+                            started_at: None,
+                            completed_at: None,
+                            error: None,
+                            input: None,
+                            usage: Some(engine_contract::Usage {
+                                input_tokens: Some(100),
+                                output_tokens: Some(50),
+                                model: "test-model".to_string(),
+                            }),
+                        },
+                    );
+                    Ok(TaskContext {
+                        event: json!({}),
+                        nodes,
+                        metadata: json!({ "ran": block_id }),
+                        node_runs,
+                    })
+                } else {
+                    Ok(TaskContext {
+                        event: json!({}),
+                        nodes: HashMap::new(),
+                        metadata: json!({ "ran": block_id }),
+                        node_runs: HashMap::new(),
+                    })
+                }
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        let recorded = &out.nodes[NODE_NAME];
+        let members = recorded["campaign_members"]
+            .as_array()
+            .expect("campaign_members should be an array");
+
+        assert_eq!(members[0]["repo"], "repo-a");
+        assert_eq!(members[0]["cost_usd"], 1.25);
+        assert_eq!(members[0]["total_tokens"], 150);
+
+        assert_eq!(members[1]["repo"], "repo-b");
+        assert_eq!(
+            members[1]["cost_usd"],
+            serde_json::Value::Null,
+            "a step that reported no cost must stay `null`, never collapse to 0"
+        );
+        assert_eq!(members[1]["total_tokens"], 0);
     }
 }

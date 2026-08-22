@@ -118,6 +118,38 @@ pub fn read_run_id(metadata: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Reads a run's `campaign_id`, if any, for tracing instrumentation
+/// (`EN.11.I` task 2). Mirrors `engine_serve::live_state::read_campaign_id`'s
+/// two-location resolution order exactly — reimplemented here rather than
+/// imported because `engine-core` cannot depend on `engine-serve` in
+/// production code (the dependency runs the other way: `engine-serve` embeds
+/// `engine-core`; `engine-serve` is only a `[dev-dependencies]` of this crate,
+/// for tests).
+///
+/// Checked in order:
+/// 1. `ctx.event["campaign_id"]` — a child `SDLC_FLOW` run's wire seam
+///    (`EN.11.E` task 2).
+/// 2. `ctx.nodes[NODE_NAME]["campaign_id"]` — the parent `ORCHESTRATION`
+///    run's own node result (`EN.11.E` task 3), keyed by the SAME constant
+///    `OrchestrationRunNode` itself registers under, not a hand-copied
+///    string literal.
+///
+/// A non-string or unparsable value reads as `None`, matching
+/// [`read_run_id`]'s defensive shape — never an error, never an empty
+/// string.
+pub(crate) fn read_campaign_id(ctx: &TaskContext) -> Option<String> {
+    ctx.event
+        .get("campaign_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            ctx.nodes
+                .get(crate::workflows::orchestration::graph::NODE_NAME)
+                .and_then(|node| node.get("campaign_id"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_string)
+}
+
 /// The injected persistence seam, invoked with a snapshot of the `TaskContext`
 /// at each node boundary (initial seed, and after every node transition).
 /// This block defines the signature only — EN.1.C wires it to Postgres.
@@ -356,6 +388,11 @@ impl Workflow {
     /// node-by-node. This is the shared core both `run_with` (fresh context,
     /// fresh ledger, start node) and a future `run_from` (rehydrated context,
     /// rehydrated ledger, stored pointer) drive.
+    #[tracing::instrument(
+        name = "workflow.walk",
+        skip_all,
+        fields(run_id = tracing::field::Empty, campaign_id = tracing::field::Empty)
+    )]
     async fn walk(
         &self,
         mut ctx: TaskContext,
@@ -364,6 +401,23 @@ impl Workflow {
         mut on_progress: OnProgress<'_>,
         options: RunOptions,
     ) -> Result<TaskContext, WorkflowError> {
+        // Record the two instrumented fields (EN.11.I task 2) once, up front:
+        // `run_id` is always available by this point (`run_with`/`run_from`
+        // stamp it into `ctx.metadata` before calling `walk`); `campaign_id`
+        // is available here for a child `SDLC_FLOW` run (carried on the
+        // event from the start) but NOT yet for the parent `ORCHESTRATION`
+        // run, which only learns its own campaign id as a side effect of its
+        // single node's own `process()` — that run has one node, so there is
+        // no second dispatch for a re-record to help. `read_campaign_id`
+        // already treats "not known yet" as `None`, never a fabricated value.
+        let span = tracing::Span::current();
+        if let Some(run_id) = read_run_id(&ctx.metadata) {
+            span.record("run_id", run_id.as_str());
+        }
+        if let Some(campaign_id) = read_campaign_id(&ctx) {
+            span.record("campaign_id", campaign_id.as_str());
+        }
+
         on_progress(&ctx);
 
         while let Some(identity) = current {
@@ -558,6 +612,31 @@ pub(crate) fn node_cost_usd(ctx: &TaskContext, identity: &str) -> Option<f64> {
 /// `Ok` or FAILED + `completed_at` + `error` on `Err`, invoking `on_progress`
 /// after each transition. Returns the updated `TaskContext` and whether the
 /// node failed (so the caller knows to halt the walk).
+///
+/// `#[instrument]` here — not on `Node::process` itself (`EN.11.I` task 2):
+/// this is the ONE dispatch site every node passes through, so instrumenting
+/// it gives every node a span without touching any of the trait's ~6
+/// in-tree impls or the growing set of workflow node types. The span
+/// nests inside `Workflow::walk`'s span, so an event fired from inside
+/// `node.process()` carries this span's `node` field alongside `walk`'s
+/// `run_id`/`campaign_id` fields — `tracing`'s span-list formatting
+/// attaches every ancestor span's recorded fields to a descendant event,
+/// not just the immediate parent's.
+///
+/// **EN.11.I task 5:** the block's own acceptance criterion (`jq -e
+/// 'select(.run_id==$ID) | .node'` returns every node of a run, in order)
+/// reads `run_id`/`node` as TOP-LEVEL keys on each JSON line. `#[instrument]`
+/// fields are only ever nested under the JSON formatter's `"span"`/`"spans"`
+/// objects — there is no `tracing-subscriber` option that flattens a span's
+/// *inherited* fields into an event's own top-level field set, only
+/// `flatten_event` for an event's OWN fields (`engine_serve::init_tracing`
+/// sets it). So each dispatch explicitly emits ONE event of its own —
+/// `info!` on success, the existing `error!` on failure — carrying `node`
+/// and `run_id` (and `campaign_id`, when the run has one) as literal event
+/// fields, not merely relying on span inheritance. This is what task 2's
+/// `instrumentation::CaptureLayer` deliberately did NOT pin (its own doc
+/// comment says so) — it proves propagation; this proves the wire shape.
+#[tracing::instrument(name = "workflow.node.dispatch", skip(node, ctx, on_progress), fields(node = %node.name()))]
 async fn node_context(
     node: &dyn crate::node::Node,
     mut ctx: TaskContext,
@@ -586,12 +665,28 @@ async fn node_context(
     // and return on `Err`.
     let pre_call_ctx = ctx.clone();
 
+    // Read once, from the pre-call snapshot, before `ctx` is moved into
+    // `node.process`: both branches below need the same values, and
+    // `read_run_id`/`read_campaign_id` are the same defensive readers
+    // `Workflow::walk` uses (never a third implementation — task 2's own
+    // rule still applies here). `Option<&str>` fields are OMITTED by
+    // `tracing` when `None`, never recorded as an empty string — matching
+    // task 2's `campaign_id` convention exactly.
+    let run_id = read_run_id(&pre_call_ctx.metadata);
+    let campaign_id = read_campaign_id(&pre_call_ctx);
+
     match node.process(ctx).await {
         Ok(mut ok_ctx) => {
             if let Some(run) = ok_ctx.node_runs.get_mut(&identity) {
                 run.status = NodeRunStatus::Success;
                 run.completed_at = Some(Utc::now());
             }
+            tracing::info!(
+                node = %identity,
+                run_id = run_id.as_deref(),
+                campaign_id = campaign_id.as_deref(),
+                "node dispatched"
+            );
             on_progress(&ok_ctx);
             (ok_ctx, false)
         }
@@ -602,6 +697,13 @@ async fn node_context(
                 run.completed_at = Some(Utc::now());
                 run.error = Some(err.message.clone());
             }
+            tracing::error!(
+                node = %identity,
+                run_id = run_id.as_deref(),
+                campaign_id = campaign_id.as_deref(),
+                error = %err.message,
+                "node failed"
+            );
             on_progress(&err_ctx);
             (err_ctx, true)
         }
@@ -1349,5 +1451,412 @@ mod tests {
 
         // The seeded "X" entry is gone -- without_seeded_nodes took effect.
         assert!(!ctx.nodes.contains_key("X"));
+    }
+
+    // -- EN.11.I task 2: run_id/campaign_id span instrumentation -----------
+
+    mod instrumentation {
+        //! A minimal `tracing_subscriber::Layer` that records, for every
+        //! emitted event, the union of that event's own fields with every
+        //! ancestor span's recorded fields (walking root-to-leaf so a
+        //! descendant span's field can shadow an ancestor's same-named
+        //! field, matching how the real JSON formatter's `spans` list
+        //! reads). This is deliberately independent of the JSON wire shape
+        //! task 5 pins — it proves span-field *propagation*, which is this
+        //! task's job, without depending on a formatter's exact output.
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        #[derive(Default, Clone)]
+        struct FieldMap(HashMap<String, String>);
+
+        impl Visit for FieldMap {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        /// Every event this layer has observed, in emission order, as its
+        /// fully-resolved (span-inherited) field map.
+        #[derive(Default)]
+        pub(super) struct Captured(Mutex<Vec<HashMap<String, String>>>);
+
+        impl Captured {
+            pub(super) fn snapshot(&self) -> Vec<HashMap<String, String>> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        pub(super) struct CaptureLayer(pub(super) Arc<Captured>);
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                ctx: Context<'_, S>,
+            ) {
+                let span = ctx.span(id).expect("span must exist in on_new_span");
+                let mut fields = FieldMap::default();
+                attrs.record(&mut fields);
+                span.extensions_mut().insert(fields);
+            }
+
+            fn on_record(
+                &self,
+                id: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                ctx: Context<'_, S>,
+            ) {
+                let span = ctx.span(id).expect("span must exist in on_record");
+                let mut extensions = span.extensions_mut();
+                if let Some(fields) = extensions.get_mut::<FieldMap>() {
+                    values.record(fields);
+                }
+            }
+
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                let mut merged = HashMap::new();
+                if let Some(scope) = ctx.event_scope(event) {
+                    for span in scope.from_root() {
+                        if let Some(fields) = span.extensions().get::<FieldMap>() {
+                            merged.extend(fields.0.clone());
+                        }
+                    }
+                }
+                let mut own = FieldMap::default();
+                event.record(&mut own);
+                merged.extend(own.0);
+                self.0 .0.lock().unwrap().push(merged);
+            }
+        }
+
+        /// Sets `subscriber` as the default for the CURRENT thread only
+        /// (`tracing::subscriber::set_default`, not the process-wide
+        /// `set_global_default`) so these tests never collide with each
+        /// other or with `engine_serve::init_tracing`'s own
+        /// idempotent-global-install test — `cargo nextest run`'s
+        /// process-per-test model (CLAUDE.md standing rule 7) makes even a
+        /// global install safe here, but a thread-local default is the
+        /// correct scope regardless of test runner.
+        pub(super) fn capturing() -> (Arc<Captured>, tracing::subscriber::DefaultGuard) {
+            let captured = Arc::new(Captured::default());
+            let layer = CaptureLayer(captured.clone());
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            (captured, guard)
+        }
+    }
+
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// A node whose `process()` emits one `tracing::info!` event, tagged
+    /// with a `marker` field — used to prove that an event fired from
+    /// *inside* a node's own `process()` inherits the ancestor spans'
+    /// recorded fields (`workflow.walk`'s `run_id`/`campaign_id` and
+    /// `workflow.node.dispatch`'s `node`) without doing anything
+    /// instrumentation-aware itself.
+    struct EventEmittingNode;
+
+    #[async_trait::async_trait]
+    impl Node for EventEmittingNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            tracing::info!(marker = "node-ran", "EventEmittingNode processed");
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "EventEmittingNode"
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_span_attaches_run_id_and_node_to_events_emitted_by_a_node() {
+        let (captured, _guard) = instrumentation::capturing();
+
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(EventEmittingNode));
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "EventEmittingNode".to_string(),
+            crate::schema::NodeConfig::new("EventEmittingNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "EventEmittingNode", nodes);
+        let workflow = Workflow::new(registry, schema);
+
+        let run_id = Uuid::new_v4();
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: None,
+            budget: None,
+            pause_signal: None,
+            run_id: Some(run_id),
+        };
+        workflow
+            .run_with(serde_json::json!({}), on_progress, options)
+            .await
+            .expect("run should succeed");
+
+        let events = captured.snapshot();
+        let node_event = events
+            .iter()
+            .find(|f| f.get("marker").map(String::as_str) == Some("node-ran"))
+            .expect("EventEmittingNode's event must have been captured");
+
+        // The two fields this task instruments: `run_id` (recorded on
+        // `Workflow::walk`'s span) and `node` (recorded on
+        // `node_context`'s per-dispatch span) both reach an event fired
+        // from deep inside a plain node's own `process()` — proving the
+        // span hierarchy, not just direct field passing, does the work.
+        assert_eq!(
+            node_event.get("run_id").map(String::as_str),
+            Some(run_id.to_string().as_str())
+        );
+        assert_eq!(
+            node_event.get("node").map(String::as_str),
+            Some("EventEmittingNode")
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_span_attaches_campaign_id_when_the_event_carries_one() {
+        let (captured, _guard) = instrumentation::capturing();
+
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(EventEmittingNode));
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "EventEmittingNode".to_string(),
+            crate::schema::NodeConfig::new("EventEmittingNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "EventEmittingNode", nodes);
+        let workflow = Workflow::new(registry, schema);
+
+        let campaign_id = Uuid::new_v4();
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        workflow
+            .run(
+                serde_json::json!({ "campaign_id": campaign_id.to_string() }),
+                on_progress,
+            )
+            .await
+            .expect("run should succeed");
+
+        let events = captured.snapshot();
+        let node_event = events
+            .iter()
+            .find(|f| f.get("marker").map(String::as_str) == Some("node-ran"))
+            .expect("EventEmittingNode's event must have been captured");
+
+        assert_eq!(
+            node_event.get("campaign_id").map(String::as_str),
+            Some(campaign_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_campaign_never_stamps_an_empty_campaign_id_field() {
+        let (captured, _guard) = instrumentation::capturing();
+
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(EventEmittingNode));
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "EventEmittingNode".to_string(),
+            crate::schema::NodeConfig::new("EventEmittingNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "EventEmittingNode", nodes);
+        let workflow = Workflow::new(registry, schema);
+
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .expect("run should succeed");
+
+        let events = captured.snapshot();
+        let node_event = events
+            .iter()
+            .find(|f| f.get("marker").map(String::as_str) == Some("node-ran"))
+            .expect("EventEmittingNode's event must have been captured");
+
+        // `Empty` fields that were never `record`ed are simply absent from
+        // the map — never present-but-empty-string. This is the negative
+        // control: it would fail exactly the way a stray
+        // `campaign_id = ""` regression would, and it currently passes
+        // because `read_campaign_id` correctly returns `None` here.
+        assert!(!node_event.contains_key("campaign_id"));
+    }
+
+    /// A node whose `process()` crosses the `spawn_blocking` boundary
+    /// itself, exactly the way `OrchestrationRunNode::process`
+    /// (`crate::workflows::orchestration::graph`) does: capture the calling
+    /// thread's current span AND dispatcher, move both into the blocking
+    /// closure, and re-establish both there before emitting anything. This
+    /// exercises the identical propagation pattern this task added to
+    /// `graph.rs`'s real `spawn_blocking` call site, without needing that
+    /// node's much heavier `RepoRegistry`/roadmap-dir/lane-chain setup.
+    struct SpawnBlockingEventNode;
+
+    #[async_trait::async_trait]
+    impl Node for SpawnBlockingEventNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            let current_span = tracing::Span::current();
+            let current_dispatch = tracing::dispatcher::get_default(|d| d.clone());
+            tokio::task::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&current_dispatch, || {
+                    let _guard = current_span.enter();
+                    tracing::info!(marker = "blocking-ran", "emitted inside spawn_blocking");
+                });
+            })
+            .await
+            .map_err(|err| NodeError::new(format!("blocking task panicked: {err}")))?;
+
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "SpawnBlockingEventNode"
+        }
+    }
+
+    /// The sibling to [`SpawnBlockingEventNode`] with the propagation
+    /// DELIBERATELY omitted — neither the span nor the dispatcher is
+    /// carried across the `spawn_blocking` boundary. This is what proves
+    /// the positive test below is actually sensitive to the fix rather
+    /// than passing for an unrelated reason: without propagation, the
+    /// blocking closure's event either never reaches the test's
+    /// thread-local subscriber (no dispatcher) or reaches it with an
+    /// empty span context (no span) — either way, `run_id` comes back
+    /// absent.
+    struct SpawnBlockingEventNodeWithoutPropagation;
+
+    #[async_trait::async_trait]
+    impl Node for SpawnBlockingEventNodeWithoutPropagation {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            tokio::task::spawn_blocking(move || {
+                tracing::info!(marker = "blocking-ran-unpropagated", "no context carried");
+            })
+            .await
+            .map_err(|err| NodeError::new(format!("blocking task panicked: {err}")))?;
+
+            ctx.nodes
+                .insert(self.name().to_string(), serde_json::json!({ "ran": true }));
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "SpawnBlockingEventNodeWithoutPropagation"
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_propagation_keeps_run_id_on_an_event_fired_from_the_blocking_thread() {
+        let (captured, _guard) = instrumentation::capturing();
+
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(SpawnBlockingEventNode));
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "SpawnBlockingEventNode".to_string(),
+            crate::schema::NodeConfig::new("SpawnBlockingEventNode", vec![]),
+        );
+        let schema = WorkflowSchema::new("single", "SpawnBlockingEventNode", nodes);
+        let workflow = Workflow::new(registry, schema);
+
+        let run_id = Uuid::new_v4();
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: None,
+            budget: None,
+            pause_signal: None,
+            run_id: Some(run_id),
+        };
+        workflow
+            .run_with(serde_json::json!({}), on_progress, options)
+            .await
+            .expect("run should succeed");
+
+        let events = captured.snapshot();
+        let blocking_event = events
+            .iter()
+            .find(|f| f.get("marker").map(String::as_str) == Some("blocking-ran"))
+            .expect(
+                "the spawn_blocking closure's event must have reached the test subscriber \
+                 via the propagated dispatcher",
+            );
+
+        assert_eq!(
+            blocking_event.get("run_id").map(String::as_str),
+            Some(run_id.to_string().as_str())
+        );
+        assert_eq!(
+            blocking_event.get("node").map(String::as_str),
+            Some("SpawnBlockingEventNode")
+        );
+    }
+
+    /// The negative control for the test above: proves the positive
+    /// assertion is actually exercising the propagation fix, not merely
+    /// something that would pass regardless. WITHOUT the span/dispatcher
+    /// carried across `spawn_blocking`, the blocking closure's event never
+    /// reaches this thread-local test subscriber at all (no propagated
+    /// dispatcher), so nothing with `marker == "blocking-ran-unpropagated"`
+    /// is ever captured — exactly the "silently-empty" failure mode this
+    /// task exists to prevent, caught here rather than assumed.
+    #[tokio::test]
+    async fn without_propagation_the_blocking_events_context_is_lost() {
+        let (captured, _guard) = instrumentation::capturing();
+
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(SpawnBlockingEventNodeWithoutPropagation));
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "SpawnBlockingEventNodeWithoutPropagation".to_string(),
+            crate::schema::NodeConfig::new("SpawnBlockingEventNodeWithoutPropagation", vec![]),
+        );
+        let schema =
+            WorkflowSchema::new("single", "SpawnBlockingEventNodeWithoutPropagation", nodes);
+        let workflow = Workflow::new(registry, schema);
+
+        let run_id = Uuid::new_v4();
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+        let options = RunOptions {
+            cancellation_token: None,
+            budget: None,
+            pause_signal: None,
+            run_id: Some(run_id),
+        };
+        workflow
+            .run_with(serde_json::json!({}), on_progress, options)
+            .await
+            .expect("run should succeed");
+
+        let events = captured.snapshot();
+        assert!(
+            !events
+                .iter()
+                .any(|f| f.get("marker").map(String::as_str) == Some("blocking-ran-unpropagated")),
+            "an event fired without span/dispatcher propagation should never reach the \
+             thread-local test subscriber set on the ORIGINAL thread — this pins the exact \
+             failure mode the propagation fix in graph.rs's spawn_blocking call site prevents"
+        );
     }
 }

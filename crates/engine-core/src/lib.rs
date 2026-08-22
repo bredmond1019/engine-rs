@@ -31,7 +31,9 @@ pub mod workflows;
 pub use brain_root::{resolve_brain_root, resolve_brain_root_from, BrainRootError};
 pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
-pub use completion::{is_complete, stamp_completion, COMPLETION_METADATA_KEY};
+pub use completion::{
+    derive_terminal_status, is_complete, stamp_completion, COMPLETION_METADATA_KEY,
+};
 pub use dispatch::{DispatchError, Dispatcher, WorkflowFactory};
 pub use locale::{Currency, Locale};
 pub use loop_combinator::{build_loop, ExitPredicate, LoopCluster, LoopSpec};

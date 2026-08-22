@@ -50,7 +50,7 @@ WORKFLOWS = {"none", "patch", "task", "run", "flow"}
 MODELS = {"sonnet", "gemini-pro", "gemini-flash", "either"}
 
 
-def check(path):
+def check(path, planning_root="planning"):
     """Return (errors, warnings) for one record file."""
     problems = []
     warnings = []
@@ -88,9 +88,34 @@ def check(path):
     if bid and stem != bid:
         bad(f"filename stem `{stem}` != id `{bid}`")
 
+    # spec_dir: the question that matters is "does this point at a real spec", not "is the
+    # directory name canonical". `/generate-tasks` step 2 is explicit that LEGACY directories
+    # (`<phase>.<block>-<title>`, `chore-<slug>`, ...) still resolve and do not require migrating,
+    # and this checker used to contradict that by hard-failing every one of them. It cost a real
+    # run: HQ.9.A is a CLOSED block whose spec is `planning/chore-fleet-parking-pass/plan.md`, and
+    # renaming that directory to satisfy the checker would have broken nine live citations across
+    # two repos — including two that cite `plan.md:146` by line as the operator approval for 59
+    # promoted rows. Rewriting closed history to make a checker green is the wrong trade.
+    #
+    # So: a spec_dir that does not exist on disk is a real defect (a pointer to nothing) and stays
+    # an ERROR. A spec_dir that exists but is not the canonical `planning/<id>/` is a WARNING —
+    # backfill debt, the same class as an empty `files`.
     spec = b.get("spec_dir", "")
-    if bid and spec and spec != f"planning/{bid}/":
-        bad(f"spec_dir `{spec}` should be `planning/{bid}/`")
+    if bid and spec:
+        canonical = f"planning/{bid}/"
+        spec_abs = os.path.join(planning_root, os.path.relpath(spec, "planning")) \
+            if spec.startswith("planning/") else os.path.join(planning_root, spec)
+        if spec != canonical:
+            if os.path.isdir(spec_abs):
+                warn(f"spec_dir `{spec}` is legacy-named, not `{canonical}` — resolves, so not a "
+                     f"blocker; migrate only if the block is still open")
+            else:
+                bad(f"spec_dir `{spec}` does not exist and is not `{canonical}`")
+        elif not os.path.isdir(spec_abs):
+            # Canonical but absent is the normal state of a block whose spec has not been
+            # generated yet — `/generate-tasks` creates the directory. Only a NON-canonical
+            # path that also does not resolve is a genuine dangling pointer, handled above.
+            warn(f"spec_dir `{spec}` does not exist yet — run /generate-tasks {bid}")
 
     if b.get("kind") not in KINDS:
         bad(f"kind `{b.get('kind')}` not one of {sorted(KINDS)}")
@@ -194,7 +219,9 @@ def main():
                 continue
             path = os.path.join(d, name)
             total += 1
-            problems, warnings = check(path)
+            # `d` is the blocks/ dir; the repo's planning root is its parent. spec_dir values are
+            # written repo-relative as `planning/<...>/`, so resolving them needs that root, not cwd.
+            problems, warnings = check(path, planning_root=os.path.dirname(d))
             if problems:
                 failed += 1
                 print(f"FAIL {path}")
