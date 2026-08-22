@@ -35,9 +35,10 @@
 //!   `sdlc_flow::close_block::CloseBlockNode`'s job, wired in by a later
 //!   task in this spec via `CloseBlockNode::with_state_source`.
 //! - `graph` — assembles the declared `WorkflowSchema` + `NodeRegistry`
-//!   (added by a later task in this spec — this task lands as an
-//!   unreachable-but-tested module with no graph yet).
+//!   (`EN.11.N` task 6, port design T9) — the first point the graph
+//!   validates end to end and `SDLC_TASK` runs in-process.
 
+pub mod graph;
 pub mod lean_bookkeep;
 pub mod schema;
 pub mod task_triage_router;

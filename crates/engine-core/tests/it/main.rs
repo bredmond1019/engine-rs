@@ -57,6 +57,7 @@ mod sdlc_flow_run_id_terminal;
 mod sdlc_flow_task_loop;
 mod sdlc_flow_terminal_paths;
 mod sdlc_flow_write_permission;
+mod sdlc_task_e2e;
 mod structured_logging;
 mod suspend_resume;
 mod terminal_admission;
