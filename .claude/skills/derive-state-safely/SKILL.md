@@ -1,21 +1,39 @@
 ---
 name: derive-state-safely
-description: How to run `mev emit-state --write` without reverting generated boards or clobbering other lanes — why a stale installed binary silently rewrites surfaces in an old format, why installing (not merging or pushing) is the delivery boundary on this machine, the measurement embargo that bans the command outright, and the fact that it rewrites the whole corpus rather than your repo. Use BEFORE any emit-state --write, validate_brain.sh or routine.sh run, and when generated boards, focus lines or lane JSON look wrong or regressed.
+description: How to run mev's authored-state write verbs without reverting generated boards or clobbering other lanes — why every one of them re-runs emit-state --write internally, why a stale installed binary silently rewrites surfaces in an old format, why installing (not merging or pushing) is the delivery boundary on this machine, the measurement embargo, the .mev-emit.lock contention error, and the fact that a write rewrites the whole corpus rather than your repo. Use BEFORE any emit-state --write, set-block-status --write, defer-epic/resume-epic/complete-epic/sync-epics --write, close-operator-gate, approve/reject, validate_brain.sh or routine.sh run, and when generated boards, focus lines or lane JSON look wrong or regressed.
 allowed-tools: Bash(mev:*) Bash(bastion:*) Bash(cargo:*) Bash(git:*) Bash(ls:*) Bash(grep:*)
 ---
 
-# Running `emit-state --write` safely
+# Running the state writers safely
 
 > **Paths below are relative to the brain root** — the directory containing `brain.toml`, found by
 > walking up from wherever you are. This skill is synced into every repo, so a repo-relative link
 > would be wrong in most of them.
 
-This is the fleet's one **destructive** routine command. It rewrites generated surfaces across every
-repo from authored state. Run it with a stale binary and it rewrites them in an **older format** —
-that is a silent regression, not an error.
+`emit-state --write` is the fleet's **destructive** routine command. It rewrites generated surfaces
+across every repo from authored state. Run it with a stale binary and it rewrites them in an
+**older format** — that is a silent regression, not an error.
 
-The same warning applies to anything that ends in it: `./scripts/validate_brain.sh` and
-`scripts/routine.sh` both call an `emit-state --write`.
+**It is not the only command that runs it.** Every authored-state write verb re-runs
+`emit-state --write` internally on success, so everything in this skill applies to all of them.
+The hazard is the write, not the command name you typed:
+
+| Command | Shape | Re-runs `emit-state --write` |
+|---|---|---|
+| `mev emit-state --write` | the write itself | — |
+| `mev set-block-status <repo:id> <status> --write` | dry-run by default | yes |
+| `mev defer-epic` · `resume-epic` · `complete-epic` · `sync-epics` (`--write`) | dry-run by default | yes |
+| `mev close-operator-gate <slug> --exit-verified` | verified-or-refused, **no dry-run** | yes |
+| `mev approve <slug> --digest <d>` · `mev reject <slug>` | digest-bound | yes |
+| `./scripts/emit_state_write.sh` · `validate_brain.sh` · `routine.sh` | wrappers | yes |
+
+So `mev set-block-status mev:MV.10.A closed --write` against a stale binary regresses boards
+fleet-wide exactly as a bare `emit-state --write` would. **There is no "small" writer** — the
+one-block verb and the whole-corpus command have the same blast radius on derived surfaces.
+
+`mev carryover`, `frontier`, `lanes`, `conformance` and every `validate-*` verb are read-only and
+exempt. `mev carryover --dispose` (`MV.ticket.carryover-dispose`) is **not** — add it to the table
+above when it ships.
 
 ## Step 1 — Rebuild first. This is not optional.
 
@@ -123,7 +141,25 @@ per-repo `--scope` filtering. The fix that actually helps is what's already in S
 authored stays per-repo, derived caches are a **convenience copy** regenerated on demand — nothing
 depends on them being co-located, so keeping them synced automatically (as above) is enough.
 
-## Step 5 — Read the run's warnings
+## Step 5 — The advisory lock, and why a worktree refuses
+
+Every authored-state writer takes an advisory lock at **`<root>/.mev-emit.lock`** before touching a
+file. This is a real mechanism, not a convention — it is what makes the "one writer at a time" rule
+in `edit-state-json` enforceable across concurrent lanes.
+
+- **Contention fails the call**: `E_EMIT_LOCK_HELD`, naming the holding pid, and **nothing is
+  written**. It is not a partial write to clean up — retry once the other lane finishes.
+- **A stale lock is reclaimed automatically** when its owning pid is no longer alive, so a crashed
+  run does not wedge the fleet. Do not delete the lock file by hand to "unstick" things; if a live
+  pid holds it, that lane is mid-write and you would be racing it.
+- **Dry-run never takes the lock**, so the default (no `--write`) form of any verb is always safe to
+  run alongside another lane.
+
+**`close-operator-gate` and `approve` refuse to run from inside a linked git worktree.** The SDLC
+engines run in worktrees, so this is the common case, not the exotic one: a gate-clearing verb
+invoked mid-block fails rather than writing. Run it from the main tree.
+
+## Step 6 — Read the run's warnings
 
 - `I_EMIT_WROTE` — informational, one per surface written. This is your blast-radius list; read it.
 - `W_EMIT_NO_SENTINEL` — a target has no `<!-- BEGIN generated:… -->` sentinel pair, so the emit was
@@ -133,8 +169,15 @@ depends on them being co-located, so keeping them synced automatically (as above
 
 ## Checklist
 
+Applies to **every** verb in the table at the top, not only a bare `emit-state --write`.
+
 - [ ] `mev conformance --check toolchain-freshness` passes, or both binaries were reinstalled
 - [ ] No measurement block is live
+- [ ] Ran the dry-run form first where the verb has one (everything except `close-operator-gate`
+      and `approve`), and the planned change is what you meant
+- [ ] `E_EMIT_LOCK_HELD` treated as "another lane is mid-write, retry" — never by deleting
+      `.mev-emit.lock`
+- [ ] Gate-clearing verbs (`close-operator-gate`, `approve`) run from the main tree, not a worktree
 - [ ] Block statuses authored **before** the run, not after
 - [ ] Blast radius read from the `I_EMIT_WROTE` lines
 - [ ] Ran via `./scripts/emit_state_write.sh` (or `validate_brain.sh`, which delegates to it) —

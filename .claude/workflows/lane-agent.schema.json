@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-portfolio/base-template/lane-agent.schema.json",
+  "title": "Lane Agent Registry Claim",
+  "description": "One running lane's addressable identity, claimed at /begin-orchestration Step 4 and released at lane close. Exists because ListAgents returns auto-generated session nicknames that are unstable across restart and carry no repo, lane or roadmap — measured live 2026-08-21 (engine-rs-5b, mev-d8, agentic-portfolio-d9, base-template-b6, okf-core-d0, bastion-c4, 11 peers total) — so a lane cannot be addressed by role ('whoever is driving mev's autonomous-foundation lane') without a record like this. Sibling to lane.schema.json and block.schema.json. This block ships the shape, checker and read helpers only; writing claims is BT.6.E.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "agent_name",
+    "repo",
+    "lane",
+    "roadmap",
+    "started_at",
+    "heartbeat"
+  ],
+  "properties": {
+    "agent_name": {
+      "type": "string",
+      "description": "The ListAgents nickname this agent is currently reachable at (e.g. 'base-template-b6'). Recorded here specifically because it is unstable across restart and carries no repo/lane/roadmap on its own — this record is what turns a volatile nickname into an addressable, restart-surviving identity for the lane.",
+      "minLength": 1
+    },
+    "repo": {
+      "type": "string",
+      "description": "Repo slug this lane is driving, as registered in brain.toml. Lets a caller filter claims down to 'who is working in this repo right now'.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "lane": {
+      "type": "string",
+      "description": "The lane's name/slug, matching the <name> in its lane-<name>.json record (lane.schema.json). Lets a caller address 'whoever is driving lane X', independent of which agent nickname currently holds it.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "roadmap": {
+      "type": "string",
+      "description": "Slug of the owning roadmap directory this lane runs under. Disambiguates the same lane name reused across different roadmaps.",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp with timezone marking when this agent claimed the lane. Fixed for the life of the claim; distinguishes 'how long has this lane been running' from heartbeat's 'is it still alive'.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "heartbeat": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp with timezone, updated periodically while the agent is alive. The staleness signal: a heartbeat older than the checker's threshold is how BT.6.D detects an abandoned lane versus a merely slow one, once joined against ListAgents liveness.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    }
+  }
+}
