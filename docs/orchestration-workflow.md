@@ -94,7 +94,7 @@ current corpus at the time it's cited, and that re-measurement is out of scope f
 | Resolve | `chain.rs` | Turns a (roadmap, lane) pair or an explicit block list into ordered `(repo, block_id)` steps. Reads mev's structured `HELD-UNTIL` / `BUDGET` / `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json` — it does not re-derive segments. |
 | Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** (backed by `corpus_gates.rs`, which reads each repo's real `planning/state.json` through `okf_core::load_state`) and refuses to start a block with an unmet edge, naming the edge and its repo. `DependencyEdge` is an enum — `Block` · `Operator { slug }` · `Approval { slug }` · `External { what }` — so an **operator gate is always unmet while present** and clears only by removal from the corpus (mev is the single writer); the engine can never self-clear one. Also reads mev's `lane-frontier.json` for lane-head startability, but `startable: true` never short-circuits the per-edge check. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail, and a block parked on an operator hold releases its permit rather than starving the ceiling. |
 | Execute | `execute.rs` | Builds and runs a **fresh in-process Rust `Workflow`** for whichever engine the block's own authored `sdlc_workflow` field names — `SDLC_FLOW` or `SDLC_TASK` — with the repo resolved through `RepoRegistry` and `event.repo` seeded. An unsupported or absent `sdlc_workflow` value errors (see above). |
-| Integrate | `integrate.rs` | Verifies the state write after the engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. Appends exactly one `lane-log.jsonl` line per step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
+| Integrate | `integrate.rs` | Verifies the state write after the engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. Before each block, re-checks the run's `cancellation_token` and a campaign-scoped `CampaignLedger` against an optional `campaign_budget` ceiling (`EN.11.F`) — both checked again at every block boundary, not just once at the start. Appends exactly one `lane-log.jsonl` line per step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held` \| `cancelled` \| `budget_halted`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
 
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
 an authored snapshot and has been wrong; the `depends_on` edges are the fact.
@@ -105,6 +105,14 @@ Exactly one line per integrated block — not zero, not two. The log is the cros
 missing or duplicated line is how a sibling lane reads the wrong state. The roadmap directory is
 resolved by the two-location rule (`planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`;
 a slug present in both is an error, never a silent preference).
+
+A clean abort, a budget halt, and a node/state-write failure are three distinguishable terminal
+states in that log, not one undifferentiated stop (`EN.11.F`): a chain halted by
+`POST /campaigns/{id}/abort` (an explicit human request) appends a `cancelled` line; a chain
+halted because the campaign-scoped `CampaignLedger` tripped its `Budget` ceiling appends a
+`budget_halted` line naming the tripped cap; either way, blocks already integrated keep their
+`closed` line and no block still running or not yet started is touched. See "Campaign identity"
+below for how a campaign's abort token and cost/token ceiling are threaded through a chain.
 
 ## Campaign identity
 
@@ -122,6 +130,12 @@ live or completed — carrying the given `campaign_id` (via `LiveStateStore::lis
 rolls up their cost/tokens from the parent run's `campaign_members` entry. See `docs/architecture.md`
 (HTTP surface, `LiveStateStore`) for the endpoint and store shape, and `docs/data-contract.md` §8 for
 the canonical wire shape.
+
+`POST /campaigns/{id}/abort` (`engine-serve`, `EN.11.F` task 2) gives a human a way to stop a whole
+campaign — every block in the chain, not just the block currently running. A campaign-scoped
+`CancellationToken`, registered in `CampaignRegistry` under the campaign's id, is what
+`integrate.rs`'s per-boundary check (above) observes. See `docs/architecture.md`'s "Campaign abort
+endpoint" entry for the route contract.
 
 ## Policy
 
