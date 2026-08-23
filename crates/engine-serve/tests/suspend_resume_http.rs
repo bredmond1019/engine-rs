@@ -97,14 +97,15 @@ fn single_success_schema(workflow_type: &str) -> WorkflowSchema {
 }
 
 fn app_state_with(dispatcher: Dispatcher) -> AppState {
-    AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(None),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: API_KEY.to_string(),
-    }
+    AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(None),
+        API_KEY.to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build()
 }
 
 /// A dispatcher with a single `SuspendNode(enabled: true) -> MarkerNode`

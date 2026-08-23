@@ -171,14 +171,15 @@ fn test_app_state() -> AppState {
         Box::new(|_event: &serde_json::Value| Ok(fixture_workflow())),
     );
 
-    AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(None),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: "schedule-test-key".to_string(),
-    }
+    AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(None),
+        "schedule-test-key".to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build()
 }
 
 fn schedule_entry() -> ScheduleEntry {
@@ -350,14 +351,15 @@ fn test_app_state_with_recorder() -> (AppState, Arc<StdMutex<Vec<serde_json::Val
         }),
     );
 
-    let state = AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(None),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: "schedule-loop-test-key".to_string(),
-    };
+    let state = AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(None),
+        "schedule-loop-test-key".to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build();
     (state, recorded)
 }
 

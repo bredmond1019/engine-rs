@@ -163,14 +163,15 @@ async fn resume_after_simulated_restart_rehydrates_from_postgres() {
         .expect("failed to connect to DATABASE_URL");
 
     let dispatcher = dispatcher_with_suspend_fixture(WORKFLOW_TYPE);
-    let state = AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(Some(pool.clone())),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: API_KEY.to_string(),
-    };
+    let state = AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(Some(pool.clone())),
+        API_KEY.to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build();
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(state))
@@ -307,14 +308,15 @@ async fn resume_against_a_row_with_a_malformed_suspension_marker_is_404_not_a_pa
     // never held this run" case; the only path that can answer at all is
     // `rehydrate_from_store`.
     let dispatcher = dispatcher_with_suspend_fixture(WORKFLOW_TYPE);
-    let state = AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(Some(pool.clone())),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: API_KEY.to_string(),
-    };
+    let state = AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(Some(pool.clone())),
+        API_KEY.to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build();
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(state))

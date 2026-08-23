@@ -139,14 +139,15 @@ fn two_node_schema(workflow_type: &str, first: &str, second: &str) -> WorkflowSc
 }
 
 fn app_state_with(dispatcher: Dispatcher) -> AppState {
-    AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(None),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: API_KEY.to_string(),
-    }
+    AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(None),
+        API_KEY.to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build()
 }
 
 /// Fetch `GET /events/{event_id}` against `app` and return `(status, body)`.

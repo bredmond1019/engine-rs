@@ -93,14 +93,15 @@ fn test_app_state() -> AppState {
         Box::new(|_event: &serde_json::Value| Ok(fixture_workflow())),
     );
 
-    AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(None),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: "integration-test-key".to_string(),
-    }
+    AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(None),
+        "integration-test-key".to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build()
 }
 
 /// (a) Triggering the fixture workflow through `POST /events/` records live
@@ -316,14 +317,15 @@ fn test_app_state_with_real_sdlc_flow() -> AppState {
     let mut dispatcher = Dispatcher::new();
     engine_serve::workflows::register_sdlc_flow(&mut dispatcher);
 
-    AppState {
-        dispatcher: Arc::new(dispatcher),
-        live: LiveStateStore::new(),
-        durable: spawn_durable_writer(None),
-        runs: RunRegistry::new(),
-        campaigns: engine_serve::abort::CampaignRegistry::new(),
-        api_key: "integration-test-key".to_string(),
-    }
+    AppState::builder(
+        Arc::new(dispatcher),
+        LiveStateStore::new(),
+        spawn_durable_writer(None),
+        "integration-test-key".to_string(),
+    )
+    .runs(RunRegistry::new())
+    .campaigns(engine_serve::abort::CampaignRegistry::new())
+    .build()
 }
 
 /// A tempdir "brain root" with a single `[[repos]]` entry (`alpha`) whose
