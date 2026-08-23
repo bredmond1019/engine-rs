@@ -6,7 +6,7 @@ doc_id: suspend-resume
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [suspend, resume, pause, walk-pointer, rehydration, approval-gate]
+keywords: [suspend, resume, pause, walk-pointer, rehydration, approval-gate, checkpoint, crash-recovery, campaign]
 related: [architecture, data-contract, D6-cancellation-and-budget-semantics]
 ---
 
@@ -155,9 +155,92 @@ routes and the status vocabulary (`pausing` → `suspended` → `running`), plus
 suspended run to `Pending` today — that is deferred, not a bug; `bastion` has not yet been taught
 the `suspended` status this block introduces.
 
+## Campaign-level crash recovery (`EN.11.H`)
+
+Everything above this section is `EN.6.F`'s **single-run** suspend/resume: a `Workflow` that
+suspended itself at a named node and is rehydrated by `resume_run`. A crashed **campaign**
+(`kill -9` mid-chain, of the kind `/orchestrate` drives) is a different shape of problem: the
+`ORCHESTRATION` workflow runs its whole chain inside one blocking `Node::process` call
+(`graph::OrchestrationRunNode::process`, via `integrate::integrate_chain`), so there is no
+suspended `TaskContext` to rehydrate when the process dies — it simply stops existing, mid-loop,
+with nothing durable recording how far it got beyond what `integrate_chain` had already written.
+
+### The checkpoint
+
+`engine_core::workflows::orchestration::checkpoint` gives each campaign one on-disk record:
+`<roadmap_dir>/checkpoint-<campaign_id>.json` — the same `roadmap_dir` `lane-log.jsonl` already
+lives in, not a new root; the filename embeds the campaign id so concurrent campaigns against the
+same roadmap never collide. A `Checkpoint` is keyed by `campaign_id` and holds a `Vec<CheckpointStep>`
+in chain order, one entry per step the chain has reached, each recording:
+
+- `repo` and `block_id` — which block this step is
+- `index` — the step's 1-based position in the chain
+- `integrated` — whether the step's `SDLC_FLOW` run finished and its `lane-log.jsonl` line was
+  appended (a step recorded with `integrated: false` had its branch created but never finished)
+- `branch` — the branch name that step's run created, if any, so a resume never re-creates it
+
+Writes are atomic (temp file + rename): a reader can only ever observe the previous complete
+checkpoint or the new one, never a torn write from the very crash the checkpoint exists to survive.
+A missing checkpoint file reads as `ReadCheckpoint::Absent`, never an error — a campaign that has
+never crossed a block boundary has no checkpoint, and that is the expected first-run state, not a
+failure.
+
+`integrate_chain` writes the checkpoint immediately after it appends each step's `lane-log.jsonl`
+line (never before) — so a crash between the two leaves the lane log ahead of the checkpoint, and a
+resume can tolerate a checkpoint that is one step behind the log, but must never skip a block the
+checkpoint has no record of.
+
+### Resume restarts at a block boundary, never mid-block
+
+`plan_campaign_resume` (`crates/engine-serve/src/resume.rs`) reads the checkpoint, counts the steps
+recorded as `integrated`, and treats that count as the 0-based index of the first step **not** yet
+done — the "N+1" a resume restarts at. It returns one of:
+
+- `NoCheckpoint` — nothing to act on (no-op, clear message)
+- `AlreadyComplete` — the checkpoint already covers the whole chain (no-op, clear message)
+- `Aborted { block_id }` — the campaign was stopped on purpose, not by a crash (refused, see below)
+- `Plan { resume_at_index, remaining }` — the chain sliced to just the steps still to run
+
+Resume never re-runs an already-integrated step and never re-slices a step's own internal progress:
+a step that was mid-flight when the crash happened restarts from that block's own beginning, not
+from wherever inside it the crashed attempt had reached. This matches `EN.11.F`'s abort
+semantics — both stop, and both resume (where resume applies), only at a chain's block boundaries.
+Mid-block resume is explicitly out of scope.
+
+Before re-dispatching the resumed-at block, `reconcile_stale_branch` best-effort removes the
+worktree and branch (`sdlc/<block_id>`) a crashed attempt at that block may have left behind,
+mirroring `SetupWorktreeNode`'s own naming so it clears exactly what a fresh run would otherwise
+collide with. It never fails the resume itself — a crashed attempt may have left nothing there at
+all, and reconciliation exists only to clear the way, never to become a new reason resume fails.
+
+### Aborted vs. crashed
+
+An operator abort (`EN.11.F`) and a tripped campaign budget both look, on the surface, like a
+crash — a chain that stopped before its last step. They are told apart by how `integrate_chain`
+itself stopped: a deliberate stop always appends a `Cancelled` or `BudgetHalted` line to
+`lane-log.jsonl` naming the block that never started; a `kill -9` crash writes **nothing** for that
+block, because the process died before it had the chance. `plan_campaign_resume` checks the last
+lane-log line for the block it would resume at — if it is `Cancelled`/`BudgetHalted`, this was
+deliberate and resume refuses it (`Aborted`); otherwise it proceeds. This is what keeps an aborted
+campaign and a crashed one distinguishable: resume must never restart a campaign the operator
+stopped on purpose.
+
+### Out of scope
+
+- **Open GitHub PRs.** A crashed run's branches may have open PRs against them; the checkpoint
+  records the branch, but resume does not close, reuse, or otherwise touch any PR on GitHub — that
+  reconciliation is a separate, later call.
+- **Multi-host / two-clone recovery.** Single-host is a stated invariant for this block: the
+  checkpoint and lane log are read from the same filesystem `resume` runs on. Recovering a campaign
+  whose crashed attempt ran on a different host or clone is explicitly cut.
+
 ## See also
 
 - [architecture.md](architecture.md) — module map entries for `engine-core/src/suspend.rs`,
   `engine-core/src/nodes/suspend.rs`, `engine-serve/src/suspend.rs`, `engine-serve/src/resume.rs`.
 - [data-contract.md](data-contract.md) — the three routes' HTTP-surface-parity entries and the
   `metadata.suspension` changelog row.
+- `engine-core/src/workflows/orchestration/checkpoint.rs` — the per-campaign checkpoint type,
+  its atomic writer, and its reader (`EN.11.H` task 1).
+- `engine-serve/src/resume.rs`'s campaign section — `plan_campaign_resume` and
+  `reconcile_stale_branch` (`EN.11.H` task 4).
