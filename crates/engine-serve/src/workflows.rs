@@ -336,6 +336,96 @@ pub fn register_sdlc_flow_with_registry(
     );
 }
 
+/// Register the `SDLC_TASK` workflow (`engine_core::workflows::sdlc_task`,
+/// `EN.11.N`/`EN.11.O`) with `dispatcher`, mirroring
+/// [`register_sdlc_flow`]/[`register_sdlc_flow_with_registry`] structurally:
+/// same policy-aware factory shape, same `EN.3.K` repo-registry seam, same
+/// re-registration of `SetupWorktreeNode` for the served path. Delegates to
+/// [`register_sdlc_task_with_registry`] using whatever repo registry is
+/// currently installed via [`repo_registry`].
+///
+/// `EN.11.P` task 3: this is the block record's T10 — SDLC_TASK gains no
+/// new registration *shape*, only a second instance of the same one.
+pub fn register_sdlc_task(dispatcher: &mut Dispatcher) {
+    register_sdlc_task_with_registry(dispatcher, repo_registry());
+}
+
+/// Register the `SDLC_TASK` workflow with an explicit repo registry
+/// (`EN.3.K`), bypassing the process-global seam — the entry point tests
+/// use to install a tempdir registry with no `ENGINE_BRAIN_ROOT` race.
+///
+/// Per event: parses `SdlcTaskEventSchema`, resolves the run's target root
+/// (absent `repo` -> `current_dir()`, present `repo` -> resolved through
+/// `repo_reg`, erroring by name rather than silently falling back — the
+/// same contract [`engine_core::workflows::sdlc_flow::setup::resolve_target_root`]
+/// gives `SDLC_FLOW`, reproduced here by hand because that helper is typed
+/// to `SDLCFlowEventSchema` specifically), builds a
+/// `PolicyConfigSource::Worktree` over it, resolves `SdlcTaskPolicy` via
+/// `sdlc_task::profiles::resolve_policy_for_run_from`, and builds
+/// `sdlc_task::graph::registry_for_policy(&policy)`.
+///
+/// When a registry is installed, this re-registers `SetupWorktreeNode` —
+/// **chaining `.with_branch_prefix("task/")` and
+/// `sdlc_task::graph::sdlc_task_policy_resolver()` exactly as
+/// `sdlc_task::graph::registry()` does**, not just `.with_registry(reg)`
+/// alone: `SetupWorktreeNode::new()` resets both to `sdlc_flow`'s
+/// defaults (the `"sdlc/"` prefix and `sdlc_flow`'s own policy section), so
+/// a bare `.with_registry(reg)` here would silently strip SDLC_TASK's
+/// branch prefix and its `harness.json` section the moment a repo registry
+/// is installed — exactly the served-vs-in-process divergence this
+/// function exists to avoid.
+pub fn register_sdlc_task_with_registry(
+    dispatcher: &mut Dispatcher,
+    repo_reg: Option<Arc<RepoRegistry>>,
+) {
+    dispatcher.register(
+        engine_core::workflows::sdlc_task::graph::schema(),
+        Box::new(move |event: &serde_json::Value| {
+            let ctx = event_only_context(event);
+            let sdlc_task_event: engine_core::workflows::sdlc_task::schema::SdlcTaskEventSchema =
+                serde_json::from_value(event.clone())
+                    .map_err(|err| format!("invalid SDLC_TASK event: {err}"))?;
+            // Hand-mirrors `sdlc_flow::setup::resolve_target_root` — see
+            // this function's doc for why it cannot be called directly
+            // (it is typed to `SDLCFlowEventSchema`).
+            let root = match sdlc_task_event.repo.as_deref() {
+                Some(slug) => {
+                    let registry = repo_reg.as_deref().ok_or_else(|| {
+                        format!(
+                            "SDLC_TASK event named repo slug '{slug}' but no repo registry is \
+                             available to resolve it"
+                        )
+                    })?;
+                    registry.resolve(slug).map_err(|err| err.to_string())?
+                }
+                None => std::env::current_dir()
+                    .map_err(|err| format!("failed to resolve current_dir(): {err}"))?,
+            };
+            let source = PolicyConfigSource::Worktree(root);
+            let policy = engine_core::workflows::sdlc_task::profiles::resolve_policy_for_run_from(
+                &ctx, &source,
+            )
+            .map_err(|err| err.to_string())?;
+            let mut registry =
+                engine_core::workflows::sdlc_task::graph::registry_for_policy(&policy);
+            if let Some(reg) = repo_reg.clone() {
+                registry.register(Box::new(
+                    SetupWorktreeNode::new()
+                        .with_registry(reg)
+                        .with_branch_prefix("task/")
+                        .with_policy_resolver(
+                            engine_core::workflows::sdlc_task::graph::sdlc_task_policy_resolver(),
+                        ),
+                ));
+            }
+            let seeded = seed_resolved_policy(&policy)?;
+            Workflow::new_validated(registry, engine_core::workflows::sdlc_task::graph::schema())
+                .map(|workflow| workflow.with_seeded_nodes(seeded))
+                .map_err(|err| err.to_string())
+        }),
+    );
+}
+
 /// Register the `RESEARCH_AGENT` workflow (`engine_core::workflows::research_agent`)
 /// with `dispatcher`, populating both the `workflow_registry` (via a
 /// policy-aware factory built on `research_agent::graph::registry_for_policy`)
@@ -867,33 +957,41 @@ pub fn register_orchestration_with_registry(
 }
 
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
-/// `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
+/// `SDLC_TASK`, `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`,
 /// `HARVEST_APPROVE`, `LEAD_INGEST`, `APPROVE_AND_RUN`, `TERMINAL_PROBE`,
 /// and `ORCHESTRATION`; future builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
 /// this with exactly one argument (`../bastion/src/serve/mod.rs:61`) and
-/// this spec cannot edit that separate repo. `SDLC_FLOW`'s repo registry
-/// (EN.3.K) is threaded through the process-global seam ([`repo_registry`])
-/// rather than a new parameter here; see
-/// [`register_builtin_workflows_with_registry`] for the explicit-registry
-/// entry point.
+/// this spec cannot edit that separate repo. `SDLC_FLOW`'s and
+/// `SDLC_TASK`'s repo registry (EN.3.K) is threaded through the
+/// process-global seam ([`repo_registry`]) rather than a new parameter
+/// here; see [`register_builtin_workflows_with_registry`] for the
+/// explicit-registry entry point.
 pub fn register_builtin_workflows(dispatcher: &mut Dispatcher) {
     register_builtin_workflows_with_registry(dispatcher, repo_registry());
 }
 
 /// Register every builtin workflow with an explicit repo registry (EN.3.K)
-/// for `SDLC_FLOW`, bypassing the process-global seam. Every other builtin
-/// workflow is unaffected by `repo` (they resolve `PolicyConfigSource::Builtin`
-/// or no policy at all) and registers exactly as [`register_builtin_workflows`]
-/// does. Test entry point: installs a tempdir registry with no
-/// `ENGINE_BRAIN_ROOT` race instead of relying on the process-global.
+/// for `SDLC_FLOW` and `SDLC_TASK`, bypassing the process-global seam.
+/// Every other builtin workflow is unaffected by `repo` (they resolve
+/// `PolicyConfigSource::Builtin` or no policy at all) and registers
+/// exactly as [`register_builtin_workflows`] does. Test entry point:
+/// installs a tempdir registry with no `ENGINE_BRAIN_ROOT` race instead of
+/// relying on the process-global.
+///
+/// `EN.11.P` task 3: `repo_reg` is cloned for `SDLC_FLOW`'s registration
+/// rather than moved, because `SDLC_TASK`'s registration right after it
+/// needs the same `Option<Arc<RepoRegistry>>` — verified at this call
+/// site: without the `.clone()` the second call would not compile
+/// ("use of moved value").
 pub fn register_builtin_workflows_with_registry(
     dispatcher: &mut Dispatcher,
     repo_reg: Option<Arc<RepoRegistry>>,
 ) {
-    register_sdlc_flow_with_registry(dispatcher, repo_reg);
+    register_sdlc_flow_with_registry(dispatcher, repo_reg.clone());
+    register_sdlc_task_with_registry(dispatcher, repo_reg);
     register_research_agent(dispatcher);
     register_diagnostic_intake(dispatcher);
     register_proposal_generator(dispatcher);
@@ -1092,6 +1190,245 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("SDLC_FLOW"));
+    }
+
+    // --- SDLC_TASK registration (EN.11.P task 3) ----------------------------
+
+    #[test]
+    fn register_sdlc_task_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_sdlc_task(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("SDLC_TASK"));
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_sdlc_task() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("SDLC_TASK"));
+    }
+
+    #[test]
+    fn sdlc_task_resolve_schema_matches_sdlc_task_graph_schema() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("SDLC_TASK")
+            .expect("SDLC_TASK schema should resolve");
+
+        assert_eq!(*schema, engine_core::workflows::sdlc_task::graph::schema());
+    }
+
+    #[test]
+    fn sdlc_task_dispatch_yields_a_runnable_workflow() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_TASK", &serde_json::json!({ "spec_slug": "my-spec" }))
+            .expect("SDLC_TASK should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn sdlc_task_dispatch_with_event_fails_loudly_on_unknown_profile() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task(&mut dispatcher);
+
+        let result = dispatcher.dispatch_with_event(
+            "SDLC_TASK",
+            &serde_json::json!({ "spec_slug": "my-spec", "profile": "not-a-real-profile" }),
+        );
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("not-a-real-profile"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn sdlc_task_dispatch_with_no_registry_installed_still_dispatches_a_runnable_workflow() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task_with_registry(&mut dispatcher, None);
+
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_TASK", &serde_json::json!({ "spec_slug": "my-spec" }))
+            .expect("SDLC_TASK should dispatch to a runnable Workflow with no registry installed");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn sdlc_task_dispatch_with_repo_resolves_policy_against_the_repos_own_harness_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(alpha.join("planning")).expect("mkdir alpha/planning");
+        std::fs::write(
+            alpha.join("planning").join("harness.json"),
+            serde_json::json!({ "sdlc_task": { "policy": { "max_attempts": 4 } } }).to_string(),
+        )
+        .expect("write harness.json");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n",
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task_with_registry(&mut dispatcher, Some(registry));
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "SDLC_TASK",
+                &serde_json::json!({ "spec_slug": "my-spec", "repo": "alpha" }),
+            )
+            .expect("SDLC_TASK should dispatch when repo resolves via the installed registry");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn sdlc_task_dispatch_with_unknown_repo_slug_fails_loudly_naming_the_slug() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n",
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task_with_registry(&mut dispatcher, Some(registry));
+
+        let result = dispatcher.dispatch_with_event(
+            "SDLC_TASK",
+            &serde_json::json!({ "spec_slug": "my-spec", "repo": "not-a-repo" }),
+        );
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("not-a-repo"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    /// The move-check (block record + task 3 doc comment): confirms the
+    /// served `SDLC_TASK` registry actually carries the `"task/"` branch
+    /// prefix and the `EN.3.K` repo registry after re-registration — not
+    /// just that dispatch succeeds. Runs the real workflow (real `git`,
+    /// against a fresh tempdir repo resolved through the installed
+    /// registry, never the process cwd) and cancels the run right after
+    /// `SetupWorktreeNode` completes, so only that one node's output is
+    /// inspected.
+    #[tokio::test]
+    async fn sdlc_task_served_setup_worktree_node_keeps_task_branch_prefix_and_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(&alpha).expect("mkdir alpha");
+        // `SetupWorktreeNode` (unmodified `sdlc_flow` machinery, reused
+        // as-is) checks out `origin/main` even on the run-in-place path —
+        // so this fixture needs a real commit and an `origin/main` ref for
+        // `git checkout -B task/my-spec origin/main` to resolve against,
+        // not just an empty `git init`.
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&alpha)
+                .status()
+                .unwrap_or_else(|err| panic!("git {args:?} should spawn: {err}"));
+            assert!(status.success(), "git {args:?} must succeed for this test");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(alpha.join("README.md"), "fixture\n").expect("write README");
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        run_git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n",
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task_with_registry(&mut dispatcher, Some(registry));
+
+        let event = serde_json::json!({ "spec_slug": "my-spec", "repo": "alpha" });
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_TASK", &event)
+            .expect("SDLC_TASK should dispatch to a runnable Workflow");
+
+        let token = engine_core::CancellationToken::new();
+        let cancel_token = token.clone();
+        let on_progress: engine_core::OnProgress<'_> = Box::new(move |ctx| {
+            if ctx
+                .node_runs
+                .get("SetupWorktreeNode")
+                .is_some_and(|run| run.status == engine_contract::NodeRunStatus::Success)
+            {
+                cancel_token.cancel();
+            }
+        });
+        let options = engine_core::RunOptions {
+            cancellation_token: Some(token),
+            budget: None,
+            pause_signal: None,
+            run_id: None,
+        };
+
+        let ctx = workflow
+            .run_with(event, on_progress, options)
+            .await
+            .expect("run should not error — it halts via cancellation");
+
+        let result = ctx
+            .nodes
+            .get("SetupWorktreeNode")
+            .expect("SetupWorktreeNode should have produced output before cancellation");
+        assert_eq!(
+            result["branch_name"], "task/my-spec",
+            "served SDLC_TASK registration must keep the task/ branch prefix"
+        );
+        assert_eq!(
+            ctx.node_runs["SetupWorktreeNode"].status,
+            engine_contract::NodeRunStatus::Success,
+            "SetupWorktreeNode must have resolved the repo-registry root and succeeded"
+        );
+        assert!(
+            !ctx.node_runs.contains_key("SpecExistsRouterNode")
+                || ctx.node_runs["SpecExistsRouterNode"].status
+                    == engine_contract::NodeRunStatus::Pending,
+            "the walk must have halted before the next node ran"
+        );
+    }
+
+    #[test]
+    fn sdlc_flow_registration_and_dispatch_unchanged_alongside_sdlc_task() {
+        let mut dispatcher = Dispatcher::new();
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("SDLC_FLOW"));
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_FLOW", &serde_json::json!({ "spec_slug": "my-spec" }))
+            .expect("SDLC_FLOW should still dispatch to a runnable Workflow");
+        let _ = workflow;
     }
 
     #[test]
@@ -1687,13 +2024,14 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_workflows_registers_all_eleven_workflow_types() {
+    fn register_builtin_workflows_registers_all_twelve_workflow_types() {
         let mut dispatcher = Dispatcher::new();
 
         register_builtin_workflows(&mut dispatcher);
 
         for workflow_type in [
             "SDLC_FLOW",
+            "SDLC_TASK",
             "RESEARCH_AGENT",
             "DIAGNOSTIC_INTAKE",
             "PROPOSAL_GENERATOR",
