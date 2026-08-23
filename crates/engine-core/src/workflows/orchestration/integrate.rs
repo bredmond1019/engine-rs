@@ -203,17 +203,37 @@ pub async fn wait_for_clearance(
 /// (`wrap_up.rs`'s own `"status": "done"` convention).
 const EXPECTED_STATE_STATUS: &str = "done";
 
-/// `planning/{block_id}/sdlc/sdlc-flow-state.json` inside `repo_path` —
-/// mirrors `workflows::sdlc_flow::wrap_up::state_path_for` exactly (this
-/// module cannot import that function directly: it is private to
-/// `wrap_up.rs`), so the two must stay in lockstep by hand if that path
-/// shape ever changes.
-fn state_path_for(repo_path: &Path, block_id: &str) -> PathBuf {
+/// The status value a state file reads when its run ended on
+/// `TerminalSignal::ReconcileFailed` — `close_block`'s own skip check
+/// (`sdlc_flow::close_block`) leaves the block genuinely un-closed, and
+/// `sdlc_task::lean_bookkeep` writes this same status and SKIPS the
+/// block-status flip for the identical reason. Checked before
+/// [`EXPECTED_STATE_STATUS`] so a reconcile failure surfaces its own
+/// specific [`IntegrateError::ReconcileFailed`] rather than the generic
+/// [`IntegrateError::StateWriteMismatch`].
+const RECONCILE_FAILED_STATE_STATUS: &str = "reconcile_failed";
+
+/// `planning/{block_id}/sdlc/{filename}` inside `repo_path`, where
+/// `filename` is `sdlc_flow::DEFAULT_STATE_FILENAME`
+/// (`"sdlc-flow-state.json"`) for [`EngineKind::Flow`] and
+/// `sdlc_task::DEFAULT_STATE_FILENAME` (`"sdlc-task-state.json"`) for
+/// [`EngineKind::Task`] — mirrors `workflows::sdlc_flow::wrap_up::
+/// state_path_for` (and, for the task engine, the equivalent sdlc_task
+/// writer) by hand: this module cannot import either directly, since both
+/// are private to their own module. The two engines write distinct state
+/// filenames so a spec driven by one engine never collides with a run of
+/// the other against the same `planning/<slug>/` directory — keep this
+/// mirror in lockstep with both if either path shape ever changes.
+fn state_path_for(repo_path: &Path, block_id: &str, engine: EngineKind) -> PathBuf {
+    let filename = match engine {
+        EngineKind::Flow => crate::workflows::sdlc_flow::DEFAULT_STATE_FILENAME,
+        EngineKind::Task => crate::workflows::sdlc_task::DEFAULT_STATE_FILENAME,
+    };
     repo_path
         .join("planning")
         .join(block_id)
         .join("sdlc")
-        .join("sdlc-flow-state.json")
+        .join(filename)
 }
 
 /// Read the state file `outcome`'s block should have written and confirm
@@ -243,7 +263,7 @@ fn state_path_for(repo_path: &Path, block_id: &str) -> PathBuf {
 /// at all (an older run, or one written by the JS `/sdlc-flow`) still
 /// passes; only an actual disagreement fails.
 pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateError> {
-    let path = state_path_for(&outcome.repo_path, &outcome.block_id);
+    let path = state_path_for(&outcome.repo_path, &outcome.block_id, outcome.engine);
     let raw =
         std::fs::read_to_string(&path).map_err(|source| IntegrateError::StateWriteUnreadable {
             repo: outcome.repo.clone(),
@@ -259,6 +279,19 @@ pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateErr
             source,
         })?;
     let status = value.get("status").and_then(Value::as_str);
+    if status == Some(RECONCILE_FAILED_STATE_STATUS) {
+        let summary = value
+            .get("bail_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("(no bail_reason in state file)")
+            .to_string();
+        return Err(IntegrateError::ReconcileFailed {
+            repo: outcome.repo.clone(),
+            block_id: outcome.block_id.clone(),
+            path,
+            summary,
+        });
+    }
     if status != Some(EXPECTED_STATE_STATUS) {
         return Err(IntegrateError::StateWriteMismatch {
             repo: outcome.repo.clone(),
@@ -483,6 +516,20 @@ pub enum IntegrateError {
         path: PathBuf,
         found: String,
     },
+    /// The block's state file parsed with `"status"` reading
+    /// `"reconcile_failed"` — the run's `TerminalSignal::ReconcileFailed`
+    /// path (`sdlc_flow::close_block`'s / `sdlc_task::lean_bookkeep`'s
+    /// shared skip check), which deliberately SKIPS the block-status flip
+    /// because the block is genuinely not closed. TERMINAL: this STOPS
+    /// the chain (Fork 5) rather than being treated as a soft warning or
+    /// folded into [`IntegrateError::StateWriteMismatch`] — a specific
+    /// diagnostic naming the reconcile failure is the whole point.
+    ReconcileFailed {
+        repo: String,
+        block_id: String,
+        path: PathBuf,
+        summary: String,
+    },
     /// A `lane-log.jsonl` entry could not be serialized.
     LaneLogSerialize {
         block_id: String,
@@ -582,6 +629,17 @@ impl fmt::Display for IntegrateError {
                  executed block '{block_id}'",
                 path.display()
             ),
+            IntegrateError::ReconcileFailed {
+                repo,
+                block_id,
+                path,
+                summary,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') reconcile failed and is NOT closed \
+                 (state file at {} reads \"status\": \"reconcile_failed\"): {summary}",
+                path.display()
+            ),
             IntegrateError::LaneLogSerialize { block_id, source } => write!(
                 f,
                 "lane-log entry for block '{block_id}' failed to serialize: {source}"
@@ -635,6 +693,7 @@ impl std::error::Error for IntegrateError {
             IntegrateError::StateWriteMismatch { .. }
             | IntegrateError::FinalValidationGateFailed { .. }
             | IntegrateError::BlockIdMismatch { .. }
+            | IntegrateError::ReconcileFailed { .. }
             | IntegrateError::RoadmapDirNotFound { .. }
             | IntegrateError::AmbiguousRoadmapDir { .. }
             | IntegrateError::HoldDeadlineExceeded { .. } => None,
@@ -961,7 +1020,91 @@ mod tests {
         .unwrap();
     }
 
+    /// Writes a `sdlc-task-state.json` (the task engine's own filename,
+    /// never `sdlc-flow-state.json`) with the given `status`.
+    fn write_task_state(repo_path: &Path, block_id: &str, status: &str) {
+        let dir = repo_path.join("planning").join(block_id).join("sdlc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sdlc-task-state.json"),
+            json!({"status": status}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn outcome_with_engine(
+        repo_path: &Path,
+        block_id: &str,
+        engine: EngineKind,
+    ) -> ExecutionOutcome {
+        ExecutionOutcome {
+            repo: "repo-a".into(),
+            repo_path: repo_path.to_path_buf(),
+            block_id: block_id.into(),
+            engine,
+            ctx: engine_contract::TaskContext {
+                event: json!({}),
+                nodes: std::collections::HashMap::new(),
+                metadata: json!({}),
+                node_runs: std::collections::HashMap::new(),
+            },
+            use_worktree: false,
+            campaign_id: uuid::Uuid::new_v4(),
+            cost_usd: None,
+            total_tokens: 0,
+        }
+    }
+
     // ── State-write verification ────────────────────────────────────────
+
+    #[test]
+    fn state_path_for_selects_the_flow_filename_for_the_flow_engine() {
+        let path = state_path_for(Path::new("/repo"), "A.1", EngineKind::Flow);
+        assert_eq!(
+            path,
+            Path::new("/repo/planning/A.1/sdlc/sdlc-flow-state.json")
+        );
+    }
+
+    #[test]
+    fn state_path_for_selects_the_task_filename_for_the_task_engine() {
+        let path = state_path_for(Path::new("/repo"), "A.1", EngineKind::Task);
+        assert_eq!(
+            path,
+            Path::new("/repo/planning/A.1/sdlc/sdlc-task-state.json")
+        );
+    }
+
+    #[test]
+    fn a_task_state_file_reading_done_integrates_exactly_like_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        write_task_state(dir.path(), "A.1", "done");
+        let outcome = outcome_with_engine(dir.path(), "A.1", EngineKind::Task);
+        assert!(verify_state_write(&outcome).is_ok());
+    }
+
+    #[test]
+    fn a_task_state_file_reading_reconcile_failed_surfaces_reconcile_failed_not_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_task_state(dir.path(), "A.1", "reconcile_failed");
+        let outcome = outcome_with_engine(dir.path(), "A.1", EngineKind::Task);
+        let err = verify_state_write(&outcome).unwrap_err();
+        assert!(
+            matches!(err, IntegrateError::ReconcileFailed { .. }),
+            "expected ReconcileFailed, got {err:?}"
+        );
+        // Never the generic mismatch — a specific diagnostic is the point.
+        assert!(!matches!(err, IntegrateError::StateWriteMismatch { .. }));
+    }
+
+    #[test]
+    fn a_flow_state_file_reading_reconcile_failed_also_surfaces_reconcile_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_corrupted_state(dir.path(), "A.1", "reconcile_failed");
+        let outcome = outcome_with_engine(dir.path(), "A.1", EngineKind::Flow);
+        let err = verify_state_write(&outcome).unwrap_err();
+        assert!(matches!(err, IntegrateError::ReconcileFailed { .. }));
+    }
 
     #[test]
     fn state_write_verification_passes_when_status_is_done() {
