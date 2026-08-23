@@ -539,12 +539,34 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         // lookup; `write_terminal_blocked_state` is a safe no-op for a
         // non-SDLC-flow context anyway (see its doc comment), but the guard
         // makes the intent legible at this call site.
-        if !suspended && workflow_type == engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE {
+        //
+        // EN.11.P task 4: SDLC_TASK gets the same terminal-blocked-state
+        // write, using its OWN state filename
+        // (`sdlc_task::DEFAULT_STATE_FILENAME`, `"sdlc-task-state.json"`) --
+        // never the flow's. `write_terminal_blocked_state` itself is
+        // workflow-agnostic: it reads the state back via the shared
+        // `latest_state`/`SDLCState` machinery that `sdlc_task::schema`
+        // re-exports "as-is" from `sdlc_flow::schema`, so the same function
+        // works unmodified for a task-engine run -- only the target
+        // filename differs, which is exactly what task 2's engine-aware
+        // `state_path_for` also keys on. Getting this filename wrong would
+        // write a flow-named state file for a task run that `state_path_for`
+        // would then never find.
+        if !suspended
+            && (workflow_type == engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE
+                || workflow_type == engine_core::workflows::sdlc_task::graph::WORKFLOW_TYPE)
+        {
+            let state_filename =
+                if workflow_type == engine_core::workflows::sdlc_task::graph::WORKFLOW_TYPE {
+                    engine_core::workflows::sdlc_task::DEFAULT_STATE_FILENAME
+                } else {
+                    engine_core::workflows::sdlc_flow::DEFAULT_STATE_FILENAME
+                };
             if let Some(reason) = &failure_reason {
                 let _ = engine_core::workflows::sdlc_flow::wrap_up::write_terminal_blocked_state(
                     &final_ctx,
                     reason,
-                    engine_core::workflows::sdlc_flow::DEFAULT_STATE_FILENAME,
+                    state_filename,
                 );
             }
         }
