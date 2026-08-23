@@ -27,6 +27,7 @@
 //! - `--resume` on an all-passed set (zero `ImplementTaskNode` calls, exactly
 //!   one reconcile): [`resume_on_all_passed_set_reruns_only_the_reconcile`]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,6 +53,14 @@ use engine_core::workflows::sdlc_task::lean_bookkeep::LeanBookkeepNode;
 use engine_core::workflows::sdlc_task::profiles::resolve_policy_for_run_from;
 use engine_core::workflows::sdlc_task::task_triage_router::TaskTriageRouterNode;
 use engine_core::workflows::sdlc_task::DEFAULT_STATE_FILENAME;
+// `EN.11.P` task 5: the ORCHESTRATION side of the mixed `task` + `flow`
+// chain — a different subsystem from the rest of this file (which drives
+// the assembled SDLC_TASK graph in isolation), pulled in only for the
+// handful of tests at the bottom of this file per the task's file scope.
+use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
+use engine_core::workflows::orchestration::graph::{
+    OrchestrationRunNode, NODE_NAME as ORCH_NODE_NAME,
+};
 use serde_json::json;
 
 const SPEC_SLUG: &str = "fixture-task-e2e-spec";
@@ -1233,4 +1242,317 @@ async fn test_depth_full_reconcile_skip_pins_zero_calls_and_skip_reason_through_
             .contains("test_depth=full"),
         "skip_reason must name test_depth=full: {final_validation_result:?}"
     );
+}
+
+// ── EN.11.P task 5: ORCHESTRATION driving a mixed `task` + `flow` chain ────
+//
+// Everything above this point drives the assembled SDLC_TASK graph in
+// isolation, one block at a time. These three tests exercise a different
+// subsystem entirely — `orchestration::graph::OrchestrationRunNode`, which
+// drives a CHAIN of blocks, each dispatched to whichever `EngineKind` it
+// resolves to (`task` or `flow`) — and are placed in this file only
+// because that is this task's declared file scope, not because they share
+// fixtures with the tests above.
+//
+// HONESTY REQUIREMENT (carried from `EN.11.P`'s `carryover_context`,
+// `orchestration-workflow-never-driven-a-real-chain`): every test below
+// runs against a tempdir fixture repo with a stubbed `FlowRunner` — no
+// real `/sdlc-task` or `/sdlc-flow` process is ever spawned, and no real
+// engine-serve HTTP endpoint is hit. A green result here pins the
+// DISPATCH and INTEGRATION contract (which engine a block resolves to,
+// whether the chain stops on a failed reconcile, `steps_integrated`'s
+// count) — it is NOT evidence of having driven a real mixed chain, and
+// the carryover must not be reported as cleared on the strength of these
+// tests. The block's acceptance criterion is phrased as a curl against a
+// live engine (`GET /campaigns/$ID` -> `steps_integrated == 2`); that curl
+// form was NOT run against a live engine as part of this task — only the
+// in-repo integration-test equivalent below was.
+
+/// Mirrors `orchestration::graph`'s own `two_repo_brain_root` test helper
+/// (duplicated rather than shared, like `orchestration_chain.rs`'s
+/// `cancel_after_block` comment explains — this file is a different crate
+/// target). One fixture repo is enough for these tests: every chain step
+/// below targets the same repo slug with different block ids.
+fn orchestration_brain_root() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+    std::fs::create_dir_all(
+        dir.path()
+            .join("planning")
+            .join("roadmaps")
+            .join("my-roadmap"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Writes the state file `verify_state_write` reads for `block_id`, at the
+/// path shape `integrate.rs`'s own (private) `state_path_for` mirrors:
+/// `planning/{block_id}/sdlc/{filename}`, where `filename` is
+/// `sdlc-flow-state.json` for [`EngineKind::Flow`] and
+/// `sdlc-task-state.json` (this file's own `DEFAULT_STATE_FILENAME`) for
+/// [`EngineKind::Task`]. `extra` is merged onto the base `{"status": ...}`
+/// object, e.g. for `"bail_reason"` on a reconcile-failed fixture.
+fn write_orchestration_state(
+    repo_path: &Path,
+    block_id: &str,
+    engine: EngineKind,
+    status: &str,
+    extra: serde_json::Value,
+) {
+    let filename = match engine {
+        EngineKind::Flow => "sdlc-flow-state.json",
+        EngineKind::Task => DEFAULT_STATE_FILENAME,
+    };
+    let dir = repo_path.join("planning").join(block_id).join("sdlc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut body = json!({ "status": status });
+    if let serde_json::Value::Object(extra_map) = extra {
+        if let serde_json::Value::Object(body_map) = &mut body {
+            body_map.extend(extra_map);
+        }
+    }
+    std::fs::write(dir.join(filename), body.to_string()).unwrap();
+}
+
+/// `(repo, block_id, engine)` for one recorded [`FlowRunner`] invocation.
+type OrchestrationCall = (String, String, EngineKind);
+
+/// A [`FlowRunner`] stub that records every invocation (repo, block_id,
+/// engine) without spawning anything real — the actual per-step outcome
+/// this suite cares about comes from the state file
+/// `write_orchestration_state` pre-seeds on disk, exactly like
+/// `orchestration::graph`'s own fixture tests (`write_done_state`).
+fn recording_orchestration_runner() -> (FlowRunner, Arc<Mutex<Vec<OrchestrationCall>>>) {
+    let calls: Arc<Mutex<Vec<OrchestrationCall>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let runner: FlowRunner = Arc::new(move |invocation: FlowInvocation| {
+        recorded.lock().unwrap().push((
+            invocation.repo.clone(),
+            invocation.block_id.clone(),
+            invocation.engine,
+        ));
+        Box::pin(async move {
+            Ok(TaskContext {
+                event: json!({}),
+                nodes: HashMap::new(),
+                metadata: json!({ "ran": invocation.block_id }),
+                node_runs: HashMap::new(),
+            })
+        })
+    });
+    (runner, calls)
+}
+
+/// THE PAYOFF CASE: a two-block chain of one `task` block and one `flow`
+/// block completes, `steps_integrated == 2`. This is the in-repo pin for
+/// the block's `curl -s $ENGINE/campaigns/$ID | jq -e '.steps_integrated
+/// == 2'` acceptance criterion — see the HONESTY REQUIREMENT comment above
+/// this section: the curl form itself was NOT exercised against a live
+/// engine.
+#[tokio::test]
+async fn mixed_task_and_flow_chain_completes_with_steps_integrated_two() {
+    let dir = orchestration_brain_root();
+    write_orchestration_state(
+        &dir.path().join("repo-a"),
+        "T.1",
+        EngineKind::Task,
+        "done",
+        json!({}),
+    );
+    write_orchestration_state(
+        &dir.path().join("repo-a"),
+        "F.1",
+        EngineKind::Flow,
+        "done",
+        json!({}),
+    );
+
+    let (run_flow, calls) = recording_orchestration_runner();
+    let resolve_engine = |_repo: &str, block_id: &str| {
+        if block_id == "T.1" {
+            EngineKind::Task
+        } else {
+            EngineKind::Flow
+        }
+    };
+
+    let node = OrchestrationRunNode::new()
+        .with_run_flow(run_flow)
+        .with_resolve_engine(Arc::new(resolve_engine));
+    let ctx = TaskContext {
+        event: json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "T.1" },
+                { "repo": "repo-a", "block_id": "F.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }),
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let out = node
+        .process(ctx)
+        .await
+        .expect("a mixed task+flow chain should complete");
+    let recorded = &out.nodes[ORCH_NODE_NAME];
+    assert_eq!(recorded["steps_integrated"], 2);
+    assert_eq!(recorded["cancellation"]["cancelled"], false);
+
+    // Both blocks actually dispatched to their resolved engine, not merely
+    // "some engine" — the mix is what this test pins.
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0],
+        ("repo-a".to_string(), "T.1".to_string(), EngineKind::Task)
+    );
+    assert_eq!(
+        calls[1],
+        ("repo-a".to_string(), "F.1".to_string(), EngineKind::Flow)
+    );
+}
+
+/// A `task` block whose reconcile failed surfaces
+/// `IntegrateError::ReconcileFailed` and STOPS the chain. Asserted on the
+/// chain actually stopping (the second, `flow`, step never dispatches at
+/// all), not merely on the error variant/message — a chain that dispatched
+/// every step and only afterward reported an error would NOT satisfy this.
+#[tokio::test]
+async fn task_block_reconcile_failure_stops_the_chain() {
+    let dir = orchestration_brain_root();
+    // T.1 (task engine) reconciled and failed.
+    write_orchestration_state(
+        &dir.path().join("repo-a"),
+        "T.1",
+        EngineKind::Task,
+        "reconcile_failed",
+        json!({ "bail_reason": "full-suite-check failed: tests" }),
+    );
+    // F.2 (flow engine) is a perfectly fine "would have passed" block — its
+    // state file is seeded exactly like the payoff case's, so if the chain
+    // wrongly kept going after T.1, this step would complete and mask the
+    // stop-on-failure behavior this test exists to pin.
+    write_orchestration_state(
+        &dir.path().join("repo-a"),
+        "F.2",
+        EngineKind::Flow,
+        "done",
+        json!({}),
+    );
+
+    let (run_flow, calls) = recording_orchestration_runner();
+    let resolve_engine = |_repo: &str, block_id: &str| {
+        if block_id == "T.1" {
+            EngineKind::Task
+        } else {
+            EngineKind::Flow
+        }
+    };
+
+    let node = OrchestrationRunNode::new()
+        .with_run_flow(run_flow)
+        .with_resolve_engine(Arc::new(resolve_engine));
+    let ctx = TaskContext {
+        event: json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "T.1" },
+                { "repo": "repo-a", "block_id": "F.2" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }),
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let err = node
+        .process(ctx)
+        .await
+        .expect_err("a failed reconcile must stop the chain with an Err, not a partial success");
+    assert!(
+        err.message.contains("reconcile_failed") || err.message.contains("reconcile failed"),
+        "error should name the reconcile failure: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("T.1"),
+        "error should name the failing block: {}",
+        err.message
+    );
+
+    // The chain actually stopped: F.2 was never dispatched.
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the flow block after the failed reconcile must never have dispatched: {calls:?}"
+    );
+    assert_eq!(calls[0].1, "T.1");
+}
+
+/// Regression guard: a `flow`-only chain behaves exactly as before this
+/// block's engine-mixing dispatch existed — every block resolves to
+/// [`EngineKind::Flow`] (the [`OrchestrationRunNode::new`] default, not
+/// overridden here), and the chain completes with `steps_integrated == 2`
+/// like any pre-`EN.11.P` two-block flow chain.
+#[tokio::test]
+async fn flow_only_chain_is_unaffected_by_task_engine_dispatch() {
+    let dir = orchestration_brain_root();
+    write_orchestration_state(
+        &dir.path().join("repo-a"),
+        "F.1",
+        EngineKind::Flow,
+        "done",
+        json!({}),
+    );
+    write_orchestration_state(
+        &dir.path().join("repo-a"),
+        "F.2",
+        EngineKind::Flow,
+        "done",
+        json!({}),
+    );
+
+    let (run_flow, calls) = recording_orchestration_runner();
+
+    // No `with_resolve_engine` override: the built-in default resolves
+    // every block to `EngineKind::Flow`, exactly as it did before this
+    // block introduced `EngineKind::Task` dispatch.
+    let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+    let ctx = TaskContext {
+        event: json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "F.1" },
+                { "repo": "repo-a", "block_id": "F.2" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }),
+        nodes: HashMap::new(),
+        metadata: json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let out = node
+        .process(ctx)
+        .await
+        .expect("an unmodified flow-only chain should still complete");
+    let recorded = &out.nodes[ORCH_NODE_NAME];
+    assert_eq!(recorded["steps_integrated"], 2);
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|(_, _, engine)| *engine == EngineKind::Flow));
 }

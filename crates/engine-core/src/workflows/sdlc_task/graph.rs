@@ -296,7 +296,14 @@ pub fn registry_for_policy(policy: &SdlcTaskPolicy) -> NodeRegistry {
 /// makes a `sdlc_task.policy` harness.json section live config instead of
 /// dead config — before this task, `SetupWorktreeNode` always read
 /// `sdlc.policy` regardless of which workflow it was assembled into.
-fn sdlc_task_policy_resolver() -> Arc<PolicyResolverFn> {
+///
+/// `pub` (not module-private) since `EN.11.P` task 3's `engine-serve`
+/// registration re-registers a fresh `SetupWorktreeNode` (to install the
+/// `EN.3.K` repo registry) and must chain this exact resolver back on —
+/// otherwise a served `SDLC_TASK` run silently falls back to
+/// `sdlc_flow`'s default resolver, reading the wrong `harness.json`
+/// section.
+pub fn sdlc_task_policy_resolver() -> Arc<PolicyResolverFn> {
     Arc::new(|ctx, worktree| {
         let source = PolicyConfigSource::Worktree(worktree.to_path_buf());
         let resolved = resolve_policy_for_run_from(ctx, &source)?;

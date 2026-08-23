@@ -1,6 +1,6 @@
 ---
 name: stop-or-continue
-description: How to decide whether to keep working in this session or hand off to a fresh one, and what to write before you do — the correctness triggers that override token count entirely, the block-boundary rule for orchestration lanes, the context thresholds, and the test for whether an artifact is good enough to clear on. Use when the operator asks whether to /clear, when context is getting large, when a natural stopping point arrives, and before recommending a fresh session for any reason.
+description: How to decide whether a session must restart for CORRECTNESS reasons, and what to write down before any handoff — the trigger table for an engine, binary, hook or CLAUDE.md changing under a running session, and the test for whether an artifact is good enough to hand off on. Context size is NOT a reason to stop; this skill says so explicitly. Use when something the session depends on changed mid-run, when the operator asks whether to /clear, and before recommending a fresh session for any reason.
 allowed-tools: Bash(grep:*) Bash(ls:*) Bash(git:*)
 ---
 
@@ -59,36 +59,22 @@ costs nothing.
 
 ---
 
-## 3. Only now, the token count
+## 3. There is no third question — context size is not a reason to stop
 
-The useful signal is not the number, it is **what fraction of context is finished tool output versus
-active understanding.** Workflow result payloads, file dumps and long test logs are the least reusable
-context you hold — a single `TaskOutput` dump can run 8k tokens. When most of the window is transcript
-rather than judgement, clearing costs almost nothing regardless of the total.
+**Removed 2026-08-23 by operator decision.** This section used to carry token bands (100-200k keep
+going, 200-300k finish and suggest clearing, over 300k clear at the next boundary) and a structural
+"clear at block boundaries, never mid-block" rule for orchestration lanes.
 
-With that as the frame, rough thresholds:
+Both are gone, and nothing replaces them. **Do not reintroduce a numeric threshold, a percentage, or
+a per-block context budget.** The measured cost of the old guidance was that lanes ended
+orchestration runs after a single block and waited to be relaunched by hand, which put the operator
+back in the loop after every block and defeated the purpose of running a chain at all. A chain runs
+every block it was given. If context genuinely runs out, the harness summarizes and the session
+continues — that is the harness's job, not a decision for the agent to pre-empt.
 
-| Context | Posture |
-|---|---|
-| under ~100k | Do not raise it. |
-| 100–200k | Keep going. Make sure the durable record is current at each natural boundary. |
-| 200–300k | Finish the unit in flight, then suggest clearing. **Do not start a new one.** |
-| over ~300k | Suggest clearing at the next boundary regardless. |
-
-These are prompts to *raise it*, not permission to stop mid-task. Never abandon work in flight to
-respect a threshold — reach the next boundary first.
-
-### Orchestration lanes: the rule is structural, not numeric
-
-**Clear at block boundaries; never mid-block.** A lane is built to resume at block granularity —
-that is what `lane-log.jsonl` and the `planning/orchestration-run/<roadmap>/` record are for — so a
-boundary is the only cheap exit. Budget roughly **20–40k of context per block** (spec reads plus the
-engine's result payload) and pick the boundary that keeps you under the band above.
-
-At every boundary a lane already writes its own handoff: the lane-log line, the `notes.md` append,
-and the block's `state.json` status. If those are current, the session is disposable by construction.
-
----
+The correctness triggers in section 1 still stand and still override everything. They are about the
+session producing **wrong** results, not expensive ones. When one fires, say which one — never dress
+it up as a context-budget call, and never go looking for one as a pretext to stop.
 
 ## What to actually say
 

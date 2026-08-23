@@ -59,6 +59,7 @@ use crate::completion::derive_terminal_status;
 use crate::policy::PolicyConfigSource;
 use crate::repo_registry::{RepoRegistry, RepoRegistryError};
 use crate::workflows::sdlc_flow;
+use crate::workflows::sdlc_task;
 use crate::{OnProgress, RunOptions, Workflow, WorkflowError};
 
 use super::chain::ChainStep;
@@ -107,6 +108,14 @@ pub struct FlowInvocation {
     /// documented, versioned `campaign_id` key of the run's `event` JSON
     /// via [`sdlc_flow_event`] — never in `TaskContext::metadata`.
     pub campaign_id: Uuid,
+    /// Which sanctioned engine this step's block authored — resolved once
+    /// by `EN.11.P` task 1's `execute_step` and carried through so
+    /// [`default_flow_runner`] (and any test double) dispatches the SAME
+    /// engine the chain resolved, rather than re-deriving it. Deliberately
+    /// no `Default` and no builder, same reasoning as `use_worktree` and
+    /// `campaign_id`: an invocation with an unstated engine is exactly the
+    /// defect this field exists to make unrepresentable.
+    pub engine: EngineKind,
 }
 
 /// A future producing a finished run's [`TaskContext`] or a [`WorkflowError`].
@@ -303,6 +312,10 @@ pub struct ExecutionOutcome {
     pub repo: String,
     pub repo_path: PathBuf,
     pub block_id: String,
+    /// Which sanctioned engine actually ran this step — copied verbatim
+    /// from the [`FlowInvocation`] the runner was called with, per CLAUDE.md
+    /// standing rule 6 ("stamp the resolved value").
+    pub engine: EngineKind,
     pub ctx: TaskContext,
     /// The isolation this step actually resolved to, per [`resolve_isolation`]
     /// — stamped here so a caller (`OrchestrationRunNode::process`) can
@@ -389,12 +402,21 @@ pub async fn execute_step(
             })?;
 
     let engine = resolve_engine(&step.repo, &step.block_id);
-    if engine != EngineKind::Flow {
-        return Err(ExecuteError::UnsupportedEngine {
-            repo: step.repo.clone(),
-            block_id: step.block_id.clone(),
-            engine,
-        });
+    // Both sanctioned engines dispatch through the same `run_flow` seam —
+    // `FlowInvocation.engine` tells the runner which one to build and run
+    // (`EN.11.P` task 1). This match exists to keep `EngineKind` closed:
+    // it is exhaustive over both variants, so it fails to compile the
+    // moment a third variant is ever added, which is exactly the
+    // compile-time guard the block's acceptance criteria require.
+    // `ExecuteError::UnsupportedEngine` is NOT produced from here anymore
+    // — `resolve_engine` is infallible over the closed `EngineKind`
+    // vocabulary, so both variants it can ever return are runnable. The
+    // variant stays reachable for a block whose authored `sdlc_workflow`
+    // fails `EngineKind::from_sdlc_workflow` before a chain ever reaches
+    // this function (see the module's `UnsupportedEngine` doc and the
+    // `unsupported_engine_error_still_displays_the_block_and_repo` test).
+    match engine {
+        EngineKind::Flow | EngineKind::Task => {}
     }
 
     let use_worktree = resolve_isolation(
@@ -409,6 +431,7 @@ pub async fn execute_step(
         block_id: step.block_id.clone(),
         use_worktree,
         campaign_id,
+        engine,
     };
     let ctx = run_flow(invocation)
         .await
@@ -445,6 +468,7 @@ pub async fn execute_step(
         repo: step.repo.clone(),
         repo_path,
         block_id: step.block_id.clone(),
+        engine,
         ctx,
         use_worktree,
         campaign_id,
@@ -466,55 +490,109 @@ fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
     })
 }
 
+/// Build the `SDLC_TASK` event JSON for one resolved [`FlowInvocation`] —
+/// same seeded shape as [`sdlc_flow_event`] against
+/// `sdlc_task::schema::SdlcTaskEventSchema` (`spec_slug` is the only
+/// required field; `repo`/`use_worktree` deserialize the same names as
+/// `SDLC_FLOW`'s schema). Deliberately does NOT seed `auto_pr` —
+/// `SdlcTaskEventSchema` drops that field entirely (`SDLC_TASK` ships no PR
+/// ceremony), so there is nothing here to set.
+fn sdlc_task_event(invocation: &FlowInvocation) -> serde_json::Value {
+    json!({
+        "repo": invocation.repo,
+        "spec_slug": invocation.block_id,
+        "use_worktree": invocation.use_worktree,
+        "campaign_id": invocation.campaign_id,
+    })
+}
+
 /// The production [`FlowRunner`]: for each [`FlowInvocation`], builds a
-/// **fresh** `SDLC_FLOW` `Workflow` — policy resolved from
-/// `PolicyConfigSource::Worktree(invocation.repo_path)`, `SetupWorktreeNode`
-/// re-registered with `registry` so `event.repo` resolves inside the run
-/// too — and runs it with `{"repo": invocation.repo, "spec_slug":
-/// invocation.block_id, "use_worktree": invocation.use_worktree,
-/// "campaign_id": invocation.campaign_id}` as the
-/// event, mirroring `engine-serve::workflows::register_sdlc_flow_with_registry`'s
-/// factory exactly — isolation included — minus the `Dispatcher`
-/// registration (this seam invokes the workflow directly rather than
-/// dispatching an HTTP event).
+/// **fresh** `Workflow` for the invocation's [`EngineKind`] — policy
+/// resolved from `PolicyConfigSource::Worktree(invocation.repo_path)`,
+/// `SetupWorktreeNode` re-registered with `registry` so `event.repo`
+/// resolves inside the run too — and runs it with the matching seeded
+/// event as the trigger, mirroring
+/// `engine-serve::workflows::register_sdlc_flow_with_registry` /
+/// `register_sdlc_task_with_registry`'s factories exactly — isolation
+/// included — minus the `Dispatcher` registration (this seam invokes the
+/// workflow directly rather than dispatching an HTTP event).
 ///
-/// Never reimplements `SDLC_FLOW`: every node in the run is
-/// `workflows::sdlc_flow`'s own.
+/// [`EngineKind::Flow`] keeps today's exact path
+/// (`sdlc_flow::setup::resolve_policy_for_run_from` +
+/// `sdlc_flow::graph::registry_for_policy` + `sdlc_flow::graph::schema()`).
+/// [`EngineKind::Task`] mirrors it against `sdlc_task`'s own entry points
+/// (`sdlc_task::profiles::resolve_policy_for_run_from` +
+/// `sdlc_task::graph::registry_for_policy` + `sdlc_task::graph::schema()`).
+///
+/// Never reimplements either engine: every node in a run is that engine's
+/// own module's node.
 #[must_use]
 pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
     Arc::new(move |invocation: FlowInvocation| {
         let registry = registry.clone();
         Box::pin(async move {
-            let event = sdlc_flow_event(&invocation);
+            match invocation.engine {
+                EngineKind::Flow => {
+                    let event = sdlc_flow_event(&invocation);
 
-            let ctx_for_policy = TaskContext {
-                event: event.clone(),
-                nodes: std::collections::HashMap::new(),
-                metadata: json!({}),
-                node_runs: std::collections::HashMap::new(),
-            };
-            let source = PolicyConfigSource::Worktree(invocation.repo_path.clone());
-            let policy = sdlc_flow::setup::resolve_policy_for_run_from(&ctx_for_policy, &source)
-                .map_err(|err| WorkflowError::new(err.to_string()))?;
+                    let ctx_for_policy = TaskContext {
+                        event: event.clone(),
+                        nodes: std::collections::HashMap::new(),
+                        metadata: json!({}),
+                        node_runs: std::collections::HashMap::new(),
+                    };
+                    let source = PolicyConfigSource::Worktree(invocation.repo_path.clone());
+                    let policy =
+                        sdlc_flow::setup::resolve_policy_for_run_from(&ctx_for_policy, &source)
+                            .map_err(|err| WorkflowError::new(err.to_string()))?;
 
-            let mut node_registry = sdlc_flow::graph::registry_for_policy(&policy);
-            node_registry.register(Box::new(
-                sdlc_flow::setup::SetupWorktreeNode::new().with_registry(registry.clone()),
-            ));
+                    let mut node_registry = sdlc_flow::graph::registry_for_policy(&policy);
+                    node_registry.register(Box::new(
+                        sdlc_flow::setup::SetupWorktreeNode::new().with_registry(registry.clone()),
+                    ));
 
-            let workflow = Workflow::new_validated(node_registry, sdlc_flow::graph::schema())
-                .map_err(|err| WorkflowError::new(err.to_string()))?;
-            let on_progress: OnProgress<'_> = Box::new(|_ctx: &TaskContext| {});
-            // `run_with` with `RunOptions` threaded from the invocation
-            // (EN.11.G task 1) — today that's `RunOptions::default()`
-            // (no cancellation/budget/pause/run_id wired from the chain
-            // yet), which is byte-for-byte behavior-identical to the bare
-            // `workflow.run(..)` call it replaces (see `RunOptions`'s own
-            // doc comment: every field `None` matches `run`'s behavior
-            // exactly). This is the seam later tasks stamp real per-step
-            // options and observed cost/tokens through.
-            let options = RunOptions::default();
-            workflow.run_with(event, on_progress, options).await
+                    let workflow =
+                        Workflow::new_validated(node_registry, sdlc_flow::graph::schema())
+                            .map_err(|err| WorkflowError::new(err.to_string()))?;
+                    let on_progress: OnProgress<'_> = Box::new(|_ctx: &TaskContext| {});
+                    // `run_with` with `RunOptions` threaded from the invocation
+                    // (EN.11.G task 1) — today that's `RunOptions::default()`
+                    // (no cancellation/budget/pause/run_id wired from the chain
+                    // yet), which is byte-for-byte behavior-identical to the bare
+                    // `workflow.run(..)` call it replaces (see `RunOptions`'s own
+                    // doc comment: every field `None` matches `run`'s behavior
+                    // exactly). This is the seam later tasks stamp real per-step
+                    // options and observed cost/tokens through.
+                    let options = RunOptions::default();
+                    workflow.run_with(event, on_progress, options).await
+                }
+                EngineKind::Task => {
+                    let event = sdlc_task_event(&invocation);
+
+                    let ctx_for_policy = TaskContext {
+                        event: event.clone(),
+                        nodes: std::collections::HashMap::new(),
+                        metadata: json!({}),
+                        node_runs: std::collections::HashMap::new(),
+                    };
+                    let source = PolicyConfigSource::Worktree(invocation.repo_path.clone());
+                    let policy =
+                        sdlc_task::profiles::resolve_policy_for_run_from(&ctx_for_policy, &source)
+                            .map_err(|err| WorkflowError::new(err.to_string()))?;
+
+                    let mut node_registry = sdlc_task::graph::registry_for_policy(&policy);
+                    node_registry.register(Box::new(
+                        sdlc_flow::setup::SetupWorktreeNode::new().with_registry(registry.clone()),
+                    ));
+
+                    let workflow =
+                        Workflow::new_validated(node_registry, sdlc_task::graph::schema())
+                            .map_err(|err| WorkflowError::new(err.to_string()))?;
+                    let on_progress: OnProgress<'_> = Box::new(|_ctx: &TaskContext| {});
+                    let options = RunOptions::default();
+                    workflow.run_with(event, on_progress, options).await
+                }
+            }
         })
     })
 }
@@ -640,14 +718,24 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
+    /// FLIPPED (`EN.11.P` task 1): the task engine is no longer unsupported
+    /// — it dispatches and invokes the runner, exactly like the flow
+    /// engine, with `FlowInvocation.engine == EngineKind::Task` so a test
+    /// double (or the production runner) can tell the two apart. No other
+    /// guard in this module was removed to make this pass:
+    /// `ExecuteError::UnsupportedEngine` still exists (see
+    /// `unsupported_engine_error_still_displays_the_block_and_repo`) and
+    /// `EngineKind` is still asserted closed to two variants by the
+    /// exhaustive `match` in `execute_step` (no `_` arm — a third variant
+    /// would fail to compile).
     #[tokio::test]
-    async fn task_engine_is_unsupported_and_never_invokes_the_runner() {
+    async fn task_engine_is_dispatched_and_invokes_the_runner() {
         let (_dir, registry) = two_repo_registry();
         let (runner, calls) = recording_runner();
         let resolve_engine = |_repo: &str, _id: &str| EngineKind::Task;
 
         let s = step("repo-a", "A.1");
-        let err = execute_step(
+        let outcome = execute_step(
             &s,
             &resolve_engine,
             &registry,
@@ -656,22 +744,41 @@ mod tests {
             Uuid::new_v4(),
         )
         .await
-        .unwrap_err();
+        .expect("task-engine step should execute");
 
-        match &err {
-            ExecuteError::UnsupportedEngine {
-                repo,
-                block_id,
-                engine,
-            } => {
-                assert_eq!(repo, "repo-a");
-                assert_eq!(block_id, "A.1");
-                assert_eq!(*engine, EngineKind::Task);
-            }
-            other => panic!("expected UnsupportedEngine, got {other:?}"),
-        }
-        // The runner must never have been called for an unsupported engine.
-        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(outcome.engine, EngineKind::Task);
+
+        // The runner must have been invoked exactly once, with the
+        // resolved task engine on the invocation — asserted via the
+        // recording double, not inferred from the outcome alone.
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].engine, EngineKind::Task);
+        assert_eq!(recorded[0].repo, "repo-a");
+        assert_eq!(recorded[0].block_id, "A.1");
+    }
+
+    /// `ExecuteError::UnsupportedEngine` stays defined and constructible
+    /// even though `execute_step`'s exhaustive match over `EngineKind` no
+    /// longer produces it for either sanctioned variant — it remains the
+    /// diagnostic a caller surfaces for a block whose authored
+    /// `sdlc_workflow` fails `EngineKind::from_sdlc_workflow` (an
+    /// `UnsupportedSdlcWorkflow`, e.g. `"sdlc-run"`/`"sdlc-block"`/typo/
+    /// absent) before a chain ever reaches `execute_step`. Deleting this
+    /// variant would remove that guard entirely.
+    #[test]
+    fn unsupported_engine_error_still_displays_the_block_and_repo() {
+        let err = ExecuteError::UnsupportedEngine {
+            repo: "repo-a".to_string(),
+            block_id: "A.1".to_string(),
+            engine: EngineKind::Task,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("A.1"), "message should name the block: {msg}");
+        assert!(
+            msg.contains("repo-a"),
+            "message should name the repo: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1030,6 +1137,7 @@ mod tests {
             block_id: "A.1".to_string(),
             use_worktree: true,
             campaign_id: Uuid::new_v4(),
+            engine: EngineKind::Flow,
         };
         assert_eq!(
             sdlc_flow_event(&invocation_true)["use_worktree"],
@@ -1057,6 +1165,7 @@ mod tests {
             block_id: "A.1".to_string(),
             use_worktree: true,
             campaign_id,
+            engine: EngineKind::Flow,
         };
         assert_eq!(
             sdlc_flow_event(&invocation)["campaign_id"],

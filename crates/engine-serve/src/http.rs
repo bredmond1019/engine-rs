@@ -442,12 +442,21 @@ async fn post_events(
     // run before a run id is minted / spawn_run is called — no run id, no
     // token, no live-state entry to clean up on rejection. Gated on
     // workflow_type so it never touches the channel/API-shaped workflows.
-    if body.workflow_type == "SDLC_FLOW" {
+    //
+    // EN.11.P task 4: widened to also cover SDLC_TASK — a task-engine event
+    // gets the exact same two checks (unknown repo slug, absent spec dir),
+    // named against the shared `engine_core::workflows::{sdlc_flow,
+    // sdlc_task}::graph::WORKFLOW_TYPE` constants rather than re-typed
+    // string literals, so this gate can never drift from what the
+    // dispatcher itself was actually registered under.
+    if body.workflow_type == engine_core::workflows::sdlc_flow::graph::WORKFLOW_TYPE
+        || body.workflow_type == engine_core::workflows::sdlc_task::graph::WORKFLOW_TYPE
+    {
         let repo_slug = body.data.get("repo").and_then(|v| v.as_str());
 
         // Check 1 — the repo slug names a registry entry (or is absent,
         // which resolves to current_dir(), exactly as `resolve_target_root`
-        // does for every other SDLC_FLOW node).
+        // does for every other SDLC_FLOW/SDLC_TASK node).
         let resolved_root = match repo_slug {
             Some(slug) => match crate::workflows::repo_registry() {
                 Some(registry) => match registry.resolve(slug) {
@@ -465,8 +474,9 @@ async fn post_events(
                         "error": "unknown repo",
                         "repo": slug,
                         "message": format!(
-                            "SDLC_FLOW event named repo slug '{slug}' but no repo registry is \
-                             available to resolve it"
+                            "{} event named repo slug '{slug}' but no repo registry is \
+                             available to resolve it",
+                            body.workflow_type
                         ),
                     }));
                 }
@@ -1055,6 +1065,147 @@ mod tests {
         std::env::set_current_dir(previous_cwd).expect("restore cwd");
         if let Some(prev) = previous_registry {
             crate::workflows::set_repo_registry(prev);
+        }
+    }
+
+    // --- EN.11.P task 4: the same pre-flight, widened to SDLC_TASK ---
+
+    /// Same shape as `test_app_state_with_sdlc_flow`, registered under the
+    /// real `SDLC_TASK` workflow_type name so `post_events`'s widened gate
+    /// fires. A harmless `MarkerNode` fixture — this exercises dispatch-
+    /// target validation, not the real SDLC_TASK graph.
+    fn test_app_state_with_sdlc_task() -> AppState {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            fixture_schema("SDLC_TASK"),
+            Box::new(|_event: &serde_json::Value| {
+                let mut registry = NodeRegistry::new();
+                registry.register(Box::new(MarkerNode));
+                Ok(Workflow::new(registry, fixture_schema("SDLC_TASK")))
+            }),
+        );
+
+        AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_sdlc_task_unknown_repo_slug_returns_422_naming_the_slug() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = crate::workflows::repo_registry();
+        let (_dir, registry) = tempdir_registry_with_alpha_spec_dir_no_tasks_json();
+        crate::workflows::set_repo_registry(registry);
+
+        let state = test_app_state_with_sdlc_task();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "SDLC_TASK",
+                "data": { "spec_slug": "my-spec", "repo": "not-a-real-repo" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 422);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["repo"], "not-a-real-repo");
+        assert!(body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not-a-real-repo"));
+
+        if let Some(prev) = previous {
+            crate::workflows::set_repo_registry(prev);
+        } else {
+            crate::workflows::clear_repo_registry();
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_sdlc_task_known_repo_absent_spec_dir_returns_422_naming_the_spec_slug() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = crate::workflows::repo_registry();
+        let (_dir, registry) = tempdir_registry_with_alpha_spec_dir_no_tasks_json();
+        crate::workflows::set_repo_registry(registry);
+
+        let state = test_app_state_with_sdlc_task();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "SDLC_TASK",
+                "data": { "spec_slug": "does-not-exist", "repo": "alpha" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 422);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["spec_slug"], "does-not-exist");
+
+        if let Some(prev) = previous {
+            crate::workflows::set_repo_registry(prev);
+        } else {
+            crate::workflows::clear_repo_registry();
+        }
+    }
+
+    #[actix_web::test]
+    async fn post_events_sdlc_task_known_repo_valid_spec_dispatches() {
+        // Non-regression in the other direction: a well-formed SDLC_TASK
+        // event with a real repo + spec dir must still dispatch (202), not
+        // be caught by the widened gate.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = crate::workflows::repo_registry();
+        let (_dir, registry) = tempdir_registry_with_alpha_spec_dir_no_tasks_json();
+        crate::workflows::set_repo_registry(registry);
+
+        let state = test_app_state_with_sdlc_task();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": "SDLC_TASK",
+                "data": { "spec_slug": "my-spec", "repo": "alpha" },
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body["run_id"].is_string());
+
+        if let Some(prev) = previous {
+            crate::workflows::set_repo_registry(prev);
+        } else {
+            crate::workflows::clear_repo_registry();
         }
     }
 
@@ -2330,6 +2481,206 @@ mod tests {
         assert_eq!(
             after, before,
             "a clean run must not modify the committed state file via the failure-path writer"
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    // -- EN.11.P task 4: the same failure-path writer, but for SDLC_TASK ---
+
+    /// Same shape as `seed_sdlc_state_file`, but seeds
+    /// `sdlc-task-state.json` (`sdlc_task::DEFAULT_STATE_FILENAME`) instead
+    /// of the flow's filename -- this is the file a task-engine
+    /// `SaveStateNode`/`WrapUpNode` write would have already produced.
+    fn seed_sdlc_task_state_file(worktree: &std::path::Path) {
+        use engine_core::workflows::sdlc_flow::schema::{RunMeta, SDLCState};
+
+        let spec_slug = "EN.11.P-task4-suspend-fixture";
+        let state_dir = worktree.join("planning").join(spec_slug).join("sdlc");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let state = SDLCState::new(spec_slug);
+        let run_meta = RunMeta {
+            branch: "task/x".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            updated_at: "2026-07-01T00:00:00Z".to_string(),
+            run_id: None,
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
+        let json = serde_json::to_string_pretty(&committed).unwrap();
+        std::fs::write(
+            state_dir.join(engine_core::workflows::sdlc_task::DEFAULT_STATE_FILENAME),
+            json,
+        )
+        .unwrap();
+    }
+
+    fn read_sdlc_task_state_file(worktree: &std::path::Path) -> serde_json::Value {
+        let path = worktree
+            .join("planning")
+            .join("EN.11.P-task4-suspend-fixture")
+            .join("sdlc")
+            .join(engine_core::workflows::sdlc_task::DEFAULT_STATE_FILENAME);
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// `SeedSdlcContextNode` stamps `ctx.nodes` only -- it is workflow-
+    /// agnostic, so it is reused verbatim from the SDLC_FLOW fixture above.
+    /// The only thing distinguishing this fixture is the schema's
+    /// `workflow_type` (`SDLC_TASK`) and the spec_slug baked into the seed
+    /// files, which drives `suspend.rs`'s widened filename selection.
+    struct SeedSdlcTaskContextNode {
+        worktree: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl Node for SeedSdlcTaskContextNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            use engine_core::workflows::sdlc_flow::policy::SdlcPolicy;
+            use engine_core::workflows::sdlc_flow::schema::{SDLCState, SDLCTask, SDLCTaskStatus};
+
+            ctx.nodes.insert(
+                "SetupWorktreeNode".to_string(),
+                serde_json::json!({ "worktree_path": self.worktree.to_string_lossy() }),
+            );
+
+            let mut sdlc_state = SDLCState::new("EN.11.P-task4-suspend-fixture");
+            let mut task = SDLCTask::new(1, "One", "d1");
+            task.status = SDLCTaskStatus::Failed;
+            sdlc_state.tasks.push(task);
+            ctx.nodes.insert(
+                "UpdateTaskStatusNode".to_string(),
+                serde_json::to_value(&sdlc_state).expect("SDLCState serializes"),
+            );
+            ctx.nodes.insert(
+                engine_core::policy::RESOLVED_POLICY_IDENTITY.to_string(),
+                serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+            );
+
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "SeedSdlcTaskContextNode"
+        }
+    }
+
+    fn sdlc_task_fail_fixture_schema() -> WorkflowSchema {
+        let mut nodes = StdHashMap::new();
+        nodes.insert(
+            "SeedSdlcTaskContextNode".to_string(),
+            engine_core::NodeConfig::new(
+                "SeedSdlcTaskContextNode",
+                vec!["AlwaysFailNode".to_string()],
+            ),
+        );
+        nodes.insert(
+            "AlwaysFailNode".to_string(),
+            engine_core::NodeConfig::new("AlwaysFailNode", vec![]),
+        );
+        WorkflowSchema::new(
+            engine_core::workflows::sdlc_task::graph::WORKFLOW_TYPE,
+            "SeedSdlcTaskContextNode",
+            nodes,
+        )
+    }
+
+    #[actix_web::test]
+    async fn a_failed_sdlc_task_walk_leaves_a_blocked_terminal_status_at_the_task_state_filename() {
+        let worktree = temp_worktree_for_terminal_write_test();
+        seed_sdlc_task_state_file(&worktree);
+
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            sdlc_task_fail_fixture_schema(),
+            Box::new({
+                let worktree = worktree.clone();
+                move |_event: &serde_json::Value| {
+                    let mut registry = NodeRegistry::new();
+                    registry.register(Box::new(SeedSdlcTaskContextNode {
+                        worktree: worktree.clone(),
+                    }));
+                    registry.register(Box::new(AlwaysFailNode));
+                    Ok(Workflow::new(registry, sdlc_task_fail_fixture_schema()))
+                }
+            }),
+        );
+        let state = AppState {
+            dispatcher: Arc::new(dispatcher),
+            live: LiveStateStore::new(),
+            durable: crate::durable::spawn_durable_writer(None),
+            runs: RunRegistry::new(),
+            api_key: "test-key".to_string(),
+        };
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let trigger_req = test::TestRequest::post()
+            .uri("/events/")
+            .insert_header(("X-API-Key", "test-key"))
+            .set_json(serde_json::json!({
+                "workflow_type": engine_core::workflows::sdlc_task::graph::WORKFLOW_TYPE,
+                "data": {},
+            }))
+            .to_request();
+        let trigger_resp = test::call_service(&app, trigger_req).await;
+        assert_eq!(trigger_resp.status(), 202);
+        let trigger_body: serde_json::Value = test::read_body_json(trigger_resp).await;
+        let run_id = trigger_body["run_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("run_id should be a parseable UUID");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let poll_req = test::TestRequest::get()
+                .uri(&format!("/events/{run_id}"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let poll_resp = test::call_service(&app, poll_req).await;
+            let poll_body: serde_json::Value = test::read_body_json(poll_resp).await;
+            if poll_body["status"] != "running" {
+                assert_eq!(poll_body["status"], "failed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run never left \"running\""
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The load-bearing assertion for this task: the terminal write must
+        // land at `sdlc-task-state.json`, BY FILENAME -- not merely that
+        // some file was written. Getting this wrong would write a
+        // flow-named file that task 2's engine-aware `state_path_for` would
+        // never look for on a task-engine block.
+        let on_disk = read_sdlc_task_state_file(&worktree);
+        assert_eq!(on_disk["status"], serde_json::json!("blocked"));
+        assert!(
+            on_disk["bail_reason"]
+                .as_str()
+                .expect("bail_reason should be a string")
+                .contains("boom"),
+            "bail_reason should name the failure: {on_disk}"
+        );
+        assert_eq!(on_disk["run_id"], serde_json::json!(run_id.to_string()));
+
+        // And the flow's filename must NOT have been created alongside it.
+        let flow_named_path = worktree
+            .join("planning")
+            .join("EN.11.P-task4-suspend-fixture")
+            .join("sdlc")
+            .join(engine_core::workflows::sdlc_flow::DEFAULT_STATE_FILENAME);
+        assert!(
+            !flow_named_path.exists(),
+            "a task-engine run must never write the flow's state filename"
         );
 
         let _ = std::fs::remove_dir_all(&worktree);
