@@ -1,13 +1,13 @@
 ---
 type: Reference
 title: SDLC Task Workflow
-description: "How the SDLC_TASK workflow graph works: the lean-close-out graph shape, the event schema, the D56 terminal reconcile, the three terminal statuses, the SdlcTaskPolicy policy surface and its three profiles, and what this block does not yet ship"
+description: "How the SDLC_TASK workflow graph works: the lean-close-out graph shape, the event schema, the D56 terminal reconcile, the three terminal statuses, the SdlcTaskPolicy policy surface and its three profiles, and dispatch over HTTP/ORCHESTRATION since EN.11.P"
 doc_id: sdlc-task-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [sdlc-task, workflow, graph, reconcile, bookkeep, terminal-status, lean, policy, profiles]
-related: [sdlc-flow-workflow, sdlc-flow-policy, architecture]
+keywords: [sdlc-task, workflow, graph, reconcile, bookkeep, terminal-status, lean, policy, profiles, dispatch]
+related: [sdlc-flow-workflow, sdlc-flow-policy, architecture, orchestration-workflow, suspend-resume]
 ---
 
 # SDLC Task Workflow
@@ -198,11 +198,15 @@ is the profile that actually RUNS the reconcile** — the one place `Fast` per-t
 backstopped by an authoritative pass. `baseline` matches today's (pre-`EN.11.O`) behaviour: `Full`,
 reconcile skipped.
 
-## What this block does not yet ship
+## Dispatchable since `EN.11.P`
 
-- **Not dispatchable.** The graph runs in-process (`sdlc_task::graph::workflow()`), but
-  `engine-serve` registration and `ORCHESTRATION` dispatch wiring are `EN.11.P` — until that
-  lands, nothing outside this crate can trigger a run over HTTP or a lane chain.
-
-A page claiming that capability before its block lands would be worse than no page at all — this
-section exists so that claim never gets made by omission.
+`engine-serve` registers `SDLC_TASK` (`register_sdlc_task`/`register_sdlc_task_with_registry`,
+mirroring the `SDLC_FLOW` factory) and wires it into `register_builtin_workflows_with_registry`,
+so `POST /events/` with `"workflow_type": "SDLC_TASK"` triggers a run over HTTP exactly like
+`SDLC_FLOW` does — same repo-scoped `422`s (unknown `repo` slug, missing `spec_slug` directory),
+the `task/` branch prefix and `sdlc_task` policy resolver preserved on the served path (not the
+flow's own). A suspended or failed `SDLC_TASK` run writes its terminal blocked state to
+`sdlc-task-state.json`, never `sdlc-flow-state.json` — see
+[orchestration-workflow.md](orchestration-workflow.md) for how `ORCHESTRATION` dispatches a chain
+that mixes `SDLC_TASK` and `SDLC_FLOW` blocks, and [suspend-resume.md](suspend-resume.md) for the
+pause/resume routes both workflow types now share.
