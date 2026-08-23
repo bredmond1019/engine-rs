@@ -116,6 +116,16 @@ The e2e suites in `tests/it/` follow rules worth preserving:
   another test's env mutation and can never touch the real corpus.
 - **Assert on-disk bytes, not just stamped paths.** mev's idempotency guard zero-stamps `paths` when
   content is unchanged, so a `paths`-only assertion can pass vacuously (learned in `EN.7.D`).
+- **A test that drives real tmux gets its OWN socket, never the default server.** Build the driver
+  with `TmuxDriver::new(..).with_socket(<unique-per-process>)` and tear down the whole server
+  (`kill-server`) via a `Drop` guard, so a panicking test cannot leak. Do NOT add a helper that
+  boots a throwaway session and kills it to "ensure a server" — killing the last session
+  *terminates* the server, so on a clean machine that helper destroys the thing it is named for.
+  Before `EN.ticket.real-tmux-tests-need-an-isolated-socket` these tests shared the default server
+  and were **self-masking**: each failing run leaked sessions that kept the server alive, so the
+  *next* run passed. Measured 2026-08-22 — 492 leaked sessions dating back four days, a green local
+  suite, and the same tests red on CI, which has no pre-existing server. Green that depends on what
+  the previous run left behind is not green.
 - **Don't pre-create directories the writer should create.** Pre-creating
   `docs/content/learning-corpus/` in every test masked a real production bug where `apply_plan`
   never created parents (`EN.7.D`, fixed in `d1a8787`).
