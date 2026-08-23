@@ -1,0 +1,151 @@
+{
+  "bail_reason": "unrecognized review verdict: BLOCKED",
+  "block_id": null,
+  "branch": "sdlc/ticket-expose-live-run-workflow-type",
+  "current_task": 4,
+  "docs": null,
+  "final_validation": null,
+  "outcomes": {
+    "model_tier_used": {
+      "generate": "sonnet",
+      "implement": "sonnet",
+      "implement_simple": "sonnet",
+      "review": "sonnet",
+      "triage": "sonnet"
+    },
+    "review_verdicts": [
+      "TriageTaskNode:PASS",
+      "ConsolidatedReviewNode:BLOCKED"
+    ],
+    "tasks_failed": 0,
+    "tasks_passed": 3,
+    "total_attempts": 5,
+    "total_cost_usd": -0.0,
+    "total_input_tokens": 92,
+    "total_output_tokens": 3076,
+    "total_retries": 1,
+    "wall_clock_secs": 998.434
+  },
+  "phase_id": null,
+  "policy": {
+    "close_out": {
+      "reuse": {
+        "docs": false,
+        "review": false,
+        "validation": false
+      }
+    },
+    "llm_triage": false,
+    "local": {
+      "constrained_json": false,
+      "endpoint": "http://localhost:11434",
+      "model": "qwen2.5:3b"
+    },
+    "max_attempts": 3,
+    "model_tiers": {
+      "generate": "sonnet",
+      "implement": "sonnet",
+      "implement_simple": "sonnet",
+      "review": "sonnet",
+      "triage": "sonnet"
+    },
+    "output_verbosity": "normal",
+    "prompt_cache": false,
+    "retry_feedback": {
+      "enabled": true,
+      "max_chars": 4000
+    },
+    "review_mode": "per_task",
+    "review_skip_max_diff_lines": 40,
+    "review_skip_max_files": 2,
+    "simple_task_max_files": 2,
+    "test_depth": "fast",
+    "timeouts": {
+      "implement": 900,
+      "review": 900,
+      "triage": 900
+    }
+  },
+  "pr": null,
+  "review": {
+    "attempts": 1,
+    "findings": [
+      "No diff content provided for review",
+      "Cannot verify acceptance criteria without seeing the actual code changes"
+    ],
+    "verdict": "BLOCKED"
+  },
+  "run_id": "2d46b140-6dc7-4f46-864e-65c32c142dfd",
+  "spec_slug": "ticket-expose-live-run-workflow-type",
+  "started_at": "2026-08-01T16:17:53Z",
+  "status": "blocked",
+  "tasks": {
+    "1": {
+      "acceptance_criteria": [
+        "A pub function/method exists that, given a live run_id, returns its workflow_type (and created_at) without the caller reaching into engine-serve-private internals",
+        "If LiveStateStore::record's signature changed, every call site named in live_state.rs's doc comments is updated in this same task"
+      ],
+      "attempt_count": 2,
+      "description": "Choose one of the two designs in tasks.md's Notes (narrow pub accessor over the existing live_run_metadata() side table, or migrate workflow_type/created_at onto LiveStateStore itself). Implement it in crates/engine-serve/src/http.rs (and crates/engine-serve/src/live_state.rs if migrating). If migrating onto LiveStateStore, audit and update every on_progress/record call site named in live_state.rs's own doc comments so the change is consistent everywhere. Re-export the new symbol from crates/engine-serve/src/lib.rs if it is not already covered by an existing glob re-export.",
+      "max_attempts": 3,
+      "status": "done",
+      "task_id": 1,
+      "title": "Add a public accessor for a live run's workflow_type",
+      "validation_commands": []
+    },
+    "2": {
+      "acceptance_criteria": [
+        "get_event's live-run branch calls the new public accessor rather than duplicating the live_run_metadata() lookup inline",
+        "GET /events/{event_id} response shape and values are unchanged for existing callers"
+      ],
+      "attempt_count": 0,
+      "description": "Update the live-run branch of get_event (crates/engine-serve/src/http.rs) to read workflow_type/created_at through the new public accessor from task 1 instead of reading live_run_metadata() directly inline, so there is exactly one code path producing this data. Confirm the existing readback behavior (workflow_type/created_at in the JSON response) is byte-identical for both a tracked and an untracked run_id.",
+      "max_attempts": 3,
+      "status": "done",
+      "task_id": 2,
+      "title": "Refactor GET /events/{event_id} to consume the new public API",
+      "validation_commands": []
+    },
+    "3": {
+      "acceptance_criteria": [
+        "A test asserts workflow_type is readable for a tracked live run",
+        "A test asserts the accessor returns None/absent for an unknown run_id"
+      ],
+      "attempt_count": 0,
+      "description": "Add unit test(s) alongside the existing test module in http.rs (or live_state.rs, if migrated there per task 1's design choice) covering: (a) workflow_type is present and correct for a run inserted via the normal insertion path, (b) the accessor returns None/absent for an unknown run_id. If migrated onto LiveStateStore, extend the existing round-trip test style already used for record_then_get_returns_latest_state / list_active_reflects_recorded_runs_with_no_database.",
+      "max_attempts": 3,
+      "status": "done",
+      "task_id": 3,
+      "title": "Unit tests for the new accessor",
+      "validation_commands": []
+    },
+    "4": {
+      "acceptance_criteria": [
+        "cargo fmt --check passes",
+        "cargo clippy -- -D warnings passes",
+        "cargo nextest run --workspace passes",
+        "cargo build --release passes"
+      ],
+      "attempt_count": 0,
+      "description": "Run the Validation Commands listed in tasks.md and confirm all pass: cargo fmt --check, cargo clippy -- -D warnings, cargo nextest run --workspace, cargo build --release. Confirm no other crate in the workspace broke from the widened/changed API.",
+      "max_attempts": 3,
+      "status": "pending",
+      "task_id": 4,
+      "title": "Validate",
+      "validation_commands": [
+        "cargo fmt --check",
+        "cargo clippy -- -D warnings",
+        "cargo nextest run --workspace",
+        "cargo build --release"
+      ]
+    }
+  },
+  "telemetry": {
+    "budget_spent": 0.0,
+    "tasks_failed": 0,
+    "tasks_passed": 3,
+    "total_attempts": 5
+  },
+  "updated_at": "2026-08-01T16:23:52Z",
+  "worktree_path": "trees/sdlc/ticket-expose-live-run-workflow-type"
+}

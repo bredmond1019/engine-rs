@@ -104,6 +104,8 @@ mod tests {
             total_input_tokens: spec.input_tok,
             total_output_tokens: spec.output_tok,
             total_cost_usd: spec.cost,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             model_tier_used: BTreeMap::new(),
         }
     }

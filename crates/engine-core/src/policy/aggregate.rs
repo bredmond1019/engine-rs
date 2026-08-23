@@ -210,6 +210,8 @@ mod tests {
             total_input_tokens: 100,
             total_output_tokens: 50,
             total_cost_usd: cost,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             model_tier_used: BTreeMap::new(),
         }
     }

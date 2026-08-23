@@ -56,6 +56,16 @@ pub struct RunTelemetry {
     /// recorded `cost_usd` in `ctx.nodes`.
     #[serde(default)]
     pub total_cost_usd: f64,
+    /// Total cache-read tokens summed across every cost-bearing stage's last
+    /// recorded `cache_read_input_tokens` in `ctx.nodes` (task 1's stamp).
+    /// Cache reads bill at ~10% of an uncached input token.
+    #[serde(default)]
+    pub total_cache_read_tokens: u64,
+    /// Total cache-creation tokens summed across every cost-bearing stage's
+    /// last recorded `cache_creation_input_tokens` in `ctx.nodes` (task 1's
+    /// stamp). Cache creation bills at ~125% of an uncached input token.
+    #[serde(default)]
+    pub total_cache_creation_tokens: u64,
     /// Per-stage model tier actually used this run, keyed by whatever
     /// identity the caller chooses (e.g. `SdlcPolicy::ModelTiers`' field
     /// names).
@@ -150,6 +160,37 @@ pub fn total_cost_usd(ctx: &TaskContext, cost_bearing_stages: &[&str]) -> f64 {
         .sum()
 }
 
+/// Sum every `cost_bearing_stages` entry's `cache_read_input_tokens` and
+/// `cache_creation_input_tokens` out of `ctx.nodes` — `(cache_read,
+/// cache_creation)`.
+///
+/// Deliberately a *different* source than [`total_tokens`]'s uncached
+/// input/output, which reads `ctx.node_runs[*].usage` (contract §6 `Usage`,
+/// which this ticket does not widen — see `ClaudeCodeStep`'s module docs).
+/// The two cache channels instead come from `ctx.nodes`, the free-form JSON
+/// object `ClaudeCodeStep` already stamps with `cost_usd`/`model`/
+/// `transport` — task 1's non-breaking seam. Reading uncached tokens from
+/// `node_runs` and cache tokens from `nodes` is intentional, not
+/// inconsistent: it is the whole reason this ticket avoided a data-contract
+/// version bump (D78).
+#[must_use]
+pub fn total_cache_tokens(ctx: &TaskContext, cost_bearing_stages: &[&str]) -> (u64, u64) {
+    cost_bearing_stages
+        .iter()
+        .filter_map(|stage| ctx.nodes.get(*stage))
+        .fold((0u64, 0u64), |(read, creation), value| {
+            let stage_read = value
+                .get("cache_read_input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let stage_creation = value
+                .get("cache_creation_input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            (read + stage_read, creation + stage_creation)
+        })
+}
+
 /// Collect `"<stage>:<verdict>"` entries for every `verdict_stages` entry
 /// that has run by the time this snapshot is taken (reads
 /// `ctx.nodes[stage]["verdict"]`).
@@ -202,6 +243,8 @@ pub fn harvest(
     inputs: RunTelemetryInputs<'_>,
 ) -> RunTelemetry {
     let (total_input_tokens, total_output_tokens) = total_tokens(ctx);
+    let (total_cache_read_tokens, total_cache_creation_tokens) =
+        total_cache_tokens(ctx, inputs.cost_bearing_stages);
 
     // Observed (task 9's transport stamp) overlays caller-supplied (the
     // resolved policy's intent): the caller-supplied map is the fallback
@@ -220,6 +263,8 @@ pub fn harvest(
         total_input_tokens,
         total_output_tokens,
         total_cost_usd: total_cost_usd(ctx, inputs.cost_bearing_stages),
+        total_cache_read_tokens,
+        total_cache_creation_tokens,
         model_tier_used,
     }
 }
@@ -324,6 +369,58 @@ mod tests {
         assert_eq!(total_cost_usd(&ctx, &["ImplementTaskNode"]), 1.5);
     }
 
+    /// Two cost-bearing stages carry distinct, nonzero cache-read and
+    /// cache-creation values; the summed totals must keep the two channels
+    /// separate (a bug collapsing them into one field, or dropping either,
+    /// must fail this assertion).
+    #[test]
+    fn total_cache_tokens_sums_both_channels_across_stages_without_collapsing_them() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "ImplementTaskNode".to_string(),
+            serde_json::json!({
+                "cost_usd": 1.5,
+                "cache_read_input_tokens": 500,
+                "cache_creation_input_tokens": 77,
+            }),
+        );
+        nodes.insert(
+            "ConsolidatedReviewNode".to_string(),
+            serde_json::json!({
+                "cost_usd": 0.5,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 9,
+            }),
+        );
+        // Not in `cost_bearing_stages` — must not contribute.
+        nodes.insert(
+            "OtherNode".to_string(),
+            serde_json::json!({
+                "cache_read_input_tokens": 9_999,
+                "cache_creation_input_tokens": 9_999,
+            }),
+        );
+        let ctx = ctx_with(nodes, HashMap::new());
+        let (cache_read, cache_creation) =
+            total_cache_tokens(&ctx, &["ImplementTaskNode", "ConsolidatedReviewNode"]);
+        assert_eq!(cache_read, 530);
+        assert_eq!(cache_creation, 86);
+        assert_ne!(cache_read, cache_creation);
+    }
+
+    /// A stage present in `cost_bearing_stages` but with no cache fields
+    /// stamped (or absent entirely) contributes zero, never `None`/panic.
+    #[test]
+    fn total_cache_tokens_defaults_absent_fields_to_zero() {
+        let mut nodes = HashMap::new();
+        nodes.insert("ImplementTaskNode".to_string(), serde_json::json!({}));
+        let ctx = ctx_with(nodes, HashMap::new());
+        assert_eq!(
+            total_cache_tokens(&ctx, &["ImplementTaskNode", "MissingNode"]),
+            (0, 0)
+        );
+    }
+
     #[test]
     fn review_verdicts_collects_in_declared_stage_order() {
         let mut nodes = HashMap::new();
@@ -385,7 +482,11 @@ mod tests {
         let mut nodes = HashMap::new();
         nodes.insert(
             "ImplementTaskNode".to_string(),
-            serde_json::json!({ "cost_usd": 0.25 }),
+            serde_json::json!({
+                "cost_usd": 0.25,
+                "cache_read_input_tokens": 500,
+                "cache_creation_input_tokens": 77,
+            }),
         );
         nodes.insert(
             "ConsolidatedReviewNode".to_string(),
@@ -421,6 +522,8 @@ mod tests {
         assert_eq!(telemetry.total_input_tokens, 10);
         assert_eq!(telemetry.total_output_tokens, 5);
         assert_eq!(telemetry.total_cost_usd, 0.25);
+        assert_eq!(telemetry.total_cache_read_tokens, 500);
+        assert_eq!(telemetry.total_cache_creation_tokens, 77);
         assert_eq!(telemetry.model_tier_used, model_tier_used);
     }
 
@@ -522,6 +625,8 @@ mod tests {
             total_input_tokens: 100,
             total_output_tokens: 50,
             total_cost_usd: 0.02,
+            total_cache_read_tokens: 40,
+            total_cache_creation_tokens: 8,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         };
         let value = serde_json::to_value(&telemetry).unwrap();
@@ -537,6 +642,8 @@ mod tests {
                 "total_input_tokens": 100,
                 "total_output_tokens": 50,
                 "total_cost_usd": 0.02,
+                "total_cache_read_tokens": 40,
+                "total_cache_creation_tokens": 8,
                 "model_tier_used": { "implement": "sonnet" },
             })
         );

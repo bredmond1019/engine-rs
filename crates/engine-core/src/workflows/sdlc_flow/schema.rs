@@ -328,6 +328,17 @@ pub struct RunOutcomes {
     /// `cost_usd` in `ctx.nodes`.
     #[serde(default)]
     pub total_cost_usd: f64,
+    /// Total cache-read tokens summed across every cost-bearing stage's
+    /// last recorded `cache_read_input_tokens` in `ctx.nodes`. `#[serde(default)]`
+    /// so a state file written before this field existed still deserializes.
+    #[serde(default)]
+    pub total_cache_read_tokens: u64,
+    /// Total cache-creation tokens summed across every cost-bearing stage's
+    /// last recorded `cache_creation_input_tokens` in `ctx.nodes`.
+    /// `#[serde(default)]` so a state file written before this field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub total_cache_creation_tokens: u64,
     /// Per-stage model tier actually used this run, keyed by the resolved
     /// policy's `ModelTiers` field names (`"implement"`, `"triage"`,
     /// `"review"`, `"implement_simple"`, `"generate"`) — so
@@ -348,6 +359,8 @@ impl From<crate::policy::RunTelemetry> for RunOutcomes {
             total_input_tokens: telemetry.total_input_tokens,
             total_output_tokens: telemetry.total_output_tokens,
             total_cost_usd: telemetry.total_cost_usd,
+            total_cache_read_tokens: telemetry.total_cache_read_tokens,
+            total_cache_creation_tokens: telemetry.total_cache_creation_tokens,
             model_tier_used: telemetry.model_tier_used,
         }
     }
@@ -365,6 +378,8 @@ impl From<RunOutcomes> for crate::policy::RunTelemetry {
             total_input_tokens: outcomes.total_input_tokens,
             total_output_tokens: outcomes.total_output_tokens,
             total_cost_usd: outcomes.total_cost_usd,
+            total_cache_read_tokens: outcomes.total_cache_read_tokens,
+            total_cache_creation_tokens: outcomes.total_cache_creation_tokens,
             model_tier_used: outcomes.model_tier_used,
         }
     }
@@ -1064,6 +1079,8 @@ mod tests {
             total_input_tokens: 100,
             total_output_tokens: 50,
             total_cost_usd: 0.02,
+            total_cache_read_tokens: 40,
+            total_cache_creation_tokens: 8,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         });
 
@@ -1133,6 +1150,8 @@ mod tests {
             total_input_tokens: 100,
             total_output_tokens: 50,
             total_cost_usd: 0.02,
+            total_cache_read_tokens: 40,
+            total_cache_creation_tokens: 8,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         };
 
@@ -1682,6 +1701,8 @@ mod tests {
             total_input_tokens: 100,
             total_output_tokens: 50,
             total_cost_usd: 0.02,
+            total_cache_read_tokens: 40,
+            total_cache_creation_tokens: 8,
             model_tier_used: BTreeMap::from([("implement".to_string(), "sonnet".to_string())]),
         });
 
@@ -1718,5 +1739,34 @@ mod tests {
         // fixture pins (and still fails on a missing field or a changed list),
         // while a newly-added knob is simply ignored.
         assert_json_subset(&expected, &actual);
+    }
+
+    /// `EN.ticket.token-usage-drops-cache-channels` task 2's positive
+    /// control: a real, pre-change committed-state file
+    /// (`core/_planning/engine-rs/archive/ticket-expose-live-run-workflow-type/sdlc/sdlc-flow-state.json`,
+    /// captured 2026-08-01, before `total_cache_read_tokens`/
+    /// `total_cache_creation_tokens` existed on `RunOutcomes`) must still
+    /// deserialize cleanly, and the two new fields must default to `0`
+    /// rather than fail parsing or the caller silently losing `outcomes`
+    /// entirely (`from_committed_state_json`'s `outcomes` lookup swallows a
+    /// parse error into `None`, which would hide exactly this failure mode).
+    #[test]
+    fn pre_change_committed_state_file_still_deserializes_with_zeroed_cache_totals() {
+        let json: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/pre_cache_channels_sdlc_flow_state.json"
+        ))
+        .expect("archived fixture parses as JSON");
+
+        let state = SDLCState::from_committed_state_json(&json).expect("parses");
+        let outcomes = state
+            .outcomes
+            .expect("outcomes must still parse, not silently become None");
+
+        // The pre-change numbers this ticket's `why` cites, preserved as a
+        // trace back to the evidence.
+        assert_eq!(outcomes.total_input_tokens, 92);
+        assert_eq!(outcomes.total_output_tokens, 3076);
+        assert_eq!(outcomes.total_cache_read_tokens, 0);
+        assert_eq!(outcomes.total_cache_creation_tokens, 0);
     }
 }
