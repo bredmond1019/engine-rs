@@ -426,6 +426,14 @@ impl Node for ClaudeCodeStep {
                 "model": transport_info.model,
                 "endpoint": transport_info.endpoint,
             },
+            // Additive, non-contract channels (`EN.ticket.token-usage-drops-cache-channels`
+            // task 1): `engine_contract::Usage` only carries uncached input/output
+            // (orchestrator data contract v1.0.1 §6), so the cache channels are
+            // stamped here rather than widening that contract type. Cache reads
+            // bill at 10% and cache creation at 125% of uncached input, so these
+            // two fields are most of the real spend on a warm run.
+            "cache_read_input_tokens": outcome.usage.cache_read_input_tokens,
+            "cache_creation_input_tokens": outcome.usage.cache_creation_input_tokens,
         });
         ctx.nodes.insert(self.name.clone(), output);
 
@@ -640,6 +648,79 @@ mod tests {
         // transport variant supplied the outcome.
         assert_eq!(output["content"], "ok");
         assert_eq!(output["model"], "claude-sonnet-4-5");
+    }
+
+    /// `EN.ticket.token-usage-drops-cache-channels` task 1: a transport that
+    /// reports nonzero cache channels must have both stamped into
+    /// `ctx.nodes[<node>]`, distinct from each other and from the uncached
+    /// input/output already stamped there.
+    #[tokio::test]
+    async fn nonzero_cache_channels_are_stamped_into_ctx_nodes() {
+        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+            .with_transport(|_config, _prompt| {
+                Box::pin(async {
+                    let mut outcome = stub_outcome();
+                    outcome.usage.cache_read_input_tokens = 500;
+                    outcome.usage.cache_creation_input_tokens = 77;
+                    Ok(outcome)
+                })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        assert_eq!(output["cache_read_input_tokens"], 500);
+        assert_eq!(output["cache_creation_input_tokens"], 77);
+    }
+
+    /// A transport reporting no cache usage must yield `0`, never `null` and
+    /// never a panic.
+    #[tokio::test]
+    async fn zero_cache_channels_stamp_as_zero_not_null() {
+        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+            .with_transport(|_config, _prompt| Box::pin(async { Ok(stub_outcome()) }));
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        assert_eq!(output["cache_read_input_tokens"], 0);
+        assert_eq!(output["cache_creation_input_tokens"], 0);
+        assert!(!output["cache_read_input_tokens"].is_null());
+        assert!(!output["cache_creation_input_tokens"].is_null());
+    }
+
+    /// `node_runs`' uncached input/output must remain unaffected by the new
+    /// cache stamping — pinning the existing telemetry-facing shape.
+    #[tokio::test]
+    async fn node_runs_uncached_usage_unchanged_by_cache_stamping() {
+        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+            .with_transport(|_config, _prompt| {
+                Box::pin(async {
+                    let mut outcome = stub_outcome();
+                    outcome.usage.cache_read_input_tokens = 500;
+                    outcome.usage.cache_creation_input_tokens = 77;
+                    Ok(outcome)
+                })
+            });
+
+        let ctx = step
+            .process(empty_context())
+            .await
+            .expect("process should succeed");
+
+        let run = ctx
+            .node_runs
+            .get("ClaudeCodeStep")
+            .expect("node_runs entry present");
+        let usage = run.usage.as_ref().expect("usage stamped");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(34));
     }
 
     #[tokio::test]
