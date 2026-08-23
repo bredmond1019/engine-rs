@@ -301,28 +301,22 @@ Full rationale, the complete cut-list, and worked before/after examples: the
 <!-- BEGIN:session-continuity -->
 ## Stopping, continuing, and handing off
 
-Decide in this order. Only the third question is about tokens, and most of the time you never reach
-it. Raise this proactively when it applies — do not wait to be asked.
+**Run to completion. Never stop, clear, or hand off because context is getting large.** There is no
+token band, no percentage, and no "the next block would be cleaner in a fresh session." A chain runs
+every block it was given; a lane that stops after one block and waits to be relaunched by hand
+defeats the entire point of the run and puts the operator back in the loop after every block. If
+context genuinely runs out, the harness summarizes and you keep going — that is its job, not yours.
 
-1. **Is there a correctness reason to restart?** This overrides everything and holds at any context
-   size. An engine, command file, installed binary (`mev`, `bastion`), hook or `settings.json`
-   changed this session; or the operator edited a `CLAUDE.md` you already read. The running session
-   is a launch-time snapshot (standing rule 10), so it keeps producing pre-change results that read
-   as an unreliable agent rather than a stale snapshot. **Name the trigger; do not present it as a
-   cost decision.**
-2. **Does the next chunk of work have a written entry point?** The gate is the artifact, not the
-   number. If the next agent can start from `status.md`, `handoff.md`, a spec's `tasks.json`, or an
-   orchestration-run `notes.md`, clearing is nearly free. If not, **suggest writing that artifact
-   first, then clearing** — and never clear mid-debug, mid-block, or mid-decision, where the
-   valuable context is the part that cannot be written down. If clearing feels expensive, that is a
-   signal the handoff is thin, not a reason to stay.
-3. **Only then, the context size.** The real signal is what fraction is finished tool output rather
-   than active understanding. Rough bands: under ~100k don't raise it · 100–200k keep going ·
-   200–300k finish the unit in flight then suggest clearing, and don't start a new one · over ~300k
-   suggest clearing at the next boundary. These prompt you to *raise* it, never to abandon work in
-   flight. **In an orchestration lane the rule is structural: clear at block boundaries, never
-   mid-block** — budget ~20–40k of context per block.
+There is exactly **one** reason to end a session early, and it is about correctness, not cost:
+**something the running session depends on changed underneath it** — an engine, command file,
+installed binary (`mev`, `bastion`), hook or `settings.json` edited this session, or a `CLAUDE.md`
+you already read. The running session is a launch-time snapshot (base-template standing rule 10), so
+it keeps producing pre-change results, which read as an unreliable agent rather than a stale
+snapshot. **Name the trigger, finish the unit of work in flight, and say plainly that a fresh
+session is needed.** Do not present it as a context-budget decision, and do not go looking for the
+trigger as an excuse to stop.
 
-Full rationale, the correctness-trigger table, and what to actually say: the **`stop-or-continue`**
-skill.
+Whenever you do hand off, write the entry point first — `status.md`, `handoff.md`, a spec's
+`tasks.json`, or an orchestration-run `notes.md` — so the next agent starts from an artifact instead
+of from your memory.
 <!-- END:session-continuity -->
