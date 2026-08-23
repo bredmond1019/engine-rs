@@ -398,6 +398,8 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
             use_worktree: false,
             campaign_id: Uuid::new_v4(),
             engine: EngineKind::Flow,
+            cancellation_token: None,
+            budget: None,
         };
         (flow_runner)(invocation)
             .await
@@ -583,6 +585,8 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         &failing_runner,
         false,
         Uuid::new_v4(),
+        None,
+        None,
     )
     .await
     .expect_err("execute_step must fail a step whose node_runs record a failed node");

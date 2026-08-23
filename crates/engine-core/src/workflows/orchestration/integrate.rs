@@ -903,6 +903,12 @@ pub async fn integrate_chain(
         // `execute::resolve_isolation`'s table. Rows 1/2 (base-template
         // always worktree, the brain root never) are resolved inside
         // `execute_step` itself and are unreachable from this value.
+        // Cancellation/budget wiring at this call site is `EN.11.F` task
+        // 4's job (the block-boundary check that decides whether to keep
+        // dispatching steps at all); this task (task 3) only makes
+        // `execute_step`'s signature able to carry them. `None, None` here
+        // is mechanical — behavior-identical to before this task, since
+        // `RunOptions::default()` was always the child's config.
         let outcome = match execute_step(
             step,
             resolve_engine,
@@ -910,6 +916,8 @@ pub async fn integrate_chain(
             run_flow,
             default_use_worktree,
             campaign_id,
+            None,
+            None,
         )
         .await
         {
