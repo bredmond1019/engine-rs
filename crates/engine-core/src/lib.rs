@@ -29,7 +29,7 @@ pub mod workflow;
 pub mod workflows;
 
 pub use brain_root::{resolve_brain_root, resolve_brain_root_from, BrainRootError};
-pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
+pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger, CampaignLedger};
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
 pub use completion::{
     derive_terminal_status, is_complete, stamp_completion, COMPLETION_METADATA_KEY,
