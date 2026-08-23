@@ -1,19 +1,21 @@
 ---
 type: Reference
 title: The ORCHESTRATION workflow
-description: How engine-rs sequences SDLC_FLOW runs across repos from a lane chain — the gates it applies before each block, the policy it resolves, and the closed engine type that bounds what it can invoke.
+description: How engine-rs sequences SDLC_FLOW and SDLC_TASK runs across repos from a lane chain, mixed within one chain — the gates it applies before each block, the policy it resolves, and the closed engine type that bounds what it can invoke.
 doc_id: orchestration-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, sdlc flow]
+keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, sdlc flow, sdlc task]
 related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, terminal-crates, orphan-recovery]
 ---
 
 # The ORCHESTRATION workflow
 
 `ORCHESTRATION` takes a **lane chain** — a roadmap plus a lane name, or an explicit block list — and
-drives one `SDLC_FLOW` run per block, in order, across more than one repo.
+drives one run per block, in order, across more than one repo. Each block's own authored
+`sdlc_workflow` field selects whether that run is `SDLC_FLOW` or `SDLC_TASK` — a chain can freely mix
+both (see "A chain may mix `task` and `flow` blocks" below).
 
 It exists because the mechanical half of driving a lane is a set of predicates over a graph: resolve
 the chain, check dependencies, pick the engine, run one block at a time, verify the state write,
@@ -25,14 +27,15 @@ those predicates fails, and that stays with a human.
 
 ## What it actually invokes — read this before extending it
 
-`ORCHESTRATION` calls the **native Rust `SDLC_FLOW` workflow in-process**. It does not open a Claude
-Code session and type `/sdlc-flow`, and it does not shell out to the JS engines under
-`.claude/workflows/`.
+`ORCHESTRATION` calls **native Rust workflows in-process** — `SDLC_FLOW` for a `flow` block,
+`SDLC_TASK` for a `task` block. It does not open a Claude Code session and type `/sdlc-flow` or
+`/sdlc-task`, and it does not shell out to the JS engines under `.claude/workflows/`.
 
 Per step, `execute.rs` resolves the step's repo slug through the injected `RepoRegistry` to an
-absolute path, builds a **fresh** `SDLC_FLOW` `Workflow` (policy-aware registry + schema, registered
-with that same registry so `SetupWorktreeNode` resolves `event.repo` too), seeds `event.repo` on the
-dispatched event, and runs it to completion. Nothing is kept alive or reused between steps.
+absolute path, builds a **fresh** `Workflow` for that block's own engine (policy-aware registry +
+schema, registered with that same registry so `SetupWorktreeNode` resolves `event.repo` too), seeds
+`event.repo` on the dispatched event, and runs it to completion. Nothing is kept alive or reused
+between steps.
 
 Claude Code sessions *do* happen — one layer down. `SDLC_FLOW`'s own model-bearing nodes
 (`ClaudeCodeStep` -> `claude_code_rs::execute`, per `D4`) spawn them for the implement, review and
@@ -48,17 +51,41 @@ Both layers read a repo's harness and `CLAUDE.md` from the **working directory**
 session cannot span repos but a workflow can. That is what removes the driver as the ceiling on lane
 length: a twelve-block chain across four repos is the same shape as a two-block chain in one.
 
-## Only `Flow` runs today — `Task` is authored but unsupported
+## A chain may mix `task` and `flow` blocks
 
-`EngineKind` has two variants, but **only `EngineKind::Flow` is runnable**, because only `SDLC_FLOW`
-has been ported to this engine. There is no Rust `SDLC_TASK` workflow. A block authored
-`sdlc_workflow: "task"` fails loudly with `ExecuteError::UnsupportedEngine` naming the block and repo
-— it does not silently fall through to `Flow`, and it does not panic.
+`EngineKind` has two variants, `Flow` and `Task`, and **both are runnable** (`EN.11.P`). The engine
+is resolved per block, from that block's own authored `sdlc_workflow` field, via
+`EngineKind::from_sdlc_workflow` — never fixed for the whole chain. A chain can freely interleave
+`task` and `flow` blocks; each step in `execute.rs` dispatches to whichever engine its own block
+declares.
 
-This is a real gap between "the workflow exists" and "the workflow can drive your lane." Concretely:
-of the nine blocks the `engine` lane closed on 2026-08-18, **four were authored `task`**
-(`EN.9.F`, `EN.10.C`, and two adopted tickets), so `ORCHESTRATION` as it stands could have driven 5
-of 9. Check the `sdlc_workflow` field of every block in a chain before assuming it is runnable.
+A block whose authored `sdlc_workflow` falls outside the closed `{task, flow}` vocabulary — absent,
+a typo, or a value like `sdlc-run`/`sdlc-block` that this engine deliberately does not support —
+still fails loudly with `ExecuteError::UnsupportedEngine` naming the block and repo. It does not
+silently fall through to `Flow`, and it does not panic. Check the `sdlc_workflow` field of every
+block in a chain if you need to know in advance whether it is runnable — a missing or unsupported
+value is the only thing that still stops a block.
+
+Each engine writes and is verified against its own state file, so a `task` step and a `flow` step
+against the same `planning/<slug>/sdlc/` directory never collide: `sdlc_flow::DEFAULT_STATE_FILENAME`
+(`sdlc-flow-state.json`) for `Flow`, `sdlc_task::DEFAULT_STATE_FILENAME` (`sdlc-task-state.json`) for
+`Task`. `integrate.rs`'s `state_path_for` selects the filename from the step's own `EngineKind`
+before reading the state write back.
+
+A `task` block whose reconcile failed is a distinct, **terminal** case: `sdlc_task::lean_bookkeep`
+writes `status: "reconcile_failed"` to its state file and deliberately skips the block-status flip,
+so the block is genuinely not closed. Integrating that as a success would be exactly the silent
+unreliability this module's state-write verification exists to prevent, so it instead surfaces
+`IntegrateError::ReconcileFailed` and **stops the chain** — the same terminal treatment as any other
+integration failure, not a warning that lets the chain continue past an unclosed block.
+
+**Scope actually exercised so far** (`EN.11.P`, tests added `crates/engine-core/tests/it/sdlc_task_e2e.rs`):
+a two-block chain of one `task` block plus one `flow` block completing with `steps_integrated == 2`;
+a `task` block with a failed reconcile stopping the chain; a `flow`-only chain unchanged. All three
+run against **tempdir fixture repos** — see "Status: not yet exercised on a real chain" below, which
+still applies to a *mixed* chain exactly as it does to a flow-only one. No corpus-wide percentage of
+"how much is now drivable" is restated here; the figure would need to be re-measured against the
+current corpus at the time it's cited, and that re-measurement is out of scope for this rewrite.
 
 ## What happens per block
 
@@ -66,7 +93,7 @@ of 9. Check the `sdlc_workflow` field of every block in a chain before assuming 
 |---|---|---|
 | Resolve | `chain.rs` | Turns a (roadmap, lane) pair or an explicit block list into ordered `(repo, block_id)` steps. Reads mev's structured `HELD-UNTIL` / `BUDGET` / `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json` — it does not re-derive segments. |
 | Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** (backed by `corpus_gates.rs`, which reads each repo's real `planning/state.json` through `okf_core::load_state`) and refuses to start a block with an unmet edge, naming the edge and its repo. `DependencyEdge` is an enum — `Block` · `Operator { slug }` · `Approval { slug }` · `External { what }` — so an **operator gate is always unmet while present** and clears only by removal from the corpus (mev is the single writer); the engine can never self-clear one. Also reads mev's `lane-frontier.json` for lane-head startability, but `startable: true` never short-circuits the per-edge check. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail, and a block parked on an operator hold releases its permit rather than starving the ceiling. |
-| Execute | `execute.rs` | Builds and runs a **fresh in-process Rust `SDLC_FLOW` `Workflow`** with the repo resolved through `RepoRegistry` and `event.repo` seeded. Selects the engine from the block's own authored `sdlc_workflow` field — `Flow` only; `Task` errors (see above). |
+| Execute | `execute.rs` | Builds and runs a **fresh in-process Rust `Workflow`** for whichever engine the block's own authored `sdlc_workflow` field names — `SDLC_FLOW` or `SDLC_TASK` — with the repo resolved through `RepoRegistry` and `event.repo` seeded. An unsupported or absent `sdlc_workflow` value errors (see above). |
 | Integrate | `integrate.rs` | Verifies the state write after the engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. Appends exactly one `lane-log.jsonl` line per step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
 
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
