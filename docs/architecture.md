@@ -213,7 +213,11 @@ engine-rs/
 │   │                         marker's snapshot, and continues from the stored `resume_at`
 │   │                         pointer — and GET /events/suspended (registered before
 │   │                         `{event_id}` so the literal path isn't swallowed by the uuid
-│   │                         extractor), EN.6.F task 11), schedule.rs (`EN.6.G` task 2 — `ScheduleEntry`/
+│   │                         extractor), EN.6.F task 11; the same file also carries
+│   │                         `plan_campaign_resume`/`reconcile_stale_branch` — campaign-level
+│   │                         crash recovery as pure functions with no new route or `AppState`
+│   │                         field, see [suspend-resume.md](suspend-resume.md#campaign-level-crash-recovery-en11h),
+│   │                         EN.11.H), schedule.rs (`EN.6.G` task 2 — `ScheduleEntry`/
 │   │                         `ScheduleRegistry`, a thin adapter over `engine_core::cron`'s `tick()`;
 │   │                         `load_schedule_entries` reads `planning/harness.json`'s
 │   │                         `schedule.entries[]`; `dispatch_scheduled_entry` builds a

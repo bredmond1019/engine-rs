@@ -9,6 +9,13 @@
 //! - [`chain`] (Task 1) — lane chain resolution from a roadmap+lane or an explicit
 //!   block list, consuming mev's structured `HELD-UNTIL` / `BUDGET` /
 //!   `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json`.
+//! - [`checkpoint`] (`EN.11.H` Task 1) — the per-chain checkpoint: which
+//!   steps of a campaign already integrated and the branch each one
+//!   created, atomically written (temp file + rename) and read as "no
+//!   checkpoint" rather than an error when the file doesn't exist yet.
+//!   [`integrate`]'s `integrate_chain` (`EN.11.H` Task 2) writes it as
+//!   each step integrates; `engine-serve`'s `resume` (`EN.11.H` Task 4)
+//!   reads it to restart a crashed campaign at block N+1.
 //! - [`gates`] (Task 2) — the dependency gate (every `depends_on` edge must be met
 //!   before a block starts) and the `EN.9.F` admission gate (queue at capacity, never
 //!   proceed or fail), both consulted before every block.
@@ -35,6 +42,7 @@
 //!   what actually installs these into the served workflow.
 
 pub mod chain;
+pub mod checkpoint;
 pub mod corpus_gates;
 pub mod engine_kind;
 pub mod execute;
