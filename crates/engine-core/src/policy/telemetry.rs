@@ -354,6 +354,115 @@ mod tests {
         assert_eq!(total_tokens(&ctx), (300, 50));
     }
 
+    /// Regression pin for the block's evidence: the only real Rust
+    /// SDLC_FLOW run on disk
+    /// (`core/_planning/engine-rs/archive/ticket-expose-live-run-workflow-type/sdlc/sdlc-flow-state.json`,
+    /// 2026-08-22) reported `total_input_tokens: 92` against
+    /// `total_output_tokens: 3076` across 3 tasks and 5 attempts. 92
+    /// uncached input tokens is not a broken meter -- it is `node_runs`'
+    /// uncached-input channel alone, because before this ticket
+    /// `ClaudeCodeStep` never stamped `cache_read_input_tokens` /
+    /// `cache_creation_input_tokens` into `ctx.nodes` at all, so
+    /// `total_cache_tokens` had nothing to sum. This test reconstructs that
+    /// run's numbers and asserts the *combined* input picture (uncached +
+    /// both cache channels) is no longer a small fraction of the 3076
+    /// output tokens once both channels are summed in -- a summing bug that
+    /// drops either channel, or a regression that stops stamping them,
+    /// collapses this back to the 92-vs-3076 undercount and fails the
+    /// assertion.
+    ///
+    /// Observed red before task 1/2 landed: with the cache fields absent
+    /// from `ctx.nodes` (the exact pre-fix shape -- `ClaudeCodeStep` wrote
+    /// no such keys), `total_cache_tokens` returns `(0, 0)`, the combined
+    /// picture is `92`, and `92 / 3076 ~= 0.03` fails `ratio > 1.0` below.
+    /// `cache_channels_absent_reproduces_the_pre_fix_undercount` re-asserts
+    /// that pre-fix shape directly so the red observation stays pinned
+    /// rather than a one-time manual check.
+    #[test]
+    fn cache_channels_prevent_the_measured_92_vs_3076_undercount() {
+        let mut node_runs = HashMap::new();
+        node_runs.insert(
+            "ImplementTaskNode".to_string(),
+            NodeRun {
+                status: NodeRunStatus::Success,
+                started_at: None,
+                completed_at: None,
+                error: None,
+                input: None,
+                usage: Some(Usage {
+                    input_tokens: Some(92),
+                    output_tokens: Some(3076),
+                    model: "m".to_string(),
+                }),
+            },
+        );
+        let mut nodes = HashMap::new();
+        // Realistic four-channel usage where the cache channels dominate --
+        // a heavily cache-primed run bills far more on cache reads than on
+        // fresh input tokens.
+        nodes.insert(
+            "ImplementTaskNode".to_string(),
+            serde_json::json!({
+                "cache_read_input_tokens": 42_000,
+                "cache_creation_input_tokens": 6_500,
+            }),
+        );
+        let ctx = ctx_with(nodes, node_runs);
+
+        let (uncached_input, output) = total_tokens(&ctx);
+        let (cache_read, cache_creation) = total_cache_tokens(&ctx, &["ImplementTaskNode"]);
+        assert_eq!(uncached_input, 92);
+        assert_eq!(output, 3076);
+
+        let combined_input_picture = uncached_input + cache_read + cache_creation;
+        let ratio = combined_input_picture as f64 / output as f64;
+        assert!(
+            ratio > 1.0,
+            "expected cache-inclusive input ({combined_input_picture}) to exceed output \
+             ({output}) once both cache channels are summed in -- got ratio {ratio}, which is \
+             the 92-vs-3076 undercount reappearing"
+        );
+    }
+
+    /// Direct pin of the pre-fix shape: when `ctx.nodes` carries no cache
+    /// fields at all (exactly what `ClaudeCodeStep` produced before task 1),
+    /// the same 92/3076 fixture's combined-input-vs-output ratio is small --
+    /// this is the failing assertion `cache_channels_prevent_the_measured_92_vs_3076_undercount`
+    /// was observed to hit before task 1/2 landed, kept here so the red
+    /// observation is asserted rather than only remembered.
+    #[test]
+    fn cache_channels_absent_reproduces_the_pre_fix_undercount() {
+        let mut node_runs = HashMap::new();
+        node_runs.insert(
+            "ImplementTaskNode".to_string(),
+            NodeRun {
+                status: NodeRunStatus::Success,
+                started_at: None,
+                completed_at: None,
+                error: None,
+                input: None,
+                usage: Some(Usage {
+                    input_tokens: Some(92),
+                    output_tokens: Some(3076),
+                    model: "m".to_string(),
+                }),
+            },
+        );
+        // No cache fields stamped -- the pre-task-1 shape.
+        let ctx = ctx_with(HashMap::new(), node_runs);
+
+        let (uncached_input, output) = total_tokens(&ctx);
+        let (cache_read, cache_creation) = total_cache_tokens(&ctx, &["ImplementTaskNode"]);
+        assert_eq!((cache_read, cache_creation), (0, 0));
+
+        let combined_input_picture = uncached_input + cache_read + cache_creation;
+        let ratio = combined_input_picture as f64 / output as f64;
+        assert!(
+            ratio < 1.0,
+            "pre-fix shape should reproduce the small-fraction undercount, got ratio {ratio}"
+        );
+    }
+
     #[test]
     fn total_cost_usd_sums_only_named_cost_bearing_stages() {
         let mut nodes = HashMap::new();
