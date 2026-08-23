@@ -971,6 +971,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "A.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -993,6 +994,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "A.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -1018,6 +1020,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "A.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -1101,6 +1104,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: repo_path.to_path_buf(),
             block_id: block_id.into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -1215,6 +1219,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "A.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -1247,6 +1252,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "A.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -1280,6 +1286,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "A.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -1306,6 +1313,7 @@ mod tests {
             repo: "repo-a".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "A.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),
@@ -1321,6 +1329,7 @@ mod tests {
             repo: "repo-b".into(),
             repo_path: dir.path().to_path_buf(),
             block_id: "B.1".into(),
+            engine: EngineKind::Flow,
             ctx: engine_contract::TaskContext {
                 event: json!({}),
                 nodes: std::collections::HashMap::new(),

@@ -397,6 +397,7 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
             block_id: block_id.to_string(),
             use_worktree: false,
             campaign_id: Uuid::new_v4(),
+            engine: EngineKind::Flow,
         };
         (flow_runner)(invocation)
             .await
@@ -697,6 +698,7 @@ fn outcome_with_state_file(
         repo: "smoke-repo".to_string(),
         repo_path: repo_root.path().to_path_buf(),
         block_id: block_id.to_string(),
+        engine: EngineKind::Flow,
         ctx: engine_contract::TaskContext {
             event: serde_json::json!({}),
             nodes: HashMap::new(),
