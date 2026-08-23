@@ -645,6 +645,12 @@ impl Node for OrchestrationRunNode {
                     poll_interval,
                     hold_deadline,
                     cancellation_token.as_ref(),
+                    // `EN.11.F` task 4 adds the campaign-boundary ceiling
+                    // check to `integrate_chain`; wiring a real cap through
+                    // `OrchestrationRunNode`'s own policy surface is not
+                    // this task's job — `None` here is behavior-identical
+                    // to before this parameter existed (no ceiling).
+                    None,
                     &move |repo, block_id| resolve_engine(repo, block_id),
                     &repo_registry,
                     &run_flow,

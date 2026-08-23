@@ -58,6 +58,8 @@ use serde_json::Value;
 
 use crate::repo_registry::RepoRegistry;
 
+use crate::budget::{Budget, BudgetDecision, BudgetHaltReason, CampaignLedger};
+
 use super::chain::ChainStep;
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
@@ -394,6 +396,20 @@ pub enum LaneLogStatus {
     Closed,
     Bailed,
     Held,
+    /// `EN.11.F` task 4: the chain stopped at a block boundary because a
+    /// cancellation was observed — distinct from [`LaneLogStatus::Bailed`]
+    /// (a failure) precisely because nothing failed: the in-flight block
+    /// (if any) already finished and committed, and only the NEXT block —
+    /// the one this line names — never started. Fork 1's decided
+    /// semantics (halt at the next block boundary, never mid-block).
+    Cancelled,
+    /// `EN.11.F` task 4: the chain stopped at a block boundary because the
+    /// campaign-scoped [`CampaignLedger`] ceiling tripped (`budget.rs`
+    /// task 1) — distinct from both [`LaneLogStatus::Bailed`] (a failure)
+    /// and [`LaneLogStatus::Cancelled`] (an explicit human request): a
+    /// budget halt is neither, it is the ceiling doing its job. The block
+    /// this line names is the one that never started.
+    BudgetHalted,
 }
 
 impl LaneLogEntry {
@@ -421,6 +437,44 @@ impl LaneLogEntry {
             block: step.block_id.clone(),
             status: LaneLogStatus::Bailed,
             note: note.into(),
+        }
+    }
+
+    /// The chain stopped at a block boundary on an observed cancellation.
+    /// `step` is the block that never started — every block before it in
+    /// the chain already has its own `closed` line on disk, untouched by
+    /// this entry (`EN.11.F` task 4: an abort never discards or rewrites
+    /// in-flight/completed work).
+    #[must_use]
+    pub fn cancelled(step: &ChainStep, lane: &str, note: impl Into<String>) -> Self {
+        Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
+            repo: step.repo.clone(),
+            block: step.block_id.clone(),
+            status: LaneLogStatus::Cancelled,
+            note: note.into(),
+        }
+    }
+
+    /// The chain stopped at a block boundary because the campaign budget
+    /// ceiling tripped. `step` is the block that never started; `reason`
+    /// names the cap, its limit, and the spend that tripped it
+    /// ([`BudgetHaltReason::cap_name`]) so the recorded note is
+    /// self-explanatory without re-deriving the ledger state.
+    #[must_use]
+    pub fn budget_halted(step: &ChainStep, lane: &str, reason: BudgetHaltReason) -> Self {
+        Self {
+            ts: Utc::now().into(),
+            lane: lane.to_string(),
+            repo: step.repo.clone(),
+            block: step.block_id.clone(),
+            status: LaneLogStatus::BudgetHalted,
+            note: format!(
+                "campaign budget ceiling tripped before block {} started: {}",
+                step.block_id,
+                reason.to_json()
+            ),
         }
     }
 }
@@ -812,6 +866,35 @@ pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
 /// thread a cancellation into yet. Cancellation here only ever prevents
 /// the *next* step from starting.
 ///
+/// A cancellation win is also recorded as one [`LaneLogEntry::cancelled`]
+/// line, naming the block that never started — the chain's own record
+/// (`lane-log.jsonl`) then carries three mutually exclusive terminal
+/// vocabularies for how it can end: `closed`/`bailed` lines for every step
+/// that ran, one `cancelled` line if the chain stopped on cancellation, or
+/// one `budget_halted` line if the campaign ceiling tripped first (see
+/// below) — never more than one of the latter two, since both `break` the
+/// loop immediately.
+///
+/// # The campaign budget ceiling (`EN.11.F` task 1 + task 4)
+///
+/// `campaign_budget`, when given, is checked at the SAME block boundary as
+/// `cancellation_token` — the top of every loop iteration, before that
+/// iteration's step is dispatched — via a [`CampaignLedger`] that
+/// accumulates each completed step's `cost_usd`/`total_tokens`
+/// ([`ExecutionOutcome::cost_usd`]/[`ExecutionOutcome::total_tokens`]).
+/// This is checked EVERY boundary, not once per campaign: a two-step chain
+/// checks it twice (once trivially, before step 1, with zero accumulated
+/// spend; once before step 2, with step 1's spend folded in), which is
+/// exactly what lets a cap set below one block's cost halt at the FIRST
+/// boundary rather than only after the whole chain. A trip halts the chain
+/// exactly like a cancellation win — `Ok` with whatever already
+/// integrated, nothing rolled back — but is recorded as a distinct
+/// [`LaneLogEntry::budget_halted`] line naming the tripped cap
+/// ([`BudgetHaltReason::cap_name`]), so a budget halt is never
+/// indistinguishable from an operator's own abort request in the chain's
+/// record. `None` (the built-in default) means no ceiling at all —
+/// behavior-identical to before this parameter existed.
+///
 /// # Per-step progress
 ///
 /// `step_observer` is called **exactly once per completed step**,
@@ -831,6 +914,7 @@ pub async fn integrate_chain(
     poll_interval: Duration,
     hold_deadline: Option<Duration>,
     cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
     resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
     registry: &RepoRegistry,
     run_flow: &FlowRunner,
@@ -842,11 +926,38 @@ pub async fn integrate_chain(
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
+    // `EN.11.F` task 1/4: accumulates each completed step's spend across
+    // the whole campaign, checked at every block boundary below —
+    // distinct from `execute_step`'s own per-NODE `BudgetLedger` inside a
+    // single child run.
+    let mut campaign_ledger = CampaignLedger::new();
     for step in chain {
         // Checked at the top of every iteration, before anything for this
         // step starts — see the "Cancellation stops the chain BETWEEN
         // steps only" section above.
         if cancellation_token.is_some_and(|t| t.is_cancelled()) {
+            let entry = LaneLogEntry::cancelled(
+                step,
+                lane.unwrap_or(step.repo.as_str()),
+                format!(
+                    "campaign cancelled at the block boundary before {} started; \
+                     every earlier block in this chain already finished and committed",
+                    step.block_id
+                ),
+            );
+            let _ = append_lane_log_line(roadmap_dir, &entry);
+            break;
+        }
+
+        // Checked at the SAME boundary as cancellation, every iteration —
+        // see the "campaign budget ceiling" doc section above. A trip
+        // halts the chain exactly like a cancellation win, but is recorded
+        // under its own `budget_halted` status so the two stay
+        // distinguishable in the chain's record.
+        if let BudgetDecision::Halt(reason) = campaign_ledger.check(campaign_budget) {
+            let entry =
+                LaneLogEntry::budget_halted(step, lane.unwrap_or(step.repo.as_str()), reason);
+            let _ = append_lane_log_line(roadmap_dir, &entry);
             break;
         }
 
@@ -883,6 +994,16 @@ pub async fn integrate_chain(
         // cancelled, held chain does not go on to acquire a permit or
         // execute the step it was waiting on.
         if cancellation_token.is_some_and(|t| t.is_cancelled()) {
+            let entry = LaneLogEntry::cancelled(
+                step,
+                lane.unwrap_or(step.repo.as_str()),
+                format!(
+                    "campaign cancelled while {} was parked on an operator hold; \
+                     every earlier block in this chain already finished and committed",
+                    step.block_id
+                ),
+            );
+            let _ = append_lane_log_line(roadmap_dir, &entry);
             break;
         }
 
@@ -942,6 +1063,12 @@ pub async fn integrate_chain(
             format!("block {} closed via SDLC_FLOW", step.block_id),
         );
         append_lane_log_line(roadmap_dir, &entry)?;
+
+        // Fold this step's spend into the campaign ledger BEFORE the next
+        // iteration's boundary check — `EN.11.F` task 1's documented
+        // `None`-cost rule applies unchanged here (a step with no cost
+        // figure contributes tokens but never a silent `$0`).
+        campaign_ledger.record_step(outcome.cost_usd, outcome.total_tokens);
 
         outcomes.push(outcome);
 
@@ -1570,6 +1697,7 @@ mod tests {
             Duration::from_millis(1),
             None,
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1649,6 +1777,7 @@ mod tests {
             Duration::from_millis(5),
             None,
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner_a,
@@ -1680,6 +1809,7 @@ mod tests {
                     &admission,
                     &NeverHeld,
                     Duration::from_millis(5),
+                    None,
                     None,
                     None,
                     &resolve_engine,
@@ -1794,6 +1924,7 @@ mod tests {
             Duration::from_millis(1),
             None,
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1838,6 +1969,7 @@ mod tests {
             Duration::from_millis(1),
             None,
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -1880,6 +2012,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             None,
             None,
             &resolve_engine,
@@ -1939,6 +2072,7 @@ mod tests {
             &admission,
             &NeverHeld,
             Duration::from_millis(1),
+            None,
             None,
             None,
             &resolve_engine,
@@ -2006,6 +2140,7 @@ mod tests {
             Duration::from_millis(1),
             None,
             None,
+            None,
             &resolve_engine,
             &registry,
             &runner,
@@ -2036,5 +2171,183 @@ mod tests {
         let parsed: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed["status"], json!("bailed"));
         assert_eq!(parsed["block"], json!("A.1"));
+    }
+
+    // ── EN.11.F task 4: the campaign budget ceiling at block boundaries ──
+
+    /// A runner whose child `ctx` reports `tokens_per_call` tokens of
+    /// usage on every invocation, via one `node_runs` entry — enough for
+    /// `step_spend`/`CampaignLedger::record_step` to fold a real,
+    /// non-zero, unambiguous token count into the campaign ledger per
+    /// step (unlike [`recording_runner`], whose bare `TaskContext`
+    /// reports none at all).
+    fn token_reporting_runner(tokens_per_call: u64) -> (FlowRunner, Arc<Mutex<Vec<String>>>) {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: FlowRunner = Arc::new(move |invocation| {
+            recorded.lock().unwrap().push(invocation.block_id.clone());
+            Box::pin(async move {
+                let mut node_runs = std::collections::HashMap::new();
+                node_runs.insert(
+                    "SomeNode".to_string(),
+                    engine_contract::NodeRun {
+                        status: engine_contract::NodeRunStatus::Success,
+                        started_at: None,
+                        completed_at: None,
+                        error: None,
+                        input: None,
+                        usage: Some(engine_contract::Usage {
+                            input_tokens: Some(tokens_per_call),
+                            output_tokens: Some(0),
+                            model: "claude-sonnet-4-5".to_string(),
+                        }),
+                    },
+                );
+                Ok(engine_contract::TaskContext {
+                    event: json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: json!({}),
+                    node_runs,
+                })
+            })
+        });
+        (runner, calls)
+    }
+
+    /// A campaign ceiling set to exactly one block's measured token cost
+    /// halts the chain at the FIRST block boundary after that block, not
+    /// after the whole chain — the second block never starts, the halt
+    /// names the tripped cap, and the first block's `closed` line stays on
+    /// disk untouched (Fork 1's decided semantics: the in-flight/completed
+    /// block is never rolled back).
+    #[tokio::test]
+    async fn a_ceiling_at_one_blocks_cost_halts_the_chain_at_the_next_boundary() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, calls) = token_reporting_runner(100);
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let budget = Budget {
+            max_total_tokens: Some(100),
+            max_cost_usd: None,
+        };
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        let outcomes = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            Some(&budget),
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("a budget halt is not an error — it returns Ok with what already integrated");
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "only A.1 should have integrated before the ceiling tripped"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["A.1".to_string()],
+            "A.2's runner must never be invoked once the ceiling has tripped"
+        );
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "A.1's closed line stays, plus one budget_halted line naming A.2"
+        );
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["status"], json!("closed"));
+        assert_eq!(first["block"], json!("A.1"));
+        let second: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["status"], json!("budget_halted"));
+        assert_eq!(second["block"], json!("A.2"));
+        assert!(
+            second["note"]
+                .as_str()
+                .unwrap()
+                .contains("max_total_tokens"),
+            "the halt reason must name the tripped cap: {second}"
+        );
+    }
+
+    /// The campaign ledger's boundary check runs at EVERY boundary, not
+    /// once per campaign: a ceiling set ABOVE the combined cost of a
+    /// three-block chain never trips, and every block still integrates —
+    /// proving the check ran (and allowed) at all three boundaries rather
+    /// than being skipped after the first.
+    #[tokio::test]
+    async fn a_ceiling_never_reached_lets_every_boundary_check_allow_and_the_whole_chain_run() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+        write_done_state(&dir.path().join("repo-a"), "A.3");
+        let (runner, calls) = token_reporting_runner(10);
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        // Three steps x 10 tokens = 30 accumulated at most; a cap of 1000
+        // never trips at any of the three boundaries checked.
+        let budget = Budget {
+            max_total_tokens: Some(1000),
+            max_cost_usd: None,
+        };
+
+        let chain = vec![
+            step("repo-a", "A.1"),
+            step("repo-a", "A.2"),
+            step("repo-a", "A.3"),
+        ];
+
+        let outcomes = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            Some(&budget),
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("an unreached ceiling must never halt the chain");
+
+        assert_eq!(outcomes.len(), 3, "every block must have integrated");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["A.1".to_string(), "A.2".to_string(), "A.3".to_string()]
+        );
     }
 }
