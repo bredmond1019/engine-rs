@@ -168,6 +168,7 @@ async fn resume_after_simulated_restart_rehydrates_from_postgres() {
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(Some(pool.clone())),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: API_KEY.to_string(),
     };
     let app = test::init_service(
@@ -311,6 +312,7 @@ async fn resume_against_a_row_with_a_malformed_suspension_marker_is_404_not_a_pa
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(Some(pool.clone())),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: API_KEY.to_string(),
     };
     let app = test::init_service(

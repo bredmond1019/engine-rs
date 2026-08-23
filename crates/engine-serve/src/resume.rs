@@ -354,6 +354,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -718,6 +719,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         };
 

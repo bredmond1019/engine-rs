@@ -176,6 +176,7 @@ fn test_app_state() -> AppState {
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(None),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: "schedule-test-key".to_string(),
     }
 }
@@ -354,6 +355,7 @@ fn test_app_state_with_recorder() -> (AppState, Arc<StdMutex<Vec<serde_json::Val
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(None),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: "schedule-loop-test-key".to_string(),
     };
     (state, recorded)
