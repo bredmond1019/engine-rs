@@ -658,14 +658,46 @@ fn verify_lane_log_readable_script() -> std::path::PathBuf {
         .join("../../scripts/verify_lane_log_readable.py")
 }
 
+/// Walk up from `start` looking for a `brain.toml` — the marker of the
+/// company-brain vault root that `scripts/verify_lane_log_readable.py`
+/// itself needs above this repo to locate
+/// `scripts/roadmap_status_discovery.py`. Returns the first ancestor
+/// directory (inclusive of `start`) that contains one, or `None` if the
+/// walk reaches the filesystem root without finding it.
+fn find_brain_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if d.join("brain.toml").is_file() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
 #[tokio::test]
-async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script() {
+async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script_when_brain_root_present(
+) {
     let script = verify_lane_log_readable_script();
+    // Genuine invariant, not the skip gate: the script is checked into this
+    // repo and is therefore always present regardless of brain-vault
+    // context. The actual environment-dependent guard is the brain-root
+    // walk below, mirroring `round_trip.rs`'s
+    // `fixture_matches_orchestrator_owned_original_when_sibling_checkout_present`.
     assert!(
         script.is_file(),
         "expected {} to exist (checked into this repo)",
         script.display()
     );
+
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(_brain_root) = find_brain_root(manifest_dir) else {
+        eprintln!(
+            "skipping: no brain.toml found walking up from {}",
+            manifest_dir.display()
+        );
+        return;
+    };
 
     let (_repos_dir, registry) = two_repo_registry();
     let (_planning_root, roadmap_dir) = fixture_roadmap_dir("prove-readability");
