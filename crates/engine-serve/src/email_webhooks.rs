@@ -89,6 +89,7 @@ fn dispatch_and_spawn(
         live,
         durable: durable_handle,
         runs,
+        campaigns: state.campaigns.clone(),
         token,
         pause,
         budget,

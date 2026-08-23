@@ -254,6 +254,7 @@ pub async fn resume_run(
         live: state.live.clone(),
         durable: state.durable.clone(),
         runs: state.runs.clone(),
+        campaigns: state.campaigns.clone(),
         token,
         pause,
         budget,

@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use engine_core::workflows::orchestration::integrate::StepProgress;
 
-use crate::abort::RunRegistry;
+use crate::abort::{CampaignRegistry, RunRegistry};
 use crate::durable::{durable_on_progress, DurableHandle};
 use crate::live_state::LiveStateStore;
 
@@ -262,6 +262,12 @@ pub(crate) struct SpawnedRun {
     pub live: LiveStateStore,
     pub durable: DurableHandle,
     pub runs: RunRegistry,
+    /// `EN.11.F` task 2 follow-up: the campaign-scoped registry `spawn_run`
+    /// registers this run's token into, keyed by campaign id, when this
+    /// dispatch is an ORCHESTRATION run carrying a `PendingOrchestrationRun`
+    /// -- a no-op for every other workflow type. See
+    /// `crate::abort::CampaignRegistry` and `AppState::campaigns`.
+    pub campaigns: CampaignRegistry,
     pub token: CancellationToken,
     pub pause: PauseSignal,
     pub budget: Budget,
@@ -400,10 +406,17 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         live,
         durable,
         runs,
+        campaigns,
         token,
         pause,
         budget,
     } = spawned;
+
+    // Set below when this dispatch's `PENDING_ORCHESTRATION_RUN` carries a
+    // campaign id (`EN.11.F` task 2 follow-up) -- `None` for every
+    // non-ORCHESTRATION run. Captured here, outside the `if let` below, so
+    // it survives to the deregistration at the end of this function.
+    let mut campaign_id: Option<uuid::Uuid> = None;
 
     // EN.ticket.orchestration-abort-and-progress task 4: an ORCHESTRATION
     // dispatch's factory (`workflows::register_orchestration_with_registry`)
@@ -431,6 +444,13 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
             });
         }
         runs.register(run_id, pending.token.clone());
+        // `EN.11.F` task 2 follow-up: register the SAME token under this
+        // run's campaign id too, so `POST /campaigns/{id}/abort` can find
+        // and trigger it -- without this, `AppState::campaigns` is never
+        // populated in production and every campaign abort 404s regardless
+        // of whether the campaign is actually live.
+        campaigns.register(pending.campaign_id, pending.token.clone());
+        campaign_id = Some(pending.campaign_id);
         pending.token
     } else {
         token
@@ -656,6 +676,15 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         }
 
         runs.deregister(run_id);
+        // Mirrors `runs.deregister` immediately above -- a campaign-scoped
+        // token nobody registered (`campaign_id` is `None` for every
+        // non-ORCHESTRATION run) has nothing to remove. Deregistered on
+        // BOTH the suspended and terminal exits, same as `runs`, since a
+        // suspended run has no live token for the chain's block-boundary
+        // check to observe either way.
+        if let Some(campaign_id) = campaign_id {
+            campaigns.deregister(campaign_id);
+        }
         remove_pause_signal(run_id);
     });
 }
@@ -1062,15 +1091,30 @@ mod tests {
         }
 
         fn build_orchestration_workflow(run_flow: FlowRunner) -> Workflow {
-            let (token, observer) = crate::workflows::build_orchestration_seams();
+            build_orchestration_workflow_for_campaign(run_flow, Uuid::new_v4()).0
+        }
+
+        /// Like [`build_orchestration_workflow`], but returns the campaign id
+        /// used to build the seams alongside the `Workflow` -- needed by a
+        /// caller that wants to assert against `AppState::campaigns`
+        /// (`EN.11.F` task 2 follow-up) via the exact id `spawn_run` will
+        /// register `token` under, not a discarded random one.
+        fn build_orchestration_workflow_for_campaign(
+            run_flow: FlowRunner,
+            campaign_id: Uuid,
+        ) -> (Workflow, Uuid) {
+            let (token, observer) = crate::workflows::build_orchestration_seams(campaign_id);
             let node = OrchestrationRunNode::new()
                 .with_run_flow(run_flow)
                 .with_cancellation_token(token)
                 .with_step_observer(observer);
             let mut registry = NodeRegistry::new();
             registry.register(Box::new(node));
-            Workflow::new_validated(registry, graph::schema())
-                .expect("orchestration workflow should validate")
+            (
+                Workflow::new_validated(registry, graph::schema())
+                    .expect("orchestration workflow should validate"),
+                campaign_id,
+            )
         }
 
         fn spawned_run(run_id: Uuid, workflow: Workflow, event: serde_json::Value) -> SpawnedRun {
@@ -1084,6 +1128,7 @@ mod tests {
                 live: LiveStateStore::new(),
                 durable: crate::durable::spawn_durable_writer(None),
                 runs: RunRegistry::new(),
+                campaigns: CampaignRegistry::new(),
                 // Discarded: `spawn_run` overrides this with the token the
                 // node itself embeds (EN.ticket.orchestration-abort-and-progress
                 // task 4) — asserted below via `runs.get`.
@@ -1189,6 +1234,104 @@ mod tests {
             );
             assert_eq!(
                 final_ctx.metadata["cancellation"]["cancelled"],
+                serde_json::json!(true)
+            );
+        }
+
+        /// The production counterpart of the test just above, but through
+        /// `CampaignRegistry` instead of `RunRegistry` -- proves the actual
+        /// gap the review found (`EN.11.F` task 2 follow-up): `spawn_run`
+        /// now registers an ORCHESTRATION run's effective token under its
+        /// resolved campaign id too, so `POST /campaigns/{id}/abort` can
+        /// find and trigger it, not just `POST /events/{run_id}/abort`.
+        /// Without that registration, `campaigns.get(campaign_id)` here
+        /// would return `None` and this test would hang forever waiting
+        /// for a chain that nothing ever told to stop.
+        #[actix_web::test]
+        async fn a_token_cancelled_via_the_campaign_registry_halts_the_chain_before_the_next_step()
+        {
+            let dir = three_block_brain_root();
+            let invocations: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+            let ready_tx = Arc::new(StdMutex::new(Some(ready_tx)));
+            let proceed_rx = Arc::new(tokio::sync::Mutex::new(Some(proceed_rx)));
+
+            let recorded = invocations.clone();
+            let run_flow: FlowRunner = Arc::new(move |invocation| {
+                let recorded = recorded.clone();
+                let ready_tx = ready_tx.clone();
+                let proceed_rx = proceed_rx.clone();
+                Box::pin(async move {
+                    recorded.lock().unwrap().push(invocation.block_id.clone());
+                    if invocation.block_id == "A.1" {
+                        if let Some(tx) = ready_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = proceed_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    Ok(TaskContext {
+                        event: serde_json::json!({}),
+                        nodes: StdHashMap::new(),
+                        metadata: serde_json::json!({ "ran": invocation.block_id }),
+                        node_runs: StdHashMap::new(),
+                    })
+                })
+            });
+
+            let campaign_id = Uuid::new_v4();
+            let (workflow, _) = build_orchestration_workflow_for_campaign(run_flow, campaign_id);
+            let run_id = Uuid::new_v4();
+            let live = LiveStateStore::new();
+            let runs = RunRegistry::new();
+            let campaigns = CampaignRegistry::new();
+            let mut spawned = spawned_run(run_id, workflow, orchestration_event(dir.path()));
+            spawned.live = live.clone();
+            spawned.runs = runs.clone();
+            spawned.campaigns = campaigns.clone();
+
+            spawn_run(spawned);
+
+            // A.1's invocation has been recorded and is parked waiting on
+            // `proceed_rx` — grab the token `POST /campaigns/{id}/abort`
+            // would find and cancel it, exactly as `abort_campaign` does.
+            ready_rx.await.expect("A.1 should signal readiness");
+            let token = campaigns
+                .get(campaign_id)
+                .expect("spawn_run must register this run's effective token under its campaign id");
+            token.cancel();
+            proceed_tx.send(()).expect("A.1 should still be waiting");
+
+            // Wait for the run to go terminal (deregistered from `runs`,
+            // which happens after `campaigns` -- see `spawn_run`'s order).
+            for _ in 0..200 {
+                if runs.get(run_id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                runs.get(run_id).is_none(),
+                "run should have gone terminal and deregistered"
+            );
+            assert!(
+                campaigns.get(campaign_id).is_none(),
+                "campaign should have been deregistered alongside the run"
+            );
+
+            assert_eq!(
+                *invocations.lock().unwrap(),
+                vec!["A.1".to_string()],
+                "A.2/A.3 must never run once the registered campaign token is cancelled"
+            );
+
+            let final_ctx = live
+                .get(run_id)
+                .expect("terminal snapshot should still be readable");
+            assert_eq!(
+                final_ctx.nodes[graph::NODE_NAME]["cancellation"]["cancelled"],
                 serde_json::json!(true)
             );
         }

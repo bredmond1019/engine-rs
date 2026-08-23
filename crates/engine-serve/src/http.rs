@@ -560,6 +560,7 @@ async fn post_events(
         live,
         durable: durable_handle,
         runs,
+        campaigns: state.campaigns.clone(),
         token,
         pause,
         budget,

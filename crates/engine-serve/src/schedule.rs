@@ -569,6 +569,7 @@ pub fn dispatch_scheduled_entry(
         live,
         durable: durable_handle,
         runs,
+        campaigns: state.campaigns.clone(),
         token,
         pause,
         budget,
