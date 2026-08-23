@@ -104,6 +104,18 @@ use crate::live_state::LiveStateStore;
 /// every engine route — a security smell in exactly the wrong place. A
 /// builder with required args for those three (plus `live`) is the shape
 /// that prevents recurrence without inventing meaningless defaults.
+///
+/// `#[non_exhaustive]`: a builder only protects a call site that uses it —
+/// it does nothing about a *new* out-of-crate call site that reaches for an
+/// exhaustive struct literal simply because the literal still compiles.
+/// `#[non_exhaustive]` closes that door: outside this crate,
+/// `AppState::builder(..).build()` is now the ONLY way to construct one.
+/// In-crate literals and out-of-crate field reads (`state.api_key` etc.)
+/// are unaffected. Landed only after `bastion` migrated its five
+/// construction sites to the builder (`BA.ticket.adopt-appstate-builder`) —
+/// adding this before that migration would have broken bastion's compile a
+/// second time.
+#[non_exhaustive]
 pub struct AppState {
     pub dispatcher: Arc<Dispatcher>,
     pub live: LiveStateStore,
