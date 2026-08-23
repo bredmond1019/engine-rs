@@ -404,13 +404,27 @@ impl Node for SetupWorktreeNode {
                 })?;
 
                 if output.status != 0 {
-                    // Best-effort cleanup; its own outcome doesn't change the
-                    // failure we're about to report.
+                    // Best-effort cleanup; neither call's own outcome
+                    // changes the failure we're about to report.
+                    //
+                    // `git worktree add -b <branch> ...` can fail AFTER
+                    // creating the branch (e.g. the worktree checkout step
+                    // itself fails), leaving the branch behind even though
+                    // the worktree never came into being. Removing only the
+                    // worktree here — and not the branch — was the
+                    // idempotency defect this block fixes (EN.11.H task 3):
+                    // a plain retry then hit `git worktree add -b <branch>`
+                    // a second time against an already-existing branch and
+                    // failed at the FIRST already-attempted step, which is
+                    // why the operator resorted to hand-deleting branches.
+                    // Deleting the branch too makes a retry of a failed
+                    // setup start from a clean slate.
                     let _ = (self.runner)(
                         "git",
                         &["worktree", "remove", "--force", &worktree_path],
                         &git_cwd,
                     );
+                    let _ = (self.runner)("git", &["branch", "-D", &branch], &git_cwd);
                     return Err(NodeError::new(format!(
                         "git worktree add failed (status {}): {}",
                         output.status, output.stderr
@@ -2036,16 +2050,135 @@ mod tests {
 
         let recorded = calls.lock().unwrap();
         // fetch (best-effort, itself failing here and ignored) + worktree add
-        // + cleanup remove.
+        // + cleanup remove + cleanup branch delete (EN.11.H task 3: the
+        // failure path must remove the branch it may have left behind, not
+        // only the worktree).
         assert_eq!(
             recorded.len(),
-            3,
-            "expected fetch + add + cleanup calls, got: {recorded:?}"
+            4,
+            "expected fetch + add + cleanup remove + cleanup branch delete calls, got: {recorded:?}"
         );
         assert_eq!(recorded[0][0], "fetch");
         assert_eq!(
             recorded[2][0..2],
             ["worktree".to_string(), "remove".to_string()]
+        );
+        assert_eq!(
+            recorded[3][0..2],
+            ["branch".to_string(), "-D".to_string()],
+            "expected the cleanup to also delete the branch, got: {recorded:?}"
+        );
+        assert_eq!(
+            recorded[3][2], "sdlc/my-spec",
+            "branch delete must target the branch this run created"
+        );
+    }
+
+    /// EN.11.H task 3, AC "The branch delete is best-effort: its non-zero
+    /// exit does not change the error surfaced to the caller". A failing
+    /// `git branch -D` (e.g. the branch was never actually created, or
+    /// something else already removed it) must not mask or alter the
+    /// original `git worktree add` failure that is being reported.
+    #[tokio::test]
+    async fn setup_cleanup_branch_delete_failure_does_not_change_reported_error() {
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            let is_branch_delete = args.first() == Some(&"branch") && args.get(1) == Some(&"-D");
+            Ok(CommandOutput {
+                status: if is_branch_delete {
+                    1
+                } else if args.first() == Some(&"worktree") && args.get(1) == Some(&"remove") {
+                    0
+                } else {
+                    1
+                },
+                stdout: String::new(),
+                stderr: "boom".to_string(),
+            })
+        });
+
+        let node = SetupWorktreeNode::new().with_runner(runner);
+        let ctx = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+        let err = node.process(ctx).await.expect_err("should fail");
+
+        assert!(
+            err.message.contains("git worktree add failed"),
+            "a failing best-effort branch delete must not mask the original \
+             worktree-add failure, got: {}",
+            err.message
+        );
+    }
+
+    /// EN.11.H task 3, ACs "A test pins that the PRE-CHANGE behaviour failed
+    /// on the already-existing branch" and "A retry of a previously-failed
+    /// setup succeeds against the stubbed `CommandRunner`".
+    ///
+    /// Simulates the real-world crash sequence: a first `git worktree add
+    /// -b <branch> ...` fails AFTER creating the branch (e.g. the checkout
+    /// step itself failed), leaving the branch behind. Before this fix, the
+    /// failure-path cleanup removed only the worktree, so a plain retry hit
+    /// `git worktree add -b <branch> ...` again against the still-existing
+    /// branch and failed at that same already-attempted step — this test
+    /// was observed RED against that pre-change behaviour (cleanup calling
+    /// `git worktree remove --force` alone, no branch delete) before the
+    /// fix above landed; it is green now because the failure-path cleanup
+    /// also deletes the branch, so a retry starts from a clean slate.
+    #[tokio::test]
+    async fn setup_retry_after_failed_add_succeeds_once_branch_is_gone() {
+        let branch_exists: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let branch_exists_clone = branch_exists.clone();
+        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+            if args.first() == Some(&"worktree") && args.get(1) == Some(&"add") {
+                if branch_exists_clone.load(Ordering::SeqCst) {
+                    return Ok(CommandOutput {
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: "fatal: a branch named 'sdlc/my-spec' already exists".to_string(),
+                    });
+                }
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            if args.first() == Some(&"branch") && args.get(1) == Some(&"-D") {
+                branch_exists_clone.store(false, Ordering::SeqCst);
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            // fetch, worktree remove, rev-parse, etc.
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = SetupWorktreeNode::new().with_runner(runner);
+
+        // First attempt: the branch already exists (a leftover from a
+        // crashed prior run), so `git worktree add` fails — this is the
+        // failure whose cleanup path is under test, not a bug in this
+        // attempt itself.
+        let ctx1 = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+        let first = node.process(ctx1).await;
+        assert!(
+            first.is_err(),
+            "first attempt must fail while the leftover branch still exists"
+        );
+
+        // Retry: with the fix, the failure-path cleanup deleted the branch,
+        // so this second attempt's `git worktree add` succeeds.
+        let ctx2 = empty_context(json!({ "spec_slug": "my-spec", "use_worktree": true }));
+        let second = node.process(ctx2).await;
+        assert!(
+            second.is_ok(),
+            "retry after a failed setup must succeed once the branch has \
+             been deleted, got: {second:?}"
         );
     }
 
