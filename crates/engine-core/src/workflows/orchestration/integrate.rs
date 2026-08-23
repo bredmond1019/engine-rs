@@ -61,8 +61,12 @@ use crate::repo_registry::RepoRegistry;
 use crate::budget::{Budget, BudgetDecision, BudgetHaltReason, CampaignLedger};
 
 use super::chain::ChainStep;
+use super::checkpoint::{
+    read_checkpoint, write_checkpoint, Checkpoint, CheckpointStep, ReadCheckpoint,
+};
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
+use crate::workflows::get_result;
 
 // ── Operator hold: pause-and-resume ─────────────────────────────────────
 
@@ -264,6 +268,19 @@ fn state_path_for(repo_path: &Path, block_id: &str, engine: EngineKind) -> PathB
 /// `"status"` happened to read `"done"`. A state file with no `"block_id"`
 /// at all (an older run, or one written by the JS `/sdlc-flow`) still
 /// passes; only an actual disagreement fails.
+/// Read the `branch_name` `SetupWorktreeNode` stamped onto a completed
+/// step's `ctx`, if the run went through it — `EN.11.H` task 2, mirrors
+/// `sdlc_flow::wrap_up::branch_name` / `sdlc_flow::task_loop::branch_name`.
+/// `None` for a plain-branch (no-worktree) run, or a step whose engine
+/// isn't [`EngineKind::Flow`] — either way, "no known branch" rather than
+/// an error; [`CheckpointStep::branch`] already treats `None` this way.
+fn step_branch_name(ctx: &engine_contract::TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")
+        .and_then(|value| value.get("branch_name"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateError> {
     let path = state_path_for(&outcome.repo_path, &outcome.block_id, outcome.engine);
     let raw =
@@ -619,6 +636,12 @@ pub enum IntegrateError {
         block_id: String,
         deadline: Duration,
     },
+    /// `EN.11.H` task 2: the checkpoint could not be written on the
+    /// success path — a real, actionable disk problem (see
+    /// [`step_branch_name`]'s call site) rather than a chain already
+    /// unwinding, so this one propagates instead of being swallowed like
+    /// the bail/cancel/budget paths' best-effort writes.
+    CheckpointWriteFailed(super::checkpoint::CheckpointError),
 }
 
 impl fmt::Display for IntegrateError {
@@ -731,6 +754,9 @@ impl fmt::Display for IntegrateError {
                  still held after {deadline:?} with no clearance — check the operator \
                  queue for this block"
             ),
+            IntegrateError::CheckpointWriteFailed(source) => {
+                write!(f, "failed to write checkpoint: {source}")
+            }
         }
     }
 }
@@ -751,6 +777,7 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::RoadmapDirNotFound { .. }
             | IntegrateError::AmbiguousRoadmapDir { .. }
             | IntegrateError::HoldDeadlineExceeded { .. } => None,
+            IntegrateError::CheckpointWriteFailed(source) => Some(source),
         }
     }
 }
@@ -764,6 +791,12 @@ impl From<GateError> for IntegrateError {
 impl From<ExecuteError> for IntegrateError {
     fn from(err: ExecuteError) -> Self {
         IntegrateError::Execute(err)
+    }
+}
+
+impl From<super::checkpoint::CheckpointError> for IntegrateError {
+    fn from(err: super::checkpoint::CheckpointError) -> Self {
+        IntegrateError::CheckpointWriteFailed(err)
     }
 }
 
@@ -931,6 +964,19 @@ pub async fn integrate_chain(
     // distinct from `execute_step`'s own per-NODE `BudgetLedger` inside a
     // single child run.
     let mut campaign_ledger = CampaignLedger::new();
+    // `EN.11.H` task 2: the per-chain checkpoint this run is extending —
+    // resumed from whatever's already on disk for this `campaign_id`
+    // (e.g. a resumed campaign re-entering `integrate_chain` for its
+    // remaining steps), or a fresh, empty one for a first run. A read
+    // failure (a corrupt file, not a missing one — see
+    // `checkpoint::read_checkpoint`) is treated the same as "start fresh"
+    // here: this loop's job is to keep integrating, not to diagnose a
+    // torn checkpoint, and every write below re-derives the full state
+    // from `outcomes` as it goes.
+    let mut checkpoint = read_checkpoint(roadmap_dir, campaign_id)
+        .ok()
+        .and_then(ReadCheckpoint::into_option)
+        .unwrap_or_else(|| Checkpoint::new(campaign_id));
     for step in chain {
         // Checked at the top of every iteration, before anything for this
         // step starts — see the "Cancellation stops the chain BETWEEN
@@ -946,6 +992,7 @@ pub async fn integrate_chain(
                 ),
             );
             let _ = append_lane_log_line(roadmap_dir, &entry);
+            let _ = write_checkpoint(roadmap_dir, &checkpoint);
             break;
         }
 
@@ -958,6 +1005,7 @@ pub async fn integrate_chain(
             let entry =
                 LaneLogEntry::budget_halted(step, lane.unwrap_or(step.repo.as_str()), reason);
             let _ = append_lane_log_line(roadmap_dir, &entry);
+            let _ = write_checkpoint(roadmap_dir, &checkpoint);
             break;
         }
 
@@ -986,6 +1034,7 @@ pub async fn integrate_chain(
             let entry =
                 LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string());
             let _ = append_lane_log_line(roadmap_dir, &entry);
+            let _ = write_checkpoint(roadmap_dir, &checkpoint);
             return Err(err);
         }
 
@@ -1004,6 +1053,7 @@ pub async fn integrate_chain(
                 ),
             );
             let _ = append_lane_log_line(roadmap_dir, &entry);
+            let _ = write_checkpoint(roadmap_dir, &checkpoint);
             break;
         }
 
@@ -1047,6 +1097,7 @@ pub async fn integrate_chain(
                 let integrate_err = IntegrateError::from(err);
                 let entry = LaneLogEntry::bailed(step, step_lane, integrate_err.to_string());
                 let _ = append_lane_log_line(roadmap_dir, &entry);
+                let _ = write_checkpoint(roadmap_dir, &checkpoint);
                 return Err(integrate_err);
             }
         };
@@ -1054,6 +1105,7 @@ pub async fn integrate_chain(
         if let Err(err) = verify_state_write(&outcome) {
             let entry = LaneLogEntry::bailed(step, step_lane, err.to_string());
             let _ = append_lane_log_line(roadmap_dir, &entry);
+            let _ = write_checkpoint(roadmap_dir, &checkpoint);
             return Err(err);
         }
 
@@ -1063,6 +1115,29 @@ pub async fn integrate_chain(
             format!("block {} closed via SDLC_FLOW", step.block_id),
         );
         append_lane_log_line(roadmap_dir, &entry)?;
+
+        // `EN.11.H` task 2: checkpoint this step as integrated, AFTER the
+        // lane-log line — a crash between the two leaves the lane log
+        // ahead of the checkpoint, never the other way round. Resume
+        // (`EN.11.H` task 4) tolerates a lane-log line for a block its
+        // checkpoint doesn't yet know about (it de-duplicates from the
+        // checkpoint, so a "duplicate-looking" line it never re-appends),
+        // but must never SKIP a block whose checkpoint says "integrated"
+        // when the lane log actually never recorded it. Propagated with
+        // `?` (unlike the ignored writes on the bail/cancel/budget paths
+        // above) because a checkpoint write failure here — on an
+        // otherwise-successful step, against a `roadmap_dir` that just
+        // accepted a lane-log append — signals a real, actionable disk
+        // problem rather than the "chain is already unwinding" case those
+        // paths guard.
+        checkpoint.steps.push(CheckpointStep {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            index: outcomes.len() as u32 + 1,
+            integrated: true,
+            branch: step_branch_name(&outcome.ctx),
+        });
+        write_checkpoint(roadmap_dir, &checkpoint)?;
 
         // Fold this step's spend into the campaign ledger BEFORE the next
         // iteration's boundary check — `EN.11.F` task 1's documented
@@ -2093,6 +2168,17 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.contains("simulated failure"), "message was: {msg}");
+        // `EN.11.H` task 2: `missing_roadmap_dir` also makes the
+        // best-effort `write_checkpoint` call on this same bail path
+        // fail (no parent directory to rename the temp file into) — that
+        // failure must be swallowed exactly like the lane-log append
+        // failure above, never surfacing as `CheckpointWriteFailed`
+        // instead of the original `Execute` error.
+        assert!(
+            !matches!(err, IntegrateError::CheckpointWriteFailed(_)),
+            "a masked checkpoint write failure would surface as CheckpointWriteFailed \
+             instead of the original step failure: {err:?}"
+        );
     }
 
     /// A two-step chain whose first step fails must not advance to the
@@ -2348,6 +2434,172 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["A.1".to_string(), "A.2".to_string(), "A.3".to_string()]
+        );
+    }
+
+    // ── EN.11.H task 2: checkpoint written as each step integrates ──────
+
+    /// A runner that behaves like [`recording_runner`] but also stamps a
+    /// `SetupWorktreeNode` result carrying a deterministic branch name for
+    /// each invoked block — mirrors what a real worktree-isolated
+    /// `SDLC_FLOW` run leaves in `ctx.nodes` for
+    /// [`step_branch_name`]/`wrap_up::branch_name` to read.
+    fn branch_stamping_runner() -> (FlowRunner, Arc<Mutex<Vec<String>>>) {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: FlowRunner = Arc::new(move |invocation| {
+            recorded.lock().unwrap().push(invocation.block_id.clone());
+            let branch_name = format!("{}-flow", invocation.block_id);
+            Box::pin(async move {
+                let mut nodes = std::collections::HashMap::new();
+                nodes.insert(
+                    "SetupWorktreeNode".to_string(),
+                    json!({ "branch_name": branch_name }),
+                );
+                Ok(engine_contract::TaskContext {
+                    event: json!({}),
+                    nodes,
+                    metadata: json!({}),
+                    node_runs: std::collections::HashMap::new(),
+                })
+            })
+        });
+        (runner, calls)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_records_every_integrated_step_with_branch_in_order() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+        write_done_state(&dir.path().join("repo-a"), "A.3");
+        let (runner, _calls) = branch_stamping_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = uuid::Uuid::new_v4();
+
+        let chain = vec![
+            step("repo-a", "A.1"),
+            step("repo-a", "A.2"),
+            step("repo-a", "A.3"),
+        ];
+
+        let outcomes = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            campaign_id,
+        )
+        .await
+        .expect("all three steps should integrate");
+        assert_eq!(outcomes.len(), 3);
+
+        let checkpoint = read_checkpoint(roadmap_dir.path(), campaign_id)
+            .expect("checkpoint read must not error")
+            .into_option()
+            .expect("a checkpoint must exist after integrating steps");
+
+        assert_eq!(checkpoint.campaign_id, campaign_id);
+        assert_eq!(checkpoint.steps.len(), 3, "exactly N integrated steps");
+        let expected = [
+            ("A.1", 1u32, "A.1-flow"),
+            ("A.2", 2u32, "A.2-flow"),
+            ("A.3", 3u32, "A.3-flow"),
+        ];
+        for (recorded, (block_id, index, branch)) in checkpoint.steps.iter().zip(expected) {
+            assert_eq!(recorded.repo, "repo-a");
+            assert_eq!(recorded.block_id, block_id);
+            assert_eq!(recorded.index, index);
+            assert!(recorded.integrated);
+            assert_eq!(recorded.branch.as_deref(), Some(branch));
+        }
+    }
+
+    /// The checkpoint write on the success path happens AFTER the
+    /// lane-log line, per `integrate_chain`'s "Write the checkpoint on
+    /// that same path, AFTER the lane-log line" contract. Pinned by
+    /// making the checkpoint write fail (a directory sitting at the exact
+    /// path `write_checkpoint`'s temp file would occupy) while the
+    /// lane-log append succeeds against the same `roadmap_dir`: if the
+    /// checkpoint were written FIRST, a crash-equivalent failure there
+    /// would leave the lane log without its `closed` line; instead the
+    /// lane-log line is on disk even though the overall call errors on
+    /// the checkpoint write that came after it.
+    #[tokio::test]
+    async fn checkpoint_is_written_after_the_lane_log_line_on_the_success_path() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = uuid::Uuid::new_v4();
+
+        // Pre-create a DIRECTORY at the exact path `write_checkpoint`
+        // would write its temp file to, so `fs::write` there fails —
+        // simulating a checkpoint write failure without touching
+        // `lane-log.jsonl` at all.
+        let checkpoint_final = roadmap_dir
+            .path()
+            .join(format!("checkpoint-{campaign_id}.json"));
+        let checkpoint_tmp = checkpoint_final.with_extension("json.tmp");
+        std::fs::create_dir_all(&checkpoint_tmp).unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            campaign_id,
+        )
+        .await
+        .expect_err("the checkpoint write failure must surface");
+
+        assert!(
+            matches!(err, IntegrateError::CheckpointWriteFailed(_)),
+            "expected the checkpoint write's own failure to surface: {err:?}"
+        );
+
+        // The lane-log line was already appended BEFORE the (failing)
+        // checkpoint write was even attempted.
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "the closed lane-log line must be on disk");
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap()["block"],
+            json!("A.1")
         );
     }
 }
