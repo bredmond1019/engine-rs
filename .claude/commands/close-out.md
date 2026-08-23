@@ -38,7 +38,7 @@ Examples:
 
 ## Execution Model
 
-Run inline — do NOT spawn a subagent. `/update-docs`, `/handoff`, and `/clean-worktree` are
+Run inline — do NOT spawn a subagent. `/update-docs`, `write-repo-doc`, `/handoff`, and `/clean-worktree` are
 invoked as Skill tool calls or commands from the main agent context; they have their own confirmation gates.
 
 ## Instructions
@@ -246,6 +246,43 @@ Record non-blocking gaps for the handoff note (Step 4).
 
 Invoke the `/update-docs --patch` skill. Wait for it to complete.
 
+#### 3b — Bring every doc you touched up to the current standard
+
+**Governed by D73** (`base-template/planning/decisions/D73-docs-upgrade-incrementally-through-close-out.md`);
+the standard itself is D72.
+
+**Load the `write-repo-doc` skill and apply it to each doc this run created or edited.** Most docs
+in this fleet predate that standard: they open with prose instead of a quickstart, use vocabulary
+they never define, and name commands and scripts without linking them. `/close-out` runs on
+virtually every piece of work, which makes it the one reliable place these get fixed — a doc that is
+never touched stays as it is, and that is fine.
+
+**Scope, so this does not become a rewrite of the whole repo:** only docs in this run's
+`changed`/`created` set. Never sweep `docs/` looking for work.
+
+Judge each one against the skill's checklist. The common gaps:
+
+- No quickstart — the reader must skim prose to find the first command.
+- A command or script named but not linked, or named without saying **where it is typed** (a Claude
+  Code slash command and a shell command look identical on the page).
+- Vocabulary used confidently and defined nowhere.
+- A section that opens in jargon with no plain-English sentence first.
+
+**Then route by size — do not start a large rewrite inside a close-out:**
+
+| Situation | Do this |
+|---|---|
+| Small gaps (a quickstart, a few links, a sentence per section) | **Fix it now**, in this commit. |
+| A genuine rewrite, **and this repo is running a roadmap** | File a `/ticket` against that roadmap. Say which doc and which gaps. |
+| A genuine rewrite, **and there is no active roadmap** | Add a **`carryover[]` entry** (`kind: drift`) to `planning/state.json`. |
+| It blocks something | Only then consider an edge. **This is the last resort, not the default.** |
+
+**Why a carryover rather than a backlog ticket when there is no roadmap:** carryover surfaces on the
+Attention board on its own. A backlog ticket with no roadmap driving it has no command that calls it
+back up, so it sits unread. Prefer the container that resurfaces itself.
+
+Record what you did either way — fixed in place, ticketed, or carried over — in the Step 4 report.
+
 ### Step 4 — Hand off
 
 **Skip this step if `--gap-check-only` was passed.** Instead, print a one-line summary:
@@ -342,6 +379,7 @@ bullets. Link paths; never restate a file. See the `report-to-the-operator` skil
 
 ```
 <spec-slug> closed out — <gates>/<total> gates, coverage <ok | gap: ...>, docs <clean | patched: N>
+<doc standard: N upgraded | M ticketed | K carried over — omit the line entirely if nothing applied>
 - <anything that failed or was skipped, with the real error>
 Next: <command>
 ```

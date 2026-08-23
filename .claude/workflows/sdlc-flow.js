@@ -68,7 +68,7 @@ export const meta = {
     { title: 'Plan',     detail: 'Enumerate tasks from tasks.json (D16 lint) + load resume state' },
     { title: 'Tasks',    detail: 'Per task: implement → fast-test → (triage → fix/bail)' },
     { title: 'Review',   detail: 'ONE consolidated review of the integrated tree; full gating suite' },
-    { title: 'Docs',     detail: 'Surgical /update-docs --patch (gates on PASS verdict)' },
+    { title: 'Docs',     detail: 'Surgical /update-docs --patch + write-repo-doc standard pass (gates on PASS verdict)' },
     { title: 'Wrap-up',  detail: 'status/log + amendment log on the branch, then open a PR (or draft PR on bail)' },
   ]
 }
@@ -2290,6 +2290,22 @@ the surface this run changed. All Bash from the worktree root.
 3. Surgically patch ONLY the affected sections (Edit tool — never rewrite whole files). Update changed
    signatures/prop tables/route lists/descriptions; add docs for new public APIs. Never delete documented
    items that still exist. Never edit CLAUDE.md. No emoji.
+
+3b. DOC STANDARD — apply the \`write-repo-doc\` skill to every doc you patched or created in step 3
+   (and to every doc you write in BOOTSTRAP MODE — a doc created here should be born to the standard,
+   never bootstrapped and then fixed later).
+   Load it with the Skill tool; do not work from memory of it.
+   Scope is ONLY the files in changed[]/created[]. Never sweep docs/ for unrelated work.
+   The gaps that matter most, in order:
+     - no quickstart, so the reader must read prose to find the first command;
+     - a command or script named but not linked, or named without saying WHERE it is typed
+       (a Claude Code slash command and a shell command look identical on the page);
+     - vocabulary used confidently and defined nowhere;
+     - a section opening in jargon with no plain-English sentence first.
+   Small gaps: fix them here, in this same commit.
+   A genuine rewrite: do NOT start it inside this run. Add it to the flagged[] field as
+   NEEDS_REVIEW with the doc path and the specific gaps, and let /close-out route it to a ticket
+   or a carryover. A half-finished doc rewrite inside a docs patch is worse than an unpatched doc.
 
 4. If a top-level architecture/overview/index doc needs changes, FLAG it NEEDS_REVIEW (in the flagged[]
    field) rather than editing it directly.
