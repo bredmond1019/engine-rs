@@ -88,6 +88,22 @@ use crate::durable::DurableHandle;
 use crate::live_state::LiveStateStore;
 
 /// Shared application state handed to every handler via `web::Data<AppState>`.
+///
+/// **Adding a field here is a cross-repo event.** `bastion` constructs
+/// `AppState` directly (`core/bastion/src/serve/mod.rs:571`) and path-depends
+/// on `engine-serve`, so any field this struct gains must stay non-breaking
+/// for that call site — use [`AppState::builder`] rather than growing the
+/// struct literal's required surface. `EN.11.F`'s `campaigns` field broke
+/// `bastion`'s compile for exactly this reason before this builder existed
+/// (`da0ccc3`, 2026-08-23): `cargo build` here stayed green because the
+/// breakage was entirely outside this repo.
+///
+/// Deliberately **not** `#[derive(Default)]`: `dispatcher: Arc<Dispatcher>`
+/// and `durable: DurableHandle` have no sane default value, and a defaulted
+/// `api_key` would default to the empty string on the one field that guards
+/// every engine route — a security smell in exactly the wrong place. A
+/// builder with required args for those three (plus `live`) is the shape
+/// that prevents recurrence without inventing meaningless defaults.
 pub struct AppState {
     pub dispatcher: Arc<Dispatcher>,
     pub live: LiveStateStore,
@@ -98,6 +114,68 @@ pub struct AppState {
     /// so the campaign-level abort route lives here.
     pub campaigns: CampaignRegistry,
     pub api_key: String,
+}
+
+impl AppState {
+    /// Start building an `AppState`. `dispatcher`, `live`, `durable`, and
+    /// `api_key` have no sane default and are required here; the registry
+    /// fields (`runs`, `campaigns`) default to empty and are the ones that
+    /// actually keep getting added — see [`AppStateBuilder::runs`] and
+    /// [`AppStateBuilder::campaigns`]. A future registry field can land as
+    /// one more optional setter without forcing a same-commit change at any
+    /// out-of-repo construction site.
+    pub fn builder(
+        dispatcher: Arc<Dispatcher>,
+        live: LiveStateStore,
+        durable: DurableHandle,
+        api_key: String,
+    ) -> AppStateBuilder {
+        AppStateBuilder {
+            dispatcher,
+            live,
+            durable,
+            api_key,
+            runs: RunRegistry::default(),
+            campaigns: CampaignRegistry::default(),
+        }
+    }
+}
+
+/// Builder for [`AppState`] — see that struct's doc comment for why this
+/// exists instead of an exhaustive struct literal or `#[derive(Default)]`.
+pub struct AppStateBuilder {
+    dispatcher: Arc<Dispatcher>,
+    live: LiveStateStore,
+    durable: DurableHandle,
+    api_key: String,
+    runs: RunRegistry,
+    campaigns: CampaignRegistry,
+}
+
+impl AppStateBuilder {
+    /// Override the default (empty) run-cancellation registry.
+    pub fn runs(mut self, runs: RunRegistry) -> Self {
+        self.runs = runs;
+        self
+    }
+
+    /// Override the default (empty) campaign-cancellation registry.
+    pub fn campaigns(mut self, campaigns: CampaignRegistry) -> Self {
+        self.campaigns = campaigns;
+        self
+    }
+
+    /// Finish building the `AppState`.
+    pub fn build(self) -> AppState {
+        AppState {
+            dispatcher: self.dispatcher,
+            live: self.live,
+            durable: self.durable,
+            runs: self.runs,
+            campaigns: self.campaigns,
+            api_key: self.api_key,
+        }
+    }
 }
 
 /// Register all routes on `cfg`, so the serve binary and the test harness
@@ -813,6 +891,50 @@ mod tests {
             campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
+    }
+
+    // `EN.ticket.appstate-additions-must-not-break-consumers` task 1: pins
+    // that `AppState` is constructible via `AppState::builder(...)` without
+    // an exhaustive field list -- the actual guarantee this ticket exists
+    // to protect. Passes only the four required args and takes the default
+    // (empty) `runs`/`campaigns` registries, which is exactly the shape a
+    // future registry-field addition must not disturb for a consumer that
+    // does the same.
+    #[actix_web::test]
+    async fn app_state_builder_does_not_require_exhaustive_fields() {
+        let dispatcher = Arc::new(Dispatcher::new());
+        let state = AppState::builder(
+            dispatcher,
+            LiveStateStore::new(),
+            crate::durable::spawn_durable_writer(None),
+            "test-key".to_string(),
+        )
+        .build();
+
+        assert_eq!(state.api_key, "test-key");
+        assert!(state.dispatcher.registered_types().is_empty());
+    }
+
+    // Same guarantee, but exercising the optional setters -- adding a
+    // registry field must remain a one-more-setter change, never a
+    // required-arg change, for a consumer that opts in to a non-default
+    // registry.
+    #[actix_web::test]
+    async fn app_state_builder_accepts_optional_registry_overrides() {
+        let dispatcher = Arc::new(Dispatcher::new());
+        let runs = RunRegistry::new();
+        let campaigns = crate::abort::CampaignRegistry::new();
+        let state = AppState::builder(
+            dispatcher,
+            LiveStateStore::new(),
+            crate::durable::spawn_durable_writer(None),
+            "test-key".to_string(),
+        )
+        .runs(runs)
+        .campaigns(campaigns)
+        .build();
+
+        assert_eq!(state.api_key, "test-key");
     }
 
     #[actix_web::test]
