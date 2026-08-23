@@ -144,6 +144,7 @@ fn app_state_with(dispatcher: Dispatcher) -> AppState {
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(None),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: API_KEY.to_string(),
     }
 }

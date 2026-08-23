@@ -463,6 +463,16 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   exceed it. `BudgetHaltReason::to_json()` renders `{cap, spent, limit}` for the metadata stamp;
   `budget.rs` itself never mutates a `TaskContext` — `Workflow::run_with` owns the write.
   Absent `Budget` config, `check()` always allows.
+- `CampaignLedger` (`engine-core::budget`, `EN.11.F` task 1) — the campaign-scoped counterpart to
+  `BudgetLedger`: accumulates spend **across a chain's steps** (block boundaries), rather than
+  across one run's nodes. `record_step(cost_usd: Option<f64>, total_tokens: u64)` folds in one
+  block's totals; a `None` cost contributes `$0` arithmetically but sets
+  `has_unknown_cost_step` so a caller can tell "no step ever reported a cost" apart from a
+  confirmed `$0` spend. `check(budget: Option<&Budget>)` reuses the same `evaluate_budget`
+  free function `BudgetLedger::check` calls, so the halt/allow decision is never forked between
+  the per-node and per-campaign ledgers even though the two ledger types are distinct. See
+  `docs/orchestration-workflow.md`'s "Campaign identity" section for how `integrate_chain` uses
+  it as the `campaign_budget` ceiling.
 - `OnProgress<'a>` (`engine-core::workflow`, `type OnProgress<'a> = Box<dyn FnMut(&TaskContext) +
   'a>`) — the injected persistence seam invoked at every node boundary (initial seed, RUNNING
   entry, SUCCESS/FAILED exit). This block only defines the signature; EN.1.C wires it to Postgres.
@@ -631,6 +641,23 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   missing/invalid API key, `404` if the run isn't currently registered (unknown or already
   finished), `202 Accepted` on success (matching `post_events`'s existing `202` convention) —
   calls `token.cancel()`, which `Workflow::run_with` observes at the next node boundary.
+- Campaign abort endpoint (`engine-serve::abort`, `EN.11.F` task 2) — `POST
+  /campaigns/{id}/abort`, registered ahead of the existing `GET /campaigns/{id}` route so the
+  literal `abort` path segment isn't swallowed by that route's `{id}` extractor. Same
+  `check_api_key` gate as `/events/{run_id}/abort`, but backed by a separate `CampaignRegistry`
+  (identical `Arc<RwLock<HashMap<Uuid, CancellationToken>>>` shape to `RunRegistry`, keyed by
+  `campaign_id` instead of `run_id`) — a new `AppState.campaigns` field alongside the existing
+  `runs`. `401` on a missing/invalid API key, `404` for both an unknown/already-finished campaign
+  id **and** a malformed/non-UUID path segment (mirroring `get_campaign`'s convention rather than
+  `abort_run`'s simpler 401/404/202-only contract), `202 {campaign_id, status: "aborting"}` on
+  success — calls `token.cancel()` on the campaign-scoped token, which `integrate_chain`
+  (`ORCHESTRATION`) observes at the next block boundary via the `cancellation_token` param
+  threaded through `FlowInvocation`/`execute_step` (task 3). `suspend::spawn_run` registers an
+  ORCHESTRATION run's effective token under its resolved `campaign_id` (in `AppState.campaigns`)
+  at the same point it registers the run's own token in `AppState.runs`, and deregisters it on
+  every exit path the same way — so this route is live end-to-end for an ORCHESTRATION dispatch,
+  not merely reachable. Calling `bastion abort <campaign>` from the CLI is out of this task's
+  scope; only the HTTP route exists today.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,

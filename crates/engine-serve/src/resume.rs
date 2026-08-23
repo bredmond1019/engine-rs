@@ -254,6 +254,7 @@ pub async fn resume_run(
         live: state.live.clone(),
         durable: state.durable.clone(),
         runs: state.runs.clone(),
+        campaigns: state.campaigns.clone(),
         token,
         pause,
         budget,
@@ -354,6 +355,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -718,6 +720,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         };
 

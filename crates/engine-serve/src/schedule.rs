@@ -569,6 +569,7 @@ pub fn dispatch_scheduled_entry(
         live,
         durable: durable_handle,
         runs,
+        campaigns: state.campaigns.clone(),
         token,
         pause,
         budget,
@@ -1100,6 +1101,7 @@ mod tests {
             live: crate::live_state::LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: crate::abort::RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         };
         (state, recorded)

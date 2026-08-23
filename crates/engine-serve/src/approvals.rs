@@ -247,6 +247,7 @@ mod tests {
             live: crate::live_state::LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: crate::abort::RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: API_KEY.to_string(),
         }
     }

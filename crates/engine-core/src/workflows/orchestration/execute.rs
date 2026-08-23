@@ -51,7 +51,8 @@ use uuid::Uuid;
 
 use engine_contract::{NodeRunStatus, TaskContext};
 
-use crate::budget::BudgetLedger;
+use crate::budget::{Budget, BudgetLedger};
+use crate::cancellation::CancellationToken;
 use crate::workflow::node_cost_usd;
 use serde_json::json;
 
@@ -87,7 +88,12 @@ pub use super::engine_kind::EngineKind;
 /// id to run as `spec_slug`. Handed to a [`FlowRunner`] so a test double
 /// can assert exactly what cwd a step actually resolved to, not merely
 /// what the caller intended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq`/`Eq` are deliberately not derived here (EN.11.F task 3):
+// `CancellationToken` wraps a `tokio::sync::watch::Sender` with no
+// meaningful equality, so a derived impl either fails to compile or
+// silently drops the field from comparison. Nothing in this crate compares
+// two whole `FlowInvocation`s — callers compare individual fields.
+#[derive(Debug, Clone)]
 pub struct FlowInvocation {
     pub repo: String,
     pub repo_path: PathBuf,
@@ -116,6 +122,31 @@ pub struct FlowInvocation {
     /// `campaign_id`: an invocation with an unstated engine is exactly the
     /// defect this field exists to make unrepresentable.
     pub engine: EngineKind,
+    /// The campaign-wide cancellation token, checked at block boundaries
+    /// (`EN.11.F` task 4) — threaded here so [`default_flow_runner`] can
+    /// hand it to the child's `RunOptions::cancellation_token`, the ONLY
+    /// cancellation path (`RunOptions`'s own doc comment: a cancelled walk
+    /// stops at a node boundary and returns `Ok(ctx)`, never `Err`, so a
+    /// cancelled run stays distinguishable from a failed one). `None` means
+    /// no cancellation checked inside the child at all. Deliberately no
+    /// `Default` and no builder on this struct, same reasoning as
+    /// `use_worktree` and `campaign_id`: an invocation with an unstated
+    /// cancellation token is exactly the defect this field exists to make
+    /// unrepresentable — callers must pass `None` explicitly rather than
+    /// getting it for free.
+    pub cancellation_token: Option<CancellationToken>,
+    /// The campaign-scoped spend cap, threaded here so
+    /// [`default_flow_runner`] can hand it to the child's
+    /// `RunOptions::budget`. This is NOT the campaign-boundary ceiling
+    /// checked by `CampaignLedger` (`EN.11.F` task 1/4) between steps —
+    /// that check runs in `integrate.rs` before the NEXT step is even
+    /// dispatched. This is the same per-node `Budget` shape handed straight
+    /// through to `RunOptions`, so the child's own node-level
+    /// `BudgetLedger::check` gate is configured too, rather than left at
+    /// today's `budget: None`. `None` means no per-node gate inside the
+    /// child. Deliberately no `Default` and no builder, same reasoning as
+    /// the other fields above.
+    pub budget: Option<Budget>,
 }
 
 /// A future producing a finished run's [`TaskContext`] or a [`WorkflowError`].
@@ -384,6 +415,12 @@ fn step_spend(ctx: &TaskContext) -> (Option<f64>, u64) {
 /// fallback (row 3 of [`resolve_isolation`]'s table) — this function does not
 /// read policy itself, it only consults `registry.brain_root()` (row 2) and
 /// `step.repo` (row 1) alongside whatever the caller passed in for row 3.
+///
+/// `cancellation_token`/`budget` (`EN.11.F` task 3) are threaded straight
+/// into the resolved [`FlowInvocation`] for [`default_flow_runner`] to hand
+/// to the child's `RunOptions` — this function does not itself check
+/// either; the block-boundary check is `integrate.rs`'s job (task 4).
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_step(
     step: &ChainStep,
     resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
@@ -391,6 +428,8 @@ pub async fn execute_step(
     run_flow: &FlowRunner,
     default_use_worktree: bool,
     campaign_id: Uuid,
+    cancellation_token: Option<CancellationToken>,
+    budget: Option<Budget>,
 ) -> Result<ExecutionOutcome, ExecuteError> {
     let repo_path =
         registry
@@ -432,6 +471,8 @@ pub async fn execute_step(
         use_worktree,
         campaign_id,
         engine,
+        cancellation_token,
+        budget,
     };
     let ctx = run_flow(invocation)
         .await
@@ -555,15 +596,16 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
                         Workflow::new_validated(node_registry, sdlc_flow::graph::schema())
                             .map_err(|err| WorkflowError::new(err.to_string()))?;
                     let on_progress: OnProgress<'_> = Box::new(|_ctx: &TaskContext| {});
-                    // `run_with` with `RunOptions` threaded from the invocation
-                    // (EN.11.G task 1) — today that's `RunOptions::default()`
-                    // (no cancellation/budget/pause/run_id wired from the chain
-                    // yet), which is byte-for-byte behavior-identical to the bare
-                    // `workflow.run(..)` call it replaces (see `RunOptions`'s own
-                    // doc comment: every field `None` matches `run`'s behavior
-                    // exactly). This is the seam later tasks stamp real per-step
-                    // options and observed cost/tokens through.
-                    let options = RunOptions::default();
+                    // `RunOptions` threaded from the invocation (`EN.11.F`
+                    // task 3): the campaign's cancellation token and
+                    // per-node budget are handed straight through to the
+                    // child's own boundary checks. `pause_signal`/`run_id`
+                    // stay `None` — out of scope here, same as before.
+                    let options = RunOptions {
+                        cancellation_token: invocation.cancellation_token.clone(),
+                        budget: invocation.budget,
+                        ..RunOptions::default()
+                    };
                     workflow.run_with(event, on_progress, options).await
                 }
                 EngineKind::Task => {
@@ -589,7 +631,11 @@ pub fn default_flow_runner(registry: Arc<RepoRegistry>) -> FlowRunner {
                         Workflow::new_validated(node_registry, sdlc_task::graph::schema())
                             .map_err(|err| WorkflowError::new(err.to_string()))?;
                     let on_progress: OnProgress<'_> = Box::new(|_ctx: &TaskContext| {});
-                    let options = RunOptions::default();
+                    let options = RunOptions {
+                        cancellation_token: invocation.cancellation_token.clone(),
+                        budget: invocation.budget,
+                        ..RunOptions::default()
+                    };
                     workflow.run_with(event, on_progress, options).await
                 }
             }
@@ -664,6 +710,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("step a should execute");
@@ -674,6 +722,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("step b should execute");
@@ -710,6 +760,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("flow-engine step should execute");
@@ -742,6 +794,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("task-engine step should execute");
@@ -802,6 +856,8 @@ mod tests {
             &failing_runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -835,6 +891,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -893,6 +951,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect_err("a child with a failed node_run must fail the step");
@@ -937,6 +997,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("a run with no failed nodes should be integrated as success");
@@ -1000,6 +1062,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("step should execute");
@@ -1026,6 +1090,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("step should execute");
@@ -1138,6 +1204,8 @@ mod tests {
             use_worktree: true,
             campaign_id: Uuid::new_v4(),
             engine: EngineKind::Flow,
+            cancellation_token: None,
+            budget: None,
         };
         assert_eq!(
             sdlc_flow_event(&invocation_true)["use_worktree"],
@@ -1166,6 +1234,8 @@ mod tests {
             use_worktree: true,
             campaign_id,
             engine: EngineKind::Flow,
+            cancellation_token: None,
+            budget: None,
         };
         assert_eq!(
             sdlc_flow_event(&invocation)["campaign_id"],
@@ -1211,6 +1281,8 @@ mod tests {
             &runner,
             true,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("ordinary step should execute");
@@ -1221,6 +1293,8 @@ mod tests {
             &runner,
             false,
             Uuid::new_v4(),
+            None,
+            None,
         )
         .await
         .expect("base-template step should execute");

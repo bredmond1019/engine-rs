@@ -89,6 +89,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use engine_contract::{NodeRun, NodeRunStatus};
+use engine_core::budget::Budget;
+use engine_core::cancellation::CancellationToken;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
 use engine_core::workflows::orchestration::execute::{
@@ -264,6 +266,11 @@ fn fixture_roadmap_dir(slug: &str) -> (tempfile::TempDir, PathBuf) {
 struct RecordingRunner {
     calls: Arc<Mutex<Vec<(String, String, PathBuf)>>>,
     status_overrides: Arc<Mutex<HashMap<String, Option<String>>>>,
+    // `EN.11.F` task 5: a block's simulated cost, used only by the
+    // campaign-ceiling cases below — absent a set override, a block
+    // reports NO cost figure at all (empty `ctx.nodes`, matching every
+    // earlier task's fixture exactly), never a silent `$0`.
+    cost_overrides: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 impl RecordingRunner {
@@ -271,6 +278,7 @@ impl RecordingRunner {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
             status_overrides: Arc::new(Mutex::new(HashMap::new())),
+            cost_overrides: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -283,6 +291,18 @@ impl RecordingRunner {
             .lock()
             .unwrap()
             .insert(block_id.to_string(), status.map(str::to_string));
+    }
+
+    /// Give `block_id`'s simulated child run one reporting node with
+    /// `cost_usd: cost` — the only way this double can produce a non-`None`
+    /// `ExecutionOutcome::cost_usd` (`execute.rs::step_spend` requires at
+    /// least one `ctx.nodes` entry carrying a `"cost_usd"` number). Used by
+    /// `EN.11.F` task 5's campaign-ceiling cases.
+    fn set_cost_override(&self, block_id: &str, cost: f64) {
+        self.cost_overrides
+            .lock()
+            .unwrap()
+            .insert(block_id.to_string(), cost);
     }
 
     fn call_count(&self) -> usize {
@@ -360,9 +380,23 @@ impl RecordingRunner {
                     write_state(&invocation.repo_path, &invocation.block_id, &status);
                 }
 
+                let mut nodes = HashMap::new();
+                if let Some(cost) = this
+                    .cost_overrides
+                    .lock()
+                    .unwrap()
+                    .get(&invocation.block_id)
+                    .copied()
+                {
+                    nodes.insert(
+                        invocation.block_id.clone(),
+                        serde_json::json!({"cost_usd": cost}),
+                    );
+                }
+
                 Ok(engine_contract::TaskContext {
                     event: serde_json::json!({}),
-                    nodes: HashMap::new(),
+                    nodes,
                     metadata: serde_json::json!({}),
                     node_runs: HashMap::new(),
                 })
@@ -398,6 +432,8 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
             use_worktree: false,
             campaign_id: Uuid::new_v4(),
             engine: EngineKind::Flow,
+            cancellation_token: None,
+            budget: None,
         };
         (flow_runner)(invocation)
             .await
@@ -479,6 +515,7 @@ async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -583,6 +620,8 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         &failing_runner,
         false,
         Uuid::new_v4(),
+        None,
+        None,
     )
     .await
     .expect_err("execute_step must fail a step whose node_runs record a failed node");
@@ -636,6 +675,7 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -819,6 +859,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         Duration::from_millis(5),
         None,
         None,
+        None,
         &always_flow,
         &registry,
         &flow_runner,
@@ -843,6 +884,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -913,5 +955,255 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
             .count(),
         1,
         "D.3's missing state write produces exactly one bailed line"
+    );
+}
+
+// ── EN.11.F task 5: abort at a block boundary + the campaign ceiling ─────
+//
+// HONESTY REQUIREMENT (this block's `carryover_context`:
+// `orchestration-workflow-never-driven-a-real-chain` stands): every case
+// below drives `integrate_chain` over `single_repo_fixture`'s tempdir git
+// repos through `RecordingRunner`, exactly like every earlier task in this
+// fixture. A green result here proves `integrate_chain`'s own control flow
+// — the cancellation check, the campaign ceiling check, and the
+// commit/halt bookkeeping — behaves as specified. It is NOT evidence that
+// a real chain, driving real `claude` subprocesses through `engine-serve`,
+// was ever actually aborted; that remains unproven and the carryover is
+// NOT cleared by this task. The un-gateable "no `claude` subprocess
+// survives 30s after an abort" criterion is covered separately (task 6:
+// a `pgrep` recipe run/recorded in the block's run notes), never by a
+// fixture test.
+//
+// The block's fifth AC — "an abort of an unknown or already-finished
+// campaign returns a stable error, never a 500, never a hang" — is
+// integration-tested at the HTTP surface in
+// `crates/engine-serve/src/abort.rs` (`EN.11.F` task 2:
+// `abort_unknown_campaign_returns_404` and friends), which is where that
+// behaviour actually lives; `integrate_chain` itself has no notion of an
+// "unknown campaign", only a token it is or is not handed. Not duplicated
+// here.
+
+/// A [`FlowRunner`] wrapper that triggers `token.cancel()` immediately
+/// after `after_block_id`'s invocation completes — simulating an operator
+/// abort landing in the gap between one block finishing and the next
+/// block's boundary check, which is exactly the window Fork 1's decided
+/// semantics (`integrate_chain`'s "Cancellation stops the chain BETWEEN
+/// steps only" doc) says an abort can and cannot reach.
+fn cancel_after(
+    base: FlowRunner,
+    token: CancellationToken,
+    after_block_id: &'static str,
+) -> FlowRunner {
+    Arc::new(move |invocation| {
+        let base = base.clone();
+        let token = token.clone();
+        Box::pin(async move {
+            let block_id = invocation.block_id.clone();
+            let result = (base)(invocation).await;
+            if block_id == after_block_id {
+                token.cancel();
+            }
+            result
+        })
+    })
+}
+
+/// AC: "Aborting a running campaign stops the chain at the next block
+/// boundary" + "the in-flight block at abort time still finishes and
+/// commits" (Fork 1's decided semantics — an abort that discards
+/// in-flight work is a FAIL, not an over-delivery).
+///
+/// The cancellation token is triggered the instant block 1's invocation
+/// returns (see [`cancel_after`]), so by the time `integrate_chain`'s loop
+/// reaches the boundary before block 2, the token already reads cancelled.
+/// Block 1 must therefore be fully committed (its branch pushed, its
+/// state file written, its `closed` lane-log line on disk) while block 2
+/// is never dispatched at all.
+#[tokio::test]
+async fn abort_between_blocks_leaves_block_one_committed_and_block_two_unstarted() {
+    let (_brain_root, _bare_root, registry, repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-f-abort");
+    let admission = AdmissionGate::with_default_policy();
+
+    let runner = RecordingRunner::new();
+    let token = CancellationToken::new();
+    let flow_runner = cancel_after(runner.clone().into_runner(), token.clone(), "TF.1");
+
+    let chain = resolve_explicit_chain(vec![
+        ("smoke-repo".to_string(), "TF.1".to_string()),
+        ("smoke-repo".to_string(), "TF.2".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        Some(&token),
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("en-11-f-lane"),
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("a cancellation win is Ok, not Err — never rolled back");
+
+    // Only block 1 ran; block 2 was never even dispatched to the runner.
+    assert_eq!(outcomes.len(), 1, "only TF.1 should have been integrated");
+    assert_eq!(outcomes[0].block_id, "TF.1");
+    assert_eq!(runner.calls_for("TF.1"), 1);
+    assert_eq!(
+        runner.calls_for("TF.2"),
+        0,
+        "TF.2 must never be dispatched after the cancellation win"
+    );
+
+    // Block 1's work is REALLY committed: a real branch, pushed, with its
+    // marker commit — never rolled back by the abort.
+    assert!(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "sdlc/TF.1"])
+            .current_dir(&repo_path)
+            .output()
+            .expect("git rev-parse")
+            .status
+            .success(),
+        "TF.1's branch must exist — the in-flight block still finishes and commits"
+    );
+    let state_a = repo_path
+        .join("planning")
+        .join("TF.1")
+        .join("sdlc")
+        .join("sdlc-flow-state.json");
+    assert!(state_a.exists(), "TF.1's state file must be written");
+
+    // Block 2's branch was never cut at all.
+    let tf2_branch = Command::new("git")
+        .args(["rev-parse", "--verify", "sdlc/TF.2"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("git rev-parse");
+    assert!(
+        !tf2_branch.status.success(),
+        "TF.2's branch must not exist — it was never started"
+    );
+
+    // The lane-log record distinguishes "TF.1 closed" from "TF.2 never
+    // started because of an explicit cancellation" — never collapsed into
+    // a single ambiguous line.
+    let contents = std::fs::read_to_string(roadmap_dir.join("lane-log.jsonl"))
+        .expect("lane-log.jsonl must exist");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON line"))
+        .collect();
+    assert_eq!(lines.len(), 2, "one closed line + one cancelled line");
+    assert_eq!(lines[0]["block"], "TF.1");
+    assert_eq!(lines[0]["status"], "closed");
+    assert_eq!(lines[1]["block"], "TF.2");
+    assert_eq!(lines[1]["status"], "cancelled");
+}
+
+/// AC: "A campaign ceiling set BELOW one block's cost halts the chain at
+/// the block boundary rather than after the whole chain, and the halt
+/// reason names the cap that tripped" + "the campaign budget is checked
+/// more than once per campaign ... a test with a two-block chain shows the
+/// check running at both boundaries".
+///
+/// The cap is set to EXACTLY block 1's reported cost. If the boundary
+/// check only ran once, up front, against a still-empty ledger (spend =
+/// 0 < cap), the chain would run both blocks to completion — so a halt
+/// before block 2 is only reachable if: (1) the FIRST boundary check ran
+/// and allowed block 1 through (spend 0 < cap), (2) block 1's cost was
+/// correctly folded into the campaign ledger afterward, and (3) the
+/// SECOND boundary check ran again, against the now-nonzero ledger, and
+/// halted (spend >= cap). That is "checked at both boundaries", made
+/// observable rather than assumed.
+#[tokio::test]
+async fn campaign_ceiling_below_one_blocks_cost_halts_at_first_boundary() {
+    let (_brain_root, _bare_root, registry, repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-f-ceiling");
+    let admission = AdmissionGate::with_default_policy();
+
+    let runner = RecordingRunner::new();
+    runner.set_cost_override("TC.1", 5.0);
+    // TC.2 is never reached, so its cost is irrelevant — no override set.
+    let flow_runner = runner.clone().into_runner();
+
+    let budget = Budget {
+        max_total_tokens: None,
+        max_cost_usd: Some(5.0), // exactly TC.1's cost
+    };
+
+    let chain = resolve_explicit_chain(vec![
+        ("smoke-repo".to_string(), "TC.1".to_string()),
+        ("smoke-repo".to_string(), "TC.2".to_string()),
+    ]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        Some(&budget),
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("en-11-f-lane"),
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("a budget halt is Ok, not Err — never rolled back");
+
+    // Block 1 ran (boundary 1's check allowed it, spend 0 < cap 5.0);
+    // block 2 never dispatched (boundary 2's check halted, spend 5.0 >=
+    // cap 5.0) — proving BOTH boundary checks ran, not just the first.
+    assert_eq!(outcomes.len(), 1, "only TC.1 should have been integrated");
+    assert_eq!(runner.calls_for("TC.1"), 1);
+    assert_eq!(
+        runner.calls_for("TC.2"),
+        0,
+        "the ceiling must halt the chain BEFORE TC.2's boundary, not after \
+         the whole chain finishes"
+    );
+
+    // TC.1's work is still committed — a budget halt is not a rollback.
+    let state_a = repo_path
+        .join("planning")
+        .join("TC.1")
+        .join("sdlc")
+        .join("sdlc-flow-state.json");
+    assert!(state_a.exists(), "TC.1's state file must be written");
+
+    let contents = std::fs::read_to_string(roadmap_dir.join("lane-log.jsonl"))
+        .expect("lane-log.jsonl must exist");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON line"))
+        .collect();
+    assert_eq!(lines.len(), 2, "one closed line + one budget_halted line");
+    assert_eq!(lines[0]["block"], "TC.1");
+    assert_eq!(lines[0]["status"], "closed");
+    assert_eq!(lines[1]["block"], "TC.2");
+    assert_eq!(lines[1]["status"], "budget_halted");
+    let note = lines[1]["note"].as_str().expect("note must be a string");
+    assert!(
+        note.contains("max_cost_usd"),
+        "the halt reason must name the cap that tripped: {note}"
     );
 }

@@ -327,6 +327,31 @@ fn parse_event(ctx: &TaskContext) -> Result<OrchestrationEventSchema, NodeError>
         .map_err(|err| NodeError::new(format!("invalid ORCHESTRATION event: {err}")))
 }
 
+/// Resolve an ORCHESTRATION event's campaign id: an explicit value on the
+/// event wins (so a resumed/operator-restarted chain rejoins the SAME
+/// campaign), a present-but-unparsable value fails loudly rather than
+/// silently minting a fresh one, and `None` mints a fresh [`Uuid::new_v4`].
+///
+/// Exposed as its own function (not just inlined into `process` below) so
+/// `engine-serve`'s `register_orchestration_with_registry` factory can
+/// resolve the SAME id up front — before the workflow this node lives in
+/// ever runs — and register it (and this run's `CancellationToken`) for
+/// `POST /campaigns/{id}/abort` to find. Without a single shared resolver,
+/// the factory and this node's own independent resolution would mint two
+/// DIFFERENT ids for an event with no explicit `campaign_id`, and an abort
+/// against the id the factory registered would never match the id this
+/// node actually stamps into its output.
+pub fn resolve_campaign_id(raw: Option<&str>) -> Result<Uuid, NodeError> {
+    match raw {
+        Some(raw) => Uuid::parse_str(raw).map_err(|err| {
+            NodeError::new(format!(
+                "invalid `campaign_id` on ORCHESTRATION event: {err}"
+            ))
+        }),
+        None => Ok(Uuid::new_v4()),
+    }
+}
+
 // ── The node ─────────────────────────────────────────────────────────────
 
 type DependsOnFn = Arc<dyn Fn(&str, &str) -> Vec<DependencyEdge> + Send + Sync>;
@@ -369,6 +394,13 @@ pub struct OrchestrationRunNode {
     /// un-injected run emits nothing and behaves exactly as before this
     /// seam existed (CLAUDE.md standing rule 6).
     step_observer: StepObserverArc,
+    /// A pre-resolved campaign id, supplied by a caller that already ran
+    /// [`resolve_campaign_id`] itself (e.g. to register this run's
+    /// cancellation token for campaign-scoped abort before the workflow
+    /// runs). `None` (the default) is behavior-stable: `process` resolves
+    /// the id from the event exactly as it did before this field existed.
+    /// See [`Self::with_campaign_id`].
+    campaign_id: Option<Uuid>,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -396,6 +428,7 @@ impl OrchestrationRunNode {
             run_flow: None,
             cancellation_token: None,
             step_observer: Arc::new(|_progress: &StepProgress| {}),
+            campaign_id: None,
         }
     }
 
@@ -470,6 +503,19 @@ impl OrchestrationRunNode {
         self.step_observer = observer;
         self
     }
+
+    /// Supply a campaign id already resolved by the caller (via
+    /// [`resolve_campaign_id`]), overriding `process`'s own resolution of
+    /// the event's `campaign_id` field. Intended for a factory that must
+    /// know this run's campaign id BEFORE the workflow runs, so it can
+    /// register this node's [`Self::with_cancellation_token`] token for
+    /// campaign-scoped abort. With no override (the default), behavior is
+    /// unchanged: `process` resolves the id from the event itself.
+    #[must_use]
+    pub fn with_campaign_id(mut self, campaign_id: Uuid) -> Self {
+        self.campaign_id = Some(campaign_id);
+        self
+    }
 }
 
 impl Default for OrchestrationRunNode {
@@ -536,13 +582,9 @@ impl Node for OrchestrationRunNode {
         // that fallback, a *present but unparsable* value must fail loudly
         // rather than silently fall through — see the field's own doc on
         // `OrchestrationEventSchema::campaign_id`.
-        let campaign_id = match &event.campaign_id {
-            Some(raw) => Uuid::parse_str(raw).map_err(|err| {
-                NodeError::new(format!(
-                    "invalid `campaign_id` on ORCHESTRATION event: {err}"
-                ))
-            })?,
-            None => Uuid::new_v4(),
+        let campaign_id = match self.campaign_id {
+            Some(id) => id,
+            None => resolve_campaign_id(event.campaign_id.as_deref())?,
         };
 
         let roadmap_slug = event
@@ -645,6 +687,12 @@ impl Node for OrchestrationRunNode {
                     poll_interval,
                     hold_deadline,
                     cancellation_token.as_ref(),
+                    // `EN.11.F` task 4 adds the campaign-boundary ceiling
+                    // check to `integrate_chain`; wiring a real cap through
+                    // `OrchestrationRunNode`'s own policy surface is not
+                    // this task's job — `None` here is behavior-identical
+                    // to before this parameter existed (no ceiling).
+                    None,
                     &move |repo, block_id| resolve_engine(repo, block_id),
                     &repo_registry,
                     &run_flow,

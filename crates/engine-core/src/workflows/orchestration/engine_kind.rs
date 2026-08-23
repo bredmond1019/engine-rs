@@ -198,12 +198,28 @@ mod tests {
             ("gates.rs", &[]),
             // `profile_by_name` resolves a named policy profile (e.g. "cheap-fast") to
             // its `PartialOrchestrationPolicy` bundle — a config lookup, not a runner.
-            ("graph.rs", &["profile_by_name"]),
+            // `resolve_campaign_id` (`EN.11.F` task 2 follow-up) parses/mints a
+            // campaign `Uuid` from an event's optional `campaign_id` string field —
+            // exposed so `engine-serve`'s factory can resolve the SAME id up front
+            // and register it for campaign-scoped abort. A UUID parse, not a runner
+            // selector.
+            ("graph.rs", &["profile_by_name", "resolve_campaign_id"]),
             // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
-            // a path lookup, not a runner. `closed`/`bailed` are `LaneLogEntry`
-            // constructors taking a `lane: &str` and a `note: impl Into<String>` —
-            // building a log line, not selecting or invoking a runner.
-            ("integrate.rs", &["resolve_roadmap_dir", "closed", "bailed"]),
+            // a path lookup, not a runner. `closed`/`bailed`/`cancelled`/`budget_halted`
+            // are `LaneLogEntry` constructors taking a `lane: &str` and a
+            // `note: impl Into<String>` (`EN.11.F` task 4 adds the latter two, same
+            // shape as the existing pair) — building a log line, not selecting or
+            // invoking a runner.
+            (
+                "integrate.rs",
+                &[
+                    "resolve_roadmap_dir",
+                    "closed",
+                    "bailed",
+                    "cancelled",
+                    "budget_halted",
+                ],
+            ),
             ("mod.rs", &[]),
         ];
 

@@ -214,6 +214,7 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         Duration::from_millis(5),
         None,
         None,
+        None,
         &always_flow,
         &registry,
         &flow_runner,
@@ -269,6 +270,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -348,6 +350,7 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             &admission2,
             &NeverHeld,
             Duration::from_millis(5),
+            None,
             None,
             None,
             &always_flow,
@@ -469,6 +472,7 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             Duration::from_millis(10),
             None,
             None,
+            None,
             &always_flow,
             &registry,
             &flow_runner,
@@ -538,6 +542,7 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -611,6 +616,13 @@ fn lane_log_contract_fixture_round_trips_into_lane_log_entry() {
             engine_core::workflows::orchestration::integrate::LaneLogStatus::Bailed => {
                 saw_bailed = true;
             }
+            // `EN.11.F` task 4: this fixture predates the cancellation/
+            // budget-halt statuses (they exist only in-process, produced
+            // by `integrate_chain` itself — no hand-written fixture line
+            // uses them), so this round-trip test has nothing to flag for
+            // either.
+            engine_core::workflows::orchestration::integrate::LaneLogStatus::Cancelled
+            | engine_core::workflows::orchestration::integrate::LaneLogStatus::BudgetHalted => {}
         }
     }
 
@@ -714,6 +726,7 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script_w
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -861,6 +874,7 @@ async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_run
             Duration::from_millis(5),
             None,
             Some(&token),
+            None,
             &always_flow,
             &registry,
             &flow_runner,
@@ -892,12 +906,23 @@ async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_run
     );
     assert_eq!(recorded[0], "A.1");
 
+    // `EN.11.F` task 4: a cancellation win is now itself recorded — one
+    // `closed` line for A.1 (unchanged), plus one `cancelled` line naming
+    // A.2, the block that never started. Before task 4 a cancel win left
+    // the chain's record silent about *why* it stopped short; the block's
+    // AC requires a clean abort, a budget halt, and a failure to be three
+    // distinguishable terminal states in that record, so the cancel is no
+    // longer a silent stop.
     let lines = lane_log_lines(&roadmap_dir);
     assert_eq!(
         lines.len(),
-        1,
-        "A.1's lane-log line stays; nothing after the cancel is appended"
+        2,
+        "A.1's `closed` line stays, plus one `cancelled` line naming the block that never started"
     );
+    assert_eq!(lines[0]["status"], "closed");
+    assert_eq!(lines[0]["block"], "A.1");
+    assert_eq!(lines[1]["status"], "cancelled");
+    assert_eq!(lines[1]["block"], "A.2");
 }
 
 /// A chain parked on an operator hold that never clears must abort
@@ -951,6 +976,7 @@ async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner
             huge_poll_interval,
             None,
             Some(&token_for_task),
+            None,
             &always_flow,
             &registry,
             &flow_runner,
@@ -1016,6 +1042,7 @@ async fn n_step_chain_calls_the_observer_exactly_n_times_with_correct_indices() 
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -1090,6 +1117,7 @@ async fn the_observer_fires_after_the_lane_log_line_is_appended() {
         Duration::from_millis(5),
         None,
         None,
+        None,
         &always_flow,
         &registry,
         &flow_runner,
@@ -1126,6 +1154,7 @@ async fn no_observer_injected_changes_nothing() {
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,
@@ -1489,6 +1518,7 @@ async fn two_step_chain_attributes_cost_and_tokens_to_the_step_that_spent_them_w
         &admission,
         &NeverHeld,
         Duration::from_millis(5),
+        None,
         None,
         None,
         &always_flow,

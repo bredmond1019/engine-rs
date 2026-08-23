@@ -76,6 +76,7 @@ fn test_app_state(release: Arc<Notify>) -> AppState {
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(None),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: API_KEY.to_string(),
     }
 }

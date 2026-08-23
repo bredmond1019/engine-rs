@@ -98,6 +98,7 @@ fn test_app_state() -> AppState {
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(None),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: "integration-test-key".to_string(),
     }
 }
@@ -320,6 +321,7 @@ fn test_app_state_with_real_sdlc_flow() -> AppState {
         live: LiveStateStore::new(),
         durable: spawn_durable_writer(None),
         runs: RunRegistry::new(),
+        campaigns: engine_serve::abort::CampaignRegistry::new(),
         api_key: "integration-test-key".to_string(),
     }
 }

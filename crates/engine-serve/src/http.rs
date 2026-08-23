@@ -82,7 +82,7 @@ use engine_core::{Budget, CancellationToken, PauseSignal};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::abort::RunRegistry;
+use crate::abort::{CampaignRegistry, RunRegistry};
 use crate::dispatch::{DispatchError, Dispatcher};
 use crate::durable::DurableHandle;
 use crate::live_state::LiveStateStore;
@@ -93,6 +93,10 @@ pub struct AppState {
     pub live: LiveStateStore,
     pub durable: DurableHandle,
     pub runs: RunRegistry,
+    /// `EN.11.F` task 2: per-campaign cancellation tokens, keyed by
+    /// campaign id. Distinct from `runs` (per-run) — a campaign is N runs,
+    /// so the campaign-level abort route lives here.
+    pub campaigns: CampaignRegistry,
     pub api_key: String,
 }
 
@@ -152,11 +156,20 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             "/approvals/ledger",
             web::get().to(crate::approvals::list_ledger),
         )
-        // `EN.11.E` task 5. No literal `/campaigns/...` segment exists yet,
-        // so `{id}` cannot shadow anything today — but per this file's
-        // established first-registration-wins trap (see `/events/suspended`
-        // and `/approvals/ledger/stats` above), any future literal segment
-        // under `/campaigns/` MUST be registered before this route.
+        // `EN.11.F` task 2. MUST be registered before `/campaigns/{id}`
+        // below — same first-registration-wins trap noted throughout this
+        // function — so the literal `abort` segment is not swallowed by
+        // the `{id}` extractor.
+        .route(
+            "/campaigns/{id}/abort",
+            web::post().to(crate::abort::abort_campaign),
+        )
+        // `EN.11.E` task 5. No other literal `/campaigns/...` segment
+        // exists, so `{id}` cannot shadow anything else today — but per
+        // this file's established first-registration-wins trap (see
+        // `/events/suspended` and `/approvals/ledger/stats` above), any
+        // future literal segment under `/campaigns/` MUST be registered
+        // before this route.
         .route("/campaigns/{id}", web::get().to(get_campaign));
 }
 
@@ -547,6 +560,7 @@ async fn post_events(
         live,
         durable: durable_handle,
         runs,
+        campaigns: state.campaigns.clone(),
         token,
         pause,
         budget,
@@ -796,6 +810,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -884,6 +899,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -1090,6 +1106,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -1303,6 +1320,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -1478,6 +1496,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -1581,6 +1600,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         };
         (state, release)
@@ -1789,6 +1809,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -2018,6 +2039,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         }
     }
@@ -2333,6 +2355,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         };
         let app = test::init_service(
@@ -2433,6 +2456,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         };
         let app = test::init_service(
@@ -2612,6 +2636,7 @@ mod tests {
             live: LiveStateStore::new(),
             durable: crate::durable::spawn_durable_writer(None),
             runs: RunRegistry::new(),
+            campaigns: crate::abort::CampaignRegistry::new(),
             api_key: "test-key".to_string(),
         };
         let app = test::init_service(
@@ -2921,6 +2946,166 @@ mod tests {
             let body: serde_json::Value = test::read_body_json(resp).await;
             assert_eq!(body["total_cost_usd"], serde_json::Value::Null);
             assert_eq!(body["total_tokens"], serde_json::json!(0));
+        }
+    }
+
+    /// `EN.11.F` task 2: `POST /campaigns/{id}/abort` driven at the HTTP
+    /// level through `actix_web::test` against the real `configure` router
+    /// — same rationale as `campaign_route_tests` above: the acceptance
+    /// criterion is a REGISTERED route with the same 401/404/202 contract
+    /// as `abort_run`, so a handler-level-only test would pass on a tree
+    /// that built the handler but forgot to wire it in.
+    mod campaign_abort_route_tests {
+        use super::*;
+        use engine_core::CancellationToken;
+
+        #[actix_web::test]
+        async fn abort_campaign_without_api_key_is_rejected() {
+            let state = test_app_state();
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::post()
+                .uri(&format!("/campaigns/{}/abort", Uuid::new_v4()))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 401);
+        }
+
+        #[actix_web::test]
+        async fn abort_campaign_malformed_id_returns_404_not_500() {
+            let state = test_app_state();
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::post()
+                .uri("/campaigns/not-a-uuid/abort")
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 404);
+        }
+
+        #[actix_web::test]
+        async fn abort_campaign_unknown_id_returns_404() {
+            let state = test_app_state();
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::post()
+                .uri(&format!("/campaigns/{}/abort", Uuid::new_v4()))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 404);
+
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(
+                body["error"],
+                serde_json::json!("unknown or finished campaign")
+            );
+        }
+
+        /// An already-finished campaign is exactly "unknown" from the
+        /// registry's point of view once `deregister` has run — same
+        /// convention as `RunRegistry`/`abort_run`.
+        #[actix_web::test]
+        async fn abort_campaign_already_finished_returns_404() {
+            let state = test_app_state();
+            let campaigns = state.campaigns.clone();
+            let campaign_id = Uuid::new_v4();
+            campaigns.register(campaign_id, CancellationToken::new());
+            campaigns.deregister(campaign_id);
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::post()
+                .uri(&format!("/campaigns/{campaign_id}/abort"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 404);
+        }
+
+        #[actix_web::test]
+        async fn abort_campaign_live_returns_202_and_triggers_the_token() {
+            let state = test_app_state();
+            let campaigns = state.campaigns.clone();
+            let campaign_id = Uuid::new_v4();
+            let token = CancellationToken::new();
+            campaigns.register(campaign_id, token.clone());
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::post()
+                .uri(&format!("/campaigns/{campaign_id}/abort"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 202);
+            assert!(
+                token.is_cancelled(),
+                "abort_campaign must trigger the registered token"
+            );
+
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["campaign_id"], serde_json::json!(campaign_id));
+            assert_eq!(body["status"], serde_json::json!("aborting"));
+        }
+
+        /// The existing per-run abort surface must be unaffected by the
+        /// campaign-scoped addition — same route, same registry, same
+        /// contract as before this task.
+        #[actix_web::test]
+        async fn per_run_abort_route_is_unchanged() {
+            let state = test_app_state();
+            let runs = state.runs.clone();
+            let run_id = Uuid::new_v4();
+            let token = CancellationToken::new();
+            runs.register(run_id, token.clone());
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .configure(configure),
+            )
+            .await;
+
+            let req = test::TestRequest::post()
+                .uri(&format!("/events/{run_id}/abort"))
+                .insert_header(("X-API-Key", "test-key"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+
+            assert_eq!(resp.status(), 202);
+            assert!(token.is_cancelled());
         }
     }
 

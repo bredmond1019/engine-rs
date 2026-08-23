@@ -106,6 +106,11 @@ pub(crate) struct StepFanoutContext {
 pub(crate) struct PendingOrchestrationRun {
     pub token: CancellationToken,
     pub fanout: Arc<RwLock<Option<StepFanoutContext>>>,
+    /// This run's resolved campaign id (`EN.11.F` task 2 follow-up) —
+    /// `spawn_run` registers `token` under this id in `AppState::campaigns`
+    /// so `POST /campaigns/{id}/abort` can find and trigger it, mirroring
+    /// how it registers `token` under `run_id` in `AppState::runs`.
+    pub campaign_id: uuid::Uuid,
 }
 
 thread_local! {
@@ -144,16 +149,25 @@ pub(crate) fn take_pending_orchestration_run() -> Option<PendingOrchestrationRun
 /// `with_step_observer` before that context exists — `spawn_run` always
 /// fills it in before the workflow this token/observer are embedded in
 /// ever runs.
+///
+/// `campaign_id` is this run's already-resolved campaign id (via
+/// [`engine_core::workflows::orchestration::graph::resolve_campaign_id`]) —
+/// carried through [`PendingOrchestrationRun`] so `spawn_run` can register
+/// `token` under it in `AppState::campaigns`, which is what makes `POST
+/// /campaigns/{id}/abort` reach a live campaign at all.
 /// The step-progress observer type `with_step_observer` takes — aliased so
 /// [`build_orchestration_seams`]'s return type reads cleanly.
 type StepObserverArc = Arc<dyn Fn(&StepProgress) + Send + Sync>;
 
-pub(crate) fn build_orchestration_seams() -> (CancellationToken, StepObserverArc) {
+pub(crate) fn build_orchestration_seams(
+    campaign_id: uuid::Uuid,
+) -> (CancellationToken, StepObserverArc) {
     let token = CancellationToken::new();
     let fanout: Arc<RwLock<Option<StepFanoutContext>>> = Arc::new(RwLock::new(None));
     set_pending_orchestration_run(PendingOrchestrationRun {
         token: token.clone(),
         fanout: fanout.clone(),
+        campaign_id,
     });
 
     let observer_fanout = fanout.clone();
@@ -907,6 +921,18 @@ pub fn register_orchestration_with_registry(
             let edge_met_gates = gates.clone();
             let block_open_gates = gates.clone();
 
+            // `EN.11.F` task 2 follow-up: resolve this run's campaign id
+            // HERE, up front — the SAME resolver `OrchestrationRunNode::process`
+            // itself would otherwise call independently — so the id
+            // `spawn_run` registers for abort below and the id this node
+            // actually stamps into its output can never diverge (an
+            // auto-minted id resolved twice would mint two different
+            // UUIDs).
+            let campaign_id = engine_core::workflows::orchestration::graph::resolve_campaign_id(
+                orch_event.campaign_id.as_deref(),
+            )
+            .map_err(|err| err.to_string())?;
+
             // EN.ticket.orchestration-abort-and-progress task 4: mint this
             // run's `CancellationToken` and step-progress observer, and hand
             // the handoff off to `suspend::spawn_run` via the thread-local
@@ -915,10 +941,14 @@ pub fn register_orchestration_with_registry(
             // already shadows) is embedded directly in the node;
             // `spawn_run` re-registers it under this run's `run_id` so
             // `POST /events/{run_id}/abort` triggers the exact token
-            // `integrate_chain` is checking, not a discarded one.
-            let (run_token, step_observer) = build_orchestration_seams();
+            // `integrate_chain` is checking, not a discarded one. It is
+            // ALSO registered under `campaign_id` in `AppState::campaigns`
+            // (`EN.11.F` task 2 follow-up), which is what makes `POST
+            // /campaigns/{id}/abort` reach a live campaign.
+            let (run_token, step_observer) = build_orchestration_seams(campaign_id);
 
             let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
+                .with_campaign_id(campaign_id)
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);
                     if let Some(err) = depends_on_gates.take_error() {
