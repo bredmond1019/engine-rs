@@ -11,14 +11,224 @@
 //! All three handlers gate on `X-API-Key` via [`crate::http::check_api_key`],
 //! matching every other run route.
 
+use std::path::{Path, PathBuf};
+
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use engine_core::workflow::ResumeState;
+use engine_core::workflows::orchestration::chain::ChainStep;
+use engine_core::workflows::orchestration::checkpoint::{
+    read_checkpoint, CheckpointError, ReadCheckpoint,
+};
+use engine_core::workflows::orchestration::integrate::{LaneLogEntry, LaneLogStatus};
+use engine_core::workflows::CommandRunner;
 use engine_core::{BudgetLedger, CancellationToken, PauseSignal};
 use uuid::Uuid;
 
 use crate::dispatch::DispatchError;
 use crate::http::{check_api_key, default_budget_from_env, AppState};
 use crate::suspend::{self, RunStart, SpawnedRun, SuspendedEntry, TakeForResume};
+
+// ── `EN.11.H` task 4: campaign-level crash recovery ─────────────────────
+//
+// Everything above this section is `EN.6.F`'s SINGLE-RUN suspend/resume: a
+// `Workflow` that suspended itself at a named node and is rehydrated by
+// `resume_run`. A crashed CAMPAIGN (`kill -9` mid-chain) is a different
+// shape of problem — the `ORCHESTRATION` workflow drives its whole chain
+// inside one blocking `Node::process` call
+// (`graph::OrchestrationRunNode::process`, via `integrate::integrate_chain`),
+// so there is no suspended `TaskContext` to rehydrate: the process simply
+// stopped existing, mid-loop, with nothing durable recording that beyond
+// whatever `integrate_chain` had already written to
+// `roadmap_dir/lane-log.jsonl` and `checkpoint-<campaign_id>.json`
+// (`EN.11.H` task 1/2).
+//
+// Resuming such a campaign is therefore: read its checkpoint, work out
+// which steps of the ORIGINAL chain are not yet integrated, reconcile any
+// branch/worktree the crashed attempt at the next step may have left
+// behind, and hand the caller the REMAINING chain to run through
+// `integrate_chain` again under the SAME `campaign_id` — never re-running
+// an already-integrated step (which would duplicate its `lane-log.jsonl`
+// line, since `integrate_chain` itself has no "skip what the checkpoint
+// already covers" logic; that is this module's job, not
+// `integrate_chain`'s — see `checkpoint.rs`'s and `integrate.rs`'s own
+// docs on this division).
+//
+// This module deliberately adds no new `AppState` field and no new HTTP
+// route: `EN.11.E`'s `campaigns` field addition to `AppState`
+// (`15d45e0`) broke `bastion`'s build for two days, undetected, because
+// `bastion` constructs `AppState` directly. `resume <campaign>` (the
+// operator-facing CLI verb this block is named for) is a pure function of
+// a checkpoint and a chain — it needs no server state at all, so the
+// safest shape is exactly that: free functions callers (a future
+// `bastion` verb, or a route added later with its own `AppState` review)
+// can call without engine-serve's `AppState` shape ever moving under them.
+
+/// What resuming campaign `campaign_id` against `chain` — the FULL,
+/// originally-resolved chain for this campaign's roadmap/lane, in the
+/// same order the crashed run was given — should do next. Produced by
+/// [`plan_campaign_resume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CampaignResumeOutcome {
+    /// No checkpoint has ever been written for this campaign — it either
+    /// never ran, or never crossed its first block boundary. There is
+    /// nothing this module can act on; resuming is a no-op.
+    NoCheckpoint,
+    /// The checkpoint's integrated-step count already covers the whole
+    /// chain. Resuming a complete campaign is a no-op, not a re-run.
+    AlreadyComplete,
+    /// The block the chain would resume at was stopped deliberately — an
+    /// operator abort (`EN.11.F`) or a tripped campaign budget ceiling —
+    /// not by a crash. See [`plan_campaign_resume`]'s doc for how this is
+    /// told apart from a real crash. Resume refuses to restart it rather
+    /// than silently re-running a campaign the operator stopped on
+    /// purpose.
+    Aborted { block_id: String },
+    /// Restart at `resume_at_index` (1-based, matching
+    /// [`engine_core::workflows::orchestration::checkpoint::CheckpointStep::index`])
+    /// with `remaining` — `chain` sliced to just the steps not yet
+    /// recorded as integrated, in their original order.
+    Plan {
+        resume_at_index: u32,
+        remaining: Vec<ChainStep>,
+    },
+}
+
+impl CampaignResumeOutcome {
+    /// A clear, operator-facing message for every outcome — AC: "Resuming
+    /// a campaign that never crashed, or one already complete, is a no-op
+    /// with a clear message rather than a re-run," extended here to cover
+    /// every variant so a caller never has to invent its own wording.
+    #[must_use]
+    pub fn message(&self, campaign_id: Uuid) -> String {
+        match self {
+            CampaignResumeOutcome::NoCheckpoint => format!(
+                "campaign {campaign_id} has no checkpoint on disk — nothing to resume (it \
+                 never ran, or never crossed a block boundary)"
+            ),
+            CampaignResumeOutcome::AlreadyComplete => format!(
+                "campaign {campaign_id} already integrated every step in its chain — nothing \
+                 to resume"
+            ),
+            CampaignResumeOutcome::Aborted { block_id } => format!(
+                "campaign {campaign_id} was stopped at block {block_id} by an operator abort \
+                 or a budget halt, not a crash — refusing to resume it"
+            ),
+            CampaignResumeOutcome::Plan {
+                resume_at_index,
+                remaining,
+            } => format!(
+                "campaign {campaign_id} resumes at step {resume_at_index} ({} block(s) \
+                 remaining)",
+                remaining.len()
+            ),
+        }
+    }
+}
+
+/// Resolve what resuming `campaign_id` should do, given `chain`.
+///
+/// `done` is the count of [`CheckpointStep`](engine_core::workflows::orchestration::checkpoint::CheckpointStep)
+/// entries the checkpoint has recorded as `integrated`. Because
+/// `integrate_chain` (`EN.11.H` task 2) appends a checkpoint step in
+/// chain order immediately as each step finishes, `done` is exactly the
+/// 0-based index of the first step NOT yet integrated — the "N+1" the
+/// block record's acceptance criteria name.
+///
+/// # Abort detection
+///
+/// `EN.11.F` abort and this crash-recovery path share one observable
+/// symptom: a chain that stopped before its last step. They differ in
+/// HOW it stopped, not IF: a deliberate stop (an operator abort, or a
+/// tripped campaign budget) always appends one
+/// [`LaneLogStatus::Cancelled`] or [`LaneLogStatus::BudgetHalted`] line
+/// naming the block that never started, written by `integrate_chain`'s
+/// own cancellation/budget branches before it returns. A `kill -9` crash
+/// writes NEITHER — the process dies mid-step with no chance to append
+/// anything for the block it never finished. So: if the block this
+/// campaign would resume at (`chain[done]`) has one of those two statuses
+/// as the LAST lane-log line naming it, this was a deliberate stop, not a
+/// crash, and resume must refuse it.
+///
+/// `LaneLogEntry` carries no `campaign_id` (it is a per-lane record, not
+/// a per-campaign one) — this check is a per-block heuristic like the
+/// rest of the lane log, using exactly the vocabulary `integrate_chain`
+/// itself writes rather than a second definition of "aborted".
+pub fn plan_campaign_resume(
+    roadmap_dir: &Path,
+    campaign_id: Uuid,
+    chain: &[ChainStep],
+) -> Result<CampaignResumeOutcome, CheckpointError> {
+    let checkpoint = match read_checkpoint(roadmap_dir, campaign_id)? {
+        ReadCheckpoint::Absent => return Ok(CampaignResumeOutcome::NoCheckpoint),
+        ReadCheckpoint::Found(checkpoint) => checkpoint,
+    };
+
+    let done = checkpoint.steps.iter().filter(|s| s.integrated).count();
+    if done >= chain.len() {
+        return Ok(CampaignResumeOutcome::AlreadyComplete);
+    }
+
+    let next = &chain[done];
+    if last_status_for_block(roadmap_dir, &next.block_id).is_some_and(|status| {
+        matches!(
+            status,
+            LaneLogStatus::Cancelled | LaneLogStatus::BudgetHalted
+        )
+    }) {
+        return Ok(CampaignResumeOutcome::Aborted {
+            block_id: next.block_id.clone(),
+        });
+    }
+
+    Ok(CampaignResumeOutcome::Plan {
+        resume_at_index: done as u32 + 1,
+        remaining: chain[done..].to_vec(),
+    })
+}
+
+/// The LAST recorded [`LaneLogStatus`] for `block_id` in
+/// `roadmap_dir/lane-log.jsonl`, if any. A missing file or an unparsable
+/// line is treated as "nothing recorded" (`None`) rather than an error —
+/// matching [`read_checkpoint`]'s "missing means absent, never an error"
+/// contract: resuming a campaign whose lane log has not been written yet
+/// must not fail merely because there is nothing there.
+fn last_status_for_block(roadmap_dir: &Path, block_id: &str) -> Option<LaneLogStatus> {
+    let contents = std::fs::read_to_string(roadmap_dir.join("lane-log.jsonl")).ok()?;
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<LaneLogEntry>(line).ok())
+        .rfind(|entry| entry.block == block_id)
+        .map(|entry| entry.status)
+}
+
+/// Best-effort git reconciliation for the branch/worktree a crashed
+/// attempt at `block_id` may have left behind — run BEFORE re-dispatching
+/// that block. Mirrors `SetupWorktreeNode`'s own default naming
+/// (`sdlc/<block_id>`, `trees/<branch>`) so the branch this clears is
+/// exactly the one a fresh `SDLC_FLOW` run for `block_id` would try to
+/// create — this is what makes the AC true: "starts at block N+1 and does
+/// NOT fail on the branch the crashed run already created."
+///
+/// Never fails: every call is `let _ = ...`, exactly like
+/// `SetupWorktreeNode`'s own best-effort cleanup (`EN.11.H` task 3). A
+/// crashed attempt may have left a worktree, a branch, both, or neither
+/// (it might never have reached `SetupWorktreeNode` at all) —
+/// reconciliation exists to clear the way for a fresh attempt, never to
+/// become a NEW reason resume fails. Deliberately does not attempt to
+/// salvage the branch's partial work: `EN.11.H`'s `out_of_scope` names
+/// "mid-block resume" as a non-goal — resume restarts a block from
+/// scratch at a block boundary, matching `EN.11.F`'s abort semantics.
+pub fn reconcile_stale_branch(repo_cwd: &Path, block_id: &str, runner: &CommandRunner) {
+    let branch = format!("sdlc/{block_id}");
+    let worktree_path = PathBuf::from("trees").join(&branch);
+    let worktree_path_str = worktree_path.to_string_lossy().into_owned();
+    let _ = runner(
+        "git",
+        &["worktree", "remove", "--force", &worktree_path_str],
+        repo_cwd,
+    );
+    let _ = runner("git", &["branch", "-D", &branch], repo_cwd);
+}
 
 /// `POST /events/{run_id}/pause` — 401 without a valid `X-API-Key`; `404`
 /// for a `run_id` that is neither live nor suspended; `409` if it is already
@@ -779,5 +989,390 @@ mod tests {
         }
 
         suspend::remove_suspended(run_id);
+    }
+}
+
+// ── `EN.11.H` task 4: campaign-level crash recovery — tests ──────────────
+
+#[cfg(test)]
+mod campaign_resume_tests {
+    use super::*;
+    use engine_core::repo_registry::RepoRegistry;
+    use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
+    use engine_core::workflows::orchestration::gates::AdmissionGate;
+    use engine_core::workflows::orchestration::integrate::{integrate_chain, NeverHeld};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn step(repo: &str, block_id: &str) -> ChainStep {
+        ChainStep {
+            repo: repo.to_string(),
+            block_id: block_id.to_string(),
+            directives: None,
+            ..Default::default()
+        }
+    }
+
+    fn one_repo_registry() -> (tempfile::TempDir, RepoRegistry) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+        )
+        .unwrap();
+        let registry = RepoRegistry::from_brain_root(dir.path()).expect("registry");
+        (dir, registry)
+    }
+
+    fn recording_flow_runner() -> (FlowRunner, Arc<Mutex<Vec<String>>>) {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: FlowRunner = Arc::new(move |invocation| {
+            recorded.lock().unwrap().push(invocation.block_id.clone());
+            Box::pin(async {
+                Ok(engine_contract::TaskContext {
+                    event: json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: json!({}),
+                    node_runs: std::collections::HashMap::new(),
+                })
+            })
+        });
+        (runner, calls)
+    }
+
+    fn write_done_state(repo_path: &std::path::Path, block_id: &str) {
+        let dir = repo_path.join("planning").join(block_id).join("sdlc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sdlc-flow-state.json"),
+            json!({"status": "done"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    // ── `plan_campaign_resume` ─────────────────────────────────────────
+
+    #[test]
+    fn no_checkpoint_on_disk_is_a_no_op() {
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = Uuid::new_v4();
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        let outcome = plan_campaign_resume(roadmap_dir.path(), campaign_id, &chain)
+            .expect("plan must not error");
+
+        assert_eq!(outcome, CampaignResumeOutcome::NoCheckpoint);
+        assert!(outcome.message(campaign_id).contains("nothing to resume"));
+    }
+
+    #[test]
+    fn a_checkpoint_covering_the_whole_chain_is_already_complete() {
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = Uuid::new_v4();
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        let checkpoint = engine_core::workflows::orchestration::checkpoint::Checkpoint {
+            campaign_id,
+            steps: vec![
+                engine_core::workflows::orchestration::checkpoint::CheckpointStep {
+                    repo: "repo-a".into(),
+                    block_id: "A.1".into(),
+                    index: 1,
+                    integrated: true,
+                    branch: Some("sdlc/A.1".into()),
+                },
+                engine_core::workflows::orchestration::checkpoint::CheckpointStep {
+                    repo: "repo-a".into(),
+                    block_id: "A.2".into(),
+                    index: 2,
+                    integrated: true,
+                    branch: Some("sdlc/A.2".into()),
+                },
+            ],
+        };
+        engine_core::workflows::orchestration::checkpoint::write_checkpoint(
+            roadmap_dir.path(),
+            &checkpoint,
+        )
+        .unwrap();
+
+        let outcome = plan_campaign_resume(roadmap_dir.path(), campaign_id, &chain)
+            .expect("plan must not error");
+
+        assert_eq!(outcome, CampaignResumeOutcome::AlreadyComplete);
+        assert!(outcome.message(campaign_id).contains("nothing to resume"));
+    }
+
+    #[test]
+    fn a_partial_checkpoint_resumes_at_the_first_step_not_yet_integrated() {
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = Uuid::new_v4();
+        let chain = vec![
+            step("repo-a", "A.1"),
+            step("repo-a", "A.2"),
+            step("repo-a", "A.3"),
+        ];
+
+        let checkpoint = engine_core::workflows::orchestration::checkpoint::Checkpoint {
+            campaign_id,
+            steps: vec![
+                engine_core::workflows::orchestration::checkpoint::CheckpointStep {
+                    repo: "repo-a".into(),
+                    block_id: "A.1".into(),
+                    index: 1,
+                    integrated: true,
+                    branch: Some("sdlc/A.1".into()),
+                },
+            ],
+        };
+        engine_core::workflows::orchestration::checkpoint::write_checkpoint(
+            roadmap_dir.path(),
+            &checkpoint,
+        )
+        .unwrap();
+
+        let outcome = plan_campaign_resume(roadmap_dir.path(), campaign_id, &chain)
+            .expect("plan must not error");
+
+        match outcome {
+            CampaignResumeOutcome::Plan {
+                resume_at_index,
+                remaining,
+            } => {
+                assert_eq!(resume_at_index, 2);
+                assert_eq!(
+                    remaining,
+                    vec![step("repo-a", "A.2"), step("repo-a", "A.3")]
+                );
+            }
+            other => panic!("expected Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deliberate_abort_line_for_the_next_block_refuses_to_resume() {
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = Uuid::new_v4();
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        let checkpoint = engine_core::workflows::orchestration::checkpoint::Checkpoint {
+            campaign_id,
+            steps: vec![
+                engine_core::workflows::orchestration::checkpoint::CheckpointStep {
+                    repo: "repo-a".into(),
+                    block_id: "A.1".into(),
+                    index: 1,
+                    integrated: true,
+                    branch: Some("sdlc/A.1".into()),
+                },
+            ],
+        };
+        engine_core::workflows::orchestration::checkpoint::write_checkpoint(
+            roadmap_dir.path(),
+            &checkpoint,
+        )
+        .unwrap();
+
+        // Simulate `EN.11.F`'s abort: `integrate_chain`'s cancellation
+        // branch appends exactly this shape of line, naming the block
+        // that never started.
+        let cancelled_line = json!({
+            "ts": "2026-08-23T00:00:00+00:00",
+            "lane": "repo-a",
+            "repo": "repo-a",
+            "block": "A.2",
+            "status": "cancelled",
+            "note": "campaign cancelled at the block boundary before A.2 started",
+        });
+        std::fs::write(
+            roadmap_dir.path().join("lane-log.jsonl"),
+            format!("{}\n", cancelled_line),
+        )
+        .unwrap();
+
+        let outcome = plan_campaign_resume(roadmap_dir.path(), campaign_id, &chain)
+            .expect("plan must not error");
+
+        assert_eq!(
+            outcome,
+            CampaignResumeOutcome::Aborted {
+                block_id: "A.2".to_string()
+            }
+        );
+        assert!(outcome.message(campaign_id).contains("not a crash"));
+    }
+
+    // ── `reconcile_stale_branch` ────────────────────────────────────────
+
+    #[test]
+    fn reconcile_stale_branch_removes_the_worktree_then_deletes_the_branch() {
+        let calls: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            recorded.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            Ok(engine_core::workflows::CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        reconcile_stale_branch(std::path::Path::new("."), "A.2", &runner);
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "git");
+        assert_eq!(
+            recorded[0].1,
+            vec!["worktree", "remove", "--force", "trees/sdlc/A.2"]
+        );
+        assert_eq!(recorded[1].0, "git");
+        assert_eq!(recorded[1].1, vec!["branch", "-D", "sdlc/A.2"]);
+    }
+
+    #[test]
+    fn reconcile_stale_branch_is_non_fatal_when_git_errors() {
+        let runner: CommandRunner =
+            Arc::new(|_program, _args, _cwd| Err(std::io::Error::other("no such branch")));
+
+        // Must not panic — every call inside is best-effort.
+        reconcile_stale_branch(std::path::Path::new("."), "A.2", &runner);
+    }
+
+    // ── Crash-then-resume round trip through `integrate_chain` ─────────
+
+    #[tokio::test]
+    async fn a_campaign_killed_after_step_one_resumes_at_step_two_without_duplicating_the_lane_log_line(
+    ) {
+        let (dir, registry) = one_repo_registry();
+        let repo_path = dir.path().join("repo-a");
+        write_done_state(&repo_path, "A.1");
+        write_done_state(&repo_path, "A.2");
+
+        let (runner, calls) = recording_flow_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let hold = NeverHeld;
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = Uuid::new_v4();
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        // The crashed run: only step 1 ever gets a chance to integrate —
+        // `kill -9` between the two blocks means `integrate_chain` was
+        // simply never called again with step 2, not that it failed.
+        let first_attempt = integrate_chain(
+            &chain[..1],
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &hold,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_| {},
+            false,
+            campaign_id,
+        )
+        .await
+        .expect("step one should integrate cleanly");
+        assert_eq!(first_attempt.len(), 1);
+
+        let lines_after_crash = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines_after_crash, 1);
+
+        // Resume: the plan must skip step 1 and hand back only step 2.
+        let plan = plan_campaign_resume(roadmap_dir.path(), campaign_id, &chain)
+            .expect("plan must not error");
+        let remaining = match plan {
+            CampaignResumeOutcome::Plan {
+                resume_at_index,
+                remaining,
+            } => {
+                assert_eq!(resume_at_index, 2);
+                remaining
+            }
+            other => panic!("expected Plan, got {other:?}"),
+        };
+        assert_eq!(remaining, vec![step("repo-a", "A.2")]);
+
+        // Running the REMAINING chain (never the full chain again) is
+        // what keeps the lane log append-only: step 1 is simply never
+        // asked for again.
+        let second_attempt = integrate_chain(
+            &remaining,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &hold,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_| {},
+            false,
+            campaign_id,
+        )
+        .await
+        .expect("step two should integrate cleanly on resume");
+        assert_eq!(second_attempt.len(), 1);
+        assert_eq!(second_attempt[0].block_id, "A.2");
+
+        // Exactly one dispatch per block — A.1 was never re-run.
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.iter().filter(|b| *b == "A.1").count(), 1);
+        assert_eq!(recorded.iter().filter(|b| *b == "A.2").count(), 1);
+
+        // No duplicate lane-log line for A.1: exactly 2 lines total, one
+        // per block, in order.
+        let final_lines: Vec<String> =
+            std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl"))
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+        assert_eq!(final_lines.len(), 2);
+        let parsed: Vec<LaneLogEntry> = final_lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(parsed[0].block, "A.1");
+        assert_eq!(parsed[1].block, "A.2");
+
+        // The checkpoint now records both steps integrated, in order.
+        let checkpoint = read_checkpoint(roadmap_dir.path(), campaign_id)
+            .unwrap()
+            .into_option()
+            .expect("checkpoint should exist");
+        assert_eq!(checkpoint.steps.len(), 2);
+        assert!(checkpoint.steps.iter().all(|s| s.integrated));
+
+        // Resuming again now reports the campaign as already complete —
+        // never a re-run.
+        let final_plan = plan_campaign_resume(roadmap_dir.path(), campaign_id, &chain)
+            .expect("plan must not error");
+        assert_eq!(final_plan, CampaignResumeOutcome::AlreadyComplete);
     }
 }
