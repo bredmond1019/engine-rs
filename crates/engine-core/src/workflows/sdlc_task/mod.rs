@@ -40,6 +40,8 @@
 
 pub mod graph;
 pub mod lean_bookkeep;
+pub mod policy;
+pub mod profiles;
 pub mod schema;
 pub mod task_triage_router;
 

@@ -203,10 +203,21 @@ fn spec_dir(ctx: &TaskContext, spec_slug: &str) -> PathBuf {
 /// Deliberately omits the orchestrator's `.env`-copy step from the Python
 /// source — that step is specific to the orchestrator's own repo layout and
 /// has no equivalent here.
+/// The resolver signature [`SetupWorktreeNode::with_policy_resolver`]
+/// takes: given the run's `TaskContext` and the resolved worktree path,
+/// produce the [`SdlcPolicy`] to stamp under
+/// [`crate::policy::RESOLVED_POLICY_IDENTITY`]. A boxed trait object rather
+/// than a generic so `SetupWorktreeNode` stays a concrete, `Box<dyn Node>`-
+/// registrable type regardless of which workflow's own policy type feeds
+/// the resolver (`EN.11.O` task 3).
+pub type PolicyResolverFn =
+    dyn Fn(&TaskContext, &Path) -> Result<SdlcPolicy, NodeError> + Send + Sync;
+
 pub struct SetupWorktreeNode {
     runner: CommandRunner,
     registry: Option<Arc<RepoRegistry>>,
     branch_prefix: &'static str,
+    policy_resolver: Arc<PolicyResolverFn>,
 }
 
 /// Default branch-name prefix (`"sdlc/{spec_slug}"`) — unchanged from
@@ -221,6 +232,7 @@ impl SetupWorktreeNode {
             runner: default_command_runner(),
             registry: None,
             branch_prefix: DEFAULT_BRANCH_PREFIX,
+            policy_resolver: Arc::new(resolve_policy_for_run),
         }
     }
 
@@ -251,6 +263,23 @@ impl SetupWorktreeNode {
     #[must_use]
     pub fn with_branch_prefix(mut self, branch_prefix: &'static str) -> Self {
         self.branch_prefix = branch_prefix;
+        self
+    }
+
+    /// Override how the [`SdlcPolicy`] to stamp is resolved. Defaults to
+    /// [`resolve_policy_for_run`] — SDLC_FLOW's own `sdlc.policy`/
+    /// `sdlc.profiles` resolution, unchanged behavior.
+    ///
+    /// `EN.11.O` task 3's seam: SDLC_TASK's registry passes a resolver that
+    /// reads `sdlc_task.{policy,profiles}` via `SdlcTaskPolicy`'s own
+    /// `resolve_policy_for_run_from` and projects the result through
+    /// `SdlcTaskPolicy::to_sdlc_policy()` — so this node still stamps an
+    /// `SdlcPolicy` (every shared node downstream reads that type
+    /// unmodified), but the section it was resolved from is keyed under
+    /// SDLC_TASK's own workflow key, not `sdlc_flow`'s.
+    #[must_use]
+    pub fn with_policy_resolver(mut self, resolver: Arc<PolicyResolverFn>) -> Self {
+        self.policy_resolver = resolver;
         self
     }
 }
@@ -515,7 +544,7 @@ impl Node for SetupWorktreeNode {
             .nodes
             .contains_key(crate::policy::RESOLVED_POLICY_IDENTITY)
         {
-            let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&worktree_path))?;
+            let resolved_policy = (self.policy_resolver)(&ctx, Path::new(&worktree_path))?;
             crate::policy::stamp_resolved_policy(&mut ctx, &resolved_policy)?;
         }
 

@@ -1,12 +1,12 @@
 ---
 type: Reference
 title: SDLC Task Workflow
-description: "How the SDLC_TASK workflow graph works: the lean-close-out graph shape, the event schema, the D56 terminal reconcile, the three terminal statuses, and what this block does not yet ship"
+description: "How the SDLC_TASK workflow graph works: the lean-close-out graph shape, the event schema, the D56 terminal reconcile, the three terminal statuses, the SdlcTaskPolicy policy surface and its three profiles, and what this block does not yet ship"
 doc_id: sdlc-task-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [sdlc-task, workflow, graph, reconcile, bookkeep, terminal-status, lean]
+keywords: [sdlc-task, workflow, graph, reconcile, bookkeep, terminal-status, lean, policy, profiles]
 related: [sdlc-flow-workflow, sdlc-flow-policy, architecture]
 ---
 
@@ -69,8 +69,8 @@ run-level authoritative gate, playing the role `Full` plays for `SDLC_FLOW`.
 | `use_worktree` | `bool` | `false` | Run **in place** by default — this is the JS engine's own default, stated explicitly rather than inherited from `SDLC_FLOW` |
 | `branch_name` | `Option<String>` | `None` | Overrides the branch-prefix default (`"task/"`) when set |
 | `llm_triage` | `bool` | `false` | |
-| `policy` | `Option<serde_json::Value>` | `None` | Opaque passthrough — `SdlcTaskPolicy` does not exist until `EN.11.O`; see [sdlc-flow-policy.md](sdlc-flow-policy.md) for the policy-surface shape `SDLC_FLOW` already has |
-| `profile` | `Option<String>` | `None` | |
+| `policy` | `Option<PartialSdlcTaskPolicy>` | `None` | Per-run inline override — the highest-precedence layer of the policy surface below |
+| `profile` | `Option<String>` | `None` | A named `sdlc_task.profiles` bundle (`baseline` / `cheap-fast` / `thorough`) |
 
 `auto_pr` is the one `SDLCFlowEventSchema` field this schema drops — `SDLC_TASK` ships no PR
 ceremony at all, so a PR-gating flag has nothing to gate.
@@ -119,14 +119,90 @@ runs.
 `--resume` on a task set where every task already passed re-runs **only** the reconcile — the
 task loop is skipped entirely, so zero `ImplementTaskNode` invocations occur.
 
+## Policy surface (`EN.11.O`)
+
+`SdlcTaskPolicy` (`crates/engine-core/src/workflows/sdlc_task/policy.rs`) is SDLC_TASK's own
+policy surface, standing rule 6's cost/latency/quality knobs for this lean loop. It is a
+**sibling** of [`SdlcPolicy`](sdlc-flow-policy.md), not a fork: the scalar/enum types SDLC_TASK's
+reused `sdlc_flow` nodes already read (`OutputVerbosity`, `TestDepth`, `RetryFeedback`,
+`TransportRetry`) are imported straight from `sdlc_flow::policy`, and `ModelTier`/`LocalConfig`
+from `crate::policy::tier`, so the two engines can never drift on what these types mean.
+
+### Knob table
+
+| Field | Built-in default | Node that reads it (via the projection below) |
+|---|---|---|
+| `output_verbosity` | `Normal` | Every `ClaudeCodeStep`-driven node's output shaping |
+| `prompt_cache` | `false` | Every `ClaudeCodeStep`-driven node's prompt-cache header |
+| `test_depth` | `Full` | `TestTaskNode` (per-task check depth) and `FinalValidationNode` (reconcile skip — see the caveat below) |
+| `model_tiers.implement` | `Sonnet` | `ImplementTaskNode` |
+| `model_tiers.triage` | `Sonnet` | `TriageTaskNode` |
+| `model_tiers.generate` | `Opus` | `GenerateTasksNode` |
+| `timeouts.implement` | `None` (unconfigured 300s) | `ImplementTaskNode`'s call timeout |
+| `timeouts.triage` | `None` | `TriageTaskNode`'s call timeout |
+| `timeouts.generate` | `None` | `GenerateTasksNode`'s call timeout |
+| `local` | `LocalConfig::default()` | Whichever stage above resolves to the `local` model tier |
+| `llm_triage` | `false` | `TriageTaskNode`'s model-triage branch |
+| `max_attempts` | `3` | The task-loop retry ceiling (a task-declared value always wins; this is the default for a task that omits it) |
+| `retry_feedback` | `RetryFeedback::default()` | `ImplementTaskNode`'s retry prompt (whether/how much prior failure output is fed back) |
+| `transport_retry` | `TransportRetry::default()` | `ClaudeCodeStep`'s bounded retry-with-backoff budget |
+
+Deliberately **not** carried: `review_mode`, `review_skip_max_files`,
+`review_skip_max_diff_lines`, `max_review_attempts`, `review_diff_max_chars`, and the
+`docs`/`review`/`implement_simple` model-tier trio — SDLC_TASK's registry (`graph.rs`) registers
+no review node and no docs node, so advertising any of these would be the
+advertised-but-unread defect this policy surface exists to prevent (the same class of bug the
+`transport-retry-policy-not-wired-to-call-sites` carryover records for `SdlcPolicy.transport_retry`
+itself).
+
+### Resolution — four layers
+
+High to low precedence:
+
+1. The per-run `SdlcTaskEventSchema.policy` inline override.
+2. The per-run event's named `profile:` bundle (looked up in `planning/harness.json`'s
+   `sdlc_task.profiles` first, then `sdlc_task::profiles::profile_by_name`'s built-in fallback).
+3. `planning/harness.json`'s `sdlc_task.policy` defaults.
+4. `SdlcTaskPolicy::default()`.
+
+The shared nodes (`ImplementTaskNode`, `TestTaskNode`, `TriageTaskNode`, `FinalValidationNode`)
+all read `sdlc_flow::policy::SdlcPolicy`, not `SdlcTaskPolicy` — they are `sdlc_flow`'s nodes,
+unmodified. `SdlcTaskPolicy::to_sdlc_policy()` **projects** the resolved policy onto an
+`SdlcPolicy`, leaving every omitted review/docs knob at `SdlcPolicy::default()`'s value, and
+`SetupWorktreeNode` stamps that projection at the start of the run. `sdlc_flow` runs are
+unaffected: `SetupWorktreeNode`'s default policy resolver still resolves `sdlc.policy` under
+`WORKFLOW_KEY = "sdlc"`, unchanged.
+
+### The three profiles
+
+| Profile | For | Observable bound it moves |
+|---|---|---|
+| `baseline` | The explicit control | Restates every built-in default, so `profile: "baseline"` is a legible no-op — same behaviour as no profile at all |
+| `cheap-fast` | Cost/latency floor | `test_depth: Fast` (runs the reconcile — see the caveat), Haiku on every model-driven stage, `max_attempts: 2`, tighter timeouts, terse output |
+| `thorough` | Quality ceiling | `test_depth: Full` (skips the reconcile), Opus for `implement`/`generate`, `max_attempts: 5`, `llm_triage: true`, generous timeouts, verbose output |
+
+Each profile is a `PartialSdlcTaskPolicy` with **every** field set explicitly — no implicit
+inheritance — and can be overridden per-section in `planning/harness.json`'s `sdlc_task.profiles`.
+
+### The `test_depth: Full` caveat
+
+`test_depth: Full` — SDLC_TASK's behaviour-stable built-in default — **silently disables**
+`FinalValidationNode`'s terminal reconcile: `sdlc_flow/final_validation.rs`'s skip condition
+(around line 265) returns a zero-`CommandRunner`-call passthrough whenever
+`policy.test_depth == TestDepth::Full`, on the reasoning that every check already ran
+authoritative (full-depth) on every per-task pass, so re-running them again at the reconcile
+would be a pure double-run. The practical consequence is counterintuitive and worth stating
+plainly: **`thorough` keeps `Full` and therefore SKIPS the reconcile**, trading that pass for a
+higher retry ceiling and the strongest model tier instead, while **`cheap-fast` sets `Fast` and
+is the profile that actually RUNS the reconcile** — the one place `Fast` per-task checks get
+backstopped by an authoritative pass. `baseline` matches today's (pre-`EN.11.O`) behaviour: `Full`,
+reconcile skipped.
+
 ## What this block does not yet ship
 
 - **Not dispatchable.** The graph runs in-process (`sdlc_task::graph::workflow()`), but
   `engine-serve` registration and `ORCHESTRATION` dispatch wiring are `EN.11.P` — until that
   lands, nothing outside this crate can trigger a run over HTTP or a lane chain.
-- **No dedicated policy surface.** `registry_for_policy` takes `sdlc_flow::policy::SdlcPolicy`,
-  not a `SdlcTaskPolicy` — that type, its named profiles, and any `SDLC_TASK`-specific knobs are
-  `EN.11.O`'s.
 
-A page claiming either capability before its block lands would be worse than no page at all —
-this section exists so that claim never gets made by omission.
+A page claiming that capability before its block lands would be worse than no page at all — this
+section exists so that claim never gets made by omission.

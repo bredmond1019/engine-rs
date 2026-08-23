@@ -16,6 +16,22 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-23]
+
+`EN.11.O` — SDLC_TASK policy and profiles — done via `/sdlc-flow` on branch `EN.11.O-flow`, PASS review, all 8 tasks passed. Added `crates/engine-core/src/workflows/sdlc_task/{policy,profiles}.rs`: `SdlcTaskPolicy`/`PartialSdlcTaskPolicy` with the four-layer resolve shim and a `to_sdlc_policy()` projection into `SdlcPolicy`, deliberately omitting the six review/docs knobs SDLC_TASK's registry never reads (task 1); `WORKFLOW_KEY` plus the baseline/cheap-fast/thorough profiles required by standing rule 6, and event-aware `resolve_policy_for_run_from` shims (task 2); `SetupWorktreeNode` gained a `with_policy_resolver` seam so SDLC_TASK's registry now resolves `SdlcTaskPolicy` via `sdlc_task.{policy,profiles}` and projects it into the stamped `SdlcPolicy` — live config instead of dead config — with the event schema's `policy` field narrowed to `Option<PartialSdlcTaskPolicy>` (task 3); `planning/harness.json` gained a `sdlc_task.{policy,profiles}` section mirroring the struct's field set exactly, documenting the `test_depth:Full` reconcile-skip trap (task 4); Guard A (advertised knob set == struct field set, derived mechanically) and Guard B (every knob projects to a shared-node-read field), both demonstrated capable of failing by a temporary sabotage-then-revert (task 5); `sdlc_task_e2e.rs` rewired off a stale `sdlc.policy` harness key onto the real `sdlc_task.policy` seam and extended to prove each profile changes a real observable — reconcile `CommandRunner` calls, `ImplementTaskNode` retry counts — through the actual registry, plus a dedicated pin for the `test_depth:Full` reconcile-skip trap (task 6); `docs/sdlc-task-workflow.md` documents the full knob table, four-layer resolution, the three profiles, and the reconcile-skip caveat, with `docs/index.md` updated (task 7); full validation gate green across the integrated tree — fmt, clippy `--all-features -D warnings`, nextest `--workspace --all-features` (2839 tests), release build, cargo audit (1 pre-existing RUSTSEC advisory in a transitive dep, non-gating) (task 8). Closes `EN.11.O`. Next: `EN.ticket.vault-dependent-tests-must-skip-not-fail`.
+
+```
+3d86358 feat: implement EN.11.O-task8
+ea59e80 feat: implement EN.11.O-task7
+986dc57 feat: implement EN.11.O-task6
+7dabcdd feat: implement EN.11.O-task5
+4cdaada feat: implement EN.11.O-task3
+fffcc20 feat: implement EN.11.O-task2
+a3f85d7 feat: implement EN.11.O-task1
+```
+
+---
+
 ## [run: 2026-08-22]
 
 `EN.11.N` — SDLC_TASK graph and schema — done via `/sdlc-flow` on branch `EN.11.N-flow`, PASS review, all 7 tasks passed. Ported base-template's `sdlc-task.js` into `crates/engine-core/src/workflows/sdlc_task/`: the module root, event schema, and `TerminalSignal::ReconcileFailed` with its `derive_committed_status` arm plus a `CloseBlockNode` skip on `reconcile_failed` per D56 (task 1); `TaskTriageRouterNode` — the three-arm deterministic fork (PASS → `UpdateTaskStatusNode`, RETRYABLE-under-budget → `IncrementAttemptNode`, MAJOR_BAIL/exhausted/unknown → `LeanBookkeepNode`), fail-closed on missing upstream results (task 2); `SpecExistsRouterNode`/`LoadTaskStateNode` promoted to real structs with `with_state_filename` builders and `SetupWorktreeNode` gained `with_branch_prefix`, so SDLC_TASK reuses SDLC_FLOW's setup nodes under its own filename/branch prefix without forking them (task 3); the D56 reconcile scope (`select_reconcile_checks`, `FinalValidationNode::with_scope`) verified already complete from a prior pass (task 4); `LeanBookkeepNode` — the lean close-out, widening `wrap_up`'s durable state helpers to `pub(crate)` for reuse, deriving bailed/reconcile_failed/done status, enforcing the fullRun guard from `event.task_range`, with `CloseBlockNode::with_state_source` reading its stamp instead of forking a second closer (task 5); `graph.rs` assembling `WORKFLOW_TYPE`/`schema()`/`registry()`/`registry_for_policy()`/`workflow()` into a `Workflow::new_validated` graph — the first point SDLC_TASK validates end to end — verified already complete from an earlier interrupted attempt (task 6); `docs/sdlc-task-workflow.md` added with its `docs/index.md` row (task 7). Full validation gate green throughout (fmt, clippy `-D warnings`, `nextest --workspace --all-features`, release build). Closes `EN.11.N` — `EngineKind::Task` is now representable AND runnable — unblocking `EN.11.O` (SDLC_TASK policy and profiles) and contributing to `EN.11.P` (task blocks are orchestratable). Next: `EN.11.O`.

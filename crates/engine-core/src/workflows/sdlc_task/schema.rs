@@ -12,6 +12,8 @@ pub use crate::workflows::sdlc_flow::schema::{
     SDLCTaskStatus, SDLCTelemetry,
 };
 
+use super::policy::PartialSdlcTaskPolicy;
+
 /// The SDLC_TASK trigger event — port design §3. `spec_slug` is the only
 /// required field; every other field is `#[serde(default)]` so `{"spec_slug":
 /// "X"}` alone deserializes.
@@ -43,13 +45,12 @@ pub struct SdlcTaskEventSchema {
     pub branch_name: Option<String>,
     #[serde(default)]
     pub llm_triage: bool,
-    /// Typed `Option<serde_json::Value>` ON PURPOSE: `PartialSdlcTaskPolicy`
-    /// does not exist until `EN.11.O`, which owns the policy surface.
-    /// Inventing a placeholder type here that `EN.11.O` would only have to
-    /// delete is worse than an opaque passthrough — see this block's
-    /// Amendment Log ("SCOPE CALL").
+    /// Per-run policy override, resolved at the highest of the four
+    /// precedence layers (`EN.11.O` task 3). Was a placeholder
+    /// `Option<serde_json::Value>` before `PartialSdlcTaskPolicy` existed;
+    /// now typed directly, same as `SDLCFlowEventSchema::policy`.
     #[serde(default)]
-    pub policy: Option<serde_json::Value>,
+    pub policy: Option<PartialSdlcTaskPolicy>,
     #[serde(default)]
     pub profile: Option<String>,
 }
@@ -95,7 +96,13 @@ mod tests {
         assert!(event.use_worktree);
         assert_eq!(event.branch_name.as_deref(), Some("task/EN.11.N"));
         assert!(event.llm_triage);
-        assert_eq!(event.policy, Some(serde_json::json!({"max_attempts": 5})));
+        assert_eq!(
+            event.policy,
+            Some(PartialSdlcTaskPolicy {
+                max_attempts: Some(5),
+                ..Default::default()
+            })
+        );
         assert_eq!(event.profile.as_deref(), Some("cheap-fast"));
     }
 

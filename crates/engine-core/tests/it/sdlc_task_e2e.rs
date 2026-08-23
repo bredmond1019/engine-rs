@@ -35,13 +35,13 @@ use claude_code_rs::Outcome;
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::policy::emit_state::EmitStateNode as GenericEmitStateNode;
+use engine_core::policy::PolicyConfigSource;
 use engine_core::workflow::{OnProgress, Workflow};
 use engine_core::workflows::sdlc_flow::close_block::CloseBlockNode;
 use engine_core::workflows::sdlc_flow::final_validation::{FinalValidationNode, ValidationScope};
 use engine_core::workflows::sdlc_flow::graph as sdlc_flow_graph;
 use engine_core::workflows::sdlc_flow::setup::{
-    resolve_policy_for_run, CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode,
-    SpecExistsRouterNode,
+    CommandOutput, CommandRunner, GenerateTasksNode, LoadTaskStateNode, SpecExistsRouterNode,
 };
 use engine_core::workflows::sdlc_flow::task_loop::{
     ImplementTaskNode, IncrementAttemptNode, SaveStateNode, TaskQueueRouterNode, TestTaskNode,
@@ -49,6 +49,7 @@ use engine_core::workflows::sdlc_flow::task_loop::{
 };
 use engine_core::workflows::sdlc_task::graph as sdlc_task_graph;
 use engine_core::workflows::sdlc_task::lean_bookkeep::LeanBookkeepNode;
+use engine_core::workflows::sdlc_task::profiles::resolve_policy_for_run_from;
 use engine_core::workflows::sdlc_task::task_triage_router::TaskTriageRouterNode;
 use engine_core::workflows::sdlc_task::DEFAULT_STATE_FILENAME;
 use serde_json::json;
@@ -59,7 +60,13 @@ const SPEC_SLUG: &str = "fixture-task-e2e-spec";
 /// `worktree_path` (and a `"task/"`-prefixed branch, matching
 /// `SetupWorktreeNode::with_branch_prefix("task/")`'s real behavior)
 /// directly, so no real `git worktree add` runs. Still resolves + stamps
-/// `RESOLVED_POLICY_IDENTITY`, exactly as the real node does.
+/// `RESOLVED_POLICY_IDENTITY`, exactly as the real node does — via
+/// SDLC_TASK's OWN seam (`resolve_policy_for_run_from` against
+/// `sdlc_task.{policy,profiles}`, projected through `to_sdlc_policy()`),
+/// mirroring `sdlc_task_graph::sdlc_task_policy_resolver` (`EN.11.O` task
+/// 3), rather than `sdlc_flow`'s plain `resolve_policy_for_run` — that
+/// distinction is exactly what makes `event.profile` observable through
+/// this suite's real registry (task 6).
 struct FixtureSetupNode {
     worktree_path: String,
 }
@@ -75,7 +82,9 @@ impl Node for FixtureSetupNode {
             }),
         );
 
-        let resolved_policy = resolve_policy_for_run(&ctx, Path::new(&self.worktree_path))?;
+        let source = PolicyConfigSource::Worktree(PathBuf::from(&self.worktree_path));
+        let resolved_task_policy = resolve_policy_for_run_from(&ctx, &source)?;
+        let resolved_policy = resolved_task_policy.to_sdlc_policy();
         engine_core::policy::stamp_resolved_policy(&mut ctx, &resolved_policy)?;
 
         Ok(ctx)
@@ -131,7 +140,7 @@ fn temp_worktree(tag: &str) -> PathBuf {
 /// Writes the fixture `tasks.json` (`task_count` PENDING tasks) and a
 /// `harness.json` under `<worktree>/planning/<SPEC_SLUG>/`.
 ///
-/// `sdlc.policy.test_depth` is pinned `"fast"` so `TestTaskNode`'s per-task
+/// `sdlc_task.policy.test_depth` is pinned `"fast"` so `TestTaskNode`'s per-task
 /// tripwire invokes `fastCommand` while `FinalValidationNode` under
 /// `ValidationScope::Reconcile` (this workflow's drain-branch scope) is free
 /// to actually run `select_reconcile_checks` rather than hitting skip
@@ -156,7 +165,55 @@ fn write_fixture_files(worktree: &Path, task_count: u32, max_attempts: u32) {
     .unwrap();
 
     let harness = json!({
-        "sdlc": { "policy": { "test_depth": "fast" } },
+        "sdlc_task": { "policy": { "test_depth": "fast" } },
+        "validation": {
+            "checks": [
+                {
+                    "name": "tests",
+                    "kind": "command",
+                    "command": "full-suite-check",
+                    "fastCommand": "fast-check",
+                    "gates": true,
+                }
+            ]
+        }
+    });
+    std::fs::write(
+        worktree.join("planning").join("harness.json"),
+        serde_json::to_string_pretty(&harness).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Like [`write_fixture_files`], but the tasks OMIT their own
+/// `max_attempts` field, so `LoadTaskStateNode::seed_max_attempts` seeds
+/// each task's retry ceiling from the resolved policy instead of a literal
+/// in the fixture — the seam task 6's profile-driven retry-ceiling
+/// assertions need (`SdlcTaskPolicy::default().max_attempts` is 3;
+/// `cheap-fast`'s is 2; `thorough`'s is 5). The `harness.json`'s
+/// `validation.checks` shape is unchanged (still one `gates: true` check
+/// with a `fastCommand` that differs from `command`, so
+/// `select_reconcile_checks` still includes it for any `test_depth: Fast`
+/// profile).
+fn write_fixture_files_policy_driven_max_attempts(worktree: &Path, task_count: u32) {
+    let spec_dir = worktree.join("planning").join(SPEC_SLUG);
+    let tasks: Vec<serde_json::Value> = (1..=task_count)
+        .map(|task_id| {
+            json!({
+                "task_id": task_id,
+                "title": format!("Implement thing {task_id}"),
+                "description": "Do the work",
+                "acceptance_criteria": ["it works"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        spec_dir.join("tasks.json"),
+        serde_json::to_string_pretty(&tasks).unwrap(),
+    )
+    .unwrap();
+
+    let harness = json!({
         "validation": {
             "checks": [
                 {
@@ -258,6 +315,34 @@ fn recording_git_runner() -> (CommandRunner, Arc<Mutex<Vec<String>>>) {
                 stderr: String::new(),
             });
         }
+        Ok(CommandOutput {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    });
+    (runner, recorded)
+}
+
+/// Injected runner, shared by `TestTaskNode` and `FinalValidationNode`,
+/// that always PASSes every check (special-cased `git status` for
+/// `TestTaskNode`'s write-verification guard, as in [`always_pass_runner`])
+/// while RECORDING every non-`git status` invocation's joined arguments —
+/// the observable task 6's profile tests read to count reconcile-specific
+/// (`full-suite-check`) calls versus per-task tripwire (`fast-check`)
+/// calls, without asserting on any resolved policy value.
+fn recording_pass_runner() -> (CommandRunner, Arc<Mutex<Vec<String>>>) {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded_clone = recorded.clone();
+    let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+        if program == "git" && args.first() == Some(&"status") {
+            return Ok(CommandOutput {
+                status: 0,
+                stdout: " M src/lib.rs\n".to_string(),
+                stderr: String::new(),
+            });
+        }
+        recorded_clone.lock().unwrap().push(args.join(" "));
         Ok(CommandOutput {
             status: 0,
             stdout: String::new(),
@@ -388,6 +473,115 @@ fn build_workflow(
 
     Workflow::new_validated(registry, schema)
         .expect("SDLC_TASK declared graph must pass WorkflowValidator::validate")
+}
+
+/// Like [`build_workflow`], but `ImplementTaskNode`'s transport is wrapped
+/// in a shared counter — the observable this suite's retry-ceiling
+/// assertions need (task 6: "counting `ImplementTaskNode` invocations",
+/// never a resolved-struct assertion). Returns the counter alongside the
+/// `Workflow` so a test can drive a failing run and read off exactly how
+/// many attempts `IncrementAttemptNode`'s loop actually dispatched before
+/// `TaskTriageRouterNode`'s budget-exhausted `MAJOR_BAIL` arm fired.
+fn build_workflow_counting_implement(
+    worktree: &Path,
+    test_runner: CommandRunner,
+    git_runner: CommandRunner,
+) -> (Workflow, Arc<AtomicUsize>) {
+    let mut registry = NodeRegistry::new();
+    let implement_calls = Arc::new(AtomicUsize::new(0));
+
+    registry.register(Box::new(FixtureSetupNode {
+        worktree_path: worktree.to_string_lossy().to_string(),
+    }));
+    registry.register(Box::new(
+        SpecExistsRouterNode::new().with_state_filename(DEFAULT_STATE_FILENAME),
+    ));
+    registry.register(Box::new(GenerateTasksNode::new()));
+    registry.register(Box::new(
+        LoadTaskStateNode::new().with_state_filename(DEFAULT_STATE_FILENAME),
+    ));
+    registry.register(Box::new(TaskQueueRouterNode));
+
+    {
+        let implement_calls = implement_calls.clone();
+        registry.register(Box::new(ImplementTaskNode::new().with_transport(Arc::new(
+            move |_config, _prompt| {
+                implement_calls.fetch_add(1, Ordering::SeqCst);
+                let outcome = stub_outcome(
+                    &json!({
+                        "summary": "implemented",
+                        "modified_files": ["src/lib.rs"],
+                        "tests_added": ["it_works"],
+                    })
+                    .to_string(),
+                );
+                Box::pin(async move { Ok(outcome) })
+            },
+        ))));
+    }
+
+    registry.register(Box::new(
+        TestTaskNode::new().with_runner(test_runner.clone()),
+    ));
+    // `thorough`'s `llm_triage: true` (task 2) means `TriageTaskNode` calls
+    // a model transport to classify a failure as RETRYABLE/MAJOR_BAIL
+    // instead of the deterministic heuristic `llm_triage: false` uses — so
+    // this builder MUST stub that transport too, or an under-budget
+    // attempt would reach for the real `claude_code_rs::execute` transport
+    // and hang/fail against a real network call. The bail gate itself
+    // (`attempt_count >= max_attempts`) is checked BEFORE this branch, so
+    // it fires deterministically regardless of what this stub returns.
+    registry.register(Box::new(
+        TriageTaskNode::new()
+            .with_runner(git_runner.clone())
+            .with_transport(Arc::new(|_config, _prompt| {
+                let outcome = stub_outcome(
+                    &json!({ "verdict": "RETRYABLE", "reason": "stubbed retry" }).to_string(),
+                );
+                Box::pin(async move { Ok(outcome) })
+            })),
+    ));
+    registry.register(Box::new(TaskTriageRouterNode));
+
+    registry.register(Box::new(UpdateTaskStatusNode));
+    registry.register(Box::new(
+        SaveStateNode::new()
+            .with_runner(git_runner.clone())
+            .with_state_filename(DEFAULT_STATE_FILENAME),
+    ));
+    registry.register(Box::new(IncrementAttemptNode));
+
+    registry.register(Box::new(
+        FinalValidationNode::new()
+            .with_runner(test_runner)
+            .with_scope(ValidationScope::Reconcile),
+    ));
+
+    registry.register(Box::new(
+        LeanBookkeepNode::new()
+            .with_runner(git_runner)
+            .with_state_filename(DEFAULT_STATE_FILENAME),
+    ));
+    registry.register(Box::new(
+        CloseBlockNode::new().with_state_source("LeanBookkeepNode"),
+    ));
+    registry.register(Box::new(GenericEmitStateNode::new(Arc::new(
+        |_program: &str, _args: &[&str], _cwd: &Path| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        },
+    ))));
+
+    let schema = sdlc_task_graph::schema();
+
+    (
+        Workflow::new_validated(registry, schema)
+            .expect("SDLC_TASK declared graph must pass WorkflowValidator::validate"),
+        implement_calls,
+    )
 }
 
 fn read_state_json(worktree: &Path) -> serde_json::Value {
@@ -774,4 +968,269 @@ async fn resume_on_all_passed_set_reruns_only_the_reconcile() {
 
     let state_json = read_state_json(&worktree);
     assert_eq!(state_json["status"], json!("done"));
+}
+
+// --- EN.11.O task 6: each profile changes a DIFFERENT observable bound ----
+//
+// Per the block record and this task's spec: a resolved-VALUE assertion
+// alone is a check whose inputs both come from the artifact under test
+// (`gate-scope-must-be-shown-capable-of-failing`). Every assertion below
+// counts something an INJECTED seam observed — `CommandRunner` calls at
+// the reconcile, or `ImplementTaskNode` transport invocations under a
+// never-passing task — never a resolved `SdlcTaskPolicy`/`SdlcPolicy`
+// field.
+//
+// Retry-ceiling arithmetic: `retry_bail_fires_at_exactly_max_attempts_via_
+// triage_back_edge` (`sdlc_flow/task_loop.rs`) pins that `TriageTaskNode`'s
+// bail gate reads `attempt_count >= max_attempts` BEFORE this attempt's
+// increment, so a never-passing task dispatches `ImplementTaskNode` at
+// `attempt_count` 0, 1, ..., `max_attempts` inclusive — `max_attempts + 1`
+// calls in total — before `MAJOR_BAIL` fires on the `max_attempts`-th
+// triage with no further increment. `baseline` (3) -> 4 calls,
+// `cheap-fast` (2) -> 3 calls, `thorough` (5) -> 6 calls: three different
+// counts, one per profile.
+
+#[tokio::test]
+async fn baseline_profile_skips_reconcile_and_uses_max_attempts_three() {
+    // Half 1: an all-passed run under `baseline` skips the reconcile
+    // entirely (zero check results stamped by `FinalValidationNode`) —
+    // `baseline` restates the built-in `test_depth: Full`, which is
+    // `FinalValidationNode`'s Reconcile-scope skip condition 1. NOTE:
+    // `test_depth: Full` also means the shared per-task tripwire
+    // (`TestTaskNode`) itself invokes the authoritative `full-suite-check`
+    // command per task (no `fastCommand` substitution at `Full`), so the
+    // raw `CommandRunner` call log is NOT the right observable here — it
+    // would conflate per-task calls with a reconcile call. The stamped
+    // `FinalValidationNode` result (`skipped` / `check_results`) is the
+    // one place that isolates the reconcile's own zero-call behaviour.
+    let worktree = temp_worktree("baseline-reconcile");
+    write_fixture_files(&worktree, 2, 2);
+
+    let (test_runner, _calls) = recording_pass_runner();
+    let (git_runner, _git_calls) = recording_git_runner();
+    let workflow = build_workflow(&worktree, test_runner, git_runner);
+
+    let event = json!({ "spec_slug": SPEC_SLUG, "profile": "baseline" });
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let final_validation_result = final_ctx
+        .nodes
+        .get("FinalValidationNode")
+        .expect("FinalValidationNode should have stamped a result");
+    assert_eq!(final_validation_result["skipped"], json!(true));
+    assert_eq!(
+        final_validation_result["check_results"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "zero CommandRunner calls at the reconcile: check_results must be empty on the skip path"
+    );
+
+    // Half 2: a never-passing task under `baseline`, with `max_attempts`
+    // seeded from the resolved policy (task's own JSON omits it), bails
+    // after exactly 4 `ImplementTaskNode` invocations (3 + 1).
+    let worktree2 = temp_worktree("baseline-retry");
+    write_fixture_files_policy_driven_max_attempts(&worktree2, 1);
+    let (git_runner2, _git_calls2) = recording_git_runner();
+    let (workflow2, implement_calls) =
+        build_workflow_counting_implement(&worktree2, always_fail_runner(), git_runner2);
+
+    let event2 = json!({ "spec_slug": SPEC_SLUG, "profile": "baseline" });
+    let final_ctx2 = workflow2
+        .run(event2, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let triage_result = final_ctx2
+        .nodes
+        .get("TriageTaskNode")
+        .expect("TriageTaskNode should have stamped a result");
+    assert_eq!(triage_result["verdict"], json!("MAJOR_BAIL"));
+    assert_eq!(
+        implement_calls.load(Ordering::SeqCst),
+        4,
+        "baseline's max_attempts (3) should yield 4 ImplementTaskNode calls before MAJOR_BAIL"
+    );
+}
+
+#[tokio::test]
+async fn cheap_fast_profile_runs_reconcile_and_uses_max_attempts_two() {
+    // Half 1: an all-passed run under `cheap-fast` (`test_depth: Fast`)
+    // actually SELECTS AND RUNS the reconcile — a non-zero `CommandRunner`
+    // call count at `FinalValidationNode`, the opposite of `baseline`'s
+    // half above.
+    let worktree = temp_worktree("cheap-fast-reconcile");
+    write_fixture_files(&worktree, 2, 2);
+
+    let (test_runner, reconcile_calls) = recording_pass_runner();
+    let (git_runner, _git_calls) = recording_git_runner();
+    let workflow = build_workflow(&worktree, test_runner, git_runner);
+
+    let event = json!({ "spec_slug": SPEC_SLUG, "profile": "cheap-fast" });
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let final_validation_result = final_ctx
+        .nodes
+        .get("FinalValidationNode")
+        .expect("FinalValidationNode should have stamped a result");
+    assert_eq!(final_validation_result["skipped"], json!(false));
+    {
+        let calls = reconcile_calls.lock().unwrap();
+        let full_suite_calls = calls
+            .iter()
+            .filter(|c| c.contains("full-suite-check"))
+            .count();
+        assert!(
+            full_suite_calls > 0,
+            "cheap-fast (test_depth: Fast) must actually run the reconcile: {calls:?}"
+        );
+    }
+
+    // Half 2: a never-passing task under `cheap-fast` bails after exactly
+    // 3 `ImplementTaskNode` invocations (2 + 1) — fewer than `baseline`'s
+    // 4 and `thorough`'s 6, proving the resolved `max_attempts: 2` is
+    // actually read by the retry loop.
+    let worktree2 = temp_worktree("cheap-fast-retry");
+    write_fixture_files_policy_driven_max_attempts(&worktree2, 1);
+    let (git_runner2, _git_calls2) = recording_git_runner();
+    let (workflow2, implement_calls) =
+        build_workflow_counting_implement(&worktree2, always_fail_runner(), git_runner2);
+
+    let event2 = json!({ "spec_slug": SPEC_SLUG, "profile": "cheap-fast" });
+    let final_ctx2 = workflow2
+        .run(event2, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let triage_result = final_ctx2
+        .nodes
+        .get("TriageTaskNode")
+        .expect("TriageTaskNode should have stamped a result");
+    assert_eq!(triage_result["verdict"], json!("MAJOR_BAIL"));
+    assert_eq!(
+        implement_calls.load(Ordering::SeqCst),
+        3,
+        "cheap-fast's max_attempts (2) should yield 3 ImplementTaskNode calls before MAJOR_BAIL"
+    );
+}
+
+#[tokio::test]
+async fn thorough_profile_skips_reconcile_like_baseline_but_uses_max_attempts_five() {
+    // Half 1: `thorough` keeps the built-in `test_depth: Full`, so its
+    // reconcile is skipped exactly like `baseline`'s — zero check results
+    // stamped by `FinalValidationNode` — even though every other knob
+    // (model tier, timeouts, retry ceiling) differs. See `baseline`'s
+    // Half-1 comment for why the stamped result, not the raw
+    // `CommandRunner` call log, is the right observable at `Full` depth
+    // (the per-task tripwire itself calls `full-suite-check` there too).
+    let worktree = temp_worktree("thorough-reconcile");
+    write_fixture_files(&worktree, 2, 2);
+
+    let (test_runner, _calls) = recording_pass_runner();
+    let (git_runner, _git_calls) = recording_git_runner();
+    let workflow = build_workflow(&worktree, test_runner, git_runner);
+
+    let event = json!({ "spec_slug": SPEC_SLUG, "profile": "thorough" });
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let final_validation_result = final_ctx
+        .nodes
+        .get("FinalValidationNode")
+        .expect("FinalValidationNode should have stamped a result");
+    assert_eq!(final_validation_result["skipped"], json!(true));
+    assert_eq!(
+        final_validation_result["check_results"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "zero CommandRunner calls at the reconcile: check_results must be empty on the skip path"
+    );
+
+    // Half 2: a never-passing task under `thorough` bails after exactly 6
+    // `ImplementTaskNode` invocations (5 + 1) — the highest of the three
+    // profiles, distinct from both `baseline` (4) and `cheap-fast` (3).
+    let worktree2 = temp_worktree("thorough-retry");
+    write_fixture_files_policy_driven_max_attempts(&worktree2, 1);
+    let (git_runner2, _git_calls2) = recording_git_runner();
+    let (workflow2, implement_calls) =
+        build_workflow_counting_implement(&worktree2, always_fail_runner(), git_runner2);
+
+    let event2 = json!({ "spec_slug": SPEC_SLUG, "profile": "thorough" });
+    let final_ctx2 = workflow2
+        .run(event2, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let triage_result = final_ctx2
+        .nodes
+        .get("TriageTaskNode")
+        .expect("TriageTaskNode should have stamped a result");
+    assert_eq!(triage_result["verdict"], json!("MAJOR_BAIL"));
+    assert_eq!(
+        implement_calls.load(Ordering::SeqCst),
+        6,
+        "thorough's max_attempts (5) should yield 6 ImplementTaskNode calls before MAJOR_BAIL"
+    );
+}
+
+/// Pins the trap the block record names twice over (`policy.rs`,
+/// `profiles.rs`): `test_depth: Full` — the built-in default, restated by
+/// both `baseline` and `thorough` — SILENTLY DISABLES the terminal
+/// reconcile. Reached through SDLC_TASK's OWN registry/schema (this
+/// suite's `build_workflow`, not a direct unit call into
+/// `final_validation.rs`), so this side cannot drift unnoticed from the
+/// mirrored `final_validation.rs` unit test
+/// (`reconcile_scope_skips_with_zero_calls_when_test_depth_is_full`).
+#[tokio::test]
+async fn test_depth_full_reconcile_skip_pins_zero_calls_and_skip_reason_through_sdlc_task_registry()
+{
+    let worktree = temp_worktree("test-depth-full-pin");
+    // `write_fixture_files_policy_driven_max_attempts` (not
+    // `write_fixture_files`) deliberately carries NO `sdlc_task.policy`
+    // section — `write_fixture_files`'s harness pins `test_depth: "fast"`
+    // as a layer-3 default (for the pre-existing, non-profile tests in
+    // this file), which would mask the built-in default this pin exists
+    // to exercise.
+    write_fixture_files_policy_driven_max_attempts(&worktree, 1);
+
+    let (git_runner, _git_calls) = recording_git_runner();
+    // No `profile` in the event at all — the built-in default IS
+    // `test_depth: Full`, so this exercises the no-profile-selected path
+    // the behaviour-stability guarantee (task 1) anchors on.
+    let workflow = build_workflow(&worktree, always_pass_runner(), git_runner);
+
+    let event = json!({ "spec_slug": SPEC_SLUG });
+    let final_ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("workflow run should not error");
+
+    let final_validation_result = final_ctx
+        .nodes
+        .get("FinalValidationNode")
+        .expect("FinalValidationNode should have stamped a result");
+    assert_eq!(final_validation_result["skipped"], json!(true));
+    assert_eq!(
+        final_validation_result["check_results"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "zero CommandRunner calls: check_results must be empty on the skip path"
+    );
+    assert!(
+        final_validation_result["skip_reason"]
+            .as_str()
+            .unwrap()
+            .contains("test_depth=full"),
+        "skip_reason must name test_depth=full: {final_validation_result:?}"
+    );
 }

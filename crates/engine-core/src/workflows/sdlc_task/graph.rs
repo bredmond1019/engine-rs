@@ -74,12 +74,13 @@ use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
+use crate::policy::PolicyConfigSource;
 use crate::workflows::sdlc_flow::close_block::CloseBlockNode;
 use crate::workflows::sdlc_flow::final_validation::{FinalValidationNode, ValidationScope};
 use crate::workflows::sdlc_flow::graph::agentic_write_config;
-use crate::workflows::sdlc_flow::policy::{ModelTier, SdlcPolicy};
+use crate::workflows::sdlc_flow::policy::ModelTier;
 use crate::workflows::sdlc_flow::setup::{
-    GenerateTasksNode, LoadTaskStateNode, SetupWorktreeNode, SpecExistsRouterNode,
+    GenerateTasksNode, LoadTaskStateNode, PolicyResolverFn, SetupWorktreeNode, SpecExistsRouterNode,
 };
 use crate::workflows::sdlc_flow::task_loop::{
     ImplementTaskNode, IncrementAttemptNode, SaveStateNode, TaskQueueRouterNode, TestTaskNode,
@@ -87,6 +88,8 @@ use crate::workflows::sdlc_flow::task_loop::{
 };
 
 use super::lean_bookkeep::LeanBookkeepNode;
+use super::policy::SdlcTaskPolicy;
+use super::profiles::resolve_policy_for_run_from;
 use super::task_triage_router::TaskTriageRouterNode;
 use super::{default_command_runner, ModelTransport, DEFAULT_STATE_FILENAME};
 
@@ -209,7 +212,9 @@ pub fn schema() -> WorkflowSchema {
 pub fn registry() -> NodeRegistry {
     let mut registry = NodeRegistry::new();
     registry.register(Box::new(
-        SetupWorktreeNode::new().with_branch_prefix("task/"),
+        SetupWorktreeNode::new()
+            .with_branch_prefix("task/")
+            .with_policy_resolver(sdlc_task_policy_resolver()),
     ));
     registry.register(Box::new(
         SpecExistsRouterNode::new().with_state_filename(DEFAULT_STATE_FILENAME),
@@ -266,13 +271,12 @@ fn real_cloud_transport() -> ModelTransport {
 /// `sdlc_flow`). Has no `ConsolidatedReviewNode` branch: `SDLC_TASK`
 /// registers no such node.
 ///
-/// Takes `sdlc_flow::policy::SdlcPolicy`, not a new `SdlcTaskPolicy` —
-/// `EN.11.O` owns the policy surface and its own acceptance criteria
-/// require that "with no profile selected, SDLC_TASK behaves exactly as
-/// `EN.11.N` left it", so inventing a policy type here would only be
-/// deleted there (this block's Amendment Log, "SCOPE CALL").
+/// Takes `SdlcTaskPolicy` (`EN.11.O` task 3) — SDLC_TASK's own resolved
+/// policy, not `sdlc_flow::policy::SdlcPolicy`. `model_tiers.triage` and
+/// `local` are fields SDLC_TASK carries directly (see `policy.rs`), so this
+/// no longer needs the `to_sdlc_policy()` projection at all.
 #[must_use]
-pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
+pub fn registry_for_policy(policy: &SdlcTaskPolicy) -> NodeRegistry {
     let mut registry = registry();
 
     if policy.model_tiers.triage == ModelTier::Local {
@@ -282,6 +286,22 @@ pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
     }
 
     registry
+}
+
+/// The [`SetupWorktreeNode::with_policy_resolver`] closure for SDLC_TASK:
+/// resolves `SdlcTaskPolicy` against `sdlc_task.{policy,profiles}` (via
+/// [`resolve_policy_for_run_from`]), then projects it onto the
+/// `SdlcPolicy` every shared `sdlc_flow` node in this registry actually
+/// reads (via [`SdlcTaskPolicy::to_sdlc_policy`]). This is the seam that
+/// makes a `sdlc_task.policy` harness.json section live config instead of
+/// dead config — before this task, `SetupWorktreeNode` always read
+/// `sdlc.policy` regardless of which workflow it was assembled into.
+fn sdlc_task_policy_resolver() -> Arc<PolicyResolverFn> {
+    Arc::new(|ctx, worktree| {
+        let source = PolicyConfigSource::Worktree(worktree.to_path_buf());
+        let resolved = resolve_policy_for_run_from(ctx, &source)?;
+        Ok(resolved.to_sdlc_policy())
+    })
 }
 
 /// Build the runnable `SDLC_TASK` `Workflow`: [`registry`] paired with
@@ -432,7 +452,7 @@ mod tests {
     #[test]
     fn registry_for_policy_with_default_policy_matches_plain_registry() {
         let default_registry = registry();
-        let policy_registry = registry_for_policy(&SdlcPolicy::default());
+        let policy_registry = registry_for_policy(&SdlcTaskPolicy::default());
 
         assert_eq!(policy_registry.len(), default_registry.len());
         assert!(policy_registry.contains("TriageTaskNode"));
@@ -443,12 +463,12 @@ mod tests {
 
     #[test]
     fn registry_for_policy_with_local_triage_tier_keeps_same_node_identities() {
-        let policy = SdlcPolicy {
-            model_tiers: crate::workflows::sdlc_flow::policy::ModelTiers {
+        let policy = SdlcTaskPolicy {
+            model_tiers: super::super::policy::SdlcTaskModelTiers {
                 triage: ModelTier::Local,
-                ..crate::workflows::sdlc_flow::policy::ModelTiers::default()
+                ..super::super::policy::SdlcTaskModelTiers::default()
             },
-            ..SdlcPolicy::default()
+            ..SdlcTaskPolicy::default()
         };
 
         let registry = registry_for_policy(&policy);
@@ -460,13 +480,13 @@ mod tests {
 
     #[test]
     fn registry_for_policy_never_rewires_implement_task_node() {
-        let policy = SdlcPolicy {
-            model_tiers: crate::workflows::sdlc_flow::policy::ModelTiers {
+        let policy = SdlcTaskPolicy {
+            model_tiers: super::super::policy::SdlcTaskModelTiers {
                 implement: ModelTier::Local,
                 triage: ModelTier::Local,
-                ..crate::workflows::sdlc_flow::policy::ModelTiers::default()
+                ..super::super::policy::SdlcTaskModelTiers::default()
             },
-            ..SdlcPolicy::default()
+            ..SdlcTaskPolicy::default()
         };
 
         let registry = registry_for_policy(&policy);
@@ -512,5 +532,132 @@ mod tests {
              only addition (patch_pr_into_state/patch_close_block_into_state) is PR/close \
              enrichment this workflow has no use for"
         );
+    }
+
+    // --- EN.11.O task 3: the SDLC_TASK policy seam -------------------------
+
+    use engine_contract::TaskContext;
+    use std::path::{Path, PathBuf};
+
+    fn event_context(event: serde_json::Value) -> TaskContext {
+        TaskContext {
+            event,
+            nodes: HashMap::new(),
+            metadata: serde_json::json!({}),
+            node_runs: HashMap::new(),
+        }
+    }
+
+    /// A unique, empty scratch directory under the OS temp dir.
+    fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-core-sdlc-task-graph-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_harness_json(worktree: &Path, contents: serde_json::Value) {
+        std::fs::create_dir_all(worktree.join("planning")).expect("create planning dir");
+        std::fs::write(
+            worktree.join("planning").join("harness.json"),
+            contents.to_string(),
+        )
+        .expect("write harness.json");
+    }
+
+    /// With no `sdlc_task.policy` section and no `profile`, the resolver
+    /// stamps exactly `SdlcTaskPolicy::default().to_sdlc_policy()` — the
+    /// behavior-stability anchor this task's AC names explicitly.
+    #[test]
+    fn sdlc_task_policy_resolver_with_no_harness_section_matches_default_projection() {
+        let worktree = temp_dir();
+        let ctx = event_context(serde_json::json!({ "spec_slug": "my-spec" }));
+
+        let resolver = sdlc_task_policy_resolver();
+        let resolved = resolver(&ctx, &worktree).expect("resolve should succeed");
+
+        assert_eq!(resolved, SdlcTaskPolicy::default().to_sdlc_policy());
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// A `sdlc_task.policy` harness.json section changes the resolved
+    /// policy — proof the seam actually reads SDLC_TASK's own section.
+    #[test]
+    fn sdlc_task_policy_resolver_reads_sdlc_task_harness_section() {
+        let worktree = temp_dir();
+        write_harness_json(
+            &worktree,
+            serde_json::json!({ "sdlc_task": { "policy": { "max_attempts": 9 } } }),
+        );
+        let ctx = event_context(serde_json::json!({ "spec_slug": "my-spec" }));
+
+        let resolver = sdlc_task_policy_resolver();
+        let resolved = resolver(&ctx, &worktree).expect("resolve should succeed");
+
+        assert_eq!(resolved.max_attempts, 9);
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// An IDENTICAL section under the plain `sdlc` key (SDLC_FLOW's own)
+    /// does NOT change SDLC_TASK's resolved policy — this pair is the only
+    /// proof the workflow key is wired correctly rather than accidentally
+    /// reading `sdlc_flow`'s section.
+    #[test]
+    fn sdlc_task_policy_resolver_ignores_plain_sdlc_harness_section() {
+        let worktree = temp_dir();
+        write_harness_json(
+            &worktree,
+            serde_json::json!({ "sdlc": { "policy": { "max_attempts": 9 } } }),
+        );
+        let ctx = event_context(serde_json::json!({ "spec_slug": "my-spec" }));
+
+        let resolver = sdlc_task_policy_resolver();
+        let resolved = resolver(&ctx, &worktree).expect("resolve should succeed");
+
+        assert_eq!(
+            resolved.max_attempts,
+            SdlcTaskPolicy::default().to_sdlc_policy().max_attempts
+        );
+        assert_ne!(resolved.max_attempts, 9);
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// `SetupWorktreeNode` as assembled by [`registry`] (branch prefix
+    /// `"task/"` + the SDLC_TASK policy resolver) stamps the SDLC_TASK
+    /// projection into `ctx.nodes`, driven through the real `Node::process`
+    /// call — not just the resolver function in isolation.
+    #[tokio::test]
+    async fn setup_worktree_node_in_sdlc_task_registry_stamps_sdlc_task_projected_policy() {
+        use crate::node::Node;
+
+        let stub_runner: crate::workflows::CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(crate::workflows::CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = SetupWorktreeNode::new()
+            .with_runner(stub_runner)
+            .with_branch_prefix("task/")
+            .with_policy_resolver(sdlc_task_policy_resolver());
+        let ctx = event_context(serde_json::json!({ "spec_slug": "my-spec" }));
+
+        let out = node.process(ctx).await.expect("setup should succeed");
+        let stamped = out
+            .nodes
+            .get(crate::policy::RESOLVED_POLICY_IDENTITY)
+            .expect("resolved policy present in ctx after setup");
+
+        let expected = serde_json::to_value(SdlcTaskPolicy::default().to_sdlc_policy())
+            .expect("serialize expected policy");
+        assert_eq!(stamped, &expected);
     }
 }
