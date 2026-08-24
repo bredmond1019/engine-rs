@@ -172,6 +172,54 @@ Each of these exists because it has already caused a real failure in this fleet.
     `processing/`, then `complete_message()` per message once triaged — do not restate the queue
     layout or receipts ledger here, `BT.6.B` owns both.
 
+    **Re-stamp both heartbeats at this same boundary.** Before releasing, update the registry
+    claim's `heartbeat` field (`<lock_dir>/lane-agents/agent-<agent_name>.json`) to the current
+    time; after re-taking, update the lease's `heartbeat` field
+    (`<lock_dir>/leases/lease-<repo>.json`) the same way. **At that same claim update, if the claim
+    carries the optional `current_block` and `block_started_at` fields, re-stamp them too** — set
+    `current_block` to the id of the block about to launch and `block_started_at` to the current
+    time, in the same write as `heartbeat`, not a separate one. Both fields are optional; a claim
+    without them is unaffected. **Leave `started_at` (on the claim) and
+    `acquired_at` (on the lease) alone** — those are acquisition timestamps, not liveness signals,
+    and re-stamping them destroys the record of when the claim or lease was actually taken (the
+    exact data loss `BT.ticket.lane-claim-and-lease-have-no-heartbeat` fixed: a lease heartbeated
+    via `acquired_at` loses its true acquisition time forever). **This is a different clock from
+    the fleet-concurrency re-registration** described in Step 5 below
+    (`fleet_concurrency_check.py register`, which bumps that separate
+    `<lock_dir>/fleet-concurrency/...` entry's own `started_at`) — heartbeating
+    the claim or the lease does not heartbeat the fleet-concurrency slot, and vice versa; do not
+    conflate the two clocks or the two files.
+
+    **In case of divergence:** the claim, the lease, and the fleet-concurrency slot are three
+    separate files, each heartbeated by its own instruction — the claim/lease heartbeat happens
+    at *every* block boundary (this rule); the fleet-concurrency heartbeat is periodic and only
+    for a heavy repo whose chain outruns its TTL (Step 5 below, "Decide engine and isolation").
+
+
+    **While no `/orchestration-commander` is running — the current arrangement — a lane is the ONLY
+    reader of any inbox, including its own.** Nothing sweeps the queue tree, so a message addressed
+    to a lane that is not running is read by nobody, and the sender goes on believing it has
+    communicated. Measured 2026-08-23: three messages, one of them a P0, sat unread for seven hours.
+    Three obligations follow, and they are the pre-commander practice restored deliberately, not a
+    regression:
+
+    1. **Ping a peer whenever a peer is affected**, rather than waiting for anything to route it for
+       you — use the `ping-agent` skill's envelope and the four-verdict response contract.
+    2. **Write every message to a durable home as well as sending it.** The ping accelerates the
+       durable channel; it never replaces it. A finding that exists only as a ping dies with the
+       receiving session.
+    3. **Record every issue, decision and surprise in this run's
+       `planning/orchestration-run/<roadmap-slug>/notes.md`**, with a status (`OPEN` / `DONE` /
+       `HELD` / `WONTFIX`), even when you have also pinged someone about it. The notes file is the
+       only channel that survives both sessions ending.
+
+    Additionally, **glance at the whole queue tree at each block boundary**, not just your own
+    inbox: `python3 <path-to-base-template>/scripts/check_messages.py` validates every lane's queue
+    in about a second. If you see an undrained inbox belonging to a lane that is not running, say so
+    in your report and in `notes.md` — surfacing it is never out of scope, even though acting on
+    another lane's message is. `BT.ticket.commander-must-validate-the-whole-queue-tree` moves this
+    to the commander once it is fixed.
+
     **Interrupt discipline**: only `RENDEZVOUS` and `LEASE_RELEASE` may interrupt a block in
     flight — both concern the tree and are objectively time-critical. Every other kind
     (`EDGE_RELEASED`, `FINDING`, `QUERY`) is triaged at the next block boundary, never before. See
@@ -292,21 +340,15 @@ sparse-checkout worktree. Worktrees are **safe in brain-vaulted repos** — the 
 symlinked `planning/` and resolve it (D46), and `/init-worktree` was fixed to match
 (`BT.ticket.init-worktree-symlink-repair`, closed). Plain branch is simply *cheaper*, not safer.
 
-Use `--worktree` when:
-- **The repo owns the engines it is running — `base-template` ALWAYS.** A chain there edits
-  `.claude/workflows/sdlc-*.js` *while those engines are executing the chain*. Without isolation a
-  block's edits land in the working tree the next block's engine loads from, so a mid-chain change
-  silently alters how the rest of the chain runs. The worktree keeps each block's engine edits
-  quarantined until you merge them deliberately.
-- The change is risky enough to want quarantined until reviewed.
-- A `.env` or other untracked file is needed at runtime → check it copied; if not, prefer plain
-  branch for that block.
+**`--worktree` is currently suspended fleet-wide** (`D81-worktree-moratorium`) — the engines refuse
+the flag outright, so isolation is not a per-run choice today. The table below records the D81
+answer for when it lifts.
 
 **Two repos have a non-negotiable answer. Encode them, do not re-derive them per run:**
 
 | Repo | Isolation | Why |
 |---|---|---|
-| `base-template` | **`--worktree` ALWAYS** | See above — a chain there edits the engines running it. |
+| `base-template` | **`--no-worktree`** (D81) | D81 refuted the old reason with a mechanism: the Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
 | the brain root (HQ) | **`--no-worktree` ALWAYS** | Carryover `hq-specs-cannot-run-in-a-worktree`. Measured 2026-08-04 inside a real branch worktree: `validate-brain --structure` gave **64 errors** and `--state` **601**, against 0/0 in the main tree. `validate-brain` walks up to the worktree's own `brain.toml` and resolves the 17 sub-repos relative to it — and every sub-repo is gitignored, so absent from any checkout. Worktree creation itself is clean; it is specifically the corpus gates that cannot pass. Same root cause as the CI exclusion in D65. |
 
 `--worktree` / `--no-worktree` on the command line overrides all of the above **except those two** —
@@ -347,6 +389,17 @@ itself is unavailable (no brain root found, unwritable), the script reports `"de
 "allowed": true` — same as today's unenforced-prose behavior, not a new way to fail. See
 `planning/decisions/D61-fleet-concurrency-enforcement.md` and
 `planning/decisions/D66-tiered-heavy-lane-concurrency.md` for the full design.
+
+**Fleet-exclusive lanes (`exclusive_repos`).** If the lane record's `exclusive_repos` array is
+non-empty, before the first block starts, write an additional `kind: exclusive` lease at
+`<lock_dir>/leases/lease-<repo>.json` for **each** repo named in `exclusive_repos` — same shape as
+any other lease record (`repo`, `lane`, `agent`, `acquired_at`, `kind: exclusive`; no new field).
+While any such lease is held, every other agent's `fleet_concurrency_check.py register` call is
+refused with exit `3` regardless of category or heaviness, so a lane that must run with the fleet
+quiesced can actually hold it — this is admission control only, never pre-emption of a lane
+already running. Remove every lease written this way at lane close — success, failure, or
+abandonment — alongside the ordinary lease and registry releases. `exclusive_repos` is read only
+here; no new field is added to `.claude/workflows/lane.schema.json` or to the lease record.
 
 ### 6. Launch the engine — do not wait idly
 Invoke the workflow **in this session**:
@@ -398,11 +451,22 @@ If any is wrong: set `status` to `closed`, then run **`mev emit-state --write`**
 **`mev validate-brain --state`** (expect 0 errors). **Record every repair** — a pattern of them is
 evidence for that open ticket.
 
-**Then check the corpus, then commit, then report** (rules 7, 8 and 9):
+**Then check the corpus, then commit, then report** (rules 7, 8 and 9). Run the four read-only
+checks, **one invocation per flag** — `validate-brain`'s flags do not compose (`main.rs` is an
+if/else-if chain, first flag wins; passing more than one silently runs only the highest-precedence
+one and reports a real, passing result for a check that never ran):
 
 ```
-./scripts/validate_brain.sh          # from the brain root — delta against the last good push
+bastion validate-brain --state
+bastion validate-brain --graph
+bastion validate-brain --links
+bastion validate-brain --structure
 ```
+
+`./scripts/validate_brain.sh` is **not** this check — on a `primary` host it ends in an
+`emit-state --write`, a commit, and a `git push` (see `derive-state-safely`), so a lane using it as
+its closing verification is committing and pushing whatever the shared index holds, not just its
+own work.
 
 Concurrent lanes pushing into one corpus is exactly the condition that accumulated 32
 `validate-brain` errors across four lanes on 2026-08-04 and blocked `git push` fleet-wide. Rule 6
@@ -476,9 +540,14 @@ as a clean pass.
 ### 10. Re-check the next block's dependencies, then launch it
 Cheap, and it catches anything that changed outside the chain.
 
-**This is the block boundary — release the lease, drain the inbox, re-take the lease** (rule 10):
-release `<lock_dir>/leases/lease-<repo>.json`, drain `<lock_dir>/queue/<repo>/<lane>/` via
-`drain_queue()`/`complete_message()`, then re-take the lease before launching the next engine. If
+**This is the block boundary — release the lease, drain the inbox, re-take the lease, and
+re-stamp both heartbeats** (rule 10): before releasing, re-stamp the registry claim's `heartbeat`
+(`<lock_dir>/lane-agents/agent-<agent_name>.json`) — and, if the claim carries the optional
+`current_block`/`block_started_at` fields, re-stamp those too, to the next block's id and now,
+in the same write; release
+`<lock_dir>/leases/lease-<repo>.json`; drain `<lock_dir>/queue/<repo>/<lane>/` via
+`drain_queue()`/`complete_message()`; re-take the lease and re-stamp its `heartbeat` before
+launching the next engine. Leave `started_at` and `acquired_at` untouched — see rule 10. If
 `--stop-after` has been reached, or `--autonomy` says this is a stopping point, release the lease
 and registry claim as at lane close and stop here instead of continuing to step 6. Otherwise
 return to step 6.

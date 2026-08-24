@@ -1,7 +1,6 @@
 ---
 name: stop-or-continue
 description: How to decide whether a session must restart for CORRECTNESS reasons, and what to write down before any handoff — the trigger table for an engine, binary, hook or CLAUDE.md changing under a running session, and the test for whether an artifact is good enough to hand off on. Context size is NOT a reason to stop; this skill says so explicitly. Use when something the session depends on changed mid-run, when the operator asks whether to /clear, and before recommending a fresh session for any reason.
-allowed-tools: Bash(grep:*) Bash(ls:*) Bash(git:*)
 ---
 
 # Deciding to stop, continue, or write something down first
