@@ -17,6 +17,7 @@
 mod action_dispatch_e2e;
 mod approve_and_run;
 mod blocked_bridge;
+mod brain_client;
 mod budget;
 mod cancellation;
 mod claude_code_step;

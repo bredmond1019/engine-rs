@@ -66,6 +66,7 @@ use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{EventsRow, NodeRunStatus, TaskContext};
 use engine_core::node::NodeRegistry;
+use engine_core::nodes::brain_client::BrainConfig;
 use engine_core::nodes::channel_transport::StubChannelTransport;
 use engine_core::nodes::doc_materializer::{
     MaterializeOutcome, MaterializedFile, StubDocMaterializer,
@@ -102,6 +103,12 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 
 const TEST_BRAIN_URL: &str = "https://brain.example/ingest/content-pipeline-e2e";
+/// `EN.6.K` task 4: a fixture `X-API-Key` so `PersistToBrainNode`'s
+/// `BrainConfig`-derived auth header is asserted through the real composed
+/// `Workflow::run` walk, not just the node's own unit tests. The URL still
+/// comes from `with_url(TEST_BRAIN_URL)` (config precedence: an explicit
+/// `with_url` always wins for the URL; the header comes from `with_config`).
+const TEST_BRAIN_API_KEY: &str = "content-pipeline-e2e-key";
 
 // ---------------------------------------------------------------------------
 // Stub helpers
@@ -376,6 +383,10 @@ fn build_registry(stubs: &Stubs) -> NodeRegistry {
         PersistToBrainNode::new()
             .with_http_post(Arc::new(stubs.http_post.clone()))
             .with_url(TEST_BRAIN_URL)
+            .with_config(BrainConfig::new(
+                "https://brain.example",
+                Some(TEST_BRAIN_API_KEY.to_string()),
+            ))
             // `EN.7.C`: this fixture's assertions expect the pre-block
             // always-push behavior, so it opts explicitly into
             // `in_process` rather than relying on the new `off` default.
@@ -459,6 +470,18 @@ async fn web_article_branch_flows_through_to_persist() {
         .last_call()
         .expect("PersistToBrainNode should have POSTed");
     assert_eq!(url, TEST_BRAIN_URL);
+
+    // `EN.6.K` task 4: the `X-API-Key` header from the fixture's
+    // `BrainConfig` reaches the real POST through the composed
+    // `Workflow::run` walk, not just PersistToBrainNode's own unit tests.
+    let headers = stubs
+        .http_post
+        .last_headers()
+        .expect("PersistToBrainNode should have POSTed with headers");
+    assert!(
+        headers.contains(&("X-API-Key".to_string(), TEST_BRAIN_API_KEY.to_string())),
+        "expected the fixture's X-API-Key header in {headers:?}"
+    );
 }
 
 #[tokio::test]
