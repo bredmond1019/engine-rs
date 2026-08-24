@@ -107,7 +107,6 @@ hitting one should find it named rather than assume they are holding it wrong.
 | `CloseBlockNode` leaves derived output uncommitted | `EN.ticket.close-block-node-leaves-derived-output-uncommitted` | It must stage and commit the derived fallout of its own state write. |
 | Vault-dependent tests fail instead of skipping | `EN.ticket.vault-dependent-tests-must-skip-not-fail` | A test needing the brain vault hard-fails on any checkout without one, including CI. |
 | The test suite mutates a tracked fixture | `EN.ticket.diagnostic-intake-fixture-tempdir` | `diagnostic-intake-state.json` is rewritten in place by running the suite. |
-| The unattended token ceiling reads low | `EN.ticket.budget-gate-undercounts-cache-channels` | `BudgetLedger` sums `input_tokens + output_tokens` only. The cache channels live in `ctx.nodes` (to avoid a D78 contract bump) and `budget.rs` never reads them — so `max_total_tokens`, the only cap that can bind under a Claude Max subscription where cost is always `-0.0`, under-counts by most of real consumption. |
 | No env-var policy source | `EN.ticket.local-policy-harness-file` | `PolicyConfigSource::HarnessFile` for the three API-shaped workflows. Interim — superseded by `EN.3.K`. |
 
 ## Keeping this page honest

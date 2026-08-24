@@ -513,6 +513,18 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   folds it into `ledger.record(...)` alongside token usage, so `Budget::max_cost_usd` actually
   gates a run the same way `max_total_tokens` already did. A node with no `cost_usd` in its output
   contributes `None` (token-only accounting), so behavior is unchanged when no cost cap is set.
+  **`EN.ticket.budget-gate-undercounts-cache-channels`:** `record` takes a third argument,
+  `cache_tokens: Option<u64>`, folded straight into `total_tokens`, and `Workflow::run_with`
+  supplies it from a sibling reader `node_cache_tokens(&ctx, &identity)` (`workflow.rs`, beside
+  `node_cost_usd`) that sums `ctx.nodes[identity]`'s `cache_read_input_tokens` +
+  `cache_creation_input_tokens`. `from_context` collects it in the same walk it already makes for
+  cost, so a resumed or crash-recovered run rebuilds the ceiling correctly rather than only the
+  live path. **This matters because `max_total_tokens` is the only cap that can bind under a
+  subscription** — the CLI reports no per-call billing there, so `total_cost_usd` is always `-0.0`
+  and `max_cost_usd` can never trip. Cache reads bill at 10% and cache creation at 125%, so before
+  this the ceiling was reading roughly one of three input channels. A node reporting neither cache
+  key contributes zero rather than erroring. `engine_contract::Usage` is deliberately unchanged —
+  the channels travel via `ctx.nodes`, so no D78 contract bump was triggered.
   `check()` is the pre-dispatch gate `Workflow::run_with` calls before each node: returns
   `Allow` or `Halt(BudgetHaltReason)` when accumulated spend is *reached* (`>=`) the configured
   cap — a cap hit exactly by the last completed node stops the walk before the node that would
@@ -630,11 +642,13 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   (`hold_poll_interval_ms`) never rewires which node runs, so there is no `registry_for_policy`
   variant to choose between at dispatch time — `engine_core::workflows::orchestration::graph::registry`
   is the only registry the workflow ever runs under — and `register_builtin_workflows` now
-  populates fourteen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
+  populates fifteen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
   `register_sdlc_task`/`register_sdlc_task_with_registry`, mirroring `SDLC_FLOW`'s;
-  `register_deliverable_render` (`DELIVERABLE_RENDER`, `EN.4.D` task 5) follows the same
+  `register_deliverable_render` (`DELIVERABLE_RENDER`, `EN.4.D` task 5) and
+  `register_linkedin_post` (`LINKEDIN_POST`, `EN.5.G` task 6) both follow the same
   `PolicyConfigSource::Builtin` shape as the other channel/API-triggered workflows — see
-  [deliverable-render-workflow.md](deliverable-render-workflow.md)).
+  [deliverable-render-workflow.md](deliverable-render-workflow.md) and
+  [linkedin-post-workflow.md](linkedin-post-workflow.md)).
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
