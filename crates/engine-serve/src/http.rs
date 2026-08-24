@@ -71,6 +71,17 @@
 //!   `total_tokens` sums as a plain `u64`. `possibly_truncated` mirrors
 //!   [`crate::live_state::CampaignLookup::possibly_truncated`] — `true`
 //!   means the completed ring may already have evicted an earlier member.
+//! - `GET /campaigns/{id}/journal` (`EN.12.D` task 5) — requires the same
+//!   `X-API-Key` header (401 without it); `404` for a malformed/non-UUID
+//!   path segment, an unknown campaign, or a self-skip when no
+//!   `DATABASE_URL` is configured (never a `500`). Returns `200
+//!   {campaign_id, rows: [...]}` — a campaign's durable journal rows
+//!   (`engine_contract::JournalRow`), read straight from Postgres via
+//!   `engine_store::list_journal_rows_for_campaign`; unlike `GET
+//!   /campaigns/{id}` above there is no in-memory counterpart, since the
+//!   journal has none. Addressed purely by `campaign_id` — no repo, no
+//!   roadmap — so a repo-less run is just as readable as a repo-scoped one.
+//!   See `crate::journal`.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -253,6 +264,20 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/campaigns/{id}/abort",
             web::post().to(crate::abort::abort_campaign),
+        )
+        // `EN.12.D` task 5. Order relative to `/campaigns/{id}` below does
+        // not matter for THIS pair — `/campaigns/{id}/journal` has one more
+        // path segment than `/campaigns/{id}`, so actix-web's matcher
+        // cannot confuse the two regardless of registration order (unlike
+        // `/campaigns/{id}/abort` vs a hypothetical `/campaigns/{literal}`,
+        // which is the shadowing shape this file's other comments guard
+        // against). Registered here anyway, grouped with the other
+        // `/campaigns/{id}/...` routes, per this file's established
+        // first-registration-wins discipline for any FUTURE literal segment
+        // under `/campaigns/`.
+        .route(
+            "/campaigns/{id}/journal",
+            web::get().to(crate::journal::get_campaign_journal),
         )
         // `EN.11.E` task 5. No other literal `/campaigns/...` segment
         // exists, so `{id}` cannot shadow anything else today — but per
