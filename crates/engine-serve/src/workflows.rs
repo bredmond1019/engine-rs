@@ -659,6 +659,44 @@ pub fn register_content_pipeline(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `LINKEDIN_POST` workflow (`engine_core::workflows::linkedin_post`)
+/// with `dispatcher`, populating both the `workflow_registry` (via a
+/// policy-aware factory built on `linkedin_post::graph::registry_for_policy`)
+/// and the `schema_registry` (via `linkedin_post::graph::schema`). See
+/// `planning/EN.5.G/tasks.md` + `tasks.json`, Task 6.
+///
+/// Channel/webhook-triggered runs carry no repo checkout at dispatch time
+/// (mirrors `RESEARCH_AGENT`/`DIAGNOSTIC_INTAKE`/`PROPOSAL_GENERATOR`/
+/// `CONTENT_PIPELINE`), so the factory resolves policy against
+/// `PolicyConfigSource::Builtin` (builtin + profile + event layers only,
+/// no filesystem access) rather than a worktree path. No node in this
+/// workflow needs an egress-transport override at registration time
+/// (unlike `CONTENT_PIPELINE`'s `ActionDispatchNode`/`RESEARCH_AGENT`'s
+/// `ResearchIngressDispatchNode`) — `linkedin_post::graph::registry_for_policy`
+/// already builds a fully wired registry.
+pub fn register_linkedin_post(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::linkedin_post::graph::schema(),
+        Box::new(|event: &serde_json::Value| {
+            let ctx = event_only_context(event);
+            let policy =
+                engine_core::workflows::linkedin_post::profiles::resolve_policy_for_run_from(
+                    &ctx,
+                    &PolicyConfigSource::Builtin,
+                )
+                .map_err(|err| err.to_string())?;
+            let registry =
+                engine_core::workflows::linkedin_post::graph::registry_for_policy(&policy);
+            let seeded = seed_resolved_policy(&policy)?;
+            Ok(Workflow::new(
+                registry,
+                engine_core::workflows::linkedin_post::graph::schema(),
+            )
+            .with_seeded_nodes(seeded))
+        }),
+    );
+}
+
 /// Register the `OPPORTUNITY_SET_STAGE` workflow
 /// (`engine_core::workflows::opportunity_edit::graph`) with `dispatcher`,
 /// populating both the `workflow_registry` and the `schema_registry`. See
@@ -1020,9 +1058,10 @@ pub fn register_orchestration_with_registry(
 
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `SDLC_TASK`, `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
-/// `CONTENT_PIPELINE`, `OPPORTUNITY_SET_STAGE`, `OPPORTUNITY_ADD_ACTION`,
-/// `HARVEST_APPROVE`, `LEAD_INGEST`, `APPROVE_AND_RUN`, `TERMINAL_PROBE`,
-/// and `ORCHESTRATION`; future builtins register here too.
+/// `CONTENT_PIPELINE`, `LINKEDIN_POST`, `OPPORTUNITY_SET_STAGE`,
+/// `OPPORTUNITY_ADD_ACTION`, `HARVEST_APPROVE`, `LEAD_INGEST`,
+/// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, and `ORCHESTRATION`; future
+/// builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
 /// this with exactly one argument (`../bastion/src/serve/mod.rs:61`) and
@@ -1059,6 +1098,7 @@ pub fn register_builtin_workflows_with_registry(
     register_proposal_generator(dispatcher);
     register_deliverable_render(dispatcher);
     register_content_pipeline(dispatcher);
+    register_linkedin_post(dispatcher);
     register_opportunity_set_stage(dispatcher);
     register_opportunity_add_action(dispatcher);
     register_harvest_approve(dispatcher);
@@ -1939,6 +1979,74 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("CONTENT_PIPELINE"));
+    }
+
+    fn minimal_linkedin_post_event() -> serde_json::Value {
+        serde_json::json!({
+            "since": "2026-08-17",
+            "until": "2026-08-24",
+        })
+    }
+
+    #[test]
+    fn register_linkedin_post_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_linkedin_post(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("LINKEDIN_POST"));
+    }
+
+    #[test]
+    fn linkedin_post_resolve_schema_returns_schema_with_work_source_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_linkedin_post(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("LINKEDIN_POST")
+            .expect("LINKEDIN_POST schema should resolve");
+
+        assert_eq!(schema.start_node, "WorkSourceNode");
+    }
+
+    #[test]
+    fn dispatch_with_event_seeds_the_resolved_linkedin_post_policy() {
+        let mut dispatcher = Dispatcher::new();
+        register_linkedin_post(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event("LINKEDIN_POST", &minimal_linkedin_post_event())
+            .expect("LINKEDIN_POST should dispatch to a runnable Workflow with no repo");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn dispatch_with_event_fails_loudly_on_unknown_linkedin_post_profile() {
+        let mut dispatcher = Dispatcher::new();
+        register_linkedin_post(&mut dispatcher);
+
+        let mut event = minimal_linkedin_post_event();
+        event["profile"] = serde_json::json!("not-a-real-profile");
+
+        let result = dispatcher.dispatch_with_event("LINKEDIN_POST", &event);
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("not-a-real-profile"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_linkedin_post() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("LINKEDIN_POST"));
     }
 
     /// `events_url_from_env` (`EN.6.A` task 5): unset/empty falls back to

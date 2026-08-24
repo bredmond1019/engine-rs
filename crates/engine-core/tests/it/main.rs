@@ -31,6 +31,7 @@ mod evals_slice;
 mod fan_out_aggregate;
 mod harvest_gate_e2e;
 mod held_session;
+mod linkedin_post_e2e;
 mod locale_rate_card;
 mod materialize_doc;
 mod operator_queue;

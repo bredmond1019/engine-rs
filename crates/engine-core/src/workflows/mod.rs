@@ -30,6 +30,7 @@ pub mod deliverable_render;
 pub mod diagnostic_intake;
 pub mod harvest_approve;
 pub mod lead_ingest;
+pub mod linkedin_post;
 pub mod opportunity_edit;
 pub mod orchestration;
 pub mod proposal_generator;
