@@ -488,7 +488,8 @@ impl Workflow {
 
             if let Some(run) = ctx.node_runs.get(&identity) {
                 let cost_usd = node_cost_usd(&ctx, &identity);
-                ledger.record(run.usage.as_ref(), cost_usd);
+                let cache_tokens = node_cache_tokens(&ctx, &identity);
+                ledger.record(run.usage.as_ref(), cost_usd, cache_tokens);
             }
 
             current = match router_next.clone() {
@@ -605,6 +606,30 @@ fn stamp_run_telemetry(ctx: &mut TaskContext, start_node_identity: &str) {
 /// run the same way `Budget::max_total_tokens` already does.
 pub(crate) fn node_cost_usd(ctx: &TaskContext, identity: &str) -> Option<f64> {
     ctx.nodes.get(identity)?.get("cost_usd")?.as_f64()
+}
+
+/// Reads a completed node's two cache-token channels out of its own
+/// `ctx.nodes[identity]` output — the same free-form location
+/// `EN.ticket.token-usage-drops-cache-channels` deliberately routed
+/// `cache_read_input_tokens` and `cache_creation_input_tokens` into rather
+/// than bumping the `engine_contract::Usage` shape (a D78 contract change).
+/// Sums whichever of the two keys are present; `None` when the node's
+/// output object exists but carries neither key (non-LLM nodes, or a
+/// pre-change state file written before those keys existed) — mirroring
+/// [`node_cost_usd`]'s absence-tolerance so a caller folding this into
+/// [`crate::budget::BudgetLedger`] never has to special-case a missing
+/// entry.
+pub(crate) fn node_cache_tokens(ctx: &TaskContext, identity: &str) -> Option<u64> {
+    let node = ctx.nodes.get(identity)?;
+    let cache_read = node.get("cache_read_input_tokens").and_then(|v| v.as_u64());
+    let cache_creation = node
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64());
+
+    match (cache_read, cache_creation) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    }
 }
 
 /// The framework-owned envelope around a single node's `process` call: stamps
