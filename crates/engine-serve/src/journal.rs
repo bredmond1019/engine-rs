@@ -20,6 +20,7 @@
 //! which returns `None` on a missing pool so its caller 404s uniformly.
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use engine_contract::{JournalDecisionKind, JournalRow};
 use uuid::Uuid;
 
 use crate::http::{check_api_key, AppState};
@@ -79,6 +80,203 @@ pub async fn get_campaign_journal(
         "campaign_id": campaign_id,
         "rows": rows,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// EN.12.D task 6 — the D57 `notes.md`/`review.md` renderer.
+//
+// `JournalRow` (`engine_contract::journal`) is deliberately repo/roadmap-
+// agnostic — it keys on `campaign_id`/`run_id` only, per EN.11.E/EN.11.G,
+// so a repo-less run is addressable with no second derivation (the read
+// route above). D57's run-record contract, by contrast, is addressed per
+// `(repo x roadmap)` (`planning/decisions/D57-orchestration-run-artifact-
+// contract.md` section 1) and requires frontmatter journal rows cannot
+// supply on their own (`roadmap`, `lane`, `repo`). `RunRecordMeta` carries
+// that missing context; the renderer below is therefore only ever called
+// for a repo-scoped run, exactly as the block record requires. A repo-less
+// campaign stays addressable through the read route alone and never goes
+// through this renderer.
+// ---------------------------------------------------------------------------
+
+/// The (repo x roadmap) identity a D57 run record is addressed by. Journal
+/// rows carry no such context (see the module doc above), so a caller
+/// rendering `notes.md`/`review.md` for a repo-scoped run supplies it here.
+#[derive(Debug, Clone)]
+pub struct RunRecordMeta {
+    pub repo: String,
+    pub roadmap: String,
+    pub lane: String,
+    pub run_started: String,
+    /// `None` while the lane is still running — `lifecycle: active`, no
+    /// `run_ended` frontmatter value (D57 section 2).
+    pub run_ended: Option<String>,
+}
+
+impl RunRecordMeta {
+    /// D57 section 2: `active` while running, `lane-complete` once the lane
+    /// has closed. This renderer never emits `consolidated` — that lifecycle
+    /// value is stamped only by `/consolidate-run`, outside this repo.
+    fn lifecycle(&self) -> &'static str {
+        if self.run_ended.is_some() {
+            "lane-complete"
+        } else {
+            "active"
+        }
+    }
+}
+
+/// One journal decision rendered as a D57 ledger/notes item. `label` is the
+/// bold status marker `roadmap_status_discovery.py`'s `_OPEN_ROW_RE` /
+/// `_HELD_ROW_RE` count (`**OPEN**` / `**HELD**`, case-insensitive) — every
+/// other kind renders as plain `DONE`, which that script does not count but
+/// D57's own vocabulary (`OPEN` / `DONE` / `HELD` / `WONTFIX`) requires.
+fn ledger_label(kind: JournalDecisionKind) -> &'static str {
+    match kind {
+        JournalDecisionKind::StepBailed
+        | JournalDecisionKind::GateRefused
+        | JournalDecisionKind::StateWriteVerificationFailed => "OPEN",
+        JournalDecisionKind::BudgetHalted => "HELD",
+        JournalDecisionKind::StepIntegrated | JournalDecisionKind::ResolvedPolicy => "DONE",
+    }
+}
+
+fn kind_title(kind: JournalDecisionKind) -> &'static str {
+    match kind {
+        JournalDecisionKind::StepIntegrated => "step integrated",
+        JournalDecisionKind::StepBailed => "step bailed",
+        JournalDecisionKind::GateRefused => "gate refused",
+        JournalDecisionKind::StateWriteVerificationFailed => "state-write verification failed",
+        JournalDecisionKind::BudgetHalted => "budget halted",
+        JournalDecisionKind::ResolvedPolicy => "resolved policy",
+    }
+}
+
+fn frontmatter(
+    campaign_id: &Uuid,
+    meta: &RunRecordMeta,
+    doc_kind: &str,
+    description: &str,
+) -> String {
+    let related = format!("{}-orchestration-run-{}", meta.repo, meta.roadmap);
+    format!(
+        "---\n\
+type: Reference\n\
+title: \"Orchestration {doc_kind} — {repo}, {roadmap} (campaign {campaign_id})\"\n\
+description: \"{description}\"\n\
+doc_id: {repo}-orchestration-run-{roadmap}-{doc_kind}\n\
+layer: [engine]\n\
+project: {repo}\n\
+status: active\n\
+keywords: [orchestration, journal, {doc_kind}, campaign]\n\
+roadmap: {roadmap}\n\
+lane: {lane}\n\
+run_started: {run_started}\n\
+run_ended: {run_ended}\n\
+lifecycle: {lifecycle}\n\
+related: [{related}]\n\
+---\n\n",
+        doc_kind = doc_kind,
+        repo = meta.repo,
+        roadmap = meta.roadmap,
+        campaign_id = campaign_id,
+        description = description,
+        lane = meta.lane,
+        run_started = meta.run_started,
+        run_ended = meta.run_ended.clone().unwrap_or_default(),
+        lifecycle = meta.lifecycle(),
+        related = related,
+    )
+}
+
+/// Renders the D57 `notes.md` view for a repo-scoped run: the running tab of
+/// items, one bullet per journal row, each carrying the `**OPEN**` /
+/// `**HELD**` / `DONE` marker `roadmap_status_discovery.py`'s
+/// `discover_run_records` counts (`_OPEN_ROW_RE`/`_HELD_ROW_RE`) and
+/// `/consolidate-run`'s Step 4 selection reads via the `roadmap:` frontmatter
+/// field above. Carries no token count, cost, or attempt count — the rendered
+/// half is read by two out-of-repo parsers and telemetry is out of scope for
+/// this block entirely.
+pub fn render_notes_md(campaign_id: &Uuid, rows: &[JournalRow], meta: &RunRecordMeta) -> String {
+    let mut out = frontmatter(
+        campaign_id,
+        meta,
+        "notes",
+        "Running tab of journal decisions for this campaign, rendered from the durable run journal.",
+    );
+    out.push_str(&format!(
+        "# Orchestration run — `{}` / {} lane `{}`\n\n",
+        meta.roadmap, meta.repo, meta.lane
+    ));
+    out.push_str(
+        "Running tab so findings do not get buried. Each item carries a status: `OPEN` · `DONE` · `HELD` · `WONTFIX`.\n\n",
+    );
+    out.push_str("## Journal\n\n");
+    if rows.is_empty() {
+        out.push_str("No journal rows for this campaign yet.\n");
+        return out;
+    }
+    for row in rows {
+        let label = ledger_label(row.kind);
+        out.push_str(&format!(
+            "- **{label}** — {step}: {title} — {reason}\n",
+            label = label,
+            step = row.step,
+            title = kind_title(row.kind),
+            reason = row.reason,
+        ));
+    }
+    out
+}
+
+/// Renders the D57 `review.md` view for a repo-scoped run: the block ledger
+/// table plus a plain-English summary, from the same rows `notes.md` above
+/// renders. `origin_roadmap` on every row defaults to `meta.roadmap` — this
+/// renderer never adopts a block from another roadmap, so the column is
+/// always the record's own roadmap slug (D57 section 3).
+pub fn render_review_md(campaign_id: &Uuid, rows: &[JournalRow], meta: &RunRecordMeta) -> String {
+    let mut out = frontmatter(
+        campaign_id,
+        meta,
+        "review",
+        "What this campaign's journal recorded and why, rendered from the durable run journal.",
+    );
+    out.push_str(&format!(
+        "# Orchestration review — {}, {}\n\n",
+        meta.repo, meta.roadmap
+    ));
+    out.push_str("## Block ledger\n\n");
+    out.push_str("| Step | Origin roadmap | Decision | Outcome |\n|---|---|---|---|\n");
+    if rows.is_empty() {
+        out.push_str("| — | — | — | no journal rows for this campaign |\n");
+    } else {
+        for row in rows {
+            out.push_str(&format!(
+                "| `{step}` | {roadmap} | {kind} | **{label}** — {reason} |\n",
+                step = row.step,
+                roadmap = meta.roadmap,
+                kind = kind_title(row.kind),
+                label = ledger_label(row.kind),
+                reason = row.reason,
+            ));
+        }
+    }
+    out.push_str("\n## What changed, in plain English\n\n");
+    let bailed = rows
+        .iter()
+        .filter(|r| r.kind == JournalDecisionKind::StepBailed)
+        .count();
+    let halted = rows
+        .iter()
+        .filter(|r| r.kind == JournalDecisionKind::BudgetHalted)
+        .count();
+    let integrated = rows
+        .iter()
+        .filter(|r| r.kind == JournalDecisionKind::StepIntegrated)
+        .count();
+    out.push_str(&format!(
+        "This campaign integrated {integrated} step(s), bailed {bailed} time(s), and was halted by a budget cap {halted} time(s).\n",
+    ));
+    out
 }
 
 #[cfg(test)]
