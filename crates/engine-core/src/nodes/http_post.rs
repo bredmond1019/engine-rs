@@ -38,11 +38,15 @@ pub trait HttpPost: Send + Sync {
     /// Same as [`HttpPost::post`], but attaches `headers` (name/value
     /// pairs) to the outbound request. Added in `EN.6.A` task 2 for the
     /// workflow-trigger self-POST to `/events/`, which 401s without an
-    /// `X-API-Key` header (`engine-serve`'s `check_api_key`) — the brain
-    /// ingest POST this seam was built for needs no auth header, so the
-    /// default implementation just ignores `headers` and delegates to
-    /// `post`. Only impls that need to actually send headers (and test
-    /// stubs asserting on them) override this.
+    /// `X-API-Key` header (`engine-serve`'s `check_api_key`). `EN.6.K`
+    /// task 3: the brain ingest POST this seam was built for now **does**
+    /// need an `X-API-Key` header too (Synapse's `/ingest/*` routes are
+    /// gated the same way `/events/` is) — every production `HttpPost`
+    /// caller now goes through this method rather than plain `post`. The
+    /// default implementation still just ignores `headers` and delegates to
+    /// `post`, for implementors (and test stubs asserting on `post` alone)
+    /// that have no header to send; [`ReqwestHttpPost`] overrides it to
+    /// actually attach `headers` to the outbound request.
     async fn post_with_headers(
         &self,
         url: &str,

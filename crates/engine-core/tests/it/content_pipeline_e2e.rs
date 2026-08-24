@@ -767,7 +767,7 @@ async fn translate_off_never_invokes_translate_and_omits_translated_markdown() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn persist_to_brain_posts_the_expected_learning_artifact_payload() {
+async fn persist_to_brain_posts_the_expected_ingest_artifact_envelope() {
     let stubs = Stubs::default_passing();
     let workflow = build_workflow(&stubs);
 
@@ -779,29 +779,33 @@ async fn persist_to_brain_posts_the_expected_learning_artifact_payload() {
         .expect("PersistToBrainNode should have POSTed");
     assert_eq!(url, TEST_BRAIN_URL);
 
+    // `EN.6.K` task 3: `PersistToBrainNode` now maps the shared
+    // `LearningArtifact` shape into `POST /ingest/artifact`'s generic
+    // envelope — `{artifact_id, doc_type, content, metadata}` — rather than
+    // POSTing the seven-field `LearningArtifact` shape directly (Synapse
+    // never served `/ingest/learning`).
     let object = body.as_object().expect("payload is an object");
     assert_eq!(
         object
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        [
-            "artifact_id",
-            "channel_type",
-            "source_ref",
-            "summary",
-            "digest_markdown",
-            "entities",
-            "language",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+        ["artifact_id", "doc_type", "content", "metadata"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     );
-    assert_eq!(body["channel_type"], json!("web_article"));
-    assert_eq!(body["source_ref"], json!("https://example.com/a"));
-    assert_eq!(body["summary"], json!("A concise summary of the content."));
-    assert_eq!(body["language"], json!("en"));
+    assert_eq!(body["doc_type"], json!("learning-artifact"));
+    assert_eq!(body["metadata"]["channel_type"], json!("web_article"));
+    assert_eq!(
+        body["metadata"]["source_ref"],
+        json!("https://example.com/a")
+    );
+    assert_eq!(
+        body["metadata"]["summary"],
+        json!("A concise summary of the content.")
+    );
+    assert_eq!(body["metadata"]["language"], json!("en"));
 
     let output = output_of(&ctx);
     assert_eq!(body["artifact_id"], json!(output.artifact_id));
