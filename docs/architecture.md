@@ -186,10 +186,17 @@ engine-rs/
 │   │                         the live map into a bounded 100-entry completed ring so a terminal
 │   │                         run's snapshot survives for HTTP readback),
 │   │                         durable.rs (DurableHandle/spawn_durable_writer/durable_on_progress —
-│   │                         mpsc-bridged async writer mapping on_progress TaskContext snapshots to
-│   │                         engine_contract::EventsRow, inserting the first PENDING snapshot per
-│   │                         run and updating subsequent ones; self-skips Postgres I/O when no
-│   │                         pool/DATABASE_URL is configured), http.rs (actix-web surface: POST
+│   │                         mpsc-bridged async writer over a `DurableItem::{Snapshot,Journal}`
+│   │                         enum (EN.12.D, widened from a Snapshot-only channel): Snapshot items
+│   │                         map on_progress TaskContext snapshots to engine_contract::EventsRow
+│   │                         (inserting the first PENDING snapshot per run, updating subsequent
+│   │                         ones), Journal items carry a `JournalRow` written via
+│   │                         `engine_store::insert_journal_row`; both self-skip Postgres I/O when
+│   │                         no pool/DATABASE_URL is configured — see "Journal" below),
+│   │                         journal.rs (`JournalRow`/`JournalDecisionKind`-consuming
+│   │                         GET /campaigns/{id}/journal route plus the D57 notes.md/review.md
+│   │                         renderer, EN.12.D — see "Journal" below), http.rs
+│   │                         (actix-web surface: POST
 │   │                         /events/ with X-API-Key gating dispatch + live-state + durable-write
 │   │                         (now spawns the run and returns 202 {run_id, event_id} immediately,
 │   │                         EN.5.F), GET /health, GET /workflows, GET /workflows/{type}/graph,
@@ -710,6 +717,27 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   every exit path the same way — so this route is live end-to-end for an ORCHESTRATION dispatch,
   not merely reachable. Calling `bastion abort <campaign>` from the CLI is out of this task's
   scope; only the HTTP route exists today.
+- Journal (`engine-serve::journal`, `engine-contract::journal`, `EN.12.D`) — a durable decision
+  log distinct from the `events` snapshot table: `JournalRow` (`engine-contract`) wraps a
+  `JournalDecisionKind` (`StepIntegrated`, `StepBailed`, `GateRefused`,
+  `StateWriteVerificationFailed`, `BudgetHalted`, `ResolvedPolicy`) plus a kind-specific
+  `serde_json::Value` detail payload, written via `engine_store::insert_journal_row` and read back
+  ordered by `(campaign_id, created_at ASC)` via `list_journal_rows_for_campaign`.
+  `integrate_chain_with_journal` (`engine-core::workflows::orchestration::integrate`) is the new
+  opt-in entry point that emits journal items at each of those decision points during an
+  `ORCHESTRATION` chain walk, plus one `ResolvedPolicy` item per executed step carrying the
+  model/transport actually used (read back from post-execution evidence, never the configured
+  policy); the original `integrate_chain` signature is unchanged so none of its ~20 existing call
+  sites needed to move. `GET /campaigns/{id}/journal` (`engine-serve::journal`), gated the same as
+  the other `/campaigns/{id}/...` routes, reads a campaign's rows straight from Postgres via
+  `state.durable.pool()` — with no `DATABASE_URL` configured (no in-memory journal store exists,
+  unlike `LiveStateStore`) it self-skips to a `404`, and an unknown/malformed campaign id 404s the
+  same way, mirroring `resume.rs`'s `rehydrate_from_store` precedent. `journal.rs` also renders a
+  `JournalRow` slice plus a caller-supplied `RunRecordMeta` (repo/roadmap/lane/run timestamps —
+  `JournalRow` itself carries none of those) into D57-shaped `notes.md`/`review.md`: `StepBailed`/
+  `GateRefused`/`StateWriteVerificationFailed` render as `**OPEN**`, `BudgetHalted` as `**HELD**`,
+  `StepIntegrated`/`ResolvedPolicy` as plain `DONE`, matching `roadmap_status_discovery.py`'s
+  `_OPEN_ROW_RE`/`_HELD_ROW_RE` parsing.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
