@@ -508,12 +508,21 @@ mod tests {
     /// fully-populated `PartialSdlcTaskPolicy`'s serialized key set —
     /// mechanically derived from the struct, never hand-copied, so a field
     /// added to one side without the other fails this test.
+    ///
+    /// `planning/` is a gitignored symlink into the company-brain vault, so
+    /// this SKIPS rather than fails when the vault is not mounted (a bare
+    /// clone, or this repo's own public CI, which never checks the private
+    /// brain repo out) — mirrors sdlc_flow::policy's
+    /// `repo_harness_json_deserializes_every_sdlc_policy_and_profile`; it is
+    /// a guard for this working tree, not a hard dependency.
     #[test]
     fn harness_json_sdlc_task_policy_key_set_matches_partial_sdlc_task_policy_fields() {
         let harness_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../planning/harness.json");
-        let raw = std::fs::read_to_string(&harness_path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", harness_path.display()));
+        let Ok(raw) = std::fs::read_to_string(&harness_path) else {
+            tracing::debug!(path = %harness_path.display(), "skipping: planning/ vault not mounted");
+            return;
+        };
         let harness: serde_json::Value =
             serde_json::from_str(&raw).expect("planning/harness.json must be valid JSON");
         let policy_section = harness
