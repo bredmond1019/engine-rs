@@ -23,8 +23,10 @@
 
 pub mod policy;
 pub mod profiles;
+pub mod render_markdown;
 pub mod schema;
 
 pub use policy::{DeliverableRenderPolicy, PartialDeliverableRenderPolicy};
 pub use profiles::resolve_policy_for_run;
+pub use render_markdown::{render_markdown, RenderDeliverableNode};
 pub use schema::{deliverable_slug, DeliverableRenderEventSchema};
