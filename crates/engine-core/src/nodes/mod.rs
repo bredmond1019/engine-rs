@@ -100,7 +100,12 @@
 //! read from. Mirrors `http_post`'s trait + live impl + recording stub
 //! shape, but on the read direction; authorized by
 //! `planning/decisions/D23-brain-read-seam.md`, the operator ruling that
-//! closed the `d9-read-seam-decision` gate D9 left open.
+//! closed the `d9-read-seam-decision` gate D9 left open. `RecallNode`
+//! (`EN.6.K` task 2, same module) is engine-rs's first `GET /recall`
+//! consumer: an `InputBinding`-style query source (`ctx.event` unbound, a
+//! bound upstream's `ctx.nodes` entry otherwise), `limit`/`hybrid` builder
+//! args, and a `{query, count, results}` stamp per the pinned
+//! `docs/data-contract.md` v1.6.0 `GET /recall` shape.
 //!
 //! `aggregate` (`EN.6.G` task 1) is `AggregateNode` — joins the N
 //! `ctx.nodes` entries a `FanOutNode` produced into one
@@ -133,8 +138,9 @@ pub mod terminal;
 
 pub use aggregate::AggregateNode;
 pub use brain_client::{
-    http_get_live, BrainConfig, BrainConfigError, HttpGet, ReqwestHttpGet, StubHttpGet,
-    BRAIN_API_KEY_ENV, BRAIN_API_URL_ENV,
+    http_get_live, BrainConfig, BrainConfigError, HttpGet, RecallNode, RecallResult,
+    ReqwestHttpGet, StubHttpGet, BRAIN_API_KEY_ENV, BRAIN_API_URL_ENV, DEFAULT_RECALL_HYBRID,
+    DEFAULT_RECALL_LIMIT, RECALL_NODE_NAME,
 };
 pub use channel_transport::{
     ChannelSendReceipt, ChannelTransport, OutboundAction, OutboundBody, StubChannelTransport,

@@ -26,7 +26,11 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use engine_contract::TaskContext;
 use serde_json::Value;
+
+use crate::node::{InputBinding, Node, NodeError};
+use crate::workflows::put_result;
 
 /// Env var `BrainConfig::from_env` reads for the Brain (Synapse) base URL —
 /// e.g. `"http://localhost:8000"`. Required: construction fails with a clear
@@ -268,6 +272,231 @@ impl BrainConfig {
     }
 }
 
+/// The `Node::name()` identity `RecallNode` runs under, and the `ctx.nodes`
+/// key its result is stamped onto.
+pub const RECALL_NODE_NAME: &str = "RecallNode";
+
+/// Default `limit` query param when [`RecallNode::with_limit`] is never
+/// called — matches Synapse's own `GET /recall` route default
+/// (`app/api/read.py`).
+pub const DEFAULT_RECALL_LIMIT: u32 = 5;
+
+/// Default `hybrid` query param when [`RecallNode::with_hybrid`] is never
+/// called. `EN.6.K` task 2 picks `true` (semantic + structural fusion) as
+/// this seam's own default — deliberately not Synapse's own route default
+/// (`false`), since a workflow reaching for `RecallNode` almost always wants
+/// the higher-recall fused result, and `with_hybrid(false)` is one call away
+/// for a caller that wants the cheaper exact/semantic-only path.
+pub const DEFAULT_RECALL_HYBRID: bool = true;
+
+/// The `ctx.event` / bound-upstream field name a query is read from when the
+/// value is a JSON object rather than a bare string — see
+/// [`RecallNode::resolve_query`].
+const QUERY_FIELD: &str = "query";
+
+/// Pull a query string out of a `ctx.event` (unbound) or bound-upstream
+/// (`ctx.nodes[upstream]`) JSON value: a bare JSON string is used directly;
+/// a JSON object is read via its `"query"` field (also a string). Any other
+/// shape, or an empty/blank string either way, is a [`NodeError`] naming
+/// which source (event vs. the bound upstream identity) produced it, since
+/// a recall with no query is not a request `GET /recall` can accept (the
+/// route 422s on an empty `q`).
+fn query_from_value(value: &Value, source_description: &str) -> Result<String, NodeError> {
+    let candidate = match value {
+        Value::String(text) => Some(text.as_str()),
+        Value::Object(_) => value.get(QUERY_FIELD).and_then(Value::as_str),
+        _ => None,
+    };
+
+    match candidate.map(str::trim) {
+        Some(query) if !query.is_empty() => Ok(query.to_string()),
+        _ => Err(NodeError::new(format!(
+            "{RECALL_NODE_NAME}: no non-empty query string found on {source_description} \
+             (expected a bare JSON string, or an object with a \"{QUERY_FIELD}\" string field)"
+        ))),
+    }
+}
+
+/// One normalized recall result row, matching Synapse's `RecallResult`
+/// schema (`app/schemas/read_schema.py`, pinned in `docs/data-contract.md`
+/// v1.6.0 § `GET /recall`): `doc_id`/`title`/`section` are nullable,
+/// `score` is a similarity where **higher is always better** on every path
+/// (the 1.6.0 polarity — never sort/threshold this ascending), and `via`
+/// widens across six values (`exact-id | semantic | hybrid | structural |
+/// keyword | memory`) so this stays a plain `String` rather than a closed
+/// enum that would fail to parse a hybrid-provenance result.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct RecallResult {
+    pub doc_id: Option<String>,
+    pub file_path: String,
+    pub title: Option<String>,
+    pub section: Option<String>,
+    pub content: String,
+    pub score: f64,
+    pub via: String,
+}
+
+/// `RecallNode` — engine-rs's Brain **read** client: `GET {base}/recall`
+/// over the injectable [`HttpGet`] seam, per
+/// [D23](../../../../../planning/decisions/D23-brain-read-seam.md). Read-only:
+/// this node never embeds, opens `pgvector`, or writes a corpus row (THE
+/// BOUNDARY TEST, `CLAUDE.md`).
+///
+/// The query string comes from an [`crate::node::InputBinding`]-style
+/// source ([`Self::resolve_query`]): unbound (the default) reads
+/// `ctx.event`; [`Self::with_input_from`] rebinds it to read
+/// `ctx.nodes[upstream]` instead — either source accepts a bare JSON string
+/// or an object carrying a `"query"` field, per [`query_from_value`].
+///
+/// `limit`/`hybrid` are plain builder args, not `Policy` knobs — deployment-
+/// ish per the block's out-of-scope note (standing rule 6 only binds a value
+/// that trades cost/latency/quality *per run*; here they are closer to a
+/// call-site's fixed shape, and the block explicitly does not wire a
+/// `RecallPolicy`).
+pub struct RecallNode {
+    http_get: Arc<dyn HttpGet>,
+    config: BrainConfig,
+    query_input: InputBinding,
+    limit: u32,
+    hybrid: bool,
+}
+
+impl RecallNode {
+    /// Build a `RecallNode` targeting `config`'s Brain, with the live
+    /// `reqwest`-backed [`HttpGet`] seam, an unbound query source (reads
+    /// `ctx.event`), and the seam's own defaults ([`DEFAULT_RECALL_LIMIT`],
+    /// [`DEFAULT_RECALL_HYBRID`]). Production callers pass
+    /// `BrainConfig::from_env()?` (a construction-time error surfaces before
+    /// this node is even built, per the block's acceptance criteria); tests
+    /// pass a `BrainConfig::new(..)` built directly.
+    #[must_use]
+    pub fn new(config: BrainConfig) -> Self {
+        Self {
+            http_get: http_get_live(),
+            config,
+            query_input: InputBinding::default(),
+            limit: DEFAULT_RECALL_LIMIT,
+            hybrid: DEFAULT_RECALL_HYBRID,
+        }
+    }
+
+    /// Override the `HttpGet` seam. Tests inject a [`StubHttpGet`] so the
+    /// gated suite never contacts a live Brain.
+    #[must_use]
+    pub fn with_http_get(mut self, http_get: Arc<dyn HttpGet>) -> Self {
+        self.http_get = http_get;
+        self
+    }
+
+    /// Override the [`BrainConfig`] (base URL / API key) this node reads.
+    #[must_use]
+    pub fn with_config(mut self, config: BrainConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Bind the query source to a bound upstream's `ctx.nodes` entry
+    /// instead of `ctx.event`. Mirrors the `with_transport`/`with_http_post`
+    /// builder convention (`crate::node::InputBinding`).
+    #[must_use]
+    pub fn with_input_from(mut self, upstream: impl Into<String>) -> Self {
+        self.query_input = InputBinding::bound(upstream);
+        self
+    }
+
+    /// Override the `limit` query param (default [`DEFAULT_RECALL_LIMIT`]).
+    #[must_use]
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Override the `hybrid` query param (default [`DEFAULT_RECALL_HYBRID`]).
+    #[must_use]
+    pub fn with_hybrid(mut self, hybrid: bool) -> Self {
+        self.hybrid = hybrid;
+        self
+    }
+
+    /// Resolve the query string per [`Self::query_input`]'s binding: bound
+    /// reads `ctx.nodes[upstream]`; unbound reads `ctx.event`. Both go
+    /// through [`query_from_value`] for the string/object-with-`"query"`
+    /// extraction.
+    fn resolve_query(&self, ctx: &TaskContext) -> Result<String, NodeError> {
+        match self.query_input.is_bound() {
+            true => {
+                let upstream = self.query_input.resolve("");
+                let value = ctx.nodes.get(upstream).ok_or_else(|| {
+                    NodeError::new(format!(
+                        "{RECALL_NODE_NAME}: bound upstream \"{upstream}\" has no ctx.nodes entry"
+                    ))
+                })?;
+                query_from_value(value, &format!("bound upstream \"{upstream}\""))
+            }
+            false => query_from_value(&ctx.event, "ctx.event"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Node for RecallNode {
+    async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        let query = self.resolve_query(&ctx)?;
+
+        let limit_str = self.limit.to_string();
+        let hybrid_str = self.hybrid.to_string();
+        let query_params = [
+            ("q", query.as_str()),
+            ("limit", limit_str.as_str()),
+            ("hybrid", hybrid_str.as_str()),
+        ];
+        let headers: Vec<(String, String)> = self.config.auth_headers();
+        let header_pairs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+
+        let url = format!("{}/recall", self.config.base_url.trim_end_matches('/'));
+
+        let body = self
+            .http_get
+            .fetch(&url, &query_params, &header_pairs)
+            .await
+            .map_err(|err| {
+                NodeError::new(format!(
+                    "{RECALL_NODE_NAME}: brain recall request failed: {err}"
+                ))
+            })?;
+
+        let results: Vec<RecallResult> = serde_json::from_value(
+            body.get("results").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|err| {
+            NodeError::new(format!(
+                "{RECALL_NODE_NAME}: brain recall response's \"results\" did not match the \
+                 pinned GET /recall contract: {err}"
+            ))
+        })?;
+
+        let mut ctx = ctx;
+        put_result(
+            &mut ctx,
+            self.name(),
+            serde_json::json!({
+                "query": query,
+                "count": results.len(),
+                "results": results,
+            }),
+        );
+
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        RECALL_NODE_NAME
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +635,151 @@ mod tests {
 
         let (_, _, headers) = stub.last_call().expect("fetch should have been recorded");
         assert!(headers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recall_node_tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn ctx_with_event(event: Value) -> TaskContext {
+        TaskContext {
+            event,
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        }
+    }
+
+    fn sample_recall_body() -> Value {
+        json!({
+            "query": "roadmap",
+            "count": 1,
+            "results": [
+                {
+                    "doc_id": "d1",
+                    "file_path": "docs/roadmap.md",
+                    "title": "Roadmap",
+                    "section": "full",
+                    "content": "the roadmap content",
+                    "score": 0.87,
+                    "via": "semantic",
+                }
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn round_trips_a_stubbed_recall_asserting_url_query_and_header() {
+        let stub = StubHttpGet::succeeding(sample_recall_body());
+        let config = BrainConfig::new("http://localhost:8000", Some("k-123".to_string()));
+        let node = RecallNode::new(config)
+            .with_http_get(Arc::new(stub.clone()))
+            .with_limit(7)
+            .with_hybrid(false);
+
+        let ctx = ctx_with_event(json!({ "query": "roadmap" }));
+        let ctx = node.process(ctx).await.expect("process should succeed");
+
+        let (url, query, headers) = stub.last_call().expect("fetch should have been recorded");
+        assert_eq!(url, "http://localhost:8000/recall");
+        assert_eq!(
+            query,
+            vec![
+                ("q".to_string(), "roadmap".to_string()),
+                ("limit".to_string(), "7".to_string()),
+                ("hybrid".to_string(), "false".to_string()),
+            ]
+        );
+        assert_eq!(
+            headers,
+            vec![("X-API-Key".to_string(), "k-123".to_string())]
+        );
+
+        let result = ctx
+            .nodes
+            .get(RECALL_NODE_NAME)
+            .expect("RecallNode should stamp a result")
+            .clone();
+        assert_eq!(result["query"], json!("roadmap"));
+        assert_eq!(result["count"], json!(1));
+        assert_eq!(result["results"][0]["file_path"], json!("docs/roadmap.md"));
+        assert_eq!(result["results"][0]["via"], json!("semantic"));
+    }
+
+    #[tokio::test]
+    async fn reads_the_query_from_a_bound_upstream_node() {
+        let stub = StubHttpGet::succeeding(sample_recall_body());
+        let config = BrainConfig::new("http://localhost:8000", None);
+        let node = RecallNode::new(config)
+            .with_http_get(Arc::new(stub.clone()))
+            .with_input_from("QueryBuilderNode");
+
+        let mut ctx = ctx_with_event(json!({}));
+        ctx.nodes.insert(
+            "QueryBuilderNode".to_string(),
+            json!({ "query": "from upstream" }),
+        );
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_, query, _) = stub.last_call().expect("fetch should have been recorded");
+        assert_eq!(query[0], ("q".to_string(), "from upstream".to_string()));
+    }
+
+    #[tokio::test]
+    async fn missing_config_key_still_sends_the_request_with_no_auth_header() {
+        let stub = StubHttpGet::succeeding(sample_recall_body());
+        let config = BrainConfig::new("http://localhost:8000", None);
+        let node = RecallNode::new(config).with_http_get(Arc::new(stub.clone()));
+
+        let ctx = ctx_with_event(json!("roadmap"));
+        node.process(ctx).await.expect("process should succeed");
+
+        let (_, _, headers) = stub.last_call().expect("fetch should have been recorded");
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_401_shaped_failure_surfaces_as_a_node_error_naming_the_status() {
+        let stub = StubHttpGet::failing("brain read endpoint returned HTTP 401 Unauthorized: {}");
+        let config = BrainConfig::new("http://localhost:8000", None);
+        let node = RecallNode::new(config).with_http_get(Arc::new(stub));
+
+        let ctx = ctx_with_event(json!({ "query": "roadmap" }));
+        let error = node
+            .process(ctx)
+            .await
+            .expect_err("a failing fetch should surface as a NodeError");
+
+        assert!(
+            error.to_string().contains("401"),
+            "error should carry the status: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_query_on_ctx_event_is_a_node_error() {
+        let stub = StubHttpGet::succeeding(sample_recall_body());
+        let config = BrainConfig::new("http://localhost:8000", None);
+        let node = RecallNode::new(config).with_http_get(Arc::new(stub));
+
+        let ctx = ctx_with_event(json!({ "not_a_query_field": "x" }));
+        let error = node
+            .process(ctx)
+            .await
+            .expect_err("no query field should fail before any fetch");
+
+        assert!(error.to_string().contains("query"));
+    }
+
+    #[test]
+    fn defaults_are_limit_five_and_hybrid_true() {
+        assert_eq!(DEFAULT_RECALL_LIMIT, 5);
+        assert!(DEFAULT_RECALL_HYBRID);
     }
 }
