@@ -27,6 +27,7 @@ use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
     resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep, StepKind,
 };
+use engine_core::workflows::orchestration::dispatch::DispatchStepError;
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
 use engine_core::workflows::orchestration::gates::{
     check_step_with_frontier_advice, load_frontier, AdmissionGate, DependencyEdge, FrontierError,
@@ -34,9 +35,12 @@ use engine_core::workflows::orchestration::gates::{
 };
 use engine_core::workflows::orchestration::graph::{OrchestrationRunNode, NODE_NAME};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain, HoldSource, IntegrateError, NeverHeld, StepProgress,
+    integrate_chain, integrate_chain_with_dispatch, HoldSource, IntegrateError, NeverHeld,
+    StepProgress,
 };
-use engine_core::Node;
+use engine_core::{
+    Dispatcher, Node, NodeConfig, NodeError, NodeRegistry, Workflow, WorkflowSchema,
+};
 
 use engine_core::nodes::terminal::admission::{AdmissionControl, AdmissionPolicy};
 
@@ -1726,5 +1730,282 @@ fn frontier_parity_absent_file_fails_loudly_naming_the_path() {
     assert!(
         msg.contains(&path.display().to_string()),
         "the failure must name the missing path: {msg}"
+    );
+}
+
+// ── `EN.12.E` Task 6 — mixed `[dispatch, block]` chain, end to end ────────
+//
+// `chain.rs` and `integrate.rs` each carry thorough unit coverage for the
+// dispatch step already (see `dispatch.rs`'s own `#[cfg(test)]` module and
+// `integrate.rs`'s `integrate_chain_with_dispatch` tests). What is missing
+// is a case that drives the WHOLE read path — a real `lane-segments.json`
+// fixture, through `resolve_lane_chain`, into `integrate_chain_with_dispatch`
+// — so a regression at any seam between those modules (not just inside one
+// of them) is caught here in the integration suite, per the block's own
+// `testing_strategy`.
+
+/// A single-node marker workflow a research-style dispatch step can be
+/// dispatched to — mirrors `dispatch.rs`'s own fixture rather than
+/// reimplementing it, since this suite drives the same modules through
+/// their public API.
+struct MixedChainMarkerNode;
+
+#[async_trait::async_trait]
+impl Node for MixedChainMarkerNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            self.name().to_string(),
+            serde_json::json!({ "research": "done" }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "MixedChainMarkerNode"
+    }
+}
+
+fn mixed_chain_fixture_schema(workflow_type: &str) -> WorkflowSchema {
+    let mut nodes = std::collections::HashMap::new();
+    nodes.insert(
+        "MixedChainMarkerNode".to_string(),
+        NodeConfig::new("MixedChainMarkerNode", vec![]),
+    );
+    WorkflowSchema::new(workflow_type, "MixedChainMarkerNode", nodes)
+}
+
+/// A `Dispatcher` with `"RESEARCH_AGENT"` registered against the marker
+/// workflow above — enough to exercise a real dispatch step's routing
+/// without a real registered production workflow.
+fn dispatcher_with_research_agent() -> Dispatcher {
+    let mut dispatcher = Dispatcher::new();
+    dispatcher.register(
+        mixed_chain_fixture_schema("RESEARCH_AGENT"),
+        Box::new(|_event: &serde_json::Value| {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(MixedChainMarkerNode));
+            Ok(Workflow::new(
+                registry,
+                mixed_chain_fixture_schema("RESEARCH_AGENT"),
+            ))
+        }),
+    );
+    dispatcher
+}
+
+fn recording_journal_sink() -> (
+    Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync>,
+    Arc<Mutex<Vec<engine_contract::JournalRow>>>,
+) {
+    let rows: Arc<Mutex<Vec<engine_contract::JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_rows = rows.clone();
+    let sink: Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync> =
+        Arc::new(move |row: engine_contract::JournalRow| sink_rows.lock().unwrap().push(row));
+    (sink, rows)
+}
+
+/// A `[research, block]` mixed chain, parsed from a real `lane-segments.json`
+/// fixture via `resolve_lane_chain` (the same read path mev's real output
+/// goes through), completes with both steps reported: the dispatch step's
+/// result is in the journal before the block step runs, and the block step
+/// still produces its usual one `lane-log.jsonl` line — the dispatch step
+/// writes none. Acceptance criterion 1 of `EN.12.E`.
+#[tokio::test]
+async fn mixed_research_block_chain_journals_research_before_block_runs() {
+    let (repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("mixed-research-block");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let dispatcher = dispatcher_with_research_agent();
+    let (sink, rows) = recording_journal_sink();
+    let sink_fn = sink.clone();
+    let _ = &repos_dir;
+
+    let lane_segments_dir = tempfile::tempdir().unwrap();
+    let json = r#"{
+        "blocks": [
+            {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "RESEARCH_AGENT", "line": 1, "segment": 0, "position": 0, "origin_roadmap": null, "kind": "dispatch"},
+            {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "A.1", "line": 2, "segment": 1, "position": 1, "origin_roadmap": null}
+        ]
+    }"#;
+    let path = lane_segments_dir.path().join("lane-segments.json");
+    std::fs::write(&path, json).unwrap();
+
+    let chain = resolve_lane_chain(&path, "r", "l", &|_| false)
+        .expect("a [dispatch, block] lane must resolve");
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].kind, StepKind::Dispatch);
+    assert_eq!(chain[1].kind, StepKind::Block);
+
+    let outcomes = integrate_chain_with_dispatch(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(1),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        roadmap_dir.as_path(),
+        Some("l"),
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+        Some(&move |row| sink_fn(row)),
+        &dispatcher,
+    )
+    .await
+    .expect("a registered [research, block] chain should integrate end to end");
+
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "only the block step produces an ExecutionOutcome; the dispatch step does not: {outcomes:?}"
+    );
+    assert_eq!(
+        runner.call_count(),
+        1,
+        "only the block step reaches the SDLC runner"
+    );
+
+    let recorded = rows.lock().unwrap();
+    let research_idx = recorded
+        .iter()
+        .position(|r| {
+            r.kind == engine_contract::JournalDecisionKind::StepIntegrated
+                && r.step == "RESEARCH_AGENT"
+        })
+        .expect("the research step's journal row must be present");
+    let block_idx = recorded
+        .iter()
+        .position(|r| {
+            r.kind == engine_contract::JournalDecisionKind::StepIntegrated && r.step == "A.1"
+        })
+        .expect("the block step's journal row must be present");
+    assert!(
+        research_idx < block_idx,
+        "the research step's journal row must land before the block step's: {recorded:?}"
+    );
+
+    let lane_log = lane_log_lines(&roadmap_dir);
+    assert_eq!(
+        lane_log.len(),
+        1,
+        "the dispatch step must write no lane-log.jsonl line; only the block step does: \
+         {lane_log:?}"
+    );
+}
+
+/// A dispatch step naming an unregistered workflow key stops the chain with
+/// a named diagnostic, reached through the full integration path (a real
+/// lane-segments fixture, not just the unit-level `Dispatcher` calls in
+/// `integrate.rs`'s own tests) — acceptance criterion 5 of `EN.12.E`.
+#[tokio::test]
+async fn unregistered_dispatch_key_stops_the_chain_through_the_integration_path() {
+    let (repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("mixed-unregistered-dispatch");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    // No workflow keys registered at all — "NOT_REGISTERED" must not resolve.
+    let dispatcher = Dispatcher::new();
+    let (sink, rows) = recording_journal_sink();
+    let sink_fn = sink.clone();
+    let _ = &repos_dir;
+
+    let lane_segments_dir = tempfile::tempdir().unwrap();
+    let json = r#"{
+        "blocks": [
+            {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "NOT_REGISTERED", "line": 1, "segment": 0, "position": 0, "origin_roadmap": null, "kind": "dispatch"},
+            {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "A.1", "line": 2, "segment": 1, "position": 1, "origin_roadmap": null}
+        ]
+    }"#;
+    let path = lane_segments_dir.path().join("lane-segments.json");
+    std::fs::write(&path, json).unwrap();
+
+    let chain = resolve_lane_chain(&path, "r", "l", &|_| false)
+        .expect("the lane must still resolve to a chain — the failure is at integrate time");
+
+    let err = integrate_chain_with_dispatch(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(1),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        roadmap_dir.as_path(),
+        Some("l"),
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+        Some(&move |row| sink_fn(row)),
+        &dispatcher,
+    )
+    .await
+    .expect_err("an unregistered workflow key must stop the chain, never fall through to block");
+
+    match &err {
+        IntegrateError::Dispatch(DispatchStepError::UnknownWorkflowKey {
+            workflow_key, ..
+        }) => {
+            assert_eq!(workflow_key, "NOT_REGISTERED");
+        }
+        other => panic!("expected IntegrateError::Dispatch(UnknownWorkflowKey), got {other:?}"),
+    }
+    assert_eq!(
+        runner.call_count(),
+        0,
+        "the block step must never run once the dispatch step stops the chain"
+    );
+
+    let recorded = rows.lock().unwrap();
+    assert!(
+        recorded.iter().any(
+            |r| r.kind == engine_contract::JournalDecisionKind::StepBailed
+                && r.step == "NOT_REGISTERED"
+        ),
+        "expected a StepBailed row naming the unregistered key: {recorded:?}"
+    );
+}
+
+/// The forward-compatibility parse case from Task 1, exercised end to end
+/// through `resolve_lane_chain` (not just `chain.rs`'s own unit test): an
+/// unrecognised field on a lane-segment's `directives` must still parse,
+/// and the recognised sibling fields alongside it must be carried through
+/// correctly onto the resolved `ChainStep`.
+#[test]
+fn forward_compatible_lane_segment_field_parses_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = r#"{
+        "blocks": [
+            {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "A.1", "line": 1, "segment": 0, "position": 0, "origin_roadmap": null, "kind": "block", "directives": {"held_until": "OTHER.1", "some_future_mev_field": "value"}}
+        ]
+    }"#;
+    let path = dir.path().join("lane-segments.json");
+    std::fs::write(&path, json).unwrap();
+
+    let steps = resolve_lane_chain(&path, "r", "l", &|_| false)
+        .expect("an unrecognised forward-compatible field must not hard-fail the whole file");
+
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].kind, StepKind::Block);
+    assert_eq!(
+        steps[0]
+            .directives
+            .as_ref()
+            .and_then(|d| d.held_until.clone()),
+        Some("OTHER.1".to_string()),
+        "the recognised directive fields must still parse correctly alongside the unknown one"
     );
 }
