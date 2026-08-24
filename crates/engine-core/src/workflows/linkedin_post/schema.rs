@@ -12,6 +12,8 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::policy::PartialLinkedInPostPolicy;
+
 fn default_candidate_count() -> u32 {
     3
 }
@@ -27,9 +29,20 @@ pub struct LinkedInPostEventSchema {
     /// Repos to read from; defaults to the whole fleet when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repos: Option<Vec<String>>,
-    /// How many post candidates to propose.
+    /// How many post candidates to propose. Distinct from the policy
+    /// layer's `candidate_count` knob — this is the per-run request; see
+    /// `policy::LinkedInPostPolicy::candidate_count`'s doc comment.
     #[serde(default = "default_candidate_count")]
     pub candidate_count: u32,
+    /// Per-event policy override (EN.4.0 convention; see
+    /// `policy::LinkedInPostPolicy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PartialLinkedInPostPolicy>,
+    /// Named profile override (EN.4.0 convention) — `"baseline"` |
+    /// `"cheap-fast"` | `"thorough"`, or a `harness.json`
+    /// `linkedin_post.profiles[name]` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// What kind of real-work artifact backs a [`PostCandidate`]'s claim.
@@ -116,6 +129,8 @@ mod tests {
         assert_eq!(input.until, "2026-08-24");
         assert!(input.repos.is_none());
         assert_eq!(input.candidate_count, 3);
+        assert!(input.policy.is_none());
+        assert!(input.profile.is_none());
     }
 
     #[test]
