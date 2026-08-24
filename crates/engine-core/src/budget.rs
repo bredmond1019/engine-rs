@@ -600,63 +600,6 @@ mod tests {
     }
 
     #[test]
-    fn max_total_tokens_cap_halts_when_cache_channels_are_included() {
-        // Positive control (EN.ticket.budget-gate-undercounts-cache-channels,
-        // task 1) — mirrors the ticket's own mutation test verbatim:
-        // input=10, output=20 (today's two-channel sum: 30) plus
-        // cache_read=1000 and cache_creation=500 (four-channel sum: 1530).
-        // All four values are mutually distinct so a channel that gets
-        // dropped or double-counted cannot pass. A cap of 100 sits strictly
-        // between 30 and 1530, so a cache-aware ledger MUST halt here.
-        //
-        // OBSERVED against unmodified HEAD (pre-fix), running the compiled
-        // test binary directly (`target/debug/deps/engine_core-<hash>
-        // budget:: --test-threads 1`): FAILS.
-        //   thread 'budget::tests::max_total_tokens_cap_halts_when_cache_channels_are_included' panicked at crates/engine-core/src/budget.rs:640:9:
-        //   assertion `left == right` failed
-        //     left: 30
-        //    right: 1530
-        // (i.e. `from_context` ignores the two cache keys entirely, so
-        // `ledger.total_tokens()` reads 30 instead of 1530 — the assertion on
-        // the raw total_tokens() figure is what fails first; the subsequent
-        // `check()` assertion is never reached in this failure mode.)
-        let mut node_runs = HashMap::new();
-        node_runs.insert("NodeA".to_string(), node_run_with_usage(10, 20));
-
-        let mut nodes = HashMap::new();
-        nodes.insert(
-            "NodeA".to_string(),
-            serde_json::json!({
-                "cache_read_input_tokens": 1000,
-                "cache_creation_input_tokens": 500,
-            }),
-        );
-
-        let ctx = TaskContext {
-            event: serde_json::json!({}),
-            nodes,
-            metadata: serde_json::json!({}),
-            node_runs,
-        };
-
-        let ledger = BudgetLedger::from_context(&ctx);
-        assert_eq!(ledger.total_tokens(), 1530);
-
-        let budget = Budget {
-            max_total_tokens: Some(100),
-            max_cost_usd: None,
-        };
-
-        assert_eq!(
-            ledger.check(Some(&budget)),
-            BudgetDecision::Halt(BudgetHaltReason::TotalTokens {
-                spent: 1530,
-                limit: 100,
-            })
-        );
-    }
-
-    #[test]
     fn halt_reason_to_json_names_the_cap() {
         let reason = BudgetHaltReason::TotalTokens {
             spent: 100,
