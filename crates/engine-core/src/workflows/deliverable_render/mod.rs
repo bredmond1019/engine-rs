@@ -19,14 +19,17 @@
 //! - `render_pdf` — `RenderPdfNode`, the `typst` subprocess node over the
 //!   injectable `CommandRunner` seam (task 4).
 //! - `graph` — `WORKFLOW_TYPE`, the declared `WorkflowSchema` / `NodeRegistry`
-//!   / `registry_for_policy` / `Workflow` assembly (task 5).
+//!   / `registry_for_policy` / `Workflow` assembly, the straight line
+//!   `RenderDeliverableNode -> RenderPdfNode` (task 5).
 
+pub mod graph;
 pub mod policy;
 pub mod profiles;
 pub mod render_markdown;
 pub mod render_pdf;
 pub mod schema;
 
+pub use graph::WORKFLOW_TYPE;
 pub use policy::{DeliverableRenderPolicy, PartialDeliverableRenderPolicy};
 pub use profiles::resolve_policy_for_run;
 pub use render_markdown::{render_markdown, RenderDeliverableNode};
