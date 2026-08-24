@@ -14,6 +14,7 @@ related: [core:engine-rs]
 
 | Doc | What it covers |
 |---|---|
+| [coming-soon.md](coming-soon.md) | **Everything on the roadmap that does NOT exist yet** — the autonomy cluster (`WORKFLOW_DISPATCH`/`CONDUCTOR`/`DEBRIEF`), the Brain read client, `DELIVERABLE_RENDER`/`CONTENT_DRAFT`/`EXTERNAL_INTEL`, run-identity and permission-profile work, and the filed-but-unfixed defects — each with its block ID, whether it is ready or what it waits on (including operator gates), and how to check `planning/state.json` for the authoritative answer |
 | [architecture.md](architecture.md) | Overview, module map, core types, data flow |
 | [deployment-launchd.md](deployment-launchd.md) | The plist `EnvironmentVariables` a permanently-running `bastion serve` under launchd needs (`ENGINE_BRAIN_ROOT` mandatory as of EN.3.K, plus `ENGINE_EVENTS_API_KEY`/`ENGINE_EVENTS_URL`/optional `ENGINE_REPO_ALLOWLIST`), what `WorkingDirectory` still determines (only the absent-`repo` fallback target), the soft-to-loud `ENGINE_BRAIN_ROOT` failure mode, and verifying the installed plist's label/port before trusting `restart_services.sh`'s header comment |
 | [cli.md](cli.md) | Synopsis, subcommands, global flags, exit codes, examples |

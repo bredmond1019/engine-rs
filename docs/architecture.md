@@ -269,6 +269,51 @@ engine-rs/
     through the real `aggregate_state_files` path end-to-end)
 ```
 
+## `AppState` is builder-only
+
+`engine_serve::http::AppState` is the shared state every HTTP handler receives. **It is
+`#[non_exhaustive]`, so outside this crate the only way to build one is `AppState::builder(..)`.**
+A struct literal will not compile.
+
+```rust
+let state = AppState::builder(dispatcher, live, durable, api_key)
+    .runs(run_registry)            // optional; defaults to empty
+    .campaigns(campaign_registry)  // optional; defaults to empty
+    .build();
+```
+
+The four arguments to `builder(..)` are required because none has a sane default:
+`dispatcher: Arc<Dispatcher>` and `durable: DurableHandle` have no meaningful empty value, and
+`api_key: String` guards every engine route — a defaulted empty key would make an unauthenticated
+`AppState` constructible, which is the one place a convenient default is actively dangerous. That is
+also why `AppState` deliberately does **not** derive `Default`.
+
+The registry fields are optional-with-default because they are empirically the ones that keep getting
+added: both `runs` and `campaigns` start empty at boot and are populated as runs and campaigns are
+minted. A future registry field lands as one more optional setter.
+
+**Why this shape exists — it is a cross-repo contract, not a style preference.** `bastion`
+path-depends on `engine-serve` and constructs `AppState` at five sites (four in `src/serve/mod.rs`,
+one in `tests/abort_contract.rs`). While the fields were public and literal-constructed, adding a
+field to `AppState` broke bastion's build. That is not hypothetical: on 2026-08-23 a new `campaigns`
+field did exactly that, and it went unnoticed for three hours because the breakage is entirely
+outside this repo — `cargo build` here stays green.
+
+Two consequences worth knowing:
+
+- **Checking a downstream consumer needs `cargo nextest run --no-run`, never `cargo build`.** One of
+  bastion's five construction sites is in `tests/abort_contract.rs`, and a release build never
+  compiles test targets — so a `cargo build --release` check passes while the consumer is still
+  broken. Use:
+  ```bash
+  cargo nextest run --no-run --locked --manifest-path ../bastion/Cargo.toml
+  ```
+  `--locked` refuses to rewrite the consumer's `Cargo.lock`, turning a silent mutation in a repo you
+  do not own into an error.
+- **A repo's own `tests/*.rs` are out-of-crate.** Rust integration tests compile as separate crates,
+  so `#[non_exhaustive]` applies to `engine-serve`'s own `tests/` files too. "In-crate" is not the
+  same as "in-repo", and that distinction cost a round of fixes when the attribute landed.
+
 ## Injectable Seams
 
 Three `crates/engine-core/src/nodes/*` seams share one shape — a trait, a live implementation

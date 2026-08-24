@@ -149,8 +149,13 @@ directly on the async worker.
 ### The 503-until-wired contract (additive seam, D15)
 
 Both handlers take the ledger as `Option<web::Data<Arc<dyn ApprovalLedger>>>`, not as a required
-`AppState` field — `AppState` is public and struct-literal-constructed in `bastion` and in five
-`engine-serve` test files, so a required field would be a cross-repo breaking change. The routes are
+`AppState` field. **The constraint that motivated this has since been removed — the decision still
+stands as shipped, but do not repeat its reasoning as if it were still true.** When D15 was written,
+`AppState` was public and struct-literal-constructed in `bastion` and in several `engine-serve` test
+files, so a required field *was* a cross-repo breaking change. It stopped being one on 2026-08-23:
+`AppState::builder(..)` plus `#[non_exhaustive]` (see [architecture.md](architecture.md#appstate-is-builder-only)) mean a new field is additive for every consumer. Adding one here would now be legal;
+the routes stay on the additive seam because the 503-until-wired contract below is worth keeping on
+its own merits, not because a field is impossible. The routes are
 registered **unconditionally**. When no ledger is registered, both return **503** with a stable JSON
 body (`{"error": "approval ledger not configured"}` or equivalent — identical between the two
 routes), never 500, never a panic. This lets the routes exist and self-describe before any host wires

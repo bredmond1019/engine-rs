@@ -307,6 +307,19 @@ matters to `model_tier_used`.
 - `tasks_passed` / `tasks_failed`.
 - `review_verdicts` — e.g. `["TriageTaskNode:RETRYABLE", "ConsolidatedReviewNode:PASS"]`.
 - `total_input_tokens` / `total_output_tokens` / `total_cost_usd`.
+- `total_cache_read_tokens` / `total_cache_creation_tokens` (`EN.ticket.token-usage-drops-cache-channels`)
+  — the two prompt-cache channels. **Read these before drawing any conclusion about input cost.**
+  `input_tokens` from the SDK is documented as *excluding cache reads*, so before these existed the
+  engine was reporting one of three input channels and every input number was wrong by however much
+  the cache carried. Measured on a real run: `total_input_tokens: 92` against
+  `total_output_tokens: 3076` across 3 tasks and 5 attempts — 92 uncached input tokens is not a
+  broken meter, it is a meter reading one channel of three.
+  **Where they come from differs from the line above, deliberately:** uncached input/output are read
+  from `ctx.node_runs`, while the two cache channels are read from `ctx.nodes[<stage>]`. That split
+  exists so the fix stayed non-breaking — widening `engine_contract::task_context::Usage` would be a
+  D78 data-contract change requiring a version bump here plus re-pinned consumer views in
+  `orchestrator` and `bastion`. `ClaudeCodeStep` stamps them into the same free-form `ctx.nodes`
+  object that already carries `cost_usd`/`model`/`transport`.
 - `model_tier_used` — per-stage tier actually **called**, not the resolved policy's intent (see
   below).
 
