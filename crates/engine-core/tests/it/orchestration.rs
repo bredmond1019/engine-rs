@@ -25,7 +25,7 @@ use engine_contract::TaskContext;
 use engine_core::cancellation::CancellationToken;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
-    resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep,
+    resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep, StepKind,
 };
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
 use engine_core::workflows::orchestration::gates::{
@@ -1628,6 +1628,7 @@ fn engine_rs_lane_head_step() -> ChainStep {
         roadmap: Some("orchestration-extensions".to_string()),
         lane: Some("engine-rs".to_string()),
         segment: Some(0),
+        kind: StepKind::Block,
     }
 }
 

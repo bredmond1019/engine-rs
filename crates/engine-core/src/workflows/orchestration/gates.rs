@@ -370,6 +370,7 @@ impl AdmissionGate {
 
 #[cfg(test)]
 mod tests {
+    use super::super::chain::StepKind;
     use super::*;
     use crate::nodes::terminal::admission::AdmissionPolicy;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -760,6 +761,7 @@ mod tests {
             roadmap: Some(roadmap.to_string()),
             lane: Some(lane.to_string()),
             segment: Some(segment),
+            kind: StepKind::Block,
         }
     }
 
