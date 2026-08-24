@@ -406,3 +406,106 @@ fn is_registered_true_after_register_builtin_workflows() {
          (the GET /workflows-equivalent listing), got {listed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 7 (EN.4.D, D64) — fixture evidence for the un-gateable live-typst
+// criterion.
+//
+// "A real PDF is produced by a live `typst`" has its evidence in another
+// process; `typst` is confirmed absent on this host (`command -v typst` ->
+// not found, 2026-08-24) and the gated suite stubs the `CommandRunner` by
+// design, so that criterion is structurally un-observable from in here.
+// What CAN be gated, and is gated below:
+//   (1) the exact rendered markdown, pinned byte-for-byte against a checked-in
+//       golden fixture for one pt-BR and one en-US roadmap;
+//   (2) the exact argv `RenderPdfNode` would hand to a real `typst`, so an
+//       operator can run it by hand once `typst` is installed and diff the
+//       resulting PDF/markdown against these fixtures.
+// The hand-verification command derived from (2) is also recorded, verbatim,
+// in `planning/orchestration-run/autonomous-foundation/notes.md`, alongside a
+// NOT-RUN note for the live-render criterion itself. Per D64 this criterion
+// must never be claimed passed on the strength of this suite being green.
+// ---------------------------------------------------------------------------
+
+const GOLDEN_PT_BR: &str = include_str!("../fixtures/deliverable_render_pt_br.md");
+const GOLDEN_EN_US: &str = include_str!("../fixtures/deliverable_render_en_us.md");
+
+#[test]
+fn golden_fixture_pt_br_markdown_matches_byte_for_byte() {
+    use engine_core::workflows::deliverable_render::render_markdown::render_markdown;
+
+    let roadmap = sample_roadmap("Loja da Ana", Locale::PtBr);
+    let rendered = render_markdown(&roadmap, Locale::PtBr);
+
+    assert_eq!(
+        rendered, GOLDEN_PT_BR,
+        "pt-BR rendered markdown drifted from the checked-in golden fixture \
+         at crates/engine-core/tests/fixtures/deliverable_render_pt_br.md — \
+         if the drift is intentional, regenerate the fixture and review the diff"
+    );
+}
+
+#[test]
+fn golden_fixture_en_us_markdown_matches_byte_for_byte() {
+    use engine_core::workflows::deliverable_render::render_markdown::render_markdown;
+
+    let roadmap = sample_roadmap("Acme", Locale::EnUs);
+    let rendered = render_markdown(&roadmap, Locale::EnUs);
+
+    assert_eq!(
+        rendered, GOLDEN_EN_US,
+        "en-US rendered markdown drifted from the checked-in golden fixture \
+         at crates/engine-core/tests/fixtures/deliverable_render_en_us.md — \
+         if the drift is intentional, regenerate the fixture and review the diff"
+    );
+}
+
+/// Pins the EXACT argv `RenderPdfNode` hands to `typst`, over the golden
+/// pt-BR fixture written to a temp `output_dir` — this is the same argv
+/// shape recorded as a runnable hand-verification command in
+/// `planning/orchestration-run/autonomous-foundation/notes.md`.
+#[tokio::test]
+async fn golden_fixture_pins_the_exact_typst_argv_for_hand_verification() {
+    let output_dir = temp_output_dir("golden-argv");
+    let (runner, calls) = stub_runner(success_output());
+    let workflow = workflow_with_runner(runner);
+
+    let roadmap = sample_roadmap("Loja da Ana", Locale::PtBr);
+    let event = deliverable_event(&roadmap, Locale::PtBr, &output_dir);
+
+    let ctx = workflow
+        .run(event, Box::new(|_ctx: &TaskContext| {}))
+        .await
+        .expect("DELIVERABLE_RENDER run should complete");
+    assert_eq!(
+        ctx.node_runs["RenderPdfNode"].status,
+        NodeRunStatus::Success
+    );
+
+    let markdown_path = output_dir.join("loja-da-ana-roadmap.md");
+    let pdf_path = output_dir.join("loja-da-ana-roadmap.pdf");
+
+    // The exact hand-verification command (program + argv + cwd), transcribed
+    // verbatim into planning/orchestration-run/autonomous-foundation/notes.md:
+    //   cd <output_dir> && typst compile <markdown_path> <pdf_path>
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let (program, args, cwd) = &calls[0];
+    assert_eq!(program, "typst");
+    assert_eq!(
+        args,
+        &vec![
+            "compile".to_string(),
+            markdown_path.display().to_string(),
+            pdf_path.display().to_string(),
+        ]
+    );
+    assert_eq!(cwd, &output_dir);
+
+    // The markdown typst would actually compile matches the golden fixture
+    // byte-for-byte, so a hand-run comparison is meaningful.
+    let written = std::fs::read_to_string(&markdown_path).unwrap();
+    assert_eq!(written, GOLDEN_PT_BR);
+
+    std::fs::remove_dir_all(&output_dir).ok();
+}
