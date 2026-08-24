@@ -303,7 +303,7 @@ assembles a policy/telemetry/review_verdict/revised snapshot itself from the dri
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
   only acquires, reasons, and POSTs; see
   [The engine↔brain persist boundary](#the-enginebrain-persist-boundary).
-- **Out of scope for this block**: PDF render (EN.4.D — not yet built).
+- **Out of scope for this block**: PDF render — see [`DELIVERABLE_RENDER`](deliverable-render-workflow.md) (`EN.4.D`).
 - **Hermetic test coverage**: `crates/engine-core/tests/proposal_generator_e2e.rs` drives the
   full nine-node chain (including the `EN.5.E` loop cluster) through both router branches (`pass`
   and `revise`) against stubbed
