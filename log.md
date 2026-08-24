@@ -18,6 +18,24 @@ related: [status, context]
 
 ## [run: 2026-08-24]
 
+Implemented `EN.5.G` — `LINKEDIN_POST`, drafting LinkedIn post candidates from the week's real work — via `/sdlc-flow` on branch `EN.5.G-flow`, all 8 tasks passed, PASS review. Task 1 added `LinkedInPostEventSchema` plus traceable `PostCandidate`/`WorkSource` types, enforcing a non-empty `sources` invariant at the deserialization boundary rather than by convention. Task 2 added `WorkSourceNode`, gathering git commits, `log.md` entries, and `planning/decisions/` files for a date range over an injectable `CommandRunner`/`FileReader`/`DirReader` seam. Task 3 added the four-layer `LinkedInPostPolicy` (draft/critic/translate tiers, `max_critic_iterations`, `candidate_count`, `translate_enabled`) with `baseline`/`cheap-fast`/`thorough` profiles. Task 4 added `PostDraftNode`, a `ClaudeCodeStep` model node proposing candidates that drops any whose sources come back empty and surfaces model-flagged `unsupported_claims` rather than emitting them. Task 5 added `BrandCriticNode` (a deterministic pre-scan for three of `brand.md`'s six anti-slop checks, model judgment for the rest) and `ReviseNode`. Task 6 assembled and registered the full graph — `WorkSourceNode -> PostDraftNode -> PostCandidateSelectNode -> BrandCriticNode -> CriticRouterNode -> {TranslateGateNode | ReviseNode -> BrandCriticNode}` — as `LINKEDIN_POST` in `engine-serve`, writing a local `CriticRouterNode`/`TranslateGateNode` rather than reusing `content_pipeline`'s literally (their hardcoded upstream reads don't match this workflow's shape). Task 7 added the `linkedin_post_e2e.rs` integration suite (traceable candidates, a revise-then-pass loop, the iteration-cap exit, an empty-range no-fabrication case), building a fresh registry with small local replicas of the three private adapter/router nodes. Task 8 validated the full gate on the integrated tree — fmt, clippy `-D warnings`, `nextest --workspace --all-features` (3119 passed), `cargo build --release`, all clean, no code changes needed. Notable decision: scoped without a new okf-core doc model — drafts are run-result-only — since the spec's `EN.6.H1` doc-model dependency is dead (that block is `wontfix` and was never built); documented in the spec's own Notes before implementation started. Closes `EN.5.G`. `docs/linkedin-post-workflow.md` added. Next: `EN.ticket.vault-dependent-tests-must-skip-not-fail`, `EN.5.B2`, `EN.5.C`.
+
+```
+7110b7e docs: update docs for EN.5.G
+fa8d59f feat: implement EN.5.G-task7
+1570747 alias claude-code-rs path dep to claude-sdk-rs
+403df12 feat: implement EN.5.G-task6
+5575c5f feat: implement EN.5.G-task5
+951d57b feat: implement EN.5.G-task4
+9b87d35 feat: implement EN.5.G-task3
+35baf30 feat: implement EN.5.G-task2
+c92d8e9 feat: implement EN.5.G-task1
+```
+
+---
+
+## [run: 2026-08-24]
+
 Implemented `EN.6.K` — Brain read-client seam (GET /recall) + ingest-client hardening — via `/sdlc-flow` on branch `en-6k-brain-read-client-flow`, all 4 tasks passed, PASS review. Task 1 added the injectable `HttpGet` seam (`ReqwestHttpGet`/`StubHttpGet`) and `BrainConfig::from_env` (`BRAIN_API_URL` required, `BRAIN_API_KEY` optional) in a new `nodes/brain_client.rs`, consuming the already-settled `D23-brain-read-seam.md` decision rather than re-authoring it. Task 2 added `RecallNode` — GET `/recall`, query sourced from `ctx.event` or a bound upstream, `limit`/`hybrid` builder args, `X-API-Key` auth, stamping `{query, count, results}` per data-contract v1.6.0. Task 3 re-pointed both `PersistToBrainNode` impls and `HarvestApproveNode` at `BrainConfig` instead of a hardcoded `localhost:8000`, and re-pointed `content_pipeline`'s persist node from the nonexistent `/ingest/learning` route to the real `POST /ingest/artifact`, mapping the `LearningArtifact` payload into that route's generic envelope — noted in the spec's Amendment Log as a scope extension beyond the read-client title. Task 4 added the `tests/it/brain_client.rs` integration suite (RecallNode composed in a real workflow, auth-header and 401-halt cases) plus `X-API-Key` header assertions in the `content_pipeline`/`proposal_generator` e2e fixtures; full gate (fmt/clippy/nextest --workspace/release build) green. Notable decisions: `PersistToBrainNode::new()`/`HarvestApproveNode::new()` stayed zero-arg/infallible, resolving `BrainConfig` lazily at process()-time to avoid touching ~10 out-of-scope call sites; `docs/data-contract.md` updated with a non-re-pin changelog row (Pinned Contract Version stays 1.8.0). Closes `EN.6.K`. Next: `EN.5.B2` (regression history + blind judge + change gate), `EN.5.C` (EXTERNAL_INTEL), `EN.5.G` (CONTENT_DRAFT).
 
 ```
