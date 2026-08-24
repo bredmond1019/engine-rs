@@ -28,10 +28,17 @@
 //! durable-write path self-skips rather than failing, keeping CI green with
 //! no live database (mirrors `engine-store`'s own `postgres_round_trip.rs`
 //! self-skip pattern).
+//!
+//! EN.12.D widens the channel's payload to carry journal rows alongside run
+//! snapshots: [`DurableItem`] is an enum (`Snapshot`/`Journal`) rather than a
+//! second channel, so both kinds of durable write share one writer task, one
+//! background bridge, and one self-skip-without-`DATABASE_URL` discipline.
+//! Journal rows are inserted append-only via `engine_store::insert_journal_row`
+//! (never revised in place, unlike a snapshot's upsert-by-`run_id`).
 
 use chrono::{DateTime, Utc};
-use engine_contract::{EventsRow, TaskContext};
-use engine_store::{touch, upsert_event};
+use engine_contract::{EventsRow, JournalRow, TaskContext};
+use engine_store::{insert_journal_row, touch, upsert_event};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -47,12 +54,24 @@ pub struct DurableMessage {
     pub snapshot: TaskContext,
 }
 
-/// Cheaply-cloneable handle for sending snapshots to the background durable
-/// writer. Safe to clone into an `on_progress` closure and into multiple
-/// concurrent runs.
+/// One item flowing down the durable writer's channel: either a run snapshot
+/// (persisted via `engine_store::upsert_event`) or a journal row (persisted
+/// via `engine_store::insert_journal_row`, append-only). Widening the
+/// channel's payload to this enum — rather than adding a second channel —
+/// keeps one writer task and one bridge for both kinds of durable record, and
+/// both inherit the same pool-is-`None` self-skip.
+#[derive(Debug, Clone)]
+pub enum DurableItem {
+    Snapshot(DurableMessage),
+    Journal(JournalRow),
+}
+
+/// Cheaply-cloneable handle for sending snapshots (and journal rows) to the
+/// background durable writer. Safe to clone into an `on_progress` closure and
+/// into multiple concurrent runs.
 #[derive(Clone)]
 pub struct DurableHandle {
-    sender: mpsc::UnboundedSender<DurableMessage>,
+    sender: mpsc::UnboundedSender<DurableItem>,
     /// The same pool [`spawn_durable_writer`] was handed, retained here so a
     /// synchronous reader (EN.6.F task 11's resume handler) can fall back to
     /// `engine_store::get_event` for a suspended run this process never saw
@@ -68,7 +87,15 @@ impl DurableHandle {
     /// in-memory `TaskContext` returned by `Workflow::run` plus the
     /// live-state store (task 2); the durable row is a best-effort record.
     pub fn send(&self, message: DurableMessage) {
-        let _ = self.sender.send(message);
+        let _ = self.sender.send(DurableItem::Snapshot(message));
+    }
+
+    /// Send a journal row to the background writer. Same swallowed-error
+    /// contract as [`DurableHandle::send`]: a dropped journal write must
+    /// never fail or interrupt the run — the journal is a best-effort
+    /// decision record, not the run's authoritative state.
+    pub fn send_journal(&self, row: JournalRow) {
+        let _ = self.sender.send(DurableItem::Journal(row));
     }
 
     /// The Postgres pool this handle was constructed with, if any —
@@ -105,8 +132,8 @@ impl DurableHandle {
 /// this module, so callers in other modules (`suspend.rs`'s own tests)
 /// cannot build one directly — this is the seam for them.
 #[cfg(test)]
-pub(crate) fn test_handle() -> (DurableHandle, mpsc::UnboundedReceiver<DurableMessage>) {
-    let (sender, receiver) = mpsc::unbounded_channel::<DurableMessage>();
+pub(crate) fn test_handle() -> (DurableHandle, mpsc::UnboundedReceiver<DurableItem>) {
+    let (sender, receiver) = mpsc::unbounded_channel::<DurableItem>();
     (DurableHandle { sender, pool: None }, receiver)
 }
 
@@ -134,30 +161,45 @@ pub fn message_to_row(
 /// drains the channel (so senders never block/backlog) but performs no
 /// Postgres I/O, self-skipping the durable write.
 pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
-    let (sender, mut receiver) = mpsc::unbounded_channel::<DurableMessage>();
+    let (sender, mut receiver) = mpsc::unbounded_channel::<DurableItem>();
     let writer_pool = pool.clone();
 
     tokio::spawn(async move {
-        while let Some(message) = receiver.recv().await {
+        while let Some(item) = receiver.recv().await {
             let Some(pool) = writer_pool.as_ref() else {
                 // No DATABASE_URL configured: self-skip the Postgres write,
-                // do not fail or panic.
+                // do not fail or panic — for both snapshots and journal rows.
                 continue;
             };
 
-            // `created_at` is immutable once a row exists (`upsert_event`
-            // excludes it from the `DO UPDATE` set), so the value passed here
-            // for an already-existing row is a don't-care; it only matters
-            // for the very first insert of a given run id.
-            let now = Utc::now();
-            let mut row = message_to_row(&message, now, now);
-            touch(&mut row);
-            if let Err(err) = upsert_event(pool, &row).await {
-                tracing::warn!(
-                    run_id = %message.run_id,
-                    error = %err,
-                    "durable write: upsert_event failed"
-                );
+            match item {
+                DurableItem::Snapshot(message) => {
+                    // `created_at` is immutable once a row exists
+                    // (`upsert_event` excludes it from the `DO UPDATE` set),
+                    // so the value passed here for an already-existing row is
+                    // a don't-care; it only matters for the very first
+                    // insert of a given run id.
+                    let now = Utc::now();
+                    let mut row = message_to_row(&message, now, now);
+                    touch(&mut row);
+                    if let Err(err) = upsert_event(pool, &row).await {
+                        tracing::warn!(
+                            run_id = %message.run_id,
+                            error = %err,
+                            "durable write: upsert_event failed"
+                        );
+                    }
+                }
+                DurableItem::Journal(row) => {
+                    if let Err(err) = insert_journal_row(pool, &row).await {
+                        tracing::warn!(
+                            run_id = %row.run_id,
+                            campaign_id = %row.campaign_id,
+                            error = %err,
+                            "durable write: insert_journal_row failed"
+                        );
+                    }
+                }
             }
         }
     });
@@ -333,7 +375,7 @@ mod tests {
 
     #[test]
     fn durable_on_progress_forwards_snapshots_to_the_handle() {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<DurableMessage>();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<DurableItem>();
         let handle = DurableHandle { sender, pool: None };
         let run_id = Uuid::new_v4();
 
@@ -348,9 +390,78 @@ mod tests {
         on_progress(&snapshot);
 
         let received = receiver.try_recv().expect("a message should be queued");
+        let DurableItem::Snapshot(received) = received else {
+            panic!("expected a Snapshot item from durable_on_progress");
+        };
         assert_eq!(received.run_id, run_id);
         assert_eq!(received.workflow_type, "fixture");
         assert_eq!(received.data, serde_json::json!({ "k": "v" }));
         assert_eq!(received.snapshot, snapshot);
+    }
+
+    fn sample_journal_row(run_id: Uuid) -> JournalRow {
+        use engine_contract::JournalDecisionKind;
+
+        JournalRow {
+            id: Uuid::new_v4(),
+            campaign_id: "campaign-1".to_string(),
+            run_id,
+            step: "build".to_string(),
+            kind: JournalDecisionKind::StepIntegrated,
+            reason: "step completed".to_string(),
+            detail: serde_json::json!({}),
+            created_at: Utc::now(),
+        }
+    }
+
+    /// A journal row sent through [`DurableHandle::send_journal`] reaches the
+    /// same channel a snapshot uses, tagged as [`DurableItem::Journal`] — the
+    /// enum-widening this task adds, asserted with a test double rather than
+    /// a real Postgres pool.
+    #[test]
+    fn journal_row_reaches_the_background_writer_via_the_same_channel() {
+        let (handle, mut receiver) = test_handle();
+        let run_id = Uuid::new_v4();
+        let row = sample_journal_row(run_id);
+
+        handle.send_journal(row.clone());
+
+        let received = receiver
+            .try_recv()
+            .expect("a journal item should be queued");
+        let DurableItem::Journal(received_row) = received else {
+            panic!("expected a Journal item from send_journal");
+        };
+        assert_eq!(received_row, row);
+    }
+
+    /// With the pool absent, sending a journal row through a live writer task
+    /// (`spawn_durable_writer(None)`) is a no-op that returns normally and
+    /// never panics or errors — the same self-skip contract `DurableMessage`
+    /// writes already have.
+    #[tokio::test]
+    async fn journal_write_self_skips_when_no_pool_is_configured() {
+        let handle = spawn_durable_writer(None);
+
+        handle.send_journal(sample_journal_row(Uuid::new_v4()));
+        handle.send_journal(sample_journal_row(Uuid::new_v4()));
+
+        // Give the background task a chance to drain the channel; there is
+        // nothing to assert against Postgres (no pool exists), so this test
+        // passes as long as sending/draining does not panic.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// A send failure (the writer task having ended, i.e. the receiver
+    /// dropped) is swallowed, not propagated — the same invariant
+    /// `DurableHandle::send` already documents at this module's top, now
+    /// exercised for journal rows.
+    #[test]
+    fn journal_send_failure_is_swallowed_not_propagated() {
+        let (handle, receiver) = test_handle();
+        drop(receiver);
+
+        // Must not panic even though nothing is listening.
+        handle.send_journal(sample_journal_row(Uuid::new_v4()));
     }
 }

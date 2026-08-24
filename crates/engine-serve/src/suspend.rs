@@ -1413,7 +1413,10 @@ mod tests {
             // of it, so only count messages actually carrying the
             // step-progress marker, in order.
             let mut durable_step_progress: Vec<(i64, i64)> = Vec::new();
-            while let Ok(message) = durable_rx.try_recv() {
+            while let Ok(item) = durable_rx.try_recv() {
+                let crate::durable::DurableItem::Snapshot(message) = item else {
+                    continue;
+                };
                 if let Some(progress) = message.snapshot.metadata.get("orchestration_step_progress")
                 {
                     let index = progress["index"].as_i64().expect("index should be an int");
