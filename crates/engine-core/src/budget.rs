@@ -551,6 +551,78 @@ mod tests {
     }
 
     #[test]
+    fn campaign_ledger_cap_trips_on_the_corrected_per_run_figure() {
+        // Pins the inheritance: `CampaignLedger::record_step` takes a
+        // caller-supplied `total_tokens` per step, so once `BudgetLedger`
+        // (task 1) folds the cache channels into that per-run figure, the
+        // campaign ceiling is correct for free — but an inherited fix with
+        // no test is indistinguishable from an untested one, and this is
+        // the ceiling `EN.11.F` relies on for an unattended overnight
+        // campaign.
+        //
+        // Two steps, each built from a real `TaskContext` via
+        // `BudgetLedger::from_context` (not hand-summed), with mutually
+        // distinct input/output/cache figures so a summing bug in either
+        // channel cannot hide.
+        let mut node_runs_1 = HashMap::new();
+        node_runs_1.insert("NodeA".to_string(), node_run_with_usage(10, 20));
+        let mut nodes_1 = HashMap::new();
+        nodes_1.insert("NodeA".to_string(), node_output_with_cache(1000, 500));
+        let ctx_1 = TaskContext {
+            event: serde_json::json!({}),
+            nodes: nodes_1,
+            metadata: serde_json::json!({}),
+            node_runs: node_runs_1,
+        };
+        let step_1_corrected = BudgetLedger::from_context(&ctx_1).total_tokens();
+        assert_eq!(step_1_corrected, 1530); // 10 + 20 + 1000 + 500
+
+        let mut node_runs_2 = HashMap::new();
+        node_runs_2.insert("NodeB".to_string(), node_run_with_usage(4, 6));
+        let mut nodes_2 = HashMap::new();
+        nodes_2.insert("NodeB".to_string(), node_output_with_cache(200, 100));
+        let ctx_2 = TaskContext {
+            event: serde_json::json!({}),
+            nodes: nodes_2,
+            metadata: serde_json::json!({}),
+            node_runs: node_runs_2,
+        };
+        let step_2_corrected = BudgetLedger::from_context(&ctx_2).total_tokens();
+        assert_eq!(step_2_corrected, 310); // 4 + 6 + 200 + 100
+
+        // Chain-level cap set strictly between the old two-channel sum
+        // (10+20 + 4+6 = 40) and the corrected four-channel sum
+        // (1530 + 310 = 1840).
+        let budget = Budget {
+            max_total_tokens: Some(500),
+            max_cost_usd: None,
+        };
+
+        let mut corrected_campaign = CampaignLedger::new();
+        corrected_campaign.record_step(Some(0.01), step_1_corrected);
+        corrected_campaign.record_step(Some(0.02), step_2_corrected);
+        assert_eq!(corrected_campaign.total_tokens(), 1840);
+        assert!(matches!(
+            corrected_campaign.check(Some(&budget)),
+            BudgetDecision::Halt(BudgetHaltReason::TotalTokens {
+                spent: 1840,
+                limit: 500,
+            })
+        ));
+
+        // Negative control: the OLD two-channel-only figure the ticket
+        // describes as under-counting must NOT trip the same cap — proving
+        // this test would have failed had `record_step` been fed the old
+        // figure, i.e. that the assertion above is load-bearing rather
+        // than trivially true for any input.
+        let mut old_campaign = CampaignLedger::new();
+        old_campaign.record_step(Some(0.01), 30); // old: 10 + 20 only
+        old_campaign.record_step(Some(0.02), 10); // old: 4 + 6 only
+        assert_eq!(old_campaign.total_tokens(), 40);
+        assert_eq!(old_campaign.check(Some(&budget)), BudgetDecision::Allow);
+    }
+
+    #[test]
     fn campaign_ledger_trips_on_a_cap_below_one_steps_cost() {
         let mut ledger = CampaignLedger::new();
         // A single step whose cost already exceeds a ceiling set below it
