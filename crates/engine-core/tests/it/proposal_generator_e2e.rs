@@ -54,6 +54,7 @@ use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{EventsRow, NodeRunStatus, TaskContext};
 use engine_core::node::NodeRegistry;
+use engine_core::nodes::brain_client::BrainConfig;
 use engine_core::nodes::http_post::StubHttpPost;
 use engine_core::policy;
 use engine_core::workflow::Workflow;
@@ -77,6 +78,12 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 const TEST_BRAIN_URL: &str = "https://brain.example/ingest/proposal-generator-e2e";
+/// `EN.6.K` task 4: a fixture `X-API-Key` so `PersistToBrainNode`'s
+/// `BrainConfig`-derived auth header is asserted through the real composed
+/// walk, not just the node's own unit tests. The URL still comes from
+/// `with_url(TEST_BRAIN_URL)` (config precedence: an explicit `with_url`
+/// always wins for the URL; the header comes from `with_config`).
+const TEST_BRAIN_API_KEY: &str = "proposal-generator-e2e-key";
 
 fn temp_worktree(tag: &str) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -347,7 +354,11 @@ fn build_registry(stubs: &Stubs) -> NodeRegistry {
     registry.register(Box::new(
         PersistToBrainNode::new()
             .with_http_post(Arc::new(stubs.http_post.clone()))
-            .with_url(TEST_BRAIN_URL),
+            .with_url(TEST_BRAIN_URL)
+            .with_config(BrainConfig::new(
+                "https://brain.example",
+                Some(TEST_BRAIN_API_KEY.to_string()),
+            )),
     ));
     registry
 }
@@ -457,6 +468,18 @@ fn persisted_roadmap(stub: &StubHttpPost) -> (String, Value) {
     let (url, body) = stub
         .last_call()
         .expect("PersistToBrainNode should have POSTed");
+
+    // `EN.6.K` task 4: the `X-API-Key` header from the fixture's
+    // `BrainConfig` reaches the real POST through the composed
+    // `Workflow::run`/`drive` walk, not just PersistToBrainNode's own unit
+    // tests.
+    let headers = stub
+        .last_headers()
+        .expect("PersistToBrainNode should have POSTed with headers");
+    assert!(
+        headers.contains(&("X-API-Key".to_string(), TEST_BRAIN_API_KEY.to_string())),
+        "expected the fixture's X-API-Key header in {headers:?}"
+    );
     let object = body.as_object().expect("payload is an object");
     assert_eq!(
         object

@@ -95,6 +95,19 @@ Do not hand-write anything `emit-state` owns: focus scalars, cache `synced_from`
 rollup tables, the HQ boards, master-plan wave tables, the lane JSONs. Editing those by hand
 duplicates the derivation engine and drifts from it.
 
+**Known pattern — stale sibling `focus.next` after a block closes.** Closing a block in one repo
+leaves *other* repos' stored `focus.next` and derived boards holding the old membership until the
+next fleet-wide `emit-state --write` runs. This is the expected shape of the gap the write exists
+to close — not a new defect, and not a code defect in whatever just merged. The tell: the failing
+assertion is about a block's membership in `focus.next`, and the block named in the failure
+recently closed, often in another repo's lane. Fix by re-running the write
+(`./scripts/emit_state_write.sh`, per Step 4) rather than re-diagnosing the cause. Self-resolving;
+nothing to file. Two look-alikes are **not** this pattern, and each needs a different response: a
+test-code assertion that has genuinely gone out of date (e.g. a hardcoded record count after a
+format conversion) is a real code fix — re-running the write changes nothing; derived-file churn
+from a *concurrent* lane's own `emit-state --write` belongs to that session — leave it uncommitted,
+it is not yours to touch.
+
 ## Step 4 — Know the blast radius before you commit
 
 **It regenerates the whole corpus spine, not the repo you ran it from.** One run has modified

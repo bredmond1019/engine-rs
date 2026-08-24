@@ -293,10 +293,23 @@ serve for runtime interchangeability. `/ingest/proposal` is pinned exactly to th
 `EN.4.C`'s `PersistToBrainNode` (`crates/engine-core/src/workflows/proposal_generator/persist_to_brain.rs`,
 built) asserts against a stub — `{ artifact_id, company_name, doc_type, section, content, roadmap }` —
 returning `200 { artifact_id, chunks_written }`; both routes reuse the same `X-API-Key` gate as
-`POST /events/` and reject a malformed body with a typed `422` (never `500`). `PersistToBrainNode`
-now has a live target to POST to instead of its `HttpPost` stub, but still POSTs to a hardcoded
-placeholder `BRAIN_INGEST_URL` constant rather than this route — pointing it at the real Synapse
-`/ingest/proposal` endpoint is unfinished follow-on work (see `planning/decisions/D9-engine-brain-boundary.md`).
+`POST /events/` and reject a malformed body with a typed `422` (never `500`). **`EN.6.K` task 3**
+retires the hardcoded placeholder `BRAIN_INGEST_URL` const both persist nodes carried: the target
+URL is now `{BrainConfig::base_url}/ingest/proposal` (or `/ingest/artifact`, below), resolved from
+`BrainConfig::from_env` (`BRAIN_API_URL`/`BRAIN_API_KEY`), and both nodes now send the `X-API-Key`
+header this route requires — `PersistToBrainNode::with_config`/`with_url` override it for tests.
+`content_pipeline::persist_to_brain::PersistToBrainNode` is re-pointed the same way, but to
+`POST /ingest/artifact`, not `/ingest/proposal`: Synapse has never served the `/ingest/learning`
+route that node's `BRAIN_INGEST_URL` const previously named. It maps the shared `LearningArtifact`
+payload shape (`{artifact_id, channel_type, source_ref, summary, digest_markdown, entities,
+language}`) into `/ingest/artifact`'s generic envelope: `{artifact_id, doc_type:
+"learning-artifact", content: digest_markdown, metadata: {channel_type, source_ref, entities,
+language, summary}}` — the optional `section`/`project`/`title`/`description` envelope fields are
+omitted (a `LearningArtifact` carries no data for them), and Synapse currently discards `metadata`
+entirely (acceptable: `content` is what gets embedded). `HarvestApproveNode`
+(`crates/engine-core/src/nodes/harvest_approve.rs`), which replays a pending harvest's stored
+`payload` to its stored `url`, now sends the same `X-API-Key` header too — it is no longer the one
+unauthenticated door into `POST /ingest/*`.
 
 **`metadata.suspension` (EN.6.F, engine-rs-side).** Mirroring `metadata.cancellation`/
 `metadata.budget`, a suspended run's `TaskContext.metadata` carries a `suspension` key: `{suspended,
@@ -328,9 +341,10 @@ engine-rs could *call* as a client, not routes it needs to *serve* for runtime i
 (the two runtimes' interchangeability contract is about `events`/`task_context`, not the Brain
 corpus). All three reuse the same `X-API-Key` gate as `POST /events/` and reject a missing/
 malformed query param with a typed `422` (never `500`). No `engine_contract` Rust type changes
-shape — no engine-rs workflow calls any of the three today; wiring a hybrid workflow to `GET
-/recall` (e.g. to ground a proposal draft in existing corpus content before persisting it via
-`POST /ingest/proposal`) remains open follow-on work.
+shape — `RecallNode` (`crates/engine-core/src/nodes/brain_client.rs`, `EN.6.K`) is engine-rs's
+first client of the three, over `GET /recall`; `GET /walk` and `GET /pulse` still have no engine-rs
+caller. Wiring a hybrid workflow to ground a proposal draft in existing corpus content via
+`RecallNode` before persisting it through `POST /ingest/proposal` remains open follow-on work.
 
 The canonical contract's v1.5.0 adds an optional `authored_at: datetime | null` field to both
 ingest routes, `POST /ingest/proposal` and `POST /ingest/artifact` (`OR.ticket.corpus-reconcile`).
@@ -426,3 +440,4 @@ time, not a gate).
 | 1.6.0 | 2026-08-01 | Re-pin from 1.5.0 to 1.6.0 (`OR.K2`, orchestrator-side; not an engine-rs block) — **the consequential one for `EN.6.K`**. `GET /recall`'s response semantics change (§ HTTP surface parity above): `score` is now a similarity where **higher is always better** on every path (`1.0` exact-id, `1.0 - cosine distance` semantic, unchanged fused similarity for hybrid), where 1.4.0 returned a raw cosine *distance* on the exact-id/semantic paths (`0.0` exact-id, lower-is-better); and `via`'s vocabulary widens from `exact-id \| semantic \| hybrid` to also include `structural \| keyword \| memory` (per-candidate hybrid provenance, previously collapsed to a bare `"hybrid"`). Field names, types, and the `q`/`limit`/`hybrid` query params are unchanged, and no `engine_contract` Rust type changes shape — `GET /recall` is a route engine-rs calls as a client, not one `engine-serve` serves. **`EN.6.K` (the Brain read-client seam — engine-rs's first `GET /recall` consumer, and therefore the first thing this polarity can bite) must be built against 1.6.0 semantics:** `RecallNode` sorts/thresholds `score` **descending / higher-is-better**, and any type deserializing `via` must tolerate all six values or it will fail to parse a hybrid result. A 1.4.0-era comparison direction ranks results backwards with no error — this re-pin exists specifically to close that window before `EN.6.K` runs. |
 | 1.7.0 | 2026-08-13 | `EN.9.C` (engine-rs-side) adds the `metadata.completion` run-level annotation (§ Run-level `metadata` annotations above) as canonical contract text, stamped by `crate::completion::stamp_completion` at every terminal exit in `crates/engine-serve/src/suspend.rs`, plus an `engine-store` query (`list_orphan_candidates`) and an `engine-serve` boot sweep (`crate::orphan::reconcile_orphans`) that use the marker's absence to find and fail crash-stranded runs, and a stale-run alarm on age-past-threshold `running`/`suspended` runs. Mirrors the `cancellation`/`budget`/`suspension` precedent exactly: no `engine_contract` Rust type changed shape, no new `NodeRunStatus` variant (D6) — `completion` lives entirely in the existing free-form `TaskContext::metadata` field. **Corrected 2026-08-21 (D78, this task):** originally recorded as "Not a re-pin — Pinned Contract Version stays 1.6.0"; that was true only from the outgoing orchestrator-owned canonical's perspective. Engine-rs already implemented and shipped this annotation on 2026-08-13, so absorbing it into this now-canonical document is a version bump to 1.7.0, not new code. See [orphan-recovery.md](orphan-recovery.md) for the full marker shape, the sweep, the alarm, and the policy knobs. |
 | 1.8.0 | 2026-08-21 | `EN.11.E` (engine-rs-side, D78 canonical) adds campaign identity (§ Campaign identity above) — a `campaign_id: uuid` first-class key naming the parent for the N runs of one chain, and a new `GET /campaigns/{id}` route (§ HTTP surface parity above) returning the campaign's runs with an `EN.11.G` cost/token rollup. **MINOR, not MAJOR**: the addition is a new key on the run's own `event`/`nodes` shape plus a wholly new, additive route; no existing field changes shape, and `NodeRunStatus`'s `pending|running|success|failed` vocabulary is untouched — the same reasoning 1.7.0's row above records for why that bump was minor. `campaign_id` is deliberately NOT a `TaskContext::metadata` annotation, unlike `cancellation`/`budget`/`completion`/`suspension`/`failure` — see § Campaign identity for why. `engine_contract`'s typed structs (`EventsRow`, `TaskContext`, `NodeRun`, `Usage`) are unchanged; the campaign id lives in the existing free-form `event: serde_json::Value` and `nodes: HashMap<String, serde_json::Value>` fields, not in a new Rust-typed column. Both pinning consumers (`orchestrator`/Synapse, `bastion`) still declare 1.7.0 as of this bump — see § Consumer re-pin obligations above and the corresponding `OPEN` items in `planning/orchestration-run/autonomous-foundation/notes.md`. |
+| — | 2026-08-24 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** `EN.6.K` task 3 (engine-rs-side, consumer-notes only) closes the two live client bugs flagged when task 1 registered `GET /recall`'s v1.4.0/v1.6.0 rows above. Both persist nodes (`proposal_generator::persist_to_brain` and `content_pipeline::persist_to_brain`) drop their hardcoded `BRAIN_INGEST_URL` placeholder consts in favor of `BrainConfig::from_env` (`BRAIN_API_URL`/`BRAIN_API_KEY`) and now send the `X-API-Key` header `POST /ingest/*` requires; `HarvestApproveNode`'s replayed POST does too. `content_pipeline::persist_to_brain::PersistToBrainNode` is re-pointed from the nonexistent `/ingest/learning` to the real `POST /ingest/artifact`, mapping the shared `LearningArtifact` shape into that route's generic envelope (§ HTTP surface parity above has the full field mapping). No `engine_contract` Rust type changed shape and no canonical route or field was added — this is engine-rs finally calling the routes Synapse has served since v1.3.0/v1.5.0, not a new contract surface, so the Pinned Contract Version does not move. |

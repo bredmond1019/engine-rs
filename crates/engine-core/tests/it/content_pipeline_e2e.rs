@@ -66,6 +66,7 @@ use claude_code_rs::parse::{ModelUsage as SdkModelUsage, Usage as SdkUsage};
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{EventsRow, NodeRunStatus, TaskContext};
 use engine_core::node::NodeRegistry;
+use engine_core::nodes::brain_client::BrainConfig;
 use engine_core::nodes::channel_transport::StubChannelTransport;
 use engine_core::nodes::doc_materializer::{
     MaterializeOutcome, MaterializedFile, StubDocMaterializer,
@@ -102,6 +103,12 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 
 const TEST_BRAIN_URL: &str = "https://brain.example/ingest/content-pipeline-e2e";
+/// `EN.6.K` task 4: a fixture `X-API-Key` so `PersistToBrainNode`'s
+/// `BrainConfig`-derived auth header is asserted through the real composed
+/// `Workflow::run` walk, not just the node's own unit tests. The URL still
+/// comes from `with_url(TEST_BRAIN_URL)` (config precedence: an explicit
+/// `with_url` always wins for the URL; the header comes from `with_config`).
+const TEST_BRAIN_API_KEY: &str = "content-pipeline-e2e-key";
 
 // ---------------------------------------------------------------------------
 // Stub helpers
@@ -376,6 +383,10 @@ fn build_registry(stubs: &Stubs) -> NodeRegistry {
         PersistToBrainNode::new()
             .with_http_post(Arc::new(stubs.http_post.clone()))
             .with_url(TEST_BRAIN_URL)
+            .with_config(BrainConfig::new(
+                "https://brain.example",
+                Some(TEST_BRAIN_API_KEY.to_string()),
+            ))
             // `EN.7.C`: this fixture's assertions expect the pre-block
             // always-push behavior, so it opts explicitly into
             // `in_process` rather than relying on the new `off` default.
@@ -459,6 +470,18 @@ async fn web_article_branch_flows_through_to_persist() {
         .last_call()
         .expect("PersistToBrainNode should have POSTed");
     assert_eq!(url, TEST_BRAIN_URL);
+
+    // `EN.6.K` task 4: the `X-API-Key` header from the fixture's
+    // `BrainConfig` reaches the real POST through the composed
+    // `Workflow::run` walk, not just PersistToBrainNode's own unit tests.
+    let headers = stubs
+        .http_post
+        .last_headers()
+        .expect("PersistToBrainNode should have POSTed with headers");
+    assert!(
+        headers.contains(&("X-API-Key".to_string(), TEST_BRAIN_API_KEY.to_string())),
+        "expected the fixture's X-API-Key header in {headers:?}"
+    );
 }
 
 #[tokio::test]
@@ -767,7 +790,7 @@ async fn translate_off_never_invokes_translate_and_omits_translated_markdown() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn persist_to_brain_posts_the_expected_learning_artifact_payload() {
+async fn persist_to_brain_posts_the_expected_ingest_artifact_envelope() {
     let stubs = Stubs::default_passing();
     let workflow = build_workflow(&stubs);
 
@@ -779,29 +802,33 @@ async fn persist_to_brain_posts_the_expected_learning_artifact_payload() {
         .expect("PersistToBrainNode should have POSTed");
     assert_eq!(url, TEST_BRAIN_URL);
 
+    // `EN.6.K` task 3: `PersistToBrainNode` now maps the shared
+    // `LearningArtifact` shape into `POST /ingest/artifact`'s generic
+    // envelope — `{artifact_id, doc_type, content, metadata}` — rather than
+    // POSTing the seven-field `LearningArtifact` shape directly (Synapse
+    // never served `/ingest/learning`).
     let object = body.as_object().expect("payload is an object");
     assert_eq!(
         object
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        [
-            "artifact_id",
-            "channel_type",
-            "source_ref",
-            "summary",
-            "digest_markdown",
-            "entities",
-            "language",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+        ["artifact_id", "doc_type", "content", "metadata"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     );
-    assert_eq!(body["channel_type"], json!("web_article"));
-    assert_eq!(body["source_ref"], json!("https://example.com/a"));
-    assert_eq!(body["summary"], json!("A concise summary of the content."));
-    assert_eq!(body["language"], json!("en"));
+    assert_eq!(body["doc_type"], json!("learning-artifact"));
+    assert_eq!(body["metadata"]["channel_type"], json!("web_article"));
+    assert_eq!(
+        body["metadata"]["source_ref"],
+        json!("https://example.com/a")
+    );
+    assert_eq!(
+        body["metadata"]["summary"],
+        json!("A concise summary of the content.")
+    );
+    assert_eq!(body["metadata"]["language"], json!("en"));
 
     let output = output_of(&ctx);
     assert_eq!(body["artifact_id"], json!(output.artifact_id));

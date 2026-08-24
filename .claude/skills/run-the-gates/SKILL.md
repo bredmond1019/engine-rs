@@ -63,15 +63,16 @@ session added a file and has not written its `index.md` row yet.
 **Read the error's path before assuming it is your change.** If the file is one you did not create,
 the session that created it owns the fix — say so rather than racing its edit.
 
-To ask the whole-corpus question deliberately:
+To ask the whole-corpus question deliberately, without pushing:
 
 ```bash
 PREPUSH_STRICT=1 git push      # gate on everything, not just your delta
-./scripts/validate_brain.sh    # same question without pushing — but see below
 ```
 
-> `validate_brain.sh` ends in an `emit-state --write`. It is **not** read-only, and it is banned
-> during a measurement embargo. For a read-only answer use the `validate-brain --<flag>` calls above.
+`./scripts/validate_brain.sh` looks like the read-only equivalent but is not one — it ends in an
+`emit-state --write`, and on a `primary` host that write is followed by a commit and a push (see
+`derive-state-safely`). It is **banned** during a measurement embargo. For a read-only whole-corpus
+answer, run the four `bastion validate-brain --<flag>` calls above instead, one per flag.
 
 ## 4. Know which checks do not gate
 

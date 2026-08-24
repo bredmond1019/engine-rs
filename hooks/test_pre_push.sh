@@ -15,6 +15,15 @@
 #
 set -uo pipefail
 
+# Scrub the git environment git exports to every hook (GIT_DIR chief among them) before
+# anything below builds a fixture repo — an inherited GIT_DIR outranks both the working
+# directory and `git -C`, so under a hook (this suite is itself a gated hooks/pre-push
+# stage-2 check) new_repo()/new_mev_repo() would otherwise clobber the CALLER's real repo.
+# Canonical copy + full rationale: scrub_git_env() in scripts/lib.sh. Not sourced here —
+# sourcing lib.sh would also pull in its PATH export and change what this suite resolves.
+unset -v GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES GIT_COMMON_DIR
+
 # The suite must be immune to the environment it is invoked from. PREPUSH_STRICT changes the
 # hook's blocking mode, and this file is itself a gated check in HQ's planning/harness.json —
 # so `PREPUSH_STRICT=1 git push` runs these tests with that variable inherited, silently

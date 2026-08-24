@@ -119,7 +119,7 @@ impl Overlay for MaterializeConfig {
 ///   workflow, against the SAME endpoint (no second indexing path, D51).
 ///
 /// The endpoint address itself is deployment topology, not a policy knob —
-/// see `persist_to_brain::BRAIN_INGEST_URL`.
+/// see `persist_to_brain::BRAIN_INGEST_PATH` and `crate::nodes::BrainConfig`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarvestConfig {
     pub mode: HarvestMode,

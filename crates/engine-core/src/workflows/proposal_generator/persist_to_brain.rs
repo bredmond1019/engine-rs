@@ -33,6 +33,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::node::{Node, NodeError};
+use crate::nodes::brain_client::BrainConfig;
 use crate::nodes::http_post::{http_post_live, HttpPost};
 use crate::workflows::{get_result, put_result};
 
@@ -59,10 +60,15 @@ const DOC_TYPE: &str = "automation_roadmap";
 /// (that, if it ever happens, is the brain's own job behind the endpoint).
 const SECTION: &str = "full";
 
-/// The Synapse brain ingest endpoint this node POSTs to (`OR.Q`,
-/// `POST /ingest/*`). Not configurable via `ProposalGeneratorPolicy` — the
-/// endpoint address is deployment topology, not a per-run policy knob.
-const BRAIN_INGEST_URL: &str = "http://localhost:8000/ingest/proposal";
+/// The path this node POSTs to, joined onto [`BrainConfig::base_url`]
+/// (`OR.Q`, `POST /ingest/*`). Not configurable via
+/// `ProposalGeneratorPolicy` — the endpoint address is deployment topology,
+/// not a per-run policy knob. `EN.6.K` task 3: the base URL/key are no
+/// longer a hardcoded `localhost:8000` const — they come from
+/// [`BrainConfig`], resolved from [`BrainConfig::from_env`] unless
+/// overridden via [`PersistToBrainNode::with_config`] /
+/// [`PersistToBrainNode::with_url`].
+const BRAIN_INGEST_PATH: &str = "/ingest/proposal";
 
 /// Deserialize the inbound `PROPOSAL_GENERATOR` event from `ctx.event`.
 fn parse_event(ctx: &TaskContext) -> Result<ProposalGeneratorEventSchema, NodeError> {
@@ -146,17 +152,29 @@ fn roadmap_to_content(company_name: &str, roadmap: &AutomationRoadmap) -> String
 /// connection.
 pub struct PersistToBrainNode {
     http_post: std::sync::Arc<dyn HttpPost>,
-    url: String,
+    /// Full target URL override. `None` (the production default) derives
+    /// the URL from [`BrainConfig::base_url`] + [`BRAIN_INGEST_PATH`] at
+    /// call time; tests set this directly to assert on an exact stub URL
+    /// without also having to construct a [`BrainConfig`].
+    url: Option<String>,
+    /// `BrainConfig` override. `None` (the production default) resolves
+    /// [`BrainConfig::from_env`] at call time — a missing `BRAIN_API_URL`
+    /// then surfaces as a `NodeError` naming the env var, not a silent
+    /// unauthenticated POST. Tests set this to assert the `X-API-Key`
+    /// header the stub receives.
+    config: Option<BrainConfig>,
 }
 
 impl PersistToBrainNode {
-    /// Construct with the live `reqwest`-backed `HttpPost` impl, POSTing to
-    /// [`BRAIN_INGEST_URL`].
+    /// Construct with the live `reqwest`-backed `HttpPost` impl. The target
+    /// URL and `X-API-Key` header are resolved from [`BrainConfig::from_env`]
+    /// unless overridden via [`Self::with_url`] / [`Self::with_config`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             http_post: http_post_live(),
-            url: BRAIN_INGEST_URL.to_string(),
+            url: None,
+            config: None,
         }
     }
 
@@ -169,12 +187,55 @@ impl PersistToBrainNode {
     }
 
     /// Override the target URL. Tests use this to assert on the exact URL
-    /// the stub was POSTed to; production code leaves it at
-    /// [`BRAIN_INGEST_URL`].
+    /// the stub was POSTed to without needing to also override
+    /// [`BrainConfig`] — production code leaves this unset and derives the
+    /// URL from [`BrainConfig::base_url`] + [`BRAIN_INGEST_PATH`].
     #[must_use]
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
-        self.url = url.into();
+        self.url = Some(url.into());
         self
+    }
+
+    /// Override the [`BrainConfig`] (base URL / `X-API-Key`) this node
+    /// resolves instead of reading `BRAIN_API_URL`/`BRAIN_API_KEY` from the
+    /// environment. Tests use this to assert the `X-API-Key` header the
+    /// stub receives.
+    #[must_use]
+    pub fn with_config(mut self, config: BrainConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Resolve `(url, headers)` for this call: an explicit [`Self::with_url`]
+    /// override always wins for the URL; the `X-API-Key` header always
+    /// comes from [`Self::with_config`] when set, otherwise
+    /// [`BrainConfig::from_env`] — falling back to no header (rather than
+    /// erroring) only when *neither* a URL nor a config override is set and
+    /// the environment is also unconfigured, which keeps every pre-`EN.6.K`
+    /// caller that only overrides `with_url` (no live Brain, stub-only)
+    /// working unchanged.
+    fn resolve_target(&self) -> Result<(String, Vec<(String, String)>), NodeError> {
+        match (&self.url, &self.config) {
+            (Some(url), Some(config)) => Ok((url.clone(), config.auth_headers())),
+            (Some(url), None) => Ok((url.clone(), Vec::new())),
+            (None, Some(config)) => Ok((
+                format!(
+                    "{}{BRAIN_INGEST_PATH}",
+                    config.base_url.trim_end_matches('/')
+                ),
+                config.auth_headers(),
+            )),
+            (None, None) => {
+                let config = BrainConfig::from_env()
+                    .map_err(|err| NodeError::new(format!("{NODE_NAME}: {err}")))?;
+                let url = format!(
+                    "{}{BRAIN_INGEST_PATH}",
+                    config.base_url.trim_end_matches('/')
+                );
+                let headers = config.auth_headers();
+                Ok((url, headers))
+            }
+        }
     }
 }
 
@@ -205,9 +266,15 @@ impl Node for PersistToBrainNode {
             "roadmap": roadmap_value,
         });
 
+        let (url, headers) = self.resolve_target()?;
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+
         let response = self
             .http_post
-            .post(&self.url, payload)
+            .post_with_headers(&url, payload, &header_refs)
             .await
             .map_err(|err| {
                 NodeError::new(format!("{NODE_NAME}: brain ingest push failed: {err}"))
@@ -359,7 +426,9 @@ mod tests {
     #[tokio::test]
     async fn process_prefers_the_revised_roadmap_over_the_writer_draft() {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
-        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_url("https://brain.example/ingest/proposal");
 
         let mut ctx = empty_ctx(base_event());
         ctx.nodes
@@ -383,7 +452,9 @@ mod tests {
     #[tokio::test]
     async fn process_surfaces_a_stub_failure_as_a_node_error() {
         let stub = StubHttpPost::failing("brain endpoint unreachable");
-        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub))
+            .with_url("https://brain.example/ingest/proposal");
 
         let mut ctx = empty_ctx(base_event());
         ctx.nodes
@@ -428,9 +499,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_config_derives_the_url_from_the_base_and_sends_the_api_key_header() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_config(BrainConfig::new(
+                "https://brain.example",
+                Some("secret-key".to_string()),
+            ));
+
+        let mut ctx = empty_ctx(base_event());
+        ctx.nodes
+            .insert(WRITER_NODE_NAME.to_string(), sample_roadmap_json());
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (url, _body) = stub.last_call().expect("post should have been recorded");
+        assert_eq!(url, "https://brain.example/ingest/proposal");
+
+        let headers = stub
+            .last_headers()
+            .expect("post_with_headers should have been used");
+        assert!(
+            headers.contains(&("X-API-Key".to_string(), "secret-key".to_string())),
+            "headers were: {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_config_and_no_api_key_sends_no_auth_header() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_config(BrainConfig::new("https://brain.example", None));
+
+        let mut ctx = empty_ctx(base_event());
+        ctx.nodes
+            .insert(WRITER_NODE_NAME.to_string(), sample_roadmap_json());
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let headers = stub
+            .last_headers()
+            .expect("post_with_headers should have been used");
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_no_url_and_no_config_errors_when_brain_api_url_is_unset() {
+        // SAFETY: engine-rs's nextest run gives each test its own process,
+        // so mutating process env here cannot race another test's reads.
+        let previous = std::env::var("BRAIN_API_URL").ok();
+        std::env::remove_var("BRAIN_API_URL");
+
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub));
+
+        let mut ctx = empty_ctx(base_event());
+        ctx.nodes
+            .insert(WRITER_NODE_NAME.to_string(), sample_roadmap_json());
+
+        let err = node.process(ctx).await.expect_err("should fail");
+        assert!(err.message.contains("BRAIN_API_URL"));
+
+        if let Some(value) = previous {
+            std::env::set_var("BRAIN_API_URL", value);
+        }
+    }
+
+    #[tokio::test]
     async fn payload_roadmap_investment_round_trips_as_an_object() {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
-        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_url("https://brain.example/ingest/proposal");
 
         let mut ctx = empty_ctx(base_event());
         ctx.nodes
@@ -460,7 +602,9 @@ mod tests {
     #[tokio::test]
     async fn brl_roadmap_content_shows_no_dollar_figure() {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
-        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_url("https://brain.example/ingest/proposal");
 
         let mut ctx = empty_ctx(base_event());
         ctx.nodes
@@ -479,7 +623,9 @@ mod tests {
     #[tokio::test]
     async fn usd_roadmap_content_shows_no_real_figure() {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
-        let node = PersistToBrainNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_url("https://brain.example/ingest/proposal");
 
         let mut usd_roadmap = sample_roadmap_json();
         usd_roadmap["authored_locale"] = json!("en-US");

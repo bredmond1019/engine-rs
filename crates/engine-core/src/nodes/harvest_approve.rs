@@ -35,12 +35,24 @@
 //! never executes, enforced inside `record_decision` itself, not by
 //! convention here. The resolved knob (whether a ledger is configured) is
 //! stamped into this node's `ctx.nodes` result either way.
+//!
+//! `EN.6.K` task 3: this node replays a stored payload to a stored `url` —
+//! a pending-harvest record can target a real Brain endpoint, so it must not
+//! be the one unauthenticated door into `POST /ingest/*`. The `X-API-Key`
+//! header now comes from [`BrainConfig`], resolved from
+//! [`BrainConfig::from_env`] unless overridden via [`Self::with_config`];
+//! when neither is available (no config override and `BRAIN_API_URL` unset)
+//! the POST proceeds with no auth header rather than erroring — the target
+//! `url` is data, not necessarily a Brain endpoint, so a missing Brain
+//! config here is not itself a construction-time failure the way it is for
+//! `PersistToBrainNode`/`RecallNode`, which always target the Brain.
 
 use chrono::{DateTime, Utc};
 use engine_contract::TaskContext;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
+use crate::nodes::brain_client::BrainConfig;
 use crate::nodes::http_post::{http_post_live, HttpPost};
 use crate::operator::ledger::{record_decision, ApprovalLedger, LedgerDecision};
 use crate::workflows::put_result;
@@ -55,6 +67,11 @@ pub const NODE_NAME: &str = "HarvestApproveNode";
 pub struct HarvestApproveNode {
     http_post: std::sync::Arc<dyn HttpPost>,
     ledger: Option<std::sync::Arc<dyn ApprovalLedger>>,
+    /// `BrainConfig` override supplying the `X-API-Key` header sent
+    /// alongside the replayed POST. `None` (the default) resolves
+    /// [`BrainConfig::from_env`] at call time, falling back to no header
+    /// when the environment is also unconfigured (see the module doc).
+    config: Option<BrainConfig>,
 }
 
 impl HarvestApproveNode {
@@ -65,6 +82,7 @@ impl HarvestApproveNode {
         Self {
             http_post: http_post_live(),
             ledger: None,
+            config: None,
         }
     }
 
@@ -83,6 +101,29 @@ impl HarvestApproveNode {
     pub fn with_ledger(mut self, ledger: std::sync::Arc<dyn ApprovalLedger>) -> Self {
         self.ledger = Some(ledger);
         self
+    }
+
+    /// Override the [`BrainConfig`] this node reads the `X-API-Key` header
+    /// from instead of [`BrainConfig::from_env`]. Tests use this to assert
+    /// the header the stub receives.
+    #[must_use]
+    pub fn with_config(mut self, config: BrainConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// The `X-API-Key` header pair to attach to the replayed POST: the
+    /// [`Self::with_config`] override when set, otherwise
+    /// [`BrainConfig::from_env`]'s key when the environment is configured,
+    /// otherwise no header at all (never an error — see the module doc for
+    /// why this node's auth resolution is lenient where
+    /// `PersistToBrainNode`/`RecallNode`'s is not).
+    fn auth_headers(&self) -> Vec<(String, String)> {
+        self.config
+            .clone()
+            .or_else(|| BrainConfig::from_env().ok())
+            .map(|config| config.auth_headers())
+            .unwrap_or_default()
     }
 
     /// Read a required string field off the pending record in `ctx.event`,
@@ -181,9 +222,19 @@ impl Node for HarvestApproveNode {
             }
         }
 
-        let response = self.http_post.post(&url, payload).await.map_err(|err| {
-            NodeError::new(format!("{NODE_NAME}: harvest approval push failed: {err}"))
-        })?;
+        let headers = self.auth_headers();
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+
+        let response = self
+            .http_post
+            .post_with_headers(&url, payload, &header_refs)
+            .await
+            .map_err(|err| {
+                NodeError::new(format!("{NODE_NAME}: harvest approval push failed: {err}"))
+            })?;
 
         let mut ctx = ctx;
         put_result(
@@ -308,6 +359,53 @@ mod tests {
     #[test]
     fn default_constructs_without_panicking() {
         let _node = HarvestApproveNode::default();
+    }
+
+    // ── EN.6.K task 3: X-API-Key on the replayed POST ───────────────────────
+
+    #[tokio::test]
+    async fn with_config_sends_the_api_key_header_on_the_replayed_post() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = HarvestApproveNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_config(crate::nodes::brain_client::BrainConfig::new(
+                "https://brain.example",
+                Some("secret-key".to_string()),
+            ));
+
+        let ctx = ctx_with_event(pending_event());
+        node.process(ctx).await.expect("process should succeed");
+
+        let headers = stub
+            .last_headers()
+            .expect("post_with_headers should have been used");
+        assert!(
+            headers.contains(&("X-API-Key".to_string(), "secret-key".to_string())),
+            "headers were: {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_config_and_no_env_sends_no_auth_header() {
+        // SAFETY: engine-rs's nextest run gives each test its own process,
+        // so mutating process env here cannot race another test's reads.
+        let previous = std::env::var("BRAIN_API_URL").ok();
+        std::env::remove_var("BRAIN_API_URL");
+
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = HarvestApproveNode::new().with_http_post(std::sync::Arc::new(stub.clone()));
+
+        let ctx = ctx_with_event(pending_event());
+        node.process(ctx).await.expect("process should succeed");
+
+        let headers = stub
+            .last_headers()
+            .expect("post_with_headers should have been used");
+        assert!(headers.is_empty());
+
+        if let Some(value) = previous {
+            std::env::set_var("BRAIN_API_URL", value);
+        }
     }
 
     // ── EN.8.C task 3: optional ApprovalLedger wiring ──────────────────────

@@ -17,8 +17,10 @@ description: >
    Default: a plain branch (<spec>-flow) checked out IN THE MAIN WORKING TREE. No
    sparse-checkout worktree, so a relative planning/ symlink (brain-vaulted repos)
    stays intact. main is left on the branch until the PR merges.
-   --worktree: the isolated sparse-checkout worktree under trees/<spec>-flow/ —
-   opt in when you need true isolation (e.g. /sdlc-block fans out parallel children).
+   --worktree: SUSPENDED FLEET-WIDE (D81, 2026-08-23). The engine refuses the flag
+   unconditionally and exits before any setup — no override, no environment escape hatch.
+   Run on a plain branch instead. The sparse-checkout worktree machinery survives
+   intact for when D81 lifts.
 
  A compact, COMMITTED, AUTHORITATIVE state.json + one worklog.md replace the 5×N
  per-stage report files: resume + review + wrap-up read a structured index instead
@@ -30,8 +32,8 @@ description: >
    /sdlc-flow <spec-slug> 1-3              scope to a task range (1-3, 1,3,5, 5)
    /sdlc-flow <spec-slug> --auto-merge     merge the PR + clean up on success
    /sdlc-flow <spec-slug> --no-pr          stop after wrap-up; do not create a PR
-   /sdlc-flow <spec-slug> --worktree       run in an isolated worktree (default: plain branch)
-   /sdlc-flow <spec-slug> --resume         re-attach the branch/worktree, resume from state.json
+   /sdlc-flow <spec-slug> --resume         re-attach the branch, resume from state.json
+   (--worktree is refused per D81 -- do not pass it)
    /sdlc-flow <spec-slug> --test-depth full  run the FULL gating suite per task (default: fast)
 
  PIPELINE
@@ -68,6 +70,31 @@ description: >
  If this prints COMMIT_GUARD_ABORT, STOP — do not run the commit; the index is empty against a
  non-empty HEAD, which is exactly the shape that deletes every tracked file.
 
+ POST-COMMIT WORK ASSERTION (D81 lift condition 2 —
+ BT.ticket.a-run-must-prove-its-commits-contain-the-work) — the COMMIT-SAFETY GUARD above only
+ catches a TOTALLY empty index; it does NOT catch a commit whose index is non-empty but whose
+ content is still wrong — e.g. many undeclared deletions with one surviving file (measured live:
+ EN.11.O, 443 files changed, 177,867 deletions, zero insertions, and it PASSED the guard above).
+ Run this immediately AFTER the PER-TASK work commit in step 3's loop (never before — it reads the
+ commit it is checking), chained with `&&` onto the commit itself, substituting the real task id
+ for `<task-id>` and the real tasks.json path for `<tasks-json-path>`:
+   NAME_STATUS=$(git diff --name-status HEAD~1 HEAD); if [ -z "$NAME_STATUS" ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit diff is EMPTY (condition 1) - no work was committed"; exit 1; fi; WA_DECLARED=$(python3 -c "
+import json
+d = json.load(open('<tasks-json-path>'))
+t = [x for x in d if x.get('task_id') == <task-id>]
+print(chr(10).join(t[0].get('files', []) if t else []))
+"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi
+ It aborts (WORK_ASSERTION_ABORT, nonzero exit) when: (1) the commit's diff is empty; (2) no
+ changed path matches the task's declared `files[]`; (3) the commit DELETES a path that is NOT in
+ `files[]` (the EN.11.O shape — undeclared/collateral deletion). Deleting a file the task DID
+ declare is fine and passes. If this prints WORK_ASSERTION_ABORT, treat the task as FAILED —
+ investigate, fix, and re-commit; do not report success. EXEMPT (never run this check at these
+ sites): the worktree-init commit, the D16 `chore: derive tasks.json ...` fallback commit, the
+ consolidated review-fix commit and the docs commit (neither is scoped to one task's `files[]`),
+ and the vault commit — the vault commits into a different repo whose own HEAD~1 and
+ `planning/`-prefixed paths this check does not attempt to reconcile, and which other concurrent
+ lanes also write to.
+
  GIT ENVIRONMENT STRIP (BT.ticket.worktree-run-can-commit-an-empty-tree, half (a)) — git exports
  nine repository-scoping variables to the hooks it runs, and a hook-spawned process inherits them;
  they OVERRIDE `-C` and cwd, so a later `git commit` can silently build its tree from a stale/foreign
@@ -92,8 +119,17 @@ description: >
 
 When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc-flow.js`. Instead, perform the flow execution yourself:
 
-1. **Worktree Setup**:
-   - Create (or re-attach) the one shared worktree at `trees/<spec-slug>-flow` and checkout branch `sdlc-flow/<spec-slug>`.
+1. **Setup — plain branch only**:
+   - **`--worktree` is REFUSED (D81 worktree moratorium, suspended fleet-wide as of 2026-08-23).** If
+     the invocation includes `--worktree`, stop immediately: report that --worktree is suspended per
+     D81 and the run must use a plain branch (drop the flag and re-invoke). Do NOT create a worktree,
+     a branch, or any commit. This mirrors the real engine, which refuses unconditionally right after
+     parsing the flag, before any setup — see `.claude/workflows/sdlc-flow.js` around the
+     `useWorktree = hasFlag('--worktree')` line. No override flag, no environment escape hatch.
+   - Otherwise (the normal path today): check out branch `sdlc-flow/<spec-slug>` IN THE MAIN WORKING
+     TREE — no sparse-checkout worktree, so a relative `planning/` symlink (brain-vaulted repos) stays
+     intact. (The sparse-checkout worktree recipe under `trees/<spec-slug>-flow/` is left intact in
+     the machinery for when D81 lifts; it is not the normal path today.)
    - **Spec location.** Paths are `planning/<spec-slug>/...` at the git root by default. If no spec
      exists there, ALSO check `<invoking-dir-relative-to-root>/planning/<spec-slug>/...` — a
      sub-brain tier (e.g. `business/`) has its own `planning/` without being its own git repo. The
@@ -142,6 +178,9 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
      - Run the COMMIT-SAFETY GUARD above, `&&`-joined with the commit itself, then commit the task
        state on the branch (`feat: implement <slug> task N`). If a vault commit is also needed
        (D46), run the same guard against `git -C <vault path>` before that commit too.
+     - Immediately after that commit, run the POST-COMMIT WORK ASSERTION above (`&&`-joined onto
+       the commit). A `WORK_ASSERTION_ABORT` means the commit did not actually contain the task's
+       declared work — treat the task as failed and fix/re-commit before proceeding.
 4. **Consolidated End-Review**:
    - Once all tasks are complete, run the full validation/test suite.
    - Run the acceptance criteria check.

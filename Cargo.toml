@@ -27,7 +27,7 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 actix-web = "4"
 async-trait = "0.1"
 futures = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 claude-code-rs = { path = "../claude-code-rs" }
 regex = "1"
 mev = { path = "../mev" }

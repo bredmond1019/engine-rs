@@ -127,11 +127,14 @@ none.
 
 `--isolation auto` resolves as:
 
+**`--worktree` is currently suspended fleet-wide** (`D81-worktree-moratorium`) — the engines refuse
+the flag outright. The table records the D81 answer.
+
 | Repo | Isolation | Why |
 |---|---|---|
-| `base-template` | **`--worktree`, always** | A chain there edits `.claude/workflows/sdlc-*.js` *while those engines are running it*. |
+| `base-template` | **`--no-worktree`** (D81) | D81 refuted the old reason with a mechanism: the Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
 | the brain root (HQ) | **`--no-worktree`, always** | `validate-brain` inside a worktree resolves the gitignored sub-repos against the worktree's own `brain.toml` and they are absent from any checkout. Measured: 64 structure / 601 state errors versus 0/0 in the main tree. Worktree creation is clean — it is the corpus gates that cannot pass. |
-| anything else | `--no-worktree` | Cheaper, and worktrees are safe but rarely needed. Use `--worktree` when a change deserves quarantine. |
+| anything else | `--no-worktree` | Cheaper, and worktrees are safe but rarely needed. |
 
 An explicit `--isolation` that contradicts either of the first two rows → **stop and report.** Do
 not run a chain whose gates cannot pass.
@@ -140,9 +143,10 @@ not run a chain whose gates cannot pass.
 once — it's
 a measurement ("64 structure / 601 state errors versus 0/0 in the main tree") that can go stale the
 moment the corpus or the worktree machinery changes. The same applies to any carryover caveat this
-lane inherits from a prior run or a sibling lane's notes file. Before treating either as fact: run
-the one command that checks it (`./scripts/validate_brain.sh` in a scratch worktree for the isolation
-row; whatever the carryover names for a carried-forward one) and record the result. An orchestration
+lane inherits from a prior run or a sibling lane's notes file. Before treating either as fact:
+re-derive it — the HQ row from a fresh `bastion validate-brain --structure` / `--state` inside a
+real worktree, `base-template`'s from D81 itself, and any carried-forward caveat from whatever the
+carryover names — and record the result. An orchestration
 run inherited at least one caveat that had since changed and planned a block on it — this is the
 same failure class `/generate-roadmap`'s Step 2 exists to close ("Inventory, and re-verify before you
 plan on it"); this step is its equivalent for isolation decisions and carryovers.
@@ -187,6 +191,17 @@ this fleet-concurrency slot release** — delete `<lock_dir>/leases/lease-<repo>
 `<lock_dir>/lane-agents/agent-<agent_name>.json`. All three releases happen together, on success,
 failure, or abandonment, so a reader looking for "what does this lane give back on exit" finds it
 in one place.
+
+**Fleet-exclusive lanes (`exclusive_repos`).** If the lane record's `exclusive_repos` array is
+non-empty, before the first block starts, write an additional `kind: exclusive` lease at
+`<lock_dir>/leases/lease-<repo>.json` for **each** repo named in `exclusive_repos` — same shape as
+any other lease record (`repo`, `lane`, `agent`, `acquired_at`, `kind: exclusive`; no new field).
+While any such lease is held, every other agent's `fleet_concurrency_check.py register` call is
+refused with exit `3` regardless of category or heaviness, so a lane that must run with the fleet
+quiesced can actually hold it — this is admission control only, never pre-emption of a lane
+already running. Remove every lease written this way at lane close — success, failure, or
+abandonment — alongside the ordinary lease and registry releases. `exclusive_repos` is read only
+here; no new field is added to `.claude/workflows/lane.schema.json` or to the lease record.
 
 ## Step 4 — Confirm
 
@@ -243,6 +258,20 @@ not the checker's.
 
 No field is added to `.claude/workflows/lane.schema.json` by this claim — the registry and lease
 records are separate files, not lane-record fields.
+
+**Re-stamp both heartbeats at every block boundary, once `/orchestrate` is running.** The claim
+written here carries `heartbeat`; the lease written here does too. `/orchestrate` rule 10 re-stamps
+both — the claim's `heartbeat` and the lease's `heartbeat` — each time it releases and re-takes the
+lease at a block boundary (do not restate that mechanism here). **At that same re-stamp, if the
+claim carries the optional `current_block` and `block_started_at` fields, update them too** — set
+`current_block` to the id of the block about to start and `block_started_at` to the current time,
+alongside the `heartbeat` write, not as a separate pass. Both fields are optional; a claim without
+them is unaffected. **Leave `started_at` (on the claim) and `acquired_at` (on the lease) alone at
+every re-stamp** — those are acquisition timestamps set once, here, at first claim; re-stamping them
+on a later heartbeat destroys the record of when the claim or lease was actually taken. **This is a
+different clock from Step 3's fleet-concurrency re-registration above** — that heartbeat refreshes
+the separate `<lock_dir>/fleet-concurrency/...` entry (a different file, on its own TTL clock) and
+does nothing to the claim's or lease's `heartbeat`; the two must not be conflated.
 
 Then run `/orchestrate <chain> <isolation-flag> [--engine ...] [--continue-on-fail]`.
 
@@ -411,11 +440,21 @@ work that has to be redone.
 
 ## Before finishing
 
-Run this repo's own gates from `planning/harness.json`, then the corpus gate from `BRAIN_ROOT`:
+Run this repo's own gates from `planning/harness.json`, then the corpus gate from `BRAIN_ROOT`.
+Use the four read-only checks, **one invocation per flag** — `validate-brain`'s flags do not
+compose (`main.rs` is an if/else-if chain, first flag wins; passing more than one silently runs
+only the highest-precedence one and reports a real, passing result for a check that never ran):
 
 ```
-./scripts/validate_brain.sh
+bastion validate-brain --state
+bastion validate-brain --graph
+bastion validate-brain --links
+bastion validate-brain --structure
 ```
+
+`./scripts/validate_brain.sh` is **not** this check — on a `primary` host it ends in an
+`emit-state --write`, a commit, and a `git push` (see `derive-state-safely`), so using it as a
+closing verification commits and pushes whatever the shared index holds, not just this lane's work.
 
 Concurrent lanes pushing into one corpus is the exact condition that accumulated 32
 `validate-brain` errors across four lanes and blocked pushes fleet-wide.

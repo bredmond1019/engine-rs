@@ -45,6 +45,17 @@
       "format": "date-time",
       "description": "ISO-8601 timestamp with timezone, updated periodically while the agent is alive. The staleness signal: a heartbeat older than the checker's threshold is how BT.6.D detects an abandoned lane versus a merely slow one, once joined against ListAgents liveness.",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "current_block": {
+      "type": "string",
+      "description": "OPTIONAL. The block id this lane is currently working on (e.g. 'BT.ticket.lanes-do-not-record-their-current-block'), re-stamped at each block boundary alongside heartbeat. Absent on every claim written before this field existed -- a drain must treat absence as 'no signal', never as an error, and fall back to the ListAgents liveness floor alone.",
+      "minLength": 1
+    },
+    "block_started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "OPTIONAL. ISO-8601 timestamp with timezone marking when the CURRENT block (named by current_block) started -- distinct from started_at, which marks when the lane itself was claimed and never moves. Re-stamped at each block boundary alongside heartbeat. Lets a caller distinguish 'three minutes into a block' (slow, not stuck) from 'three hours into a block' (a candidate), refining the heartbeat-staleness signal rather than replacing it.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
     }
   }
 }

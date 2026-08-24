@@ -1,6 +1,6 @@
 //! `PersistToBrainNode` — the terminal, harvest-gate-governed push of a
-//! `LearningArtifact` to Synapse `POST /ingest/*` (EN.5.A task 11; D51: no
-//! embedding or pgvector in engine-rs — this seam only POSTs).
+//! `LearningArtifact` to Synapse `POST /ingest/artifact` (EN.5.A task 11;
+//! D51: no embedding or pgvector in engine-rs — this seam only POSTs).
 //!
 //! EN.4.C pattern (mirrors `proposal_generator::persist_to_brain`):
 //! `with_http_post`/`with_url` builders, live default `http_post_live()`.
@@ -13,6 +13,20 @@
 //! this node in the declared `CONTENT_PIPELINE` graph (task 6): the source
 //! `.md` is written before this node's Synapse push, so a failed push no
 //! longer costs the run its written document (D53).
+//!
+//! `EN.6.K` task 3: Synapse never served `/ingest/learning` — this node now
+//! POSTs to the real `POST /ingest/artifact` route ([`docs/data-contract.md`]
+//! consumer copy), mapping the `LearningArtifact` shape into that route's
+//! generic envelope via [`learning_artifact_to_ingest_payload`]:
+//! `{artifact_id, doc_type: "learning-artifact", content: digest_markdown,
+//! metadata: {channel_type, source_ref, entities, language, summary}}`. The
+//! envelope's optional `section`/`project`/`title`/`description` fields are
+//! omitted — a `LearningArtifact` carries no data for them. Synapse
+//! currently *discards* the `metadata` field entirely (acceptable: `content`
+//! is what gets embedded); it is still sent so a future Synapse route
+//! upgrade can start reading it without an engine-rs-side change. Base
+//! URL/`X-API-Key` now come from [`BrainConfig`] instead of a hardcoded
+//! `localhost:8000` const, mirroring `proposal_generator::persist_to_brain`.
 //!
 //! `EN.7.C` task 4: this node is now the execution site of the generic
 //! `crate::nodes::harvest_gate::HarvestGate` every pipeline inherits. The
@@ -51,7 +65,10 @@
 use engine_contract::TaskContext;
 use serde_json::json;
 
+use serde_json::Value;
+
 use crate::node::{Node, NodeError};
+use crate::nodes::brain_client::BrainConfig;
 use crate::nodes::harvest_gate::{pending_harvest_record, HarvestDecision, HarvestGate};
 use crate::nodes::http_post::{http_post_live, HttpPost};
 use crate::nodes::materialize_doc;
@@ -63,31 +80,72 @@ use super::learning_artifact::build_learning_artifact_payload;
 /// `ctx.nodes` key its result is stamped onto.
 pub const NODE_NAME: &str = "PersistToBrainNode";
 
-/// The Synapse brain ingest endpoint this node POSTs to (`OR.Q`,
-/// `POST /ingest/*`). Not configurable via `ContentPipelinePolicy` — the
-/// endpoint address is deployment topology, not a per-run policy knob. Live
-/// ingest URL is a placeholder until Synapse `OR.Q` wiring lands (same
-/// status as EN.4.C); tests stub `HttpPost`, so this does not gate the
-/// block.
-const BRAIN_INGEST_URL: &str = "http://localhost:8000/ingest/learning";
+/// The `doc_type` this node always sends on the `POST /ingest/artifact`
+/// envelope — Synapse serves no dedicated learning-artifact route, so this
+/// value is what distinguishes a content-pipeline artifact from any other
+/// `doc_type` the generic route accepts.
+const DOC_TYPE: &str = "learning-artifact";
+
+/// The path this node POSTs to, joined onto [`BrainConfig::base_url`]
+/// (`OR.Q`, `POST /ingest/artifact` — Synapse serves no `/ingest/learning`
+/// route). Not configurable via `ContentPipelinePolicy` — the endpoint
+/// address is deployment topology, not a per-run policy knob.
+const BRAIN_INGEST_PATH: &str = "/ingest/artifact";
+
+/// Map [`build_learning_artifact_payload`]'s seven-field `LearningArtifact`
+/// shape (`{artifact_id, channel_type, source_ref, summary,
+/// digest_markdown, entities, language}`) into `POST /ingest/artifact`'s
+/// generic envelope: `{artifact_id, doc_type, content, metadata}`, where
+/// `content` is the digest markdown (what Synapse embeds) and `metadata`
+/// carries the remaining fields so a future Synapse read of `metadata` has
+/// them available (Synapse currently discards `metadata` — acceptable,
+/// `content` is what gets embedded). The envelope's optional
+/// `section`/`project`/`title`/`description` fields are omitted: a
+/// `LearningArtifact` carries no data for any of them.
+fn learning_artifact_to_ingest_payload(learning_artifact: &Value) -> Value {
+    serde_json::json!({
+        "artifact_id": learning_artifact["artifact_id"],
+        "doc_type": DOC_TYPE,
+        "content": learning_artifact["digest_markdown"],
+        "metadata": {
+            "channel_type": learning_artifact["channel_type"],
+            "source_ref": learning_artifact["source_ref"],
+            "entities": learning_artifact["entities"],
+            "language": learning_artifact["language"],
+            "summary": learning_artifact["summary"],
+        },
+    })
+}
 
 /// The terminal node that POSTs the finished `ContentPipelineOutput` to the
 /// brain ingest endpoint over the injectable `HttpPost` seam. No forward
 /// connection in EN.5.A.
 pub struct PersistToBrainNode {
     http_post: std::sync::Arc<dyn HttpPost>,
-    url: String,
+    /// Full target URL override. `None` (the production default) derives
+    /// the URL from [`BrainConfig::base_url`] + [`BRAIN_INGEST_PATH`] at
+    /// call time; tests set this directly to assert on an exact stub URL
+    /// without also having to construct a [`BrainConfig`].
+    url: Option<String>,
+    /// `BrainConfig` override. `None` (the production default) resolves
+    /// [`BrainConfig::from_env`] at call time — a missing `BRAIN_API_URL`
+    /// then surfaces as a `NodeError` naming the env var, not a silent
+    /// unauthenticated POST. Tests set this to assert the `X-API-Key`
+    /// header the stub receives.
+    config: Option<BrainConfig>,
     harvest: HarvestGate,
 }
 
 impl PersistToBrainNode {
-    /// Construct with the live `reqwest`-backed `HttpPost` impl, POSTing to
-    /// [`BRAIN_INGEST_URL`].
+    /// Construct with the live `reqwest`-backed `HttpPost` impl. The target
+    /// URL and `X-API-Key` header are resolved from [`BrainConfig::from_env`]
+    /// unless overridden via [`Self::with_url`] / [`Self::with_config`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             http_post: http_post_live(),
-            url: BRAIN_INGEST_URL.to_string(),
+            url: None,
+            config: None,
             harvest: HarvestGate::default(),
         }
     }
@@ -101,11 +159,22 @@ impl PersistToBrainNode {
     }
 
     /// Override the target URL. Tests use this to assert on the exact URL
-    /// the stub was POSTed to; production code leaves it at
-    /// [`BRAIN_INGEST_URL`].
+    /// the stub was POSTed to without needing to also override
+    /// [`BrainConfig`] — production code leaves this unset and derives the
+    /// URL from [`BrainConfig::base_url`] + [`BRAIN_INGEST_PATH`].
     #[must_use]
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
-        self.url = url.into();
+        self.url = Some(url.into());
+        self
+    }
+
+    /// Override the [`BrainConfig`] (base URL / `X-API-Key`) this node
+    /// resolves instead of reading `BRAIN_API_URL`/`BRAIN_API_KEY` from the
+    /// environment. Tests use this to assert the `X-API-Key` header the
+    /// stub receives.
+    #[must_use]
+    pub fn with_config(mut self, config: BrainConfig) -> Self {
+        self.config = Some(config);
         self
     }
 
@@ -116,6 +185,39 @@ impl PersistToBrainNode {
     pub fn with_harvest(mut self, gate: HarvestGate) -> Self {
         self.harvest = gate;
         self
+    }
+
+    /// Resolve `(url, headers)` for this call — same precedence as
+    /// `proposal_generator::persist_to_brain::PersistToBrainNode::resolve_target`:
+    /// an explicit [`Self::with_url`] always wins for the URL; the
+    /// `X-API-Key` header comes from [`Self::with_config`] when set,
+    /// otherwise [`BrainConfig::from_env`] — falling back to no header
+    /// (rather than erroring) only when neither a URL nor a config override
+    /// is set and the environment is also unconfigured, which keeps every
+    /// pre-`EN.6.K` caller that only overrides `with_url` (no live Brain,
+    /// stub-only) working unchanged.
+    fn resolve_target(&self) -> Result<(String, Vec<(String, String)>), NodeError> {
+        match (&self.url, &self.config) {
+            (Some(url), Some(config)) => Ok((url.clone(), config.auth_headers())),
+            (Some(url), None) => Ok((url.clone(), Vec::new())),
+            (None, Some(config)) => Ok((
+                format!(
+                    "{}{BRAIN_INGEST_PATH}",
+                    config.base_url.trim_end_matches('/')
+                ),
+                config.auth_headers(),
+            )),
+            (None, None) => {
+                let config = BrainConfig::from_env()
+                    .map_err(|err| NodeError::new(format!("{NODE_NAME}: {err}")))?;
+                let url = format!(
+                    "{}{BRAIN_INGEST_PATH}",
+                    config.base_url.trim_end_matches('/')
+                );
+                let headers = config.auth_headers();
+                Ok((url, headers))
+            }
+        }
     }
 }
 
@@ -132,17 +234,30 @@ impl Node for PersistToBrainNode {
         // must not fork by harvest mode, which is what makes a deferred
         // (`approval`) push byte-identical to what an `in_process` push
         // would have sent.
-        let payload = build_learning_artifact_payload(&ctx)?;
-        let artifact_id = payload["artifact_id"].clone();
+        let learning_artifact = build_learning_artifact_payload(&ctx)?;
+        let artifact_id = learning_artifact["artifact_id"].clone();
+        // `EN.6.K` task 3: map the shared `LearningArtifact` shape into
+        // `POST /ingest/artifact`'s generic envelope once, unconditionally
+        // — the payload sent in every mode (an attempted `in_process` POST
+        // or a deferred `approval` pending record) is this mapped envelope,
+        // never the raw seven-field shape, so a completed deferred harvest
+        // stays byte-identical to what an in-process push would have sent.
+        let payload = learning_artifact_to_ingest_payload(&learning_artifact);
         let harvest_mode = self.harvest.mode();
 
         let mut ctx = ctx;
 
         match self.harvest.decide() {
             HarvestDecision::Post => {
+                let (url, headers) = self.resolve_target()?;
+                let header_refs: Vec<(&str, &str)> = headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect();
+
                 let response = self
                     .http_post
-                    .post(&self.url, payload)
+                    .post_with_headers(&url, payload, &header_refs)
                     .await
                     .map_err(|err| {
                         NodeError::new(format!("{NODE_NAME}: brain ingest push failed: {err}"))
@@ -189,9 +304,9 @@ impl Node for PersistToBrainNode {
                     })
                     .unwrap_or_default();
 
+                let (url, _headers) = self.resolve_target()?;
                 let artifact_id_str = artifact_id.as_str().unwrap_or_default().to_string();
-                let pending =
-                    pending_harvest_record(artifact_id_str, self.url.clone(), payload, doc_paths);
+                let pending = pending_harvest_record(artifact_id_str, url, payload, doc_paths);
 
                 put_result(
                     &mut ctx,
@@ -275,11 +390,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_posts_the_expected_learning_artifact_payload() {
+    async fn process_posts_the_expected_ingest_artifact_envelope() {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub.clone()))
-            .with_url("https://brain.example/ingest/learning")
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::InProcess));
 
         let mut ctx = empty_ctx(base_event(false));
@@ -289,34 +404,42 @@ mod tests {
         let ctx = node.process(ctx).await.expect("process should succeed");
 
         let (url, body) = stub.last_call().expect("post should have been recorded");
-        assert_eq!(url, "https://brain.example/ingest/learning");
+        assert_eq!(url, "https://brain.example/ingest/artifact");
 
         let object = body.as_object().expect("payload is an object");
         assert_eq!(
             object.keys().cloned().collect::<BTreeSet<_>>(),
+            ["artifact_id", "doc_type", "content", "metadata"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+        assert_eq!(body["artifact_id"], json!("artifact-1"));
+        assert_eq!(body["doc_type"], json!("learning-artifact"));
+        assert_eq!(body["content"], json!("# Digest\n\nA concise summary."));
+
+        let metadata = body["metadata"].as_object().expect("metadata is an object");
+        assert_eq!(
+            metadata.keys().cloned().collect::<BTreeSet<_>>(),
             [
-                "artifact_id",
                 "channel_type",
                 "source_ref",
-                "summary",
-                "digest_markdown",
                 "entities",
                 "language",
+                "summary",
             ]
             .iter()
             .map(|s| s.to_string())
             .collect()
         );
-        assert_eq!(body["artifact_id"], json!("artifact-1"));
-        assert_eq!(body["channel_type"], json!("web_article"));
-        assert_eq!(body["source_ref"], json!("https://example.com/a"));
-        assert_eq!(body["summary"], json!("A concise summary."));
+        assert_eq!(body["metadata"]["channel_type"], json!("web_article"));
         assert_eq!(
-            body["digest_markdown"],
-            json!("# Digest\n\nA concise summary.")
+            body["metadata"]["source_ref"],
+            json!("https://example.com/a")
         );
-        assert_eq!(body["entities"], json!(["Acme Corp"]));
-        assert_eq!(body["language"], json!("en"));
+        assert_eq!(body["metadata"]["entities"], json!(["Acme Corp"]));
+        assert_eq!(body["metadata"]["language"], json!("en"));
+        assert_eq!(body["metadata"]["summary"], json!("A concise summary."));
 
         let result = &ctx.nodes[NODE_NAME];
         assert_eq!(result["posted"], json!(true));
@@ -328,17 +451,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_posts_a_body_identical_to_the_shared_builder_output() {
+    async fn process_posts_a_body_that_is_the_mapped_shared_builder_output() {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::InProcess));
 
         let mut ctx = empty_ctx(base_event(false));
         put_result(&mut ctx, digest_render::NODE_NAME, output_json(false));
         put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
 
-        let expected = build_learning_artifact_payload(&ctx).expect("builder should succeed");
+        let learning_artifact =
+            build_learning_artifact_payload(&ctx).expect("builder should succeed");
+        let expected = learning_artifact_to_ingest_payload(&learning_artifact);
 
         node.process(ctx).await.expect("process should succeed");
 
@@ -347,10 +473,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_config_derives_the_ingest_artifact_url_and_sends_the_api_key_header() {
+        let stub = StubHttpPost::succeeding(json!({"ok": true}));
+        let node = PersistToBrainNode::new()
+            .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_config(BrainConfig::new(
+                "https://brain.example",
+                Some("secret-key".to_string()),
+            ))
+            .with_harvest(HarvestGate::new(HarvestMode::InProcess));
+
+        let mut ctx = empty_ctx(base_event(false));
+        put_result(&mut ctx, digest_render::NODE_NAME, output_json(false));
+        put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
+
+        node.process(ctx).await.expect("process should succeed");
+
+        let (url, _body) = stub.last_call().expect("post should have been recorded");
+        assert_eq!(url, "https://brain.example/ingest/artifact");
+
+        let headers = stub
+            .last_headers()
+            .expect("post_with_headers should have been used");
+        assert!(
+            headers.contains(&("X-API-Key".to_string(), "secret-key".to_string())),
+            "headers were: {headers:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_uses_target_lang_when_translated_markdown_is_present() {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::InProcess));
 
         let mut event = base_event(true);
@@ -362,7 +518,7 @@ mod tests {
         node.process(ctx).await.expect("process should succeed");
 
         let (_url, body) = stub.last_call().expect("post should have been recorded");
-        assert_eq!(body["language"], json!("pt-BR"));
+        assert_eq!(body["metadata"]["language"], json!("pt-BR"));
     }
 
     #[tokio::test]
@@ -370,6 +526,7 @@ mod tests {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub.clone()))
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::InProcess));
 
         let mut ctx = empty_ctx(base_event(false));
@@ -387,7 +544,7 @@ mod tests {
         node.process(ctx).await.expect("process should succeed");
 
         let (_url, body) = stub.last_call().expect("post should have been recorded");
-        assert_eq!(body["source_ref"], json!("yt:abc123"));
+        assert_eq!(body["metadata"]["source_ref"], json!("yt:abc123"));
     }
 
     #[tokio::test]
@@ -395,6 +552,7 @@ mod tests {
         let stub = StubHttpPost::failing("brain endpoint unreachable");
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub))
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::InProcess));
 
         let mut ctx = empty_ctx(base_event(false));
@@ -501,7 +659,7 @@ mod tests {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub.clone()))
-            .with_url("https://brain.example/ingest/learning")
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::Approval));
 
         let mut ctx = empty_ctx(base_event(false));
@@ -520,8 +678,9 @@ mod tests {
             }),
         );
 
-        let expected_payload =
+        let expected_learning_artifact =
             build_learning_artifact_payload(&ctx).expect("builder should succeed");
+        let expected_payload = learning_artifact_to_ingest_payload(&expected_learning_artifact);
 
         let ctx = node.process(ctx).await.expect("process should succeed");
 
@@ -536,7 +695,7 @@ mod tests {
         assert_eq!(pending["artifact_id"], json!("artifact-1"));
         assert_eq!(
             pending["url"],
-            json!("https://brain.example/ingest/learning")
+            json!("https://brain.example/ingest/artifact")
         );
         assert_eq!(pending["payload"], expected_payload);
         assert_eq!(
@@ -550,6 +709,7 @@ mod tests {
         let stub = StubHttpPost::succeeding(json!({"ok": true}));
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub))
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::Approval));
 
         let mut ctx = empty_ctx(base_event(false));
@@ -585,6 +745,7 @@ mod tests {
             let stub = StubHttpPost::succeeding(json!({"ok": true}));
             let node = PersistToBrainNode::new()
                 .with_http_post(std::sync::Arc::new(stub))
+                .with_url("https://brain.example/ingest/artifact")
                 .with_harvest(HarvestGate::new(mode));
 
             let mut ctx = empty_ctx(base_event(false));
@@ -608,6 +769,7 @@ mod tests {
         let stub = StubHttpPost::failing("brain endpoint unreachable");
         let node = PersistToBrainNode::new()
             .with_http_post(std::sync::Arc::new(stub))
+            .with_url("https://brain.example/ingest/artifact")
             .with_harvest(HarvestGate::new(HarvestMode::InProcess));
 
         let mut ctx = empty_ctx(base_event(false));

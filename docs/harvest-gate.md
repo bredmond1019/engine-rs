@@ -113,7 +113,7 @@ node that completes one (`HarvestApproveNode`) so the two can never drift:
 ```json
 {
   "artifact_id": "artifact-1",
-  "url": "http://localhost:8000/ingest/learning",
+  "url": "http://localhost:8000/ingest/artifact",
   "payload": { "...": "the exact body an in_process push would have POSTed" },
   "doc_paths": ["brain/content/learning/artifact-1.md"]
 }
@@ -143,7 +143,7 @@ Content-Type: application/json
   "workflow_type": "HARVEST_APPROVE",
   "data": {
     "artifact_id": "artifact-1",
-    "url": "http://localhost:8000/ingest/learning",
+    "url": "http://localhost:8000/ingest/artifact",
     "payload": { "...": "..." },
     "doc_paths": ["brain/content/learning/artifact-1.md"]
   }

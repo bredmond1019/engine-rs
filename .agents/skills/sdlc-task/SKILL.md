@@ -39,16 +39,17 @@ description: >
 
  ISOLATION
    Default: IN PLACE on the current branch (no worktree) — cheapest, like /sdlc-run.
-   --worktree: run in an isolated git worktree on its own branch (you integrate the
-   branch yourself when ready). Opt-in only.
+   --worktree: SUSPENDED FLEET-WIDE (D81, 2026-08-23). The engine refuses the flag
+   unconditionally and exits before any setup — no override, no environment escape hatch.
+   Run on a plain branch instead. The worktree machinery survives intact for when D81 lifts.
 
  USAGE
    /sdlc-task <spec-slug>                 run every task in the spec, in place
    /sdlc-task <spec-slug> 2               run only task 2
    /sdlc-task <spec-slug> 1-3             run a task range (1-3, 1,3,5, 5)
-   /sdlc-task <spec-slug> 2 --worktree    run task 2 in an isolated worktree/branch
    /sdlc-task <spec-slug> --resume        resume from the committed state file
    /sdlc-task <spec-slug> --test-depth full  full gating suite per task (default: fast)
+   (--worktree is refused per D81 -- do not pass it)
 
  PIPELINE
    setup (locate repo / create worktree) → enumerate (D16 lint) → [resume load]
@@ -91,6 +92,30 @@ description: >
    if git rev-parse --verify -q HEAD >/dev/null; then TRACKED=$(git ls-tree -r HEAD --name-only | wc -l | tr -d ' '); STAGED=$(git ls-files -s | wc -l | tr -d ' '); if [ "$TRACKED" -gt 0 ] && [ "$STAGED" -eq 0 ]; then echo "COMMIT_GUARD_ABORT: index holds 0 entries but HEAD tracks $TRACKED files - refusing to commit a tree that deletes everything (BT.ticket.worktree-run-can-commit-an-empty-tree)"; exit 1; fi; fi
  If this prints COMMIT_GUARD_ABORT, STOP — do not run the commit; the index is empty against a
  non-empty HEAD, which is exactly the shape that deletes every tracked file.
+
+ POST-COMMIT WORK ASSERTION (D81 lift condition 2 —
+ BT.ticket.a-run-must-prove-its-commits-contain-the-work) — the COMMIT-SAFETY GUARD above only
+ catches a TOTALLY empty index; it does NOT catch a commit whose index is non-empty but whose
+ content is still wrong — e.g. many undeclared deletions with one surviving file (measured live:
+ EN.11.O, 443 files changed, 177,867 deletions, zero insertions, and it PASSED the guard above).
+ Run this immediately AFTER every PER-TASK work commit in step 7 (never before — it reads the
+ commit it is checking), chained with `&&` onto the commit itself, substituting the real task id
+ for `<task-id>` and the real tasks.json path for `<tasks-json-path>`:
+   NAME_STATUS=$(git diff --name-status HEAD~1 HEAD); if [ -z "$NAME_STATUS" ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit diff is EMPTY (condition 1) - no work was committed"; exit 1; fi; WA_DECLARED=$(python3 -c "
+import json
+d = json.load(open('<tasks-json-path>'))
+t = [x for x in d if x.get('task_id') == <task-id>]
+print(chr(10).join(t[0].get('files', []) if t else []))
+"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi
+ It aborts (WORK_ASSERTION_ABORT, nonzero exit) when: (1) the commit's diff is empty; (2) no
+ changed path matches the task's declared `files[]`; (3) the commit DELETES a path that is NOT in
+ `files[]` (the EN.11.O shape — undeclared/collateral deletion). Deleting a file the task DID
+ declare is fine and passes. If this prints WORK_ASSERTION_ABORT, treat the task as FAILED —
+ investigate, fix, and re-commit; do not report success. EXEMPT (never run this check at these
+ sites): the worktree-init commit, the two D16 `chore: derive tasks.json ...` fallback commits, and
+ the vault commit (step 7b) — the vault commits into a different repo whose own HEAD~1 and
+ `planning/`-prefixed paths this check does not attempt to reconcile, and which other concurrent
+ lanes also write to.
 
  GIT ENVIRONMENT STRIP (BT.ticket.worktree-run-can-commit-an-empty-tree, half (a)) — git exports
  nine repository-scoping variables to the hooks it runs, and a hook-spawned process inherits them;
@@ -139,13 +164,26 @@ only this section — not the `.js` — should end up doing exactly what the rea
   range (`1-3`), a comma list (`1,3,5`), or a mix (`1-3,7`). Parse into the sorted set of integers it
   names; if it doesn't match `\d+(-\d+)?` per comma-part, or names nothing, stop and report an error —
   do not guess.
-- `--worktree` — opt-in isolation (default is in-place on the current branch).
+- `--worktree` — **REFUSED (D81 worktree moratorium, suspended fleet-wide as of 2026-08-23).** If
+  `--worktree` is present, stop immediately: report that --worktree is suspended per D81 and the run
+  must use a plain branch (drop the flag and re-invoke). Do NOT proceed to Step 1, do NOT create a
+  worktree, a branch, or any commit. This mirrors the real engine, which refuses unconditionally
+  right after parsing the flag, before any setup — see `.claude/workflows/sdlc-task.js` around the
+  `useWorktree = hasFlag('--worktree')` line. No override flag, no environment escape hatch: an
+  escape hatch would make the moratorium documentation again, which is the exact failure D81 names.
+  The worktree machinery below (Steps 1b/1c) is left intact for when D81 lifts — it is not the
+  normal path today.
 - `--resume` — resume from the on-disk `sdlc-task-state.json`, reusing the existing worktree/branch by
   name and skipping the D19 thin-spec gate (see Step 1).
 - `--test-depth fast|full` — default `fast` (only `gates:true`-and-not-`perTask:false` checks run per
   task); `full` runs the whole harness suite on every task. Reject any other value.
 
 ### Step 1 — Setup: locate the repo, or create the isolated worktree
+
+**Reached only when `--worktree` was NOT passed** — Step 0 already refused and stopped if it was.
+Every worktree-mode branch below (`--worktree` fresh create, reuse, re-attach, Steps 1b/1c) is
+therefore dead code under the moratorium, kept only so the machinery is intact for when D81 lifts;
+go straight to "In-place mode" below.
 
 Run everything below from the **main repo root** unless noted.
 
@@ -400,6 +438,11 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
      ```
      (fix pass: `fix: fix pass <attempt-1> for <stem>`, e.g. attempt 2's fix commit reads
      `fix: fix pass 1 for <stem>`.) Capture the short hash via `git log --oneline -1`.
+   - **Post-commit work assertion.** Immediately after the commit above lands, run the POST-COMMIT
+     WORK ASSERTION `&&`-joined onto it, with `<task-id>` = this `taskNum` and `<tasks-json-path>` =
+     `<tasksJsonFile>`. `WORK_ASSERTION_ABORT` means the task FAILED — the commit does not actually
+     contain (or over-reaches beyond) the task's declared `files[]`; fix and re-commit, do not report
+     success.
    - **Vault-aware commit (D46 — if planning/ is a vaulted symlink)**: Planning/ is a relative symlink pointing to
      a brain-owned vault repository (e.g., agentic-portfolio HQ). Its bytes live at a DIFFERENT git repo,
      invisible to the commit made above. If this attempt created or edited ANY file under planning/

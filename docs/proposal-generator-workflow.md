@@ -238,14 +238,14 @@ live network call happens in tests) to POST the payload. Non-2xx responses surfa
 `NodeError` — there is no fallback target for a failed brain push. On success it stamps
 `{"posted": true, "status", "artifact_id", "response"}` onto `ctx`.
 
-**Not yet wired to a real endpoint.** `PersistToBrainNode::new()` currently POSTs to a
-hardcoded placeholder `BRAIN_INGEST_URL` constant (`http://localhost:8000/ingest/proposal`) —
-`ProposalGeneratorPolicy` carries no endpoint knob. The canonical target is Synapse's
-`POST /ingest/proposal` (brain block `OR.Q`, pinned in [data-contract.md](data-contract.md)),
-which matches this payload shape exactly and returns `200 {artifact_id, chunks_written}`.
-Pointing `PersistToBrainNode` at the real endpoint (and/or exposing it as a policy/deployment
-knob) is open follow-on work. `with_url(...)` exists alongside `with_http_post(...)` so tests
-and future callers can override the target without touching the constant.
+**Wired to the real endpoint (`EN.6.K`).** `PersistToBrainNode` no longer POSTs to a hardcoded
+placeholder. The URL/`X-API-Key` header are resolved from `crate::nodes::brain_client::BrainConfig`
+(`BrainConfig::from_env`, reading `BRAIN_API_URL`/`BRAIN_API_KEY`) joined with the fixed path
+`/ingest/proposal` — the canonical target is Synapse's `POST /ingest/proposal` (brain block
+`OR.Q`, pinned in [data-contract.md](data-contract.md)), which matches this payload shape exactly
+and returns `200 {artifact_id, chunks_written}`. `ProposalGeneratorPolicy` still carries no
+endpoint knob; `with_url(...)` and `with_config(...)` exist alongside `with_http_post(...)` so
+tests and future callers can override the target without touching env.
 
 Per THE BOUNDARY TEST, this node only POSTs — no embedding model is loaded, no `pgvector`
 connection is opened, and no corpus table is written from this repo. What happens behind the

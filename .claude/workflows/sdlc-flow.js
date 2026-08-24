@@ -224,6 +224,33 @@ function renderCommitSafetyGuard(gitCmd = 'git') {
   return `if ${gitCmd} rev-parse --verify -q HEAD >/dev/null; then TRACKED=$(${gitCmd} ls-tree -r HEAD --name-only | wc -l | tr -d ' '); STAGED=$(${gitCmd} ls-files -s | wc -l | tr -d ' '); if [ "$TRACKED" -gt 0 ] && [ "$STAGED" -eq 0 ]; then echo "COMMIT_GUARD_ABORT: index holds 0 entries but HEAD tracks $TRACKED files - refusing to commit a tree that deletes everything (BT.ticket.worktree-run-can-commit-an-empty-tree)"; exit 1; fi; fi`
 }
 
+// Post-commit work assertion (D81 lift condition 2 — BT.ticket.a-run-must-prove-its-commits-contain-the-work).
+// renderCommitSafetyGuard() above fires only on a TOTALLY empty index (TRACKED>0 && STAGED==0); EN.11.O had a
+// NON-EMPTY index full of deletions (443 files, 177,867 deletions, zero insertions) and sailed straight through
+// it. This is the complement: it runs AFTER the task's own work commit (never before — HEAD~1 must exist), reads
+// tasksJsonPath itself at RUN TIME (never a JS-side static file list — the engine never parses tasks.json's
+// `files[]`, only the agent does) to get task `taskNum`'s declared files[], then aborts when ANY of:
+//   (1) the commit's diff (git diff --name-status HEAD~1 HEAD) is EMPTY;
+//   (2) NO changed path matches any declared file — condition (2);
+//   (3) the commit DELETES ("D" status) a path that is NOT a declared file — the EN.11.O shape, condition (3).
+// Deletion is not itself the signal: a task that deletes a file it DECLARED passes condition (3) cleanly, since
+// that path is matched in WA_DECLARED. Diagnostic names the task and the failing condition, plus both path sets.
+// EXEMPT (by simply never being called at their commit sites, same idiom renderCommitSafetyGuard already uses
+// for the worktree-init commit): the worktree-init commit, the D16 `chore: derive tasks.json ...` fallback
+// commits, and the vault commit (step 7b) — the vault commits into a DIFFERENT repo where HEAD is the vault's
+// own and files[] entries are `planning/`-prefixed; comparing that commit's diff would need a second, foreign
+// HEAD~1 that may not exist yet in a freshly-adopted vault checkout and that other concurrent lanes also write
+// to, so a false WORK_ASSERTION_ABORT there would block an honest vault commit on a shared repo it does not
+// fully control. Exempted outright rather than compared.
+function renderWorkAssertion(gitCmd = 'git', taskNum, tasksJsonPath) {
+  return `NAME_STATUS=$(${gitCmd} diff --name-status HEAD~1 HEAD); if [ -z "$NAME_STATUS" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit diff is EMPTY (condition 1) - no work was committed"; exit 1; fi; WA_DECLARED=$(python3 -c "
+import json
+d = json.load(open('${tasksJsonPath}'))
+t = [x for x in d if x.get('task_id') == ${taskNum}]
+print(chr(10).join(t[0].get('files', []) if t else []))
+"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi`
+}
+
 // Given a stage's self-reported filesModified (repo-root-relative) and a resolved vault, return the
 // vault-relative subset (the part of the path after "planning/") that needs an independent
 // vault-commit check. Derived from what the stage ACTUALLY wrote — never a hard-coded filename list.
@@ -242,6 +269,10 @@ const resumeMode    = hasFlag('--resume')
 // planning/ symlink intact — worktrees break it). --worktree opts back into the isolated sparse-checkout
 // worktree (needed for true isolation).
 const useWorktree   = hasFlag('--worktree')
+if (useWorktree) {
+  log(`ERROR: --worktree is suspended fleet-wide (D81). Run on a plain branch instead -- drop the --worktree flag and re-invoke. See docs/decisions/D81-worktree-moratorium.md.`)
+  return { error: 'worktree moratorium (D81)', blockId }
+}
 
 const VALID_TEST_DEPTHS = ['fast', 'full']
 const testDepthFlag = flagStr('--test-depth')
@@ -1854,6 +1885,12 @@ ${isFix ? `fix: fix pass ${attempt - 1} for ${stem}` : `feat: implement ${stem}`
 EOF
 )"
    Run: cd ${worktreePath} && ${GIT} log --oneline -1   (capture the short hash)
+
+7a. Post-commit work assertion (D81 lift condition 2) — prove this commit actually contains Task
+   ${taskNum}'s declared work, not the absence of it:
+   Run: cd ${worktreePath} && ${renderWorkAssertion('git', taskNum, tasksJsonFile)}
+   If this prints WORK_ASSERTION_ABORT, the commit failed the check — treat this as a task failure
+   (investigate, fix, and re-commit) before proceeding; do NOT report success with a failing assertion.
 ${vault.vaulted ? `
 7b. planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a DIFFERENT git
     repo, invisible to the commit you just made in step 7. If this attempt created or edited ANY file
