@@ -65,6 +65,24 @@
 //! own doc). An operator issuing an abort stops the *next* step, not the
 //! current one.
 //!
+//! # Dispatch steps stay inside the single node (`EN.12.E` Task 4)
+//!
+//! A [`chain::ChainStep`] whose `kind` is [`chain::StepKind::Dispatch`] runs
+//! [`super::dispatch::execute_dispatch_step`] instead of
+//! [`execute::execute_step`]'s SDLC engine path — but that routing decision
+//! happens *inside* [`integrate::integrate_chain`]'s per-step loop, not as a
+//! new graph node here. The declared shape stays exactly what the module
+//! doc's ASCII diagram says (one node, `OrchestrationRunNode`, start and
+//! terminal) for every named policy profile ([`baseline`], [`cheap_fast`],
+//! [`thorough`]) and for a chain that mixes `block`/`dispatch` steps alike —
+//! [`schema`]/[`registry`] take no policy or chain-shape input at all, so
+//! there is no combination of profile, per-run event override, or step
+//! `kind` that could ever change the declared node set (CLAUDE.md standing
+//! rule 6's "keep the shape invariant across settings"; see the existing
+//! `every_named_profile_leaves_the_declared_node_set_identical` test below).
+//! A dispatch step is a no-op path *within* `OrchestrationRunNode::process`
+//! for a chain that has none, never a conditional rewire of the graph.
+//!
 //! A cancelled chain is never mistaken for a failed or a completed one:
 //! [`OrchestrationRunNode::process`] stamps `ctx.nodes[NODE_NAME]["cancellation"]`
 //! with whether the run was cancelled and, if so, at which step index of
