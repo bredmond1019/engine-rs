@@ -20,6 +20,7 @@
 
 pub mod brand_critic;
 pub mod draft;
+pub mod graph;
 pub mod policy;
 pub mod profiles;
 pub mod revise;
@@ -28,6 +29,7 @@ pub mod work_source;
 
 pub use brand_critic::BrandCriticNode;
 pub use draft::PostDraftNode;
+pub use graph::WORKFLOW_TYPE;
 pub use policy::LinkedInPostPolicy;
 pub use revise::ReviseNode;
 pub use schema::{LinkedInPostEventSchema, PostCandidate, WorkSource, WorkSourceKind};
