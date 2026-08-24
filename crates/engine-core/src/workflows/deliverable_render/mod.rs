@@ -21,6 +21,10 @@
 //! - `graph` — `WORKFLOW_TYPE`, the declared `WorkflowSchema` / `NodeRegistry`
 //!   / `registry_for_policy` / `Workflow` assembly (task 5).
 
+pub mod policy;
+pub mod profiles;
 pub mod schema;
 
+pub use policy::{DeliverableRenderPolicy, PartialDeliverableRenderPolicy};
+pub use profiles::resolve_policy_for_run;
 pub use schema::{deliverable_slug, DeliverableRenderEventSchema};

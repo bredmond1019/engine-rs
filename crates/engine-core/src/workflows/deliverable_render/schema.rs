@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::locale::Locale;
 use crate::workflows::proposal_generator::schema::AutomationRoadmap;
 
+use super::policy::PartialDeliverableRenderPolicy;
+
 /// Fallback basename component used when the roadmap carries no
 /// `situation` (and therefore no `company_name`) to derive a slug from, or
 /// when the derived slug would otherwise be empty (e.g. a `company_name`
@@ -40,6 +42,14 @@ pub struct DeliverableRenderEventSchema {
     /// Directory both output artifacts (`<company-slug>-roadmap.md` and
     /// `.pdf`) are written under.
     pub output_dir: PathBuf,
+    /// Per-run policy override — the highest-precedence layer in
+    /// `policy::resolve`'s four-layer merge (`EN.4.D` task 2).
+    #[serde(default)]
+    pub policy: Option<PartialDeliverableRenderPolicy>,
+    /// A named profile bundle (`baseline` / `cheap-fast` / `thorough`) to
+    /// resolve against, second-highest precedence after `policy` above.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Derive the `<company-slug>` basename component
