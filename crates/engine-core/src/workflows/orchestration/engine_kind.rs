@@ -96,6 +96,85 @@ impl EngineKind {
 mod tests {
     use super::*;
 
+    /// `EN.12.E` task 2 — guard pinning `EngineKind`'s closed two-variant set.
+    ///
+    /// `EN.12.E` adds a per-chain-step `kind` (`block | dispatch | command`) but a
+    /// dispatch step never selects an `EngineKind` at all — this type stays exactly
+    /// `{Task, Flow}`. Rust has no runtime reflection over an enum's variant count, so
+    /// this reads this module's own source (via `env!("CARGO_MANIFEST_DIR")`, never
+    /// `git diff`, so it is immune to a concurrent lane's unrelated uncommitted files)
+    /// and counts the doc-commented variant lines inside `pub enum EngineKind { ... }`.
+    /// A third variant added anywhere — by `EN.12.E`'s own dispatch work or a later
+    /// "simplification" that folds `dispatch`/`command` into this enum — makes this
+    /// count 3 and fails loudly, naming this block.
+    #[test]
+    fn engine_kind_has_exactly_two_variants() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/workflows/orchestration/engine_kind.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("EN.12.E guard: failed to read {path:?}: {err}"));
+
+        let enum_start = source.find("pub enum EngineKind {").unwrap_or_else(|| {
+            panic!("EN.12.E guard: could not find `pub enum EngineKind {{` in {path:?}")
+        });
+        let enum_body_start = enum_start + "pub enum EngineKind {".len();
+        let enum_end = source[enum_body_start..]
+            .find('}')
+            .map(|i| enum_body_start + i)
+            .unwrap_or_else(|| {
+                panic!("EN.12.E guard: unterminated `enum EngineKind` block in {path:?}")
+            });
+        let body = &source[enum_body_start..enum_end];
+
+        let variant_count = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with('#'))
+            .count();
+
+        assert_eq!(
+            variant_count, 2,
+            "EN.12.E: EngineKind must stay a closed two-variant enum (Task, Flow) — \
+             a dispatch step never selects an EngineKind at all, so this block does \
+             not widen the set. Found {variant_count} variant line(s) in {path:?}. If \
+             you are adding a third variant or a dispatch/command variant here, stop: \
+             route dispatch steps through the sibling dispatch.rs node instead."
+        );
+    }
+
+    /// `EN.12.E` task 2 — companion guard: no `From<&str>`/`From<String>` string-typed
+    /// escape hatch for `EngineKind`. The only sanctioned entry point is
+    /// [`EngineKind::from_sdlc_workflow`], which returns a `Result` and can diagnose an
+    /// unrecognised value instead of silently mapping it.
+    #[test]
+    fn engine_kind_has_no_from_str_or_from_string_impl() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/workflows/orchestration/engine_kind.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("EN.12.E guard: failed to read {path:?}: {err}"));
+
+        // Line-based, and only actual `impl` declarations (a trimmed line starting
+        // with `impl From<...`) with no `"` on the line — this deliberately excludes
+        // this very test's own string-literal assertion text and this module's doc
+        // comments, which mention the same phrase in prose.
+        let has_from_str = source.lines().any(|line| {
+            let t = line.trim_start();
+            t.starts_with("impl From<&str> for EngineKind") && !line.contains('"')
+        });
+        let has_from_string = source.lines().any(|line| {
+            let t = line.trim_start();
+            t.starts_with("impl From<String> for EngineKind") && !line.contains('"')
+        });
+
+        assert!(
+            !has_from_str && !has_from_string,
+            "EN.12.E: found a `From<&str>`/`From<String>` impl for EngineKind in \
+             {path:?} — this is exactly the string-typed escape hatch the closed \
+             engine vocabulary forbids. Use EngineKind::from_sdlc_workflow instead, \
+             which returns Result<EngineKind, UnsupportedSdlcWorkflow>."
+        );
+    }
+
     #[test]
     fn task_and_flow_map_to_their_variants() {
         assert_eq!(
@@ -198,6 +277,11 @@ mod tests {
                 &["resolve_depends_on", "is_edge_met", "is_block_open"],
             ),
             ("engine_kind.rs", &["from_sdlc_workflow"]),
+            // `workflow_key` reads `ChainStep::block_id` back out as the `Dispatcher`
+            // registry key a `dispatch` step names — a struct-field accessor over an
+            // already-parsed `ChainStep`, not a string-typed runner-selection entry
+            // point. It never selects an `EngineKind` (`EN.12.E` task 3).
+            ("dispatch.rs", &["workflow_key"]),
             ("execute.rs", &[]),
             ("gates.rs", &[]),
             // `profile_by_name` resolves a named policy profile (e.g. "cheap-fast") to

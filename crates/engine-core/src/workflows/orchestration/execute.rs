@@ -63,7 +63,7 @@ use crate::workflows::sdlc_flow;
 use crate::workflows::sdlc_task;
 use crate::{OnProgress, RunOptions, Workflow, WorkflowError};
 
-use super::chain::ChainStep;
+use super::chain::{ChainStep, StepKind};
 
 // ── Engine selection ────────────────────────────────────────────────────
 
@@ -250,6 +250,19 @@ pub fn resolve_isolation(
 /// `chain`/`gates` modules') "never fail silently" convention.
 #[derive(Debug)]
 pub enum ExecuteError {
+    /// The step's [`StepKind`] is not [`StepKind::Block`] (`EN.12.E` Task 4).
+    /// [`execute_step`] is the `block` path only — a `dispatch` step is
+    /// routed to [`super::dispatch::execute_dispatch_step`] by the chain
+    /// driver *before* it ever reaches this function, never through it (see
+    /// that module's own "never through `super::execute::execute_step`"
+    /// doc). This variant exists so a caller that skips that routing gets a
+    /// loud, named diagnostic instead of `execute_step` silently running
+    /// the wrong kind of step through the SDLC engine path.
+    WrongStepKind {
+        repo: String,
+        block_id: String,
+        kind: StepKind,
+    },
     /// The step's repo slug did not resolve through the [`RepoRegistry`].
     RepoResolutionFailed {
         repo: String,
@@ -289,6 +302,16 @@ pub enum ExecuteError {
 impl fmt::Display for ExecuteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ExecuteError::WrongStepKind {
+                repo,
+                block_id,
+                kind,
+            } => write!(
+                f,
+                "step '{block_id}' (repo '{repo}') has kind {kind:?}, not Block — \
+                 execute_step only runs block steps; a dispatch step must be routed to \
+                 the dispatch node instead"
+            ),
             ExecuteError::RepoResolutionFailed {
                 repo,
                 block_id,
@@ -327,6 +350,7 @@ impl std::error::Error for ExecuteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ExecuteError::RepoResolutionFailed { source, .. } => Some(source),
+            ExecuteError::WrongStepKind { .. } => None,
             ExecuteError::UnsupportedEngine { .. } => None,
             ExecuteError::StepFailed { source, .. } => Some(source),
             ExecuteError::ChildFailed { .. } => None,
@@ -406,6 +430,19 @@ fn step_spend(ctx: &TaskContext) -> (Option<f64>, u64) {
 /// — for [`EngineKind::Flow`] only — invoke `run_flow` with the resolved
 /// [`FlowInvocation`].
 ///
+/// # Kind-routed (`EN.12.E` Task 4)
+///
+/// This function is the `block`-kind path only. A step whose [`StepKind`]
+/// (`step.kind`) is not [`StepKind::Block`] never reaches the SDLC engine
+/// path: it fails fast with [`ExecuteError::WrongStepKind`] before
+/// `resolve_engine`/`registry`/`run_flow` are ever consulted. A `dispatch`
+/// step's actual invocation is [`super::dispatch::execute_dispatch_step`],
+/// called by the chain driver directly — never through here — so this
+/// guard is a defense-in-depth backstop, not the routing decision itself.
+/// A step with no `kind` deserializes to `StepKind::Block` (`EN.12.E` Task
+/// 1), so every existing caller and test — none of which set `kind`
+/// explicitly — is completely unaffected by this guard.
+///
 /// `resolve_engine` is consulted before the repo resolves to a cwd is
 /// irrelevant to the caller: both must succeed for the step to run, and
 /// either failing reports the block id and repo. `run_flow` is never
@@ -431,6 +468,14 @@ pub async fn execute_step(
     cancellation_token: Option<CancellationToken>,
     budget: Option<Budget>,
 ) -> Result<ExecutionOutcome, ExecuteError> {
+    if step.kind != StepKind::Block {
+        return Err(ExecuteError::WrongStepKind {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            kind: step.kind,
+        });
+    }
+
     let repo_path =
         registry
             .resolve(&step.repo)
@@ -899,6 +944,91 @@ mod tests {
 
         assert!(matches!(err, ExecuteError::RepoResolutionFailed { .. }));
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// `EN.12.E` Task 4: a non-`Block` step (`dispatch` here, standing in
+    /// for `command` too — both hit the same guard) never reaches the SDLC
+    /// engine path. Asserted two ways: the returned error names the step
+    /// and its kind, AND — the criterion that actually matters — the
+    /// `FlowRunner` recording double was never invoked at all, proving the
+    /// dispatch path never falls through to `run_flow`.
+    #[tokio::test]
+    async fn a_dispatch_kind_step_never_reaches_the_sdlc_engine_path() {
+        let (_dir, registry) = two_repo_registry();
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+
+        let s = ChainStep {
+            repo: "repo-a".to_string(),
+            block_id: "RESEARCH_AGENT".to_string(),
+            directives: None,
+            kind: StepKind::Dispatch,
+            ..Default::default()
+        };
+        let err = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            ExecuteError::WrongStepKind {
+                repo,
+                block_id,
+                kind,
+            } => {
+                assert_eq!(repo, "repo-a");
+                assert_eq!(block_id, "RESEARCH_AGENT");
+                assert_eq!(*kind, StepKind::Dispatch);
+            }
+            other => panic!("expected WrongStepKind, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RESEARCH_AGENT"),
+            "message should name the block: {msg}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "run_flow (the SDLC engine path) must never be consulted for a dispatch step"
+        );
+    }
+
+    /// A chain step with no `kind` set (via `..Default::default()`, exactly
+    /// how every pre-`EN.12.E` test in this module constructs a
+    /// `ChainStep`) still deserializes/defaults to `StepKind::Block` and
+    /// runs the ordinary SDLC engine path unchanged — the guard above never
+    /// fires for it.
+    #[tokio::test]
+    async fn a_step_with_no_kind_still_runs_the_block_path() {
+        let (_dir, registry) = two_repo_registry();
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+
+        let s = step("repo-a", "A.1");
+        assert_eq!(s.kind, StepKind::Block);
+        let outcome = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+            None,
+            None,
+        )
+        .await
+        .expect("a block-kind step should execute exactly as before");
+
+        assert_eq!(outcome.block_id, "A.1");
+        assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
     #[test]

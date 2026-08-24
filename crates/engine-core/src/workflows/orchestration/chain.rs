@@ -23,18 +23,23 @@
 //! file, so it carries no lane directives at all ([`ChainStep::directives`] is always
 //! `None`).
 //!
-//! # Malformed input is a loud error
+//! # Malformed input is a loud error — but an unrecognised field is not (`EN.12.E`)
 //!
-//! [`resolve_lane_chain`] parses `planning/lane-segments.json` with `#[serde(deny_unknown_fields)]`
-//! on every directive shape it reads. A directive whose value does not match the grammar
-//! `mev` emits (e.g. `budget` present but not an object, or an unrecognised key inside it)
-//! fails the whole parse loudly rather than silently defaulting to "no directives" — the
-//! read either succeeds with a well-formed artifact or fails outright.
+//! [`resolve_lane_chain`] parses `planning/lane-segments.json` against the grammar `mev`
+//! emits. A directive whose value does not match the grammar's *shape* (e.g. `budget`
+//! present but not an object) still fails the whole parse loudly rather than silently
+//! defaulting to "no directives". An *unrecognised key* on [`LaneDirectives`] or
+//! [`LaneBudget`], though, now parses successfully and is dropped — `mev`'s
+//! `brain::lane_segments::LaneDirectives` is hand-mirrored across two repos with no shared
+//! dependency, so `#[serde(deny_unknown_fields)]` on this read side means mev shipping one
+//! new field first hard-fails every lane segment on every un-rebuilt engine, not just the
+//! new one (seam 15). Forward-compatibility beats strictness here on purpose; a malformed
+//! *shape* is still a bug worth failing loudly on.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One block in a resolved chain: which repo it lives in, its block id, and the owning
 /// lane's structured directives, if any.
@@ -48,6 +53,13 @@ use serde::Deserialize;
 /// [`gates::find_lane_head`](super::gates::find_lane_head)). [`resolve_lane_chain`] fills
 /// all three; [`resolve_explicit_chain`] leaves them `None`, matching `directives: None`'s
 /// same "deliberate bypass" contract — an explicit list names no lane segment at all.
+///
+/// `kind` (`EN.12.E` Task 1) is the step's engine: `block` keeps today's `EngineKind`-
+/// selected SDLC invocation, `dispatch` runs a registered workflow instead (`EN.12.E` Task
+/// 3+), and `command` is reserved vocabulary only — nothing executes it yet. Absent input
+/// defaults to `StepKind::Block`, so a chain with no `kind` behaves exactly as before this
+/// field existed. `EngineKind` itself (`orchestration/engine_kind.rs`) is untouched and
+/// stays a closed two-variant enum — a `dispatch` step never selects one at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChainStep {
     pub repo: String,
@@ -56,6 +68,20 @@ pub struct ChainStep {
     pub roadmap: Option<String>,
     pub lane: Option<String>,
     pub segment: Option<usize>,
+    pub kind: StepKind,
+}
+
+/// A chain step's engine, reserved by `EN.12.E` Task 1. Wire spellings are lowercase
+/// (`block` / `dispatch` / `command`) to match `mev`'s eventual emission vocabulary
+/// exactly — see [`ChainStep::kind`]. `command` is reserved only; nothing in this repo
+/// executes it yet (out of scope for `EN.12.E`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StepKind {
+    #[default]
+    Block,
+    Dispatch,
+    Command,
 }
 
 /// A lane's structured directives, mirroring the shape `mev`'s
@@ -63,8 +89,14 @@ pub struct ChainStep {
 /// that module for the authoritative grammar — this is a reading-side mirror, not a
 /// second definition of the format; the two must stay in lockstep by hand since this
 /// crate does not depend on `mev`.
+///
+/// Deliberately **not** `deny_unknown_fields` (`EN.12.E` Task 1) — an unrecognised key
+/// here parses and is dropped rather than hard-failing the whole lane-segments read. See
+/// the module doc's "Malformed input is a loud error" section for why: this struct is
+/// hand-mirrored with no shared dependency to enforce the mirror, so strict rejection
+/// would let mev shipping one new field first break every un-rebuilt engine on every lane
+/// segment, not just the one carrying the new field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LaneDirectives {
     /// The block ID or operator-gate slug the whole lane waits on before any block in it
     /// may start. Carried as opaque text, exactly as `mev` emits it — this module never
@@ -78,9 +110,9 @@ pub struct LaneDirectives {
     pub exclusive_repos: Option<Vec<String>>,
 }
 
-/// The `BUDGET` directive's parsed value — see [`LaneDirectives`].
+/// The `BUDGET` directive's parsed value — see [`LaneDirectives`]. Also not
+/// `deny_unknown_fields`, for the same forward-compatibility reason.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LaneBudget {
     pub heavy: bool,
     #[serde(default)]
@@ -91,13 +123,17 @@ pub struct LaneBudget {
 /// (`mev::brain::lane_segments::DerivedBlockPosition`). Only the fields this module
 /// actually uses are declared as meaningful; `line` and `origin_roadmap` are read and
 /// kept (never silently dropped by an unknown-fields parse failure) but this module has
-/// no use for either yet.
+/// no use for either yet. `kind` (`EN.12.E`) is the `Deserialize` mirror of
+/// [`ChainStep::kind`], adjacent to `directives` rather than nested inside it — absent
+/// input defaults to [`StepKind::Block`].
 #[derive(Debug, Clone, Deserialize)]
 struct RawBlockPosition {
     roadmap: String,
     lane: String,
     repo: String,
     id: String,
+    #[serde(default)]
+    kind: StepKind,
     #[allow(dead_code)]
     #[serde(default)]
     line: usize,
@@ -257,6 +293,7 @@ pub fn resolve_lane_chain(
             roadmap: Some(b.roadmap.clone()),
             lane: Some(b.lane.clone()),
             segment: Some(b.segment),
+            kind: b.kind,
         })
         .collect())
 }
@@ -277,6 +314,7 @@ pub fn resolve_explicit_chain(blocks: Vec<(String, String)>) -> Vec<ChainStep> {
             roadmap: None,
             lane: None,
             segment: None,
+            kind: StepKind::Block,
         })
         .collect()
 }
@@ -328,6 +366,7 @@ mod tests {
                     roadmap: Some("r".into()),
                     lane: Some("l".into()),
                     segment: Some(0),
+                    kind: StepKind::Block,
                 },
                 ChainStep {
                     repo: "repo-b".into(),
@@ -336,6 +375,7 @@ mod tests {
                     roadmap: Some("r".into()),
                     lane: Some("l".into()),
                     segment: Some(0),
+                    kind: StepKind::Block,
                 },
             ]
         );
@@ -426,16 +466,39 @@ mod tests {
         assert!(matches!(err, ChainError::ParseFailed { .. }), "got {err:?}");
     }
 
+    /// `EN.12.E` Task 1's forward-compatibility positive control (seam 15).
+    ///
+    /// **Observed FAILING** with `#[serde(deny_unknown_fields)]` temporarily re-added to
+    /// `LaneDirectives` (the pre-`EN.12.E` state), via
+    /// `cargo nextest run -p engine-core chain::tests::unrecognised_directive_key_is_tolerated_forward_compat`:
+    ///
+    /// ```text
+    /// thread 'workflows::orchestration::chain::tests::unrecognised_directive_key_is_tolerated_forward_compat' (330542126) panicked at crates/engine-core/src/workflows/orchestration/chain.rs:492:69:
+    /// called `Result::unwrap()` on an `Err` value: ParseFailed { path: "/var/folders/.../lane-segments.json", source: Error("unknown field `future_field`, expected one of `held_until`, `budget`, `exclusive_repos`", line: 3, column: 195) }
+    /// test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2248 filtered out
+    /// ```
+    ///
+    /// **Observed PASSING** after removing `deny_unknown_fields` again (this commit's
+    /// state): `cargo nextest run -p engine-core chain::tests::unrecognised_directive_key_is_tolerated_forward_compat`
+    /// reports `1 passed`.
     #[test]
-    fn malformed_directive_unknown_key_is_a_loud_error() {
+    fn unrecognised_directive_key_is_tolerated_forward_compat() {
         let json = r#"{
             "blocks": [
-                {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "A.1", "line": 1, "segment": 0, "position": 0, "origin_roadmap": null, "directives": {"unknown_key": true}}
+                {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "A.1", "line": 1, "segment": 0, "position": 0, "origin_roadmap": null, "directives": {"held_until": "OTHER.1", "future_field": "some-forward-compatible-value"}}
             ]
         }"#;
-        let path = write_fixture("malformed-unknown-key", json);
-        let err = resolve_lane_chain(&path, "r", "l", &|_| false).unwrap_err();
-        assert!(matches!(err, ChainError::ParseFailed { .. }), "got {err:?}");
+        let path = write_fixture("unrecognised-directive-key", json);
+        let steps = resolve_lane_chain(&path, "r", "l", &|_| false).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0]
+                .directives
+                .as_ref()
+                .and_then(|d| d.held_until.clone()),
+            Some("OTHER.1".to_string()),
+            "the recognised fields alongside the unknown one must still parse correctly"
+        );
     }
 
     #[test]
@@ -454,5 +517,51 @@ mod tests {
         let path = PathBuf::from("/nonexistent/does-not-exist/lane-segments.json");
         let err = resolve_lane_chain(&path, "r", "l", &|_| false).unwrap_err();
         assert!(matches!(err, ChainError::ReadFailed { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn chain_step_with_no_kind_field_defaults_to_block() {
+        let json = r#"{
+            "blocks": [
+                {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "A.1", "line": 1, "segment": 0, "position": 0, "origin_roadmap": null}
+            ]
+        }"#;
+        let path = write_fixture("no-kind", json);
+        let steps = resolve_lane_chain(&path, "r", "l", &|_| false).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, StepKind::Block);
+    }
+
+    #[test]
+    fn explicit_chain_steps_default_to_block_kind() {
+        let steps = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
+        assert_eq!(steps[0].kind, StepKind::Block);
+    }
+
+    #[test]
+    fn step_kind_round_trips_through_serde_with_lowercase_wire_spellings() {
+        for (kind, wire) in [
+            (StepKind::Block, "\"block\""),
+            (StepKind::Dispatch, "\"dispatch\""),
+            (StepKind::Command, "\"command\""),
+        ] {
+            let serialized = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serialized, wire, "unexpected wire spelling for {kind:?}");
+            let deserialized: StepKind = serde_json::from_str(wire).unwrap();
+            assert_eq!(deserialized, kind, "round-trip mismatch for {wire}");
+        }
+    }
+
+    #[test]
+    fn raw_block_position_with_explicit_kind_is_carried_onto_chain_step() {
+        let json = r#"{
+            "blocks": [
+                {"roadmap": "r", "lane": "l", "repo": "repo-a", "id": "A.1", "line": 1, "segment": 0, "position": 0, "origin_roadmap": null, "kind": "dispatch"}
+            ]
+        }"#;
+        let path = write_fixture("explicit-dispatch-kind", json);
+        let steps = resolve_lane_chain(&path, "r", "l", &|_| false).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, StepKind::Dispatch);
     }
 }

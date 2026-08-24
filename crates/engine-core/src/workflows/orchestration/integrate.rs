@@ -56,14 +56,16 @@ use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::dispatch::Dispatcher;
 use crate::repo_registry::RepoRegistry;
 
 use crate::budget::{Budget, BudgetDecision, BudgetHaltReason, CampaignLedger};
 
-use super::chain::ChainStep;
+use super::chain::{ChainStep, StepKind};
 use super::checkpoint::{
     read_checkpoint, write_checkpoint, Checkpoint, CheckpointStep, ReadCheckpoint,
 };
+use super::dispatch::{execute_dispatch_step, DispatchStepError};
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
 use crate::workflows::get_result;
@@ -642,6 +644,22 @@ pub enum IntegrateError {
     /// unwinding, so this one propagates instead of being swallowed like
     /// the bail/cancel/budget paths' best-effort writes.
     CheckpointWriteFailed(super::checkpoint::CheckpointError),
+    /// A dispatch step ([`StepKind::Dispatch`]) failed to resolve or run its
+    /// registered workflow — from [`execute_dispatch_step`]. Mirrors
+    /// [`IntegrateError::Execute`]'s "wrap the sibling module's error type"
+    /// shape; see [`DispatchStepError`] for the specific cause (an
+    /// unregistered key, a policy resolution failure, or the dispatched
+    /// workflow itself failing).
+    Dispatch(DispatchStepError),
+    /// A [`StepKind::Dispatch`] step was reached with no [`Dispatcher`]
+    /// configured for this chain run at all (`integrate_chain`/
+    /// `integrate_chain_with_journal` both pass `None`; only
+    /// [`integrate_chain_with_dispatch`] supplies one). Distinct from
+    /// [`IntegrateError::Dispatch`]'s `UnknownWorkflowKey` — there is no
+    /// registry to have even checked the key against. Never falls through
+    /// to a block invocation, matching `dispatch.rs`'s "never fail
+    /// silently" convention.
+    NoDispatcherConfigured { repo: String, block_id: String },
 }
 
 impl fmt::Display for IntegrateError {
@@ -757,6 +775,12 @@ impl fmt::Display for IntegrateError {
             IntegrateError::CheckpointWriteFailed(source) => {
                 write!(f, "failed to write checkpoint: {source}")
             }
+            IntegrateError::Dispatch(err) => write!(f, "{err}"),
+            IntegrateError::NoDispatcherConfigured { repo, block_id } => write!(
+                f,
+                "dispatch step '{block_id}' (repo '{repo}') has no Dispatcher configured \
+                 for this chain run — cannot resolve its workflow key"
+            ),
         }
     }
 }
@@ -776,8 +800,10 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::ReconcileFailed { .. }
             | IntegrateError::RoadmapDirNotFound { .. }
             | IntegrateError::AmbiguousRoadmapDir { .. }
-            | IntegrateError::HoldDeadlineExceeded { .. } => None,
+            | IntegrateError::HoldDeadlineExceeded { .. }
+            | IntegrateError::NoDispatcherConfigured { .. } => None,
             IntegrateError::CheckpointWriteFailed(source) => Some(source),
+            IntegrateError::Dispatch(err) => Some(err),
         }
     }
 }
@@ -791,6 +817,12 @@ impl From<GateError> for IntegrateError {
 impl From<ExecuteError> for IntegrateError {
     fn from(err: ExecuteError) -> Self {
         IntegrateError::Execute(err)
+    }
+}
+
+impl From<DispatchStepError> for IntegrateError {
+    fn from(err: DispatchStepError) -> Self {
+        IntegrateError::Dispatch(err)
     }
 }
 
@@ -1096,6 +1128,7 @@ pub async fn integrate_chain(
         default_use_worktree,
         campaign_id,
         None,
+        None,
     )
     .await
 }
@@ -1148,6 +1181,63 @@ pub async fn integrate_chain_with_journal(
         default_use_worktree,
         campaign_id,
         Some(journal_sink),
+        None,
+    )
+    .await
+}
+
+/// Identical to [`integrate_chain_with_journal`], plus a [`Dispatcher`] this
+/// loop uses to run any [`StepKind::Dispatch`] step in the chain (`EN.12.E`
+/// task 5). A `dispatch` step never reaches [`execute_step`]'s SDLC engine
+/// path — see [`super::dispatch`]'s module doc — so this is the one entry
+/// point that can actually integrate a mixed `[block, dispatch]` chain
+/// end to end; [`integrate_chain`] and [`integrate_chain_with_journal`] both
+/// pass `None` for the dispatcher internally, so a chain that reaches a
+/// `dispatch` step through either of those fails loudly with
+/// [`IntegrateError::NoDispatcherConfigured`] rather than silently falling
+/// through to a block invocation.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_dispatch(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    campaign_id: uuid::Uuid,
+    journal_sink: Option<&JournalSinkFn>,
+    dispatcher: &Dispatcher,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        campaign_id,
+        journal_sink,
+        Some(dispatcher),
     )
     .await
 }
@@ -1172,6 +1262,7 @@ async fn integrate_chain_impl(
     default_use_worktree: bool,
     campaign_id: uuid::Uuid,
     journal_sink: Option<&JournalSinkFn>,
+    dispatcher: Option<&Dispatcher>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -1311,6 +1402,84 @@ async fn integrate_chain_impl(
         let _permit = admission.acquire_for(step).await;
 
         let step_lane = lane.unwrap_or(step.repo.as_str());
+
+        // `EN.12.E` task 5: a `dispatch` step never reaches `execute_step`'s
+        // SDLC engine path at all (`execute_step` itself fails fast with
+        // `ExecuteError::WrongStepKind` for any non-`Block` step — see
+        // `execute.rs` task 4). Route it to `execute_dispatch_step`
+        // instead, and record its outcome as a journal row rather than a
+        // `lane-log.jsonl` line: that append-only contract is explicitly
+        // out of scope for this block and must not change (see the module
+        // doc's point 3 and this loop's `lane-log.jsonl` handling below,
+        // which a dispatch step never reaches). The journal write happens
+        // here, before the loop's next iteration begins, so a later step
+        // — or the morning debrief reading the journal — always sees a
+        // dispatch step's result before anything that ran after it.
+        if step.kind == StepKind::Dispatch {
+            let Some(dispatcher) = dispatcher else {
+                let err = IntegrateError::NoDispatcherConfigured {
+                    repo: step.repo.clone(),
+                    block_id: step.block_id.clone(),
+                };
+                emit_journal(
+                    journal_sink,
+                    campaign_id,
+                    journal_run_id(None),
+                    &step.block_id,
+                    engine_contract::JournalDecisionKind::StepBailed,
+                    err.to_string(),
+                    serde_json::json!({}),
+                );
+                return Err(err);
+            };
+
+            let event = serde_json::json!({});
+            let on_progress: crate::OnProgress<'_> =
+                Box::new(|_ctx: &engine_contract::TaskContext| {});
+            match execute_dispatch_step(step, dispatcher, &event, on_progress).await {
+                Ok(dispatch_outcome) => {
+                    let step_run_id = journal_run_id(Some(&dispatch_outcome.ctx));
+                    emit_journal(
+                        journal_sink,
+                        campaign_id,
+                        step_run_id,
+                        &step.block_id,
+                        engine_contract::JournalDecisionKind::StepIntegrated,
+                        format!(
+                            "dispatch step '{}' completed via workflow key '{}'",
+                            step.block_id, dispatch_outcome.workflow_key
+                        ),
+                        serde_json::json!({ "workflow_key": dispatch_outcome.workflow_key }),
+                    );
+                }
+                Err(err) => {
+                    // Never falls through to a block invocation — an
+                    // unregistered workflow key, a policy-resolution
+                    // failure, or the dispatched workflow itself failing
+                    // all stop the chain here, same as `execute_step`'s own
+                    // bail path above (minus the `lane-log.jsonl` line,
+                    // which a dispatch step never writes).
+                    let integrate_err = IntegrateError::from(err);
+                    emit_journal(
+                        journal_sink,
+                        campaign_id,
+                        journal_run_id(None),
+                        &step.block_id,
+                        engine_contract::JournalDecisionKind::StepBailed,
+                        integrate_err.to_string(),
+                        serde_json::json!({}),
+                    );
+                    return Err(integrate_err);
+                }
+            }
+
+            // No `ExecutionOutcome` to push (a dispatch step never runs an
+            // SDLC engine), no lane-log line, no checkpoint entry (there is
+            // no SDLC block state write for this step to make resumable).
+            // The journal row above is this step's entire durable record;
+            // advance the loop to the next step.
+            continue;
+        }
 
         // `default_use_worktree` is the resolved `OrchestrationPolicy
         // ::default_use_worktree` fallback, threaded in from
@@ -3176,6 +3345,305 @@ mod tests {
                     && r.step == "A.1"
             ),
             "expected a ResolvedPolicy row: {recorded:?}"
+        );
+    }
+
+    // ── Dispatch steps (`EN.12.E` task 5) ───────────────────────────────
+
+    struct DispatchMarkerNode;
+
+    #[async_trait::async_trait]
+    impl crate::Node for DispatchMarkerNode {
+        async fn process(
+            &self,
+            mut ctx: engine_contract::TaskContext,
+        ) -> Result<engine_contract::TaskContext, crate::NodeError> {
+            ctx.nodes
+                .insert(self.name().to_string(), json!({ "ran": true }));
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            "DispatchMarkerNode"
+        }
+    }
+
+    fn dispatch_fixture_schema(workflow_type: &str) -> crate::WorkflowSchema {
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            "DispatchMarkerNode".to_string(),
+            crate::NodeConfig::new("DispatchMarkerNode", vec![]),
+        );
+        crate::WorkflowSchema::new(workflow_type, "DispatchMarkerNode", nodes)
+    }
+
+    /// A [`Dispatcher`] with one workflow key (`"RESEARCH_AGENT"` by
+    /// default) registered against a single-node marker workflow — enough
+    /// to exercise [`integrate_chain_with_dispatch`]'s routing without
+    /// pulling in a real registered production workflow.
+    fn dispatcher_with_registered_key(workflow_type: &'static str) -> Dispatcher {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register(
+            dispatch_fixture_schema(workflow_type),
+            Box::new(move |_event: &serde_json::Value| {
+                let mut registry = crate::NodeRegistry::new();
+                registry.register(Box::new(DispatchMarkerNode));
+                Ok(crate::Workflow::new(
+                    registry,
+                    dispatch_fixture_schema(workflow_type),
+                ))
+            }),
+        );
+        dispatcher
+    }
+
+    fn dispatch_step(repo: &str, workflow_key: &str) -> ChainStep {
+        ChainStep {
+            repo: repo.to_string(),
+            block_id: workflow_key.to_string(),
+            directives: None,
+            kind: StepKind::Dispatch,
+            ..Default::default()
+        }
+    }
+
+    fn read_lane_log(roadmap_dir: &Path) -> String {
+        std::fs::read_to_string(roadmap_dir.join("lane-log.jsonl")).unwrap_or_default()
+    }
+
+    /// A dispatch step's outcome lands in the journal — via the same
+    /// `JournalSinkFn`/`emit_journal` seam every other decision point
+    /// uses — and writes NO `lane-log.jsonl` line at all (the file is not
+    /// even created), matching the block's explicit out-of-scope clause.
+    #[tokio::test]
+    async fn a_dispatch_step_records_a_journal_row_and_writes_no_lane_log_line() {
+        let dispatcher = dispatcher_with_registered_key("RESEARCH_AGENT");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let (dir, registry) = two_repo_registry();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (runner, _calls) = recording_runner();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+        let _ = &dir;
+
+        let chain = vec![dispatch_step("repo-a", "RESEARCH_AGENT")];
+
+        let outcomes = integrate_chain_with_dispatch(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            Some(&move |row| sink_fn(row)),
+            &dispatcher,
+        )
+        .await
+        .expect("the registered dispatch step should integrate");
+
+        assert!(
+            outcomes.is_empty(),
+            "a dispatch step never produces an SDLC ExecutionOutcome: {outcomes:?}"
+        );
+        let recorded = rows.lock().unwrap();
+        assert!(
+            recorded.iter().any(
+                |r| r.kind == engine_contract::JournalDecisionKind::StepIntegrated
+                    && r.step == "RESEARCH_AGENT"
+            ),
+            "expected a StepIntegrated row for the dispatch step: {recorded:?}"
+        );
+        assert_eq!(
+            read_lane_log(roadmap_dir.path()),
+            "",
+            "a dispatch step must never write a lane-log.jsonl line"
+        );
+    }
+
+    /// A `[dispatch, block]` mixed chain: the dispatch step's journal row
+    /// is present before the block step's own execution runs — i.e. the
+    /// journal write happens synchronously within the loop iteration, not
+    /// deferred past the next step's start.
+    #[tokio::test]
+    async fn a_dispatch_steps_result_is_journaled_before_the_next_step_runs() {
+        let dispatcher = dispatcher_with_registered_key("RESEARCH_AGENT");
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (runner, _calls) = recording_runner();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![
+            dispatch_step("repo-a", "RESEARCH_AGENT"),
+            step("repo-a", "A.1"),
+        ];
+
+        integrate_chain_with_dispatch(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            Some(&move |row| sink_fn(row)),
+            &dispatcher,
+        )
+        .await
+        .expect("a mixed [dispatch, block] chain should integrate both steps");
+
+        let recorded = rows.lock().unwrap();
+        let dispatch_row_idx = recorded
+            .iter()
+            .position(|r| {
+                r.kind == engine_contract::JournalDecisionKind::StepIntegrated
+                    && r.step == "RESEARCH_AGENT"
+            })
+            .expect("dispatch step's journal row must be present");
+        let block_row_idx = recorded
+            .iter()
+            .position(|r| {
+                r.kind == engine_contract::JournalDecisionKind::StepIntegrated && r.step == "A.1"
+            })
+            .expect("block step's journal row must be present");
+        assert!(
+            dispatch_row_idx < block_row_idx,
+            "the dispatch step's journal row must be recorded before the block step's: \
+             {recorded:?}"
+        );
+        // The dispatch step never appends a lane-log line — exactly one
+        // line total, for the block step.
+        assert_eq!(read_lane_log(roadmap_dir.path()).lines().count(), 1);
+    }
+
+    /// A dispatch step naming an unregistered workflow key stops the
+    /// chain with a named diagnostic — never silently falling through to
+    /// a block invocation — and still records a `StepBailed` journal row.
+    #[tokio::test]
+    async fn a_dispatch_step_naming_an_unregistered_key_stops_the_chain() {
+        let dispatcher = Dispatcher::new();
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (runner, _calls) = recording_runner();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![dispatch_step("repo-a", "UNKNOWN_WORKFLOW")];
+
+        let err = integrate_chain_with_dispatch(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            Some(&move |row| sink_fn(row)),
+            &dispatcher,
+        )
+        .await
+        .expect_err("an unregistered workflow key must stop the chain");
+
+        assert!(
+            matches!(
+                err,
+                IntegrateError::Dispatch(DispatchStepError::UnknownWorkflowKey { .. })
+            ),
+            "expected IntegrateError::Dispatch(UnknownWorkflowKey), got {err:?}"
+        );
+        let recorded = rows.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.kind == engine_contract::JournalDecisionKind::StepBailed),
+            "expected a StepBailed row naming the unregistered key: {recorded:?}"
+        );
+    }
+
+    /// A `dispatch` step reached through [`integrate_chain_with_journal`]
+    /// (no `Dispatcher` supplied at all) fails loudly with
+    /// [`IntegrateError::NoDispatcherConfigured`] rather than silently
+    /// falling through to a block invocation.
+    #[tokio::test]
+    async fn a_dispatch_step_with_no_dispatcher_configured_fails_loudly() {
+        let (_dir, registry) = two_repo_registry();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (runner, _calls) = recording_runner();
+
+        let chain = vec![dispatch_step("repo-a", "RESEARCH_AGENT")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect_err("a dispatch step with no Dispatcher configured must fail");
+
+        assert!(
+            matches!(err, IntegrateError::NoDispatcherConfigured { .. }),
+            "expected IntegrateError::NoDispatcherConfigured, got {err:?}"
         );
     }
 
