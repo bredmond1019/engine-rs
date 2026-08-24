@@ -234,3 +234,205 @@ fn renderer_requires_explicit_run_record_meta_not_derived_from_rows() {
     assert!(notes.contains(&meta.repo));
     assert!(notes.contains(&meta.roadmap));
 }
+
+// ---------------------------------------------------------------------------
+// EN.12.D task 7 — route-level integration coverage, plus the standing
+// fixture for the un-gateable `bastion journal $ID | grep -q 'bail'`
+// criterion (D64). The CLI verb lives in another repo and its binary is
+// installed separately, so it cannot be exercised here; this file's
+// `bail_reason_is_returned_through_the_read_route` test is the standing
+// fixture named by the block record for that criterion.
+//
+// The three campaign-content tests below require a live Postgres (the read
+// route only ever serves rows through `state.durable.pool()`, and
+// `insert_journal_row` itself needs a live database) — they are
+// `#[ignore]`d exactly like `engine-store`'s `postgres_round_trip.rs` tests,
+// opted into with:
+//
+// ```sh
+// DATABASE_URL=postgres://... cargo nextest run -p engine-serve --test journal_integration --run-ignored ignored-only
+// ```
+//
+// The no-`DATABASE_URL` self-skip path (pool absent -> clean 404) is proven
+// unconditionally (no live database, no `#[ignore]`) both here
+// (`read_route_self_skips_to_404_with_no_pool_configured`) and in
+// `crate::journal`'s own unit tests
+// (`get_campaign_journal_self_skips_to_404_with_no_pool_configured`).
+
+use std::sync::Arc;
+
+use actix_web::test as actix_test;
+use actix_web::{web, App};
+use engine_core::dispatch::Dispatcher;
+use engine_serve::durable::spawn_durable_writer;
+use engine_serve::http::{configure, AppState};
+use engine_serve::live_state::LiveStateStore;
+use engine_store::{connect, insert_journal_row};
+
+const TEST_API_KEY: &str = "journal-integration-test-key";
+
+fn route_test_app_state(pool: Option<sqlx::PgPool>) -> AppState {
+    AppState::builder(
+        Arc::new(Dispatcher::new()),
+        LiveStateStore::new(),
+        spawn_durable_writer(pool),
+        TEST_API_KEY.to_string(),
+    )
+    .build()
+}
+
+async fn live_pool() -> sqlx::PgPool {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this ignored test (see file header)");
+    connect(&database_url)
+        .await
+        .expect("failed to connect to DATABASE_URL")
+}
+
+/// STANDING FIXTURE for the un-gateable criterion `bastion journal $ID |
+/// grep -q 'bail'` (D64): drives a campaign with a bailed step through the
+/// read route (task 5) and asserts the bail reason appears in the response
+/// body, which is exactly what the out-of-repo `bastion journal` CLI verb
+/// would print.
+#[actix_web::test]
+#[ignore = "requires a live Postgres; run with DATABASE_URL set and --run-ignored ignored-only (see file header)"]
+async fn bail_reason_is_returned_through_the_read_route() {
+    let pool = live_pool().await;
+    let campaign_id = Uuid::new_v4();
+
+    let mut row = sample_row("deploy", JournalDecisionKind::StepBailed, "network timeout");
+    row.campaign_id = campaign_id.to_string();
+    insert_journal_row(&pool, &row)
+        .await
+        .expect("insert_journal_row should succeed against a live Postgres");
+
+    let state = route_test_app_state(Some(pool));
+    let app = actix_test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let req = actix_test::TestRequest::get()
+        .uri(&format!("/campaigns/{campaign_id}/journal"))
+        .insert_header(("X-API-Key", TEST_API_KEY))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = actix_test::read_body_json(resp).await;
+    assert_eq!(body["campaign_id"], campaign_id.to_string());
+    let rows = body["rows"].as_array().expect("rows array");
+    assert!(
+        rows.iter()
+            .any(|r| r["kind"] == "step_bailed" && r["reason"] == "network timeout"),
+        "expected a step_bailed row naming the bail reason, got: {body}"
+    );
+}
+
+/// A campaign halted by a budget cap returns its `BudgetHalted` row through
+/// the same read route, carrying the cap name / spend / limit in `detail`.
+#[actix_web::test]
+#[ignore = "requires a live Postgres; run with DATABASE_URL set and --run-ignored ignored-only (see file header)"]
+async fn budget_halted_row_is_returned_through_the_read_route() {
+    let pool = live_pool().await;
+    let campaign_id = Uuid::new_v4();
+
+    let mut row = sample_row(
+        "chain-block-3",
+        JournalDecisionKind::BudgetHalted,
+        "daily cap exceeded",
+    );
+    row.campaign_id = campaign_id.to_string();
+    row.detail = serde_json::json!({ "cap_name": "daily", "spent": 42.5, "limit": 40.0 });
+    insert_journal_row(&pool, &row)
+        .await
+        .expect("insert_journal_row should succeed against a live Postgres");
+
+    let state = route_test_app_state(Some(pool));
+    let app = actix_test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let req = actix_test::TestRequest::get()
+        .uri(&format!("/campaigns/{campaign_id}/journal"))
+        .insert_header(("X-API-Key", TEST_API_KEY))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = actix_test::read_body_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let halt = rows
+        .iter()
+        .find(|r| r["kind"] == "budget_halted")
+        .expect("expected a budget_halted row");
+    assert_eq!(halt["detail"]["cap_name"], "daily");
+    assert_eq!(halt["detail"]["spent"], 42.5);
+    assert_eq!(halt["detail"]["limit"], 40.0);
+}
+
+/// A repo-less campaign (no roadmap, no repo — `JournalRow` carries no such
+/// field, per the renderer's documentation-only assertion above) is still
+/// addressable purely by `campaign_id` through the read route.
+#[actix_web::test]
+#[ignore = "requires a live Postgres; run with DATABASE_URL set and --run-ignored ignored-only (see file header)"]
+async fn repo_less_campaign_is_addressable_through_the_read_route() {
+    let pool = live_pool().await;
+    let campaign_id = Uuid::new_v4();
+
+    let mut row = sample_row("only-step", JournalDecisionKind::StepIntegrated, "ok");
+    row.campaign_id = campaign_id.to_string();
+    insert_journal_row(&pool, &row)
+        .await
+        .expect("insert_journal_row should succeed against a live Postgres");
+
+    let state = route_test_app_state(Some(pool));
+    let app = actix_test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let req = actix_test::TestRequest::get()
+        .uri(&format!("/campaigns/{campaign_id}/journal"))
+        .insert_header(("X-API-Key", TEST_API_KEY))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = actix_test::read_body_json(resp).await;
+    assert_eq!(body["campaign_id"], campaign_id.to_string());
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+}
+
+/// With no `DATABASE_URL` (pool absent), the journal write path self-skips
+/// rather than failing (`durable.rs`'s existing contract, widened to
+/// journal rows), and the read route answers a clean 404 rather than
+/// panicking or erroring — proven unconditionally, no live database
+/// required, so this runs in the gated suite.
+#[actix_web::test]
+async fn read_route_self_skips_to_404_with_no_pool_configured() {
+    let campaign_id = Uuid::new_v4();
+    let state = route_test_app_state(None);
+
+    let app = actix_test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let req = actix_test::TestRequest::get()
+        .uri(&format!("/campaigns/{campaign_id}/journal"))
+        .insert_header(("X-API-Key", TEST_API_KEY))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+
+    assert_eq!(resp.status(), 404);
+}
