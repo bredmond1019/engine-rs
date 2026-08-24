@@ -277,6 +277,11 @@ mod tests {
                 &["resolve_depends_on", "is_edge_met", "is_block_open"],
             ),
             ("engine_kind.rs", &["from_sdlc_workflow"]),
+            // `workflow_key` reads `ChainStep::block_id` back out as the `Dispatcher`
+            // registry key a `dispatch` step names — a struct-field accessor over an
+            // already-parsed `ChainStep`, not a string-typed runner-selection entry
+            // point. It never selects an `EngineKind` (`EN.12.E` task 3).
+            ("dispatch.rs", &["workflow_key"]),
             ("execute.rs", &[]),
             ("gates.rs", &[]),
             // `profile_by_name` resolves a named policy profile (e.g. "cheap-fast") to

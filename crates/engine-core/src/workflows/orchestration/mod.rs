@@ -40,10 +40,17 @@
 //!   instead of [`graph::OrchestrationRunNode::new`]'s permissive always-proceed
 //!   defaults. `engine-serve`'s `register_orchestration_with_registry` (Task 2) is
 //!   what actually installs these into the served workflow.
+//! - [`dispatch`] (`EN.12.E` Task 3) — the dispatch step: a sibling of
+//!   [`execute`], not a variant of it. Resolves a `dispatch`-kind
+//!   [`chain::ChainStep`]'s `block_id` as a registered [`crate::Dispatcher`]
+//!   workflow key (`RESEARCH_AGENT`, `CONTENT_PIPELINE`, ...) and runs it as
+//!   one chain step, never selecting an [`engine_kind::EngineKind`] and never
+//!   falling through to a block invocation for an unregistered key.
 
 pub mod chain;
 pub mod checkpoint;
 pub mod corpus_gates;
+pub mod dispatch;
 pub mod engine_kind;
 pub mod execute;
 pub mod gates;
