@@ -623,8 +623,11 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   (`hold_poll_interval_ms`) never rewires which node runs, so there is no `registry_for_policy`
   variant to choose between at dispatch time — `engine_core::workflows::orchestration::graph::registry`
   is the only registry the workflow ever runs under — and `register_builtin_workflows` now
-  populates thirteen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
-  `register_sdlc_task`/`register_sdlc_task_with_registry`, mirroring `SDLC_FLOW`'s).
+  populates fourteen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
+  `register_sdlc_task`/`register_sdlc_task_with_registry`, mirroring `SDLC_FLOW`'s;
+  `register_deliverable_render` (`DELIVERABLE_RENDER`, `EN.4.D` task 5) follows the same
+  `PolicyConfigSource::Builtin` shape as the other channel/API-triggered workflows — see
+  [deliverable-render-workflow.md](deliverable-render-workflow.md)).
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a

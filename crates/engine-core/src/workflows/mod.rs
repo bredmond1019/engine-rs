@@ -26,6 +26,7 @@ use crate::policy::command_floor::{self, CommandDecision};
 
 pub mod approve_and_run;
 pub mod content_pipeline;
+pub mod deliverable_render;
 pub mod diagnostic_intake;
 pub mod harvest_approve;
 pub mod lead_ingest;

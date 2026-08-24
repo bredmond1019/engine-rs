@@ -82,7 +82,6 @@ consumer that never re-ranks. The blocks above are the implementation of that ru
 
 | Capability | Block | State | What it will do |
 |---|---|---|---|
-| `DELIVERABLE_RENDER` | `EN.4.D` | **Ready** | Render a roadmap to PDF. Referenced as "not yet built" from [diagnostic-intake-workflow.md](diagnostic-intake-workflow.md) and [proposal-generator-workflow.md](proposal-generator-workflow.md). |
 | `CONTENT_DRAFT` | `EN.5.G` | **Ready** | Draft posts from shipped work, review-gated. |
 | `EXTERNAL_INTEL` | `EN.5.C` | Waiting on `orchestrator:OR.Q` | Ecosystem sweep and ranked digest — the engine half of a Synapse pairing. |
 | Regression history + blind judge | `EN.5.B2` | **Ready** | Keep-if-better / revert-if-worse change gate. |

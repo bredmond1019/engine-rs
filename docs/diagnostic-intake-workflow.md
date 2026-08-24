@@ -177,7 +177,8 @@ Content-Type: application/json
   dedicated setup node. It resolves its own worktree path from an upstream `SetupWorktreeNode`
   result if present in `ctx.nodes`, falling back to `std::env::current_dir()` otherwise.
 - **Out of scope for this block**: company/prospecting research (EN.4.A, `research_agent`), PDF
-  render (EN.4.D — not yet built). Proposal generation and scoring (EN.4.C, built) imports
+  render (see [`DELIVERABLE_RENDER`](deliverable-render-workflow.md), `EN.4.D`). Proposal
+  generation and scoring (EN.4.C, built) imports
   `DiagnosticIntake` by name — see [proposal-generator-workflow.md](proposal-generator-workflow.md).
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
   only acquires and reasons; a downstream `PersistToBrainNode` (not part of this block) would own

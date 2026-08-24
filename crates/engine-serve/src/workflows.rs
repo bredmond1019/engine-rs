@@ -546,6 +546,38 @@ pub fn register_proposal_generator(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `DELIVERABLE_RENDER` workflow
+/// (`engine_core::workflows::deliverable_render`) with `dispatcher`,
+/// populating both the `workflow_registry` (via a policy-aware factory
+/// built on `deliverable_render::graph::registry_for_policy`) and the
+/// `schema_registry` (via `deliverable_render::graph::schema`). Mirrors
+/// [`register_proposal_generator`] / [`register_diagnostic_intake`] exactly
+/// — a channel/API-triggered run with no repo checkout at dispatch time, so
+/// the factory resolves `PolicyConfigSource::Builtin`. See
+/// `planning/EN.4.D/tasks.md`, Task 5.
+pub fn register_deliverable_render(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::deliverable_render::graph::schema(),
+        Box::new(|event: &serde_json::Value| {
+            let ctx = event_only_context(event);
+            let policy =
+                engine_core::workflows::deliverable_render::profiles::resolve_policy_for_run_from(
+                    &ctx,
+                    &PolicyConfigSource::Builtin,
+                )
+                .map_err(|err| err.to_string())?;
+            let registry =
+                engine_core::workflows::deliverable_render::graph::registry_for_policy(&policy);
+            let seeded = seed_resolved_policy(&policy)?;
+            Ok(Workflow::new(
+                registry,
+                engine_core::workflows::deliverable_render::graph::schema(),
+            )
+            .with_seeded_nodes(seeded))
+        }),
+    );
+}
+
 /// Env var this crate reads for the base URL its own served `POST /events/`
 /// endpoint is reachable at, so a served `CONTENT_PIPELINE` run's
 /// `ActionDispatchNode` self-POSTs a `TriggerWorkflow` action back to the
@@ -1025,6 +1057,7 @@ pub fn register_builtin_workflows_with_registry(
     register_research_agent(dispatcher);
     register_diagnostic_intake(dispatcher);
     register_proposal_generator(dispatcher);
+    register_deliverable_render(dispatcher);
     register_content_pipeline(dispatcher);
     register_opportunity_set_stage(dispatcher);
     register_opportunity_add_action(dispatcher);
@@ -1738,6 +1771,81 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("PROPOSAL_GENERATOR"));
+    }
+
+    fn minimal_deliverable_render_event() -> serde_json::Value {
+        serde_json::json!({
+            "roadmap": {
+                "situation": null,
+                "candidates": [],
+                "top_profiles": [],
+                "recommendation": null,
+                "authored_locale": "pt-BR",
+            },
+            "locale": "pt-BR",
+            "output_dir": "/tmp/deliverable-render-workflows-test",
+        })
+    }
+
+    #[test]
+    fn register_deliverable_render_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_deliverable_render(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("DELIVERABLE_RENDER"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_render_deliverable_node_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_deliverable_render(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("DELIVERABLE_RENDER")
+            .expect("DELIVERABLE_RENDER schema should resolve");
+
+        assert_eq!(schema.start_node, "RenderDeliverableNode");
+    }
+
+    #[test]
+    fn dispatch_with_event_seeds_the_resolved_deliverable_render_policy() {
+        let mut dispatcher = Dispatcher::new();
+        register_deliverable_render(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event("DELIVERABLE_RENDER", &minimal_deliverable_render_event())
+            .expect("DELIVERABLE_RENDER should dispatch to a runnable Workflow with no repo");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn dispatch_with_event_fails_loudly_on_unknown_deliverable_render_profile() {
+        let mut dispatcher = Dispatcher::new();
+        register_deliverable_render(&mut dispatcher);
+
+        let mut event = minimal_deliverable_render_event();
+        event["profile"] = serde_json::json!("not-a-real-profile");
+
+        let result = dispatcher.dispatch_with_event("DELIVERABLE_RENDER", &event);
+
+        match result {
+            Err(crate::dispatch::DispatchError::PolicyResolutionFailed(message)) => {
+                assert!(message.contains("not-a-real-profile"));
+            }
+            Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
+            Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_deliverable_render() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("DELIVERABLE_RENDER"));
     }
 
     fn minimal_web_article_event() -> serde_json::Value {
