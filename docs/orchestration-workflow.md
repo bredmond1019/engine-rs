@@ -1,12 +1,12 @@
 ---
 type: Reference
 title: The ORCHESTRATION workflow
-description: How engine-rs sequences SDLC_FLOW and SDLC_TASK runs across repos from a lane chain, mixed within one chain — the gates it applies before each block, the policy it resolves, and the closed engine type that bounds what it can invoke.
+description: How engine-rs sequences SDLC_FLOW and SDLC_TASK runs, plus dispatched in-process workflows, across repos from a lane chain — the gates it applies before each step, the policy it resolves, and the closed engine type that bounds what it can invoke.
 doc_id: orchestration-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, sdlc flow, sdlc task]
+keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, sdlc flow, sdlc task, dispatch step]
 related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, terminal-crates, orphan-recovery]
 ---
 
@@ -87,14 +87,50 @@ still applies to a *mixed* chain exactly as it does to a flow-only one. No corpu
 "how much is now drivable" is restated here; the figure would need to be re-measured against the
 current corpus at the time it's cited, and that re-measurement is out of scope for this rewrite.
 
+## A chain may also mix `block` and `dispatch` steps (`EN.12.E`)
+
+Every step in a chain also carries a `kind`, separate from the `EngineKind` question above.
+`kind` answers "is this step an SDLC spec at all, or a registered in-process workflow?" — while
+`EngineKind` (previous section) only ever answers "which SDLC engine" for a step that already is
+one. A `ChainStep`'s `kind` is `StepKind::Block` by default, so an existing chain with no `kind`
+field behaves exactly as before this feature; `StepKind::Dispatch` opts one step into the
+behavior below (`StepKind::Command` is reserved for a future block).
+
+- **A `block` step** is everything described above — one `SDLC_FLOW`/`SDLC_TASK` run against a
+  corpus block, gated, executed, and integrated the normal way.
+- **A `dispatch` step** runs a **registered in-process workflow** instead — one of the workflows
+  already registered with the same `Dispatcher` `engine-serve::workflows` populates (for example
+  `RESEARCH_AGENT` or `CONTENT_PIPELINE`; see `docs/architecture.md`'s `Dispatcher` entry). It
+  never opens a Claude Code session, never selects an `EngineKind`, and never falls through to a
+  block invocation — those are separate code paths (`dispatch.rs`'s `execute_dispatch_step`, not
+  `execute.rs`'s `execute_step`).
+
+A dispatch step reuses `ChainStep::block_id` as the `Dispatcher` registry key (`workflow_type`,
+e.g. `"RESEARCH_AGENT"`) rather than adding a new field — `dispatch.rs`'s `workflow_key` accessor
+names that reuse so a reader never has to infer it from the field name. An unregistered key stops
+the chain loudly with `DispatchStepError::UnknownWorkflowKey`, naming the step's `block_id` and
+the key it resolved to; it never silently proceeds to the next step or falls back to a block run.
+
+**A dispatch step's outcome is recorded in the journal, not `lane-log.jsonl`.** `integrate.rs`
+routes a `Dispatch` step to `execute_dispatch_step` and records the result as a `JournalRow` (the
+same `StepIntegrated`/`StepBailed` decision kinds a block step's integration uses — see
+`docs/architecture.md`'s Journal entry) through a new opt-in entry point,
+`integrate_chain_with_dispatch`. It does not push an `ExecutionOutcome`, write a checkpoint entry,
+or call `step_observer` — there is no SDLC state write to make resumable and no `ExecutionOutcome`
+shape to fabricate for a workflow that was never an SDLC run. Calling a chain with a dispatch step
+through the older `integrate_chain`/`integrate_chain_with_journal` entry points (no `Dispatcher`
+supplied) fails loudly with `IntegrateError::NoDispatcherConfigured` rather than silently skipping
+the step.
+
 ## What happens per block
 
 | Stage | Module | What it does |
 |---|---|---|
 | Resolve | `chain.rs` | Turns a (roadmap, lane) pair or an explicit block list into ordered `(repo, block_id)` steps. Reads mev's structured `HELD-UNTIL` / `BUDGET` / `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json` — it does not re-derive segments. |
 | Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** (backed by `corpus_gates.rs`, which reads each repo's real `planning/state.json` through `okf_core::load_state`) and refuses to start a block with an unmet edge, naming the edge and its repo. `DependencyEdge` is an enum — `Block` · `Operator { slug }` · `Approval { slug }` · `External { what }` — so an **operator gate is always unmet while present** and clears only by removal from the corpus (mev is the single writer); the engine can never self-clear one. Also reads mev's `lane-frontier.json` for lane-head startability, but `startable: true` never short-circuits the per-edge check. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail, and a block parked on an operator hold releases its permit rather than starving the ceiling. |
-| Execute | `execute.rs` | Builds and runs a **fresh in-process Rust `Workflow`** for whichever engine the block's own authored `sdlc_workflow` field names — `SDLC_FLOW` or `SDLC_TASK` — with the repo resolved through `RepoRegistry` and `event.repo` seeded. An unsupported or absent `sdlc_workflow` value errors (see above). |
-| Integrate | `integrate.rs` | Verifies the state write after the engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. Before each block, re-checks the run's `cancellation_token` and a campaign-scoped `CampaignLedger` against an optional `campaign_budget` ceiling (`EN.11.F`) — both checked again at every block boundary, not just once at the start. Appends exactly one `lane-log.jsonl` line per step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held` \| `cancelled` \| `budget_halted`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
+| Execute | `execute.rs` | For a `block`-kind step: builds and runs a **fresh in-process Rust `Workflow`** for whichever engine the block's own authored `sdlc_workflow` field names — `SDLC_FLOW` or `SDLC_TASK` — with the repo resolved through `RepoRegistry` and `event.repo` seeded. An unsupported or absent `sdlc_workflow` value errors (see above). A non-`Block` `kind` reaching `execute_step` is refused with `ExecuteError::WrongStepKind` — a `dispatch` step is routed elsewhere (below), never through this path. |
+| Dispatch | `dispatch.rs` | For a `dispatch`-kind step (`EN.12.E`, see "A chain may also mix `block` and `dispatch` steps" below): resolves the step's `block_id` as a `Dispatcher` registry key and runs the registered in-process workflow to completion, never selecting an `EngineKind`. |
+| Integrate | `integrate.rs` | Verifies the state write after a `block` step's engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. Before each block, re-checks the run's `cancellation_token` and a campaign-scoped `CampaignLedger` against an optional `campaign_budget` ceiling (`EN.11.F`) — both checked again at every block boundary, not just once at the start. Appends exactly one `lane-log.jsonl` line per `block` step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held` \| `cancelled` \| `budget_halted`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. A `dispatch` step's outcome is journaled instead, not appended to `lane-log.jsonl` (see below). An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
 
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
 an authored snapshot and has been wrong; the `depends_on` edges are the fact.
