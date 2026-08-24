@@ -5,7 +5,7 @@
 //! layer for the run state it owns. Built on the D2 persistence stack (`sqlx::PgPool`).
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use engine_contract::{EventsRow, TaskContext};
+use engine_contract::{EventsRow, JournalDecisionKind, JournalRow, TaskContext};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
 use sqlx::{PgPool, Row};
@@ -170,6 +170,96 @@ pub async fn list_orphan_candidates(
                     .0,
                 created_at: row.try_get::<NaiveDateTime, _>("created_at")?.and_utc(),
                 updated_at: row.try_get::<NaiveDateTime, _>("updated_at")?.and_utc(),
+            })
+        })
+        .collect()
+}
+
+/// Serialize a [`JournalDecisionKind`] to its snake_case wire string (e.g.
+/// `"step_bailed"`) for storage in the `journal`'s `kind` text column. Reuses
+/// the enum's own `#[serde(rename_all = "snake_case")]` tag rather than
+/// hand-maintaining a parallel string table.
+fn journal_kind_to_text(kind: JournalDecisionKind) -> String {
+    match serde_json::to_value(kind).expect("JournalDecisionKind always serializes") {
+        serde_json::Value::String(s) => s,
+        other => unreachable!("JournalDecisionKind must serialize to a string, got {other:?}"),
+    }
+}
+
+/// Inverse of [`journal_kind_to_text`]: decode a stored `kind` string back
+/// into a [`JournalDecisionKind`]. An unrecognized value is an `sqlx::Error`
+/// (via `Error::Decode`) rather than a panic, since it can only originate
+/// from a row a future/older engine-serve version wrote.
+fn journal_kind_from_text(text: &str) -> Result<JournalDecisionKind, sqlx::Error> {
+    serde_json::from_value(serde_json::Value::String(text.to_string()))
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+}
+
+/// Target schema (EN.12.D): `journal (id uuid primary key, campaign_id text,
+/// run_id uuid, step text, kind text, reason text, detail json, created_at
+/// timestamp)`. A composite index on `(campaign_id, created_at)` is required
+/// so [`list_journal_rows_for_campaign`]'s `WHERE campaign_id = $1 ORDER BY
+/// created_at ASC` reads back in decision order without a full table scan —
+/// e.g. `CREATE INDEX journal_campaign_created_at_idx ON journal
+/// (campaign_id, created_at);`. This repo carries no `.sql` migrations (the
+/// `events` table above is likewise schema-documented in comments, not in a
+/// tracked migration file); provisioning this index is a deployment-side
+/// step, mirroring how `events`' schema is provisioned.
+///
+/// Insert one durable journal row (EN.12.D). Follows `insert_event`'s shape:
+/// a plain `INSERT`, no upsert semantics — journal rows are append-only
+/// decision records, never revised in place.
+///
+/// Callers are expected to self-skip this call entirely when no
+/// `DATABASE_URL`/pool is configured (the same discipline `durable.rs`
+/// already applies to `EventsRow` writes); this function itself always
+/// requires a live `&PgPool`.
+pub async fn insert_journal_row(pool: &PgPool, row: &JournalRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO journal (id, campaign_id, run_id, step, kind, reason, detail, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(row.id)
+    .bind(&row.campaign_id)
+    .bind(row.run_id)
+    .bind(&row.step)
+    .bind(journal_kind_to_text(row.kind))
+    .bind(&row.reason)
+    .bind(Json(&row.detail))
+    .bind(row.created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// List a campaign's journal rows ordered by `created_at` ascending, so a
+/// campaign's journal reads back in decision order (oldest decision first).
+pub async fn list_journal_rows_for_campaign(
+    pool: &PgPool,
+    campaign_id: &str,
+) -> Result<Vec<JournalRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, campaign_id, run_id, step, kind, reason, detail, created_at \
+         FROM journal \
+         WHERE campaign_id = $1 \
+         ORDER BY created_at ASC",
+    )
+    .bind(campaign_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let kind_text: String = row.try_get("kind")?;
+            Ok(JournalRow {
+                id: row.try_get("id")?,
+                campaign_id: row.try_get("campaign_id")?,
+                run_id: row.try_get("run_id")?,
+                step: row.try_get("step")?,
+                kind: journal_kind_from_text(&kind_text)?,
+                reason: row.try_get("reason")?,
+                detail: row.try_get::<Json<serde_json::Value>, _>("detail")?.0,
+                created_at: row.try_get::<NaiveDateTime, _>("created_at")?.and_utc(),
             })
         })
         .collect()

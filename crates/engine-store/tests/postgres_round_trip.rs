@@ -20,10 +20,12 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use engine_contract::{EventsRow, NodeRun, NodeRunStatus, TaskContext};
+use engine_contract::{
+    EventsRow, JournalDecisionKind, JournalRow, NodeRun, NodeRunStatus, TaskContext,
+};
 use engine_store::{
-    connect, get_event, get_task_context, insert_event, list_orphan_candidates, update_event,
-    upsert_event,
+    connect, get_event, get_task_context, insert_event, insert_journal_row,
+    list_journal_rows_for_campaign, list_orphan_candidates, update_event, upsert_event,
 };
 use uuid::Uuid;
 
@@ -383,6 +385,74 @@ async fn list_orphan_candidates_returns_only_uncompleted_rows_older_than_cutoff(
     // Clean up so repeated local runs don't accumulate rows.
     for id in [completed_id, orphan_id, recent_id] {
         sqlx::query("DELETE FROM events WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("cleanup delete should succeed");
+    }
+}
+
+/// `insert_journal_row` / `list_journal_rows_for_campaign` (EN.12.D task 2):
+/// rows for one campaign come back ordered by `created_at` ascending, and a
+/// row for a *different* campaign is excluded.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with `cargo test -p engine-store -- --ignored`"]
+async fn insert_then_list_journal_rows_returns_campaign_rows_in_created_at_order() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set to run this ignored test (see file header)");
+
+    let pool = connect(&database_url)
+        .await
+        .expect("failed to connect to DATABASE_URL");
+
+    let campaign_id = format!("engine-store-journal-test-{}", Uuid::new_v4());
+    let other_campaign_id = format!("engine-store-journal-test-other-{}", Uuid::new_v4());
+    let base = Utc::now();
+
+    let make_row = |kind: JournalDecisionKind, campaign: &str, offset_secs: i64| JournalRow {
+        id: Uuid::new_v4(),
+        campaign_id: campaign.to_string(),
+        run_id: Uuid::new_v4(),
+        step: "build".to_string(),
+        kind,
+        reason: format!("{kind:?}"),
+        detail: serde_json::json!({}),
+        created_at: base + chrono::Duration::seconds(offset_secs),
+    };
+
+    // Inserted out of chronological order on purpose, to prove the read path
+    // sorts rather than relying on insertion order.
+    let second = make_row(JournalDecisionKind::StepBailed, &campaign_id, 20);
+    let first = make_row(JournalDecisionKind::ResolvedPolicy, &campaign_id, 5);
+    let third = make_row(JournalDecisionKind::BudgetHalted, &campaign_id, 40);
+    let other = make_row(JournalDecisionKind::StepIntegrated, &other_campaign_id, 10);
+
+    for row in [&second, &first, &third, &other] {
+        insert_journal_row(&pool, row)
+            .await
+            .expect("insert_journal_row should succeed");
+    }
+
+    let rows = list_journal_rows_for_campaign(&pool, &campaign_id)
+        .await
+        .expect("list_journal_rows_for_campaign should succeed");
+
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![first.id, second.id, third.id],
+        "rows must come back ordered by created_at ascending"
+    );
+    assert!(
+        rows.iter().all(|r| r.campaign_id == campaign_id),
+        "no row from another campaign must be returned"
+    );
+    assert_eq!(rows[0].kind, JournalDecisionKind::ResolvedPolicy);
+    assert_eq!(rows[1].kind, JournalDecisionKind::StepBailed);
+    assert_eq!(rows[2].kind, JournalDecisionKind::BudgetHalted);
+
+    // Clean up so repeated local runs don't accumulate rows.
+    for id in [first.id, second.id, third.id, other.id] {
+        sqlx::query("DELETE FROM journal WHERE id = $1")
             .bind(id)
             .execute(&pool)
             .await

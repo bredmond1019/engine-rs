@@ -270,6 +270,7 @@ mod tests {
                 model: String::new(),
             }),
             Some(cost),
+            None,
         );
         ledger
     }

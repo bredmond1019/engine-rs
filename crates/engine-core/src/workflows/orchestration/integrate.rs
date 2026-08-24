@@ -843,6 +843,116 @@ pub struct StepProgress {
 /// boundary alongside every other closure this node owns.
 pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
 
+/// An injected "record this journal item" seam (`EN.12.D` task 4) — mirrors
+/// [`StepObserverFn`]'s shape exactly, `Send + Sync` for the same reason.
+/// Production wiring hands this a closure that forwards to
+/// `engine_serve::durable::DurableHandle::send_journal` (`engine-core`
+/// cannot depend on `engine-serve` — the dependency runs the other way —
+/// so the sink is injected here rather than called directly); tests
+/// substitute a closure that records into a `Vec`/`Mutex` instead. Reached
+/// only through [`integrate_chain_with_journal`] — [`integrate_chain`]
+/// itself always passes `None`, making journal recording strictly
+/// additive over the pre-`EN.12.D` behavior.
+pub type JournalSinkFn = dyn Fn(engine_contract::JournalRow) + Send + Sync;
+
+/// Build one [`engine_contract::JournalRow`] and forward it to
+/// `journal_sink`, if any. A `None` sink (the default via
+/// [`integrate_chain`]) is a true no-op: no row is even constructed.
+fn emit_journal(
+    journal_sink: Option<&JournalSinkFn>,
+    campaign_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+    step: &str,
+    kind: engine_contract::JournalDecisionKind,
+    reason: impl Into<String>,
+    detail: Value,
+) {
+    let Some(sink) = journal_sink else {
+        return;
+    };
+    sink(engine_contract::JournalRow {
+        id: uuid::Uuid::new_v4(),
+        campaign_id: campaign_id.to_string(),
+        run_id,
+        step: step.to_string(),
+        kind,
+        reason: reason.into(),
+        detail,
+        created_at: Utc::now(),
+    });
+}
+
+/// The child run id a journal row keys on (`EN.11.G`): read back from the
+/// finished child's own `TaskContext::metadata` stamp
+/// (`engine_core::workflow::read_run_id`, under `RUN_ID_METADATA_KEY`) when
+/// present, else a fresh id. A step whose child never stamped one (no
+/// `RunOptions::run_id` threaded into this particular invocation) or that
+/// never started at all (`ctx: None` — a gate refusal or a budget halt,
+/// both decided BEFORE any child runs) still gets an addressable, valid
+/// row rather than a row with a missing/fabricated field.
+fn journal_run_id(ctx: Option<&engine_contract::TaskContext>) -> uuid::Uuid {
+    ctx.and_then(|ctx| crate::workflow::read_run_id(&ctx.metadata))
+        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4)
+}
+
+/// The resolved policy actually used for a finished step, read from the
+/// child's own `ctx` — never from the triggering event's configured
+/// values (`EN.12.D`'s "decision inputs, not outputs" clause: the one
+/// archived Rust `SDLC_FLOW` run on disk carries `policy.local =
+/// {qwen2.5:3b}` while having actually executed on cloud, so stamping the
+/// configured value would record a run that never happened).
+///
+/// - `model_tier` is folded from every `node_runs[..].usage.model` the
+///   child actually reported — empty if none did, a single string if every
+///   node agrees, a list if they diverge.
+/// - `transport` is folded the same way from every node output's
+///   `"transport"."tier"` stamp — the same convention `ClaudeCodeStep`/
+///   `task_loop.rs` nodes already use (see e.g. `task_loop.rs`'s
+///   `TriageTaskNode` transport-tier tests).
+/// - `executor` is the sanctioned engine the chain actually resolved and
+///   ran ([`EngineKind`]), stamped on [`ExecutionOutcome::engine`].
+/// - `profile` is read from the child's own triggering `ctx.event` (the
+///   profile bundle NAME selected for this run) — there is no
+///   resolved-vs-configured divergence possible for a profile identifier
+///   the way there is for a model tier picked ad hoc mid-run, so this one
+///   field is not re-derived from execution evidence.
+fn resolved_policy_detail(ctx: &engine_contract::TaskContext, engine: EngineKind) -> Value {
+    let mut models: Vec<String> = Vec::new();
+    for run in ctx.node_runs.values() {
+        if let Some(usage) = &run.usage {
+            if !usage.model.is_empty() && !models.contains(&usage.model) {
+                models.push(usage.model.clone());
+            }
+        }
+    }
+    let mut tiers: Vec<String> = Vec::new();
+    for output in ctx.nodes.values() {
+        if let Some(tier) = output
+            .get("transport")
+            .and_then(|t| t.get("tier"))
+            .and_then(Value::as_str)
+        {
+            if !tiers.contains(&tier.to_string()) {
+                tiers.push(tier.to_string());
+            }
+        }
+    }
+    let single_or_list = |mut values: Vec<String>| -> Value {
+        match values.len() {
+            0 => Value::Null,
+            1 => Value::String(values.remove(0)),
+            _ => serde_json::json!(values),
+        }
+    };
+    serde_json::json!({
+        "profile": ctx.event.get("profile").cloned().unwrap_or(Value::Null),
+        "model_tier": single_or_list(models),
+        "transport": single_or_list(tiers),
+        "executor": engine.to_string(),
+    })
+}
+
 // ── The integrated loop ─────────────────────────────────────────────────
 
 /// Drive `chain` to completion, in order: for every step, gate on
@@ -937,6 +1047,16 @@ pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
 /// index convention. A no-op observer (e.g. `&|_| {}`) makes this
 /// parameter behavior-stable: nothing about the loop's control flow or
 /// return value depends on it.
+///
+/// `EN.12.D` task 4 widens the loop with a fifth-and-sixth pair of journal
+/// emissions (on top of the five decision points named in [`emit_journal`]'s
+/// call sites): a `ResolvedPolicy` item per successfully-executed step
+/// (never the configured value — see [`resolved_policy_detail`]), and a
+/// `BudgetHalted` item at the same boundary the campaign ceiling already
+/// checks. This function's own public signature stays byte-identical
+/// (`journal_sink` is always `None` here) so every existing caller keeps
+/// compiling unmodified; [`integrate_chain_with_journal`] is the new entry
+/// point that actually wants journal rows.
 #[allow(clippy::too_many_arguments)]
 pub async fn integrate_chain(
     chain: &[ChainStep],
@@ -956,6 +1076,102 @@ pub async fn integrate_chain(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     campaign_id: uuid::Uuid,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        campaign_id,
+        None,
+    )
+    .await
+}
+
+/// Identical to [`integrate_chain`] except every decision point ALSO
+/// forwards a [`JournalRow`] to `journal_sink` (`EN.12.D` task 4) — a
+/// bail, a gate refusal, a state-write verification failure, a budget
+/// halt, an integrated step, and one resolved-policy item per executed
+/// step. `journal_sink` is the injectable seam production code wires to
+/// `engine_serve::durable::DurableHandle::send_journal` (the async
+/// Postgres write itself stays off this function's hot path, exactly like
+/// `step_observer`); tests substitute a recording closure.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_journal(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    campaign_id: uuid::Uuid,
+    journal_sink: &JournalSinkFn,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        campaign_id,
+        Some(journal_sink),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn integrate_chain_impl(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    campaign_id: uuid::Uuid,
+    journal_sink: Option<&JournalSinkFn>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -1006,10 +1222,38 @@ pub async fn integrate_chain(
                 LaneLogEntry::budget_halted(step, lane.unwrap_or(step.repo.as_str()), reason);
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
+            // `EN.12.D` task 4: the fifth decision point — the one decision
+            // an unattended overnight run makes with nobody present to
+            // observe it. No child ran for this step, so the row keys on a
+            // fresh id ([`journal_run_id`] with `ctx: None`).
+            emit_journal(
+                journal_sink,
+                campaign_id,
+                journal_run_id(None),
+                &step.block_id,
+                engine_contract::JournalDecisionKind::BudgetHalted,
+                format!(
+                    "campaign budget ceiling tripped before block {} started",
+                    step.block_id
+                ),
+                reason.to_json(),
+            );
             break;
         }
 
-        check_dependencies(step, resolve_depends_on, is_edge_met)?;
+        if let Err(err) = check_dependencies(step, resolve_depends_on, is_edge_met) {
+            let integrate_err = IntegrateError::from(err);
+            emit_journal(
+                journal_sink,
+                campaign_id,
+                journal_run_id(None),
+                &step.block_id,
+                engine_contract::JournalDecisionKind::GateRefused,
+                integrate_err.to_string(),
+                serde_json::json!({}),
+            );
+            return Err(integrate_err);
+        }
 
         // Wait out any operator hold BEFORE touching admission at all —
         // EN.11.L Task 1. The admission permit must be scoped to the
@@ -1098,14 +1342,50 @@ pub async fn integrate_chain(
                 let entry = LaneLogEntry::bailed(step, step_lane, integrate_err.to_string());
                 let _ = append_lane_log_line(roadmap_dir, &entry);
                 let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                // `EN.12.D` task 4: no child `ctx` exists for a step whose
+                // `execute_step` call itself failed — the row keys on a
+                // fresh id, same as the pre-dispatch decision points above.
+                emit_journal(
+                    journal_sink,
+                    campaign_id,
+                    journal_run_id(None),
+                    &step.block_id,
+                    engine_contract::JournalDecisionKind::StepBailed,
+                    integrate_err.to_string(),
+                    serde_json::json!({}),
+                );
                 return Err(integrate_err);
             }
         };
+
+        // `EN.12.D` task 4: one `ResolvedPolicy` item per step whose child
+        // actually ran, emitted here — BEFORE `verify_state_write` — so it
+        // is recorded regardless of whether the subsequent verification
+        // passes. Keyed on the child's own stamped run id when present.
+        let step_run_id = journal_run_id(Some(&outcome.ctx));
+        emit_journal(
+            journal_sink,
+            campaign_id,
+            step_run_id,
+            &step.block_id,
+            engine_contract::JournalDecisionKind::ResolvedPolicy,
+            "resolved policy for this step, read after execution",
+            resolved_policy_detail(&outcome.ctx, outcome.engine),
+        );
 
         if let Err(err) = verify_state_write(&outcome) {
             let entry = LaneLogEntry::bailed(step, step_lane, err.to_string());
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
+            emit_journal(
+                journal_sink,
+                campaign_id,
+                step_run_id,
+                &step.block_id,
+                engine_contract::JournalDecisionKind::StateWriteVerificationFailed,
+                err.to_string(),
+                serde_json::json!({}),
+            );
             return Err(err);
         }
 
@@ -1115,6 +1395,18 @@ pub async fn integrate_chain(
             format!("block {} closed via SDLC_FLOW", step.block_id),
         );
         append_lane_log_line(roadmap_dir, &entry)?;
+
+        // `EN.12.D` task 4: the integrated-step decision point — the child
+        // ran AND its state write verified.
+        emit_journal(
+            journal_sink,
+            campaign_id,
+            step_run_id,
+            &step.block_id,
+            engine_contract::JournalDecisionKind::StepIntegrated,
+            format!("block {} closed via SDLC_FLOW", step.block_id),
+            serde_json::json!({}),
+        );
 
         // `EN.11.H` task 2: checkpoint this step as integrated, AFTER the
         // lane-log line — a crash between the two leaves the lane log
@@ -2601,5 +2893,432 @@ mod tests {
             serde_json::from_str::<Value>(lines[0]).unwrap()["block"],
             json!("A.1")
         );
+    }
+
+    // ── `EN.12.D` task 4: journal emissions at the five decision points ──
+
+    fn recording_journal_sink() -> (
+        std::sync::Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync>,
+        Arc<Mutex<Vec<engine_contract::JournalRow>>>,
+    ) {
+        let rows: Arc<Mutex<Vec<engine_contract::JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = rows.clone();
+        let sink: std::sync::Arc<dyn Fn(engine_contract::JournalRow) + Send + Sync> =
+            std::sync::Arc::new(move |row: engine_contract::JournalRow| {
+                recorded.lock().unwrap().push(row);
+            });
+        (sink, rows)
+    }
+
+    /// A real bailed chain step produces a `StepBailed` journal row whose
+    /// `reason` names the bail.
+    #[tokio::test]
+    async fn journal_records_a_bailed_step_naming_the_bail() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain_with_journal(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &move |row| sink_fn(row),
+        )
+        .await
+        .expect_err("a failing step must propagate its error");
+        assert!(matches!(err, IntegrateError::Execute(_)));
+
+        let recorded = rows.lock().unwrap();
+        let bailed = recorded
+            .iter()
+            .find(|r| r.kind == engine_contract::JournalDecisionKind::StepBailed)
+            .expect("a StepBailed row must be recorded");
+        assert!(
+            bailed.reason.contains("simulated failure"),
+            "reason should name the bail: {}",
+            bailed.reason
+        );
+        assert_eq!(bailed.step, "A.1");
+    }
+
+    /// A step halted by a budget cap produces a `BudgetHalted` journal row
+    /// naming the tripped cap, the spend, and the limit. A halt that
+    /// produces no row is a failure.
+    #[tokio::test]
+    async fn journal_records_a_budget_halt_naming_the_tripped_cap() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = token_reporting_runner(100);
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let budget = Budget {
+            max_total_tokens: Some(100),
+            max_cost_usd: None,
+        };
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        integrate_chain_with_journal(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            Some(&budget),
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &move |row| sink_fn(row),
+        )
+        .await
+        .expect("a budget halt is not an error");
+
+        let recorded = rows.lock().unwrap();
+        let halted = recorded
+            .iter()
+            .find(|r| r.kind == engine_contract::JournalDecisionKind::BudgetHalted)
+            .expect("a BudgetHalted row must be recorded — a halt with no row is a failure");
+        assert_eq!(halted.step, "A.2", "the block that never started");
+        assert_eq!(halted.detail["cap"], json!("max_total_tokens"));
+        assert!(halted.detail.get("spent").is_some());
+        assert!(halted.detail.get("limit").is_some());
+    }
+
+    /// A refused gate produces a `GateRefused` journal row.
+    #[tokio::test]
+    async fn journal_records_a_gate_refusal() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| {
+            vec![DependencyEdge::Block {
+                repo: "repo-a".to_string(),
+                block_id: "A.0".to_string(),
+            }]
+        };
+        let is_met = |_repo: &str, _id: &str| false;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain_with_journal(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &move |row| sink_fn(row),
+        )
+        .await
+        .expect_err("an unmet dependency must gate the step");
+        assert!(matches!(err, IntegrateError::Gate(_)));
+
+        let recorded = rows.lock().unwrap();
+        let refused = recorded
+            .iter()
+            .find(|r| r.kind == engine_contract::JournalDecisionKind::GateRefused)
+            .expect("a GateRefused row must be recorded");
+        assert_eq!(refused.step, "A.1");
+    }
+
+    /// A failed state-write verification produces a
+    /// `StateWriteVerificationFailed` journal row.
+    #[tokio::test]
+    async fn journal_records_a_state_write_verification_failure() {
+        let (dir, registry) = two_repo_registry();
+        write_corrupted_state(&dir.path().join("repo-a"), "A.1", "in_progress");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain_with_journal(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &move |row| sink_fn(row),
+        )
+        .await
+        .expect_err("a mismatched state write must fail loudly");
+        assert!(matches!(err, IntegrateError::StateWriteMismatch { .. }));
+
+        let recorded = rows.lock().unwrap();
+        let failed = recorded
+            .iter()
+            .find(|r| r.kind == engine_contract::JournalDecisionKind::StateWriteVerificationFailed)
+            .expect("a StateWriteVerificationFailed row must be recorded");
+        assert_eq!(failed.step, "A.1");
+    }
+
+    /// An integrated step produces a `StepIntegrated` journal row, and a
+    /// successful step also produces a `ResolvedPolicy` row.
+    #[tokio::test]
+    async fn journal_records_step_integrated_and_resolved_policy_for_a_successful_step() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        integrate_chain_with_journal(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &move |row| sink_fn(row),
+        )
+        .await
+        .expect("the step should integrate");
+
+        let recorded = rows.lock().unwrap();
+        assert!(
+            recorded.iter().any(
+                |r| r.kind == engine_contract::JournalDecisionKind::StepIntegrated
+                    && r.step == "A.1"
+            ),
+            "expected a StepIntegrated row: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(
+                |r| r.kind == engine_contract::JournalDecisionKind::ResolvedPolicy
+                    && r.step == "A.1"
+            ),
+            "expected a ResolvedPolicy row: {recorded:?}"
+        );
+    }
+
+    /// THE LOAD-BEARING TEST: a step configured with a local model tier
+    /// that is NOT used at execution produces a `ResolvedPolicy` row
+    /// recording the tier that ACTUALLY RAN — never the configured value.
+    /// The event carries `policy.local = "qwen2.5:3b"` (the configured
+    /// tier), but the child's own `ctx` reports it actually executed on
+    /// `claude-sonnet-4-5` over the cloud transport — the row must echo
+    /// the latter, matching the archived-run discrepancy the block record
+    /// cites.
+    #[tokio::test]
+    async fn journal_resolved_policy_records_the_tier_that_actually_ran_not_the_configured_one() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let runner: FlowRunner = Arc::new(move |_invocation| {
+            Box::pin(async move {
+                let mut node_runs = std::collections::HashMap::new();
+                node_runs.insert(
+                    "ClaudeCodeStep".to_string(),
+                    engine_contract::NodeRun {
+                        status: engine_contract::NodeRunStatus::Success,
+                        started_at: None,
+                        completed_at: None,
+                        error: None,
+                        input: None,
+                        usage: Some(engine_contract::Usage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(10),
+                            // The tier that ACTUALLY ran — cloud, not the
+                            // configured local tier below.
+                            model: "claude-sonnet-4-5".to_string(),
+                        }),
+                    },
+                );
+                let mut nodes = std::collections::HashMap::new();
+                nodes.insert(
+                    "ClaudeCodeStep".to_string(),
+                    json!({ "transport": { "tier": "cloud", "endpoint": null } }),
+                );
+                Ok(engine_contract::TaskContext {
+                    // The CONFIGURED value — a journal stamping this would
+                    // record a run that never happened.
+                    event: json!({ "policy": { "local": "qwen2.5:3b" } }),
+                    nodes,
+                    metadata: json!({}),
+                    node_runs,
+                })
+            })
+        });
+
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        integrate_chain_with_journal(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &move |row| sink_fn(row),
+        )
+        .await
+        .expect("the step should integrate");
+
+        let recorded = rows.lock().unwrap();
+        let resolved = recorded
+            .iter()
+            .find(|r| r.kind == engine_contract::JournalDecisionKind::ResolvedPolicy)
+            .expect("a ResolvedPolicy row must be recorded");
+
+        assert_eq!(
+            resolved.detail["model_tier"],
+            json!("claude-sonnet-4-5"),
+            "the row must record the tier that ACTUALLY ran, not the configured \
+             'qwen2.5:3b' — a row echoing the configured value fails: {}",
+            resolved.detail
+        );
+        assert_eq!(resolved.detail["transport"], json!("cloud"));
+        assert_ne!(
+            resolved.detail["model_tier"],
+            json!("qwen2.5:3b"),
+            "a row echoing the configured value must fail this test"
+        );
+    }
+
+    /// With no journal sink (the plain `integrate_chain` entry point,
+    /// unchanged from before this task), the run still completes
+    /// normally — journal recording is strictly additive.
+    #[tokio::test]
+    async fn plain_integrate_chain_still_works_with_no_journal_sink() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let outcomes = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("chain should complete");
+        assert_eq!(outcomes.len(), 1);
     }
 }

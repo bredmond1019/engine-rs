@@ -8,22 +8,27 @@
 //! behavior is unchanged from before this block.
 //!
 //! `engine_contract::Usage` (contract §6) carries `input_tokens` /
-//! `output_tokens` / `model` but no cost figure, so token spend is folded in
-//! from `NodeRun.usage` directly while cost spend is folded in separately
-//! via [`BudgetLedger::record`]'s `cost_usd` parameter — callers that have a
-//! cost figure (e.g. `ClaudeCodeStep`'s SDK `Outcome::cost_usd`) pass it
+//! `output_tokens` / `model` but no cost figure and no cache-token
+//! channels, so token spend is folded in from `NodeRun.usage` directly
+//! while cost spend and cache-token spend are folded in separately via
+//! [`BudgetLedger::record`]'s `cost_usd` and `cache_tokens` parameters —
+//! callers that have those figures (e.g. `ClaudeCodeStep`'s SDK
+//! `Outcome::cost_usd` and the `cache_read_input_tokens` /
+//! `cache_creation_input_tokens` keys it writes into `ctx.nodes`, deliberately
+//! routed there rather than into the contract's `Usage` shape) pass them
 //! alongside the usage.
 
 use engine_contract::{TaskContext, Usage};
 
-use crate::workflow::node_cost_usd;
+use crate::workflow::{node_cache_tokens, node_cost_usd};
 
 /// Optional per-run spend caps. Any field left `None` is not enforced.
 /// `Budget::default()` (all `None`) means "no gate" — the ledger's
 /// [`BudgetLedger::check`] always allows.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Budget {
-    /// Halt once accumulated `input_tokens + output_tokens` across all
+    /// Halt once accumulated `input_tokens + output_tokens +
+    /// cache_read_input_tokens + cache_creation_input_tokens` across all
     /// completed nodes reaches this cap.
     pub max_total_tokens: Option<u64>,
     /// Halt once accumulated cost (USD) across all completed nodes reaches
@@ -108,10 +113,12 @@ impl BudgetLedger {
 
     /// Lossy fallback for a context whose suspension marker carries no
     /// ledger snapshot (a marker written before EN.6.F, or a DB row from an
-    /// older process). Sums `node_runs[*].usage` (tokens) and
-    /// `nodes[*].cost_usd` (dollars, via the same [`node_cost_usd`] reader
-    /// `Workflow::run`'s own fold uses) across every node identity in the
-    /// context.
+    /// older process). Sums `node_runs[*].usage` (input/output tokens) plus,
+    /// per node identity, `nodes[*].cache_read_input_tokens` +
+    /// `nodes[*].cache_creation_input_tokens` (via [`node_cache_tokens`],
+    /// the same reader `Workflow::run`'s own fold uses) and
+    /// `nodes[*].cost_usd` (dollars, via the same [`node_cost_usd`] reader)
+    /// across every node identity in the context.
     ///
     /// **LOSSY** — `node_runs` is keyed by node identity, not by
     /// invocation, so a node that ran `N` times through a loop back-edge
@@ -119,21 +126,26 @@ impl BudgetLedger {
     /// all `N` runs. This exists so a resume never silently restarts spend
     /// at zero, not because it reconstructs the true historical total.
     pub fn from_context(ctx: &TaskContext) -> Self {
-        let total_tokens = ctx
+        let usage_tokens: u64 = ctx
             .node_runs
             .values()
             .filter_map(|run| run.usage.as_ref())
             .map(|usage| usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0))
             .sum();
 
-        let total_cost_usd = ctx
-            .nodes
-            .keys()
-            .filter_map(|identity| node_cost_usd(ctx, identity))
-            .sum();
+        let mut total_cost_usd = 0.0;
+        let mut cache_tokens = 0u64;
+        for identity in ctx.nodes.keys() {
+            if let Some(cost) = node_cost_usd(ctx, identity) {
+                total_cost_usd += cost;
+            }
+            if let Some(tokens) = node_cache_tokens(ctx, identity) {
+                cache_tokens += tokens;
+            }
+        }
 
         Self {
-            total_tokens,
+            total_tokens: usage_tokens + cache_tokens,
             total_cost_usd,
         }
     }
@@ -141,19 +153,34 @@ impl BudgetLedger {
     /// Folds a completed node's spend into the ledger.
     ///
     /// `usage: None` (non-LLM nodes, or an LLM node that reported none)
-    /// contributes no tokens. `cost_usd: None` contributes no cost — pass
-    /// `Some` only when the caller has an actual cost figure in hand.
-    pub fn record(&mut self, usage: Option<&Usage>, cost_usd: Option<f64>) {
+    /// contributes no `input_tokens`/`output_tokens`. `cost_usd: None`
+    /// contributes no cost — pass `Some` only when the caller has an actual
+    /// cost figure in hand. `cache_tokens: None` (a non-LLM node, or a node
+    /// whose SDK call reported neither cache channel) contributes no cache
+    /// tokens — pass the sum of `cache_read_input_tokens` +
+    /// `cache_creation_input_tokens` (e.g. via
+    /// [`crate::workflow::node_cache_tokens`]) when the caller has it.
+    pub fn record(
+        &mut self,
+        usage: Option<&Usage>,
+        cost_usd: Option<f64>,
+        cache_tokens: Option<u64>,
+    ) {
         if let Some(usage) = usage {
             self.total_tokens += usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0);
+        }
+        if let Some(cache_tokens) = cache_tokens {
+            self.total_tokens += cache_tokens;
         }
         if let Some(cost) = cost_usd {
             self.total_cost_usd += cost;
         }
     }
 
-    /// Accumulated `input_tokens + output_tokens` across every [`record`]
-    /// call so far.
+    /// Accumulated `input_tokens + output_tokens + cache_read_input_tokens +
+    /// cache_creation_input_tokens` across every [`record`] call so far —
+    /// all four channels the CLI can report, not just the two the
+    /// `engine_contract::Usage` shape carries.
     ///
     /// [`record`]: BudgetLedger::record
     pub fn total_tokens(&self) -> u64 {
@@ -320,8 +347,8 @@ mod tests {
     #[test]
     fn ledger_accumulates_across_several_usage_entries() {
         let mut ledger = BudgetLedger::new();
-        ledger.record(Some(&usage(10, 20)), Some(0.01));
-        ledger.record(Some(&usage(5, 15)), Some(0.02));
+        ledger.record(Some(&usage(10, 20)), Some(0.01), None);
+        ledger.record(Some(&usage(5, 15)), Some(0.02), None);
 
         assert_eq!(ledger.total_tokens(), 50);
         assert!((ledger.total_cost_usd() - 0.03).abs() < f64::EPSILON);
@@ -330,8 +357,8 @@ mod tests {
     #[test]
     fn usage_none_contributes_nothing() {
         let mut ledger = BudgetLedger::new();
-        ledger.record(Some(&usage(10, 20)), Some(0.01));
-        ledger.record(None, None);
+        ledger.record(Some(&usage(10, 20)), Some(0.01), None);
+        ledger.record(None, None, None);
 
         assert_eq!(ledger.total_tokens(), 30);
         assert!((ledger.total_cost_usd() - 0.01).abs() < f64::EPSILON);
@@ -340,7 +367,7 @@ mod tests {
     #[test]
     fn under_cap_allows() {
         let mut ledger = BudgetLedger::new();
-        ledger.record(Some(&usage(10, 10)), Some(0.01));
+        ledger.record(Some(&usage(10, 10)), Some(0.01), None);
 
         let budget = Budget {
             max_total_tokens: Some(1000),
@@ -353,7 +380,7 @@ mod tests {
     #[test]
     fn at_cap_halts_naming_total_tokens() {
         let mut ledger = BudgetLedger::new();
-        ledger.record(Some(&usage(50, 50)), None);
+        ledger.record(Some(&usage(50, 50)), None, None);
 
         let budget = Budget {
             max_total_tokens: Some(100),
@@ -379,7 +406,7 @@ mod tests {
     #[test]
     fn over_cap_halts_naming_cost_usd() {
         let mut ledger = BudgetLedger::new();
-        ledger.record(None, Some(5.5));
+        ledger.record(None, Some(5.5), None);
 
         let budget = Budget {
             max_total_tokens: None,
@@ -405,7 +432,11 @@ mod tests {
     #[test]
     fn no_config_always_allows() {
         let mut ledger = BudgetLedger::new();
-        ledger.record(Some(&usage(u64::MAX / 2, u64::MAX / 2)), Some(1_000_000.0));
+        ledger.record(
+            Some(&usage(u64::MAX / 2, u64::MAX / 2)),
+            Some(1_000_000.0),
+            None,
+        );
 
         assert_eq!(ledger.check(None), BudgetDecision::Allow);
     }
@@ -520,6 +551,78 @@ mod tests {
     }
 
     #[test]
+    fn campaign_ledger_cap_trips_on_the_corrected_per_run_figure() {
+        // Pins the inheritance: `CampaignLedger::record_step` takes a
+        // caller-supplied `total_tokens` per step, so once `BudgetLedger`
+        // (task 1) folds the cache channels into that per-run figure, the
+        // campaign ceiling is correct for free — but an inherited fix with
+        // no test is indistinguishable from an untested one, and this is
+        // the ceiling `EN.11.F` relies on for an unattended overnight
+        // campaign.
+        //
+        // Two steps, each built from a real `TaskContext` via
+        // `BudgetLedger::from_context` (not hand-summed), with mutually
+        // distinct input/output/cache figures so a summing bug in either
+        // channel cannot hide.
+        let mut node_runs_1 = HashMap::new();
+        node_runs_1.insert("NodeA".to_string(), node_run_with_usage(10, 20));
+        let mut nodes_1 = HashMap::new();
+        nodes_1.insert("NodeA".to_string(), node_output_with_cache(1000, 500));
+        let ctx_1 = TaskContext {
+            event: serde_json::json!({}),
+            nodes: nodes_1,
+            metadata: serde_json::json!({}),
+            node_runs: node_runs_1,
+        };
+        let step_1_corrected = BudgetLedger::from_context(&ctx_1).total_tokens();
+        assert_eq!(step_1_corrected, 1530); // 10 + 20 + 1000 + 500
+
+        let mut node_runs_2 = HashMap::new();
+        node_runs_2.insert("NodeB".to_string(), node_run_with_usage(4, 6));
+        let mut nodes_2 = HashMap::new();
+        nodes_2.insert("NodeB".to_string(), node_output_with_cache(200, 100));
+        let ctx_2 = TaskContext {
+            event: serde_json::json!({}),
+            nodes: nodes_2,
+            metadata: serde_json::json!({}),
+            node_runs: node_runs_2,
+        };
+        let step_2_corrected = BudgetLedger::from_context(&ctx_2).total_tokens();
+        assert_eq!(step_2_corrected, 310); // 4 + 6 + 200 + 100
+
+        // Chain-level cap set strictly between the old two-channel sum
+        // (10+20 + 4+6 = 40) and the corrected four-channel sum
+        // (1530 + 310 = 1840).
+        let budget = Budget {
+            max_total_tokens: Some(500),
+            max_cost_usd: None,
+        };
+
+        let mut corrected_campaign = CampaignLedger::new();
+        corrected_campaign.record_step(Some(0.01), step_1_corrected);
+        corrected_campaign.record_step(Some(0.02), step_2_corrected);
+        assert_eq!(corrected_campaign.total_tokens(), 1840);
+        assert!(matches!(
+            corrected_campaign.check(Some(&budget)),
+            BudgetDecision::Halt(BudgetHaltReason::TotalTokens {
+                spent: 1840,
+                limit: 500,
+            })
+        ));
+
+        // Negative control: the OLD two-channel-only figure the ticket
+        // describes as under-counting must NOT trip the same cap — proving
+        // this test would have failed had `record_step` been fed the old
+        // figure, i.e. that the assertion above is load-bearing rather
+        // than trivially true for any input.
+        let mut old_campaign = CampaignLedger::new();
+        old_campaign.record_step(Some(0.01), 30); // old: 10 + 20 only
+        old_campaign.record_step(Some(0.02), 10); // old: 4 + 6 only
+        assert_eq!(old_campaign.total_tokens(), 40);
+        assert_eq!(old_campaign.check(Some(&budget)), BudgetDecision::Allow);
+    }
+
+    #[test]
     fn campaign_ledger_trips_on_a_cap_below_one_steps_cost() {
         let mut ledger = CampaignLedger::new();
         // A single step whose cost already exceeds a ceiling set below it
@@ -610,5 +713,151 @@ mod tests {
         assert_eq!(json["cap"], serde_json::json!("max_total_tokens"));
         assert_eq!(json["spent"], serde_json::json!(100));
         assert_eq!(json["limit"], serde_json::json!(100));
+    }
+
+    // -- cache-channel folding (EN.ticket.budget-gate-undercounts-cache-channels) --
+
+    #[test]
+    fn record_folds_cache_channels_into_total_tokens() {
+        // input=10, output=20, cache_read=1000, cache_creation=500 ->
+        // 1530. Every channel is a mutually distinct value so a bug that
+        // drops or double-counts any one of them cannot pass.
+        let mut ledger = BudgetLedger::new();
+        ledger.record(Some(&usage(10, 20)), None, Some(1000 + 500));
+
+        assert_eq!(ledger.total_tokens(), 1530);
+    }
+
+    #[test]
+    fn record_cap_between_two_channel_and_four_channel_sums_halts() {
+        // MUTATION TEST — this is the ticket's load-bearing positive
+        // control. input+output = 30 (the old two-channel figure); cache
+        // channels total 1500 (the two channels the old code dropped).
+        // A cap of 100 sits strictly between the two-channel sum (30) and
+        // the four-channel sum (1530), so it can only trip if the cache
+        // channels are actually folded in.
+        //
+        // Observed FAILING against the pre-fix `record(usage, cost_usd)`
+        // two-argument signature (cache channels silently dropped):
+        //   thread 'budget::tests::record_cap_between_two_channel_and_four_channel_sums_halts' panicked at crates/engine-core/src/budget.rs:
+        //   expected a halt between the two- and four-channel sums, got Allow
+        //   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+        //   test budget::tests::record_cap_between_two_channel_and_four_channel_sums_halts ... FAILED
+        //
+        // Observed PASSING after widening `record` to accept
+        // `cache_tokens: Option<u64>` and folding it into `total_tokens`:
+        //   test budget::tests::record_cap_between_two_channel_and_four_channel_sums_halts ... ok
+        let mut ledger = BudgetLedger::new();
+        ledger.record(Some(&usage(10, 20)), None, Some(1000 + 500));
+
+        let budget = Budget {
+            max_total_tokens: Some(100),
+            max_cost_usd: None,
+        };
+
+        match ledger.check(Some(&budget)) {
+            BudgetDecision::Halt(BudgetHaltReason::TotalTokens { spent, limit }) => {
+                assert_eq!(spent, 1530);
+                assert_eq!(limit, 100);
+            }
+            other => panic!(
+                "expected a halt between the two- and four-channel sums, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn record_cache_tokens_none_contributes_nothing() {
+        // Absence-tolerance: a `ctx.nodes` entry with no cache keys (a
+        // non-LLM node, or a pre-change state file) must contribute zero,
+        // not error and not be treated as a de-facto zero that masks a
+        // reader bug elsewhere.
+        let mut ledger = BudgetLedger::new();
+        ledger.record(Some(&usage(10, 20)), None, None);
+
+        assert_eq!(ledger.total_tokens(), 30);
+    }
+
+    fn node_output_with_cache(cache_read: u64, cache_creation: u64) -> serde_json::Value {
+        serde_json::json!({
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
+        })
+    }
+
+    #[test]
+    fn from_context_recovers_cache_channels_from_ctx_nodes() {
+        // Proves the crash-recovery / resume path, not just the live
+        // `record` path: a `TaskContext` whose `node_runs` carries
+        // input/output usage and whose `ctx.nodes` separately carries the
+        // two cache-token keys must sum all four channels.
+        let mut node_runs = HashMap::new();
+        node_runs.insert("NodeA".to_string(), node_run_with_usage(10, 20));
+
+        let mut nodes = HashMap::new();
+        nodes.insert("NodeA".to_string(), node_output_with_cache(1000, 500));
+
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes,
+            metadata: serde_json::json!({}),
+            node_runs,
+        };
+
+        let ledger = BudgetLedger::from_context(&ctx);
+
+        assert_eq!(ledger.total_tokens(), 1530);
+    }
+
+    #[test]
+    fn from_context_node_with_no_cache_keys_contributes_zero() {
+        // Positive control on the absence-tolerant reader: a node whose
+        // `ctx.nodes` entry carries no cache keys at all (a non-LLM node,
+        // or a state file written before the cache keys existed) must not
+        // error and must not perturb the token total.
+        let mut node_runs = HashMap::new();
+        node_runs.insert("NodeA".to_string(), node_run_with_usage(10, 20));
+
+        let mut nodes = HashMap::new();
+        nodes.insert("NodeA".to_string(), serde_json::json!({"cost_usd": 0.5}));
+
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes,
+            metadata: serde_json::json!({}),
+            node_runs,
+        };
+
+        let ledger = BudgetLedger::from_context(&ctx);
+
+        assert_eq!(ledger.total_tokens(), 30);
+        assert!((ledger.total_cost_usd() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn from_context_mixed_cache_and_no_cache_nodes_sums_correctly() {
+        // Mutually distinct values across two nodes, one with cache keys
+        // and one without, so a bug that collapses per-node cache figures
+        // together or leaks into the no-cache node cannot pass.
+        let mut node_runs = HashMap::new();
+        node_runs.insert("NodeA".to_string(), node_run_with_usage(10, 20));
+        node_runs.insert("NodeB".to_string(), node_run_with_usage(3, 7));
+
+        let mut nodes = HashMap::new();
+        nodes.insert("NodeA".to_string(), node_output_with_cache(1000, 500));
+        nodes.insert("NodeB".to_string(), serde_json::json!({"cost_usd": 0.1}));
+
+        let ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes,
+            metadata: serde_json::json!({}),
+            node_runs,
+        };
+
+        let ledger = BudgetLedger::from_context(&ctx);
+
+        // NodeA: 10 + 20 + 1000 + 500 = 1530; NodeB: 3 + 7 + 0 = 10.
+        assert_eq!(ledger.total_tokens(), 1540);
     }
 }
