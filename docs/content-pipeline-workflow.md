@@ -307,11 +307,14 @@ from `ContentPipelinePolicy.harvest` and branches:
 profiles (including the new `curated-harvest`, which resolves `in_process`), and the
 `HARVEST_APPROVE` hand-off.
 
-**Not yet wired to a real endpoint.** `PersistToBrainNode::new()` currently POSTs to a hardcoded
-placeholder `BRAIN_INGEST_URL` constant (`http://localhost:8000/ingest/learning`) —
-`ContentPipelinePolicy` carries no endpoint knob. The canonical target is Synapse's `POST
-/ingest/*` (brain block `OR.Q`). `with_url(...)` exists alongside `with_http_post(...)` so tests
-and future callers can override the target without touching the constant.
+**Wired to the real endpoint (`EN.6.K`).** `PersistToBrainNode` no longer POSTs to a hardcoded
+placeholder. The URL/`X-API-Key` header are resolved from `crate::nodes::brain_client::BrainConfig`
+(`BrainConfig::from_env`, reading `BRAIN_API_URL`/`BRAIN_API_KEY`) joined with the fixed path
+`/ingest/artifact` — Synapse never served `/ingest/learning`, so this node now targets the real
+`POST /ingest/artifact` route (pinned in [data-contract.md](data-contract.md)) instead of the
+former placeholder path. `ContentPipelinePolicy` still carries no endpoint knob; `with_url(...)`
+and `with_config(...)` exist alongside `with_http_post(...)` so tests and future callers can
+override the target without touching env.
 
 Per THE BOUNDARY TEST, this node only POSTs — no embedding model is loaded, no `pgvector`
 connection is opened, and no corpus table is written from this repo. What happens behind the
