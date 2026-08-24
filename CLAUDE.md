@@ -109,8 +109,17 @@ housekeeping. There is no global scheduler.
    a new `crates/engine-core/tests/*.rs` file, which cargo builds as a separate binary that
    statically re-links the whole ~345-crate graph. See [`docs/testing.md`](docs/testing.md) and
    "Build / test / run" below.
-9. <!-- Add further project-specific standing rules here (prompt handling, registries, deployment
-   boundaries, code style, etc.). -->
+9. **Never `git push` this repo directly from inside it.** This repo sits in the fleet's Cargo
+   path-dependency graph (`engine-rs` -> `claude-code-rs`, `mev`, `okf-core`; and `bastion` ->
+   `engine-rs`), and every Rust repo's CI clones its sibling path-deps at their unpinned default
+   branch — pushing out of order breaks a sibling's CI on code that was actually fine (the
+   2026-08-18 outage: `bastion` red with `cannot find function lanes_brain in crate mev` purely
+   because `mev` sat 23 commits unpushed). Route every push through the company-brain's
+   `agentic-portfolio/scripts/git_push.sh --all`, which pushes the whole fleet in dependency
+   order and skips a repo flagged `ci-blocked` (a Cargo dependency is red on GitHub with nothing
+   queued to fix it). Branching, committing, and opening/reviewing/merging PRs to `main` locally
+   are all fine from inside this repo — only the final `git push` of `main` to `origin` must go
+   through that script.
 
 ## Known bugs
 
