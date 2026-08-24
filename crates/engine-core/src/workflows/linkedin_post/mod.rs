@@ -19,5 +19,7 @@
 //!   assembly, `WORKFLOW_TYPE = "LINKEDIN_POST"` (task 6).
 
 pub mod schema;
+pub mod work_source;
 
 pub use schema::{LinkedInPostEventSchema, PostCandidate, WorkSource, WorkSourceKind};
+pub use work_source::WorkSourceNode;
