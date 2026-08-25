@@ -134,7 +134,7 @@ the flag outright. The table records the D81 answer.
 |---|---|---|
 | `base-template` | **`--no-worktree`** (D81) | D81 refuted the old reason with a mechanism: the Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
 | the brain root (HQ) | **`--no-worktree`, always** | `validate-brain` inside a worktree resolves the gitignored sub-repos against the worktree's own `brain.toml` and they are absent from any checkout. Measured: 64 structure / 601 state errors versus 0/0 in the main tree. Worktree creation is clean — it is the corpus gates that cannot pass. |
-| anything else | `--no-worktree` | Cheaper, and worktrees are safe but rarely needed. |
+| anything else | `--no-worktree` | Cheaper. Use `--worktree` when a change deserves quarantine — subject to the D81 suspension above; the engines refuse it fleet-wide until D81 is lifted. |
 
 An explicit `--isolation` that contradicts either of the first two rows → **stop and report.** Do
 not run a chain whose gates cannot pass.
@@ -163,7 +163,7 @@ per task. Determine whether this repo is heavy, and which category, mechanically
 
 **This is enforced, not prose-only.** If this repo is heavy, register before starting, passing the
 category from the `is-heavy` output:
-`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <this-repo-name> --category <category>`.
+`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <this-repo-name> --category <category> --agent <this lane's agent identity>`.
 Exit code `3` (`"allowed": false`) means that category's pool is already at capacity (2
 browser-automation lanes, or 4 native-build lanes) — stop and report rather than starting another;
 wait or swap in a cheap-gate block instead.
@@ -171,13 +171,17 @@ wait or swap in a cheap-gate block instead.
 **Do not pass `--pid`.** The process running `register` is this short-lived command invocation —
 it exits as soon as this step returns, so its own pid is never a valid liveness signal for a later
 process to check. Leave `pid_source` at its default (`"self"`); the entry is then held by **TTL
-(90 minutes) plus explicit release only**, never by pid liveness. If this chain runs longer than
-that, **re-register periodically as a heartbeat** (repeat the same `register --repo <this-repo-name>
---category <category>` call) — it is idempotent-refresh, so it bumps `started_at` instead of
-consuming a second slot.
+(90 minutes) plus explicit release only**, never by pid liveness. **Pass `--agent <this lane's
+agent identity>`** on every `register` and `release` call — the entry is keyed on that identity,
+not on the caller's pid, which is what lets a `release` run from a different process than the one
+that registered actually free the slot. If this chain runs longer than that, re-register
+periodically as a heartbeat (repeat the same `register --repo <this-repo-name> --category
+<category> --agent <this lane's agent identity>` call): a repeat register for the SAME agent
+refreshes `started_at` on the existing entry in place rather than consuming a second slot.
 
 **Release the slot when this repo's chain finishes — this is required, not optional:**
-`... release --repo <this-repo-name>`, on success, failure, or abandonment. A lane killed mid-run
+`... release --repo <this-repo-name> --agent <this lane's agent identity>`, on success, failure,
+or abandonment. A lane killed mid-run
 without releasing does not block the fleet forever — its entry expires automatically once it is
 past the TTL, or (for an entry with an *explicitly*-supplied `--pid`) once that pid has died — but
 that is the fallback, not a substitute for releasing on exit. If the lock store itself is
@@ -225,8 +229,11 @@ Print, and stop for confirmation unless `--execute`:
   (`agent_name`, `repo`, `lane`, `roadmap`, `started_at`, `heartbeat`), to
   `<lock_dir>/lane-agents/agent-<agent_name>.json`.
 - Take the repo lease, per `.claude/workflows/lease.schema.json` (`repo`, `lane`, `agent`,
-  `acquired_at`, `kind`), at `<lock_dir>/leases/lease-<repo>.json`. `kind` is `exclusive` for a
-  lane that will commit — every real lane.
+  `acquired_at`, `heartbeat`, `kind`), at `<lock_dir>/leases/lease-<repo>.json`. `kind` is
+  `exclusive` for a lane that will commit — every real lane. `acquired_at` is IMMUTABLE, set once
+  here and never re-stamped; `heartbeat` is the field that gets re-stamped to prove liveness — a
+  lease written without it falls back to judging staleness on `acquired_at` and can never recover
+  once that ages past the threshold, however live its holder actually is.
 - Both writes happen before the first block launches. If either write fails, stop; do not start
   the chain holding only one of the two.
 

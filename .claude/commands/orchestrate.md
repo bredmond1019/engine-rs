@@ -204,7 +204,11 @@ Each of these exists because it has already caused a real failure in this fleet.
     regression:
 
     1. **Ping a peer whenever a peer is affected**, rather than waiting for anything to route it for
-       you — use the `ping-agent` skill's envelope and the four-verdict response contract.
+       you — use the `ping-agent` skill's envelope and the four-verdict response contract. Every
+       envelope requires `verified_by`: fill it with the literal command you ran and its real
+       output when you checked the claim yourself, or `UNVERIFIED: <who claimed it>` when you are
+       relaying a claim you did not independently verify — never restate someone else's finding as
+       your own without one of those two.
     2. **Write every message to a durable home as well as sending it.** The ping accelerates the
        durable channel; it never replaces it. A finding that exists only as a ping dies with the
        receiving session.
@@ -367,7 +371,7 @@ end/reconcile. Before starting a heavy repo, determine this by reading the targe
 `python3 <path-to-base-template>/scripts/fleet_concurrency_check.py is-heavy --repo-path <target-repo>`
 (the JSON `category` field is `"browser-automation"` or `"native-build"`), then register it with
 that category:
-`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <name> --category <category>`.
+`python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <name> --category <category> --agent <this lane's agent identity>`.
 Exit code `3` (or `"allowed": false` in the JSON output) means that category's pool is already at
 capacity (`MAX_LANES_BY_CATEGORY`: 2 browser-automation, 4 native-build) — put this repo on a
 cheap-gate block instead, or wait.
@@ -375,13 +379,18 @@ cheap-gate block instead, or wait.
 **Do not pass `--pid`.** The process running `register` is the short-lived Claude Code command
 invocation itself — it exits as soon as this step returns, so its own pid is never a valid
 liveness signal for a later process to check. Leave `pid_source` at its default (`"self"`); the
-entry is then held by **TTL (90 minutes) plus explicit release only**, never by pid liveness. If a
-heavy chain runs longer than that, **re-register periodically as a heartbeat**
-(`... register --repo <name> --category <category>` again) — registration is idempotent-refresh,
-so the same repo+category bumps `started_at` instead of consuming a second slot.
+entry is then held by **TTL (90 minutes) plus explicit release only**, never by pid liveness.
+**Pass `--agent <this lane's agent identity>`** on every `register` and `release` call — the
+entry is keyed on that identity, not on the caller's pid, which is what lets a `release` run
+from a different process than the one that registered actually free the slot. If a heavy chain
+runs longer than that, re-register periodically as a heartbeat (`... register --repo <name>
+--category <category> --agent <this lane's agent identity>` again): a repeat register for the
+SAME agent refreshes `started_at` on the existing entry in place rather than consuming a second
+slot.
 
 **The lane MUST release its slot on exit** — success, failure, or abandonment — with
-`... release --repo <name>` when the heavy repo's chain finishes. A stale entry (one past the TTL,
+`... release --repo <name> --agent <this lane's agent identity>` when the heavy repo's chain
+finishes. A stale entry (one past the TTL,
 or one with an *explicitly*-supplied `--pid` that has died) is swept automatically on the next
 registration, so a lane that dies without releasing does not block the fleet permanently — but
 release on exit is still required, since TTL is the fallback, not the norm. If the lock store
@@ -415,6 +424,33 @@ If the engine **bailed** (triage MAJOR, immediate-bail, review FAIL after its bo
 - `--stop-on-fail` (default) → stop the chain. Report which block, why, and the remaining chain.
 - `--continue-on-fail` → record it, leave the block `open`, continue. **Never mark a bailed block
   closed.**
+
+**Record the bail in the run-state's `bails[]` shape (BT.ticket.bails-must-be-append-only).** An
+engine-driven bail already appends this entry to the spec's `sdlc-*state.json` itself; a
+hand-driven bail — one this chain records from a lane's report rather than from a live engine
+invocation — must produce the same append so the two are indistinguishable on disk later. APPEND
+(never overwrite) an entry shaped:
+```
+{occurred_at, task_id, check_id, failing_artifact, ownership, bail_class, reason, resolution: null}
+```
+- `occurred_at` — ISO-8601 timestamp of the bail, not of when you're writing this entry after.
+- `task_id` — the task the engine was on when it bailed.
+- `check_id` — the harness check name from the failure output, if the report names one; `null`
+  otherwise.
+- `failing_artifact` — the path the check named in its failure output, or `null` when it named
+  none. Never fabricate a path the report didn't give you.
+- `ownership` — `self` when `failing_artifact` intersects the task's declared `files[]`, `foreign`
+  when it does not — the same set-intersection `renderWorkAssertion()` already computes; `null`
+  when `failing_artifact` is `null`.
+- `bail_class` — the immediate-bail reason number if the report gives one, else `null`.
+- `reason` — the human-readable bail reason (mirrors what would otherwise have gone into
+  `bail_reason`).
+- `resolution` — `null` at record time; filled in later (`resumed-clean`, `respec`, or
+  `abandoned`) on whichever run clears the bail — never delete or overwrite the original entry to
+  do so.
+Load the `record-a-bail` skill for the classification vocabulary (artifact-vs-detector, same-vs-
+different defect) before deciding `check_id`/`failing_artifact`/`bail_class` for a report that
+doesn't spell them out directly.
 
 If the engine did **not** bail but `sdlc-flow`'s return has `stranded: true` — a `PASS` verdict
 that ended with no PR opened and (under `--auto-merge`) no merge, because the PR stage was

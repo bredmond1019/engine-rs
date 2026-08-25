@@ -386,7 +386,15 @@ not persist between calls.
    - Missing/invalid → log that no valid state was found and run every selected task fresh.
    - Valid → collect every task number whose `tasks["<N>"].status == "passed"` into a skip-set; those
      tasks are skipped entirely in the per-task loop (logged, not re-run). Also read `bail_reason` for
-     context. **Also copy the file's entire top-level `tasks` object verbatim into the in-memory
+     context, and read the file's top-level `bails` array (append-only bail history —
+     BT.ticket.bails-must-be-append-only) verbatim into `state.bails`, defaulting to `[]` when absent.
+     This resume merge is a MUST-preserve-and-append, never a re-initialise: dropping or overwriting a
+     prior entry here reproduces the exact defect the array exists to fix — a bail that is later
+     retried successfully silently losing its own record. Any entry still open (`resolution: null`) in
+     the carried-forward array is annotated `resolution: "resumed-clean"` at this point, since a task
+     that reaches Step 2's resume-load already passed; if this invocation bails again on the same or a
+     different task, that bail gets its own fresh entry appended — nothing is lost either way. **Also
+     copy the file's entire top-level `tasks` object verbatim into the in-memory
      `state.tasks` map before the per-task loop starts** — the loop below only ever writes
      `state.tasks[N]` for tasks it actually runs this invocation, so a skipped/already-passed task
      never re-enters it on its own. Without this seed, the very next state write (Step 3.3) would
@@ -565,16 +573,27 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
        guessing.
      - If MAJOR: **break the loop immediately** for this task — do not burn the remaining attempts —
        record the bail reason, mark the run blocked, and stop the whole per-task loop (subsequent
-       tasks in `taskList` do not run this pass).
+       tasks in `taskList` do not run this pass). **Also append a fully-populated entry to
+       `state.bails`** (append-only, never overwritten — BT.ticket.bails-must-be-append-only):
+       `{occurred_at, task_id, check_id, failing_artifact, ownership, bail_class, reason, resolution:
+       null}`. `reason` carries the same bail-reason text as `bail_reason`; `check_id` is the harness
+       check name already available from this task's recorded issues, best-effort; `failing_artifact`,
+       `ownership`, and `bail_class` are set when derivable at this call site and `null` otherwise
+       (deriving them from the check output is separate work, out of scope here). `bail_reason` stays
+       set too, as a plain mirror of this entry's `reason` — it is never independently authoritative
+       once `bails` is non-empty.
      - If RETRYABLE and this is attempt 3 (the last one): the loop is naturally exhausted — bail
-       anyway, with a fallback reason noting all 3 attempts failed. This is a different bail path from
+       anyway, with a fallback reason noting all 3 attempts failed, appending its own `bails` entry the
+       same way. This is a different bail path from
        MAJOR but has the same effect: the run stops.
      - If RETRYABLE and attempts remain: record the triage reason as a "fix" note and loop to the next
        attempt.
 3. **State write — once per task, disk-only, never committed by any git command.** After the task's
    attempt loop resolves (passed, or bailed), write the full accumulated `state` object (spec_slug,
    mode, branch, worktree_path, status, current_task, tasks_run, the per-task `tasks{}` map,
-   bail_reason, and the token roll-up) to `<stateFile>` via a plain file write — `mkdir -p
+   bail_reason, the append-only `bails[]` array (never truncated or reset — carry every entry from the
+   resume-load forward plus whatever this invocation appended), and the token roll-up) to `<stateFile>`
+   via a plain file write — `mkdir -p
    <blockDir>/sdlc` first, preserve `started_at` from the file if one already exists (else stamp now),
    always refresh `updated_at`. **`tasks{}` must be the merged map** — the tasks carried forward from
    Step 2.3's resume-load (already-passed tasks from a prior invocation) union the tasks this
@@ -791,7 +810,9 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
 - Write `<stateFile>` one final time (same disk-only rules as Step 3.3), with `status` set to
   `"blocked"` (bailed), `"reconcile_failed"` (Step 3.5's authoritative reconcile failed), or
   `"done"` (otherwise), capturing the final token roll-up. On `"reconcile_failed"`, also set
-  `bail_reason` to the reconcile's failing check names + a tail of their output.
+  `bail_reason` to the reconcile's failing check names + a tail of their output, and append a `bails[]`
+  entry for it (`task_id: null` — D56: this fires after every task already passed its own tripwire, so
+  there is no single task to attribute it to; `check_id: "terminal-reconcile"`).
 - Report to the user:
   - Which tasks passed / bailed, and the final branch (plus the worktree path, under `--worktree`).
   - **On bail**: point the user at `<stateFile>` for the per-task detail, tell them to fix the

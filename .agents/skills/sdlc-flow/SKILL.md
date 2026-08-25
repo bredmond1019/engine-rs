@@ -178,6 +178,15 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
      - Run the COMMIT-SAFETY GUARD above, `&&`-joined with the commit itself, then commit the task
        state on the branch (`feat: implement <slug> task N`). If a vault commit is also needed
        (D46), run the same guard against `git -C <vault path>` before that commit too.
+     - **If this task's fix loop ended in a triage MAJOR or an exhausted-attempts bail
+       (BT.ticket.bails-must-be-append-only):** append one fully-populated entry to the committed
+       `state.json`'s top-level `bails` array — `{occurred_at, task_id, check_id, failing_artifact,
+       ownership, bail_class, reason, resolution: null}` — never overwrite or truncate the array; a
+       second bail in the same run appends a second entry, the first stays byte-identical.
+       `bail_reason` is still set too, as a plain mirror of the newest entry's `reason`. On
+       `--resume`, read `state.json`'s prior `bails` array and carry it forward verbatim before
+       appending anything new — re-initialising it instead of merging silently deletes a bail that
+       was later retried successfully, which is the exact defect this record exists to prevent.
      - Immediately after that commit, run the POST-COMMIT WORK ASSERTION above (`&&`-joined onto
        the commit). A `WORK_ASSERTION_ABORT` means the commit did not actually contain the task's
        declared work — treat the task as failed and fix/re-commit before proceeding.

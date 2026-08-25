@@ -18,6 +18,16 @@ why that is deliberate, not a limitation.
 — a drain is a Claude turn with shell access, not a Python process, so naming a function is not an
 instruction a drain can execute. Everything below is a **shell command**, run as written.
 
+**0. Read the open-work board FIRST — before the queue sweep in (a), before anything else in this
+drain.** `planning/open-work/index.md` is the fleet's single durable listing of every named
+recovery item and alert a past drain has already surfaced and left open. Read its open rows now,
+so every later step in this drain already knows what has been found before, and a repeat can be
+reported as an instance of an existing row (see steps 4-5) instead of being rediscovered from
+scratch. Measured cost of skipping this: a finding written to this board at 05:45Z was
+re-diagnosed from first principles five hours later by a different role, because that role never
+read the board before it started. If `planning/open-work/index.md` does not exist yet, note that
+and continue — step 5 creates it on the first drain that needs it.
+
 **a. Validate every message record and layout invariant across every lane, not just this one's.**
 ```
 python3 scripts/check_messages.py --quiet
@@ -148,6 +158,12 @@ Every path left in the remainder is **authored** — a human or an agent wrote i
 pure function of `state.json` — so it is **surfaced, never touched**. Route each one by lease
 state, checking case 0 first, then falling through to exactly three more cases:
 
+**Before filing any of the four cases below as a fresh finding, check it against the open-work
+board read in step 1.** If this repo/cause already has an open row on `planning/open-work/index.md`,
+report this occurrence as `instance N of <row>` and update that row's count — never append a new
+row for a cause already on the board. Re-deriving a finding that is already written down is
+costly and invisible, because it looks exactly like fresh work while producing nothing new.
+
 0. **No lease on the repo, but a live lane elsewhere is a known cross-repo writer.** Before
    reaching for case 3's alert, check whether the file's dirty repo holds no lease *because* some
    other live lane — found the same way case 1/2 already find one, by joining `ListAgents` against
@@ -180,7 +196,9 @@ state, checking case 0 first, then falling through to exactly three more cases:
      above. A lane blocked on an operator is the HEALTHIEST state a blocked lane can be in — the
      heartbeat goes stale precisely because the lane is correctly waiting, not because it died —
      and must never be reported as abandoned. Three false recovery items on a previous run came
-     from exactly this conflation.
+     from exactly this conflation. If this drain's own report is the thing that should reach the
+     operator (not merely note the healthy-blocked lane in the written report) — see the
+     `notify-operator` skill for whether that rises to a real notification and which verb to use.
 
    This is one decision procedure, not two, and it stays that way deliberately. The branch above —
    `ListAgents` liveness joined against heartbeat staleness — is the FLOOR: it alone decides which
@@ -218,7 +236,9 @@ state, checking case 0 first, then falling through to exactly three more cases:
 3. **No lease at all** on the repo the file lives in, and case 0 found no live cross-repo writer
    to attribute it to. **Alert** via the brain's `lib.sh` `send_alert()` — an authored file dirty
    with nothing holding the repo, and no lane explaining it, is unexplained by any lane this drain
-   knows about.
+   knows about. `send_alert()` is the automation-side alert path; reaching the human operator
+   directly mid-run is a separate decision — see the `notify-operator` skill for when that is
+   warranted and which verb to use.
 
 `scripts/check_lane_agents.py` gives you the timestamp-age half of case 2 (a lease's `acquired_at`
 or a registry claim's `heartbeat`) but **cannot call `ListAgents`** — by its own docstring, it
@@ -249,11 +269,45 @@ resolves it or a later drain observes it gone, not when a newer drain simply for
 Create the file (with OKF frontmatter — this repo's standing rule 5) and its `planning/index.md`
 row on the first drain that needs it.
 
+**A recurring cause updates its existing row instead of appending a new one.** When step 4 matched
+this occurrence against a row already open on the board (per the check added there), write the
+match back here as `instance N of <row>` on that same row — incrementing its count — rather than
+adding a fresh row for the same cause. A board with fewer, denser rows that each carry an accurate
+instance count is the point: anything reading this file afterward sees how many times a cause has
+recurred instead of re-deriving that count from N separate rows.
+
+**Forward-looking note.** Once `BT.ticket.bails-must-be-append-only`
+(`planning/blocks/BT.ticket.bails-must-be-append-only.json`) lands, this step stops counting
+instances by comparing against the board by hand — the instance count is READ from the append-only
+bail records themselves, which become the source of truth for how many times a cause has recurred.
+Until then, the board comparison above is the only mechanism.
+
 ### 6. Stamp the heartbeat
 Write the last-drain heartbeat file (the same file `scripts/commander_drain.sh` checks for
 staleness) with the current UTC timestamp, unconditionally — even a drain that did nothing in
 steps 1-5 (empty inbox, nothing dirty, no orphans) still proves the drain ran by stamping this. A
 missing or stale heartbeat is itself the signal that drains have stopped happening.
+
+**Then append this drain's record to the durable evidence log.** Track three counts as you work
+steps 1-2 — `DRAINED` (messages step 1c moved out of this lane's `inbox/`), `ROUTED` (messages
+step 2 relayed), `COMPLETED` (messages step 2 moved into `done/`) — and pass them here:
+```
+python3 "<brain_root>/scripts/drain_log.py" record \
+  --roadmap "<roadmap>" --lock-dir "$LOCK_DIR" --brain-root "<brain_root>" \
+  --drained "$DRAINED" --routed "$ROUTED" --completed "$COMPLETED"
+```
+`<brain_root>` is the same walk-up-for-`brain.toml` resolution step 3 already uses — never a
+repo-relative path. `<roadmap>` is this drain's roadmap slug, resolved by finding every
+`planning/roadmaps/*/lane-<this repo>.json` under `<brain_root>` (step 1's own repo name) whose
+`"lane"` matches this drain's lane: if exactly one such lane file exists, its `"roadmap"` field
+names the roadmap. **Degrade-and-report, never abort, when a roadmap cannot be resolved this
+way** — zero matching lane files (this repo/lane is not part of any roadmap run right now) or
+more than one (this repo/lane is in-flight on two roadmaps at once, and this drain does not
+guess which one the queue activity belongs to) both mean: skip the `drain_log.py` call, note
+"no roadmap resolved — drain-log record skipped" in this drain's report line, and continue —
+the heartbeat above has already been stamped, and steps 1-5's work is already done regardless.
+`drain_log.py` itself exits 2 if `--roadmap` names a directory that does not exist; treat that
+identically — log it, do not fail the drain over it.
 
 ## Stateless per drain
 
@@ -281,8 +335,8 @@ that the next drain cannot reconstruct from disk.
 - **The commander never runs an SDLC engine and never implements a block.** Its only writes are:
   queue-directory transitions (step 1), relayed messages (step 2), whatever
   `emit_state_write.sh` derives and commits (step 3), `planning/open-work/index.md` (step 5), and
-  the heartbeat file (step 6). If a drain finds itself about to touch application code or a spec's
-  `tasks.json`, stop — that is a lane's job, not this one's.
+  the heartbeat file and drain-log record (step 6). If a drain finds itself about to touch
+  application code or a spec's `tasks.json`, stop — that is a lane's job, not this one's.
 
 ## Out of scope (do not attempt here)
 
@@ -319,7 +373,7 @@ One line per drain, appended to the running log the wrapper maintains (never a n
 drain — see "Stateless per drain"):
 
 ```
-<UTC timestamp> · drained <n> · routed <n> · committed <manifest paths, or "none"> · orphans: <silent n / recovery n / alert n> · heartbeat stamped
+<UTC timestamp> · drained <n> · routed <n> · committed <manifest paths, or "none"> · orphans: <silent n / recovery n / alert n> · heartbeat stamped · drain-log: <recorded to <roadmap> | no roadmap resolved, skipped>
 ```
 
 Then, only if non-empty:

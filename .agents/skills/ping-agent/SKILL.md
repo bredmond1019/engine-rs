@@ -49,6 +49,12 @@ of a format that was never typed in the first place. This skill does not restate
 table — read `.claude/workflows/message.schema.json` for the authoritative shape; what follows is
 one worked example per kind, written to:
 
+Every envelope requires `verified_by`, in one of two shapes: **a block containing the literal
+command that was run and its real output** (a command line, then its output on a following line),
+or the string **`UNVERIFIED: <who claimed it>`** naming the claimant when you are relaying rather
+than independently checking. Neither an empty string nor a bare adjective such as `measured`
+satisfies it — that is the exact defect this field exists to catch.
+
 ```
 <lock_dir>/queue/<repo>/<lane>/inbox/<ts>-<uuid>.json
 ```
@@ -64,7 +70,8 @@ on it, unsignalled:
   "kind": "EDGE_RELEASED",
   "subject": {"repo": "bastion", "block": "BA.21.A"},
   "body": "engine-rs side of the data-contract dependency is now merged on main; BA.21.A is unblocked.",
-  "durable_home": {"channel": "state-edge", "ref": "bastion:BA.21.A:depends_on[0]"}
+  "durable_home": {"channel": "state-edge", "ref": "bastion:BA.21.A:depends_on[0]"},
+  "verified_by": "git -C engine-rs log -1 --format=%H main\nf3a9c21 merge data-contract into main"
 }
 ```
 
@@ -79,7 +86,8 @@ on it, unsignalled:
   "kind": "FINDING",
   "subject": {"repo": "base-template"},
   "body": "P0: carryover sweep found 30 of 202 entries are misfiled operator work gating nothing.",
-  "durable_home": {"channel": "run-record", "ref": "base-template/planning/orchestration-run/autonomous-foundation/notes.md"}
+  "durable_home": {"channel": "run-record", "ref": "base-template/planning/orchestration-run/autonomous-foundation/notes.md"},
+  "verified_by": "mev carryover --json | jq '[.[] | select(.kind==\"deferred\" and .misfiled_operator)] | length'\n30"
 }
 ```
 
@@ -93,7 +101,8 @@ on it, unsignalled:
   "kind": "RENDEZVOUS",
   "subject": {"repo": "bastion"},
   "body": "D62 downstream check against bastion is DEFERRED until this lane goes idle. Ping back when your tree is quiet.",
-  "durable_home": {"channel": "lane-log", "ref": "lane-log.jsonl:line-482"}
+  "durable_home": {"channel": "lane-log", "ref": "lane-log.jsonl:line-482"},
+  "verified_by": "UNVERIFIED: relayed from bastion-c4 lane close notice"
 }
 ```
 
@@ -108,7 +117,8 @@ body:
   "kind": "LEASE_RELEASE",
   "subject": {"repo": "okf-core"},
   "body": "RELEASE: exclusive lease on okf-core released, tree clean at commit a1b2c3d.",
-  "durable_home": {"channel": "state-edge", "ref": "okf-core:lease-release-2026-08-22"}
+  "durable_home": {"channel": "state-edge", "ref": "okf-core:lease-release-2026-08-22"},
+  "verified_by": "git -C okf-core status --porcelain\n(empty)"
 }
 ```
 
@@ -123,11 +133,12 @@ is never dressed up as a finding:
   "kind": "QUERY",
   "subject": {"repo": "engine-rs", "block": "ER.9.C"},
   "body": "Is ER.9.C's structured-output port still blocked on the message schema landing, or has that cleared?",
-  "durable_home": {"channel": "carryover", "ref": "base-template:query-er9c-status"}
+  "durable_home": {"channel": "carryover", "ref": "base-template:query-er9c-status"},
+  "verified_by": "UNVERIFIED: base-template-b6, asking not asserting"
 }
 ```
 
-## Rule 1 — verify before acting
+## Rule 1 — verify before acting, and before relaying
 
 A ping is a claim the receiver verifies **locally** before acting on it, and the verification is
 recorded. This is not invented policy: it is what the fleet's only real cross-lane exchange already
@@ -137,6 +148,17 @@ here rather than taken on report"** — the receiver independently re-checked al
 properties, the ticket's `state.json` registration, and `mev lanes --json` before accepting a P0
 raised by the mev lane. Without this rule a wrong claim propagates at the speed of the queue: the
 next lane that reads the message inherits the error, and nothing in the channel itself catches it.
+
+**The relay is bound too, not only the receiver.** A relay is any lane that composes a new envelope
+re-asserting a claim it did not itself check — passing along "measured and NEGATIVE" from an
+upstream message, or restating another lane's finding in its own words. MEASURED across the
+2026-08-23 autonomous-foundation run (`liaison-retro.md` section B): three relayed claims were
+caught wrong by their receivers, each traceable to a relay that re-asserted an adjective
+("measured") instead of carrying the evidence — one was a flat VERIFIED-FALSE that one `ls -la`
+would have caught before it was ever sent. **Before composing an envelope that repeats someone
+else's claim, either independently verify it yourself, or mark it `UNVERIFIED: <who claimed it>`
+in `verified_by` rather than re-asserting it as your own.** A relay is never entitled to upgrade
+another lane's unverified claim into an asserted one just by restating it.
 
 ## Rule 2 — always also to disk
 

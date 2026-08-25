@@ -421,6 +421,7 @@ const STATE_LOAD_SCHEMA = {
     passedTasks: { type: 'array', items: { type: 'integer' }, description: 'task numbers whose status is "passed"' },
     bailReason:  { type: 'string',  description: 'the prior bail_reason, or "" when none' },
     tasksJson:   { type: 'string',  description: 'Verbatim JSON (as a string) of the state file\'s top-level "tasks" object, so the engine can carry the full prior task history forward. "{}" when absent/no state.' },
+    bails:       { type: 'array', items: { type: 'object' }, description: 'Verbatim contents (each entry as-is, unmodified) of the state file\'s top-level "bails" array — BT.ticket.bails-must-be-append-only. [] when absent/no state.' },
     notes:       { type: 'string' }
   }
 }
@@ -870,6 +871,13 @@ const state = {
   tasks_run: [],
   tasks: {},        // "N": { status, attempts, summary, issues, fixes, decisions, files_changed, commit, validated }
   bail_reason: null,
+  // APPEND-ONLY (BT.ticket.bails-must-be-append-only) — one entry per bail: {occurred_at, task_id,
+  // check_id, failing_artifact, ownership, bail_class, reason, resolution}. A bail that is later
+  // resumed cleanly is ANNOTATED (resolution: 'resumed-clean'), never removed. `bail_reason` above
+  // stays as a mirror of the newest entry's `reason` — never independently truthful on its own.
+  // Nothing reads `bails` yet (clustering/counting is separate, out-of-scope work); this is the
+  // durable per-run record that work will consume.
+  bails: [],
   tokens: { stages: [], total: { promptTokEst: 0, filesReadKb: 0, inTokEst: 0, outTok: 0 } },  // Block A — refreshed on every write
 }
 
@@ -909,17 +917,30 @@ async function writeTaskState(label, { cwd }) {
         entries.splice(branchIdx + 1, 0, ['started_at', cachedStartedAt])
         return Object.fromEntries(entries)
       })(), null, 2)
+  // The two JS-side `state.bails` mutation sites (inline bail-assignment, terminal reconcile —
+  // BT.ticket.bails-must-not-mint-time-in-the-engine) have no JS clock legal under the Workflow
+  // runtime shim, so they stamp the same "__BAIL_OCCURRED_AT__" sentinel buildBailPayload already
+  // uses and leave it in the LIVE `state` object for this dedicated writer to resolve — this is
+  // the ONLY place either sentinel ever reaches disk from that route, so the substitution below is
+  // what keeps the guarantee that no bails[] entry persists with it unresolved.
+  const bailOccurredAtNote = stateJson.includes('__BAIL_OCCURRED_AT__')
+    ? `\n\nThe object below also contains one or more literal "__BAIL_OCCURRED_AT__" placeholder
+  strings inside \`bails[]\` entries (a JS-side bail was just recorded, which has no shim-legal
+  clock of its own). Replace EVERY occurrence of that exact literal with NOW — the same value you
+  read as the first line of STEP 1's output — in this SAME turn, alongside the
+  started_at/updated_at insertion. Never leave one unresolved on disk.`
+    : ''
   const stepTwoText = firstWrite
     ? `STEP 2 — write ${stateFile} with EXACTLY this JSON, but inserting two extra top-level keys
   "started_at" (preserved or NOW, per STEP 1) and "updated_at" (NOW) right after "branch". Valid JSON only
   (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except for
-  adding those two timestamp keys):
+  adding those two timestamp keys):${bailOccurredAtNote}
 ${stateJson}`
     : `STEP 2 — write ${stateFile} with EXACTLY this JSON, but inserting exactly one extra top-level
   key: "updated_at" (NOW), right after "started_at" (already present in the object below,
   immediately after "branch" — it was set from the value given in STEP 1). Valid JSON only
   (double quotes, no trailing commas, no markdown fences). The object to write (verbatim except for
-  adding that one timestamp key):
+  adding that one timestamp key):${bailOccurredAtNote}
 ${stateJson}`
   const result = await agent(`
 You maintain the run-state for an /sdlc-task pipeline. You run from the run root. Write ONE JSON
@@ -1375,10 +1396,12 @@ if (resumeMode) {
   const loaded = await tracedAgent(`${W}
 You read the COMMITTED run-state for an /sdlc-task resume. Do NOT modify anything.
   cd ${runDir} && cat ${stateFile} 2>/dev/null || echo "__NO_STATE__"
-If "__NO_STATE__" or invalid JSON → exists=false, tasksJson="{}". Otherwise exists=true, startedAt =
-its started_at, passedTasks = the task numbers whose tasks[N].status == "passed", bailReason = its
-bail_reason or "", tasksJson = the exact JSON (as a string) of its top-level "tasks" object, verbatim
-— this is how the engine carries the full prior task history forward across a resume.
+If "__NO_STATE__" or invalid JSON → exists=false, tasksJson="{}", bails=[]. Otherwise exists=true,
+startedAt = its started_at, passedTasks = the task numbers whose tasks[N].status == "passed",
+bailReason = its bail_reason or "", tasksJson = the exact JSON (as a string) of its top-level "tasks"
+object, verbatim, bails = the exact contents (each entry unmodified) of its top-level "bails" array,
+or [] when absent — this is how the engine carries the full prior task history AND every prior bail
+record forward across a resume (BT.ticket.bails-must-be-append-only: never drop or rewrite an entry).
 Return via StructuredOutput.
 `, withModel({ label: 'state-load', schema: STATE_LOAD_SCHEMA, phase: 'Plan' }, MODEL.stateLoad))
   if (loaded && loaded.exists) {
@@ -1386,7 +1409,14 @@ Return via StructuredOutput.
     log(`Resume: ${passedFromState.size} task(s) already passed (${[...passedFromState].sort((a, b) => a - b).join(', ') || 'none'}); skipping them.`)
     try {
       const priorTasks = JSON.parse(loaded.tasksJson || '{}')
-      if (priorTasks && typeof priorTasks === 'object') Object.assign(state.tasks, priorTasks)
+      // APPEND-ONLY (BT.ticket.bails-must-be-append-only): the prior run's bails[] MUST be merged
+      // forward, never re-initialised — that silent re-init is the exact defect this ticket fixes
+      // (eight of nine measured foreign-state bails left no trace on disk because of it). Any entry
+      // still open (resolution === null) that survives to a resume is, by definition, about to be
+      // retried; annotate it resumed-clean now rather than leaving it open forever — if THIS run
+      // bails again it gets its OWN fresh entry, so nothing is lost either way.
+      const priorState = { bails: Array.isArray(loaded.bails) ? loaded.bails : [] }
+      if (priorTasks && typeof priorTasks === 'object') Object.assign(state.tasks, priorTasks); const inheritedBails = (typeof priorState !== 'undefined' && Array.isArray(priorState.bails) ? priorState.bails : (priorTasks && Array.isArray(priorTasks.__pendingBails) ? priorTasks.__pendingBails : [])).map(b => (b && b.resolution === null) ? { ...b, resolution: 'resumed-clean' } : b); state.bails = inheritedBails.concat(state.bails); if (state.tasks) delete state.tasks.__pendingBails
     } catch {
       log('(resume) could not parse prior tasks JSON from state.json — already-passed tasks may drop out of the committed history on the next write.')
     }
@@ -1495,10 +1525,14 @@ STEP W1 — run this as ONE Bash call, exactly as written. Do not split it into 
   started_at below. Otherwise started_at = NOW.
 
 STEP W2 — write ${onBail.stateFile} with EXACTLY this JSON, but: (a) inserting two extra top-level
-  keys "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch", and
-  (b) replacing the literal placeholder string "__BAIL_REASON__" (the top-level "bail_reason" field)
-  with the effective bail reason computed above. Valid JSON only (double quotes, no trailing commas,
-  no markdown fences). The object to write (verbatim except for those substitutions):
+  keys "started_at" (preserved or NOW, per STEP W1) and "updated_at" (NOW) right after "branch",
+  (b) replacing the literal placeholder string "__BAIL_REASON__" (the top-level "bail_reason" field
+  AND the "reason" field inside the new bails[] entry — both occurrences) with the effective bail
+  reason computed above, and (c) replacing the literal placeholder string "__BAIL_OCCURRED_AT__"
+  (the "occurred_at" field inside that same new bails[] entry) with NOW, the exact value you read
+  as the first line of STEP W1's output — do this substitution in this SAME turn, alongside (b).
+  Valid JSON only (double quotes, no trailing commas, no markdown fences). The object to write
+  (verbatim except for those substitutions):
 ${onBail.stateJson}
 
 STEP W3 — use the Write tool for the file. Do NOT run \`git add\`, \`git commit\`, \`git checkout\`,
@@ -1534,6 +1568,27 @@ function buildBailPayload(taskNum, t, majorFallback, exhaustionFallback = null) 
   snapshot.tasks[String(taskNum)] = { ...t, status: 'failed' }
   snapshot.status = 'blocked'
   snapshot.bail_reason = '__BAIL_REASON__'
+  // APPEND-ONLY (BT.ticket.bails-must-be-append-only) — one entry per bail, never overwritten.
+  // `reason` carries the SAME "__BAIL_REASON__" placeholder as `bail_reason` above (b) below), so
+  // the one substitution the writing agent performs for the reason keeps both in sync.
+  // `occurred_at` carries the sibling "__BAIL_OCCURRED_AT__" placeholder (BT.ticket.bails-must-
+  // not-mint-time-in-the-engine) — a JS-side clock call is illegal under the Workflow runtime
+  // shim, so the writing agent substitutes NOW (already obtained via STEP W1's `date -u` call)
+  // for this sentinel in the SAME turn it substitutes __BAIL_REASON__; see (c) in
+  // renderBailStateWriteRecipe's STEP W2 below. check_id best-effort from
+  // the task's own recorded issues (the harness check name already on `t`, never reimplemented);
+  // failing_artifact/ownership/bail_class stay null here — not yet derivable at this call site
+  // (see out_of_scope: checks-must-name-their-failing-artifact is separate work).
+  snapshot.bails = [...(snapshot.bails || []), {
+    occurred_at: '__BAIL_OCCURRED_AT__',
+    task_id: taskNum,
+    check_id: (t.issues && t.issues.length) ? t.issues[t.issues.length - 1] : null,
+    failing_artifact: null,
+    ownership: null,
+    bail_class: null,
+    reason: '__BAIL_REASON__',
+    resolution: null,
+  }]
   snapshot.tokens = buildTokensBlock()
   return { stateFile, stateJson: JSON.stringify(snapshot, null, 2), majorFallback, exhaustionFallback }
 }
@@ -1933,7 +1988,13 @@ Return via StructuredOutput:
 
   // One state write per task — disk-only, never committed (see writeTaskState).
   t.status = taskPassed ? 'passed' : 'failed'
-  if (bailed && !taskPassed) { state.status = 'blocked'; state.bail_reason = bailReason }
+  // APPEND-ONLY (BT.ticket.bails-must-be-append-only): record this terminal bail on `state.bails`
+  // itself (never overwritten). `state.tasks.__pendingBails` is a resume-safety carrier: it rides
+  // along inside `state.tasks` (which already survives every resume path this engine has), so the
+  // resume merge below can recover this run's bail even on the rare path where the dedicated
+  // `bails` read comes back empty; the merge deletes it the moment it is consumed, so it is
+  // transient scaffolding, never load-bearing on its own.
+  if (bailed && !taskPassed) { state.status = 'blocked'; state.bail_reason = bailReason }; if (bailed && !taskPassed) { const bailEntry = { occurred_at: '__BAIL_OCCURRED_AT__', task_id: state.current_task, check_id: null, failing_artifact: null, ownership: null, bail_class: null, reason: bailReason, resolution: null }; state.bails = [...state.bails, bailEntry]; state.tasks.__pendingBails = [...(state.tasks.__pendingBails || []), bailEntry] }
   // Reliability net: either the pass-path fold (runTests' onPass) or the terminal-bail fold
   // (triage's onBail) already wrote sdlc-task-state.json in the SAME turn as the resolving
   // test/triage call when taskStateWritten is true — skip the dedicated writer in that case.
@@ -2052,7 +2113,13 @@ output; empty when allPassed), notes.
 }
 
 state.status = bailed ? 'blocked' : (reconcileFailed ? 'reconcile_failed' : 'done')
-if (reconcileFailed) state.bail_reason = `Terminal reconcile failed (D56): ${reconcileFailBlob}`
+if (reconcileFailed) {
+  const reconcileBailReason = `Terminal reconcile failed (D56): ${reconcileFailBlob}`
+  // APPEND-ONLY (BT.ticket.bails-must-be-append-only) — no task to attribute this to (D56: it
+  // fires after every task already passed its own tripwire), so task_id stays null.
+  state.bails = [...state.bails, { occurred_at: '__BAIL_OCCURRED_AT__', task_id: null, check_id: 'terminal-reconcile', failing_artifact: null, ownership: null, bail_class: null, reason: reconcileBailReason, resolution: null }]
+  state.bail_reason = reconcileBailReason
+}
 
 // ----------------------------------------------------------------
 // LEAN BOOKKEEP CLOSE-OUT — the one bit of authored state the lean engine still owes.
