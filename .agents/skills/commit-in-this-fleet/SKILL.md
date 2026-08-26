@@ -8,7 +8,6 @@ description: >
   add/commit/stash/reset/mv in this fleet, before committing after `mev emit-state --write`,
   and whenever `git status` shows changes you did not make.
 ---
-
 # Committing in this fleet
 
 > **Paths below are relative to the brain root** — the directory containing `brain.toml`, found by
@@ -95,11 +94,47 @@ into `.claude/worktrees/` and reports **another agent's** in-flight failures as 
 belonged to a different tree, a full diagnostic cycle wasted). Scope the command, or check
 `git worktree list` before believing a red gate.
 
+## Scripting a multi-repo commit loop
+
+Two shell traps, both measured driving an 18-repo commit loop for a harness sync.
+
+**Trap A — zsh does not word-split an unquoted expansion.** The interactive shell in this fleet
+is **zsh**. Collecting dirty paths into a variable and passing it unquoted does not split on
+newlines the way it would in bash:
+
+```bash
+paths=$(git -C "$r" status --short -- .claude | awk '{print $2}')
+git -C "$r" commit -o $paths -m "..."     # zsh passes ALL of it as ONE pathspec
+```
+
+Every repo failed with `error: pathspec '.agents/skills/write-repo-doc/SKILL.md<newline>...' did
+not match any file(s) known to git`.
+
+**Trap B — the installed bash is 3.2 and has no `mapfile`.** Re-running the loop under
+`bash <<'BASH' … BASH` with `mapfile -t paths < <(…)` printed `bash: mapfile: command not found`
+on every iteration, left the array empty, and **silently skipped every repo** — a clean-looking
+run that committed nothing. macOS ships bash 3.2 (confirmed: `bash --version` →
+`GNU bash, version 3.2.57(1)-release`); `mapfile`/`readarray` need bash 4+.
+
+**What limited the damage both times:** rule 2's pathspec-matching behaviour is a safety property,
+not just a footgun — a `git commit -o` whose pathspec matches nothing **aborts the whole commit**,
+it does not partially commit what did match. Both broken loops produced zero bad commits; they
+just did no work.
+
+**What actually worked:** drive the loop from `python3` with a real argv list, no shell quoting or
+splitting involved:
+
+```python
+subprocess.run(["git", "-C", r, "commit", "-q", "-o", *paths, "-m", MSG])
+```
+
 ## Before you commit
 
 - [ ] Pathspec is explicit — no `add -A`, no `add .`
 - [ ] New files were `git add`ed, not just named in `-o`
 - [ ] `git status --short <paths>` is empty afterwards
+- [ ] A scripted multi-repo loop was verified with `git status --short` per repo afterward, not
+      assumed from a clean exit — both known failure modes print plausible-looking output
 - [ ] Nothing in the commit belongs to another session (read the file list, don't assume)
 - [ ] If the work touched `planning/`, `git -C <BRAIN_ROOT> status` was checked too
 - [ ] No secrets. This is a private repo and several of its sub-repos are public
