@@ -58,11 +58,17 @@ of how correct those paragraphs are.
 
 ### 2. Name the runnable thing
 
-**This rule exists because of a measured failure.** `orchestration.md` documented only
-`./scripts/commander_drain.sh`. The reader had no idea `/orchestration-commander` was a slash
-command he could type — and the script turned out to be a *wrapper* that reads that very command
-file and feeds it to a Claude turn. The wrapper was also the dangerous path: no dry-run, always
-writes to the shared lock directory.
+**This rule exists because of a measured failure, since fixed.** `orchestration.md` once
+documented only `./scripts/commander_drain.sh`. The reader had no idea `/orchestration-commander`
+was a slash command he could type — and the script turned out to be a *wrapper* that reads that
+very command file and feeds it to a Claude turn. The wrapper was also the dangerous path: no
+dry-run, always writes to the shared lock directory.
+
+**That doc now shows the fix**, which is why it is listed under Related below as an example to
+imitate: `orchestration.md` § "The commander" is a two-row table giving both run paths — the
+interactive slash command first, the unattended wrapper second, each with *when to use it* and the
+note that they share one implementation. Read the before and the after together; the contrast is
+the lesson.
 
 So, for anything runnable:
 
@@ -195,6 +201,10 @@ guessed at is the defect list. Do this for any doc someone will rely on without 
 - `base-template/docs/workflows/index.md` — a worked example: diagram, vocabulary table, and
   jump-links from every term.
 - `base-template/docs/workflows/orchestration.md` and `lane-coordination.md` — worked examples of
-  the quickstart-first, plain-English-opener shape.
+  the quickstart-first, plain-English-opener shape. `orchestration.md` § "The commander" is also
+  the *after* half of rule 2's measured failure: the defect described there was fixed in this file,
+  and its two-row run table is the shape rule 2 asks for.
+- `base-template/docs/workflows/roadmap-sweep.md` — a worked example of rule 2's danger labelling:
+  the safe `--dry-run` path is shown first and the live side effects are called out at the command.
 - For **published** writing (blog posts, learning modules), the fuller voice standard is
   `learn-ai/content/blog/CLAUDE.md` § "Voice and tone" — same teacher identity, higher bar.

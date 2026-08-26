@@ -338,6 +338,14 @@ Each has already cost a real run in this fleet.
    never let it become a second status.md. Give every item a status so it can be triaged later:
    `OPEN` · `DONE` · `HELD` · `WONTFIX`. Commit it with the lane-log line.
 
+   **Dual-write for anything that would qualify under Rule 6's "must not decide alone" list.** In
+   addition to the notes.md entry, append one line to `planning/roadmaps/<roadmap>/escalations.jsonl`
+   per `scripted-liaison-sweep-design` section 3, for every such item. Write **both**, never one
+   instead of the other: the notes.md prose carries the reasoning for a human or a fresh agent to
+   read; the `escalations.jsonl` line is what a script can diff without parsing prose. Dropping
+   either regresses to the failure mode this record exists to fix from the opposite direction —
+   losing either the reasoning trail or the machine-diffable signal.
+
    The lane log is the *cross-lane* channel and stays one line per block; this file is the *local*
    one and holds the detail. Anything that needs a ticket later, or that the next agent would
    otherwise rediscover the hard way, belongs here.
@@ -392,7 +400,9 @@ Each has already cost a real run in this fleet.
 
    What you still must **not** decide alone: an operator gate (below), a bailed block's fate, two
    blocks that genuinely disagree about the same behaviour, and anything that would edit another
-   lane's repo. Those stop and get reported.
+   lane's repo. Those stop and get reported. Each case here is also a `kind` value in the
+   escalation schema (`operator-gate`, `bail`, `disagreement`, `cross-repo-edit`) — write both the
+   notes.md entry and the `escalations.jsonl` line per Rule 5 above.
 
 7. **Urgent-item adoption.** Nothing before this rule let a P0 raised mid-run jump a chain — the
    2026-08-21 empty-tree P0 was adopted into a live lane ad hoc, with no defined procedure, because

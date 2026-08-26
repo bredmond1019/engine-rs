@@ -3,23 +3,27 @@
 ## Variables
 
 $ARGUMENTS — free-text description of the feature, experiment, or body of work to plan.
-             Optional flags: `--founding`, `--clarify`.
+             Optional flags: `--founding`, `--clarify`, `--lane`.
 
 | Flag | What it does |
 |---|---|
 | `--founding` | This is the project's founding roadmap — a new repo's first blocks. Adds the Goal / Destination / Architecture framing and writes to `planning/founding/`. Invoked by `/new-project`. |
 | `--clarify` | Force the clarify gate on regardless of `planning/harness.json`. |
 | `--no-redteam` | Skip the adversarial pass (step 10). For a small, low-risk initiative only. |
+| `--lane` | Also emit `planning/<slug>/lane-<slug>.json` (D71), authored against `.claude/workflows/lane.schema.json`, so `/begin-orchestration --roadmap <slug> --lane <slug>` can drive this initiative's blocks in dependency order — the same mechanism `/generate-roadmap` gives a multi-repo program. **Opt-in, not the default**: most `/plan` output is never meant to be orchestrated (small initiatives run block-by-block, by hand, on purpose), and silently emitting an extra artifact every time would surprise that far more common caller. See step 7c and the Output Format below. |
 
 ## Purpose
 
 Author **one initiative**: a coherent body of work in **one repo**, spanning one or more blocks.
-Output is two things:
+Output is two things, plus a third when `--lane` is passed:
 
 - `planning/<slug>/plan.md` — the authored **narrative**: the goal, the sequencing rationale, the
   architecture framing, the cut list. Everything true of the *set* rather than of any one block.
 - `planning/blocks/<BlockID>.json` — one **block record** per block. The definition of each
   member.
+- `planning/<slug>/lane-<slug>.json` (only with `--lane`) — the **lane record** `/begin-orchestration`
+  drives: the same blocks, in dependency order, in the one shape `.claude/workflows/lane.schema.json`
+  defines. See the scope ladder below and step 7c.
 
 `/plan` does **not** write `tasks.json`. Task decomposition is deferred to
 `/generate-tasks <BlockID>`, run later, per block — because a later block's tasks depend on an
@@ -29,6 +33,12 @@ re-derived anyway (D65).
 > **Scope ladder.** Multi-repo program → `/generate-roadmap`. One repo, multiple blocks → here.
 > A single block → `/ticket` (behavior change) or `/chore` (maintenance).
 > `master-plan.md` is **generated** from the block graph, not authored — never hand-write one.
+>
+> **Orchestrating the result.** A `/plan` initiative can be driven the same way a `/generate-roadmap`
+> program is — `/begin-orchestration` knocking out its blocks in dependency order, with the same
+> notes, run records and documentation discipline. Pass `--lane` to also emit a lane record
+> (step 7c); without it, `/plan` produces only the narrative and block records, and the initiative
+> is worked block-by-block by hand, as most `/plan` output is meant to be.
 >
 > **Upstream.** For work on an existing system large enough that the cut is not obvious, the
 > pre-plan pipeline runs first: `/assess` → `/seams` → `/sequence`. Its output,
@@ -152,6 +162,28 @@ re-derived anyway (D65).
    work left in prose with no row in `state.json`. Report what it
    found — including "nothing", which on a multi-block initiative is a claim.
 
+7c. **When `--lane` is set, emit the lane record** — `planning/<slug>/lane-<slug>.json`, authored
+   against `.claude/workflows/lane.schema.json` (D71). One repo, one lane: this command scopes to a
+   single repo, so the lane needs no cross-repo assignment, just the blocks in dependency order.
+
+   - `lane` = `<slug>`. `roadmap` = `<slug>` — this is what makes the initiative resolve the same
+     way a roadmap does: `/begin-orchestration`'s bare-slug resolution checks
+     `planning/roadmaps/<slug>/` first, then falls back to legacy `planning/<slug>/` — the exact
+     directory this command already writes to. No change to `/begin-orchestration` is needed or
+     permitted; this only works because that fallback already exists.
+   - `blocks[]` — every block written in step 7, **in dependency order** (the order later blocks
+     depend on earlier ones, matching the Sequence Table), each as
+     `{"id": "<BlockID>", "origin_roadmap": "<slug>", "repo": "<this repo's slug>"}`. IDs must be
+     the exact ones written to `planning/blocks/<BlockID>.json` — never re-minted here.
+   - `budget.heavy` — determine mechanically, never from memory:
+     `python3 <path-to-base-template>/scripts/fleet_concurrency_check.py is-heavy --repo-path <this-repo>`.
+     Author the result as `budget.heavy`; omit `budget` entirely only if the script cannot run.
+   - Leave `isolation` unauthored unless this initiative needs a specific override — plain
+     `/begin-orchestration --roadmap <slug> --lane <slug>` resolves isolation itself via its own
+     policy table (`--isolation auto`).
+   - Validate before handing over: `python3 <path-to-base-template>/scripts/check_lane_records.py --planning planning`.
+     A failure here means the lane file, not the plan, is wrong — fix and re-run.
+
 8. **Write the narrative** to `planning/<slug>/plan.md` using the Output Format below. The
    narrative holds only what is true of the set — it must not duplicate a block's what/why/files,
    which live in the block records and would immediately drift.
@@ -179,6 +211,9 @@ re-derived anyway (D65).
      an operator/approval edge, a `carryover[]` entry, a `reference[]` fact, a backlog row — or a
      cut-list line with a reason. Those are the only two destinations. Prose gates nothing and
      surfaces on no board, so an item held only here is lost, not deferred.
+   - **When `--lane` was passed, the lane record (7c) validates** —
+     `check_lane_records.py` clean, every `blocks[].id` matching a real `planning/blocks/<ID>.json`,
+     and array order matching the Sequence Table's dependency order.
    - **The consistency pass (7b) ran and is reported** — C1–C6, with what it found and what was
      left standing deliberately. Specifically: no `depends_on` edge is `{"type": "external"}` for
      work that lives in a fleet repo; every block whose `files[]` reach outside its own repo's tree
@@ -256,6 +291,8 @@ Handoff written to planning/handoff.md.
 - `planning/blocks/` — block records; `planning/<slug>/` — initiative narratives
 - `.claude/workflows/block.schema.json` — the block record field contract
 - `.claude/workflows/block-registration.md` — the shared registration procedure
+- `.claude/workflows/lane.schema.json` — the lane record field contract (`--lane` output, D71)
+- `scripts/check_lane_records.py` — validates a lane record; run it before handing over a `--lane` run
 
 Read `CLAUDE.md` for the project's actual stack and conventions — do not assume any framework,
 language, or directory structure that isn't written there.
@@ -348,6 +385,7 @@ cut is a decision with a date on it. Make this list longer than is comfortable.>
 planning/<slug>/plan.md            (<N> phases, <M> blocks)
 planning/blocks/                   <M> block records written
 state.json: <created | already existed>, <M> blocks registered
+planning/<slug>/lane-<slug>.json   <written, <M> blocks | not requested (--lane not passed)>
 
 Blocks ready to decompose:
   - <ID> — <name>
@@ -360,4 +398,8 @@ Red team: <x> attacks landed, <y> rejected
 
 Next (turn the first block into a runnable spec):
   /generate-tasks <ID>
+
+<If --lane was passed:>
+Or drive the whole initiative through the SDLC engines in order:
+  /begin-orchestration --roadmap <slug> --lane <slug>
 ```
