@@ -402,11 +402,13 @@ end-to-end proof (one `ScheduleRegistry.tick()` fire dispatching one persist-sha
 outbound-action-shaped record through `spawn_run`, plus a configured entry driven all the way to an
 observed dispatch through `spawn_schedule_loop`).
 
-> **The loop is spawnable but unspawned.** No live process calls `spawn_schedule_loop` — the call
-> site belongs in `bastion`'s `serve/mod.rs` alongside `spawn_durable_writer`, which is a different
-> repo and therefore a separate block. Until it lands, a configured `schedule.entries[]` entry never
-> fires, with no error and no log line. Anything downstream that depends on a schedule (e.g. the
-> deferred newsletter digest) needs that block too, not just this one.
+> **The loop is spawned but not turned on.** `bastion`'s `serve/mod.rs` (`core/bastion/src/serve/mod.rs`,
+> a different repo) does call `spawn_schedule_loop`, alongside `spawn_durable_writer`, guarded by
+> `resolve_engine_harness_path()`. What remains is configuration: `BASTION_ENGINE_HARNESS_PATH` is
+> unset on the deployed Mac Mini (so the guard resolves to `None` and no loop spawns), and this
+> repo's own `planning/harness.json` `schedule.entries` is `[]` (so even a running loop has nothing
+> to fire). Anything downstream that depends on a schedule (e.g. the deferred newsletter digest)
+> needs both of those set, not a code change.
 
 ## Build & CI
 

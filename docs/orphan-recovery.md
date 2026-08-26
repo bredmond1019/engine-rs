@@ -151,9 +151,11 @@ scan limit.
 
 `engine-serve` is a library `bastion serve` mounts; this spec exposes `reconcile_orphans` as a
 callable entry point and covers it hermetically, but does not call it at server boot — that wiring
-is a `bastion`-side change, exactly like the existing `spawn_schedule_loop` /
-`schedule-loop-spawnable-but-unspawned` carryover. Expect a carryover and a bastion ticket rather
-than a claim that the crash path is live end to end.
+is a `bastion`-side change — the same shape of follow-up `spawn_schedule_loop`
+(`EN.ticket.cron-schedule-startup-wiring`) needed and got: its call site is now wired into
+`bastion`'s `serve/mod.rs`, so that carryover is resolved (what remains for it is configuration —
+`BASTION_ENGINE_HARNESS_PATH` and `schedule.entries` — not code). Expect a carryover and a bastion
+ticket here too, rather than a claim that the crash path is live end to end.
 
 ## Tests
 

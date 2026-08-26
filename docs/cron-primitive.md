@@ -141,9 +141,10 @@ same non-blocking `dispatch_with_event` -> mint `run_id` -> `spawn_run` sequence
 and [content-pipeline-workflow.md](content-pipeline-workflow.md) for how a scheduled fire reaches a
 workflow.
 
-**Nothing polls it yet.** `spawn_schedule_loop` (below) is the interval driver, but no live process
-calls it — the call site belongs in `bastion`'s `serve/mod.rs`, beside its existing
-`spawn_durable_writer(...)` call, and that is a different repo. **Until that lands, a configured
-`schedule.entries[]` entry will never fire**, silently and without an error. Do not read the
-paragraph above as "scheduling is running in production"; it is wired end-to-end *within this repo*
-only.
+**The call site is wired but not turned on.** `spawn_schedule_loop` (below) is the interval driver,
+and `bastion`'s `serve/mod.rs` (a different repo) does call it, guarded by
+`resolve_engine_harness_path()`. What is still open is **configuration, not code**: on today's
+deployed Mac Mini, `BASTION_ENGINE_HARNESS_PATH` is unset, so the guard resolves to `None` and no
+loop is spawned; separately, this repo's own `planning/harness.json` `schedule.entries` is `[]`, so
+even a running loop has nothing to fire. Do not read the paragraph above as "scheduling is running
+in production" — it is wired end-to-end but not enabled.
