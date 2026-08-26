@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Crash Recovery (Orphan Sweep + Stale-Run Alarm)
-description: The metadata.completion marker, the boot sweep that fails crash-stranded runs loudly, the stale-run alarm on aged running/suspended runs, the OrphanLister seam, the OrphanPolicy knobs, and why boot wiring lands in bastion rather than here.
+description: The metadata.completion marker, the boot sweep that fails crash-stranded runs loudly, the stale-run alarm on aged running/suspended runs, the OrphanLister seam, the OrphanPolicy knobs, and where boot wiring lives (bastion's `serve/mod.rs`, now wired).
 doc_id: orphan-recovery
 layer: [engine]
 project: engine-rs
@@ -102,8 +102,9 @@ Idempotent: a candidate this call reconciles now carries a `completion` marker, 
 `list_orphan_candidates` call — live or stubbed — no longer returns it.
 
 **Hand-verified recipe.** Killing the `:8090` instance mid-run and letting launchd restart it leaves
-the run in a terminal `failed` state within one boot cycle once `reconcile_orphans` is wired at
-boot (see "Boot wiring" below) — the run record documents this recipe end to end.
+the run in a terminal `failed` state within one boot cycle — `reconcile_orphans` **is** wired at
+boot (see "Boot wiring" below), so this path is live. The run record documents the recipe end to
+end.
 
 ## The stale-run alarm
 
@@ -147,15 +148,17 @@ question, not a cost/quality dial. `cheap-fast` alarms sooner, at a lower priori
 rows per sweep; `thorough` gives a longer alarm grace period, a higher alarm priority, and a wider
 scan limit.
 
-## Boot wiring lands in bastion, not here
+## Boot wiring lives in bastion — and is wired
 
-`engine-serve` is a library `bastion serve` mounts; this spec exposes `reconcile_orphans` as a
-callable entry point and covers it hermetically, but does not call it at server boot — that wiring
-is a `bastion`-side change — the same shape of follow-up `spawn_schedule_loop`
-(`EN.ticket.cron-schedule-startup-wiring`) needed and got: its call site is now wired into
-`bastion`'s `serve/mod.rs`, so that carryover is resolved (what remains for it is configuration —
-`BASTION_ENGINE_HARNESS_PATH` and `schedule.entries` — not code). Expect a carryover and a bastion
-ticket here too, rather than a claim that the crash path is live end to end.
+`engine-serve` is a library `bastion serve` mounts, so the call site is a `bastion`-side change.
+That change has landed: `reconcile_orphans` runs **once at boot, before the HTTP listener binds**,
+at `core/bastion/src/serve/mod.rs:556` (`ticket-orphan-reconcile-wiring` task 1), with the sweep
+summary passed through `classify_orphan_sweep` / `log_orphan_sweep`. This spec still owns the
+entry point and its hermetic coverage; bastion owns when it fires.
+
+`spawn_schedule_loop` (`EN.ticket.cron-schedule-startup-wiring`) followed the same shape and is
+also wired now — though unlike this sweep it does not yet *run*, because what remains for it is
+configuration: `BASTION_ENGINE_HARNESS_PATH` is unset and `schedule.entries` is empty.
 
 ## Tests
 
