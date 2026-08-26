@@ -20,6 +20,8 @@
     "tasks_failed": 0,
     "tasks_passed": 1,
     "total_attempts": 1,
+    "total_cache_creation_tokens": 0,
+    "total_cache_read_tokens": 0,
     "total_cost_usd": -0.0,
     "total_input_tokens": 1,
     "total_output_tokens": 1,
