@@ -1,5 +1,5 @@
 {
-  "version": "bd817da9ff6cf531a672395a84eabacff86a5ff2",
+  "version": "143b372b6cd51e54eaead5c9cffa38b984012764",
   "generated": "2026-08-26",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -70,7 +70,7 @@
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
     ".claude/skills/write-okf-markdown/SKILL.md": "981cd2c1eba9fa4a01fe3ba4239ba8841de795bdf1fa9e1cd0eeccbf891957eb",
-    ".claude/skills/edit-state-json/SKILL.md": "88ce2ed700c2a1a4187cb578df89b095bae451a4be4a2007b205282a52e36959",
+    ".claude/skills/edit-state-json/SKILL.md": "239bea8375eb920a48ece8d183873d8ae3447b546c820f9ba52322e4b189f5de",
     ".claude/skills/commit-in-this-fleet/SKILL.md": "0413b04e35e03516a9f99467c7ea7179e7d3e76d38744af6f812ad31407a794c",
     ".claude/skills/derive-state-safely/SKILL.md": "8d08b50ba495fae98cbecf8feea3a4e39e199d6ab987ffcecb25af01ff8e996c",
     ".claude/skills/run-the-gates/SKILL.md": "dca58f6aab6c07a48b39067358a2373a9199e8e28510f26c35f242c6799abcc5",
@@ -82,7 +82,7 @@
     ".agents/skills/sdlc-task/SKILL.md": "63075035c808059d7a06bad9c2ce8a3c15734e933125f335fb054fd23e6603e2",
     ".agents/skills/sdlc-flow/SKILL.md": "5d37bcc88d35274e00ab8e49c4c436827974714056cfc5b4df820dd8a32e3217",
     ".agents/skills/write-okf-markdown/SKILL.md": "7b21aa295a24ab0c013111fd4e05df3bea97ec5d181cec3414171f28a5325186",
-    ".agents/skills/edit-state-json/SKILL.md": "fe57cd6acf631301214efa4f88ba51832b3deecd0e21a04dcb5379817ec8eae8",
+    ".agents/skills/edit-state-json/SKILL.md": "799e637866c6ec1362508e27cf5f701cab6c5255b3fbfc3e06cff7640f71a8a9",
     ".agents/skills/commit-in-this-fleet/SKILL.md": "09081452ee0b81595ea940607a22fab382e88453ae83fbb4e1e823e63cb2419a",
     ".agents/skills/derive-state-safely/SKILL.md": "058eaae817a683f4b344573bbdb9f7ba62f3a6900e4d769ccaa81077ea10a94a",
     ".agents/skills/run-the-gates/SKILL.md": "3398f3fc4293b7a13af8409d73f358414a81fe46efc5614d90faaa131582a014",

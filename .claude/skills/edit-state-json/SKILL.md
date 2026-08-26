@@ -131,6 +131,30 @@ Two things that make an `operator` edge work rather than rot:
 `operator` and `approval` are **targetless but identified** — no node, skipped by dangling/cycle/topo
 logic. That is why they gate without creating a phantom block.
 
+### `origin` — a struct, not a string
+
+`origin` records which backlog idea or carryover finding a block was promoted from. It is a
+**two-field struct and both fields are required** (`Origin` in `core/okf-core/src/state.rs:644` —
+`kind: String`, `slug: String`, neither optional):
+
+```json
+"origin": {"type": "backlog", "slug": "self-hosted-ci-runner-mac-mini"}
+"origin": null                                    // the overwhelmingly common case
+"origin": "scripted-liaison-sweep"                // ❌ bare string — WHOLE FILE fails to parse
+```
+
+The bare string is the natural guess when hand-authoring a block, and it fails as
+`invalid type: string "...", expected struct Origin at line N column M`.
+
+**`type` is an unvalidated free `String`, so nothing will catch a wrong value.** The field's own doc
+comment says `"backlog"` or `"carryover"`, but six values are live across the corpus (measured
+2026-08-26 over 50 `state.json` files): `roadmap` 41, `known_issue` 32, `backlog` 27, `carryover` 11,
+`deferred` 4, `defect` 2 — against 1906 blocks with `origin: null`. Note `known_issue` is a **retired**
+carryover kind (Step 3) that survives here precisely because this field is not a closed vocabulary.
+
+**If the block did not come from a tracked backlog or carryover node, write `null`.** Naming the
+initiative it belongs to is what `note` is for.
+
 ### `clears_when` predicates (carryover only)
 
 Untagged: either free prose, or one of the typed predicates — `block_closed`, `file_exists`,
@@ -246,6 +270,12 @@ views** when any discovered `state.json` fails to load —
 
 So one malformed file in one repo stops `emit-state` regenerating **every** board in the fleet.
 
+**The cascade is loud out of all proportion to the typo.** Measured 2026-08-26: one wrong field type
+in each of two `state.json` files made `bastion validate-brain --state` report **1138 errors** — every
+one downstream of those two parse failures. Do not start fixing the list from the top. Fix the parse
+errors, re-run, and watch the other 1136 disappear. `mev validate-state <path>` on the file you just
+edited names the line and column directly and is the faster loop.
+
 Sibling code, same family: `E_STATE_SCHEMA_BAD_BLOCKED_BY` — a `related[]` or `depends_on[]` entry
 written as a bare string instead of a dependency object (`{"type": "block", "repo": ..., "id": ...}`).
 Shapes and the two ways this bites on `carryover[]` are in Step 2.
@@ -350,6 +380,7 @@ Two consequences:
 - [ ] Block keys are `repo:id`; every `depends_on` entry is a tagged object, not a bare string
 - [ ] Any `operator` edge's `exit` names an **artifact**, not the work
 - [ ] `kind` / `class` from the closed vocabulary; no newly-minted legacy value
+- [ ] `origin` is `null` or a `{"type", "slug"}` struct — **never a bare string**
 - [ ] `scope` is an object with **exactly one** of `repo` / `tier` / `cross_repo` set
 - [ ] `cross_repo` is a **boolean**, not the string `"true"`
 - [ ] Any `clears_when` is **not** already satisfied — confirmed with `mev carryover --repo <slug>`
