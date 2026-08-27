@@ -16,6 +16,24 @@ related: [status, context]
 
 ---
 
+## [run: 2026-08-27]
+
+### Security fix: `event-listener` RustSec bump
+
+`cargo update -p event-listener` (`5.4.1` -> `5.4.2`), fixing `RUSTSEC-2026-0221` (unsound
+`Send`/`Sync` impl on `StackSlot`, reachable via `sqlx-core`). No `Cargo.toml` edit. Part of a
+fleet-wide `cargo audit` pass this session (see HQ's `docs/rust-dependency-audit.md`) — this repo's
+build-speed fix (dead `sccache` removal, `[profile.dev]`, single `tests/it.rs` binary) already
+landed 2026-07-29, so today's change here is the dependency bump only. `cargo audit` is down to two
+upstream-blocked findings: `h2` 0.3.x (pinned by `actix-http`'s `h2 = "^0.3"`, no compatible upgrade
+exists) and `spin` (yanked, via `flume`/`sqlx-sqlite` — possibly unreachable in the actual build).
+Full gate chain green: fmt, clippy `--all-features`, nextest `--workspace --all-features` (3168
+passed), release build.
+
+```
+6892297 security(deps): bump event-listener for RustSec fix
+```
+
 ## [run: 2026-08-24]
 
 Implemented `EN.12.E` — `WORKFLOW_DISPATCH`: a chain step can run a registered workflow, not just a block — across 7 tasks via `/sdlc-flow` on branch `EN.12.E-flow`, PASS verdict. `ChainStep` gains `kind: StepKind` (block/dispatch/command, default block) plus forward-compatible `LaneDirectives`/`LaneBudget` parsing (`deny_unknown_fields` removed from both structs, positively controlled live against a real deny-unknown-fields failure) (task 1); two guard tests pin `EngineKind`'s closed two-variant set and confirm no `From<&str>`/`From<String>` impl exists via source-scan tests matching the module's existing pattern (task 2); new `dispatch.rs` resolves a dispatch step's `block_id` as a `Dispatcher` registry key and runs it in-process, stopping the chain with a named `UnknownWorkflowKey` diagnostic on an unregistered key or `ChildFailed` on a failed node, never selecting an `EngineKind` or falling through to a block invocation (task 3); `execute_step` now refuses non-Block kinds via a new `ExecuteError::WrongStepKind`, keeping dispatch routing entirely out of the SDLC engine path (task 4); `integrate_chain_with_dispatch` routes dispatch steps to `execute_dispatch_step` and records the outcome as a journal row (via EN.12.D's journal seam) with no `lane-log.jsonl` line, added as a new entry point so `integrate_chain`/`integrate_chain_with_journal` stay byte-identical (task 5); mixed `[research, block]` chain integration coverage (journal ordering, single lane-log line), an unregistered-dispatch-key-stops-the-chain case, and an end-to-end forward-compatible lane-segment field parse test added to `tests/it/orchestration.rs` (task 6); full gate green — fmt, clippy `--all-features -D warnings`, nextest `--workspace --all-features` (3168/3168 passed, 21 skipped), release build (task 7). Notable decisions: `kind` sits adjacent to `directives` on `RawBlockPosition` (sibling field, not nested), per the block spec's wording; `execute_dispatch_step` routing lives in `integrate.rs`'s per-step loop, not inside `execute_step`, per `dispatch.rs`'s own "never through `execute::execute_step`" doc contract. Closes `EN.12.E`. `docs/orchestration-workflow.md` updated. Next: pick up from `planning/status.md`'s `next` frontmatter list (`EN.ticket.vault-dependent-tests-must-skip-not-fail`, `EN.5.B2`, `EN.5.C`, `EN.6.L`, and others).
