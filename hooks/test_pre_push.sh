@@ -19,7 +19,7 @@ set -uo pipefail
 # anything below builds a fixture repo — an inherited GIT_DIR outranks both the working
 # directory and `git -C`, so under a hook (this suite is itself a gated hooks/pre-push
 # stage-2 check) new_repo()/new_mev_repo() would otherwise clobber the CALLER's real repo.
-# Canonical copy + full rationale: scrub_git_env() in scripts/lib.sh. Not sourced here —
+# Canonical copy + full rationale: scrub_git_env() in scripts/sync/lib.sh. Not sourced here —
 # sourcing lib.sh would also pull in its PATH export and change what this suite resolves.
 unset -v GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
     GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES GIT_COMMON_DIR
@@ -518,7 +518,7 @@ check "consumer gate: missing brain.toml skips rather than blocks" $?
 # than merely that scripts/check_no_stray_tilde.sh works standalone (already covered by the
 # script's own red baseline in planning/HQ.7.B/tasks.md). The fixture's harness.json check
 # mirrors the real script's own predicate (`test ! -e './~'`, filesystem-only, no git) so the
-# fixture repo never needs scripts/lib.sh or HQ_ROOT resolution — only the wiring is under
+# fixture repo never needs scripts/sync/lib.sh or HQ_ROOT resolution — only the wiring is under
 # test here. The fixture's `~` lives under $WORK (a mktemp dir), never near the real repo root.
 # =========================================================================================
 

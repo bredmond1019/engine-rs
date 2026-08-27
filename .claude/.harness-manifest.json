@@ -1,6 +1,6 @@
 {
-  "version": "143b372b6cd51e54eaead5c9cffa38b984012764",
-  "generated": "2026-08-26",
+  "version": "fdec30ebe6db936cc1f4ff67298e552dcb5df1f8",
+  "generated": "2026-08-27",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
     ".claude/commands/document.md": "ea9e4d419b52935a22ab9e11091a5eb0b0e5e7c859a79bdd2d05ff5f4d39bd20",
@@ -71,13 +71,14 @@
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
     ".claude/skills/write-okf-markdown/SKILL.md": "981cd2c1eba9fa4a01fe3ba4239ba8841de795bdf1fa9e1cd0eeccbf891957eb",
     ".claude/skills/edit-state-json/SKILL.md": "239bea8375eb920a48ece8d183873d8ae3447b546c820f9ba52322e4b189f5de",
-    ".claude/skills/commit-in-this-fleet/SKILL.md": "0413b04e35e03516a9f99467c7ea7179e7d3e76d38744af6f812ad31407a794c",
+    ".claude/skills/commit-in-this-fleet/SKILL.md": "4ebd21c54aa7d00b1590d482e10a856e6ca8609233ab7c7e1bcda0a65e9ef74a",
     ".claude/skills/derive-state-safely/SKILL.md": "8d08b50ba495fae98cbecf8feea3a4e39e199d6ab987ffcecb25af01ff8e996c",
     ".claude/skills/run-the-gates/SKILL.md": "dca58f6aab6c07a48b39067358a2373a9199e8e28510f26c35f242c6799abcc5",
     ".claude/skills/stop-or-continue/SKILL.md": "1b67799b753f527f9b5f9c842e861e0bafcd575784dcbb43877c864e0e44a9ba",
     ".claude/skills/ping-agent/SKILL.md": "dc0eb3189ab4c38c56fa753b1812a3ab7c13c0ea062afde9e1cca76f19cc6c3a",
     ".claude/skills/write-repo-doc/SKILL.md": "aac13124759e74efae8042e84d05830116a20dd5e9c9986a8cbb7ad4e47bd2b9",
     ".claude/skills/notify-operator/SKILL.md": "2784ea2bc23e08f2119c815e233a034d47691a1a6a01e4f8a6f40f27ad8a49b1",
+    ".claude/skills/fleet-push-discipline/SKILL.md": "af2962869cc83f859f61e28998d28612e7be3628b3d465a0ca8bdd9dc7fc1e64",
     "scripts/check_block_records.py": "78e305f58442d8e928c1e05aae031fd8ef84873461c725f3ecda98ff6d1a30e5",
     ".agents/skills/sdlc-task/SKILL.md": "63075035c808059d7a06bad9c2ce8a3c15734e933125f335fb054fd23e6603e2",
     ".agents/skills/sdlc-flow/SKILL.md": "5d37bcc88d35274e00ab8e49c4c436827974714056cfc5b4df820dd8a32e3217",
@@ -91,8 +92,8 @@
     ".agents/skills/ping-agent/SKILL.md": "d10ae51c6775f0bf0f908b0c363c6996713694abd81b2ed4fdb2b9f08704d8d0",
     ".agents/skills/write-repo-doc/SKILL.md": "d363b45c394ebbae0613933ffb20429e5df6062376d08aa29ab85ff98f3e8036",
     ".agents/skills/notify-operator/SKILL.md": "f03c1c71ed913af454ff2085ad56edddb5c5c6824fe837880a42d70dc1c9cd43",
-    "hooks/pre-push": "c211232487efaeb034f1c333c6ebd53830bd4e4411196c5a87c2c2bddd596f8e",
-    "hooks/test_pre_push.sh": "2cc33f736f1b37b26112a306154190f11698c4e38e8bf23ba4a992b5bf77eb6a",
-    "hooks/README.md": "87411c2a68869027fe86db2e92357bf45c8c18730e509fc7123907de576e944a"
+    "hooks/pre-push": "1d690176202897306e6643258c73fe50c05db608c1622e590d08ba07cf794cc9",
+    "hooks/test_pre_push.sh": "bfa8d5fdca6642611dcf680fe5502902be34acb7387b84b61b1ddfade429948b",
+    "hooks/README.md": "b64bedb9bf0943c8b21ddc278faba67fb58e7bf2316a2a95f6b959594f68dfbd"
   }
 }
