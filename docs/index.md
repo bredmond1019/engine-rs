@@ -1,7 +1,7 @@
 ---
 type: Index
 title: engine-rs Docs
-description: Navigation index for all engine-rs reference documentation
+description: Navigation index for all engine-rs reference documentation — grouped by what you are trying to do.
 doc_id: docs-index
 layer: [meta]
 project: engine-rs
@@ -12,25 +12,63 @@ related: [core:engine-rs, workflows-index]
 
 # engine-rs — Documentation Index
 
+A map of every doc in this directory, grouped by what you're trying to do. Each row is one line;
+the detail lives in the doc itself.
+
+**New here? Two pages answer most questions:** [workflows/README.md](workflows/README.md) for what
+the engine can do, and [architecture.md](architecture.md) for how it's built.
+
+## Start here
+
 | Doc | What it covers |
 |---|---|
-| **[workflows/](workflows/README.md)** | **Start here for "what can this thing do".** The capability catalogue — every registered workflow, what it does in plain English, how to trigger it — plus the per-workflow reference docs, and [policy-and-profiles.md](workflows/policy-and-profiles.md) for changing cost/speed/quality and running stages on local models. File listing: [workflows/index.md](workflows/index.md) |
-| [coming-soon.md](coming-soon.md) | **Everything on the roadmap that does NOT exist yet** — the autonomy cluster (`WORKFLOW_DISPATCH`/`CONDUCTOR`/`DEBRIEF`), the Brain read client, `DELIVERABLE_RENDER`/`CONTENT_DRAFT`/`EXTERNAL_INTEL`, run-identity and permission-profile work, and the filed-but-unfixed defects — each with its block ID, whether it is ready or what it waits on (including operator gates), and how to check `planning/state.json` for the authoritative answer |
-| [architecture.md](architecture.md) | Overview, module map, core types, data flow |
-| [deployment-launchd.md](deployment-launchd.md) | The plist `EnvironmentVariables` a permanently-running `bastion serve` under launchd needs (`ENGINE_BRAIN_ROOT` mandatory as of EN.3.K, plus `ENGINE_EVENTS_API_KEY`/`ENGINE_EVENTS_URL`/optional `ENGINE_REPO_ALLOWLIST`), what `WorkingDirectory` still determines (only the absent-`repo` fallback target), the soft-to-loud `ENGINE_BRAIN_ROOT` failure mode, and verifying the installed plist's label/port before trusting `restart_services.sh`'s header comment |
-| [cli.md](cli.md) | Synopsis, subcommands, global flags, exit codes, examples |
-| [testing.md](testing.md) | Which test commands to run, the single-integration-test-binary layout (`tests/it/`) and how to add a suite to it, the hermetic-test conventions (no network, tempdir corpora, assert on-disk bytes), and per-task `validation_commands` in the SDLC loop |
-| [data-contract.md](data-contract.md) | Pinned orchestrator data-contract version, field mappings to `engine_contract` Rust types, HTTP surface parity, re-pin checklist |
-| [terminal-nodes.md](terminal-nodes.md) | The Phase 9/10 terminal node stack (`EN.9.D`-`EN.10.A`) — session identity + lease, read-only observe, pane bounding, guarded sends, the bounded/cancellable await and its predicate enum, the runtime manifest override + no-match alarm, admission control, operator-hold policy, held sessions and `LiveClaudeSessionNode`; the three non-obvious invariants (stamp-before-fallible, the node owns its timeout, never `remove_file` a marker), every policy default, and how Claude-specific each layer actually is |
-| [materialize-doc-node.md](materialize-doc-node.md) | `MaterializeDocNode` and the injectable `DocMaterializer` seam — the generic writer node that calls `mev`/`okf-core` in-process to write a `BrainDocModel`-shaped artifact (opportunity, learning-artifact, proposal) into the Brain corpus as a source `.md` document (D53's fourth boundary-test channel), brain-root resolution (`ENGINE_BRAIN_ROOT`), dry-run vs. write vs. disabled, its live instances (`RESEARCH_AGENT` opportunity + `CONTENT_PIPELINE` learning-artifact), the `ctx.nodes` result shape, and the `OpportunityEdit` variants (`SetStage`/`AddAction`/`MergeContacts`) |
-| [harvest-gate.md](harvest-gate.md) | `HarvestMode`/`HarvestGate` — the generic `off`/`in_process`/`approval` gate fronting `PersistToBrainNode`'s Synapse ingest POST, the four-layer resolution and named profiles (incl. the new `curated-harvest`), why the default is `off`, the `pending` record shape, the `HARVEST_APPROVE` micro-workflow hand-off, the stable stamp key set, the D51 no-second-indexing-path boundary note, and (as of `EN.8.A`) the declared `OperatorChannel` field |
-| [operator-payload-contract.md](operator-payload-contract.md) | `engine-core::operator` (`EN.8.A`/`EN.8.B`) — `OperatorPayloadLimits` (confirmed WhatsApp interactive-reply limits), `OperatorPayload`'s digest-bound rendered summary + response options, `validate`/`ValidatedOperatorPayload` (route-to-session on failure, type-level enforced), `OperatorChannel` (`notification`/`session-<slug>`) declared on `HarvestGate`, `operator::queue` (depth-limited `OperatorQueue`, `QueueSource`/`BlockedEdgeSource`, storm-suppression digest), and terminal run-failure notifications (`operator::failure`, `ticket-run-failure-notification`) — the acknowledgement-only payload rendered once per run at `mark_terminal`, truncate-rather-than-drop on an over-limit error, and the `notify_on_statuses`/`failure_item_priority` policy knobs |
-| [terminal-crates.md](terminal-crates.md) | `term-core`/`term-attach` (`EN.9.A`) — what each crate holds, the additive-feature-unification reasoning for the two-crate split, the `tmux_locale_env` trap, the `include_str!` data-file coupling, and the two-repo reversibility constraint |
-| [terminal-driver.md](terminal-driver.md) | The `TerminalDriver` seam and session lease (`EN.9.B`) — why the async tmux mirror is a requirement (no `web::block` wrapper on `node_context`), the `http_post.rs`-shaped trait + `TmuxDriver`/`StubTerminalDriver`, the capture cache, the fail-closed session lease's read-back arbitration (why tmux has no CAS), the operator hold's read/write asymmetry and 60s detach grace, the per-session send mutex, and the `C-u` line-clear recovery |
-| [orphan-recovery.md](orphan-recovery.md) | Crash recovery (`EN.9.C`) — the `metadata.completion` terminal-exit marker, `engine-store`'s `list_orphan_candidates` query, the `OrphanLister` seam, the boot sweep (`reconcile_orphans`) that fails crash-stranded runs loudly without ever resuming them, the stale-run alarm on aged `running`/`suspended` runs, the `OrphanPolicy` knobs (`reconcile_on_boot`, `stale_run_alarm_secs`, `orphan_item_priority`, `orphan_scan_limit`), and why boot wiring lands in bastion, not here |
-| [approval-ledger.md](approval-ledger.md) | `engine-core::operator::ledger` (`EN.8.C`) — the append-only `{digest, decision, who, timestamp, rendered diff}` row per gate decision, why it is a JSONL file behind an injectable `ApprovalLedger` seam rather than a Postgres table (no migration tooling for the contract-owned `events` schema; CI has no Postgres), `FileApprovalLedger`/`InMemoryApprovalLedger`/`default_ledger_path`, the digest-mismatch-forces-`Requeued` enforcement inside `record_decision`, and the `time_to_approval` / `decisions_per_day` queries behind the roadmap's 10-of-14-days operated bar |
-| [suspend-resume.md](suspend-resume.md) | Suspend/resume (`EN.6.F`) — the `metadata.suspension` marker shape, the two origins (operator pause, `SuspendNode`) converging on one marker and one `run_from` walk pointer, the `PauseSignal`-vs-`CancellationToken` distinction, the loop-top granularity and `ParallelNode` atomicity limits, why resume does not re-resolve policy (incl. the `SDLC_FLOW` cwd caveat), the never-expiring/eviction-backstop semantics, the three routes (`POST /events/{run_id}/pause`, `POST /events/{event_id}/resume`, `GET /events/suspended`), and campaign-level crash recovery (`EN.11.H`) — the per-campaign checkpoint, block-boundary-only resume, the abort-vs-crash distinction, and the open-PRs/multi-host out-of-scope limits |
-| [email-adapter.md](email-adapter.md) | The email channel (`EN.6.B`) — outbound `EmailChannelTransport` (Resend HTTP API, `ReplyContext` threading, the `mail.bastiel.com.br` sender), the `RESEND_API_KEY`/`ENGINE_EMAIL_FROM` env vars, the `opportunity_slug` tag-echo correlation from send through the bounce/delivery webhook to `EN.7.B`'s `OPPORTUNITY_ADD_ACTION`, both webhook routes (`/webhooks/email/inbound`, `/webhooks/email/events`) with request/response shapes, the `X-API-Key` gate and deferred Svix signature verification, the D51/D53 boundary note, and why there is no policy surface here |
-| [cron-primitive.md](cron-primitive.md) | The standalone durable cron primitive (`EN.6.M`, `crates/engine-core/src/cron/`) — `CronSchedule`'s Calendar (drift-free) vs. Interval (catch-up-safe) variants, `normalize_schedule`/`validate_schedule`/`recover_next_fire_at`/`advance_next_fire_at`, `CronRecord`/`FireOutcome`/`CronFireLogEntry` and the silence protocol, the injectable `CronStore` seam + restart-durable `FileCronStore`, and the `tick()` driver — live caller is `EN.6.G`'s `crates/engine-serve/src/schedule.rs` (see architecture.md § Schedule Source) |
+| **[workflows/](workflows/README.md)** | **"What can this thing do, and how do I run it."** Every registered workflow, what each does, and how to trigger one. Also holds every per-workflow reference doc — file listing at [workflows/index.md](workflows/index.md) |
+| [architecture.md](architecture.md) | How the engine is built: crate layout, core types, injectable seams, data flow |
+| [cli.md](cli.md) | The command-line surface — synopsis, subcommands, flags, exit codes |
+| [coming-soon.md](coming-soon.md) | What is planned and **does not exist yet**, each with its block ID and what it waits on |
 
-For project strategy and current focus, see [`planning/`](../planning/index.md).
+## Tuning and running workflows
+
+| Doc | What it covers |
+|---|---|
+| [workflows/policy-and-profiles.md](workflows/policy-and-profiles.md) | Change cost, speed and quality without editing Rust — named profiles, the four-layer precedence, and running a stage on a local model |
+| [workflows/sdlc-flow-policy.md](workflows/sdlc-flow-policy.md) | `SDLC_FLOW`'s own knobs, its five named profiles, and run telemetry |
+| [suspend-resume.md](suspend-resume.md) | Pausing and resuming a run, and campaign-level crash recovery |
+| [orphan-recovery.md](orphan-recovery.md) | What happens to runs stranded by a crash — the boot sweep and the stale-run alarm |
+| [cron-primitive.md](cron-primitive.md) | The durable scheduling primitive: calendar vs. interval schedules, and the restart-durable store |
+
+## Deploying and testing
+
+| Doc | What it covers |
+|---|---|
+| [deployment-launchd.md](deployment-launchd.md) | The environment variables a permanently-running `bastion serve` needs, and how to verify the installed plist |
+| [testing.md](testing.md) | Which test commands to run, the one-binary-per-crate test layout, and the hermetic-test conventions |
+
+## Contracts and boundaries
+
+Where this engine meets something it does not own — the Brain, the operator, an outside service.
+
+| Doc | What it covers |
+|---|---|
+| [data-contract.md](data-contract.md) | The versioned `events`/`node_runs` schema, its Rust type mappings, and the re-pin checklist |
+| [materialize-doc-node.md](materialize-doc-node.md) | The writer node that turns a workflow result into a Brain document, and its injectable seam |
+| [harvest-gate.md](harvest-gate.md) | The `off`/`in_process`/`approval` gate that decides whether a Brain write happens at all |
+| [operator-payload-contract.md](operator-payload-contract.md) | What the engine may send a human: payload limits, the operator queue, and run-failure notifications |
+| [approval-ledger.md](approval-ledger.md) | The append-only record of every gate decision — who approved what, and when |
+| [email-adapter.md](email-adapter.md) | The email channel: outbound sending, both inbound webhooks, and their auth |
+
+## The terminal stack
+
+How the engine drives a real tmux session. Read in this order.
+
+| Doc | What it covers |
+|---|---|
+| [terminal-crates.md](terminal-crates.md) | Why `term-core`/`term-attach` are two crates, and what each holds |
+| [terminal-driver.md](terminal-driver.md) | The `TerminalDriver` seam, the fail-closed session lease, and the operator hold |
+| [terminal-nodes.md](terminal-nodes.md) | The node stack built on that seam — observe, guarded send, bounded await — and its invariants |
+
+---
+
+Project strategy and current focus live in this repo's `planning/` directory. It is a symlink into
+the private company-brain vault and is **not** part of the public repo, so it is referenced here as
+a bare path rather than a link: `engine-rs/planning/index.md`.
