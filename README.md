@@ -154,6 +154,7 @@ and because of the three path dependencies above, it checks out `mev`, `okf-core
 |---|---|---|
 | `failed to load source for dependency 'mev'` (or `okf-core`/`claude-code-rs`) | The three sibling repos aren't cloned, or aren't adjacent to `engine-rs` | Re-check the clone layout in Quickstart — all four repos must share one parent directory |
 | `cargo test` reports failures that don't reproduce under `nextest` | Plain `cargo test` runs tests as threads in one process; some tests assume nextest's per-test process isolation | Use `cargo nextest run --workspace` instead — see "Testing" above |
+| A test run ends with `TIMEOUT` on one test and a non-zero exit | That test ran past the 300s bound (`60s` × 5) that [`.config/nextest.toml`](.config/nextest.toml) sets on the default profile, so nextest killed it rather than letting the run hang with no verdict | If the test is genuinely slow rather than stuck, give **that one test** its own override — see [docs/testing.md](docs/testing.md) § "The nextest terminate-after bound". **Don't weaken the global bound** |
 | `#[ignore]`d Postgres test panics with `DATABASE_URL must be set` | You ran it with `-- --ignored` without setting `DATABASE_URL` | Either don't pass `--ignored`, or set `DATABASE_URL` to a real (disposable) Postgres instance first |
 | `cargo-nextest: command not found` | The test runner isn't installed | `cargo install cargo-nextest --locked` |
 
