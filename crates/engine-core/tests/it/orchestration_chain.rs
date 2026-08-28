@@ -904,10 +904,15 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
     let lines: Vec<&str> = contents.lines().collect();
     assert_eq!(lines.len(), 3, "two closed lines + one bailed line");
 
-    let expected_keys: std::collections::BTreeSet<&str> =
+    let required_keys: std::collections::BTreeSet<&str> =
         ["ts", "lane", "repo", "block", "status", "note"]
             .into_iter()
             .collect();
+    // EN.11.A task 5 adds `run_id`, `writer`, `build_sha` as additive,
+    // `skip_serializing_if = "Option::is_none"` identity fields — legal on
+    // an engine-written line. Anything else is a renamed or unexpected key.
+    let allowed_extra_keys: std::collections::BTreeSet<&str> =
+        ["run_id", "writer", "build_sha"].into_iter().collect();
 
     let mut statuses = Vec::new();
     for line in &lines {
@@ -915,15 +920,22 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
             serde_json::from_str(line).expect("each lane-log line must be valid JSON");
         let obj = value.as_object().expect("each line must be a JSON object");
 
-        // FIXED: the key set is EXACTLY {ts, lane, repo, block, status,
-        // note} — NOT the old {repo, block_id, integrated_at}. An added or
-        // renamed field fails this assertion.
+        // FIXED core shape {ts, lane, repo, block, status, note} plus only
+        // the known-additive identity keys — NOT the old {repo, block_id,
+        // integrated_at}. A renamed or unrecognized field fails this
+        // assertion.
         let keys: std::collections::BTreeSet<&str> =
             obj.keys().map(std::string::String::as_str).collect();
-        assert_eq!(
-            keys, expected_keys,
-            "FIXED shape only — lane-log line must carry exactly \
-             {{ts, lane, repo, block, status, note}}, got {obj:?}"
+        assert!(
+            keys.is_superset(&required_keys),
+            "lane-log line must carry at least {{ts, lane, repo, block, status, note}}, got {obj:?}"
+        );
+        let extra: std::collections::BTreeSet<&str> =
+            keys.difference(&required_keys).copied().collect();
+        assert!(
+            extra.is_subset(&allowed_extra_keys),
+            "lane-log line carries unrecognized keys beyond the fixed shape and the known \
+             additive identity fields {{run_id, writer, build_sha}}: extra={extra:?}, got {obj:?}"
         );
         assert!(
             !obj.contains_key("block_id") && !obj.contains_key("integrated_at"),
