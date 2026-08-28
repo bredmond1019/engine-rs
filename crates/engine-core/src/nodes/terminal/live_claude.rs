@@ -54,11 +54,12 @@
 //! block record's own `Out of Scope` section.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
 use serde_json::Value;
-use term_core::driver::TerminalDriver;
+use term_core::driver::{GuardedSendRequest, GuardedSender, SendError, TerminalDriver};
 
 use crate::node::{InputBinding, Node, NodeError};
 use crate::workflow::read_run_id;
@@ -66,10 +67,18 @@ use crate::workflows::{get_result, put_result};
 
 use super::held_session;
 use super::identity::HasSessionInput;
+use super::session::DEFAULT_LEASE_TTL;
 
 /// The `Node::name()` identity `LiveClaudeSessionNode` runs under, and the
 /// `ctx.nodes` key its output is stamped onto.
 pub const NODE_NAME: &str = "LiveClaudeSessionNode";
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Resolve the `claude` binary NAME (not a path lookup — the shell inside
 /// the tmux pane does its own `PATH` resolution when the typed command
@@ -202,10 +211,13 @@ impl LiveClaudeSessionNode {
         self
     }
 
-    /// Read the upstream `HeldSessionNode`'s stored `session_name` from
-    /// `ctx.nodes`, per the bound (or defaulted) `session_input` identity.
-    /// Mirrors `observe.rs`/`send.rs`'s identical read.
-    fn read_upstream_session(&self, ctx: &TaskContext) -> Result<String, NodeError> {
+    /// Read the upstream `HeldSessionNode`'s stored `session_name` and
+    /// `lease_nonce` from `ctx.nodes`, per the bound (or defaulted)
+    /// `session_input` identity. Mirrors `observe.rs`/`send.rs`'s identical
+    /// read — this node holds no lease of its own, so the nonce
+    /// `GuardedSender` needs to renew the held session's lease must come
+    /// from `held_session.rs`'s published result, never be invented here.
+    fn read_upstream_session(&self, ctx: &TaskContext) -> Result<(String, String), NodeError> {
         let bound = self.session_input.resolve(held_session::NODE_NAME);
         let stored = get_result(ctx, bound).ok_or_else(|| {
             NodeError::new(format!(
@@ -213,7 +225,7 @@ impl LiveClaudeSessionNode {
                  after a HeldSessionNode"
             ))
         })?;
-        stored
+        let session_name = stored
             .get("session_name")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -221,7 +233,17 @@ impl LiveClaudeSessionNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: {bound}'s stored result is missing `session_name`"
                 ))
-            })
+            })?;
+        let lease_nonce = stored
+            .get("lease_nonce")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                NodeError::new(format!(
+                    "{NODE_NAME}: {bound}'s stored result is missing `lease_nonce`"
+                ))
+            })?;
+        Ok((session_name, lease_nonce))
     }
 }
 
@@ -234,7 +256,7 @@ impl HasSessionInput for LiveClaudeSessionNode {
 #[async_trait::async_trait]
 impl Node for LiveClaudeSessionNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        let session_name = self.read_upstream_session(&ctx)?;
+        let (session_name, lease_nonce) = self.read_upstream_session(&ctx)?;
         let run_id = read_run_id(&ctx.metadata).ok_or_else(|| {
             NodeError::new(format!(
                 "{NODE_NAME}: no run_id stamped on ctx.metadata — cannot derive OTel resource \
@@ -244,19 +266,39 @@ impl Node for LiveClaudeSessionNode {
         let node_identity = self.session_input.resolve(held_session::NODE_NAME);
         let command = build_command_line(&self.config, &run_id, node_identity);
 
-        // `send_keys` (literal, then Enter — `TerminalDriver`'s own default
-        // composition) is the exact primitive a human operator's keystrokes
-        // become; typing `claude` here is indistinguishable, from tmux's
-        // point of view, from a person doing it themselves at an attached
-        // pane. No second start path, no `Command::new` here.
-        self.driver
-            .send_keys(&session_name, &command)
+        // Route through `GuardedSender`, exactly as `send.rs` does: this
+        // node holds no lease of its own, so the nonce/session_name it
+        // renews with come from the upstream `HeldSessionNode` result read
+        // above, never invented here. `send_keys` (literal, then Enter) is
+        // the exact primitive a human operator's keystrokes become; typing
+        // `claude` here is indistinguishable, from tmux's point of view,
+        // from a person doing it themselves at an attached pane. No second
+        // start path, no `Command::new` here.
+        let guarded = GuardedSender::new(self.driver.as_ref());
+        guarded
+            .send_keys(GuardedSendRequest {
+                session_name: &session_name,
+                keys: &command,
+                run_id: &run_id,
+                nonce: &lease_nonce,
+                identity: NODE_NAME,
+                lease_expires_at_ms: now_ms() + DEFAULT_LEASE_TTL.as_millis() as u64,
+                now_ms: now_ms(),
+            })
             .await
-            .map_err(|err| {
-                NodeError::new(format!(
+            .map_err(|err| match err {
+                SendError::Lease(lease_err) => NodeError::new(format!(
                     "{NODE_NAME}: failed to launch interactive claude session in \
-                     '{session_name}': {err}"
-                ))
+                     '{session_name}' — lease is no longer ours: {lease_err}"
+                )),
+                SendError::Hold(hold_err) => NodeError::new(format!(
+                    "{NODE_NAME}: launch refused by operator hold on '{session_name}': \
+                     {hold_err}"
+                )),
+                other => NodeError::new(format!(
+                    "{NODE_NAME}: failed to launch interactive claude session in \
+                     '{session_name}': {other}"
+                )),
             })?;
 
         put_result(
@@ -284,6 +326,14 @@ mod tests {
     use term_core::driver::{StubOutcome, StubTerminalDriver};
 
     fn ctx_with_upstream_session(identity: &str, session_name: &str) -> TaskContext {
+        ctx_with_upstream_session_and_nonce(identity, session_name, "nonce-1")
+    }
+
+    fn ctx_with_upstream_session_and_nonce(
+        identity: &str,
+        session_name: &str,
+        lease_nonce: &str,
+    ) -> TaskContext {
         let mut ctx = TaskContext {
             event: serde_json::json!({}),
             nodes: Default::default(),
@@ -292,9 +342,26 @@ mod tests {
         };
         ctx.nodes.insert(
             identity.to_string(),
-            serde_json::json!({ "session_name": session_name, "created": true }),
+            serde_json::json!({
+                "session_name": session_name,
+                "lease_nonce": lease_nonce,
+                "created": true,
+            }),
         );
         ctx
+    }
+
+    /// Seed the driver so a lease `renew` under `nonce` succeeds: the
+    /// read-back must show a live lease carrying that exact nonce, run_id
+    /// `eng-run-1` (the fixed run_id every test's `ctx_with_upstream_session`
+    /// stamps), and this node's own identity. Mirrors `send.rs`'s
+    /// identically-named helper.
+    fn seed_live_lease(driver: &StubTerminalDriver, session_name: &str, nonce: &str) {
+        let far_future = now_ms() + std::time::Duration::from_secs(3600).as_millis() as u64;
+        driver.set_show_option_result_for(
+            format!("@engine_lease@{session_name}"),
+            StubOutcome::Ok(format!("eng-run-1:{nonce}:{NODE_NAME}:{far_future}")),
+        );
     }
 
     #[test]
@@ -379,6 +446,7 @@ mod tests {
     async fn process_sends_the_resolved_command_into_the_upstream_held_session() {
         std::env::remove_var("CLAUDE_BINARY");
         let driver = Arc::new(StubTerminalDriver::new());
+        seed_live_lease(&driver, "eng-run-1_HeldSessionNode", "nonce-1");
         driver.set_send_literal_result(StubOutcome::empty_ok());
         driver.set_send_enter_result(StubOutcome::empty_ok());
 
@@ -415,6 +483,7 @@ mod tests {
     #[tokio::test]
     async fn process_uses_session_input_binding_when_bound() {
         let driver = Arc::new(StubTerminalDriver::new());
+        seed_live_lease(&driver, "eng-run-2_CustomHeldNode", "nonce-1");
         driver.set_send_literal_result(StubOutcome::empty_ok());
         driver.set_send_enter_result(StubOutcome::empty_ok());
 
@@ -509,6 +578,7 @@ mod tests {
     async fn process_never_stamps_a_usage_or_cost_usd_key() {
         std::env::remove_var("CLAUDE_BINARY");
         let driver = Arc::new(StubTerminalDriver::new());
+        seed_live_lease(&driver, "eng-run-4_HeldSessionNode", "nonce-1");
         driver.set_send_literal_result(StubOutcome::empty_ok());
         driver.set_send_enter_result(StubOutcome::empty_ok());
 
@@ -533,6 +603,7 @@ mod tests {
     #[tokio::test]
     async fn process_surfaces_a_node_error_on_driver_send_failure() {
         let driver = Arc::new(StubTerminalDriver::new());
+        seed_live_lease(&driver, "eng-run-3_HeldSessionNode", "nonce-1");
         driver.set_send_literal_result(StubOutcome::NoServer);
 
         let node = LiveClaudeSessionNode::new(driver);
@@ -543,5 +614,76 @@ mod tests {
             .await
             .expect_err("driver failure must surface as a node error");
         assert!(err.to_string().contains("eng-run-3_HeldSessionNode"));
+    }
+
+    #[tokio::test]
+    async fn process_errors_when_upstream_result_is_missing_lease_nonce() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let node = LiveClaudeSessionNode::new(driver);
+        let mut ctx = TaskContext {
+            event: serde_json::json!({}),
+            nodes: Default::default(),
+            metadata: serde_json::json!({ "run_id": "eng-run-1" }),
+            node_runs: Default::default(),
+        };
+        ctx.nodes.insert(
+            held_session::NODE_NAME.to_string(),
+            serde_json::json!({ "session_name": "eng-run-1_HeldSessionNode" }),
+        );
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("must error with a missing lease_nonce");
+        assert!(err.to_string().contains("lease_nonce"));
+    }
+
+    #[tokio::test]
+    async fn active_operator_hold_refuses_the_launch_with_zero_driver_calls() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let session_name = "eng-run-5_HeldSessionNode";
+        seed_live_lease(&driver, session_name, "nonce-1");
+        driver.set_show_option_result_for(
+            format!("@operator_hold@{session_name}"),
+            StubOutcome::Ok("1".to_string()),
+        );
+        let node = LiveClaudeSessionNode::new(driver.clone());
+        let ctx = ctx_with_upstream_session(held_session::NODE_NAME, session_name);
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("expected an active operator hold to refuse the launch");
+        assert!(
+            err.to_string().contains("operator hold"),
+            "expected the error to name the operator hold, got: {err}"
+        );
+
+        let calls = driver.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.get(1).map(String::as_str) == Some("send-keys")),
+            "an active operator hold must issue zero driver send-keys calls, got: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_succeeded_enter_failed_triggers_c_u_line_clear_recovery() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let session_name = "eng-run-6_HeldSessionNode";
+        seed_live_lease(&driver, session_name, "nonce-1");
+        driver.set_send_enter_result(StubOutcome::NoServer);
+        let node = LiveClaudeSessionNode::new(driver.clone());
+        let ctx = ctx_with_upstream_session(held_session::NODE_NAME, session_name);
+
+        let result = node.process(ctx).await;
+
+        assert!(result.is_err(), "expected the Enter failure to surface");
+        let calls = driver.calls();
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "C-u")),
+            "expected the C-u line-clear recovery to have been sent, got: {calls:?}"
+        );
     }
 }
