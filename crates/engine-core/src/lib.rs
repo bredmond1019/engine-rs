@@ -8,6 +8,7 @@
 
 pub mod brain_root;
 pub mod budget;
+pub mod build_info;
 pub mod cancellation;
 pub mod completion;
 pub mod cron;

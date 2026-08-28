@@ -7,7 +7,7 @@
 #            header comment below for the full rationale (ticket-consumer-compile-gate).
 #
 # Stage 1 background: the full 5-flag `validate-brain` suite already runs nightly on the
-# Mac Mini (scripts/validate_brain.sh, wired from scripts/routine.sh) and exits non-zero
+# Mac Mini (scripts/sync/validate_brain.sh, wired from scripts/sync/routine.sh) and exits non-zero
 # on failure — but that is detection only: nightly, remote, log-only, and it gates
 # nothing. A bad commit made on any machine can be pushed immediately, and the drift is
 # only discovered a day later in a log file nobody is looking at. This hook moves the
@@ -17,7 +17,7 @@
 # (hooks/validate-baseline.json) — never on any error. `core/engine-rs` alone currently
 # carries 9 committed E_GRAPH_DANGLING_RELATED errors; a block-on-any gate would be red
 # from day one there and would just get bypassed with --no-verify forever. The baseline
-# ratchets DOWN only (see scripts/validate_brain.sh) — it is safe to be stale-high, and
+# ratchets DOWN only (see scripts/sync/validate_brain.sh) — it is safe to be stale-high, and
 # must never silently absorb an increase.
 #
 # Scope: the baseline is corpus-wide and singular, not per-repo. `validate-brain`
@@ -29,7 +29,7 @@
 # Known constraint: validate-brain's check flags do NOT compose (main.rs:665-678 is an
 # if/else-if chain — the first flag present wins). --sync --graph --state --links
 # --structure therefore need five separate invocations, same as
-# scripts/validate_brain.sh. Do not try to pass multiple flags in one call.
+# scripts/sync/validate_brain.sh. Do not try to pass multiple flags in one call.
 #
 # Stage 2 background: stage 1 only ever measures brain-corpus drift — it says nothing
 # about whether THIS repo's own code (lint/types/tests/build) still works. Solo-operator
@@ -234,7 +234,7 @@ for ln in dict.fromkeys(current):
     else
       if [ "$total" -gt 0 ]; then
         echo "pre-push: [stage 1/2] no NEW errors from this push; $total pre-existing error(s) reported, not blocking." >&2
-        echo "pre-push:   (run 'PREPUSH_STRICT=1 git push' to gate on the whole corpus, or scripts/validate_brain.sh to see them all)" >&2
+        echo "pre-push:   (run 'PREPUSH_STRICT=1 git push' to gate on the whole corpus, or scripts/sync/validate_brain.sh to see them all)" >&2
       fi
     fi
   else
@@ -464,7 +464,7 @@ stage3_check_consumers() {
 #
 # Why this is worth noise: `mev` is the fleet's WRITER. `mev emit-state --write` rewrites
 # derived files across every repo in brain.toml, and both `/log-work` and
-# scripts/routine.sh invoke it from PATH. A stale install therefore keeps writing with
+# scripts/sync/routine.sh invoke it from PATH. A stale install therefore keeps writing with
 # whatever derivation logic it was built with, silently.
 #
 # This is not hypothetical. On 2026-08-04 the append-only revision-history writer
@@ -472,7 +472,7 @@ stage3_check_consumers() {
 # ~/.cargo/bin/mev still held a pre-merge build. Every real `emit-state --write` for hours
 # afterward ran WITHOUT the safety net the ticket had just added, and nothing surfaced it.
 #
-# Why it goes stale on THIS machine specifically: scripts/build_and_install.sh reinstalls a
+# Why it goes stale on THIS machine specifically: scripts/sync/build_and_install.sh reinstalls a
 # binary only when git_sync.sh PULLED new commits for its repo. Commits AUTHORED locally
 # never trip that condition — so the machine doing the work is exactly the one that drifts,
 # while the Mac Mini self-heals on its next cron pull.

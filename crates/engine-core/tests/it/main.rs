@@ -16,6 +16,7 @@
 
 mod action_dispatch_e2e;
 mod approve_and_run;
+mod artifact_identity;
 mod blocked_bridge;
 mod brain_client;
 mod budget;

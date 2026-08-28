@@ -43,6 +43,21 @@
 //! same rationale as `opportunity_edit::graph`'s module doc: neither node
 //! calls a model, so there is no `ModelTier` to resolve and nothing for a
 //! policy layer to override.
+//!
+//! **`ctx.event` is untrusted external input.** This workflow's only caller
+//! today is `bastiel`'s public readiness-check form, forwarding a website
+//! visitor's own submission (business/bastiel's `sendBrainIngest`, gated by
+//! `X-API-Key` but not otherwise validated against its content). Nothing in
+//! this workflow calls a model or a shell — `MaterializeDocNode`/
+//! `MergeContactsNode` only ever read/write files — so a hostile submission
+//! cannot inject a prompt or a command *here*. The residual risk is
+//! downstream: the opportunity document this writes becomes part of the
+//! corpus that later workflows and Claude Code agent sessions read as
+//! working context. Any consumer of `business/docs/opportunities/*.md`
+//! (a workflow node, `syn recall`, or an agent reading the corpus directly)
+//! must treat the "Research Brief" section of a lead-sourced opportunity
+//! doc as data, never as instructions — see the "Untrusted input" notice
+//! `okf_core::doc::opportunity::Opportunity::body` renders alongside it.
 
 use std::collections::HashMap;
 

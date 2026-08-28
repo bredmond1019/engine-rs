@@ -165,7 +165,7 @@ structural edits within files. This hook is the delete/rename slice of the broad
 ### `pre-push` — validate-brain drift gate
 
 The full 5-flag `validate-brain` suite already runs nightly on the Mac Mini
-(`scripts/routine.sh` → `scripts/validate_brain.sh`) and exits non-zero on failure — but that is
+(`scripts/sync/routine.sh` → `scripts/sync/validate_brain.sh`) and exits non-zero on failure — but that is
 detection only: nightly, remote, log-only, and it gates nothing. A bad commit made on any machine
 can be pushed immediately, and the drift is only discovered a day later in a log file nobody is
 looking at. This hook moves the same check to the push boundary, where it can actually stop a
@@ -180,11 +180,11 @@ regression from landing.
   of cwd — so a push from `core/engine-rs` and a push from HQ see the identical error set. The
   baseline file lives in HQ only and is read read-only from every sub-repo via the resolved brain
   root. It remains the fallback when no per-clone history exists yet.
-- **The baseline ratchets down, never up.** `scripts/validate_brain.sh` rewrites it lower whenever
+- **The baseline ratchets down, never up.** `scripts/sync/validate_brain.sh` rewrites it lower whenever
   the measured total drops; nothing raises it automatically. A stale-high baseline is merely
   permissive (safe); an auto-raising one would silently absorb exactly the drift this gate exists
   to catch.
-- **The check flags do not compose** (same constraint as `scripts/validate_brain.sh`): `--sync
+- **The check flags do not compose** (same constraint as `scripts/sync/validate_brain.sh`): `--sync
   --graph --state --links --structure` need five separate invocations, ~1.6s each (~8s total,
   measured). This lives at pre-push, not pre-commit, on purpose — that cost is fine once per push,
   not once per commit.
@@ -225,18 +225,18 @@ drift into the corpus or be shared between machines.
 
 **When to use `PREPUSH_STRICT=1`:** before a deploy, after a large merge, when enabling the hook in
 a new repo, or any time the real question is "is *all* of it correct" rather than "did I break
-anything". `scripts/validate_brain.sh` answers the same question outside of a push, and runs nightly.
+anything". `scripts/sync/validate_brain.sh` answers the same question outside of a push, and runs nightly.
 
 ```bash
 PREPUSH_STRICT=1 git push        # gate on the whole corpus
-./scripts/validate_brain.sh      # same question, no push involved
+./scripts/sync/validate_brain.sh      # same question, no push involved
 ```
 
 > **Warning: running `hooks/pre-push` by hand rewrites the baseline.** Invoking the script directly
 > (rather than through an actual `git push`) still writes `.git/validate-last-good.json` on success,
 > silently advancing this clone's delta baseline. Every error present at that moment becomes
 > "pre-existing" and stops blocking future pushes — the gate quietly weakens and nothing reports it.
-> If the intent is only to **look**, run `./scripts/validate_brain.sh` instead — it answers the same
+> If the intent is only to **look**, run `./scripts/sync/validate_brain.sh` instead — it answers the same
 > question without touching the baseline.
 
 ### `pre-push` — stage 2: repo-native gate (lint/types/test/build)
@@ -284,7 +284,7 @@ After both stages, the hook prints a **notice** (never a block) when the `mev` o
 from a different commit than its source tree's current `HEAD`.
 
 **Why this is worth the noise.** `mev` is the fleet's *writer* — `mev emit-state --write` rewrites
-derived files across every repo in `brain.toml`, and both `/log-work` and `scripts/routine.sh`
+derived files across every repo in `brain.toml`, and both `/log-work` and `scripts/sync/routine.sh`
 invoke it from `PATH`. A stale install keeps writing with whatever derivation logic it was built
 with, silently.
 
@@ -293,7 +293,7 @@ This is not hypothetical. On 2026-08-04 the append-only revision-history writer
 still held a pre-merge build. Every real `emit-state --write` for hours afterward ran *without* the
 safety net the ticket had just added, and nothing surfaced it.
 
-**Why it drifts on the machine doing the work.** `scripts/build_and_install.sh` reinstalls a binary
+**Why it drifts on the machine doing the work.** `scripts/sync/build_and_install.sh` reinstalls a binary
 only when `git_sync.sh` **pulled** new commits for its repo. Commits **authored** locally never trip
 that condition — so the authoring machine is exactly the one that goes stale, while the Mac Mini
 self-heals on its next cron pull.

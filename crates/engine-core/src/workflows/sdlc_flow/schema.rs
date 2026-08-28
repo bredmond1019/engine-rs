@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::build_info;
 use crate::node::NodeError;
 
 use super::policy::{PartialPolicy, SdlcPolicy};
@@ -517,6 +518,16 @@ impl SDLCState {
     /// base-template's JS `sdlc-flow.js` engine will never emit this key, so
     /// a file it wrote round-trips through [`Self::from_committed_state_json`]
     /// reading it back as `None`.
+    ///
+    /// `build`/`writer`/`host` (EN.11.A) follow the same additive-top-level
+    /// precedent, TOP LEVEL rather than nested under a `metadata` object —
+    /// this function emits a flat object with no `metadata` key to join, and
+    /// no consumer has ever read one. They are derived internally from
+    /// [`build_info`] rather than threaded through as parameters: they are
+    /// properties of the writing binary and process, identical at every call
+    /// site, so a parameter would just make every call site pass the same
+    /// value. `run_id` (on [`RunMeta`]) stays a parameter because it
+    /// genuinely varies per run.
     #[must_use]
     pub fn to_committed_state_json(
         &self,
@@ -538,6 +549,7 @@ impl SDLCState {
         let status = derive_committed_status(self, terminal_signal);
         let current_task = derive_current_task(&self.tasks);
         let bail_reason = derive_bail_reason(terminal_signal);
+        let (hostname, pid) = build_info::host_stamp();
 
         serde_json::json!({
             "spec_slug": self.spec_slug,
@@ -559,6 +571,15 @@ impl SDLCState {
             "phase_id": self.phase_id,
             "block_id": self.block_id,
             "final_validation": final_validation,
+            "build": {
+                "git_sha": build_info::GIT_SHA,
+                "built_at": build_info::BUILT_AT,
+            },
+            "writer": build_info::WRITER,
+            "host": {
+                "hostname": hostname,
+                "pid": pid,
+            },
         })
     }
 
@@ -918,6 +939,43 @@ pub fn derive_bail_reason(terminal_signal: Option<&TerminalSignal>) -> Option<St
         }
         other => other.message().to_string(),
     })
+}
+
+/// Was this committed artifact written by the run we are currently in?
+/// (EN.11.A task 3 — the stale-artifact accessor `SQ-09`'s red-build gate
+/// keys on.)
+///
+/// KEYS ON `run_id` ONLY, NEVER on the presence/absence of
+/// `final_validation` — `task_loop::SaveStateNode` writes
+/// `final_validation: null` on EVERY intermediate save, so a presence check
+/// would misread a mid-run save as final (seams.md seam 3, the tri-state
+/// trap this block's record names explicitly).
+///
+/// Reads the artifact's own `run_id` out of `value` (the D31-committed JSON
+/// shape [`SDLCState::to_committed_state_json`] emits — a bare string or
+/// JSON `null`, exactly as `run_id` round-trips through
+/// [`SDLCState::from_committed_state_json`]) and compares it against
+/// `current_run_id`:
+///
+/// - Artifact `run_id` differs from `current_run_id` (including an artifact
+///   with no `run_id` key/a `null` value, e.g. one written by base-template's
+///   JS engine, compared against a current run that DOES have a run_id) ->
+///   stale (`true`).
+/// - Artifact `run_id` matches `current_run_id` exactly -> not stale
+///   (`false`), regardless of `final_validation`.
+/// - Both sides are absent/`None` (no run_id anywhere to compare) -> not
+///   stale (`false`) — there is nothing to detect staleness against, so this
+///   accessor declines to flag it rather than guessing.
+#[must_use]
+pub fn committed_artifact_is_stale(
+    value: &serde_json::Value,
+    current_run_id: Option<&str>,
+) -> bool {
+    let artifact_run_id = value.get("run_id").and_then(serde_json::Value::as_str);
+    match (artifact_run_id, current_run_id) {
+        (None, None) => false,
+        (artifact, current) => artifact != current,
+    }
 }
 
 #[cfg(test)]
@@ -1414,6 +1472,58 @@ mod tests {
 
         let state = SDLCState::from_committed_state_json(&value)
             .expect("state with no final_validation key should still parse");
+        assert_eq!(state.spec_slug, "js-engine-fixture");
+    }
+
+    // --- EN.11.A build/writer/host identity --------------------------------
+
+    #[test]
+    fn to_committed_state_json_carries_a_non_empty_build_git_sha() {
+        let state = SDLCState::new("EN.11.A-fixture");
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
+        let git_sha = json["build"]["git_sha"]
+            .as_str()
+            .expect("build.git_sha is a string");
+        assert!(!git_sha.is_empty());
+        assert_eq!(git_sha, build_info::GIT_SHA);
+        assert!(json["build"]["built_at"].is_string());
+    }
+
+    #[test]
+    fn to_committed_state_json_writer_is_engine_rs() {
+        let state = SDLCState::new("EN.11.A-fixture");
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
+        assert_eq!(json["writer"], serde_json::json!("engine-rs"));
+    }
+
+    #[test]
+    fn to_committed_state_json_host_pid_matches_current_process() {
+        let state = SDLCState::new("EN.11.A-fixture");
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
+        assert_eq!(json["host"]["pid"], serde_json::json!(std::process::id()));
+        assert!(json["host"]["hostname"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn from_committed_state_json_missing_build_writer_host_keys_still_parses() {
+        // Base-template's JS `sdlc-flow.js` engine's shape: none of
+        // `build`/`writer`/`host` are ever emitted — a file missing all three
+        // is exactly a JS-engine-written file, and must remain legal input.
+        let value = serde_json::json!({
+            "spec_slug": "js-engine-fixture",
+            "branch": "sdlc/js-engine-fixture",
+            "worktree_path": "trees/sdlc/js-engine-fixture",
+            "started_at": "2026-07-25T00:00:00Z",
+            "updated_at": "2026-07-25T00:10:00Z",
+            "status": "running",
+            "current_task": 1,
+            "tasks": {},
+        });
+
+        let state = SDLCState::from_committed_state_json(&value)
+            .expect("state with no build/writer/host keys should still parse");
         assert_eq!(state.spec_slug, "js-engine-fixture");
     }
 

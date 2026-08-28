@@ -395,6 +395,18 @@ pub fn resolve_roadmap_dir(planning_root: &Path, slug: &str) -> Result<PathBuf, 
 /// the fleet's hand-written lines are) round-trips byte-for-byte through
 /// serde instead of being silently normalized to `Z` — the offset is part
 /// of what is on disk, not lost information.
+///
+/// `run_id`/`writer`/`build_sha` (`EN.11.A` task 5) are the same identity
+/// [`crate::build_info`] stamps into a committed `sdlc-flow-state.json`
+/// (`schema.rs`'s `to_committed_state_json`), carried onto this file's own
+/// append-only line so a chain-integrated block is attributable to the run
+/// and build that closed it. All three are ADDITIVE and OPTIONAL:
+/// `#[serde(default)]` lets the fleet's many hand-written and pre-`EN.11.A`
+/// engine-written lines (all six-field) keep deserializing, and
+/// `#[serde(skip_serializing_if = "Option::is_none")]` means a line this
+/// engine could not stamp (no child run — `bailed`/`cancelled`/
+/// `budget_halted`) omits the keys entirely rather than writing `null`,
+/// exactly like `run_id`'s own tri-state discipline in `schema.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneLogEntry {
     pub ts: DateTime<FixedOffset>,
@@ -403,6 +415,19 @@ pub struct LaneLogEntry {
     pub block: String,
     pub status: LaneLogStatus,
     pub note: String,
+    /// The writing run's id, when a child actually ran for this line (only
+    /// [`LaneLogEntry::closed`] has one — see [`journal_run_id`]). Absent
+    /// entirely (never `null`) on a line recorded before any child started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// [`crate::build_info::WRITER`] — always known and always stamped when
+    /// [`LaneLogEntry::with_identity`] is applied, regardless of whether a
+    /// run_id is available for this particular line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
+    /// [`crate::build_info::GIT_SHA`] of the binary that wrote this line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_sha: Option<String>,
 }
 
 /// The closed vocabulary of outcomes a lane-log line can record. No
@@ -442,6 +467,9 @@ impl LaneLogEntry {
             block: outcome.block_id.clone(),
             status: LaneLogStatus::Closed,
             note: note.into(),
+            run_id: None,
+            writer: None,
+            build_sha: None,
         }
     }
 
@@ -456,6 +484,9 @@ impl LaneLogEntry {
             block: step.block_id.clone(),
             status: LaneLogStatus::Bailed,
             note: note.into(),
+            run_id: None,
+            writer: None,
+            build_sha: None,
         }
     }
 
@@ -473,6 +504,9 @@ impl LaneLogEntry {
             block: step.block_id.clone(),
             status: LaneLogStatus::Cancelled,
             note: note.into(),
+            run_id: None,
+            writer: None,
+            build_sha: None,
         }
     }
 
@@ -494,7 +528,25 @@ impl LaneLogEntry {
                 step.block_id,
                 reason.to_json()
             ),
+            run_id: None,
+            writer: None,
+            build_sha: None,
         }
+    }
+
+    /// Stamp this line with the writing binary's identity — always the
+    /// build sha and [`crate::build_info::WRITER`], and `run_id` when the
+    /// caller has one (only a `closed` line, whose child actually ran, does
+    /// — see [`journal_run_id`]). Applied at the single `append_lane_log_line`
+    /// call sites in [`integrate_chain_impl`], not inside the per-status
+    /// constructors above, so every status gets the same treatment from one
+    /// place rather than four independent copies.
+    #[must_use]
+    pub fn with_identity(mut self, run_id: Option<String>) -> Self {
+        self.run_id = run_id;
+        self.writer = Some(crate::build_info::WRITER.to_string());
+        self.build_sha = Some(crate::build_info::GIT_SHA.to_string());
+        self
     }
 }
 
@@ -1297,7 +1349,8 @@ async fn integrate_chain_impl(
                      every earlier block in this chain already finished and committed",
                     step.block_id
                 ),
-            );
+            )
+            .with_identity(None);
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             break;
@@ -1310,7 +1363,8 @@ async fn integrate_chain_impl(
         // distinguishable in the chain's record.
         if let BudgetDecision::Halt(reason) = campaign_ledger.check(campaign_budget) {
             let entry =
-                LaneLogEntry::budget_halted(step, lane.unwrap_or(step.repo.as_str()), reason);
+                LaneLogEntry::budget_halted(step, lane.unwrap_or(step.repo.as_str()), reason)
+                    .with_identity(None);
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             // `EN.12.D` task 4: the fifth decision point — the one decision
@@ -1367,7 +1421,8 @@ async fn integrate_chain_impl(
         .await
         {
             let entry =
-                LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string());
+                LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string())
+                    .with_identity(None);
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             return Err(err);
@@ -1386,7 +1441,8 @@ async fn integrate_chain_impl(
                      every earlier block in this chain already finished and committed",
                     step.block_id
                 ),
-            );
+            )
+            .with_identity(None);
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             break;
@@ -1508,7 +1564,8 @@ async fn integrate_chain_impl(
             Ok(outcome) => outcome,
             Err(err) => {
                 let integrate_err = IntegrateError::from(err);
-                let entry = LaneLogEntry::bailed(step, step_lane, integrate_err.to_string());
+                let entry = LaneLogEntry::bailed(step, step_lane, integrate_err.to_string())
+                    .with_identity(None);
                 let _ = append_lane_log_line(roadmap_dir, &entry);
                 let _ = write_checkpoint(roadmap_dir, &checkpoint);
                 // `EN.12.D` task 4: no child `ctx` exists for a step whose
@@ -1543,7 +1600,12 @@ async fn integrate_chain_impl(
         );
 
         if let Err(err) = verify_state_write(&outcome) {
-            let entry = LaneLogEntry::bailed(step, step_lane, err.to_string());
+            // A child DID run for this step (execute_step succeeded above),
+            // so `step_run_id` is a real, meaningful stamp here — unlike the
+            // earlier `bailed`/`cancelled`/`budget_halted` sites, where no
+            // child ever started.
+            let entry = LaneLogEntry::bailed(step, step_lane, err.to_string())
+                .with_identity(Some(step_run_id.to_string()));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             emit_journal(
@@ -1562,7 +1624,8 @@ async fn integrate_chain_impl(
             &outcome,
             step_lane,
             format!("block {} closed via SDLC_FLOW", step.block_id),
-        );
+        )
+        .with_identity(Some(step_run_id.to_string()));
         append_lane_log_line(roadmap_dir, &entry)?;
 
         // `EN.12.D` task 4: the integrated-step decision point — the child
@@ -2088,6 +2151,66 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["block", "lane", "note", "repo", "status", "ts"]);
+    }
+
+    /// `EN.11.A` task 5: a `closed` entry stamped via `with_identity` carries
+    /// the run's id plus the writer/build-sha identity as top-level keys.
+    #[test]
+    fn stamped_closed_entry_serializes_with_run_id_writer_and_build_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = outcome_for(dir.path(), "A.1");
+        let entry = LaneLogEntry::closed(&outcome, "repo-a", "closed")
+            .with_identity(Some("11111111-2222-3333-4444-555555555555".to_string()));
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            value["run_id"],
+            json!("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(value["writer"], json!(crate::build_info::WRITER));
+        assert_eq!(value["build_sha"], json!(crate::build_info::GIT_SHA));
+    }
+
+    /// A line recorded before any child ran (`with_identity(None)`) still
+    /// gets the writer/build-sha stamp — those are properties of the
+    /// writing binary, known unconditionally — but omits `run_id` entirely
+    /// rather than serializing it as `null`.
+    #[test]
+    fn unstamped_run_id_is_omitted_entirely_not_serialized_as_null() {
+        let failing_step = step("repo-a", "A.1");
+        let entry = LaneLogEntry::bailed(&failing_step, "repo-a", "boom").with_identity(None);
+        let value = serde_json::to_value(&entry).unwrap();
+        assert!(
+            !value.as_object().unwrap().contains_key("run_id"),
+            "run_id key must be absent, not present-and-null: {value}"
+        );
+        assert_eq!(value["writer"], json!(crate::build_info::WRITER));
+        assert_eq!(value["build_sha"], json!(crate::build_info::GIT_SHA));
+    }
+
+    /// A legacy six-field line — every hand-written and pre-`EN.11.A`
+    /// engine-written line on disk fleet-wide — must still deserialize.
+    #[test]
+    fn legacy_six_field_line_still_deserializes() {
+        let legacy = json!({
+            "ts": "2026-08-19T12:00:00-03:00",
+            "lane": "repo-a",
+            "repo": "repo-a",
+            "block": "A.1",
+            "status": "closed",
+            "note": "hand-written line, pre-EN.11.A"
+        });
+        let entry: LaneLogEntry =
+            serde_json::from_value(legacy).expect("legacy six-field line should still deserialize");
+        assert_eq!(entry.status, LaneLogStatus::Closed);
+        assert_eq!(entry.run_id, None);
+        assert_eq!(entry.writer, None);
+        assert_eq!(entry.build_sha, None);
+
+        // The `-03:00` offset must round-trip byte-for-byte, not be
+        // normalized to `Z` — this struct's whole reason for using
+        // `DateTime<FixedOffset>` over `DateTime<Utc>`.
+        let round_tripped = serde_json::to_value(&entry).unwrap();
+        assert_eq!(round_tripped["ts"], json!("2026-08-19T12:00:00-03:00"));
     }
 
     /// No constructor can produce an entry without an explicit status —

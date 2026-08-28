@@ -276,6 +276,20 @@ endpoint — it prompts for confirmation and reports 202/404/401/connection-fail
     the run-level authoritative gate failed even though every task passed its own tripwire and
     review; it degrades the run's terminal status but does not flip it to `"blocked"` (see
     [D12](../planning/decisions/D12-per-task-vs-final-check-depth.md)).
+  - **`build`/`writer`/`host`** (top-level keys, `EN.11.A`) — stamped by
+    `SDLCState::to_committed_state_json` on every write, same additive precedent as `run_id`:
+    `build.git_sha`/`build.built_at` are the compile-time identity of the engine binary that wrote
+    this file (`engine_core::build_info::{GIT_SHA, BUILT_AT}`, sourced from `build.rs` via `env!`,
+    falling back to `"unknown"` outside a git checkout); `writer` is the fixed string
+    `"engine-rs"`; `host.hostname`/`host.pid` (`build_info::host_stamp()`) identify the process
+    that produced the write. Together they let a reader tell which build/host/process is behind
+    any given state file — useful once more than one binary or machine can write the same spec's
+    state. `SDLCState::from_committed_state_json` still parses a file missing all three keys.
+  - **Artifact staleness** — `committed_artifact_is_stale(value, current_run_id)` compares a
+    committed artifact's `run_id` against the current run's: they differ (including the artifact
+    having no `run_id` at all while the current run does) -> stale; they match -> not stale; both
+    absent -> not stale (nothing to compare against, so it declines to guess rather than
+    flagging a false positive).
   - **Terminal status on a failed walk** (EN.6.J) — a node returning `Err` halts the walk before
     `WrapUpNode` ever runs, which used to leave this file saying `"running"` forever. `engine-serve`
     now detects that outcome after the walk exits (a failed node run, an `Err` from `run_with`, or

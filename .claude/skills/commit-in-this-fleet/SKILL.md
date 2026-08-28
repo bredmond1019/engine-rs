@@ -3,7 +3,6 @@ name: commit-in-this-fleet
 description: How to commit in the agentic-portfolio fleet without swallowing another session's work — why one git repo owns every planning/ directory, why `git add -A` is banned here rather than merely discouraged, what `git commit -o` does and does not stage, and the worktree and symlink traps that make a clean-looking commit wrong. Use BEFORE any git add/commit/stash/reset/mv in this fleet, before committing after `mev emit-state --write`, and whenever `git status` shows changes you did not make.
 allowed-tools: Bash(git:*) Bash(ls:*) Bash(test:*) Bash(grep:*)
 ---
-
 # Committing in this fleet
 
 > **Paths below are relative to the brain root** — the directory containing `brain.toml`, found by
