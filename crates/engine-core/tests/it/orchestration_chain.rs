@@ -13,7 +13,7 @@
 //! naming the block that flips it (never asserted BEFORE that block lands: this
 //! is `EN.11.B` task 1, scaffolding only — cases live in later tasks of this same spec):
 //!
-//! - (a) COMPOSITION (smoke-run.md §3.4) — still WRONG. Flipped by `EN.11.C`.
+//! - (a) COMPOSITION (smoke-run.md §3.4) — now FIXED, by `EN.11.C`.
 //! - (b) FAILED STEP INVISIBLE (smoke-run.md §3.2) — now FIXED, by `EN.11.D`.
 //! - (c) RED AUTHORITATIVE BUILD (smoke-run.md §3.3) — now FIXED, by
 //!   `EN.ticket.final-validation-failure-must-block` (closed 2026-08-20).
@@ -46,13 +46,16 @@
 //! `crates/engine-core/src/` was empty at that point and remains empty in this commit.
 //! No production source differs from HEAD.
 //!
-//! - **(a)** [`block_n_plus_1s_tree_lacks_block_ns_work_today`] — perturbed
-//!   `integrate_chain`'s per-step loop (`integrate.rs`) to push each step's completed
-//!   branch tip to `origin/main` and fetch it back (simulating the chaining `EN.11.C`
-//!   will add), immediately after `verify_state_write` succeeds. Observed failure:
-//!   `panicked at .../orchestration_chain.rs:456:5: WRONG-TODAY: B2's tree must NOT
-//!   contain B1's marker, because B2's branch was cut from origin/main, not from B1's
-//!   tip — flips by EN.11.C`.
+//! - **(a)** [`block_n_plus_1s_tree_contains_block_ns_work`] (as of `EN.11.B` task 4,
+//!   named `block_n_plus_1s_tree_lacks_block_ns_work_today` and asserted at its
+//!   then-current WRONG value) — perturbed `integrate_chain`'s per-step loop
+//!   (`integrate.rs`) to push each step's completed branch tip to `origin/main` and
+//!   fetch it back (simulating the chaining `EN.11.C` would add), immediately after
+//!   `verify_state_write` succeeds. Observed failure: `panicked at
+//!   .../orchestration_chain.rs:456:5: WRONG-TODAY: B2's tree must NOT contain B1's
+//!   marker, because B2's branch was cut from origin/main, not from B1's tip — flips
+//!   by EN.11.C`. `EN.11.C` task 3 has since flipped this case to its FIXED value —
+//!   see that block's own commit for the current perturbation record.
 //! - **(b)** [`a_failed_setup_worktree_step_stops_the_chain_via_execute_step`] —
 //!   `EN.11.D` Task 4: perturbed `execute_step`'s `if derive_terminal_status(&ctx) ==
 //!   "failed"` guard (`execute.rs`) to `if false && derive_terminal_status(&ctx) ==
@@ -393,6 +396,20 @@ impl RecordingRunner {
                         serde_json::json!({"cost_usd": cost}),
                     );
                 }
+                // `EN.11.C` task 1: the real `PullRequestNode` stamps the
+                // branch it pushed onto `ctx.nodes["PullRequestNode"]`, on
+                // both the `auto_pr: true` and `auto_pr: false` shapes —
+                // this double mirrors that so `integrate_chain`'s merge
+                // stage (`resolve_merge_branch`) has a branch name to find,
+                // exactly like a real `SDLC_FLOW` run would leave behind.
+                nodes.insert(
+                    "PullRequestNode".to_string(),
+                    serde_json::json!({
+                        "branch_name": branch,
+                        "pr_url": null,
+                        "skipped": true,
+                    }),
+                );
 
                 Ok(engine_contract::TaskContext {
                     event: serde_json::json!({}),
@@ -482,21 +499,20 @@ fn always_flow(_repo: &str, _id: &str) -> EngineKind {
     EngineKind::Flow
 }
 
-// ── Case (a): COMPOSITION — still WRONG today ─────────────────────────────
+// ── Case (a): COMPOSITION — now FIXED by EN.11.C ──────────────────────────
 //
-// smoke-run.md §3.4: a two-block chain over the SAME repo should, in the
-// fixed world, cut block N+1's branch from block N's tip so the second
-// block's tree contains the first block's work. It does not — `EngineRunner`
-// cuts every block's branch from `origin/main`, so block N+1's tree is
-// missing block N's marker entirely. `integrate_chain` calls `execute_step`
-// per step (never chaining one step's branch into the next), and
-// `RecordingRunner` mirrors real `SDLC_FLOW`'s branch discipline exactly
-// (`checkout -B sdlc/<block> origin/main`), so this is production's actual
-// behaviour, not an artifact of the double.
+// smoke-run.md §3.4: a two-block chain over the SAME repo should cut block
+// N+1's branch from a tree that actually contains block N's work. Each
+// block's branch is still cut fresh from `origin/main` (`RecordingRunner`
+// mirrors real `SDLC_FLOW`'s branch discipline exactly:
+// `checkout -B sdlc/<block> origin/main` — that per-step discipline does
+// NOT change), but `integrate_chain`'s new merge stage (`EN.11.C` task 2)
+// now merges each just-integrated step's branch into `main` and pushes it
+// before the next step starts, so block N+1's `origin/main` — and
+// therefore its own branch — carries block N's work. See EN.11.C's block
+// record for the fix.
 #[tokio::test]
-// WRONG TODAY — flipped by EN.11.C (not in this lane; EN.11.C depends on
-// this block).
-async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
+async fn block_n_plus_1s_tree_contains_block_ns_work() {
     let (_brain_root, _bare_root, registry, repo_path) = single_repo_fixture("smoke-repo");
     let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-b-case-a");
     let runner = RecordingRunner::new();
@@ -531,11 +547,11 @@ async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
     .expect("two-block chain over one repo should integrate cleanly");
     assert_eq!(outcomes.len(), 2);
 
-    // Check out B2's branch and inspect its tree. In the FIXED world (once
-    // EN.11.C lands) `sdlc/B2` would be cut from `sdlc/B1`'s tip and would
-    // therefore carry B1's marker file too. Today it does not: `sdlc/B2`
-    // was cut from `origin/main`, exactly like `sdlc/B1` was, so B1's
-    // marker never reaches B2's tree.
+    // Check out B2's branch and inspect its tree. B1 integrated first, so
+    // `integrate_chain`'s merge stage landed `sdlc/B1` on `origin/main`
+    // before B2's step ever ran — `sdlc/B2` was cut fresh from that now-
+    // updated `origin/main` (per-step branch discipline is unchanged), so
+    // it carries B1's marker file too.
     run_git(&repo_path, &["checkout", "-q", "sdlc/B2"]);
     let b2_marker = repo_path.join(RecordingRunner::marker_file("B2"));
     let b1_marker_on_b2 = repo_path.join(RecordingRunner::marker_file("B1"));
@@ -544,13 +560,82 @@ async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
         "B2's own marker must exist on its own branch"
     );
     assert!(
-        !b1_marker_on_b2.exists(),
-        "WRONG-TODAY: B2's tree must NOT contain B1's marker, because B2's \
-         branch was cut from origin/main, not from B1's tip — flips by EN.11.C"
+        b1_marker_on_b2.exists(),
+        "FIXED: B2's tree must contain B1's marker — EN.11.C's merge stage \
+         landed sdlc/B1 on origin/main before B2's branch was cut"
     );
 
     // Ancestry confirms the same fact at the git-graph level: B1's branch
-    // tip is not an ancestor of B2's branch tip.
+    // tip is now an ancestor of B2's branch tip.
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "sdlc/B1", "sdlc/B2"])
+        .current_dir(&repo_path)
+        .status()
+        .expect("spawn git merge-base --is-ancestor")
+        .success();
+    assert!(
+        is_ancestor,
+        "FIXED: sdlc/B1 must be an ancestor of sdlc/B2 — EN.11.C composes the chain"
+    );
+
+    // `main` itself also carries B1's marker — the merge stage pushed it
+    // there, not merely into B2's branch.
+    run_git(&repo_path, &["checkout", "-q", "main"]);
+    assert!(
+        repo_path.join(RecordingRunner::marker_file("B1")).exists(),
+        "main must carry B1's marker after the merge stage pushed it"
+    );
+}
+
+/// Gate-capable-of-failing companion to
+/// [`block_n_plus_1s_tree_contains_block_ns_work`] (base-template D68
+/// constraint 4): builds the identical fixture and cuts two branches BY
+/// HAND, both from `origin/main`, without ever driving `integrate_chain` —
+/// exactly the pre-`EN.11.C` shape (no merge stage ever ran). The same
+/// composition probe (marker presence + `merge-base --is-ancestor`) must
+/// report NOT-composed against this hand-built state, proving the probe
+/// above actually distinguishes the composed world from the uncomposed one
+/// rather than passing vacuously.
+#[tokio::test]
+async fn composition_probe_reports_not_composed_without_the_merge_stage() {
+    let (_brain_root, _bare_root, _registry, repo_path) = single_repo_fixture("smoke-repo");
+
+    // Cut sdlc/B1 from origin/main, commit a marker, push it — but never
+    // merge it back into main, and never let `integrate_chain` touch it.
+    run_git(
+        &repo_path,
+        &["checkout", "-q", "-B", "sdlc/B1", "origin/main"],
+    );
+    std::fs::write(
+        repo_path.join(RecordingRunner::marker_file("B1")),
+        "B1: marker\n",
+    )
+    .expect("write B1 marker");
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-q", "-m", "B1: marker"]);
+    run_git(&repo_path, &["push", "-q", "origin", "sdlc/B1"]);
+
+    // Cut sdlc/B2 from origin/main too — origin/main was never updated
+    // with B1's work, so this is exactly the pre-EN.11.C shape.
+    run_git(
+        &repo_path,
+        &["checkout", "-q", "-B", "sdlc/B2", "origin/main"],
+    );
+    std::fs::write(
+        repo_path.join(RecordingRunner::marker_file("B2")),
+        "B2: marker\n",
+    )
+    .expect("write B2 marker");
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-q", "-m", "B2: marker"]);
+    run_git(&repo_path, &["push", "-q", "origin", "sdlc/B2"]);
+
+    run_git(&repo_path, &["checkout", "-q", "sdlc/B2"]);
+    let b1_marker_on_b2 = repo_path.join(RecordingRunner::marker_file("B1"));
+    assert!(
+        !b1_marker_on_b2.exists(),
+        "NOT-composed: without the merge stage, B2's tree must not carry B1's marker"
+    );
     let is_ancestor = Command::new("git")
         .args(["merge-base", "--is-ancestor", "sdlc/B1", "sdlc/B2"])
         .current_dir(&repo_path)
@@ -559,7 +644,7 @@ async fn block_n_plus_1s_tree_lacks_block_ns_work_today() {
         .success();
     assert!(
         !is_ancestor,
-        "WRONG-TODAY: sdlc/B1 must NOT be an ancestor of sdlc/B2 — flips by EN.11.C"
+        "NOT-composed: without the merge stage, sdlc/B1 must not be an ancestor of sdlc/B2"
     );
 }
 
@@ -1217,5 +1302,193 @@ async fn campaign_ceiling_below_one_blocks_cost_halts_at_first_boundary() {
     assert!(
         note.contains("max_cost_usd"),
         "the halt reason must name the cap that tripped: {note}"
+    );
+}
+
+// ── EN.11.C task 3: the merge stage itself ───────────────────────────────
+
+/// Wraps `base` so that, for exactly `block_id`, the returned `ctx`'s
+/// `PullRequestNode.branch_name` is overwritten to `bogus_branch` — a
+/// branch name the fixture never actually pushes. Used to drive
+/// `integrate_chain`'s merge stage into `merge_step_branch`'s failure path
+/// (an unmergeable, in this case nonexistent, ref) without needing a real
+/// merge conflict.
+fn bad_branch_for(
+    base: FlowRunner,
+    block_id: &'static str,
+    bogus_branch: &'static str,
+) -> FlowRunner {
+    Arc::new(move |invocation| {
+        let base = base.clone();
+        let id = invocation.block_id.clone();
+        Box::pin(async move {
+            let mut ctx = (base)(invocation).await?;
+            if id == block_id {
+                ctx.nodes.insert(
+                    "PullRequestNode".to_string(),
+                    serde_json::json!({
+                        "branch_name": bogus_branch,
+                        "pr_url": null,
+                        "skipped": true,
+                    }),
+                );
+            }
+            Ok(ctx)
+        })
+    })
+}
+
+/// AC: "A step whose merge cannot be completed returns the new
+/// `IntegrateError` variant, and the error's `Display` output contains the
+/// git stderr; the lane log holds a `bailed` line and no `closed` line for
+/// that block." Block `MB.1` integrates normally (its own state write and
+/// lane-log `closed` line happen before the merge stage runs — the merge
+/// stage is the LAST thing before that `closed` line is appended, so `MB.1`
+/// itself never reaches this failure), but `MB.1`'s reported branch name is
+/// overwritten to one that was never pushed, so `merge_step_branch`'s
+/// `git merge --no-ff <bogus branch>` fails with a nonzero exit and real
+/// git stderr.
+#[tokio::test]
+async fn an_unmergeable_step_fails_the_step_and_never_closes_it() {
+    let (_brain_root, _bare_root, registry, _repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-c-merge-fail");
+    let admission = AdmissionGate::with_default_policy();
+
+    let runner = RecordingRunner::new();
+    let flow_runner = bad_branch_for(
+        runner.clone().into_runner(),
+        "MB.1",
+        "sdlc/this-branch-was-never-pushed",
+    );
+
+    let chain = resolve_explicit_chain(vec![("smoke-repo".to_string(), "MB.1".to_string())]);
+
+    let err = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        Some("en-11-c-merge-fail-lane"),
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect_err("a merge onto a nonexistent branch must fail the step");
+
+    match &err {
+        IntegrateError::StepMergeFailed {
+            block_id, stderr, ..
+        } => {
+            assert_eq!(block_id, "MB.1");
+            assert!(
+                !stderr.is_empty(),
+                "the git stderr must reach the error, never be swallowed"
+            );
+        }
+        other => panic!("expected IntegrateError::StepMergeFailed, got: {other:?}"),
+    }
+    assert!(
+        err.to_string().len()
+            > "block 'MB.1' (repo 'smoke-repo') integrated but its branch \
+             'sdlc/this-branch-was-never-pushed' could not be merged into main and pushed: "
+                .len(),
+        "Display output must carry the actual git stderr text, not just the static prefix: {err}"
+    );
+
+    let contents = std::fs::read_to_string(roadmap_dir.join("lane-log.jsonl"))
+        .expect("lane-log.jsonl must exist after the bailed line");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON line"))
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one lane-log line for MB.1");
+    assert_eq!(lines[0]["block"], "MB.1");
+    assert_eq!(
+        lines[0]["status"], "bailed",
+        "an unmergeable step must never be recorded as closed"
+    );
+}
+
+/// AC: "The `planning/` symlink still resolves into the canonical vault
+/// inside a worktree after the merge stage runs" (base-template D50 /
+/// seams.md seam 9). Replaces the fixture repo's real, committed
+/// `planning/` directory with a symlink into a separate tempdir vault —
+/// exactly this repo's own on-disk shape — then drives a two-block chain
+/// through the merge stage and asserts the symlink still resolves to the
+/// same vault afterward.
+#[tokio::test]
+async fn planning_symlink_still_resolves_into_its_vault_after_the_merge_stage() {
+    let (_brain_root, _bare_root, registry, repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-11-c-symlink");
+    let admission = AdmissionGate::with_default_policy();
+
+    let vault = tempfile::tempdir().expect("vault tempdir");
+    std::fs::write(
+        vault.path().join("harness.json"),
+        r#"{"validation":{"checks":[]}}"#,
+    )
+    .expect("write vault harness.json");
+    std::fs::remove_dir_all(repo_path.join("planning")).expect("remove real planning dir");
+    std::os::unix::fs::symlink(vault.path(), repo_path.join("planning"))
+        .expect("symlink planning into the vault");
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(
+        &repo_path,
+        &["commit", "-q", "-m", "planning -> vault symlink"],
+    );
+    run_git(&repo_path, &["push", "-q", "origin", "main"]);
+
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let chain = resolve_explicit_chain(vec![
+        ("smoke-repo".to_string(), "SL.1".to_string()),
+        ("smoke-repo".to_string(), "SL.2".to_string()),
+    ]);
+
+    integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("two-block chain over a symlinked planning/ should integrate cleanly");
+
+    run_git(&repo_path, &["checkout", "-q", "main"]);
+    let planning_path = repo_path.join("planning");
+    let metadata =
+        std::fs::symlink_metadata(&planning_path).expect("stat the planning path on main");
+    assert!(
+        metadata.file_type().is_symlink(),
+        "planning must still be a symlink after the merge stage, not a real directory"
+    );
+    let target = std::fs::read_link(&planning_path).expect("read the planning symlink's target");
+    assert_eq!(
+        target,
+        vault.path(),
+        "planning symlink must still resolve into its original vault tempdir"
     );
 }
