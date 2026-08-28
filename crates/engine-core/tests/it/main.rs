@@ -30,6 +30,7 @@ mod deliverable_render_e2e;
 mod diagnostic_intake_e2e;
 mod evals_slice;
 mod fan_out_aggregate;
+mod gate_timeout_fixture;
 mod harvest_gate_e2e;
 mod held_session;
 mod linkedin_post_e2e;
