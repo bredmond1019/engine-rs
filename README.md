@@ -46,7 +46,7 @@ cd engine-rs
 cargo install cargo-nextest --locked   # one-time; this workspace's test runner
 
 cargo build --workspace                # build every crate
-cargo nextest run --workspace          # run the full test suite (~1200+ tests, no live services)
+cargo nextest run --workspace          # run the full test suite (no live services needed)
 ```
 
 That's it — no database, no external service, no `.env` file is required to build or run the
@@ -178,4 +178,4 @@ for inclusion in this work by you, as defined in the Apache-2.0 license, shall b
 as above, without any additional terms or conditions.
 
 Built for one operator and released because it may be useful to others — there is no support
-obligation, no issue-response SLA, and no stability promise. See HQ decisions D40 and D75.
+obligation, no issue-response SLA, and no stability promise.
