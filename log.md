@@ -14,6 +14,20 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-08-27]
+
+`EN.11.A` — Artifact identity: build stamp, writer, run_id and host — done via `/sdlc-flow` on branch `EN.11.A-flow`. All 6 tasks passed, PASS review. `engine-core` gained `build_info::{GIT_SHA, BUILT_AT, WRITER, host_stamp()}` sourced from a new `build.rs` (git sha + RFC3339 build timestamp via `cargo:rustc-env`, falling back to `"unknown"` outside a git checkout — task 1); `SDLCState::to_committed_state_json` now stamps additive top-level `build.git_sha`/`build.built_at`, `writer`, and `host.{hostname,pid}` keys derived internally from `build_info::host_stamp()` rather than a 7th tail parameter, with `from_committed_state_json` still parsing files missing all three keys (task 2); `committed_artifact_is_stale(value, current_run_id)` added, keying only on `run_id` (never `final_validation` presence, since `SaveStateNode` writes that `null` on every save), backed by a 6-test `tests/it/artifact_identity.rs` suite including a dedicated negative-control test proving the stale assertion is real per D68 constraint 4 (task 3); `GET /health` now returns `build.git_sha`/`build.built_at` (task 4); `LaneLogEntry` gained optional `run_id`/`writer`/`build_sha`, stamped via a new `with_identity()` at every `append_lane_log_line` call site in `integrate_chain_impl` — closed lines get the real `step_run_id`, no-child-ran bail lines get `None` but still stamp `writer`/`build_sha` (task 5); task 6 ran the full validation suite, fixing a pre-existing lane-log exact-shape test broken by task 5's additive fields rather than reverting the design. Full gate green — fmt, clippy `-D warnings`, `nextest --workspace` (3185 passed, 0 failed, 21 skipped), release build. Closes `EN.11.A`. Docs updated: `docs/data-contract.md`, `docs/sdlc-flow-workflow.md`, `docs/orchestration-workflow.md`. Next: `EN.ticket.vault-dependent-tests-must-skip-not-fail`.
+
+```
+75d95ec docs: update docs for EN.11.A
+a732ca9 test: allow additive identity keys in fixed-shape lane-log test (EN.11.A task 6)
+5034f3d feat: implement EN.11.A-task5
+86080e1 feat: implement EN.11.A-task4
+a76e25a feat: implement EN.11.A-task3
+ff9f252 feat: implement EN.11.A-task2
+4874418 feat: implement EN.11.A-task1
+```
+
 ---
 
 ## [run: 2026-08-27]
