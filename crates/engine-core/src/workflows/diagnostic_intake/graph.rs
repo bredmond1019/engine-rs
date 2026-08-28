@@ -115,6 +115,36 @@ mod tests {
     use super::*;
     use crate::validate::WorkflowValidator;
 
+    /// Isolated per-test tempdir worktree, mirroring `extract.rs`'s
+    /// `temp_worktree()` (`EN.ticket.hermetic-test-temp-dirs`): a test that
+    /// drives `IntakeExtractNode::process` without stamping a
+    /// `SetupWorktreeNode` result falls back to `worktree_path`'s
+    /// `std::env::current_dir()` branch and `persist_state` writes into the
+    /// crate's own tracked `planning/diagnostic-intake-state.json` —
+    /// exactly the dirtying `ticket-diagnostic-intake-fixture-tempdir` task 2
+    /// closes. `remove_dir_all` before `create_dir_all` so a recycled PID
+    /// cannot produce a false failure.
+    fn temp_worktree() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-core-diagnostic-intake-graph-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Stamp a `SetupWorktreeNode` result pointing at `worktree`, mirroring
+    /// `diagnostic_intake_e2e.rs`'s `set_worktree` helper.
+    fn set_worktree(ctx: &mut engine_contract::TaskContext, worktree: &std::path::Path) {
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            serde_json::json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+    }
+
     #[test]
     fn schema_passes_validation() {
         let schema = schema();
@@ -238,6 +268,8 @@ mod tests {
             crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
             serde_json::to_value(&policy).expect("policy serializes"),
         );
+        let worktree = temp_worktree();
+        set_worktree(&mut ctx, &worktree);
 
         let local_http_post: crate::nodes::LocalHttpPost = Arc::new(|_url, _body| {
             Box::pin(async {
@@ -273,6 +305,7 @@ mod tests {
             out.nodes["IntakeExtractNode"]["transport"]["endpoint"],
             "http://localhost:11434"
         );
+        std::fs::remove_dir_all(&worktree).ok();
     }
 
     /// Same seam, but the local endpoint fails — the resulting telemetry
@@ -309,6 +342,8 @@ mod tests {
             crate::policy::RESOLVED_POLICY_IDENTITY.to_string(),
             serde_json::to_value(DiagnosticIntakePolicy::default()).expect("policy serializes"),
         );
+        let worktree = temp_worktree();
+        set_worktree(&mut ctx, &worktree);
 
         let local_http_post: crate::nodes::LocalHttpPost =
             Arc::new(|_url, _body| Box::pin(async { Err("connection refused".to_string()) }));
@@ -353,5 +388,6 @@ mod tests {
 
         let out = node.process(ctx).await.expect("process should succeed");
         assert_eq!(out.nodes["IntakeExtractNode"]["transport"]["tier"], "cloud");
+        std::fs::remove_dir_all(&worktree).ok();
     }
 }

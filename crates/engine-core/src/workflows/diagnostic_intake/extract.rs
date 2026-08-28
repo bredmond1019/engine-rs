@@ -137,6 +137,21 @@ fn build_prompt(event: &DiagnosticIntakeEventSchema, locale: Locale) -> String {
 /// falls back to the process's current working directory, and a ctx driven
 /// directly in a unit test (no upstream node at all) still resolves *some*
 /// path rather than failing `process`.
+///
+/// `ticket-diagnostic-intake-fixture-tempdir` task 2: this fallback is
+/// exactly why every test that drives `IntakeExtractNode::process` must
+/// stamp a `SetupWorktreeNode` result pointing at an isolated tempdir — an
+/// unstamped ctx run from `cargo nextest`'s crate-root cwd otherwise
+/// overwrites the tracked `crates/engine-core/planning/diagnostic-intake-state.json`
+/// fixture. Every test in this module and in
+/// `tests/it/diagnostic_intake_e2e.rs` already stamps one (verified: two
+/// consecutive `cargo nextest run --workspace` runs leave `git status
+/// --porcelain` empty). The two tests that did NOT were
+/// `graph::tests::extract_registry_for_policy_stamps_local_tier_on_stubbed_local_success`
+/// and `graph::tests::extract_registry_for_policy_stamps_cloud_tier_on_local_failure_fallback`
+/// (both drive this node directly via `registry_for_policy`'s rewired
+/// transport) — fixed there, not here, since this module's own tests were
+/// already hermetic going in.
 fn worktree_path(ctx: &TaskContext) -> PathBuf {
     get_result(ctx, "SetupWorktreeNode")
         .and_then(|value| value.get("worktree_path"))
