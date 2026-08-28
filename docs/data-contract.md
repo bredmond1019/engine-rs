@@ -224,7 +224,7 @@ canonical contract's §7, so a caller can target either runtime:
 | Method | Path | engine-rs handler |
 |---|---|---|
 | `POST` | `/events/` | `http::post_events` — `X-API-Key` gated, dispatches + records live state + enqueues the durable write |
-| `GET` | `/health` | `http::health` |
+| `GET` | `/health` | `http::health` — `200 {status: "ok", build: {git_sha, built_at}}`, the compile-time identity of the binary answering the request (`engine_core::build_info::{GIT_SHA, BUILT_AT}`, `EN.11.A`) — not the currently-deployed Mini binary if a newer one hasn't restarted the process yet |
 | `GET` | `/workflows` | `http::list_workflows` |
 | `GET` | `/workflows/{type}/graph` | `http::workflow_graph` — `404` for an unregistered type |
 | `POST` | `/events/{run_id}/abort` | `abort::abort_run` (EN.2.B) — same `X-API-Key` gate; `401`/`404`/`202` per the canonical contract §7 |

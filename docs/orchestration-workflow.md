@@ -142,6 +142,14 @@ missing or duplicated line is how a sibling lane reads the wrong state. The road
 resolved by the two-location rule (`planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`;
 a slug present in both is an error, never a silent preference).
 
+Every line also carries optional `run_id`/`writer`/`build_sha` identity fields (`EN.11.A`,
+additive — skip-if-`None`, so an older reader parsing the fixed `{ts, lane, repo, block, status,
+note}` shape still round-trips). `writer`/`build_sha` are stamped on every line regardless of
+outcome. `run_id` is the executed step's engine run UUID when a child workflow actually ran for
+that step (a `closed` line, or a `bailed` line from a post-execution failure such as a state-write
+verification mismatch); it is `None` when the step never got that far — cancelled, budget-halted,
+or held/bailed before execution started, so there is no run to name.
+
 A clean abort, a budget halt, and a node/state-write failure are three distinguishable terminal
 states in that log, not one undifferentiated stop (`EN.11.F`): a chain halted by
 `POST /campaigns/{id}/abort` (an explicit human request) appends a `cancelled` line; a chain
