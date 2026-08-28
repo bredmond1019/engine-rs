@@ -1,0 +1,24 @@
+# nextest profile config for engine-rs.
+#
+# Added by EN.ticket.test-gate-must-terminate-a-hang-not-wedge (task 2): the default profile
+# previously had no `terminate-after`, so a genuinely wedged test would block the authoritative
+# gate (`cargo nextest run --workspace --all-features`) forever with no verdict and no
+# diagnostic. `slow-timeout.terminate-after` bounds that: any test running past
+# `period * terminate-after` is killed by nextest and reported as TIMEOUT instead of hanging.
+#
+# The bound (60s period x 5 = 300s) is set well above the slowest test observed on 2026-08-23
+# (`terminal_admission::on_disk_manifest_edit_is_picked_up_by_the_next_capture_with_no_rebuild`
+# at 1.118s), so no existing test should ever trip it. If a legitimately slow test does trip it
+# in the future, give that ONE test its own `[[profile.default.overrides]]` entry (see below) —
+# do not weaken this global bound.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The deliberately-wedging fixture test (`crates/engine-core/tests/it/gate_timeout_fixture.rs`)
+# gets its own short bound so `scripts/test_nextest_terminates_a_hang.sh` doesn't have to wait
+# out the global 300s bound just to observe the TIMEOUT verdict. This test is `#[ignore]`d and
+# only ever runs via `--run-ignored only -E 'test(deliberately_wedges)'`, so this override never
+# affects a normal gate run.
+[[profile.default.overrides]]
+filter = 'test(deliberately_wedges)'
+slow-timeout = { period = "5s", terminate-after = 1 }
