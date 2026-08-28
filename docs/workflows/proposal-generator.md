@@ -39,7 +39,7 @@ ProposalCompanyResearchNode -> OpportunityIdentifierNode -> ProposalWriterNode
 ```
 
 Nine nodes: the original seven plus a `{guard, increment}` pair (`EN.5.E` task 4) built from
-`crate::loop_combinator::build_loop` (see [architecture.md](architecture.md#core-types)).
+`crate::loop_combinator::build_loop` (see [architecture.md](../architecture.md#core-types)).
 `ProposalReviewRouterNode` is a deterministic `Router` that reads `ProposalReviewNode`'s stored
 verdict off `ctx.nodes` and routes to whichever branch matches — a `Router::route` takes
 `&TaskContext` and cannot mutate it, so policy resolution and telemetry live in the model nodes
@@ -217,7 +217,7 @@ for the reader/precedence mechanics, identical here).
 
 `PersistToBrainNode` (`persist_to_brain.rs`) is where this workflow crosses THE BOUNDARY TEST
 (`CLAUDE.md`) — see
-[`planning/decisions/D9-engine-brain-boundary.md`](../planning/decisions/D9-engine-brain-boundary.md)
+[`planning/decisions/D9-engine-brain-boundary.md`](../../planning/decisions/D9-engine-brain-boundary.md)
 for the full record. It builds
 
 ```json
@@ -242,7 +242,7 @@ live network call happens in tests) to POST the payload. Non-2xx responses surfa
 placeholder. The URL/`X-API-Key` header are resolved from `crate::nodes::brain_client::BrainConfig`
 (`BrainConfig::from_env`, reading `BRAIN_API_URL`/`BRAIN_API_KEY`) joined with the fixed path
 `/ingest/proposal` — the canonical target is Synapse's `POST /ingest/proposal` (brain block
-`OR.Q`, pinned in [data-contract.md](data-contract.md)), which matches this payload shape exactly
+`OR.Q`, pinned in [data-contract.md](../data-contract.md)), which matches this payload shape exactly
 and returns `200 {artifact_id, chunks_written}`. `ProposalGeneratorPolicy` still carries no
 endpoint knob; `with_url(...)` and `with_config(...)` exist alongside `with_http_post(...)` so
 tests and future callers can override the target without touching env.
@@ -255,7 +255,7 @@ ingest endpoint (embedding the roadmap, writing the `BrainDocument` row, updatin
 ## How to trigger a run
 
 Same HTTP surface as every other `engine-serve` workflow (`docs/cli.md`; see
-[sdlc-flow-workflow.md](sdlc-flow-workflow.md#how-to-trigger-a-run) for the full auth/mounting
+[sdlc-flow-workflow.md](sdlc-flow.md#how-to-trigger-a-run) for the full auth/mounting
 story):
 
 ```
@@ -303,7 +303,7 @@ assembles a policy/telemetry/review_verdict/revised snapshot itself from the dri
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
   only acquires, reasons, and POSTs; see
   [The engine↔brain persist boundary](#the-enginebrain-persist-boundary).
-- **Out of scope for this block**: PDF render — see [`DELIVERABLE_RENDER`](deliverable-render-workflow.md) (`EN.4.D`).
+- **Out of scope for this block**: PDF render — see [`DELIVERABLE_RENDER`](deliverable-render.md) (`EN.4.D`).
 - **Hermetic test coverage**: `crates/engine-core/tests/proposal_generator_e2e.rs` drives the
   full nine-node chain (including the `EN.5.E` loop cluster) through both router branches (`pass`
   and `revise`) against stubbed

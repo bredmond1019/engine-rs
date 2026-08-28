@@ -285,7 +285,7 @@ silently didn't is worse than a run that stops. To turn the behavior off, turn i
 payload is built first and unconditionally, in every harvest mode.
 
 **`EN.7.C`: gate-governed, not unconditional.** `PersistToBrainNode` no longer always pushes.
-It resolves a `crate::nodes::harvest_gate::HarvestGate` (see [harvest-gate.md](harvest-gate.md))
+It resolves a `crate::nodes::harvest_gate::HarvestGate` (see [harvest-gate.md](../harvest-gate.md))
 from `ContentPipelinePolicy.harvest` and branches:
 
 - `off` (**built-in default**) — no POST. Indexing is left to the existing manifest /
@@ -303,7 +303,7 @@ from `ContentPipelinePolicy.harvest` and branches:
 `process` stamps one stable key set in every mode:
 `{"posted", "skipped", "harvest_mode", "status", "artifact_id", "response", "pending"}`, with
 `status`/`response`/`pending` `null` where they do not apply. See
-[harvest-gate.md](harvest-gate.md) for the full mode table, the four-layer resolution, the named
+[harvest-gate.md](../harvest-gate.md) for the full mode table, the four-layer resolution, the named
 profiles (including the new `curated-harvest`, which resolves `in_process`), and the
 `HARVEST_APPROVE` hand-off.
 
@@ -311,7 +311,7 @@ profiles (including the new `curated-harvest`, which resolves `in_process`), and
 placeholder. The URL/`X-API-Key` header are resolved from `crate::nodes::brain_client::BrainConfig`
 (`BrainConfig::from_env`, reading `BRAIN_API_URL`/`BRAIN_API_KEY`) joined with the fixed path
 `/ingest/artifact` — Synapse never served `/ingest/learning`, so this node now targets the real
-`POST /ingest/artifact` route (pinned in [data-contract.md](data-contract.md)) instead of the
+`POST /ingest/artifact` route (pinned in [data-contract.md](../data-contract.md)) instead of the
 former placeholder path. `ContentPipelinePolicy` still carries no endpoint knob; `with_url(...)`
 and `with_config(...)` exist alongside `with_http_post(...)` so tests and future callers can
 override the target without touching env.
@@ -343,19 +343,19 @@ seam (`with_transport`); a transport error is recorded as a `delivered: false` r
 fails the run. `WorkflowTriggerDispatch` prefers an injected in-process `Dispatcher`
 (fire-and-forget via `spawn_blocking`) over its `POST /events/` HTTP fallback (carrying an
 `X-API-Key` header), and `channel_transport_live()` routes `ChannelType::Email` to
-`EmailChannelTransport` (`EN.6.B`, see [email-adapter.md](email-adapter.md)) and every other
+`EmailChannelTransport` (`EN.6.B`, see [email-adapter.md](../email-adapter.md)) and every other
 channel to `UnwiredChannelTransport` (`EN.6.C`/`EN.6.D` — real Slack/Telegram/WhatsApp adapters
 are still open follow-on work). `crates/engine-serve/src/workflows.rs` re-registers `ActionDispatchNode` with
 `channel_transport_live` pointed at the deployment-configured `ENGINE_EVENTS_URL` (default
 `http://localhost:8080/events/`) — `register_research_agent` mirrors this same override for
 `ResearchIngressDispatchNode` (`EN.6.E`), so `RESEARCH_AGENT`'s self-feeding trigger into
 `CONTENT_PIPELINE` reaches the same configured endpoint; see
-[research-agent-workflow.md § Self-feeding dispatch](research-agent-workflow.md#self-feeding-dispatch-researchingressdispatchnode).
+[research-agent-workflow.md § Self-feeding dispatch](research-agent.md#self-feeding-dispatch-researchingressdispatchnode).
 
 ## How to trigger a run
 
 Same HTTP surface as every other `engine-serve` workflow (`docs/cli.md`; see
-[sdlc-flow-workflow.md](sdlc-flow-workflow.md#how-to-trigger-a-run) for the full auth/mounting
+[sdlc-flow-workflow.md](sdlc-flow.md#how-to-trigger-a-run) for the full auth/mounting
 story):
 
 ```
@@ -394,7 +394,7 @@ schema above.
   `translated_markdown`).
 - **`ctx.nodes["PersistToBrainNode"]`** — `{"posted", "skipped", "harvest_mode", "status",
   "artifact_id", "response", "pending"}`, the harvest-gate-governed brain-push result (see
-  [harvest-gate.md](harvest-gate.md)).
+  [harvest-gate.md](../harvest-gate.md)).
 - **`ctx.nodes["ActionDispatchNode"]`** — `{"dispatched": [{envelope_id, channel_type,
   reply_context, body, receipt}]}`, one entry per `OutboundAction` sent (reply digest and/or
   chain trigger), each stamped with the run's `envelope_id`.
@@ -422,7 +422,7 @@ This workflow has no dedicated `content-pipeline-state.json` telemetry writer of
   real implementation.
 - **Out of scope for this block**: real channel adapters for Slack; Telegram/WhatsApp are
   routed through `UnwiredChannelTransport` pending `EN.6.C`/`EN.6.D` (Email now has its own real
-  adapter, `EN.6.B`, see [email-adapter.md](email-adapter.md)), and the real Synapse `OR.Q`
+  adapter, `EN.6.B`, see [email-adapter.md](../email-adapter.md)), and the real Synapse `OR.Q`
   ingest endpoint remains a placeholder URL.
 - **Hermetic test coverage**: `crates/engine-core/tests/content_pipeline_e2e.rs` drives the full
   `Workflow::run` walk loop through every branch (both fetch/normalize converge paths, the

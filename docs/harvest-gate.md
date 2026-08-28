@@ -162,7 +162,7 @@ approved, is never a silent drop.
 `HARVEST_APPROVE` is a single-node, model-free micro-workflow — both start and terminal node, no
 router, no `policy`/`profiles` module, no `harness.json` section — the same pattern
 `OPPORTUNITY_SET_STAGE`/`OPPORTUNITY_ADD_ACTION` use (see
-[opportunity-edit-workflows.md](opportunity-edit-workflows.md)). It is registered by
+[opportunity-edit-workflows.md](workflows/opportunity-edit.md)). It is registered by
 `register_harvest_approve` (`crates/engine-serve/src/workflows.rs`), which
 `register_builtin_workflows` calls alongside every other builtin.
 
@@ -185,13 +185,13 @@ index. Concretely:
 
 ## See also
 
-- [content-pipeline-workflow.md](content-pipeline-workflow.md) — the `CONTENT_PIPELINE` graph
+- [content-pipeline-workflow.md](workflows/content-pipeline.md) — the `CONTENT_PIPELINE` graph
   `PersistToBrainNode` terminates (as of `EN.6.A`, `ActionDispatchNode` runs after it), and the
   `LearningArtifact` payload shape in full.
 - [materialize-doc-node.md](materialize-doc-node.md) — the upstream `MaterializeDocNode` write
   that always happens identically regardless of harvest mode, and the `DocMaterializer` seam
   pattern `HarvestApproveNode`'s model-free, single-node shape mirrors.
-- [opportunity-edit-workflows.md](opportunity-edit-workflows.md) — the micro-workflow pattern
+- [opportunity-edit-workflows.md](workflows/opportunity-edit.md) — the micro-workflow pattern
   (`OPPORTUNITY_SET_STAGE`/`OPPORTUNITY_ADD_ACTION`) `HARVEST_APPROVE` copies: no policy module,
   no profiles module, no `harness.json` section.
 - [architecture.md](architecture.md#injectable-seams) — the `http_post.rs` seam row, now noting

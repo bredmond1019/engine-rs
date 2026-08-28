@@ -28,7 +28,7 @@ two declared graphs), registered from `crates/engine-serve/src/workflows.rs`
 
 `crates/engine-core/src/nodes/doc_materializer.rs`'s `DocMaterializer` trait — the same
 injectable seam `MaterializeDocNode` uses (see
-[materialize-doc-node.md](materialize-doc-node.md)) — gains a second method:
+[materialize-doc-node.md](../materialize-doc-node.md)) — gains a second method:
 
 ```rust
 async fn edit_opportunity(
@@ -83,7 +83,7 @@ OpportunityEditNode::new(op: OpportunityEditOp)   // OpportunityEditOp::SetStage
   `AddOpportunityActionEvent` — the single source of truth for each event's field list).
 - `new(op)` defaults to the live seam (`doc_materializer_live()`), `write = true`, and no explicit
   brain root (resolved at run time via `crate::brain_root::resolve_brain_root()` — see
-  [materialize-doc-node.md § Brain-root resolution](materialize-doc-node.md#brain-root-resolution-engine_brain_root)
+  [materialize-doc-node.md § Brain-root resolution](../materialize-doc-node.md#brain-root-resolution-engine_brain_root)
   for the `ENGINE_BRAIN_ROOT` precedence).
 - A missing or ill-typed `slug` / `stage` / `at` / `kind` / `note` field is a `NodeError` naming
   that field.
@@ -144,7 +144,7 @@ Content-Type: application/json
 ```
 
 Same HTTP surface as every other `engine-serve` workflow (`docs/cli.md`; see
-[sdlc-flow-workflow.md § How to trigger a run](sdlc-flow-workflow.md#how-to-trigger-a-run) for the
+[sdlc-flow-workflow.md § How to trigger a run](sdlc-flow.md#how-to-trigger-a-run) for the
 full auth/mounting story). `crates/engine-serve/src/workflows.rs`'s
 `register_opportunity_set_stage` / `register_opportunity_add_action` are the first
 `register_builtin_workflows` entries whose `WorkflowFactory` resolves no policy and seeds no
@@ -194,5 +194,5 @@ harvest) copies this block's single-node, both-start-and-terminal, no-router sha
 `policy` module, no `profiles` module, no `harness.json` section — `HarvestApproveNode`, like
 `OpportunityEditNode`, calls no model and reads no policy layer, so `register_harvest_approve`
 resolves no policy and seeds no policy stamp, exactly like `register_opportunity_set_stage` /
-`register_opportunity_add_action` above. See [harvest-gate.md](harvest-gate.md) for the full
+`register_opportunity_add_action` above. See [harvest-gate.md](../harvest-gate.md) for the full
 gate and the `HARVEST_APPROVE` hand-off.
