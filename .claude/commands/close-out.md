@@ -116,23 +116,65 @@ if [ "$CURRENT_BRANCH" = "$RESOLVED_BASE" ]; then
   else
     # /sdlc-task in its default in-place mode commits straight onto the current (often base)
     # branch — no merge commit to scope from. It persists its own pre-task HEAD as `base_sha` in
-    # planning/<spec>/sdlc/sdlc-task-state.json for exactly this case. Recover the most recently
-    # updated one for this branch before giving up.
+    # planning/<spec>/sdlc/sdlc-task-state.json for exactly this case.
+    #
+    # Take the EARLIEST base of the current run, not the most recent. An /orchestrate chain runs
+    # several blocks in place on one branch, each writing its own state file whose `base_sha` is
+    # the HEAD it started from — so the newest file's base_sha is the last BLOCK's base, and
+    # scoping to it silently drops every earlier block in the chain from the emoji gate and the
+    # coverage sweep. Measured 2026-08-28: a three-block chain resolved to block 3's base and would
+    # have reviewed one block of three while reporting a clean close-out.
+    #
+    # "Of the current run" is bounded two ways, because the oldest base_sha on disk is often a
+    # months-old spec that would over-scope just as badly:
+    #   - the candidate must still be an ancestor of HEAD (a stale or abandoned base is not), and
+    #   - it must belong to the same run, approximated as within RUN_WINDOW_HOURS of the newest
+    #     candidate's timestamp.
+    # Among what survives, pick the base furthest back — the most commits between it and HEAD.
     TASK_BASE=$(python3 -c "
-import glob, json
-best_sha, best_ts = '', ''
+import glob, json, subprocess
+from datetime import datetime, timedelta
+
+RUN_WINDOW_HOURS = 24
+
+def parse(ts):
+    try:
+        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+def is_ancestor(sha):
+    return subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'HEAD'],
+                          capture_output=True).returncode == 0
+
+def distance(sha):
+    r = subprocess.run(['git', 'rev-list', '--count', sha + '..HEAD'],
+                       capture_output=True, text=True)
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else -1
+
+cands = []
 for f in glob.glob('planning/*/sdlc/sdlc-task-state.json'):
     try:
         d = json.load(open(f))
     except Exception:
         continue
-    if d.get('branch') != '$CURRENT_BRANCH' or not d.get('base_sha'):
+    sha = d.get('base_sha')
+    if d.get('branch') != '$CURRENT_BRANCH' or not sha:
         continue
-    ts = d.get('updated_at') or d.get('started_at') or ''
-    if ts >= best_ts:
-        best_ts, best_sha = ts, d['base_sha']
-print(best_sha)
-")
+    ts = parse(d.get('updated_at') or d.get('started_at') or '')
+    if ts is None or not is_ancestor(sha):
+        continue
+    dist = distance(sha)
+    if dist <= 0:          # base_sha == HEAD, or unreadable: nothing to scope
+        continue
+    cands.append((ts, dist, sha))
+
+print('')
+if cands:
+    newest = max(c[0] for c in cands)
+    window = [c for c in cands if newest - c[0] <= timedelta(hours=RUN_WINDOW_HOURS)]
+    print(max(window, key=lambda c: c[1])[2])
+" | tail -1)
     if [ -n "$TASK_BASE" ] && git rev-parse --verify -q "$TASK_BASE" >/dev/null 2>&1 && [ "$(git rev-parse "$TASK_BASE")" != "$(git rev-parse HEAD)" ]; then
       RANGE="${TASK_BASE}..HEAD"
       echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' with no merge commit — recovered base_sha=$TASK_BASE from an /sdlc-task run's state file: $RANGE"
