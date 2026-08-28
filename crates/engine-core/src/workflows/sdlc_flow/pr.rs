@@ -7,10 +7,17 @@
 //!
 //! Reads `worktree_path` / `branch_name` from `SetupWorktreeNode`'s output
 //! and `auto_pr` / `spec_slug` from the inbound event. When `auto_pr` is
-//! `false` this node is a no-op: it stamps `{pr_url: null, skipped: true}`
-//! and never touches git/gh. Otherwise it runs `git push origin <branch>`
-//! then `gh pr create ...` via the hoisted [`CommandRunner`] seam, surfacing
-//! a non-zero exit as a [`NodeError`].
+//! `false` this node is a no-op: it stamps `{pr_url: null, skipped: true,
+//! branch_name}` and never touches git/gh. Otherwise it runs
+//! `git push origin <branch>` then `gh pr create ...` via the hoisted
+//! [`CommandRunner`] seam, surfacing a non-zero exit as a [`NodeError`].
+//!
+//! Both stamped shapes also publish `branch_name` — the branch this node
+//! pushed (or would have pushed, on the `auto_pr: false` short-circuit) —
+//! so the chain's merge stage (`orchestration/integrate.rs`, EN.11.C) can
+//! resolve which branch to merge without re-deriving it from
+//! `SetupWorktreeNode` itself. This node still deliberately never merges
+//! (human review gate, D25); publishing the branch name is not merging.
 
 use std::path::Path;
 
@@ -37,6 +44,16 @@ fn default_auto_pr() -> bool {
 fn parse_event(ctx: &TaskContext) -> Result<PrEvent, NodeError> {
     serde_json::from_value(ctx.event.clone())
         .map_err(|err| NodeError::new(format!("invalid SDLC_FLOW event: {err}")))
+}
+
+/// The branch name `SetupWorktreeNode` stamped, if it has run — `None` when
+/// it has not (rather than erroring), so the `auto_pr: false` short-circuit
+/// can still stamp an explicit `null` for the chain's merge stage to read.
+fn setup_branch_name(ctx: &TaskContext) -> Option<String> {
+    get_result(ctx, "SetupWorktreeNode")?
+        .get("branch_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// `SetupWorktreeNode`'s stamped `{worktree_path, branch_name, ...}` output.
@@ -90,10 +107,11 @@ impl Node for PullRequestNode {
         let event = parse_event(&ctx)?;
 
         if !event.auto_pr {
+            let branch_name = setup_branch_name(&ctx);
             put_result(
                 &mut ctx,
                 "PullRequestNode",
-                json!({ "pr_url": null, "skipped": true }),
+                json!({ "pr_url": null, "skipped": true, "branch_name": branch_name }),
             );
             return Ok(ctx);
         }
@@ -137,7 +155,7 @@ impl Node for PullRequestNode {
         put_result(
             &mut ctx,
             "PullRequestNode",
-            json!({ "pr_url": pr_url, "skipped": false }),
+            json!({ "pr_url": pr_url, "skipped": false, "branch_name": branch_name }),
         );
 
         Ok(ctx)
@@ -196,7 +214,33 @@ mod tests {
         let result = &out.nodes["PullRequestNode"];
         assert!(result["pr_url"].is_null());
         assert_eq!(result["skipped"], json!(true));
+        assert_eq!(result["branch_name"], json!("sdlc/EN.3.B"));
         assert!(!*called.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn auto_pr_false_stamps_null_branch_name_when_setup_has_not_run() {
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let ctx = TaskContext {
+            event: json!({ "spec_slug": "EN.3.B", "auto_pr": false }),
+            nodes: HashMap::new(),
+            metadata: json!({}),
+            node_runs: HashMap::new(),
+        };
+        let node = PullRequestNode::new().with_runner(runner);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let result = &out.nodes["PullRequestNode"];
+        assert!(result["pr_url"].is_null());
+        assert_eq!(result["skipped"], json!(true));
+        assert!(result["branch_name"].is_null());
     }
 
     #[tokio::test]
@@ -237,11 +281,17 @@ mod tests {
             json!("https://github.com/example/repo/pull/42")
         );
         assert_eq!(result["skipped"], json!(false));
+        assert_eq!(result["branch_name"], json!("sdlc/EN.3.B"));
 
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);
         assert!(recorded[0].starts_with("git push origin sdlc/EN.3.B"));
         assert!(recorded[1].starts_with("gh pr create"));
+
+        // Never-auto-merge contract (D25): no call issues a merge.
+        assert!(!recorded
+            .iter()
+            .any(|c| c.starts_with("gh pr merge") || c.contains("git merge")));
     }
 
     #[tokio::test]
