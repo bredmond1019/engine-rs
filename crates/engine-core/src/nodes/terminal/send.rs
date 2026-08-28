@@ -33,8 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine_contract::TaskContext;
 use serde_json::Value;
-use term_core::driver::TerminalDriver;
-use term_core::lease::SessionLease;
+use term_core::driver::{GuardedSendRequest, GuardedSender, SendError, TerminalDriver};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::node::{InputBinding, Node, NodeError};
@@ -226,31 +225,32 @@ impl Node for TerminalSendNode {
             return Ok(ctx);
         }
 
-        // Verify the lease is still ours BEFORE any send. `renew` is the
-        // read-back-gated primitive: it only succeeds while the option
-        // still shows our nonce, so a foreign or expired lease (stolen, or
-        // never ours) surfaces as `LeaseError` here rather than letting a
-        // stale-lease send reach the driver.
-        let lease = SessionLease::new(self.driver.as_ref());
-        lease
-            .renew(
-                &session_name,
-                &lease_nonce,
-                now_ms() + DEFAULT_LEASE_TTL.as_millis() as u64,
-                &run_id,
-                NODE_NAME,
-            )
+        // Route the send through `GuardedSender`, which renews the lease
+        // (fail-closed: a foreign or expired lease refuses the send before
+        // anything reaches the driver), then consults the operator hold,
+        // then performs the literal+Enter send with the `C-u` line-clear
+        // recovery — all under its own per-session lock.
+        let guarded = GuardedSender::new(self.driver.as_ref());
+        guarded
+            .send_keys(GuardedSendRequest {
+                session_name: &session_name,
+                keys: &command,
+                run_id: &run_id,
+                nonce: &lease_nonce,
+                identity: NODE_NAME,
+                lease_expires_at_ms: now_ms() + DEFAULT_LEASE_TTL.as_millis() as u64,
+                now_ms: now_ms(),
+            })
             .await
-            .map_err(|err| {
-                NodeError::new(format!(
-                    "{NODE_NAME}: send refused — lease is no longer ours: {err}"
-                ))
+            .map_err(|err| match err {
+                SendError::Lease(lease_err) => NodeError::new(format!(
+                    "{NODE_NAME}: send refused — lease is no longer ours: {lease_err}"
+                )),
+                SendError::Hold(hold_err) => NodeError::new(format!(
+                    "{NODE_NAME}: send refused by operator hold: {hold_err}"
+                )),
+                other => NodeError::new(format!("{NODE_NAME}: send_keys failed: {other}")),
             })?;
-
-        self.driver
-            .send_keys(&session_name, &command)
-            .await
-            .map_err(|err| NodeError::new(format!("{NODE_NAME}: send_keys failed: {err}")))?;
 
         // Record acceptance AFTER the send actually happened, so a send
         // that fails mid-way is never marked accepted.
@@ -476,6 +476,53 @@ mod tests {
             "expected an absent/expired lease to refuse the send"
         );
         assert_eq!(send_keys_calls(&driver), 0);
+    }
+
+    #[tokio::test]
+    async fn active_operator_hold_refuses_the_send_with_zero_driver_calls() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let session_name = "eng-run1_TerminalSessionNode";
+        seed_live_lease(&driver, session_name, "nonce-1");
+        driver.set_show_option_result_for(
+            format!("@operator_hold@{session_name}"),
+            StubOutcome::Ok("1".to_string()),
+        );
+        let node = TerminalSendNode::new(driver.clone());
+
+        let ctx =
+            ctx_with_upstream_session("run-1", session_name, "nonce-1", "cargo build", "send-1");
+        let result = node.process(ctx).await;
+
+        let err = result.expect_err("expected an active operator hold to refuse the send");
+        assert!(
+            err.to_string().contains("operator hold"),
+            "expected the error to name the operator hold, got: {err}"
+        );
+        assert_eq!(
+            send_keys_calls(&driver),
+            0,
+            "an active operator hold must issue zero driver send-keys calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_succeeded_enter_failed_triggers_c_u_line_clear_recovery() {
+        let driver = Arc::new(StubTerminalDriver::new());
+        let session_name = "eng-run1_TerminalSessionNode";
+        seed_live_lease(&driver, session_name, "nonce-1");
+        driver.set_send_enter_result(StubOutcome::NoServer);
+        let node = TerminalSendNode::new(driver.clone());
+
+        let ctx =
+            ctx_with_upstream_session("run-1", session_name, "nonce-1", "cargo build", "send-1");
+        let result = node.process(ctx).await;
+
+        assert!(result.is_err(), "expected the Enter failure to surface");
+        let calls = driver.calls();
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "C-u")),
+            "expected the C-u line-clear recovery to have been sent, got: {calls:?}"
+        );
     }
 
     /// Obfuscated bypasses are OUT OF SCOPE for `command_floor` (no
