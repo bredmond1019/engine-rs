@@ -128,10 +128,32 @@ $ARGUMENTS — one of two input modes:
    - **If a file named as modified does not exist**, the record is wrong. Stop and say which file,
      rather than emitting a task against a path that is not there. If a file named as new already
      exists, say so — the block may be re-treading work that landed.
-   - Read only what the named files and their immediate siblings require. Do not load the codebase.
+   - Bound this read to what `files[]` and their immediate siblings require — it is not a licence
+     to load the codebase.
 
    Line numbers move between authoring and execution: name **symbols**, not line numbers, in every
    task you write.
+
+   **Re-verify the record's premises too, not only `files[]`.** A block record's premises live in
+   three places — `files[]`, `acceptance_criteria`, and any design document it cites — and reading
+   only the first lets the other two expire silently between authoring and execution. Before
+   writing any task:
+   - **Re-verify every acceptance criterion against the current tree.** Use this triage test to
+     keep it cheap: a criterion naming a path, symbol, or count that this block does **not itself
+     modify** is the one nothing else forces anyone to read — check those against the tree now. A
+     criterion about the code the block is already changing gets re-read anyway by the `files[]`
+     pass above, so it needs no separate check. Concrete instance: a criterion demanding
+     `rg OperatorTransport crates/engine-core` stay empty was authored true and became false the
+     same day when a sibling block in the same lane deliberately put that trait there — a
+     files[]-scoped read could never reach it, because the criterion named a path this block does
+     not touch.
+   - **Re-read any design document the record cites** in `related` or names in `what`/`why`. Why:
+     the next block's author reads the cited design doc, not another block's amendment log — a
+     correction recorded only in a sibling block's amendment log reaches nobody who reads the doc
+     instead.
+   - **On a mismatch, amend the record and say so (D18) — never silently reword the criterion, and
+     never delete merged sibling work to satisfy a stale one.** A criterion that now contradicts
+     landed work is evidence the record is stale, not evidence the landed work is wrong.
 
 6. THINK HARD about correct scope:
    - Do not invent work beyond what the block defines.

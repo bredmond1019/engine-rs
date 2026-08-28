@@ -127,14 +127,16 @@ none.
 
 `--isolation auto` resolves as:
 
-**`--worktree` is currently suspended fleet-wide** (`D81-worktree-moratorium`) — the engines refuse
-the flag outright. The table records the D81 answer.
+`--worktree` was suspended fleet-wide from 2026-08-23 to 2026-08-28 (`D81-worktree-moratorium`);
+it was lifted after `BT.ticket.worktree-smoke-fixture` verified a real `--worktree` run end to end.
+The table below records the current isolation recommendation per repo, D81 history noted where it
+still bears on the *why*:
 
 | Repo | Isolation | Why |
 |---|---|---|
-| `base-template` | **`--no-worktree`** (D81) | D81 refuted the old reason with a mechanism: the Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
+| `base-template` | **`--no-worktree`** (default) | The Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
 | the brain root (HQ) | **`--no-worktree`, always** | `validate-brain` inside a worktree resolves the gitignored sub-repos against the worktree's own `brain.toml` and they are absent from any checkout. Measured: 64 structure / 601 state errors versus 0/0 in the main tree. Worktree creation is clean — it is the corpus gates that cannot pass. |
-| anything else | `--no-worktree` | Cheaper. Use `--worktree` when a change deserves quarantine — subject to the D81 suspension above; the engines refuse it fleet-wide until D81 is lifted. |
+| anything else | `--no-worktree` | Cheaper. Use `--worktree` when a change deserves quarantine — available again fleet-wide since the D81 lift. |
 
 An explicit `--isolation` that contradicts either of the first two rows → **stop and report.** Do
 not run a chain whose gates cannot pass.
@@ -145,8 +147,8 @@ a measurement ("64 structure / 601 state errors versus 0/0 in the main tree") th
 moment the corpus or the worktree machinery changes. The same applies to any carryover caveat this
 lane inherits from a prior run or a sibling lane's notes file. Before treating either as fact:
 re-derive it — the HQ row from a fresh `bastion validate-brain --structure` / `--state` inside a
-real worktree, `base-template`'s from D81 itself, and any carried-forward caveat from whatever the
-carryover names — and record the result. An orchestration
+real worktree, `base-template`'s from the launch-time-snapshot argument it rests on, and any
+carried-forward caveat from whatever the carryover names — and record the result. An orchestration
 run inherited at least one caveat that had since changed and planned a block on it — this is the
 same failure class `/generate-roadmap`'s Step 2 exists to close ("Inventory, and re-verify before you
 plan on it"); this step is its equivalent for isolation decisions and carryovers.

@@ -174,7 +174,7 @@ given while having resolved the *physical* one:
 ```
 error [E_LINK_DEAD_MARKDOWN] learn-ai/planning/decisions/D12-....md
   — dead markdown link: '../../docs/voice.md' does not exist
-    (resolved: '/Users/brandon/.../learn-ai/planning/decisions/../../docs/voice.md')
+    (resolved: '<home>/.../learn-ai/planning/decisions/../../docs/voice.md')
 ```
 
 Collapse that printed path by hand and it reads `learn-ai/docs/voice.md`, which **does** exist — so

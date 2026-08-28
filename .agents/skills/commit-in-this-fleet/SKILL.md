@@ -37,7 +37,7 @@ Not style — these stage the **whole index**, which includes any other session'
 shared vault. This has happened repeatedly and is recorded as a fleet trap
 (`bastion-web:emit-state-rewrites-sibling-repos`): one lane's `emit-state` run modified
 `core/_planning/bastion/state.json`, `core/_planning/engine-rs/state.json`, `README.md` and
-`client/_planning/brazilianportugui/status.md`, *several carrying other sessions' uncommitted work* —
+`client/_planning/<client-repo>/status.md`, *several carrying other sessions' uncommitted work* —
 a new block, a dependency-edge removal, hand-written focus prose. A bare `git add -A` after that
 sweeps all of it into your commit.
 

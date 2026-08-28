@@ -90,6 +90,10 @@
         }
       }
     },
+    "postEmitCommitCommand": {
+      "type": "string",
+      "description": "OPTIONAL. A shell command the bookkeep stage runs immediately after `mev emit-state --write` succeeds, in an in-place (non-worktree) run only. No default value ships, and the scaffold stub does not carry this key — its absence means the engines behave exactly as before this field existed: no post-emit command runs. When present, the engine invokes this command as-is and surfaces a non-zero exit as a reported failure rather than swallowing it; it never runs in worktree mode, where the preceding emit-state step itself does not run. This key carries no assumption about what the command does or where it lives — that is project policy, not engine mechanism."
+    },
     "flow": {
       "type": "object",
       "additionalProperties": false,

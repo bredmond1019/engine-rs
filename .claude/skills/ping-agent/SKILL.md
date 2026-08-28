@@ -53,6 +53,24 @@ satisfies it — that is the exact defect this field exists to catch.
 <lock_dir>/queue/<repo>/<lane>/inbox/<ts>-<uuid>.json
 ```
 
+`<ts>` is an ISO-8601 **basic-form** UTC timestamp — `YYYYMMDDThhmmssZ`, no dashes, no colons — for
+example `20260827T143011Z`. Mint it with:
+
+```
+date -u +%Y%m%dT%H%M%SZ
+```
+
+Stripping the colons out of an extended-form stamp (`2026-08-27T14:30:11Z`) is **not** sufficient —
+the dashes remain, and `scripts/check_messages.py`'s `FILENAME_RE` still rejects the result. Use the
+`date` incantation above, not a string transform on an existing timestamp. `<uuid>` must equal the
+record's `message_id` (already stated by the checker's module docstring); `FILENAME_RE` in
+`scripts/check_messages.py` is the authority for the exact shape.
+
+**Validate before treating a message as sent**: after writing an envelope into a peer's inbox, run
+`python3 base-template/scripts/check_messages.py` from the brain root and confirm 0 own-repo gating
+failures. This catches the filename shape above and every other envelope field in one command — a
+hand-rolled sender guessing at any of them is the same defect.
+
 **EDGE_RELEASED** — a dependency edge cleared on the sender's side and a waiting lane may be idling
 on it, unsignalled:
 

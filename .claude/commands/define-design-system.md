@@ -54,7 +54,7 @@ standard so later work can be reviewed.
    > retrofitted later. The newer frontends are the reference.
 
    The practice's web standard, verified 2026-08-19 in `business/bastiel` and
-   `client/jardins-fitness` — the two most recent frontends, and the two built the way the operator
+   `client/<client-frontend>` — the two most recent frontends, and the two built the way the operator
    intends. Adopt this; depart only with a stated reason:
 
    | Piece | Standard | Notes |
@@ -89,7 +89,7 @@ standard so later work can be reviewed.
 
    Note what shadcn does **not** give you: it installs primitives, not a design system. The tokens
    in step 4 and the inventory in step 5 are still yours to decide — and `bastiel` and
-   `jardins-fitness` each ship only one or two `ui/` components today, which is the correct starting
+   the client frontend each ship only one or two `ui/` components today, which is the correct starting
    size, not an oversight.
 
    For **mobile** the equivalent is Flutter `ThemeData` + Material 3, which `bastion-ui` uses. For

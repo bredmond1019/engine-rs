@@ -147,6 +147,82 @@ resolved absolute path from the second line).
   return result
 }
 
+// BT.ticket.worktree-setup-can-adopt-the-brain-root-as-repo-root — resolve repoRoot ONCE, here in
+// the engine, and hand it to every later prompt as a GIVEN literal instead of asking the setup agent
+// to derive-and-substitute a repoRoot placeholder token itself. That hand-substitution was the measured
+// mechanism of a real misbinding: an agent read the correct root on command 1, then voluntarily cd'd
+// to the brain root and re-derived REPO_ROOT there — nothing instructed it to, but nothing forbade it
+// either. Removing the agent's discretion (one fixed command, no substitution to perform) removes the
+// class, not just the one observed instance.
+// Same shape as detectPlanningVault() immediately above, for the same reason: the Workflow runtime
+// has no fs/process/require and `import` declarations don't even parse, so this shells out via a
+// cheap Haiku agent turn instead of resolving the path in-process. Returns null on failure (unlike
+// detectPlanningVault's safe fallback) — a wrong repoRoot silently accepted here is exactly the
+// defect this ticket exists to remove, so the caller must abort rather than guess.
+const RESOLVE_REPO_ROOT_SCHEMA = {
+  type: 'object',
+  required: ['repoRoot', 'gitCommonDir', 'tierPrefix', 'brainTomlAtRoot'],
+  properties: {
+    repoRoot:        { type: 'string', description: 'Absolute repo root from the REPO_ROOT: line' },
+    gitCommonDir:    { type: 'string', description: 'Absolute --git-common-dir from the GIT_COMMON_DIR: line' },
+    tierPrefix:      { type: 'string', description: 'The invoking directory\'s path relative to repoRoot, with a trailing slash (e.g. "business/"), or "" at the repo root, from the TIER_PREFIX: line' },
+    brainTomlAtRoot: { type: 'boolean', description: 'true iff the BRAIN_TOML: line reads "yes" — a brain.toml exists at repoRoot' }
+  }
+}
+async function resolveRepoRoot() {
+  const result = await agent(`
+Resolve this repo's root and related mechanical facts ONCE, before anything else runs.
+Run exactly this ONE Bash call, from the invoking directory — do not cd anywhere first, do not
+substitute or re-derive any value, and do not run any other command:
+  REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && echo "REPO_ROOT:$REPO_ROOT" && echo "GIT_COMMON_DIR:$(${GIT} rev-parse --path-format=absolute --git-common-dir)" && echo "TIER_PREFIX:$(python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')")" && { [ -f "$REPO_ROOT/brain.toml" ] && echo "BRAIN_TOML:yes" || echo "BRAIN_TOML:no"; }
+Four labelled lines come back — REPO_ROOT:, GIT_COMMON_DIR:, TIER_PREFIX:, BRAIN_TOML: (yes/no).
+Return via StructuredOutput: repoRoot (the REPO_ROOT: value), gitCommonDir (the GIT_COMMON_DIR:
+value), tierPrefix (the TIER_PREFIX: value, "" when invoking at the repo root), brainTomlAtRoot
+(true iff BRAIN_TOML: is yes).
+`, { label: 'resolve-repo-root', schema: RESOLVE_REPO_ROOT_SCHEMA, model: 'haiku' })
+  return result || null
+}
+
+// BINDING / BRAIN-ROOT / POPULATION checks (BT.ticket.worktree-setup-can-adopt-the-brain-root-as-repo-root,
+// task 4) — run immediately after the setup agent returns (after its setupError handling) and BEFORE the
+// enumerate/per-task stages, so a misbound or unpopulated checkout is caught before any task's implement
+// stage touches it. Same shape as verifyVaultCommit() above: the agent runs ONE fixed script and transcribes
+// its already-labelled output; the abort DECISION is made HERE IN JS, never left to the model's own
+// reasoning over labelled lines — verifyVaultCommit's comment above documents a cheap model reliably
+// skipping the else branch of multi-branch conditional prose, measured live. Neither this function nor its
+// callers know what a "brain root" IS in any project-specific sense: the BRAIN-ROOT GUARD below compares two
+// mechanical facts (brain.toml presence at two paths, both ordinary filesystem facts), never a
+// harness-check count and never a hardcoded path (see out_of_scope on the ticket).
+const SETUP_GUARD_SCHEMA = {
+  type: 'object',
+  required: ['gitCommonDir', 'brainTomlAtRun'],
+  properties: {
+    gitCommonDir:   { type: 'string', description: 'Absolute --git-common-dir from the GIT_COMMON_DIR: line' },
+    brainTomlAtRun: { type: 'boolean', description: 'true iff the BRAIN_TOML_AT_RUN: line reads "yes"' },
+    missingCount:   { type: 'integer', description: 'Worktree mode only: the MISSING_COUNT: integer (0 when the script was not asked to check population)' },
+    missingSample:  { type: 'array', items: { type: 'string' }, description: 'Worktree mode only: up to 5 example missing paths, split from the MISSING_SAMPLE: line on "|" with empty entries dropped' },
+    notes:          { type: 'string' }
+  }
+}
+async function verifySetupBinding(worktreePath, useWorktreeMode) {
+  // Population check only runs in worktree mode — a branch-mode run has no separate checkout to
+  // under-populate (worktreePath === repoRoot, already fully checked out).
+  const populationCmd = useWorktreeMode
+    ? ` && MISSING=$(${GIT} -C ${worktreePath} ls-files | while read -r p; do [ -e "${worktreePath}/$p" ] || echo "$p"; done); echo "MISSING_COUNT:$(printf '%s\\n' "$MISSING" | grep -c . || true)" && echo "MISSING_SAMPLE:$(printf '%s\\n' "$MISSING" | head -5 | tr '\\n' '|')"`
+    : ''
+  const script = `${GIT} -C ${worktreePath} rev-parse --path-format=absolute --git-common-dir | sed 's/^/GIT_COMMON_DIR:/' && { [ -f "${worktreePath}/brain.toml" ] && echo "BRAIN_TOML_AT_RUN:yes" || echo "BRAIN_TOML_AT_RUN:no"; }${populationCmd}`
+  const result = await agent(`
+Run this exact script from ${worktreePath} with Bash, verbatim, and transcribe its labelled output —
+do not reason about binding, brain roots, or population yourself, the script already produced the facts:
+\`\`\`
+${script}
+\`\`\`
+Return via StructuredOutput: gitCommonDir (the GIT_COMMON_DIR: value), brainTomlAtRun (true iff
+BRAIN_TOML_AT_RUN: is yes)${useWorktreeMode ? ', missingCount (the MISSING_COUNT: integer), missingSample (the MISSING_SAMPLE: value split on "|", empty entries dropped)' : ', missingCount (0), missingSample ([])'}.
+`, { label: 'verify-setup-binding', schema: SETUP_GUARD_SCHEMA, model: 'haiku' })
+  return result || null
+}
+
 // Vault-aware task commits (extends D46): the per-task implement/fix stage and the docs stage below
 // are instructed to stage + commit any planning/ paths they wrote THROUGH the vault repo (git -C
 // <vault.planningPath>), reusing detectPlanningVault's real path exactly like the wrap-up recipe
@@ -269,10 +345,6 @@ const resumeMode    = hasFlag('--resume')
 // planning/ symlink intact — worktrees break it). --worktree opts back into the isolated sparse-checkout
 // worktree (needed for true isolation).
 const useWorktree   = hasFlag('--worktree')
-if (useWorktree) {
-  log(`ERROR: --worktree is suspended fleet-wide (D81). Run on a plain branch instead -- drop the --worktree flag and re-invoke. See docs/decisions/D81-worktree-moratorium.md.`)
-  return { error: 'worktree moratorium (D81)', blockId }
-}
 
 const VALID_TEST_DEPTHS = ['fast', 'full']
 const testDepthFlag = flagStr('--test-depth')
@@ -495,6 +567,8 @@ const WRAPUP_SCHEMA = {
     stateWriteValidated: { type: 'boolean', description: 'true if mev validate-brain --state gated the state.json mutation (before/after diff, net-new only); false when mev was not on PATH and the write landed with only json.load-level parsing (a degrade, not a pass)' },
     stateWriteRejected: { type: 'boolean', description: 'true if the state.json mutation introduced net-new schema errors and was rolled back byte-exact; the block was NOT flipped to closed this run' },
     emitStateRan:  { type: 'boolean', description: 'true if `mev emit-state --write` regenerated derived surfaces on the branch itself during this in-place (non-worktree) wrap-up; false when skipped (worktree mode, or mev/brain.toml absent)' },
+    postEmitHookRan:    { type: 'boolean', description: 'true if planning/harness.json\'s postEmitCommitCommand was configured AND invoked this run (in-place only, and only when emitStateRan is true); false when absent, or skipped (worktree mode / emit-state did not run)' },
+    postEmitHookFailed: { type: 'boolean', description: 'true if the configured postEmitCommitCommand was invoked and exited non-zero; false otherwise' },
     stateWritten:  { type: 'boolean', description: 'true if the agent ALSO persisted sdlc-flow-state.json + worklog.md this same turn (the wrap-up-phase state-write fold); false/omitted when it did not (write not attempted/completed)' },
     notes:         { type: 'string' }
   }
@@ -667,6 +741,7 @@ const HARNESS_CONFIG_SCHEMA = {
       description: 'The parsed harness.json (omit when present is false)',
       properties: {
         stack: { type: 'string' },
+        postEmitCommitCommand: { type: 'string', description: 'OPTIONAL. Shell command the wrap-up stage runs after `mev emit-state --write` succeeds, in-place only. Absent means no post-emit command runs.' },
         validation: {
           type: 'object',
           properties: {
@@ -733,7 +808,8 @@ STEP 2 — Decide:
   - "__HARNESS_ABSENT__" (file missing) → present=false, omit config.
   - File printed but NOT valid JSON → present=false, notes="harness.json present but invalid JSON: <reason>".
   - File printed and valid JSON → present=true, and copy the parsed object into "config", keeping ONLY
-    these fields when present: stack; validation.checks[] (each: {kind, name, command, purpose, gates,
+    these fields when present: stack; postEmitCommitCommand (string, verbatim, do not interpret it);
+    validation.checks[] (each: {kind, name, command, purpose, gates,
     perTask, fastCommand} plus any kind-specific fields present — baselineCommand, reasonCommand,
     compareKeys[], countPattern, failOn, warningPatterns[], rules[] ({id, pattern, paths,
     allowlistPattern})); flow ({autoMerge, testDepth, prBase, bailReasons[]}). Preserve kind-specific
@@ -1070,9 +1146,21 @@ set to the updated_at value you used.
 phase('Setup')
 log(`Setting up the ${useWorktree ? 'shared worktree' : 'branch'} for ${blockId}${resumeMode ? ' (resume — reuse existing if present)' : ''}...`)
 
-// The working directory the STEP 6 reads run from once the branch/worktree is live. [placeholders]
-// are filled by the agent with the resolved values.
-const setupWorkdir = useWorktree ? 'trees/[branchName]' : '[repoRoot]'
+// Resolve repoRoot ONCE, in the engine, before the setup agent ever runs — see resolveRepoRoot()
+// above for why this exists. Everything downstream gets repoRoot as a literal; only [branchName]
+// remains an agent-filled placeholder (it is genuinely chosen inside STEP 2 below and cannot be
+// pre-computed here).
+const repoRootResult = await resolveRepoRoot()
+if (!repoRootResult) {
+  log('resolveRepoRoot agent returned null — aborting pipeline before any branch/worktree work')
+  return { error: 'resolveRepoRoot failed', blockId }
+}
+const { repoRoot, gitCommonDir, tierPrefix: invocationTierPrefix, brainTomlAtRoot } = repoRootResult
+log(`Resolved repoRoot: ${repoRoot} (git-common-dir: ${gitCommonDir})`)
+
+// The working directory the STEP 6 reads run from once the branch/worktree is live. repoRoot is now
+// a literal, engine-resolved value; [branchName] is the only remaining agent-filled placeholder.
+const setupWorkdir = useWorktree ? `${repoRoot}/trees/[branchName]` : repoRoot
 
 const worktreeRecipe = `${resumeMode ? `
 RESUME MODE IS ON — reuse the existing worktree for this spec instead of creating a fresh one.
@@ -1109,7 +1197,8 @@ STEP 2 — Find a free worktree name. FIRST check the exact base candidate "${ba
   "${baseBranchName}-3", … up to "-10" (an unrelated name collision, not a prior attempt on this
   spec — bumping past those is fine). Store the chosen name as branchName.
 
-STEP 3 — Create the worktree (replace [branchName] / [repoRoot] with actual values):
+STEP 3 — Create the worktree (repoRoot is GIVEN as ${repoRoot} — use it verbatim; replace ONLY
+  [branchName] with the value you chose in STEP 2):
   a. mkdir -p trees
   b. ${GIT} worktree add --no-checkout trees/[branchName] -b [branchName]
   c. ${GIT} -C trees/[branchName] sparse-checkout init --cone
@@ -1117,7 +1206,7 @@ STEP 3 — Create the worktree (replace [branchName] / [repoRoot] with actual va
      ${GIT} -C trees/[branchName] sparse-checkout set $(${GIT} ls-tree HEAD --name-only -d | tr '\\n' ' ')
   e. ${GIT} -C trees/[branchName] checkout
   f. Discover and copy EVERY gitignored env-shaped file (.env, .env.local, .env.* in any
-     directory) from repoRoot into trees/[branchName], preserving each file's path relative to
+     directory) from ${repoRoot} into trees/[branchName], preserving each file's path relative to
      the repo root (creating parent directories as needed — so app/.env lands at
      trees/[branchName]/app/.env). Only files git actually ignores; exclude node_modules/,
      .venv/, venv/, trees/, and vendor/; never overwrite a file that already exists in the
@@ -1153,7 +1242,7 @@ STEP 4 — Verify:
   Confirm it contains the tracked top-level directories — at minimum planning/ (real dir or the fixed
   symlink) and .claude/. Confirm planning/ resolves: ls trees/[branchName]/planning/ >/dev/null 2>&1 && echo "PLANNING_OK".
 
-STEP 5 — Compute worktreePath = repoRoot + "/trees/" + branchName`
+STEP 5 — worktreePath = "${repoRoot}/trees/" + branchName  (repoRoot is GIVEN — do not recompute it)`
 
 const branchRecipe = `${resumeMode ? `
 RESUME MODE IS ON — reuse the existing branch for this spec instead of creating a fresh one.
@@ -1194,7 +1283,7 @@ STEP 4 — Verify:
   Run: ${GIT} branch --show-current      (must print [branchName])
   Run: ls planning/ .claude/ >/dev/null 2>&1 && echo "TREE_OK" || echo "TREE_MISSING"
 
-STEP 5 — worktreePath = repoRoot  (branch mode runs in the main working tree — there is no separate worktree dir)`
+STEP 5 — worktreePath = "${repoRoot}"  (GIVEN — branch mode runs in the main working tree, so there is no separate worktree dir; do not recompute repoRoot)`
 
 const setupResult = await tracedAgent(`
 You are the setup agent. ${useWorktree
@@ -1208,14 +1297,15 @@ Target:
   Legacy spec file:  ${specFile} (fallback — only used when the block record is absent)
   Base name:  ${baseBranchName}
 
-STEP 1 — Get the absolute repo root:
-  Run: ${GIT} rev-parse --show-toplevel
-  Store the trimmed output as repoRoot.
-  Run this too — it must reflect where /sdlc-flow was actually invoked from (e.g. a sub-brain tier
-  like business/), not worktreePath, which may differ:
-    REPO_ROOT=$(${GIT} rev-parse --show-toplevel) && python3 -c "import os; r=os.path.relpath(os.getcwd(), '$REPO_ROOT'); print('' if r=='.' else r+'/')"
-       (store trimmed stdout as candidateTierPrefix — "" when invoking at the git root, otherwise
-       the invoking directory's path relative to repoRoot with a trailing slash, e.g. "business/")
+STEP 1 — repoRoot is GIVEN, not derived. The engine already resolved it before you were invoked:
+  repoRoot = ${repoRoot}
+  candidateTierPrefix = "${invocationTierPrefix}" (the invoking directory's path relative to
+    repoRoot, with a trailing slash, e.g. "business/", or "" when /sdlc-flow was invoked at the
+    repo root — it reflects where /sdlc-flow was actually invoked from, not worktreePath, which
+    may differ)
+  Use both values VERBATIM everywhere below. Do NOT re-derive repoRoot with \`${GIT} rev-parse
+  --show-toplevel\` or any other command, and do NOT cd outside repoRoot at any point in this
+  recipe — re-deriving it is exactly the failure this step exists to prevent.
 ${useWorktree ? worktreeRecipe : branchRecipe}
 
 STEP 6 — Report pipeline-start inputs (run these from the live checkout):
@@ -1273,6 +1363,33 @@ const { branchName, worktreePath } = setupResult
 state.branch = branchName
 state.worktree_path = worktreePath
 log(`${useWorktree ? 'Worktree' : 'Branch'} ready: ${worktreePath} (branch: ${branchName})`)
+
+// BINDING / BRAIN-ROOT / POPULATION GUARDS — run before any task work, before even the
+// enumerate stage. See verifySetupBinding() above for why the decision is made here in JS.
+const bindingCheck = await verifySetupBinding(worktreePath, useWorktree)
+if (!bindingCheck) {
+  log('verifySetupBinding agent returned null — aborting pipeline before any task runs')
+  return { error: 'Setup binding guard failed', reason: 'verification agent returned null', blockId }
+}
+if (!bindingCheck.gitCommonDir.startsWith(repoRoot)) {
+  log(`BINDING GUARD FAILED: run directory's git-common-dir (${bindingCheck.gitCommonDir}) does not resolve under the engine-resolved repoRoot (${repoRoot}) — aborting before any task runs`)
+  return { error: 'Setup binding guard failed', reason: `git-common-dir ${bindingCheck.gitCommonDir} does not resolve under repoRoot ${repoRoot}`, blockId }
+}
+log(`BINDING GUARD passed: git-common-dir (${bindingCheck.gitCommonDir}) resolves under repoRoot (${repoRoot})`)
+if (bindingCheck.brainTomlAtRun && !brainTomlAtRoot) {
+  log(`BRAIN-ROOT GUARD FAILED: run root (${worktreePath}) holds a brain.toml but the engine-resolved invocation root (${repoRoot}) did not — this run has adopted the brain root as its repo root — aborting before any task runs`)
+  return { error: 'Setup binding guard failed', reason: `brain.toml present at run root ${worktreePath} but absent at invocation root ${repoRoot}`, blockId }
+}
+log('BRAIN-ROOT GUARD passed: run root brain.toml presence matches the invocation root')
+if (useWorktree) {
+  const missingCount = bindingCheck.missingCount || 0
+  if (missingCount > 0) {
+    log(`POPULATION GUARD FAILED: ${missingCount} tracked path(s) missing on disk in worktree ${worktreePath} — examples: ${(bindingCheck.missingSample || []).join(', ') || '(none reported)'} — aborting before any task runs`)
+    return { error: 'Setup binding guard failed', reason: `${missingCount} tracked paths missing from worktree ${worktreePath}`, blockId }
+  }
+  log('POPULATION GUARD passed: every tracked path in the worktree index is present on disk')
+}
+
 if (useWorktree) {
   const envFilesCopied = setupResult.envFilesCopied || []
   log(envFilesCopied.length
@@ -1524,6 +1641,14 @@ const harnessCfg = await loadHarnessConfig(worktreePath)
 log(harnessCfg
   ? `Harness config: ${(harnessCfg.validation?.checks || []).length} check(s); flow.${JSON.stringify(harnessCfg.flow || {})}`
   : 'No planning/harness.json — validation falls back to the spec.')
+
+// BT.ticket.bookkeep-leaves-derived-output-uncommitted (task 4): OPTIONAL post-emit commit hook,
+// project policy only (mechanism: run it if configured; never a default, never a fact about where
+// any project's scripts live). String, not boolean — a missing/blank key means "no hook". Manual-
+// replication guide for this hook: .agents/skills/sdlc-flow/SKILL.md, Docs & Wrap-up step.
+const postEmitCommitCommand = typeof harnessCfg?.postEmitCommitCommand === 'string' && harnessCfg.postEmitCommitCommand.trim()
+  ? harnessCfg.postEmitCommitCommand
+  : ''
 
 // Resolve flow policy: CLI flag overrides harness.json overrides built-in default.
 const flowCfg = harnessCfg?.flow || {}
@@ -2639,6 +2764,20 @@ print('FLIPPED:' + bid)
       ? `- Do NOT run \`mev emit-state --write\` here: this is a linked git worktree, where emit-state refuses to run. The authored edits are committed on the branch below (step 5); the derived surfaces regenerate on the base branch when this branch merges (/clean-worktree or /close-out --merge-branch run emit-state after integration). Set emitStateRan=false.`
       : `- This run is IN PLACE on branch ${branchName} (in the main repo tree, not an isolated worktree) — emit-state is safe to run right here on the branch, the same way \`git commit\` already lands right here: cd ${worktreePath} && mev emit-state --write . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation. (This is separate from the --auto-merge path's own emit-state call in step 5 below, which re-derives again on ${prBase} after the PR merges — that call is unaffected and still runs unconditionally there.)`}
 
+2d. OPTIONAL post-emit commit hook. ${postEmitCommitCommand
+      ? `planning/harness.json declares postEmitCommitCommand — run it ONLY when step 2c set emitStateRan=true
+    (i.e. never in worktree mode, and never when emit-state itself was skipped). This mechanism does not
+    know or care what the command does — it is project policy, not engine fact:
+      cd ${worktreePath} && ${postEmitCommitCommand}
+    Check the real exit code (not a piped one — see the pipe-exit-code trap). Exit 0 → postEmitHookRan=true,
+    postEmitHookFailed=false. Non-zero → postEmitHookRan=true, postEmitHookFailed=true, and copy the
+    command's stderr/stdout tail verbatim into notes — this MUST be reported, never swallowed. Do not
+    retry it and do not attempt to "fix" or roll anything back yourself; the command owns its own
+    transaction, so a failure here means step 5 below (this stage's own commit) still runs as normal —
+    this hook is independent of it.`
+      : `planning/harness.json defines no postEmitCommitCommand — skip this step entirely. Set
+    postEmitHookRan=false and postEmitHookFailed=false. This is the default, unchanged behaviour.`}
+
 3. Prepend a new log.md entry (newest first):
    ## [run: date +%Y-%m-%d]
    [One paragraph: what was implemented across tasks ${taskList.join(', ')}, the ${finalVerdict} verdict${bailed ? ` and why it bailed (${bailReason})` : ''}, notable decisions. End with "Next: ...".]
@@ -2692,6 +2831,7 @@ ${renderWrapupStateWriteRecipe(wrapupStatePayload)}
 Return via StructuredOutput: statusUpdated, devlogUpdated, nextFocus, amendments[], commitHash,
 blockStatusFlipped (the state.json block id closed in step 2b, or "" — including when the write was
 rejected by validation), stateWriteValidated, stateWriteRejected (step 2b), emitStateRan (step 2c),
+postEmitHookRan, postEmitHookFailed (step 2d),
 stateWritten (true only if you performed the additional state write above), notes.
 `, withModel({ label: 'wrap-up', schema: WRAPUP_SCHEMA, phase: 'Wrap-up' }, MODEL.wrapup))
 
@@ -2702,6 +2842,11 @@ if (wrapupResult?.stateWriteRejected) {
 }
 if (wrapupResult?.amendments?.length) log(`Spec amendments (D18): ${wrapupResult.amendments.length} line(s) appended.`)
 log(`Derived surfaces (in-place, this wrap-up): ${wrapupResult?.emitStateRan ? 'regenerated (mev emit-state --write).' : useWorktree ? 'skipped — worktree mode; focus.next stays stale until regenerated on merge.' : 'skipped (mev/brain.toml absent).'}`)
+if (wrapupResult?.postEmitHookRan) {
+  log(wrapupResult?.postEmitHookFailed
+    ? `postEmitCommitCommand FAILED (planning/harness.json) — reported, not swallowed. ${wrapupResult?.notes || ''}`
+    : `postEmitCommitCommand ran (planning/harness.json).`)
+}
 
 // Final state write (status reflects the terminal state; PR fields filled after creation).
 // state.status was already set by buildWrapupStatePayload() above, before the agent call, so the

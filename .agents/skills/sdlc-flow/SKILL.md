@@ -17,10 +17,14 @@ description: >
    Default: a plain branch (<spec>-flow) checked out IN THE MAIN WORKING TREE. No
    sparse-checkout worktree, so a relative planning/ symlink (brain-vaulted repos)
    stays intact. main is left on the branch until the PR merges.
-   --worktree: SUSPENDED FLEET-WIDE (D81, 2026-08-23). The engine refuses the flag
-   unconditionally and exits before any setup — no override, no environment escape hatch.
-   Run on a plain branch instead. The sparse-checkout worktree machinery survives
-   intact for when D81 lifts.
+   --worktree: creates an isolated sparse-checkout worktree under trees/<spec>-flow/ for
+   true isolation. Was suspended fleet-wide 2026-08-23 to 2026-08-28 (D81,
+   worktree-moratorium) after three whole-repo-deletion incidents behind a green PASS;
+   lifted after BT.ticket.worktree-smoke-fixture verified a real --worktree run end to
+   end and confirmed the guards added during the suspension hold (binding/brain-root/
+   population guards, the commit-safety guard, the post-commit work assertion).
+   Replicating this pipeline by hand: create the worktree only when --worktree was
+   explicitly passed.
 
  A compact, COMMITTED, AUTHORITATIVE state.json + one worklog.md replace the 5×N
  per-stage report files: resume + review + wrap-up read a structured index instead
@@ -32,8 +36,8 @@ description: >
    /sdlc-flow <spec-slug> 1-3              scope to a task range (1-3, 1,3,5, 5)
    /sdlc-flow <spec-slug> --auto-merge     merge the PR + clean up on success
    /sdlc-flow <spec-slug> --no-pr          stop after wrap-up; do not create a PR
-   /sdlc-flow <spec-slug> --resume         re-attach the branch, resume from state.json
-   (--worktree is refused per D81 -- do not pass it)
+   /sdlc-flow <spec-slug> --resume         re-attach the branch (or worktree), resume from state.json
+   /sdlc-flow <spec-slug> --worktree       run in an isolated trees/<spec>-flow/ checkout
    /sdlc-flow <spec-slug> --test-depth full  run the FULL gating suite per task (default: fast)
 
  PIPELINE
@@ -119,22 +123,52 @@ print(chr(10).join(t[0].get('files', []) if t else []))
 
 When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc-flow.js`. Instead, perform the flow execution yourself:
 
-1. **Setup — plain branch only**:
-   - **`--worktree` is REFUSED (D81 worktree moratorium, suspended fleet-wide as of 2026-08-23).** If
-     the invocation includes `--worktree`, stop immediately: report that --worktree is suspended per
-     D81 and the run must use a plain branch (drop the flag and re-invoke). Do NOT create a worktree,
-     a branch, or any commit. This mirrors the real engine, which refuses unconditionally right after
-     parsing the flag, before any setup — see `.claude/workflows/sdlc-flow.js` around the
-     `useWorktree = hasFlag('--worktree')` line. No override flag, no environment escape hatch.
-   - Otherwise (the normal path today): check out branch `sdlc-flow/<spec-slug>` IN THE MAIN WORKING
+1. **Setup — plain branch, or isolated worktree with `--worktree`**:
+   - **Without `--worktree` (default):** check out branch `<spec-slug>-flow` IN THE MAIN WORKING
      TREE — no sparse-checkout worktree, so a relative `planning/` symlink (brain-vaulted repos) stays
-     intact. (The sparse-checkout worktree recipe under `trees/<spec-slug>-flow/` is left intact in
-     the machinery for when D81 lifts; it is not the normal path today.)
+     intact. `main` stays on the branch until the PR merges; refuse to start on a dirty working tree.
+   - **With `--worktree`:** create (or, with `--resume`, reuse/re-attach) an isolated sparse-checkout
+     worktree, mirroring `/sdlc-task`'s Steps 1b/1c (see `.agents/skills/sdlc-task/SKILL.md`) with the
+     branch name `<spec-slug>-flow` instead of `<blockId>-task`:
+     - `--resume`: try to reuse first — `git worktree list | grep "trees/<spec-slug>-flow"` and
+       `git branch --list "<spec-slug>-flow"`. Worktree exists → reuse verbatim. Branch exists but
+       worktree missing (orphaned) → re-attach with `git worktree add --no-checkout` (no `-b`). Neither
+       exists → fall through to a fresh create.
+     - Fresh create:
+       ```
+       mkdir -p trees
+       git worktree add --no-checkout trees/<spec-slug>-flow -b <spec-slug>-flow
+       git -C trees/<spec-slug>-flow sparse-checkout init --cone
+       git -C trees/<spec-slug>-flow sparse-checkout set $(git ls-tree HEAD --name-only -d | tr '\n' ' ')
+       git -C trees/<spec-slug>-flow checkout
+       ```
+       Then seed gitignored `.env`/`.env.*` files (same recipe as `/sdlc-task` Step 1b(f)) and commit
+       `chore: init worktree <spec-slug>-flow --allow-empty`.
+     - Repair the `planning/` symlink inside the worktree if the repo is brain-vaulted (same recipe as
+       `/sdlc-task` Step 1c — absolute symlink to the same vault target, never relative, never a real
+       directory).
+     - `runDir = repoRoot/trees/<spec-slug>-flow`.
    - **Spec location.** Paths are `planning/<spec-slug>/...` at the git root by default. If no spec
      exists there, ALSO check `<invoking-dir-relative-to-root>/planning/<spec-slug>/...` — a
      sub-brain tier (e.g. `business/`) has its own `planning/` without being its own git repo. The
      ROOT always wins when a spec exists at both locations. If found at neither, abort and name BOTH
      paths you searched, not just one.
+   - **Binding / brain-root / population guards** (BT.ticket.worktree-setup-can-adopt-the-brain-root-as-repo-root)
+     — run these BEFORE the D16 preflight lint below and before any task work, comparing against the
+     `repoRoot` you resolved at the top of this step (never re-derive it):
+     - **BINDING GUARD.** `runGitCommonDir = git -C <runDir> rev-parse --path-format=absolute
+       --git-common-dir`. If it does not resolve under `repoRoot`, abort — `Setup binding guard
+       failed`, naming both `runGitCommonDir` and `repoRoot`. This is the check that catches the
+       run silently adopting a different repo (e.g. the brain root) than the one it resolved.
+     - **BRAIN-ROOT GUARD.** If `<runDir>/brain.toml` exists but a `brain.toml` did NOT exist at the
+       invocation root, abort — `Setup binding guard failed`, naming both paths. Never identify a
+       brain root by counting harness checks or by a hardcoded path — brain.toml presence at the two
+       roots is the only signal.
+     - **POPULATION GUARD (worktree mode only).** Every path in `git -C <runDir> ls-files` must exist on disk at `<runDir>/<path>`; if
+       any are missing, abort — `Setup binding guard failed`, naming the missing count and up to
+       five example paths.
+     Log each guard's verdict, pass or fail — the transcript must show the check ran, not merely
+     that nothing exploded.
 2. **D16 preflight lint — do not guess the task structure.**
    - If the spec's `tasks.json` already exists, skip to task execution.
    - If it is missing but `tasks.md` has derivable step content, derive a FRESH `tasks.json` from
@@ -198,7 +232,11 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
    - If PASS, run `/update-docs --patch` to update documentation, running the COMMIT-SAFETY GUARD
      `&&`-joined before the docs commit (and its vault counterpart, if any patched/created doc lives
      under `planning/`).
-   - Update the status and log.
+   - Update the status and log. In-place (non-worktree) only, after `mev emit-state --write`
+     succeeds: if `planning/harness.json` declares an OPTIONAL `postEmitCommitCommand`
+     (BT.ticket.bookkeep-leaves-derived-output-uncommitted), run it — this is project policy, never
+     an engine default, so an absent key is a silent no-op. A hook failure must be reported, never
+     swallowed, and never blocks the wrap-up commit below (the hook owns its own transaction).
    - Run the COMMIT-SAFETY GUARD `&&`-joined before the wrap-up commit — both the repo-local one and,
      in a vaulted repo, the vault one (`git -C <vault path>`) — then commit.
    - Create a pull request (PR) using git CLI or GitHub CLI (unless `--no-pr` is specified).

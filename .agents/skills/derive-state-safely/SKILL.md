@@ -120,7 +120,7 @@ it is not yours to touch.
 
 **It regenerates the whole corpus spine, not the repo you ran it from.** One run has modified
 `core/_planning/bastion/state.json`, `core/_planning/engine-rs/state.json`, `README.md`,
-`client/_planning/brazilianportugui/status.md` and the tier/HQ rollups in a single pass —
+`client/_planning/<client-repo>/status.md` and the tier/HQ rollups in a single pass —
 several carrying **other sessions' uncommitted work**
 (`bastion-web:emit-state-rewrites-sibling-repos`).
 

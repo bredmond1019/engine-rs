@@ -115,6 +115,14 @@ This stage does not author block records or register `state.json`. That is `/pla
      only thing in the graph that actually holds the work behind it. Sequence with them where a
      human genuinely gates the chain.
 
+     **An operator errand's citable identity is `OP.<slug>`** — the flat identifier derived from
+     the `slug` its edge already carries (D76; authority: `docs/state/state-schema.md`'s OP
+     section). It is not a footnote to mint a ref for: the block table's `Ref` column and this
+     errand table both cite the errand as `OP.<slug>`, never as a document-local ref invented for
+     this file. `SQ-E1a`/`SQ-E1b`/`SQ-E2` — the labels `planning/cli-surface-to-skills/sequence.md`
+     invented for its three operator items — are exactly the shape this replaces: unresolvable by
+     any tool and meaningless outside that one file. Do not repeat it.
+
      **Aim the cut at autonomy anyway.** Every errand is a place the chain stops until the operator
      is at the keyboard, so file one only when *only* a human can do it — a credential, an
      outward-facing or irreversible action, a machine visit, a decision that is theirs to own.
@@ -296,7 +304,9 @@ what is last, which orderings are forced by dependency rather than preference.>
 | SQ-01 | `EN.12.A` | <name> | <repo> | `registered` \| `candidate` | <what becomes possible> | `EN.12.B`, `MV.4.A` | <paths> | <check + how it is shown failing> | <what sinks it> |
 
 *`Block ID` is the identity. `Ref` is a row label for this document's crosswalk and appears in no
-lane file's executable lines. `depends_on` names block IDs, never refs.*
+lane file's executable lines. `depends_on` names block IDs, never refs. For a row that is an
+operator errand rather than a code block, the `Ref` IS `OP.<slug>` — do not mint a separate
+`SQ-nn`-style ref for it.*
 
 *Wave exit (an observation with a command — becomes the roadmap's Definition of Done verbatim):*
 ```
@@ -309,6 +319,10 @@ OK  <command> → <expected output>
 |---|---|---|---|
 
 ## Operator errands
+
+*`#` is `OP.<slug>` — the derived identifier over the slug this errand's `operator` edge carries
+(D76; authority: `docs/state/state-schema.md`'s OP section). Never a document-local ref like
+`SQ-E1a`.*
 
 | # | Errand | Blocks | Exit artifact (pointable, or `UNRESOLVED`) | Why a human |
 |---|---|---|---|---|

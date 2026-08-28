@@ -235,7 +235,13 @@ ticket, `"Chores"` for a chore — and add an entry to its `blocks[]` if one doe
 - `description` — the same one-liner as the block record. This is what the surfaces read.
 - `status` — `"open"`. Never hand-set `"blocked"`; blocked-ness is derived from unmet
   `depends_on`.
-- `sdlc_workflow`, `model` — the block's choices.
+- `sdlc_workflow` — **required**, not merely a field to fill in. A block with no value cannot be
+  resolved to an engine, so `/orchestrate` cannot drive it and it silently drops out of any chain
+  that names it. Registering a new block with no `sdlc_workflow` value is an error in mev's state
+  validator (a missing-value sibling of `E_STATE_SDLC_WORKFLOW_ENUM`). This is delta-attributed:
+  pre-existing blocks already missing the value are reported, not blocking — do not go backfilling
+  them because you saw the error on an unrelated registration.
+- `model` — the block's choice.
 - `wave` — for a roadmap block, `10 * <phase>`. For a ticket or chore, the next multiple of ten
   past this repo's highest existing wave, so one-offs queue behind roadmap work and stay on the
   same lattice. Ask before assigning an earlier wave. **Do not use `max + 1`** — that lands

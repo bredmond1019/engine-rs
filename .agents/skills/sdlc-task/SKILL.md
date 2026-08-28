@@ -39,9 +39,13 @@ description: >
 
  ISOLATION
    Default: IN PLACE on the current branch (no worktree) — cheapest, like /sdlc-run.
-   --worktree: SUSPENDED FLEET-WIDE (D81, 2026-08-23). The engine refuses the flag
-   unconditionally and exits before any setup — no override, no environment escape hatch.
-   Run on a plain branch instead. The worktree machinery survives intact for when D81 lifts.
+   --worktree: creates an isolated trees/<branch>/ checkout for true isolation. Was
+   suspended fleet-wide 2026-08-23 to 2026-08-28 (D81, worktree-moratorium) after three
+   whole-repo-deletion incidents behind a green PASS; lifted after
+   BT.ticket.worktree-smoke-fixture verified a real --worktree run end to end and
+   confirmed the guards added during the suspension hold (binding/brain-root/population
+   guards, the commit-safety guard, the post-commit work assertion). Replicating this
+   pipeline by hand: create the worktree only when --worktree was explicitly passed.
 
  USAGE
    /sdlc-task <spec-slug>                 run every task in the spec, in place
@@ -49,7 +53,7 @@ description: >
    /sdlc-task <spec-slug> 1-3             run a task range (1-3, 1,3,5, 5)
    /sdlc-task <spec-slug> --resume        resume from the committed state file
    /sdlc-task <spec-slug> --test-depth full  full gating suite per task (default: fast)
-   (--worktree is refused per D81 -- do not pass it)
+   /sdlc-task <spec-slug> --worktree      run in an isolated trees/<branch>/ checkout
 
  PIPELINE
    setup (locate repo / create worktree) → enumerate (D16 lint) → [resume load]
@@ -164,15 +168,10 @@ only this section — not the `.js` — should end up doing exactly what the rea
   range (`1-3`), a comma list (`1,3,5`), or a mix (`1-3,7`). Parse into the sorted set of integers it
   names; if it doesn't match `\d+(-\d+)?` per comma-part, or names nothing, stop and report an error —
   do not guess.
-- `--worktree` — **REFUSED (D81 worktree moratorium, suspended fleet-wide as of 2026-08-23).** If
-  `--worktree` is present, stop immediately: report that --worktree is suspended per D81 and the run
-  must use a plain branch (drop the flag and re-invoke). Do NOT proceed to Step 1, do NOT create a
-  worktree, a branch, or any commit. This mirrors the real engine, which refuses unconditionally
-  right after parsing the flag, before any setup — see `.claude/workflows/sdlc-task.js` around the
-  `useWorktree = hasFlag('--worktree')` line. No override flag, no environment escape hatch: an
-  escape hatch would make the moratorium documentation again, which is the exact failure D81 names.
-  The worktree machinery below (Steps 1b/1c) is left intact for when D81 lifts — it is not the
-  normal path today.
+- `--worktree` — creates an isolated `trees/<branch>/` checkout instead of running in place — see
+  Steps 1b/1c below. Was suspended fleet-wide 2026-08-23 to 2026-08-28 (D81, worktree-moratorium)
+  after three whole-repo-deletion incidents behind a green PASS; lifted after
+  `BT.ticket.worktree-smoke-fixture` verified a real `--worktree` run end to end.
 - `--resume` — resume from the on-disk `sdlc-task-state.json`, reusing the existing worktree/branch by
   name and skipping the D19 thin-spec gate (see Step 1).
 - `--test-depth fast|full` — default `fast` (only `gates:true`-and-not-`perTask:false` checks run per
@@ -180,12 +179,9 @@ only this section — not the `.js` — should end up doing exactly what the rea
 
 ### Step 1 — Setup: locate the repo, or create the isolated worktree
 
-**Reached only when `--worktree` was NOT passed** — Step 0 already refused and stopped if it was.
-Every worktree-mode branch below (`--worktree` fresh create, reuse, re-attach, Steps 1b/1c) is
-therefore dead code under the moratorium, kept only so the machinery is intact for when D81 lifts;
-go straight to "In-place mode" below.
-
-Run everything below from the **main repo root** unless noted.
+Run everything below from the **main repo root** unless noted. Without `--worktree`, skip straight
+to "In-place mode" below; with it, work through the worktree-mode branch (fresh create, reuse,
+re-attach, Steps 1b/1c).
 
 1. `repoRoot` = `git rev-parse --show-toplevel`. `currentBranch` = `git rev-parse --abbrev-ref HEAD`.
    **Before any other `cd`**, also compute `candidateTierPrefix` — the CURRENT working directory's
@@ -309,6 +305,27 @@ Run everything below from the **main repo root** unless noted.
   searched — naming only the root reads as "the spec was never written" when the real cause may be
   "the engine looked in the wrong place". Tell the user to run `/generate-tasks <blockId>` (and
   `/breakdown`), commit, then re-run.
+
+8. **Step 1d — Binding / brain-root / population guards** (BT.ticket.worktree-setup-can-adopt-the-brain-root-as-repo-root).
+   Run these BEFORE Step 2 (Plan) and before any task work — a misbound or unpopulated checkout must
+   never reach the per-task loop. Compare against `repoRoot` as computed in Step 1.1, never re-derive it:
+   - **BINDING GUARD.** Compute `runGitCommonDir = git -C <runDir> rev-parse --path-format=absolute
+     --git-common-dir`. If `runGitCommonDir` does NOT resolve under `repoRoot`, **abort** —
+     `Setup binding guard failed`, naming BOTH `runGitCommonDir` and `repoRoot` in the reason. This
+     catches a run whose checkout is actually bound to a different repo than the one you resolved in
+     Step 1 (e.g. it silently adopted the brain root).
+   - **BRAIN-ROOT GUARD.** Check whether `<runDir>/brain.toml` exists. If it exists AND `brainTomlAtRoot`
+     (captured in Step 1.1 at the invocation root) was false, **abort** — `Setup binding guard failed`,
+     reason naming that a brain.toml is present at the run root but was absent at the invocation root.
+     Never identify a brain root by counting harness checks or by a hardcoded path — this is the only
+     signal to use.
+   - **POPULATION GUARD (worktree mode only).**
+     For every path in `git -C <runDir> ls-files`, verify it exists on disk at `<runDir>/<path>`. If any
+     are missing, **abort** — `Setup binding guard failed`, naming the missing count and up to five
+     example paths. This catches a worktree that bound to the correct repo but never actually populated
+     (e.g. a sparse-checkout that silently produced zero files).
+   All three guards log their verdict (pass or fail) even when they pass, so the transcript shows the
+   check ran rather than merely that nothing exploded.
 
 From here on, every Bash call in every later step is prefixed with `cd <runDir> &&` — shell state does
 not persist between calls.
@@ -769,7 +786,26 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
      that just closed until `/clean-worktree` or `/merge-train` runs `mev emit-state --write` on
      merge. Report this explicitly (do not report the run as leaving `focus` fresh); do not attempt
      to hand-edit `focus.next` here.
-5. **Commit** (stage explicitly — never `git add -A`). Never run `git checkout`/`git switch`/`git
+5. **OPTIONAL post-emit commit hook** (`postEmitCommitCommand`, `planning/harness.json`) —
+   BT.ticket.bookkeep-leaves-derived-output-uncommitted: run it ONLY when step 4 actually ran `mev
+   emit-state --write` (i.e. never in worktree mode, and never when emit-state itself was skipped
+   because `mev`/`brain.toml` was absent). This mechanism does not know or care what the command
+   does — it is project policy, never an engine default and never a fact about where any project
+   keeps its scripts:
+   ```
+   cd <runDir> && <postEmitCommitCommand>
+   ```
+   Check the REAL exit code, not a piped one. Exit 0 → report `postEmitHookRan=true`,
+   `postEmitHookFailed=false`. Non-zero → report `postEmitHookRan=true`, `postEmitHookFailed=true`,
+   and copy the command's stderr/stdout tail verbatim into notes — this must be surfaced, never
+   swallowed. Do not retry it and do not attempt to "fix" or roll anything back yourself; the
+   command owns its own transaction, so a failure here does not block step 6's own commit below.
+   If `planning/harness.json` defines no `postEmitCommitCommand`, skip this step entirely — report
+   `postEmitHookRan=false`, `postEmitHookFailed=false`. This is the default, unchanged behaviour;
+   no scaffolded repo carries this key unless it opts in. `/sdlc-flow`'s wrap-up stage runs the
+   identical hook, gated the identical way (in-place only, only after its own `emit-state --write`
+   succeeds) — see [`docs/workflows/sdlc-flow.md`'s Wrap-up row](../../../docs/workflows/sdlc-flow.md#pipeline).
+6. **Commit** (stage explicitly — never `git add -A`). Never run `git checkout`/`git switch`/`git
    branch` outside this repo's own root, or (when vaulted) outside the vault's own root — if a `git
    add` fails, report it; do not relocate the commit to force it through.
    - **Vaulted repo (`planning/` is a symlink — D46, e.g. this very `agentic-portfolio` HQ)**: the

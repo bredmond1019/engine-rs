@@ -344,15 +344,15 @@ sparse-checkout worktree. Worktrees are **safe in brain-vaulted repos** — the 
 symlinked `planning/` and resolve it (D46), and `/init-worktree` was fixed to match
 (`BT.ticket.init-worktree-symlink-repair`, closed). Plain branch is simply *cheaper*, not safer.
 
-**`--worktree` is currently suspended fleet-wide** (`D81-worktree-moratorium`) — the engines refuse
-the flag outright, so isolation is not a per-run choice today. The table below records the D81
-answer for when it lifts.
+`--worktree` was suspended fleet-wide from 2026-08-23 to 2026-08-28 (`D81-worktree-moratorium`);
+it was lifted after `BT.ticket.worktree-smoke-fixture` verified a real `--worktree` run end to end,
+so isolation is a per-run choice again. The table below records the current answer.
 
 **Two repos have a non-negotiable answer. Encode them, do not re-derive them per run:**
 
 | Repo | Isolation | Why |
 |---|---|---|
-| `base-template` | **`--no-worktree`** (D81) | D81 refuted the old reason with a mechanism: the Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
+| `base-template` | **`--no-worktree`** (default) | The Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
 | the brain root (HQ) | **`--no-worktree` ALWAYS** | Carryover `hq-specs-cannot-run-in-a-worktree`. Measured 2026-08-04 inside a real branch worktree: `validate-brain --structure` gave **64 errors** and `--state` **601**, against 0/0 in the main tree. `validate-brain` walks up to the worktree's own `brain.toml` and resolves the 17 sub-repos relative to it — and every sub-repo is gitignored, so absent from any checkout. Worktree creation itself is clean; it is specifically the corpus gates that cannot pass. Same root cause as the CI exclusion in D65. |
 
 `--worktree` / `--no-worktree` on the command line overrides all of the above **except those two** —

@@ -28,9 +28,11 @@ Usage: /begin-session <session-slug> [--roadmap <path>] [--dry-run]
 
 | Flag | Default | What it does |
 |---|---|---|
-| `<session-slug>` | **required** | e.g. `operator-developer-offer`. Kebab-case, prefixed `operator-`. |
+| `<session-slug>` | **required** | e.g. `operator-developer-offer`. Kebab-case, prefixed `operator-`. Also accepts the `OP.<slug>` citation form (D76) — strip the `OP.` prefix before resolving; the underlying join key is the bare slug, unchanged. A slug that already carries the redundant `operator-` prefix stutters as `OP.operator-<thing>` — that is expected, not a bug; do not rename the slug to fix it. Authority: `docs/state/state-schema.md`'s `OP.<slug>` section. |
 | `--roadmap <path>` | inferred | Where the session is defined, when it is not yet a graph edge. |
 | `--dry-run` | off | Print the resolved session, its exit artifact and gated blocks; change nothing. |
+
+The command's name and its argument are unchanged — this only widens what the argument accepts.
 
 Empty `$ARGUMENTS` → print usage, list every session you can resolve, and stop.
 
@@ -83,7 +85,8 @@ to make it cheap to give.
 A session ends **only** when its exit artifact exists. Then, in order:
 
 1. **Write the artifact**, at the path the session named. OKF frontmatter if it enters the corpus.
-2. **Clear the gate.** For an `operator` edge: `mev close-operator-gate <slug> --exit-verified`.
+2. **Clear the gate.** For an `operator` edge: `mev close-operator-gate <slug> --exit-verified` —
+   `<slug>` here is the bare slug (strip `OP.` if the session was addressed in that form).
    For a session still resolved from a roadmap's Wave 0 table (no edge yet), remove the session row
    and say what replaced it. `--exit-verified` is the operator asserting the artifact exists —
    **mev never infers it.**

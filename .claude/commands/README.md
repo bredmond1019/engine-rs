@@ -615,7 +615,7 @@ consistent with screen one.
 
 Two things keep it honest. It **starts from the practice's settled stack** — Next 16 + React 19 +
 Tailwind 4 with CSS variables + **shadcn/ui** (`style: base-nova`, `baseColor: neutral`) + `lucide`,
-as built in `business/bastiel` and `client/jardins-fitness`, with the reference `components.json`
+as built in `business/bastiel` and a client frontend, with the reference `components.json`
 inlined so a new project starts identical. Hand-rolling is the departure and needs a reason.
 
 Note *how* that precedent is chosen, because it generalises: **a pattern found in a codebase tells
