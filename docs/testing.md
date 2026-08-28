@@ -130,6 +130,51 @@ The e2e suites in `tests/it/` follow rules worth preserving:
   `docs/content/learning-corpus/` in every test masked a real production bug where `apply_plan`
   never created parents (`EN.7.D`, fixed in `d1a8787`).
 
+## The nextest terminate-after bound
+
+`.config/nextest.toml` sets `[profile.default] slow-timeout = { period = "60s", terminate-after = 5 }`
+(300s total). Before this existed, the default profile had no `terminate-after` at all: a
+genuinely wedged test would report a SLOW line and then simply never return, blocking the
+authoritative gate (`cargo nextest run --workspace --all-features`) forever with no verdict and
+no diagnostic — the next agent has to guess what happened. With the bound set, any test that runs
+past `period * terminate-after` is killed by nextest and reported as **TIMEOUT** instead of
+hanging the run.
+
+300s is set well above the slowest test observed on 2026-08-23
+(`terminal_admission::on_disk_manifest_edit_is_picked_up_by_the_next_capture_with_no_rebuild` at
+1.118s), so no existing test should ever trip it.
+
+**If a legitimately slow test does trip it**, do not weaken the global bound — give that one test
+its own override in `.config/nextest.toml`:
+
+```toml
+[[profile.default.overrides]]
+filter = 'test(name_of_the_slow_test)'
+slow-timeout = { period = "5s", terminate-after = 1 }
+```
+
+`crates/engine-core/tests/it/gate_timeout_fixture.rs` holds a deliberately-wedging `#[ignore]`d
+test (`deliberately_wedges_to_prove_the_gate_terminates_it`) with exactly this shape of override,
+so `scripts/test_nextest_terminates_a_hang.sh` can prove the bound actually fires without waiting
+out the full 300s global bound.
+
+### Two ways a slow build masquerades as a hang
+
+The bound above exists because a P1 was once filed claiming a specific test hung. It did not
+reproduce, and the investigation found two unrelated, non-defect causes that look identical to a
+real hang from the outside:
+
+- **Piping the command through `tail` (or anything else) buffers output** — a slow build then
+  shows as zero output until the whole pipeline finishes, which reads exactly like a wedged test.
+  Run gate commands unpiped when diagnosing a suspected hang.
+- **A bloated `target/` tree makes incremental builds far slower than a cold build** — see "Keep
+  `target/` clean" above: a 40GB tree's incremental build was measured at ~3x slower than a
+  from-scratch cold build. "Builds for a while, then no output for 90+ seconds" matches this far
+  better than a test hang does.
+
+Before concluding a test has genuinely wedged, check `du -sh target` and re-run the command
+unpiped first.
+
 ## Per-task validation in the SDLC loop
 
 `tasks.json` tasks that cannot break the build — docs-only, config-only — should declare their own
