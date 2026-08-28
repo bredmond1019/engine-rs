@@ -289,7 +289,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 }
 
 async fn health() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "ok",
+        "build": {
+            "git_sha": engine_core::build_info::GIT_SHA,
+            "built_at": engine_core::build_info::BUILT_AT,
+        }
+    }))
 }
 
 /// The registered workflow types (sorted for a deterministic response).
@@ -988,6 +994,13 @@ mod tests {
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "ok");
+        let git_sha = body["build"]["git_sha"]
+            .as_str()
+            .expect("build.git_sha present and a string");
+        assert!(!git_sha.is_empty(), "build.git_sha must be non-empty");
     }
 
     #[actix_web::test]
