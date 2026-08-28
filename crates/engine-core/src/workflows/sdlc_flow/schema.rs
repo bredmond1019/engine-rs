@@ -941,6 +941,43 @@ pub fn derive_bail_reason(terminal_signal: Option<&TerminalSignal>) -> Option<St
     })
 }
 
+/// Was this committed artifact written by the run we are currently in?
+/// (EN.11.A task 3 — the stale-artifact accessor `SQ-09`'s red-build gate
+/// keys on.)
+///
+/// KEYS ON `run_id` ONLY, NEVER on the presence/absence of
+/// `final_validation` — `task_loop::SaveStateNode` writes
+/// `final_validation: null` on EVERY intermediate save, so a presence check
+/// would misread a mid-run save as final (seams.md seam 3, the tri-state
+/// trap this block's record names explicitly).
+///
+/// Reads the artifact's own `run_id` out of `value` (the D31-committed JSON
+/// shape [`SDLCState::to_committed_state_json`] emits — a bare string or
+/// JSON `null`, exactly as `run_id` round-trips through
+/// [`SDLCState::from_committed_state_json`]) and compares it against
+/// `current_run_id`:
+///
+/// - Artifact `run_id` differs from `current_run_id` (including an artifact
+///   with no `run_id` key/a `null` value, e.g. one written by base-template's
+///   JS engine, compared against a current run that DOES have a run_id) ->
+///   stale (`true`).
+/// - Artifact `run_id` matches `current_run_id` exactly -> not stale
+///   (`false`), regardless of `final_validation`.
+/// - Both sides are absent/`None` (no run_id anywhere to compare) -> not
+///   stale (`false`) — there is nothing to detect staleness against, so this
+///   accessor declines to flag it rather than guessing.
+#[must_use]
+pub fn committed_artifact_is_stale(
+    value: &serde_json::Value,
+    current_run_id: Option<&str>,
+) -> bool {
+    let artifact_run_id = value.get("run_id").and_then(serde_json::Value::as_str);
+    match (artifact_run_id, current_run_id) {
+        (None, None) => false,
+        (artifact, current) => artifact != current,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
