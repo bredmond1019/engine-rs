@@ -580,6 +580,67 @@ mod tests {
         assert_eq!(parsed["policy"]["model_tiers"]["extract"], "sonnet");
     }
 
+    /// `ticket-diagnostic-intake-fixture-tempdir` task 3: regression test for
+    /// the hermetic property task 2 restored — driving
+    /// `IntakeExtractNode::process` with NO `SetupWorktreeNode` stamp must
+    /// never write into this crate's own tracked
+    /// `planning/diagnostic-intake-state.json`. `worktree_path`'s
+    /// `current_dir()` fallback (see its doc comment above) resolves to
+    /// whatever the process's cwd is, so this test controls that cwd itself
+    /// rather than trusting the node's own report of where it wrote —
+    /// `cargo nextest` forks one process per test, so `set_current_dir` here
+    /// cannot affect any other test running concurrently.
+    ///
+    /// Shown capable of failing (base-template D68 constraint 4): with the
+    /// `set_current_dir(&isolated)` line below removed (so the fallback
+    /// resolves to the real crate-root cwd nextest starts every test in,
+    /// exactly the historical bug), this test FAILS — the `before`/`after`
+    /// byte comparison on the real tracked fixture differs, because the
+    /// unstamped write really does land on it. Restoring the
+    /// `set_current_dir(&isolated)` redirect makes it pass again. Both
+    /// observations were verified by hand for this task; the file was
+    /// restored via `git checkout --` immediately after the failing run
+    /// confirmed the corruption, before this test was committed.
+    #[tokio::test]
+    async fn process_never_writes_the_crate_committed_fixture_without_a_worktree_stamp() {
+        let real_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("planning")
+            .join("diagnostic-intake-state.json");
+        let before = std::fs::read(&real_fixture).expect("committed fixture exists");
+
+        let original_cwd = std::env::current_dir().expect("cwd readable");
+        let isolated = temp_worktree();
+        std::env::set_current_dir(&isolated).expect("redirect cwd to isolated tempdir");
+
+        let node =
+            IntakeExtractNode::new().with_transport(stub_transport(Some(stub_intake_json())));
+        // Deliberately NOT stamped with "SetupWorktreeNode" — this is the
+        // exact ctx shape that used to corrupt the tracked fixture.
+        let ctx = empty_ctx(intake_event());
+
+        let result = node.process(ctx).await;
+
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        result.expect("process should still succeed without a worktree stamp");
+
+        let after = std::fs::read(&real_fixture).expect("committed fixture still exists");
+        assert_eq!(
+            before, after,
+            "process must not modify the crate's tracked diagnostic-intake-state.json \
+             fixture when driven without a SetupWorktreeNode stamp"
+        );
+
+        let isolated_state = isolated
+            .join("planning")
+            .join("diagnostic-intake-state.json");
+        assert!(
+            isolated_state.exists(),
+            "the unstamped write should still land somewhere (the fallback cwd), \
+             proving the node did write, just not into the tracked fixture"
+        );
+    }
+
     #[tokio::test]
     async fn process_errors_when_event_is_invalid() {
         let node =
