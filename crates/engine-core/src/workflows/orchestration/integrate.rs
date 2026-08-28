@@ -45,6 +45,20 @@
 //!    sibling lane reads the wrong state, so [`integrate_chain`] appends
 //!    the line only once, immediately after that block's state write
 //!    verifies.
+//! 4. The merge stage (`EN.11.C`) — after a step's state write verifies
+//!    and before its `closed` lane-log line is appended, [`integrate_chain`]
+//!    merges that step's branch into `main` and pushes it. This is what
+//!    makes block N+1's tree actually contain block N's work: without it,
+//!    every step in a chain cuts its branch from `origin/main` and the
+//!    next step's tree is missing everything before it
+//!    (sequence.md's red-team finding G1). It lives HERE, in the chain,
+//!    rather than in `SDLC_FLOW`/`PullRequestNode` — `PullRequestNode`'s
+//!    "deliberately never auto-merges" contract (human review gate, D25)
+//!    stands unchanged for a standalone `SDLC_FLOW` run; only a chain
+//!    integrating steps back-to-back with nobody in the loop between them
+//!    has grounds to merge automatically. A step whose merge cannot
+//!    complete (a conflict, a rejected push) is [`IntegrateError::StepMergeFailed`]
+//!    and is never recorded as `closed` — see [`merge_step_branch`].
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -281,6 +295,77 @@ fn step_branch_name(ctx: &engine_contract::TaskContext) -> Option<String> {
         .and_then(|value| value.get("branch_name"))
         .and_then(|value| value.as_str())
         .map(str::to_string)
+}
+
+// ── Merge stage: block N's branch lands before block N+1 starts ────────
+
+/// Resolve the branch to merge for a just-integrated step (`EN.11.C` task
+/// 2) — prefer `PullRequestNode`'s own stamped `branch_name` (task 1,
+/// `sdlc_flow/pr.rs`), which is the authoritative "branch this run
+/// actually pushed" answer even on the `auto_pr: false` short-circuit;
+/// fall back to [`step_branch_name`] for a run that never reached
+/// `PullRequestNode` at all (e.g. an older engine build, or a chain step
+/// that isn't `SDLC_FLOW`-shaped). `None` from both means no branch is
+/// known for this step — the documented no-op case [`step_branch_name`]'s
+/// own doc already treats this way, not an error: the merge stage below
+/// skips silently for it.
+fn resolve_merge_branch(ctx: &engine_contract::TaskContext) -> Option<String> {
+    get_result(ctx, "PullRequestNode")
+        .and_then(|value| value.get("branch_name"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| step_branch_name(ctx))
+}
+
+/// Merge `branch` into `main` and push, inside `repo_path` — the stage
+/// that makes block N+1's tree actually contain block N's work
+/// (`EN.11.C`, sequence.md's red-team finding G1: "no merge block, despite
+/// the smoke run saying so"). Lives in the chain's integrate stage rather
+/// than in `SDLC_FLOW`/`PullRequestNode` deliberately:
+/// `PullRequestNode`'s "deliberately never auto-merges" contract (human
+/// review gate, D25) stands unchanged — a human-triggered `SDLC_FLOW` run
+/// still never merges anything on its own. It is only the CHAIN,
+/// integrating one block right after another with nobody in the loop
+/// between them, that has grounds to merge automatically.
+///
+/// Runs three plain git commands via [`crate::workflows::default_command_runner`]
+/// (`checkout main`, `merge --no-ff <branch>`, `push origin main`) and fails
+/// the step on the FIRST non-zero exit — no conflict resolution is
+/// attempted (out of scope; a conflict is a step failure, never silently
+/// integrated). The failing command's stderr is carried on
+/// [`IntegrateError::StepMergeFailed`] so it reaches the run result rather
+/// than being swallowed — see that variant's doc for the incident this
+/// closes.
+fn merge_step_branch(
+    repo_path: &Path,
+    repo: &str,
+    block_id: &str,
+    branch: &str,
+) -> Result<(), IntegrateError> {
+    let runner = crate::workflows::default_command_runner();
+    let steps: [(&str, &[&str]); 3] = [
+        ("git", &["checkout", "main"]),
+        ("git", &["merge", "--no-ff", branch]),
+        ("git", &["push", "origin", "main"]),
+    ];
+    for (program, args) in steps {
+        let output =
+            runner(program, args, repo_path).map_err(|source| IntegrateError::StepMergeFailed {
+                repo: repo.to_string(),
+                block_id: block_id.to_string(),
+                branch: branch.to_string(),
+                stderr: format!("failed to spawn `{program} {}`: {source}", args.join(" ")),
+            })?;
+        if output.status != 0 {
+            return Err(IntegrateError::StepMergeFailed {
+                repo: repo.to_string(),
+                block_id: block_id.to_string(),
+                branch: branch.to_string(),
+                stderr: output.stderr,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_state_write(outcome: &ExecutionOutcome) -> Result<(), IntegrateError> {
@@ -712,6 +797,21 @@ pub enum IntegrateError {
     /// to a block invocation, matching `dispatch.rs`'s "never fail
     /// silently" convention.
     NoDispatcherConfigured { repo: String, block_id: String },
+    /// `EN.11.C` task 2: a step's branch could not be merged into `main`
+    /// and pushed after it integrated — the "chains compose" merge stage
+    /// (see [`resolve_merge_branch`] / the `integrate_chain_impl` call
+    /// site). Carries the raw git stderr so it reaches the run result
+    /// rather than being swallowed — the block record's `notes` cites a
+    /// real incident where a merge-adjacent failure surfaced as a bare,
+    /// reasonless PR failure with no diagnostic text at all. A step this
+    /// happens to is never recorded as `closed` (see the call site: this
+    /// variant returns BEFORE the `closed` lane-log line is appended).
+    StepMergeFailed {
+        repo: String,
+        block_id: String,
+        branch: String,
+        stderr: String,
+    },
 }
 
 impl fmt::Display for IntegrateError {
@@ -828,6 +928,16 @@ impl fmt::Display for IntegrateError {
                 write!(f, "failed to write checkpoint: {source}")
             }
             IntegrateError::Dispatch(err) => write!(f, "{err}"),
+            IntegrateError::StepMergeFailed {
+                repo,
+                block_id,
+                branch,
+                stderr,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') integrated but its branch '{branch}' \
+                 could not be merged into main and pushed: {stderr}"
+            ),
             IntegrateError::NoDispatcherConfigured { repo, block_id } => write!(
                 f,
                 "dispatch step '{block_id}' (repo '{repo}') has no Dispatcher configured \
@@ -853,7 +963,8 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::RoadmapDirNotFound { .. }
             | IntegrateError::AmbiguousRoadmapDir { .. }
             | IntegrateError::HoldDeadlineExceeded { .. }
-            | IntegrateError::NoDispatcherConfigured { .. } => None,
+            | IntegrateError::NoDispatcherConfigured { .. }
+            | IntegrateError::StepMergeFailed { .. } => None,
             IntegrateError::CheckpointWriteFailed(source) => Some(source),
             IntegrateError::Dispatch(err) => Some(err),
         }
@@ -1618,6 +1729,33 @@ async fn integrate_chain_impl(
                 serde_json::json!({}),
             );
             return Err(err);
+        }
+
+        // `EN.11.C` task 2: the merge stage — the "chains compose" leg.
+        // Runs AFTER `verify_state_write` succeeds and BEFORE the `closed`
+        // lane-log line below, so a step whose branch cannot be merged is
+        // never recorded as closed. A step with no resolvable branch name
+        // (neither `PullRequestNode` nor `SetupWorktreeNode` ran) skips
+        // silently — see `resolve_merge_branch`'s doc.
+        if let Some(branch) = resolve_merge_branch(&outcome.ctx) {
+            if let Err(err) =
+                merge_step_branch(&outcome.repo_path, &step.repo, &step.block_id, &branch)
+            {
+                let entry = LaneLogEntry::bailed(step, step_lane, err.to_string())
+                    .with_identity(Some(step_run_id.to_string()));
+                let _ = append_lane_log_line(roadmap_dir, &entry);
+                let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                emit_journal(
+                    journal_sink,
+                    campaign_id,
+                    step_run_id,
+                    &step.block_id,
+                    engine_contract::JournalDecisionKind::StepBailed,
+                    err.to_string(),
+                    serde_json::json!({}),
+                );
+                return Err(err);
+            }
         }
 
         let entry = LaneLogEntry::closed(
@@ -3023,18 +3161,84 @@ mod tests {
 
     // ── EN.11.H task 2: checkpoint written as each step integrates ──────
 
+    /// A real git repo with a real bare `origin` — `git init`, an initial
+    /// commit on `main`, and a push of `main` to the bare remote. `EN.11.C`
+    /// task 2's merge stage runs real `git checkout main` / `git merge` /
+    /// `git push origin main` in a step's `repo_path`, so any test whose
+    /// runner stamps a branch for the chain to merge needs a real git repo
+    /// underneath it, not merely an empty directory. `repo_path` must
+    /// already exist and be empty; the bare origin lives in its own
+    /// separate tempdir, returned so it outlives the test.
+    fn init_real_git_repo(repo_path: &Path) -> tempfile::TempDir {
+        fn run_git(cwd: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn `git {}`: {e}", args.join(" ")));
+            assert!(
+                output.status.success(),
+                "`git {}` in {cwd:?} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let bare_root = tempfile::tempdir().expect("bare-origin tempdir");
+        let bare_path = bare_root.path().join("origin.git");
+        run_git(
+            bare_root.path(),
+            &["init", "-q", "--bare", bare_path.to_str().expect("utf8")],
+        );
+        run_git(repo_path, &["init", "-q"]);
+        run_git(repo_path, &["checkout", "-q", "-b", "main"]);
+        run_git(
+            repo_path,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        run_git(repo_path, &["config", "user.name", "EN.11.C Fixture"]);
+        std::fs::write(repo_path.join("README.md"), "initial\n").expect("write README.md");
+        run_git(repo_path, &["add", "-A"]);
+        run_git(repo_path, &["commit", "-q", "-m", "initial commit"]);
+        run_git(
+            repo_path,
+            &["remote", "add", "origin", bare_path.to_str().expect("utf8")],
+        );
+        run_git(repo_path, &["push", "-q", "origin", "main"]);
+        bare_root
+    }
+
     /// A runner that behaves like [`recording_runner`] but also stamps a
     /// `SetupWorktreeNode` result carrying a deterministic branch name for
     /// each invoked block — mirrors what a real worktree-isolated
     /// `SDLC_FLOW` run leaves in `ctx.nodes` for
-    /// [`step_branch_name`]/`wrap_up::branch_name` to read.
+    /// [`step_branch_name`]/`wrap_up::branch_name` to read. Also cuts that
+    /// branch for REAL, from `main`, inside `invocation.repo_path` — the
+    /// merge stage (`EN.11.C` task 2) needs a real ref to merge, not merely
+    /// a stamped string.
     fn branch_stamping_runner() -> (FlowRunner, Arc<Mutex<Vec<String>>>) {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = calls.clone();
         let runner: FlowRunner = Arc::new(move |invocation| {
             recorded.lock().unwrap().push(invocation.block_id.clone());
             let branch_name = format!("{}-flow", invocation.block_id);
+            let repo_path = invocation.repo_path.clone();
             Box::pin(async move {
+                let output = std::process::Command::new("git")
+                    .args(["checkout", "-q", "-b", &branch_name, "main"])
+                    .current_dir(&repo_path)
+                    .output()
+                    .expect("spawn git checkout -b");
+                assert!(
+                    output.status.success(),
+                    "git checkout -b {branch_name} in {repo_path:?} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                std::process::Command::new("git")
+                    .args(["checkout", "-q", "main"])
+                    .current_dir(&repo_path)
+                    .output()
+                    .expect("spawn git checkout main");
                 let mut nodes = std::collections::HashMap::new();
                 nodes.insert(
                     "SetupWorktreeNode".to_string(),
@@ -3054,6 +3258,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_records_every_integrated_step_with_branch_in_order() {
         let (dir, registry) = two_repo_registry();
+        let _bare_origin = init_real_git_repo(&dir.path().join("repo-a"));
         write_done_state(&dir.path().join("repo-a"), "A.1");
         write_done_state(&dir.path().join("repo-a"), "A.2");
         write_done_state(&dir.path().join("repo-a"), "A.3");
