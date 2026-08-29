@@ -27,13 +27,16 @@ use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
     resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep, StepKind,
 };
+use engine_core::workflows::orchestration::debrief::{brief_names_every_bail, StubJournalReader};
 use engine_core::workflows::orchestration::dispatch::DispatchStepError;
 use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
 use engine_core::workflows::orchestration::gates::{
     check_step_with_frontier_advice, load_frontier, AdmissionGate, DependencyEdge, FrontierError,
     GateError,
 };
-use engine_core::workflows::orchestration::graph::{OrchestrationRunNode, NODE_NAME};
+use engine_core::workflows::orchestration::graph::{
+    debrief_registry, debrief_schema, OrchestrationRunNode, NODE_NAME,
+};
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain, integrate_chain_with_dispatch, HoldSource, IntegrateError, NeverHeld,
     StepProgress,
@@ -42,6 +45,7 @@ use engine_core::{
     Dispatcher, Node, NodeConfig, NodeError, NodeRegistry, Workflow, WorkflowSchema,
 };
 
+use engine_core::nodes::channel_transport::StubChannelTransport;
 use engine_core::nodes::terminal::admission::{AdmissionControl, AdmissionPolicy};
 
 // ── Shared fixtures ──────────────────────────────────────────────────────
@@ -2008,4 +2012,285 @@ fn forward_compatible_lane_segment_field_parses_end_to_end() {
         Some("OTHER.1".to_string()),
         "the recognised directive fields must still parse correctly alongside the unknown one"
     );
+}
+
+// ── `DEBRIEF` integration coverage (`EN.12.G` task 5) ────────────────────
+//
+// Four checked-in campaign journal fixtures — clean, bailed, operator-
+// waiting, empty — driven through the actual registered `DEBRIEF`
+// workflow (`debrief_schema`/`debrief_registry` + `Workflow::run`), not
+// just `DebriefNode::process` directly, so this suite also exercises the
+// graph assembly `EN.12.G` task 4 wired in. `StubJournalReader` plus
+// `StubChannelTransport` keep every test hermetic: no database, no live
+// `CONTENT_PIPELINE` dispatch.
+
+fn debrief_row(
+    campaign_id: &str,
+    step: &str,
+    kind: engine_contract::JournalDecisionKind,
+    reason: &str,
+    offset_secs: i64,
+) -> engine_contract::JournalRow {
+    engine_contract::JournalRow {
+        id: Uuid::new_v4(),
+        campaign_id: campaign_id.to_string(),
+        run_id: Uuid::new_v4(),
+        step: step.to_string(),
+        kind,
+        reason: reason.to_string(),
+        detail: serde_json::json!({}),
+        created_at: chrono::Utc::now() + chrono::Duration::seconds(offset_secs),
+    }
+}
+
+/// Run the real registered `DEBRIEF` workflow (schema + registry, `EN.12.G`
+/// task 4) over `rows` for `campaign_id`, hermetically — a
+/// `StubJournalReader` seeded with `rows` and a succeeding
+/// `StubChannelTransport`. Returns the rendered brief and the transport's
+/// recorded calls.
+async fn run_debrief_workflow(
+    campaign_id: Uuid,
+    rows: Vec<engine_contract::JournalRow>,
+) -> (String, Arc<StubChannelTransport>) {
+    let transport = Arc::new(StubChannelTransport::succeeding());
+    let registry = debrief_registry(
+        Arc::new(StubJournalReader::succeeding(rows)),
+        transport.clone(),
+        None,
+    );
+    let workflow = Workflow::new_validated(registry, debrief_schema())
+        .expect("DEBRIEF declared graph must pass WorkflowValidator::validate");
+
+    let ctx = workflow
+        .run(serde_json::json!(campaign_id.to_string()), Box::new(|_| {}))
+        .await
+        .expect("DEBRIEF must run to completion");
+
+    let recorded = &ctx.nodes[engine_core::workflows::orchestration::debrief::DEBRIEF_NODE_NAME];
+    let brief = recorded["brief"].as_str().unwrap().to_string();
+    (brief, transport)
+}
+
+/// Fixture (a): a clean multi-step campaign — every step named, in
+/// `created_at` order.
+#[tokio::test]
+async fn debrief_fixture_clean_campaign_names_every_step_in_order() {
+    let campaign_id = Uuid::new_v4();
+    let campaign = campaign_id.to_string();
+    let rows = vec![
+        debrief_row(
+            &campaign,
+            "provision",
+            engine_contract::JournalDecisionKind::StepIntegrated,
+            "ok",
+            0,
+        ),
+        debrief_row(
+            &campaign,
+            "build",
+            engine_contract::JournalDecisionKind::StepIntegrated,
+            "ok",
+            5,
+        ),
+        debrief_row(
+            &campaign,
+            "deploy",
+            engine_contract::JournalDecisionKind::StepIntegrated,
+            "ok",
+            10,
+        ),
+    ];
+
+    let (brief, transport) = run_debrief_workflow(campaign_id, rows).await;
+
+    let provision_pos = brief.find("provision").expect("provision named");
+    let build_pos = brief.find("build").expect("build named");
+    let deploy_pos = brief.find("deploy").expect("deploy named");
+    assert!(provision_pos < build_pos && build_pos < deploy_pos);
+    assert!(
+        brief.to_lowercase().contains("clean run"),
+        "a fully clean campaign must read as a clean success: {brief}"
+    );
+    assert_eq!(
+        transport.calls().len(),
+        1,
+        "the rendered digest must be dispatched to CONTENT_PIPELINE exactly once"
+    );
+}
+
+/// Fixture (b) — THE LOAD-BEARING TEST. Per carryover
+/// `gate-scope-must-be-shown-capable-of-failing`: a check whose inputs
+/// both come from the artifact under test returns the same green a real
+/// check returns, so this test does not merely assert the real renderer
+/// names the bail — it separately builds "a renderer that omits the bail"
+/// (a hand-stripped brief string with the reason text removed) and shows
+/// `brief_names_every_bail` return `false` against it. That demonstrates
+/// the check can fail before trusting that it passing on the real
+/// renderer means anything.
+#[tokio::test]
+async fn debrief_fixture_bailed_campaign_names_the_bail_and_the_check_is_shown_capable_of_failing()
+{
+    let campaign_id = Uuid::new_v4();
+    let campaign = campaign_id.to_string();
+    let rows = vec![
+        debrief_row(
+            &campaign,
+            "build",
+            engine_contract::JournalDecisionKind::StepIntegrated,
+            "ok",
+            0,
+        ),
+        debrief_row(
+            &campaign,
+            "publish",
+            engine_contract::JournalDecisionKind::StepBailed,
+            "publish target unreachable: connection refused",
+            5,
+        ),
+    ];
+
+    // (1) The real renderer, run end to end through the registered
+    // workflow, names the bail and its reason and does NOT read clean.
+    let (brief, _transport) = run_debrief_workflow(campaign_id, rows.clone()).await;
+    assert!(brief.contains("publish"));
+    assert!(brief.contains("publish target unreachable: connection refused"));
+    assert!(
+        !brief.to_lowercase().contains("clean run"),
+        "a bailed campaign must not read as a clean success: {brief}"
+    );
+
+    // (2) DEMONSTRATION the check is capable of failing: a renderer that
+    // omits the bail's reason text must be rejected by
+    // `brief_names_every_bail`, the same function `DebriefNode::process`
+    // gates on before writing a row.
+    let renderer_that_hides_the_failure =
+        "2 step(s) ran:\n- [build] integrated: ok\n- [publish] BAILED".to_string();
+    assert!(
+        !brief_names_every_bail(&renderer_that_hides_the_failure, &rows),
+        "the bail-naming check must be able to return false, not just true"
+    );
+}
+
+/// Fixture (c): an operator-waiting item. An operator hold that is still
+/// open when a campaign is otherwise finished is recorded as a
+/// `GateRefused` journal row (mirrors `integrate.rs`'s "operator hold
+/// deadline exceeded" write path) — this test asserts that row's reason
+/// text survives into the rendered brief, not silently dropped.
+#[tokio::test]
+async fn debrief_fixture_operator_waiting_item_survives_into_the_brief() {
+    let campaign_id = Uuid::new_v4();
+    let campaign = campaign_id.to_string();
+    let rows = vec![
+        debrief_row(
+            &campaign,
+            "review",
+            engine_contract::JournalDecisionKind::StepIntegrated,
+            "ok",
+            0,
+        ),
+        debrief_row(
+            &campaign,
+            "ship",
+            engine_contract::JournalDecisionKind::GateRefused,
+            "waiting on operator clearance: block still under an operator hold",
+            5,
+        ),
+    ];
+
+    let (brief, _transport) = run_debrief_workflow(campaign_id, rows).await;
+
+    assert!(brief.contains("ship"));
+    assert!(brief.contains("waiting on operator clearance: block still under an operator hold"));
+}
+
+/// Fixture (d): an empty campaign — zero journal rows — produces a brief
+/// saying nothing ran, never an empty or absent response, and a
+/// `DebriefRendered` row is still written (AC3).
+#[tokio::test]
+async fn debrief_fixture_empty_campaign_says_nothing_ran_not_empty_or_absent() {
+    let campaign_id = Uuid::new_v4();
+
+    let (brief, transport) = run_debrief_workflow(campaign_id, vec![]).await;
+
+    assert!(!brief.is_empty());
+    assert!(brief.to_lowercase().contains("no steps ran"));
+    assert_eq!(
+        transport.calls().len(),
+        1,
+        "even an empty campaign dispatches its (non-empty) brief"
+    );
+}
+
+/// AC6 / the EN.12.F decoupling: a debrief renders for a campaign produced
+/// by an ORDINARY explicit-block-list chain (`resolve_explicit_chain` +
+/// `integrate_chain_with_dispatch`, no `dispatch`-kind step anywhere) —
+/// with no conductor present anywhere in the fixture. The real journal
+/// rows that chain produces are fed straight into a `StubJournalReader`
+/// and rendered through the registered `DEBRIEF` workflow.
+#[tokio::test]
+async fn debrief_renders_for_a_campaign_produced_by_an_explicit_block_list_chain_with_no_conductor()
+{
+    let (_repos_dir, registry) = two_repo_registry();
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("debrief-no-conductor");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let campaign_id = Uuid::new_v4();
+    let (sink, rows) = recording_journal_sink();
+    let sink_fn = sink.clone();
+    // No dispatch-kind steps and no workflow keys registered — an
+    // ordinary two-block chain, exactly the shape produced by a plain
+    // `/orchestrate` run with no conductor anywhere.
+    let dispatcher = Dispatcher::new();
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+
+    integrate_chain_with_dispatch(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(1),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        roadmap_dir.as_path(),
+        None,
+        &|_: &StepProgress| {},
+        false,
+        campaign_id,
+        Some(&move |row| sink_fn(row)),
+        &dispatcher,
+    )
+    .await
+    .expect("an ordinary explicit-block-list chain with no conductor must integrate cleanly");
+
+    let campaign_rows: Vec<engine_contract::JournalRow> = rows.lock().unwrap().clone();
+    assert!(
+        !campaign_rows.is_empty(),
+        "the chain must have produced real journal rows to feed the debrief"
+    );
+    assert!(
+        campaign_rows
+            .iter()
+            .all(|r| !r.step.to_uppercase().contains("CONDUCTOR")),
+        "no step in this fixture may resemble a conductor: {campaign_rows:?}"
+    );
+
+    let (brief, transport) = run_debrief_workflow(campaign_id, campaign_rows).await;
+
+    assert!(brief.contains("A.1"));
+    assert!(brief.contains("B.1"));
+    assert!(
+        !brief.to_uppercase().contains("CONDUCTOR"),
+        "the rendered brief must not reference a conductor: {brief}"
+    );
+    assert_eq!(transport.calls().len(), 1);
 }

@@ -41,6 +41,13 @@ pub enum JournalDecisionKind {
     /// branch taken is carried in `detail` alongside the recall result that
     /// caused it, never inferred from the absence of a row.
     RecallConsulted,
+    /// A morning brief was rendered from a finished campaign's journal rows
+    /// (`DEBRIEF`, EN.12.G). `detail` carries `{ brief, row_count,
+    /// bailed_steps }` — the brief text itself, how many rows it summarised,
+    /// and the bailed-step reasons it must name (AC2). This IS the brief:
+    /// AC4 requires it retrievable over the same `GET /campaigns/{id}/journal`
+    /// route family as the raw rows, with no second derivation.
+    DebriefRendered,
 }
 
 /// One row of the durable run journal.
@@ -105,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_decision_kinds_round_trip() {
+    fn all_eight_decision_kinds_round_trip() {
         let kinds = [
             JournalDecisionKind::StepIntegrated,
             JournalDecisionKind::StepBailed,
@@ -114,6 +121,7 @@ mod tests {
             JournalDecisionKind::BudgetHalted,
             JournalDecisionKind::ResolvedPolicy,
             JournalDecisionKind::RecallConsulted,
+            JournalDecisionKind::DebriefRendered,
         ];
         for kind in kinds {
             let row = sample_row(kind);
@@ -137,6 +145,14 @@ mod tests {
         assert_eq!(kind_json, "\"recall_consulted\"");
         let round_tripped: JournalDecisionKind = serde_json::from_str(&kind_json).unwrap();
         assert_eq!(round_tripped, JournalDecisionKind::RecallConsulted);
+    }
+
+    #[test]
+    fn debrief_rendered_serializes_to_snake_case_wire_string() {
+        let kind_json = serde_json::to_string(&JournalDecisionKind::DebriefRendered).unwrap();
+        assert_eq!(kind_json, "\"debrief_rendered\"");
+        let round_tripped: JournalDecisionKind = serde_json::from_str(&kind_json).unwrap();
+        assert_eq!(round_tripped, JournalDecisionKind::DebriefRendered);
     }
 
     #[test]

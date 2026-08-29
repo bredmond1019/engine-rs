@@ -269,6 +269,11 @@ mod tests {
             // `read_checkpoint` take `&Path`/`Uuid`/`&Checkpoint`, never a
             // bare `&str` runner name.
             ("checkpoint.rs", &[]),
+            // No string-typed pub fn: `JournalReader::rows_for_campaign` takes
+            // a `&Uuid`, and `StubJournalReader`'s constructors take owned
+            // `Vec<JournalRow>` / `impl Into<String>` test-double config, not
+            // a runner-name escape hatch.
+            ("debrief.rs", &["brief_names_every_bail"]),
             // `resolve_depends_on`/`is_edge_met` take a repo slug + block id,
             // `is_block_open` takes an opaque HELD-UNTIL token — corpus lookups keyed
             // by identifier, not a runner-name escape hatch.

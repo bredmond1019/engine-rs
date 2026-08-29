@@ -644,13 +644,15 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   (`hold_poll_interval_ms`) never rewires which node runs, so there is no `registry_for_policy`
   variant to choose between at dispatch time — `engine_core::workflows::orchestration::graph::registry`
   is the only registry the workflow ever runs under — and `register_builtin_workflows` now
-  populates fifteen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
+  populates seventeen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
   `register_sdlc_task`/`register_sdlc_task_with_registry`, mirroring `SDLC_FLOW`'s;
   `register_deliverable_render` (`DELIVERABLE_RENDER`, `EN.4.D` task 5) and
   `register_linkedin_post` (`LINKEDIN_POST`, `EN.5.G` task 6) both follow the same
   `PolicyConfigSource::Builtin` shape as the other channel/API-triggered workflows — see
   [deliverable-render-workflow.md](workflows/deliverable-render.md) and
-  [linkedin-post-workflow.md](workflows/linkedin-post.md)).
+  [linkedin-post-workflow.md](workflows/linkedin-post.md); `register_recall` (`RECALL`, `EN.12.L`)
+  and `register_debrief` (`DEBRIEF`, `EN.12.G`) are the two most recent additions, both
+  no-policy single-node micro-workflows — see the Journal section below).
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
@@ -737,7 +739,8 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   log distinct from the `events` snapshot table: `JournalRow` (`engine-contract`) wraps a
   `JournalDecisionKind` (`StepIntegrated`, `StepBailed`, `GateRefused`,
   `StateWriteVerificationFailed`, `BudgetHalted`, `ResolvedPolicy`, `RecallConsulted` — `EN.12.L`,
-  added when a `RECALL` dispatch step's result branches the chain, see below) plus a kind-specific
+  added when a `RECALL` dispatch step's result branches the chain, see below —, `DebriefRendered` —
+  `EN.12.G`, written by the `DEBRIEF` workflow once it renders a campaign's brief, see below) plus a kind-specific
   `serde_json::Value` detail payload, written via `engine_store::insert_journal_row` and read back
   ordered by `(campaign_id, created_at ASC)` via `list_journal_rows_for_campaign`.
   `integrate_chain_with_journal` (`engine-core::workflows::orchestration::integrate`) is the new
@@ -767,6 +770,25 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   (no lane-log entry, no checkpoint write) rather than running it. A `RECALL` step that itself
   fails still bails the chain the same way any other failing step does; only an empty result set
   skips.
+- `DEBRIEF` (`crates/engine-core/src/workflows/orchestration/debrief.rs`, `EN.12.G`) — a
+  single-node workflow (`DebriefNode`, both start and terminal, built by `graph::debrief_schema`/
+  `graph::debrief_registry`) that renders a morning brief from one campaign's journal. The
+  campaign id is the only input (`ctx.event`, same bare-string-or-object two-shape extraction as
+  `RecallNode::resolve_query`); `DebriefNode` reads that campaign's rows through the injectable
+  `JournalReader` seam (`engine-core` cannot call `engine_store` directly — same reasoning as
+  `HttpGet`/`HttpPost` — so `engine-serve::journal::journal_reader_live` is the only production
+  implementation), renders one deterministic text digest naming every bail's reason (`render_brief`
+  / `brief_names_every_bail`), dispatches that digest to `CONTENT_PIPELINE` over the existing
+  `ChannelTransport` seam (fire-and-forget, like every other `OutboundBody::TriggerWorkflow`
+  caller), and **separately, synchronously** writes the same digest back as a
+  `JournalDecisionKind::DebriefRendered` row via the injected `JournalSinkFn` — so what
+  `GET /campaigns/{id}/journal` returns is exactly the text this node produced, not whatever the
+  fire-and-forget `CONTENT_PIPELINE` run does with it. `register_debrief`
+  (`crates/engine-serve/src/workflows.rs`) wires the live `JournalReader` (`journal_reader_live`,
+  called with `None` — a `Dispatcher` factory closure runs before `AppState`'s Postgres pool
+  exists, so it self-skips to an empty campaign, same gap `ORCHESTRATION` documents) and the live
+  `ChannelTransport`, so `DEBRIEF` is directly dispatchable via `POST /events/` with
+  `workflow_type: "DEBRIEF"` and no conductor, chain, roadmap, or lane involved.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
