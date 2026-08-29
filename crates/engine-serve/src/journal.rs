@@ -19,8 +19,13 @@
 //! clean `404`, never a `500`. This mirrors `crate::resume::rehydrate_from_store`,
 //! which returns `None` on a missing pool so its caller 404s uniformly.
 
+use std::sync::Arc;
+
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use async_trait::async_trait;
 use engine_contract::{JournalDecisionKind, JournalRow};
+use engine_core::workflows::orchestration::debrief::JournalReader;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::http::{check_api_key, AppState};
@@ -282,6 +287,60 @@ pub fn render_review_md(campaign_id: &Uuid, rows: &[JournalRow], meta: &RunRecor
     out
 }
 
+// ---------------------------------------------------------------------------
+// EN.12.G task 1 — the live `JournalReader` seam.
+//
+// `engine-core` depends only on `engine-contract` and cannot call
+// `engine_store::list_journal_rows_for_campaign` directly, so the debrief
+// (`engine_core::workflows::orchestration::debrief`) reads through an
+// injectable trait. This is the one production implementation, over the
+// same `engine_store` function the read route above already uses.
+// ---------------------------------------------------------------------------
+
+/// The live [`JournalReader`]: reads a campaign's rows through
+/// `engine_store::list_journal_rows_for_campaign` over an optional pool.
+///
+/// Self-skips exactly like the read route above and the durable write path
+/// (`crate::durable::spawn_durable_writer`'s pool-is-`None` branch) when no
+/// `DATABASE_URL` is configured: `rows_for_campaign` returns an empty `Vec`
+/// rather than an error, since "no pool configured" is a deployment fact,
+/// not a per-campaign read failure — a debrief run against it should render
+/// "nothing ran" rather than fail the node outright.
+#[derive(Clone)]
+pub struct LiveJournalReader {
+    pool: Option<PgPool>,
+}
+
+impl LiveJournalReader {
+    #[must_use]
+    pub fn new(pool: Option<PgPool>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl JournalReader for LiveJournalReader {
+    async fn rows_for_campaign(&self, campaign_id: &Uuid) -> Result<Vec<JournalRow>, String> {
+        let Some(pool) = self.pool.as_ref() else {
+            // No DATABASE_URL configured: mirror the durable write path's
+            // self-skip discipline rather than erroring.
+            return Ok(Vec::new());
+        };
+
+        engine_store::list_journal_rows_for_campaign(pool, &campaign_id.to_string())
+            .await
+            .map_err(|err| format!("journal read failed for campaign {campaign_id}: {err}"))
+    }
+}
+
+/// Convenience constructor: an `Arc<dyn JournalReader>` wrapping
+/// [`LiveJournalReader`], for `engine-serve`'s `register_debrief` (task 4)
+/// to wire into `DebriefNode`.
+#[must_use]
+pub fn journal_reader_live(pool: Option<PgPool>) -> Arc<dyn JournalReader> {
+    Arc::new(LiveJournalReader::new(pool))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -301,6 +360,21 @@ mod tests {
             "test-key".to_string(),
         )
         .build()
+    }
+
+    /// EN.12.G task 1: with no pool configured, `LiveJournalReader`
+    /// self-skips to an empty `Vec` rather than an error — the same
+    /// discipline `get_campaign_journal`'s pool-is-`None` branch applies.
+    #[tokio::test]
+    async fn live_journal_reader_self_skips_to_empty_rows_with_no_pool() {
+        let reader = super::journal_reader_live(None);
+
+        let rows = reader
+            .rows_for_campaign(&Uuid::new_v4())
+            .await
+            .expect("self-skip returns Ok, not Err");
+
+        assert!(rows.is_empty());
     }
 
     /// `RecallConsulted` renders `DONE` (an observation, not an open item

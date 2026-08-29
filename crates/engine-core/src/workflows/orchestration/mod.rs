@@ -46,10 +46,15 @@
 //!   workflow key (`RESEARCH_AGENT`, `CONTENT_PIPELINE`, ...) and runs it as
 //!   one chain step, never selecting an [`engine_kind::EngineKind`] and never
 //!   falling through to a block invocation for an unregistered key.
+//! - [`debrief`] (`EN.12.G` Task 1) — the `DEBRIEF` workflow: a `JournalReader`
+//!   seam (`engine-core` cannot depend on `engine-store`) plus the
+//!   hermetic `StubJournalReader` test double every debrief test runs
+//!   against. `DebriefNode` itself lands in task 3.
 
 pub mod chain;
 pub mod checkpoint;
 pub mod corpus_gates;
+pub mod debrief;
 pub mod dispatch;
 pub mod engine_kind;
 pub mod execute;
