@@ -13,7 +13,7 @@ related: [architecture, proposal-generator-workflow, sdlc-flow-policy, data-cont
 # Deliverable Render Workflow
 
 `DELIVERABLE_RENDER` (block `EN.4.D`) turns an already-written `AutomationRoadmap` (the
-structured output of [`PROPOSAL_GENERATOR`](proposal-generator-workflow.md), `EN.4.C`) into the
+structured output of [`PROPOSAL_GENERATOR`](proposal-generator.md), `EN.4.C`) into the
 client-facing deliverable: a locale-correct markdown file, then a PDF rendered from it by the
 `typst` CLI. It does not write or research anything — the roadmap arrives inline on the event —
 so both of its nodes are deterministic; no model runs on the default path.
@@ -173,7 +173,7 @@ Trigger the same way as any other workflow — `POST /events` with `"workflow_ty
 "DELIVERABLE_RENDER"` and the event body from [Quickstart](#quickstart) above; dispatch resolves
 policy once at dispatch time (`PolicyConfigSource::Builtin` — channel/API-shaped, no repo
 checkout) and seeds it into `ctx.nodes` under `policy::RESOLVED_POLICY_IDENTITY`, same as every
-other builtin registration (see [architecture.md](architecture.md) § dispatch).
+other builtin registration (see [architecture.md](../architecture.md) § dispatch).
 
 On success, `ctx.nodes["RenderDeliverableNode"]` and `ctx.nodes["RenderPdfNode"]` each carry
 `{ "markdown_path", "pdf_path", "company_slug" }` (`RenderPdfNode`'s copy recomputed
@@ -182,12 +182,12 @@ files exist on disk at those paths under `event.output_dir`.
 
 ## See also
 
-- [proposal-generator-workflow.md](proposal-generator-workflow.md) — produces the
+- [proposal-generator-workflow.md](proposal-generator.md) — produces the
   `AutomationRoadmap` this workflow renders, including the `authored_locale` stamp this
   workflow's refusal checks against.
 - [sdlc-flow-policy.md](sdlc-flow-policy.md) — the shared `Policy` framework (four-layer
   resolution, profile bundles) this workflow's policy surface is built on.
-- [architecture.md](architecture.md) — dispatch, `register_builtin_workflows`, and the
+- [architecture.md](../architecture.md) — dispatch, `register_builtin_workflows`, and the
   `PolicyConfigSource::Builtin` vs. `Worktree` split.
-- [testing.md](testing.md) — the single-integration-test-binary layout this workflow's e2e
+- [testing.md](../testing.md) — the single-integration-test-binary layout this workflow's e2e
   suite (`tests/it/deliverable_render_e2e.rs`) follows.

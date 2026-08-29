@@ -46,8 +46,8 @@ no-op is the only cost control.
 | `ResearchModeRouterNode` | Deterministic router | Deserializes the event into `ResearchAgentEventSchema`; routes to `CompanyResearchNode` for `mode: "company"`, `ProspectingResearchNode` for `mode: "prospecting"`, or `None` for an invalid/malformed event. |
 | `CompanyResearchNode` | **Model** (Sonnet by default, tunable via policy) | Wraps `ClaudeCodeStep` with `WebSearch`/`WebFetch` tools granted and a `CompanyBrief` `json_schema`. Resolves the run's `ResearchAgentPolicy`, applies research-stage tier/prompt-cache/verbosity/contact-acquisition shaping, parses the reply into a `CompanyBrief`, deterministically stamps `company_url` from the trigger event when the model omitted it, stamps it + usage onto `ctx`, and persists `research-agent-state.json`. |
 | `ProspectingResearchNode` | **Model** (Sonnet by default, tunable via policy) | Same shape as `CompanyResearchNode` for the `prospect` stage: resolves policy, applies shaping, runs a `WebSearch`-backed sweep, parses a `ProspectingResult`, stamps `ctx` + usage, and persists `research-agent-state.json`. |
-| `MaterializeDocNode` (`EN.7.B`) | Deterministic writer | Configured with model `"opportunity"` and an ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference — exactly one of the two runs per event, so it reads whichever is present. Writes/updates the resulting `CompanyBrief`/`ProspectingResult` into the Brain corpus as an Opportunity `.md` document via `mev`'s `plan_ingest` (kind auto-detected from the payload shape — no adapter node needed), including the `company_url` -> `url` and `sources[]` -> `links[]` lifting (see [Source-link and contact lifting](#source-link-and-contact-lifting) below). See [materialize-doc-node.md](materialize-doc-node.md). |
-| `MergeContactsNode` (`EN.4.E`) | Deterministic writer | Configured with the same ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference as `MaterializeDocNode` and an unset brain root (resolves the same way). Collects the `contacts[]` the research node surfaced (per-brief for company mode, unioned across every `ProspectLead` for prospecting mode) and, when non-empty, calls the injectable `DocMaterializer::edit_opportunity` seam with `OpportunityEdit::MergeContacts` — routed by `MevDocMaterializer` to `mev::doc::opportunity::plan_merge_contacts`. An empty collected list short-circuits to a stamped no-op result with **no** seam call — see [Contacts: extraction contract and the two-step write](#contacts-extraction-contract-and-the-two-step-write). See [materialize-doc-node.md § `OpportunityEdit`](materialize-doc-node.md#the-docmaterializer-seam). |
+| `MaterializeDocNode` (`EN.7.B`) | Deterministic writer | Configured with model `"opportunity"` and an ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference — exactly one of the two runs per event, so it reads whichever is present. Writes/updates the resulting `CompanyBrief`/`ProspectingResult` into the Brain corpus as an Opportunity `.md` document via `mev`'s `plan_ingest` (kind auto-detected from the payload shape — no adapter node needed), including the `company_url` -> `url` and `sources[]` -> `links[]` lifting (see [Source-link and contact lifting](#source-link-and-contact-lifting) below). See [materialize-doc-node.md](../materialize-doc-node.md). |
+| `MergeContactsNode` (`EN.4.E`) | Deterministic writer | Configured with the same ordered `with_source_nodes(["CompanyResearchNode", "ProspectingResearchNode"])` preference as `MaterializeDocNode` and an unset brain root (resolves the same way). Collects the `contacts[]` the research node surfaced (per-brief for company mode, unioned across every `ProspectLead` for prospecting mode) and, when non-empty, calls the injectable `DocMaterializer::edit_opportunity` seam with `OpportunityEdit::MergeContacts` — routed by `MevDocMaterializer` to `mev::doc::opportunity::plan_merge_contacts`. An empty collected list short-circuits to a stamped no-op result with **no** seam call — see [Contacts: extraction contract and the two-step write](#contacts-extraction-contract-and-the-two-step-write). See [materialize-doc-node.md § `OpportunityEdit`](../materialize-doc-node.md#the-docmaterializer-seam). |
 | `ResearchIngressDispatchNode` (`EN.6.E`) | Deterministic dispatcher | **The graph's terminal node.** Gated by the resolved `ingress_dispatch` knob (default `enabled: false`, a behavior-stable no-op that stamps `skipped: true`). When enabled, wraps the run's finished research output (whichever of `CompanyResearchNode`/`ProspectingResearchNode` ran) as an `IngressEnvelope` and sends one `TriggerWorkflow` action through the injectable `ChannelTransport` egress seam (`EN.6.A`) into `dispatch.target_workflow_type` (`"CONTENT_PIPELINE"` by default) — closing the self-feeding research-to-content loop. The `envelope_id` is derived deterministically (`ctx.metadata["envelope_id"]` when present, else `research-agent:{path MaterializeDocNode stamped}` — never `Uuid::new_v4()`), so re-dispatching the same input is idempotent at the correlation-key level. A materialize that legitimately planned zero actions (no path to derive an `envelope_id` from) is treated as a soft skip, not a run failure. A transport error is recorded as a `delivered: false` receipt, never a `NodeError` — this node never fails the run. See [Self-feeding dispatch: `ResearchIngressDispatchNode`](#self-feeding-dispatch-researchingressdispatchnode) below. |
 
 ### Behaviour change: a served run now requires a resolvable brain root
@@ -299,7 +299,7 @@ clobber a human-edited note. That policy stays owned by mev, not duplicated here
 **Slug derivation** for the merge call uses `okf_core::derive_slug` over the same title the ingest
 mapping uses (`company_name` for company mode, `"{vertical} — Prospecting Sweep"` for prospecting)
 — not `MaterializeDocNode`'s stamped `paths`, because mev's idempotency guard zero-stamps `paths`
-when content is unchanged (see [materialize-doc-node.md](materialize-doc-node.md)), which would
+when content is unchanged (see [materialize-doc-node.md](../materialize-doc-node.md)), which would
 lose the slug on a re-run.
 
 **A zero-contact run is a success, not a partial failure.** When `MergeContactsNode` collects an
@@ -339,7 +339,7 @@ pub enum OpportunityEdit {
 
 `MevDocMaterializer` routes `MergeContacts` to `mev::doc::opportunity::plan_merge_contacts`;
 `StubDocMaterializer` records it the same way it records `SetStage`/`AddAction`, for tests. See
-[materialize-doc-node.md](materialize-doc-node.md#the-docmaterializer-seam) for the seam's full
+[materialize-doc-node.md](../materialize-doc-node.md#the-docmaterializer-seam) for the seam's full
 shape.
 
 ## Self-feeding dispatch: `ResearchIngressDispatchNode`
@@ -357,7 +357,7 @@ shape.
   `delivered: false` receipt via the shared `receipt_from_send_result` helper, not a `NodeError`),
   and the same live-transport default (`channel_transport_live`, targeting the shared
   `channel_transport::DEFAULT_EVENTS_URL` placeholder until a deployment's `ENGINE_EVENTS_URL` is
-  wired — see [content-pipeline-workflow.md](content-pipeline-workflow.md) for `ActionDispatchNode`'s
+  wired — see [content-pipeline-workflow.md](content-pipeline.md) for `ActionDispatchNode`'s
   identical convention).
 - **Policy resolution.** Reads the same `ctx.nodes[RESOLVED_POLICY_IDENTITY]` stamp the two
   terminal research nodes read via `crate::policy::resolved_policy_strict`, so a served run's
@@ -511,7 +511,7 @@ for the reader/precedence mechanics, identical here).
 ## How to trigger a run
 
 Same HTTP surface as every other `engine-serve` workflow (`docs/cli.md`; see
-[sdlc-flow-workflow.md](sdlc-flow-workflow.md#how-to-trigger-a-run) for the full auth/mounting
+[sdlc-flow-workflow.md](sdlc-flow.md#how-to-trigger-a-run) for the full auth/mounting
 story):
 
 ```
@@ -547,7 +547,7 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
 - **`ctx.nodes["MaterializeDocNode"]`** — the ingest write's result stamp:
   `{materialized, dry_run, model: "opportunity", paths, warnings}`, naming the Opportunity `.md`
   path written or updated under `business/docs/opportunities/`. See
-  [materialize-doc-node.md § Result stamp](materialize-doc-node.md#result-stamp).
+  [materialize-doc-node.md § Result stamp](../materialize-doc-node.md#result-stamp).
 - **`ctx.nodes["MergeContactsNode"]`** — the contact-merge's result stamp, mirroring
   `MaterializeDocNode`'s shape. On the normal zero-contact path this reports a stamped no-op (no
   `DocMaterializer` call made); when contacts were collected, it reports the same
@@ -567,15 +567,15 @@ has run; `GET /workflows/RESEARCH_AGENT/graph` returns the declared schema above
   back to `std::env::current_dir()` otherwise.
 - **Out of scope for this block**: intake extraction (EN.4.B), PDF render (EN.4.D — not yet
   built). Proposal generation (EN.4.C, built) reuses `CompanyResearchNode`, re-exported from
-  `workflows::research_agent` — see [proposal-generator-workflow.md](proposal-generator-workflow.md).
+  `workflows::research_agent` — see [proposal-generator-workflow.md](proposal-generator.md).
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
   only acquires and reasons and writes the repo-tracked source `.md` document via `mev`
   in-process (`MaterializeDocNode`, D53's fourth boundary-test channel); Synapse still owns the
   derived index (embeddings, `brain_edges`, retrieval) over whatever gets written here — see
-  [materialize-doc-node.md § Why this node exists](materialize-doc-node.md#why-this-node-exists-d53s-fourth-boundary-test-channel).
+  [materialize-doc-node.md § Why this node exists](../materialize-doc-node.md#why-this-node-exists-d53s-fourth-boundary-test-channel).
   Editing an already-written opportunity's `stage`/`actions[]` after this run completes is the
   separate `OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION` micro-workflows — see
-  [opportunity-edit-workflows.md](opportunity-edit-workflows.md).
+  [opportunity-edit-workflows.md](opportunity-edit.md).
 - **Hermetic test coverage**: `crates/engine-core/tests/research_agent_e2e.rs` drives both modes
   end-to-end against a stubbed transport and a stubbed `MaterializeDocNode` (no real corpus write),
   asserts `registry_for_policy` never rewires to `local`, and asserts dispatcher registration

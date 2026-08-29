@@ -91,18 +91,22 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use engine_contract::{NodeRun, NodeRunStatus};
+use engine_contract::{JournalDecisionKind, JournalRow, NodeRun, NodeRunStatus};
 use engine_core::budget::Budget;
 use engine_core::cancellation::CancellationToken;
+use engine_core::nodes::{RecallNode, StubHttpGet, RECALL_NODE_NAME};
 use engine_core::repo_registry::RepoRegistry;
-use engine_core::workflows::orchestration::chain::resolve_explicit_chain;
+use engine_core::workflows::orchestration::chain::{resolve_explicit_chain, ChainStep, StepKind};
 use engine_core::workflows::orchestration::execute::{
     execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowInvocation, FlowRunner,
 };
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
 use engine_core::workflows::orchestration::integrate::{
-    integrate_chain, verify_state_write, IntegrateError, LaneLogStatus, NeverHeld, StepProgress,
+    integrate_chain, integrate_chain_with_dispatch, verify_state_write, IntegrateError,
+    LaneLogStatus, NeverHeld, StepProgress,
 };
+use engine_core::workflows::recall::RECALL_WORKFLOW_TYPE;
+use engine_core::{BrainConfig, Dispatcher, HttpGet, NodeRegistry, Workflow};
 
 // ── Git process helpers ──────────────────────────────────────────────────
 
@@ -1490,5 +1494,271 @@ async fn planning_symlink_still_resolves_into_its_vault_after_the_merge_stage() 
         target,
         vault.path(),
         "planning symlink must still resolve into its original vault tempdir"
+    );
+}
+
+// ── `EN.12.L` task 5: `[dispatch RECALL, block]` branches on the brain's answer ──
+//
+// AC4's load-bearing test. Drives the REAL `RecallNode` over the injectable
+// `StubHttpGet` seam (never `RecallStubNode`, which `integrate.rs`'s own
+// task-4 unit tests use to isolate the branching logic from the HTTP
+// transport) through the actual `RECALL` registered workflow
+// (`engine_core::workflows::recall`), end to end via
+// `integrate_chain_with_dispatch` — the one public entry point that can
+// integrate a mixed `[dispatch, block]` chain at all. Hermetic: the stub
+// never contacts a live Brain, matching how `PersistToBrainNode` is tested
+// and D23's Consequences.
+
+/// A one-node stand-in that seeds a fixed, non-empty query string onto
+/// `ctx.nodes` before the real `RecallNode` runs. `integrate_chain_with_
+/// dispatch` hands every dispatch step's factory the same fixed `{}`
+/// event (`integrate.rs`, `EN.12.L` task 4) — a real, unbound `RecallNode`
+/// reading `ctx.event` directly would therefore always fail to resolve a
+/// query before it ever reaches the `HttpGet` seam under test, regardless
+/// of the stubbed recall body. This node stands in for whatever upstream
+/// step supplies the query in a real deployment, so `RecallNode::
+/// with_input_from` — its existing, already-shipped bound-query path — has
+/// something to read, and the test actually exercises the real node's HTTP
+/// round trip rather than being unable to reach it at all.
+struct QuerySeedNode;
+
+#[async_trait::async_trait]
+impl engine_core::Node for QuerySeedNode {
+    async fn process(
+        &self,
+        mut ctx: engine_contract::TaskContext,
+    ) -> Result<engine_contract::TaskContext, engine_core::NodeError> {
+        ctx.nodes.insert(
+            "QuerySeed".to_string(),
+            serde_json::json!({ "query": "stub-query" }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "QuerySeed"
+    }
+}
+
+/// A `Dispatcher` with `RECALL_WORKFLOW_TYPE` registered against a real
+/// `RecallNode` (bound to [`QuerySeedNode`]'s output, per its module doc)
+/// whose `HttpGet` seam is `http_get` — a `StubHttpGet` in every case
+/// below, so the gated suite never contacts a live Brain.
+fn recall_dispatcher(http_get: Arc<dyn HttpGet>) -> Dispatcher {
+    let mut dispatcher = Dispatcher::new();
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        "QuerySeed".to_string(),
+        engine_core::NodeConfig::new("QuerySeed", vec![RECALL_NODE_NAME.to_string()]),
+    );
+    nodes.insert(
+        RECALL_NODE_NAME.to_string(),
+        engine_core::NodeConfig::new(RECALL_NODE_NAME, vec![]),
+    );
+    let schema = engine_core::WorkflowSchema::new(RECALL_WORKFLOW_TYPE, "QuerySeed", nodes);
+    dispatcher.register(
+        schema.clone(),
+        Box::new(move |_event: &serde_json::Value| {
+            let mut registry = NodeRegistry::new();
+            registry.register(Box::new(QuerySeedNode));
+            registry.register(Box::new(
+                RecallNode::new(BrainConfig::new("http://stub.invalid", None))
+                    .with_input_from("QuerySeed")
+                    .with_http_get(http_get.clone()),
+            ));
+            Ok(Workflow::new(registry, schema.clone()))
+        }),
+    );
+    dispatcher
+}
+
+/// A recall-shaped body with `count` results, each carrying an ascending
+/// `score` — mirrors the fixture shape `crates/engine-core/tests/fixtures/
+/// recall_response.json` pins, field-for-field, so the stub body a real
+/// `RecallResponse` deserializes cleanly.
+fn recall_body(count: usize) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = (0..count)
+        .map(|i| {
+            serde_json::json!({
+                "doc_id": null,
+                "file_path": "docs/example.md",
+                "title": null,
+                "section": null,
+                "content": "example content",
+                "score": 0.5 + i as f64 * 0.1,
+                "via": "semantic",
+            })
+        })
+        .collect();
+    serde_json::json!({ "query": "stub-query", "count": count, "results": results })
+}
+
+fn recall_dispatch_step(repo: &str) -> ChainStep {
+    ChainStep {
+        repo: repo.to_string(),
+        block_id: RECALL_WORKFLOW_TYPE.to_string(),
+        kind: StepKind::Dispatch,
+        ..Default::default()
+    }
+}
+
+fn block_step(repo: &str, block_id: &str) -> ChainStep {
+    ChainStep {
+        repo: repo.to_string(),
+        block_id: block_id.to_string(),
+        kind: StepKind::Block,
+        ..Default::default()
+    }
+}
+
+type RecordingJournalSink = (
+    Arc<dyn Fn(JournalRow) + Send + Sync>,
+    Arc<Mutex<Vec<JournalRow>>>,
+);
+
+fn recording_journal_sink() -> RecordingJournalSink {
+    let rows: Arc<Mutex<Vec<JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = rows.clone();
+    let sink: Arc<dyn Fn(JournalRow) + Send + Sync> = Arc::new(move |row: JournalRow| {
+        recorder.lock().unwrap().push(row);
+    });
+    (sink, rows)
+}
+
+/// Run a `[dispatch RECALL, block]` chain once against `http_get`, returning
+/// the `ExecutionOutcome`s and the recorded journal rows — the shared driver
+/// for the two "different brain answer, different outcome" cases below, so
+/// the only thing that differs between them is the stubbed body.
+async fn run_recall_then_block_chain(
+    http_get: Arc<dyn HttpGet>,
+) -> Result<(Vec<ExecutionOutcome>, Vec<JournalRow>), IntegrateError> {
+    let (_brain_root, _bare_root, registry, _repo_path) = single_repo_fixture("recall-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-12-l-task5");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+    let dispatcher = recall_dispatcher(http_get);
+    let (sink, rows) = recording_journal_sink();
+    let sink_fn = sink.clone();
+
+    let chain = vec![
+        recall_dispatch_step("recall-repo"),
+        block_step("recall-repo", "B1"),
+    ];
+
+    let outcomes = integrate_chain_with_dispatch(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+        Some(&move |row: JournalRow| sink_fn(row)),
+        &dispatcher,
+    )
+    .await?;
+
+    let recorded = rows.lock().unwrap().clone();
+    Ok((outcomes, recorded))
+}
+
+/// The load-bearing AC4 test: the SAME `[dispatch RECALL, block]` chain,
+/// run twice, differing ONLY in the stubbed recall body — an empty
+/// `results` array vs. a one-result array. The second step runs in one
+/// case and is skipped in the other; the `RecallConsulted` row's `branch`
+/// field distinguishes the two runs and is recorded before the following
+/// step's own journal row.
+#[tokio::test]
+async fn a_recall_then_block_chain_takes_a_different_branch_on_a_different_recall_body() {
+    let empty_stub: Arc<dyn HttpGet> = Arc::new(StubHttpGet::succeeding(recall_body(0)));
+    let (empty_outcomes, empty_rows) = run_recall_then_block_chain(empty_stub)
+        .await
+        .expect("an empty recall result must skip the next step, not fail the chain");
+
+    assert!(
+        empty_outcomes.is_empty(),
+        "the skipped block step must produce no ExecutionOutcome: {empty_outcomes:?}"
+    );
+    let empty_recall_row = empty_rows
+        .iter()
+        .find(|r| r.kind == JournalDecisionKind::RecallConsulted)
+        .expect("a RecallConsulted row must be present for the empty-result run");
+    assert_eq!(
+        empty_recall_row.detail.get("branch"),
+        Some(&serde_json::json!("skipped-next")),
+        "an empty recall result must journal branch: skipped-next: {empty_recall_row:?}"
+    );
+    assert!(
+        !empty_rows.iter().any(|r| r.step == "B1"),
+        "a skipped block step must have no journal row of its own: {empty_rows:?}"
+    );
+
+    let nonempty_stub: Arc<dyn HttpGet> = Arc::new(StubHttpGet::succeeding(recall_body(1)));
+    let (nonempty_outcomes, nonempty_rows) = run_recall_then_block_chain(nonempty_stub)
+        .await
+        .expect("a non-empty recall result must let the next step run");
+
+    assert_eq!(
+        nonempty_outcomes.len(),
+        1,
+        "the block step must have run and produced one ExecutionOutcome: {nonempty_outcomes:?}"
+    );
+    let recall_row_idx = nonempty_rows
+        .iter()
+        .position(|r| r.kind == JournalDecisionKind::RecallConsulted)
+        .expect("a RecallConsulted row must be present for the non-empty-result run");
+    let block_row_idx = nonempty_rows
+        .iter()
+        .position(|r| r.step == "B1")
+        .expect("the block step's own journal row must be present");
+    assert!(
+        recall_row_idx < block_row_idx,
+        "the RecallConsulted row must be recorded before the following step's own row: \
+         {nonempty_rows:?}"
+    );
+    assert_eq!(
+        nonempty_rows[recall_row_idx].detail.get("branch"),
+        Some(&serde_json::json!("ran-next")),
+        "a non-empty recall result must journal branch: ran-next: {:?}",
+        nonempty_rows[recall_row_idx]
+    );
+
+    // The one thing that differed between the two runs was the stubbed
+    // recall body — everything else about the chain, the dispatcher
+    // registration, and the driver was identical.
+    assert_ne!(
+        empty_recall_row.detail.get("branch"),
+        nonempty_rows[recall_row_idx].detail.get("branch"),
+        "the two runs must have taken different branches"
+    );
+}
+
+/// A failing `RECALL` step (the real `RecallNode` over a `StubHttpGet` that
+/// always errors, standing in for an unreachable Brain) bails the chain via
+/// the existing dispatch error path — it must never be silently treated as
+/// `count == 0`, so the following block step must never run OR be recorded
+/// as skipped; the chain simply stops.
+#[tokio::test]
+async fn a_failing_recall_step_bails_the_chain_via_the_real_recall_node() {
+    let failing_stub: Arc<dyn HttpGet> = Arc::new(StubHttpGet::failing("brain unreachable (stub)"));
+
+    let err = run_recall_then_block_chain(failing_stub)
+        .await
+        .expect_err("a failing RecallNode must bail the chain, not skip past it");
+
+    assert!(
+        matches!(err, IntegrateError::Dispatch(_)),
+        "a failing RECALL step must surface as a dispatch error: {err:?}"
     );
 }

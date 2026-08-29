@@ -27,14 +27,14 @@ explicit, registry-resolved `repo` slug.
 | `ENGINE_BRAIN_ROOT` | **Mandatory as of EN.3.K** | The root the repo registry resolves `brain.toml` against (`crates/engine-core/src/brain_root.rs`). Without it, `RepoRegistry::from_env()` falls back to walking up from the process cwd looking for `brain.toml` — a walk-up that only succeeds if `WorkingDirectory` happens to sit inside the brain tree. Under launchd there is no guarantee of that, so treat this as mandatory, not optional. |
 | `ENGINE_EVENTS_API_KEY` | Already required (pre-EN.3.K) | The `X-API-Key` value `check_api_key` gates `POST /events/` (and friends) against; read by `WorkflowTriggerDispatch`/channel egress (`crates/engine-core/src/nodes/channel_transport.rs`). |
 | `ENGINE_EVENTS_URL` | Already required (pre-EN.3.K) | The deployment-configured base URL for the server's own `/events/` endpoint, used by egress nodes that loop back through HTTP (`crates/engine-serve/src/workflows.rs`). |
-| `ENGINE_REPO_ALLOWLIST` | Optional | Comma-separated slugs narrowing the repo registry (see [`sdlc-flow-workflow.md`](sdlc-flow-workflow.md)). Unset — the default, and what the Mac Mini runs — means every `brain.toml` slug is reachable. |
+| `ENGINE_REPO_ALLOWLIST` | Optional | Comma-separated slugs narrowing the repo registry (see [`sdlc-flow-workflow.md`](workflows/sdlc-flow.md)). Unset — the default, and what the Mac Mini runs — means every `brain.toml` slug is reachable. |
 | `ENGINE_LOG` | Optional | `tracing_subscriber::EnvFilter` string controlling log verbosity for the JSON tracing subscriber `engine_serve::init_tracing()` installs (e.g. `debug`, `engine_core=debug,info`). Unset defaults to `info`, matching pre-tracing `eprintln!` visibility. |
 
 `DATABASE_URL` and `BASTION_ENGINE_API_KEY` remain required for `bastion serve` to mount the
 engine routes at all (`decide_engine_mount`, `core/bastion/src/serve/mod.rs`) — unrelated to
 `EN.3.K` but listed here because a missing engine mount produces the same class of confusing
 404-with-no-boot-error this doc exists to head off. See
-[`sdlc-flow-smoke.md`](sdlc-flow-smoke.md)'s Prerequisites section for the full list.
+[`sdlc-flow-smoke.md`](workflows/sdlc-flow-smoke.md)'s Prerequisites section for the full list.
 
 ## What `WorkingDirectory` still determines
 
@@ -50,7 +50,7 @@ named in the registry.
 
 `WorkingDirectory` **remains the fallback target for absent-`repo` events** — an event with no
 `repo` field still resolves to `current_dir()`, byte-identical to pre-EN.3.K behavior (see
-[`sdlc-flow-workflow.md`](sdlc-flow-workflow.md)). Set it to a sane checkout (e.g. this repo's
+[`sdlc-flow-workflow.md`](workflows/sdlc-flow.md)). Set it to a sane checkout (e.g. this repo's
 working tree) rather than leaving it at `/` — an absent-`repo` event dispatched against `/` would
 still 422 downstream (no `planning/<slug>/` under `/`), but there is no reason to depend on that
 rather than pointing it somewhere sane.

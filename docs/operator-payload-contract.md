@@ -90,7 +90,7 @@ depth-limited operator queue:
   predicate no longer holds at selection time via an injectable `with_level_predicate` closure.
   `open_item(item_id) -> Option<(&OperatorQueueItem, DateTime<Utc>)>` (`EN.8.D` task 6) resolves a
   delivered item's id back to what is currently open, alongside its `opened_at` — the lookup
-  [`approve-and-run-workflow.md`](approve-and-run-workflow.md)'s `ApproveAndRunSeams` composes
+  [`approve-and-run-workflow.md`](workflows/approve-and-run.md)'s `ApproveAndRunSeams` composes
   into bastion's `PendingLookup` shape. `crates/engine-serve/src/blocked_bridge.rs` (`EN.9.G`) is
   a second `with_level_predicate` consumer: it re-checks a live `LevelSource` (current state ==
   Blocked) on every trigger before delivering into the queue, using a deterministic

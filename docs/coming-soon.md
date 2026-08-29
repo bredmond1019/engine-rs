@@ -70,7 +70,7 @@ The engine writes to the Brain today ([`materialize-doc-node.md`](materialize-do
 | Capability | Block | State | What it will do |
 |---|---|---|---|
 | Brain read client | `EN.6.K` | **Ready** | `HttpGet` seam, `BrainConfig`, a `RecallNode` over `GET /recall`, plus ingest-client hardening. |
-| Recall consumer | `EN.12.L` | Waiting on `orchestrator:OR.3.B`, `EN.12.E` | The engine half of the read seam, consuming a contract-pinned recall result mid-chain. |
+| Recall consumer | `EN.12.L` | **Ready** | The engine half of the read seam: a dispatchable `RECALL` workflow over `RecallNode`, chain-branching on an empty result (`integrate_chain_inner`), and a `JournalDecisionKind::RecallConsulted` row. See [`architecture.md`](architecture.md). |
 | `CLAIM_REAFFIRM` | `EN.6.L` | Waiting on `EN.6.K`, `mev:MV.ticket.distill-freshness-lane` | Distilled-claim reaffirmation via queue-drain. |
 | Content-pipeline ingest fix | `EN.12.K` | Waiting on `orchestrator:OR.3.A` | Real route, auth header, and the chosen payload mapping. |
 

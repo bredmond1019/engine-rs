@@ -138,7 +138,7 @@ due fire through `dispatch_scheduled_entry` — a `Schedule`-typed `IngressEnvel
 same non-blocking `dispatch_with_event` -> mint `run_id` -> `spawn_run` sequence
 `crate::http::post_events` uses, never a self-directed HTTP call. See
 [architecture.md § Schedule Source](architecture.md#schedule-source-eng6g) for the adapter's shape
-and [content-pipeline-workflow.md](content-pipeline-workflow.md) for how a scheduled fire reaches a
+and [content-pipeline-workflow.md](workflows/content-pipeline.md) for how a scheduled fire reaches a
 workflow.
 
 **The call site is wired but not turned on.** `spawn_schedule_loop` (below) is the interval driver,

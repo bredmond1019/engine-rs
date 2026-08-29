@@ -33,7 +33,7 @@ The hazard is the write, not the command name you typed:
 | `mev defer-epic` · `resume-epic` · `complete-epic` · `sync-epics` (`--write`) | dry-run by default | yes |
 | `mev close-operator-gate <slug> --exit-verified` | verified-or-refused, **no dry-run** | yes |
 | `mev approve <slug> --digest <d>` · `mev reject <slug>` | digest-bound | yes |
-| `./scripts/emit_state_write.sh` · `validate_brain.sh` · `routine.sh` | wrappers | yes |
+| `./scripts/sync/emit_state_write.sh` · `sync/validate_brain.sh` · `sync/routine.sh` | wrappers | yes |
 
 So `mev set-block-status mev:MV.10.A closed --write` against a stale binary regresses boards
 fleet-wide exactly as a bare `emit-state --write` would. **There is no "small" writer** — the
@@ -74,13 +74,19 @@ while the Mac Mini self-heals on its next cron pull
 (`mev:mev-install-trigger-misses-locally-authored-commits`). The pre-push advisory is non-blocking.
 Manual fix: `cargo install --path core/mev --force`.
 
-**`BRAIN_ROLE` gates two scripts, not this command.** Only `scripts/commit_routine_updates.sh` and
-`scripts/validate_brain.sh` check it — `grep -rn BRAIN_ROLE scripts/*.sh` is the full consumer list.
+**`BRAIN_ROLE` gates five scripts, not this command.** `scripts/sync/commit_routine_updates.sh`,
+`scripts/sync/emit_state_write.sh`, `scripts/sync/validate_brain.sh`,
+`scripts/sync/follow_up_routine.sh` and `scripts/roadmap_sweep_cron.sh` all branch on it
+(`scripts/sync/lib.sh` resolves it). **Every one of these lives under `scripts/sync/` except the
+cron sweep** — a bare `scripts/<name>.sh` path does not exist and exits 127, which reads as a
+failed gate rather than a missing file. Use `grep -rln BRAIN_ROLE scripts/` for the consumer list:
+`grep -rn BRAIN_ROLE scripts/*.sh` does **not** recurse and returns only the one script that
+happens to sit at the top level, which reads as a much shorter list than the real one.
 Neither the `bastion` nor the `mev` **binary** checks it at all
 (`grep -rn BRAIN_ROLE core/bastion/src core/mev/src` is empty), so calling `bastion emit-state --write`
 or `mev set-block-status ... --write` directly — the interactive/agent path — is never gated by it,
 regardless of the host's role or when it was last set. The gate exists for exactly one thing:
-`scripts/routine.sh`'s **unattended nightly cron** run, where `validate_brain.sh` runs `emit-state`
+`scripts/sync/routine.sh`'s **unattended nightly cron** run, where `validate_brain.sh` runs `emit-state`
 read-only unless `BRAIN_ROLE=primary`, and `commit_routine_updates.sh` stages/commits/pushes nothing
 unless `BRAIN_ROLE=primary`. Do not read a `replica` role as a reason an interactive session's
 `--write` call was somehow unsafe or unauthorized — it wasn't gated either way.
@@ -109,7 +115,7 @@ next fleet-wide `emit-state --write` runs. This is the expected shape of the gap
 to close — not a new defect, and not a code defect in whatever just merged. The tell: the failing
 assertion is about a block's membership in `focus.next`, and the block named in the failure
 recently closed, often in another repo's lane. Fix by re-running the write
-(`./scripts/emit_state_write.sh`, per Step 4) rather than re-diagnosing the cause. Self-resolving;
+(`./scripts/sync/emit_state_write.sh`, per Step 4) rather than re-diagnosing the cause. Self-resolving;
 nothing to file. Two look-alikes are **not** this pattern, and each needs a different response: a
 test-code assertion that has genuinely gone out of date (e.g. a hardcoded record count after a
 format conversion) is a real code fix — re-running the write changes nothing; derived-file churn
@@ -133,7 +139,7 @@ cross repos, so closing a block in one repo can flip `focus.next` in several oth
 *authored* data never changed, only their *derived* cache did. That is expected, not a bug to chase.
 
 **Don't hand-craft the commit pathspec from `git status`, and don't call `bastion emit-state
---write` directly.** Call `./scripts/emit_state_write.sh` instead — it's the one place the
+--write` directly.** Call `./scripts/sync/emit_state_write.sh` instead — it's the one place the
 write-then-commit sequence is defined. It runs `emit-state` (write on primary, read-only on
 replica, same `BRAIN_ROLE` gate as always), writes every touched path to `$LOG_DIR/.emit_wrote`,
 and on a primary immediately calls `commit_routine_updates.sh` to stage and commit **exactly**
@@ -201,7 +207,7 @@ Applies to **every** verb in the table at the top, not only a bare `emit-state -
 - [ ] Gate-clearing verbs (`close-operator-gate`, `approve`) run from the main tree, not a worktree
 - [ ] Block statuses authored **before** the run, not after
 - [ ] Blast radius read from the `I_EMIT_WROTE` lines
-- [ ] Ran via `./scripts/emit_state_write.sh` (or `validate_brain.sh`, which delegates to it) —
+- [ ] Ran via `./scripts/sync/emit_state_write.sh` (or `sync/validate_brain.sh`, which delegates to it) —
       never `bastion emit-state --write` directly — so the touched paths are committed
       automatically, not left dirty for a later manual sweep
 - [ ] If the run reported success but files are still dirty afterward, checked the log for a

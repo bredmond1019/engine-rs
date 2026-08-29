@@ -69,10 +69,15 @@ To ask the whole-corpus question deliberately, without pushing:
 PREPUSH_STRICT=1 git push      # gate on everything, not just your delta
 ```
 
-`./scripts/validate_brain.sh` looks like the read-only equivalent but is not one — it ends in an
+`./scripts/sync/validate_brain.sh` looks like the read-only equivalent but is not one — it ends in an
 `emit-state --write`, and on a `primary` host that write is followed by a commit and a push (see
 `derive-state-safely`). It is **banned** during a measurement embargo. For a read-only whole-corpus
 answer, run the four `bastion validate-brain --<flag>` calls above instead, one per flag.
+
+**Note the `sync/`.** There is no `./scripts/validate_brain.sh` — that path exits **127**, which
+reads as a failed corpus gate rather than a missing file, so a lane that copies it concludes the
+fleet is red. Measured 2026-08-28: four lanes hit this in one night, and one then reached for the
+path that does exist and ran the writer as its closing check.
 
 ## 4. Know which checks do not gate
 

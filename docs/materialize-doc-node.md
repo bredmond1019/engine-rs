@@ -80,7 +80,7 @@ pub trait DocMaterializer: Send + Sync {
 Opportunity document, reusing this same `MaterializeOutcome` result shape (no new type).
 `MaterializeDocNode` never calls it; `OpportunityEditNode` and (for `MergeContacts`) `MergeContactsNode`
 do. Full details for `SetStage`/`AddAction` — the enum, valid-stage validation, idempotency, and
-the error surface — live in [opportunity-edit-workflows.md](opportunity-edit-workflows.md), not
+the error surface — live in [opportunity-edit-workflows.md](workflows/opportunity-edit.md), not
 duplicated here.
 
 `MergeContacts { slug, contacts }` (`EN.4.E`) is the enum's third variant — added by the contact-
@@ -95,7 +95,7 @@ empty — so a re-run never duplicates a contact or clobbers a human-edited note
 directly on `MaterializeDocNode`'s builder shape (`with_materializer`/`with_brain_root`/
 `with_source_nodes`/`with_write`) — wired downstream of `MaterializeDocNode` in the
 `RESEARCH_AGENT` graph. See [research-agent-workflow.md § Contacts: extraction contract and the
-two-step write](research-agent-workflow.md#contacts-extraction-contract-and-the-two-step-write)
+two-step write](workflows/research-agent.md#contacts-extraction-contract-and-the-two-step-write)
 for the full contract (anti-fabrication rule, why contacts route through mev's merge planner
 instead of the ingest mapping, and why the zero-contact case makes no seam call at all).
 
@@ -192,7 +192,7 @@ MaterializeDocNode::new(model: impl Into<String>)
   `ctx.event` when the list is empty. This is how one shared `MaterializeDocNode` instance can sit
   downstream of `RESEARCH_AGENT`'s two mutually-exclusive producer branches
   (`CompanyResearchNode` | `ProspectingResearchNode` — exactly one runs per event; see
-  [research-agent-workflow.md](research-agent-workflow.md)). A configured-but-fully-absent
+  [research-agent-workflow.md](workflows/research-agent.md)). A configured-but-fully-absent
   preference list is a `NodeError` naming every identity tried, joined by `", "` (mirrors
   `persist_to_brain::read_source_ref`'s message style).
 - `with_write(false)` is dry-run: nothing is written to disk, but the result stamp still names the
@@ -276,5 +276,5 @@ human-approval hand-off) is now gate-governed. `MaterializeDocNode`'s `with_enab
 no-op is the pattern that gate's own `off` mode follows: the node/hop stays present, the run
 continues, and a stable key set is stamped either way. See
 [harvest-gate.md](harvest-gate.md) for the full gate, and
-[content-pipeline-workflow.md](content-pipeline-workflow.md#the-enginebrain-persist-boundary) for
+[content-pipeline-workflow.md](workflows/content-pipeline.md#the-enginebrain-persist-boundary) for
 `PersistToBrainNode`, the gate's execution site.

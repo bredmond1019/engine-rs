@@ -336,6 +336,29 @@ pub struct RecallResult {
     pub via: String,
 }
 
+/// The full `GET /recall` response envelope, matching Synapse's
+/// `app/schemas/read_schema.py::RecallResponse` field-for-field: `query`
+/// echoes the searched string, `count` is the number of results returned,
+/// and `results` carries the normalized rows ([`RecallResult`]).
+/// `RecallNode::process` deserializes the whole response body through this
+/// type rather than reaching into `body.get("results")` alone, so a
+/// renamed/added/removed field anywhere in the envelope — not just inside
+/// `results` — is caught by serde instead of silently ignored.
+///
+/// Deliberately carries **no** `#[serde(deny_unknown_fields)]`: production
+/// deserialization stays forward-compatible with an additive Synapse-side
+/// field (the same reasoning `chain.rs`'s `LaneDirectives` documents for
+/// mev's hand-mirrored grammar) — a deployed engine must not break mid-run
+/// just because Synapse shipped one more field first. Strictness lives in
+/// the test-only mirror in `tests/it/brain_client.rs`'s conformance test
+/// instead.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct RecallResponse {
+    pub query: String,
+    pub count: usize,
+    pub results: Vec<RecallResult>,
+}
+
 /// `RecallNode` — engine-rs's Brain **read** client: `GET {base}/recall`
 /// over the injectable [`HttpGet`] seam, per
 /// [D23](../../../../../planning/decisions/D23-brain-read-seam.md). Read-only:
@@ -468,13 +491,10 @@ impl Node for RecallNode {
                 ))
             })?;
 
-        let results: Vec<RecallResult> = serde_json::from_value(
-            body.get("results").cloned().unwrap_or(Value::Null),
-        )
-        .map_err(|err| {
+        let response: RecallResponse = serde_json::from_value(body).map_err(|err| {
             NodeError::new(format!(
-                "{RECALL_NODE_NAME}: brain recall response's \"results\" did not match the \
-                 pinned GET /recall contract: {err}"
+                "{RECALL_NODE_NAME}: brain recall response did not match the pinned GET /recall \
+                 contract: {err}"
             ))
         })?;
 
@@ -483,9 +503,9 @@ impl Node for RecallNode {
             &mut ctx,
             self.name(),
             serde_json::json!({
-                "query": query,
-                "count": results.len(),
-                "results": results,
+                "query": response.query,
+                "count": response.results.len(),
+                "results": response.results,
             }),
         );
 

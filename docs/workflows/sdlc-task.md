@@ -12,7 +12,7 @@ related: [sdlc-flow-workflow, sdlc-flow-policy, architecture, orchestration-work
 
 # SDLC Task Workflow
 
-`SDLC_TASK` is the lean sibling of [`SDLC_FLOW`](sdlc-flow-workflow.md): implement -> test ->
+`SDLC_TASK` is the lean sibling of [`SDLC_FLOW`](sdlc-flow.md): implement -> test ->
 triage -> (loop) -> a single run-level reconcile -> a lean close-out, with no per-task review,
 no docs patch, and no PR ceremony. It is the graph for one small unit of behaviour-changing work
 (a `/ticket` or `/chore`) rather than a whole spec's review-and-ship cycle — the
@@ -207,6 +207,6 @@ so `POST /events/` with `"workflow_type": "SDLC_TASK"` triggers a run over HTTP 
 the `task/` branch prefix and `sdlc_task` policy resolver preserved on the served path (not the
 flow's own). A suspended or failed `SDLC_TASK` run writes its terminal blocked state to
 `sdlc-task-state.json`, never `sdlc-flow-state.json` — see
-[orchestration-workflow.md](orchestration-workflow.md) for how `ORCHESTRATION` dispatches a chain
-that mixes `SDLC_TASK` and `SDLC_FLOW` blocks, and [suspend-resume.md](suspend-resume.md) for the
+[orchestration-workflow.md](orchestration.md) for how `ORCHESTRATION` dispatches a chain
+that mixes `SDLC_TASK` and `SDLC_FLOW` blocks, and [suspend-resume.md](../suspend-resume.md) for the
 pause/resume routes both workflow types now share.

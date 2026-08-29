@@ -499,10 +499,15 @@ bastion validate-brain --links
 bastion validate-brain --structure
 ```
 
-`./scripts/validate_brain.sh` is **not** this check — on a `primary` host it ends in an
+`./scripts/sync/validate_brain.sh` is **not** this check — on a `primary` host it ends in an
 `emit-state --write`, a commit, and a `git push` (see `derive-state-safely`), so a lane using it as
 its closing verification is committing and pushing whatever the shared index holds, not just its
 own work.
+
+**Note the `sync/`.** There is no `./scripts/validate_brain.sh` — that path exits **127**, which
+reads as a failed corpus gate rather than a missing file, so a lane that copies it concludes the
+fleet is red. Measured 2026-08-28: four lanes hit this in one night, and one then reached for the
+path that does exist and ran the writer as its closing check.
 
 Concurrent lanes pushing into one corpus is exactly the condition that accumulated 32
 `validate-brain` errors across four lanes on 2026-08-04 and blocked `git push` fleet-wide. Rule 6

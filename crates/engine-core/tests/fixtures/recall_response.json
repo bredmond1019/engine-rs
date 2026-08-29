@@ -1,0 +1,24 @@
+{
+  "query": "roadmap",
+  "count": 2,
+  "results": [
+    {
+      "doc_id": "d1",
+      "file_path": "docs/roadmap.md",
+      "title": "Roadmap",
+      "section": "full",
+      "content": "the roadmap content",
+      "score": 0.91,
+      "via": "semantic"
+    },
+    {
+      "doc_id": null,
+      "file_path": "docs/plan.md",
+      "title": null,
+      "section": null,
+      "content": "a related plan",
+      "score": 0.62,
+      "via": "keyword"
+    }
+  ]
+}

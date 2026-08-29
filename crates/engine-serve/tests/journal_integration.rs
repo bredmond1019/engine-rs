@@ -236,6 +236,87 @@ fn renderer_requires_explicit_run_record_meta_not_derived_from_rows() {
 }
 
 // ---------------------------------------------------------------------------
+// EN.12.L task 6 — fixture evidence for the un-gateable `bastion journal
+// $CAMPAIGN | grep -q 'recall'` DoD line (D64).
+//
+// AC3 of the EN.12.L block record names that DoD line. Its evidence lives in
+// ANOTHER REPO (`bastion`), in ANOTHER PROCESS (an installed binary),
+// against a live Postgres — no engine-rs harness check can observe it, and a
+// green `cargo nextest` run here is NOT evidence that the DoD line holds
+// against the installed binary. `bastion journal` reads through this
+// repo's own renderer (`engine_serve::journal::render_notes_md` /
+// `render_review_md`, both driven by `kind_title`), so this test renders a
+// campaign journal that contains a `RecallConsulted` row through that same
+// SOURCE code path and asserts the rendered text contains the substring
+// `recall` — the exact substring the DoD's `grep -q 'recall'` keys on.
+//
+// LIMITATION, STATED EXPLICITLY: this proves SOURCE behaviour only — that
+// this repo's renderer, compiled in-tree, emits `recall` for a
+// `RecallConsulted` row. It does NOT prove the installed `bastion` binary on
+// the Mini emits the same line; that binary and this source tree diverge
+// whenever `bastion` has not been rebuilt since this renderer last changed.
+// A real end-to-end run of `bastion journal $CAMPAIGN | grep -q 'recall'`
+// against a live campaign is the only thing that closes that gap, and it is
+// declared un-gateable here for exactly that reason.
+//
+// SHOWN CAPABLE OF FAILING: `kind_title(RecallConsulted)` is the only
+// producer of the `recall` substring this test can see. If that string were
+// ever changed to drop the substring (e.g. renamed to a title with no
+// `recall` in it), both assertions below would fail — the notes.md ledger
+// bullet's title clause and the review.md table's `Decision` column both
+// render through `kind_title`, so either rendering catches the regression.
+#[test]
+fn render_notes_md_contains_recall_for_recall_consulted_row() {
+    let campaign_id = Uuid::new_v4();
+    let rows = vec![
+        sample_row("build", JournalDecisionKind::StepIntegrated, "ok"),
+        sample_row(
+            "recall",
+            JournalDecisionKind::RecallConsulted,
+            "brain returned 1 result",
+        ),
+    ];
+    let meta = sample_meta(None);
+
+    let notes = render_notes_md(&campaign_id, &rows, &meta);
+
+    assert!(
+        notes.contains("recall"),
+        "rendered notes.md must contain the substring 'recall' for a \
+         RecallConsulted row — got: {notes}"
+    );
+    // The bullet itself, not merely the word appearing incidentally
+    // elsewhere (e.g. the step name) — pins it to kind_title's rendering.
+    assert!(
+        notes.contains("recall consulted"),
+        "expected the DONE bullet to render kind_title's 'recall consulted' \
+         text — got: {notes}"
+    );
+}
+
+/// Same fixture through `review.md`'s block ledger table — the `Decision`
+/// column also renders via `kind_title`, so `bastion journal` reading
+/// either rendered artifact would see the same substring.
+#[test]
+fn render_review_md_contains_recall_for_recall_consulted_row() {
+    let campaign_id = Uuid::new_v4();
+    let rows = vec![sample_row(
+        "recall",
+        JournalDecisionKind::RecallConsulted,
+        "brain returned 1 result",
+    )];
+    let meta = sample_meta(Some("2026-08-29"));
+
+    let review = render_review_md(&campaign_id, &rows, &meta);
+
+    assert!(
+        review.contains("recall consulted"),
+        "rendered review.md block ledger must contain 'recall consulted' \
+         for a RecallConsulted row — got: {review}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // EN.12.D task 7 — route-level integration coverage, plus the standing
 // fixture for the un-gateable `bastion journal $ID | grep -q 'bail'`
 // criterion (D64). The CLI verb lives in another repo and its binary is

@@ -27,13 +27,13 @@ unmet.
    every path `SetupWorktreeNode` touches was relative to the serve process's cwd — including the
    `planning` symlink resolution and the `git checkout -B ... origin/main` fallback, both run
    against `Path::new(".")`. As of `EN.3.K`, the event carries an explicit, registry-resolved
-   `repo` slug (see [sdlc-flow-workflow.md](sdlc-flow-workflow.md)) — **a smoke run should set
+   `repo` slug (see [sdlc-flow-workflow.md](sdlc-flow.md)) — **a smoke run should set
    `"repo": "engine-rs"` in its event body** rather than relying on the serve process's cwd. The
    cwd requirement is still real for any event that omits `repo` (it resolves to
    `current_dir()`, byte-identical to before), so starting `bastion serve` from `core/engine-rs`
    remains the safe default for an absent-`repo` run — but it is now a fallback, not the only
    answer to "which repo does this server serve." See
-   [deployment-launchd.md](deployment-launchd.md) for the `ENGINE_BRAIN_ROOT` registry
+   [deployment-launchd.md](../deployment-launchd.md) for the `ENGINE_BRAIN_ROOT` registry
    prerequisite that makes a `repo`-bearing event resolvable at all.
 2. **`DATABASE_URL` set with Postgres reachable AND `BASTION_ENGINE_API_KEY` non-empty.**
    `decide_engine_mount` (`core/bastion/src/serve/mod.rs:103-133`, called at `mod.rs:257-259`)
@@ -75,7 +75,7 @@ never a path — e.g. `--repo engine-rs`, matching `agentic-portfolio/brain.toml
 to be set on the **serve process** (not on the script's own process) — without it,
 `RepoRegistry::from_env()` cannot resolve and every `repo`-bearing event 422s with `"no repo
 registry is available to resolve it"` (`crates/engine-serve/src/http.rs:443-450`; see
-[deployment-launchd.md](deployment-launchd.md)).
+[deployment-launchd.md](../deployment-launchd.md)).
 
 `--repo` takes a required argument (a missing one is a usage error, exit 3) and cannot be combined
 with `--watch` or `--clean` (also a usage error). The trigger banner names which mode a run is in.
@@ -100,7 +100,7 @@ path, per `EN.3.K`). See tasks 7 and 9 of `planning/EN.3.J-sdlc-flow-smoke/tasks
   flag is the most damaging mistake available when running this smoke.
   `SetupWorktreeNode` does now refuse to start a `use_worktree: false` run against a **dirty**
   live checkout (`git status --porcelain` guard, aborting with the dirty paths named — see
-  [sdlc-flow-workflow.md](sdlc-flow-workflow.md)), which bounds the damage to a tree that was
+  [sdlc-flow-workflow.md](sdlc-flow.md)), which bounds the damage to a tree that was
   clean to begin with. That is a backstop, not a substitute: keep setting the flag.
 - **`auto_pr` defaults to `true`** (`default_auto_pr`, `crates/engine-core/src/workflows/sdlc_flow/schema.rs:101-103`;
   the field at `schema.rs:118-119`), so it must be set `false` explicitly. With it false,

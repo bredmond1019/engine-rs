@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use engine_contract::TaskContext;
 use engine_core::node::{Node, NodeError, NodeRegistry};
 use engine_core::nodes::brain_client::{
-    BrainConfig, HttpGet, RecallNode, StubHttpGet, RECALL_NODE_NAME,
+    BrainConfig, HttpGet, RecallNode, RecallResponse, StubHttpGet, RECALL_NODE_NAME,
 };
 use engine_core::schema::{NodeConfig, WorkflowSchema};
 use engine_core::workflow::Workflow;
@@ -214,4 +214,162 @@ async fn a_non_2xx_shaped_stub_failure_surfaces_as_a_node_error_and_halts_the_wa
         !ctx.nodes.contains_key("SummarizeRecallNode"),
         "the downstream node should never have run past RecallNode's failure"
     );
+}
+
+/// EN.12.L task 1 — fixture-conformance coverage for `GET /recall`'s
+/// response envelope against `tests/fixtures/recall_response.json`, a
+/// checked-in capture of Synapse's pinned
+/// `app/schemas/read_schema.py::RecallResponse` shape.
+///
+/// Production's `RecallResponse`/`RecallResult` (`nodes::brain_client`)
+/// carry no `#[serde(deny_unknown_fields)]` on purpose — a deployed engine
+/// must keep working the day Synapse ships one more additive field. So
+/// strictness lives here instead: `StrictRecallResponse`/`StrictRecallResult`
+/// are a test-only mirror of the exact same fields, but WITH
+/// `deny_unknown_fields`, and the fixture is round-tripped through both the
+/// strict mirror and the real production type.
+///
+/// Demonstrated failing, not assumed: `strict_mirror_fails_when_a_field_is_renamed`
+/// below takes the checked-in fixture and renames `"query"` to
+/// `"search_query"` before deserializing through the strict mirror, and
+/// asserts that fails. That is the drift this module exists to catch —
+/// renaming, adding, or removing a field Synapse pins — demonstrated
+/// directly against the fixture rather than assumed from the derive macro.
+/// (An *added* field is exercised the same way by
+/// `strict_mirror_fails_when_a_field_is_added`, and *production* tolerating
+/// that same addition is exercised by
+/// `production_type_tolerates_an_added_unknown_field`, covering AC5.)
+mod recall_response_conformance {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictRecallResult {
+        #[allow(dead_code)]
+        doc_id: Option<String>,
+        #[allow(dead_code)]
+        file_path: String,
+        #[allow(dead_code)]
+        title: Option<String>,
+        #[allow(dead_code)]
+        section: Option<String>,
+        #[allow(dead_code)]
+        content: String,
+        #[allow(dead_code)]
+        score: f64,
+        #[allow(dead_code)]
+        via: String,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictRecallResponse {
+        #[allow(dead_code)]
+        query: String,
+        #[allow(dead_code)]
+        count: usize,
+        #[allow(dead_code)]
+        results: Vec<StrictRecallResult>,
+    }
+
+    const FIXTURE_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/recall_response.json"
+    );
+
+    fn load_fixture() -> Value {
+        let raw = std::fs::read_to_string(FIXTURE_PATH)
+            .unwrap_or_else(|err| panic!("failed to read {FIXTURE_PATH}: {err}"));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|err| panic!("fixture {FIXTURE_PATH} is not valid JSON: {err}"))
+    }
+
+    #[test]
+    fn strict_mirror_deserializes_the_checked_in_fixture_cleanly() {
+        let fixture = load_fixture();
+        let strict: Result<StrictRecallResponse, _> = serde_json::from_value(fixture);
+        assert!(
+            strict.is_ok(),
+            "the checked-in fixture should match Synapse's pinned RecallResponse \
+             field-for-field: {strict:?}"
+        );
+    }
+
+    #[test]
+    fn production_type_deserializes_the_checked_in_fixture_cleanly() {
+        let fixture = load_fixture();
+        let production: Result<RecallResponse, _> = serde_json::from_value(fixture);
+        assert!(
+            production.is_ok(),
+            "production RecallResponse should also accept the checked-in fixture: {production:?}"
+        );
+    }
+
+    #[test]
+    fn strict_mirror_fails_when_a_field_is_renamed() {
+        let mut fixture = load_fixture();
+        let renamed_value = fixture
+            .as_object_mut()
+            .expect("fixture is a JSON object")
+            .remove("query")
+            .expect("fixture has a \"query\" field to rename");
+        fixture
+            .as_object_mut()
+            .unwrap()
+            .insert("search_query".to_string(), renamed_value);
+
+        let strict: Result<StrictRecallResponse, _> = serde_json::from_value(fixture);
+        assert!(
+            strict.is_err(),
+            "renaming \"query\" to \"search_query\" should fail the strict conformance mirror, \
+             proving this test can actually detect drift"
+        );
+    }
+
+    #[test]
+    fn strict_mirror_fails_when_a_field_is_removed() {
+        let mut fixture = load_fixture();
+        fixture
+            .as_object_mut()
+            .expect("fixture is a JSON object")
+            .remove("count")
+            .expect("fixture has a \"count\" field to remove");
+
+        let strict: Result<StrictRecallResponse, _> = serde_json::from_value(fixture);
+        assert!(
+            strict.is_err(),
+            "removing \"count\" should fail the strict conformance mirror"
+        );
+    }
+
+    #[test]
+    fn strict_mirror_fails_when_a_field_is_added() {
+        let mut fixture = load_fixture();
+        fixture
+            .as_object_mut()
+            .expect("fixture is a JSON object")
+            .insert("workspace".to_string(), json!("default"));
+
+        let strict: Result<StrictRecallResponse, _> = serde_json::from_value(fixture);
+        assert!(
+            strict.is_err(),
+            "an added, unpinned field should fail the strict conformance mirror"
+        );
+    }
+
+    #[test]
+    fn production_type_tolerates_an_added_unknown_field() {
+        let mut fixture = load_fixture();
+        fixture
+            .as_object_mut()
+            .expect("fixture is a JSON object")
+            .insert("workspace".to_string(), json!("default"));
+
+        let production: Result<RecallResponse, _> = serde_json::from_value(fixture);
+        assert!(
+            production.is_ok(),
+            "production RecallResponse must stay forward-compatible with an additive Synapse \
+             field, so a deployed engine does not break mid-run: {production:?}"
+        );
+    }
 }

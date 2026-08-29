@@ -336,15 +336,15 @@ I/O:
 | `crates/engine-serve/src/orphan.rs` (`EN.9.C`) | `OrphanLister` / `PgOrphanLister` (`orphan_lister_live()`) | `RecordingOrphanLister` | `crate::orphan::reconcile_orphans` (the boot sweep) | Lists `events` rows whose `task_context.metadata.completion` is absent past a policy-resolved age (`engine-store::list_orphan_candidates`), so the crash-recovery sweep is testable with no database; not one of the three `crates/engine-core/src/nodes/*` seams above — it lives in `engine-serve` and lists rows rather than dispatching an action. See [orphan-recovery.md](orphan-recovery.md) |
 
 See [materialize-doc-node.md](materialize-doc-node.md) for the `DocMaterializer` seam and
-`MaterializeDocNode` in detail, [opportunity-edit-workflows.md](opportunity-edit-workflows.md) for
+`MaterializeDocNode` in detail, [opportunity-edit-workflows.md](workflows/opportunity-edit.md) for
 the `edit_opportunity` operation and `OpportunityEditNode`,
-[content-pipeline-workflow.md](content-pipeline-workflow.md) for `HttpPost` and `ChannelTransport`
+[content-pipeline-workflow.md](workflows/content-pipeline.md) for `HttpPost` and `ChannelTransport`
 in their workflow context, and [harvest-gate.md](harvest-gate.md) for the `HarvestMode`/
 `HarvestGate` gate fronting the `http_post.rs` seam and the `HARVEST_APPROVE` completion
 micro-workflow. The operator-facing half that *drives* those pending records —
 `APPROVE_AND_RUN` (`EN.8.D`), which drains them into the depth-limited operator queue, records each
 decision in the approval ledger, and executes only a matched-digest approval — is documented in
-[approve-and-run-workflow.md](approve-and-run-workflow.md).
+[approve-and-run-workflow.md](workflows/approve-and-run.md).
 
 **Materialize -\> harvest ordering guarantee.** In `CONTENT_PIPELINE`, `MaterializeDocNode` always
 runs upstream of `PersistToBrainNode` in the declared graph, and the harvest gate never changes
@@ -568,7 +568,7 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   reusable builder for the `{guard router, increment node, back-edge}` cluster idiom (generalized
   from the hand-written `sdlc_flow::graph`/`task_loop` retry loop; the task-loop drain branch now
   also carries a `FinalValidationNode` run-level validation gate, `EN.3.E` — see
-  [sdlc-flow-workflow.md](sdlc-flow-workflow.md)). `build_loop(LoopSpec) ->
+  [sdlc-flow-workflow.md](workflows/sdlc-flow.md)). `build_loop(LoopSpec) ->
   LoopCluster` returns two boxed nodes (a guard `Router` and an increment node, both identity-
   derived via `with_identity` so distinct-prefix clusters coexist in one registry) plus their
   declared `NodeConfig` connections, ready to merge into a `NodeRegistry`/`WorkflowSchema`. The
@@ -594,7 +594,7 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   firewall invariant**: this module defines no conversion between `Currency::Brl` and
   `Currency::Usd` anywhere — no rate constant, no helper, no test — matching `rates.md`'s "never
   quoted in the same conversation, never cross-converted" rule; see
-  [proposal-generator-workflow.md § Locale and the firewalled rate card](proposal-generator-workflow.md#locale-and-the-firewalled-rate-card)
+  [proposal-generator-workflow.md § Locale and the firewalled rate card](workflows/proposal-generator.md#locale-and-the-firewalled-rate-card)
   for how `ProposalWriterNode`/`ProposalReviseNode` consume it to populate
   `FirstEngagement.investment` deterministically instead of letting the model author a price.
   `Locale` is a per-client attribute, not a cost/latency/quality tradeoff, so it is deliberately
@@ -649,8 +649,8 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `register_deliverable_render` (`DELIVERABLE_RENDER`, `EN.4.D` task 5) and
   `register_linkedin_post` (`LINKEDIN_POST`, `EN.5.G` task 6) both follow the same
   `PolicyConfigSource::Builtin` shape as the other channel/API-triggered workflows — see
-  [deliverable-render-workflow.md](deliverable-render-workflow.md) and
-  [linkedin-post-workflow.md](linkedin-post-workflow.md)).
+  [deliverable-render-workflow.md](workflows/deliverable-render.md) and
+  [linkedin-post-workflow.md](workflows/linkedin-post.md)).
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
@@ -736,7 +736,8 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 - Journal (`engine-serve::journal`, `engine-contract::journal`, `EN.12.D`) — a durable decision
   log distinct from the `events` snapshot table: `JournalRow` (`engine-contract`) wraps a
   `JournalDecisionKind` (`StepIntegrated`, `StepBailed`, `GateRefused`,
-  `StateWriteVerificationFailed`, `BudgetHalted`, `ResolvedPolicy`) plus a kind-specific
+  `StateWriteVerificationFailed`, `BudgetHalted`, `ResolvedPolicy`, `RecallConsulted` — `EN.12.L`,
+  added when a `RECALL` dispatch step's result branches the chain, see below) plus a kind-specific
   `serde_json::Value` detail payload, written via `engine_store::insert_journal_row` and read back
   ordered by `(campaign_id, created_at ASC)` via `list_journal_rows_for_campaign`.
   `integrate_chain_with_journal` (`engine-core::workflows::orchestration::integrate`) is the new
@@ -754,6 +755,18 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `GateRefused`/`StateWriteVerificationFailed` render as `**OPEN**`, `BudgetHalted` as `**HELD**`,
   `StepIntegrated`/`ResolvedPolicy` as plain `DONE`, matching `roadmap_status_discovery.py`'s
   `_OPEN_ROW_RE`/`_HELD_ROW_RE` parsing.
+- Recall-gated branching (`EN.12.L`) — the `RECALL` workflow (`crates/engine-core/src/workflows/
+  recall/`, a single-node graph over `RecallNode`, registered by `register_recall` in
+  `crates/engine-serve/src/workflows.rs`) is dispatchable from an `ORCHESTRATION` chain step
+  (`kind: "dispatch"`, block id `RECALL`, `EN.12.E`). `integrate_chain_inner`
+  (`crates/engine-core/src/workflows/orchestration/integrate.rs`) special-cases a `RECALL` step's
+  result instead of emitting the generic `StepIntegrated` row: it computes `top_score` as the max
+  `results[].score` from `RecallNode`'s stamped output (`None` when there are no results), records
+  a `JournalDecisionKind::RecallConsulted` row (`query`/`count`/`top_score`/`branch`), and — when
+  `count == 0` — sets a loop-local `pending_skip` flag that makes the *next* chain step a no-op
+  (no lane-log entry, no checkpoint write) rather than running it. A `RECALL` step that itself
+  fails still bails the chain the same way any other failing step does; only an empty result set
+  skips.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,

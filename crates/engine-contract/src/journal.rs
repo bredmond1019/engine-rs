@@ -36,6 +36,11 @@ pub enum JournalDecisionKind {
     /// The resolved policy (profile, model tier, transport, executor) actually
     /// used for a step, read after four-layer resolution.
     ResolvedPolicy,
+    /// The engine consulted the brain (a `RECALL` dispatch step) and what it
+    /// read changed what the chain did next (EN.12.L, D23 constraint 3). The
+    /// branch taken is carried in `detail` alongside the recall result that
+    /// caused it, never inferred from the absence of a row.
+    RecallConsulted,
 }
 
 /// One row of the durable run journal.
@@ -100,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn all_six_decision_kinds_round_trip() {
+    fn all_seven_decision_kinds_round_trip() {
         let kinds = [
             JournalDecisionKind::StepIntegrated,
             JournalDecisionKind::StepBailed,
@@ -108,6 +113,7 @@ mod tests {
             JournalDecisionKind::StateWriteVerificationFailed,
             JournalDecisionKind::BudgetHalted,
             JournalDecisionKind::ResolvedPolicy,
+            JournalDecisionKind::RecallConsulted,
         ];
         for kind in kinds {
             let row = sample_row(kind);
@@ -123,6 +129,14 @@ mod tests {
                 "kind {kind_json} is not snake_case"
             );
         }
+    }
+
+    #[test]
+    fn recall_consulted_serializes_to_snake_case_wire_string() {
+        let kind_json = serde_json::to_string(&JournalDecisionKind::RecallConsulted).unwrap();
+        assert_eq!(kind_json, "\"recall_consulted\"");
+        let round_tripped: JournalDecisionKind = serde_json::from_str(&kind_json).unwrap();
+        assert_eq!(round_tripped, JournalDecisionKind::RecallConsulted);
     }
 
     #[test]

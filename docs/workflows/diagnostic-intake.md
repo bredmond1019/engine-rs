@@ -65,7 +65,7 @@ requires `name`+`description`, since real transcripts may genuinely leave a rubr
 unaddressed — evidence discipline means flagging a gap (empty string), never inventing content.
 
 This type is **load-bearing**: EN.4.C (`proposal_generator`, built — see
-[proposal-generator-workflow.md](proposal-generator-workflow.md)) imports `DiagnosticIntake` by name (re-exported from
+[proposal-generator-workflow.md](proposal-generator.md)) imports `DiagnosticIntake` by name (re-exported from
 `workflows::diagnostic_intake` in `mod.rs`).
 
 `IntakeExtractNode` sets `Config.json_schema` on the underlying `claude_code_rs::Config` (via
@@ -141,7 +141,7 @@ for the reader/precedence mechanics, identical here).
 ## How to trigger a run
 
 Same HTTP surface as every other `engine-serve` workflow (`docs/cli.md`; see
-[sdlc-flow-workflow.md](sdlc-flow-workflow.md#how-to-trigger-a-run) for the full auth/mounting
+[sdlc-flow-workflow.md](sdlc-flow.md#how-to-trigger-a-run) for the full auth/mounting
 story):
 
 ```
@@ -177,9 +177,9 @@ Content-Type: application/json
   dedicated setup node. It resolves its own worktree path from an upstream `SetupWorktreeNode`
   result if present in `ctx.nodes`, falling back to `std::env::current_dir()` otherwise.
 - **Out of scope for this block**: company/prospecting research (EN.4.A, `research_agent`), PDF
-  render (see [`DELIVERABLE_RENDER`](deliverable-render-workflow.md), `EN.4.D`). Proposal
+  render (see [`DELIVERABLE_RENDER`](deliverable-render.md), `EN.4.D`). Proposal
   generation and scoring (EN.4.C, built) imports
-  `DiagnosticIntake` by name — see [proposal-generator-workflow.md](proposal-generator-workflow.md).
+  `DiagnosticIntake` by name — see [proposal-generator-workflow.md](proposal-generator.md).
 - **No embedding/pgvector/corpus writes** — per THE BOUNDARY TEST (`CLAUDE.md`), this workflow
   only acquires and reasons; a downstream `PersistToBrainNode` (not part of this block) would own
   handing extracted intake off to Synapse's ingest endpoint.

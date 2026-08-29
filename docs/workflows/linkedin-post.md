@@ -147,7 +147,7 @@ profiles (`baseline`/`cheap-fast`/`thorough`) and the harness defaults section: 
 ## How to trigger a run
 
 Same HTTP surface as every other `engine-serve` workflow (`docs/cli.md`; see
-[sdlc-flow-workflow.md](sdlc-flow-workflow.md#how-to-trigger-a-run) for the full auth/mounting
+[sdlc-flow-workflow.md](sdlc-flow.md#how-to-trigger-a-run) for the full auth/mounting
 story):
 
 ```

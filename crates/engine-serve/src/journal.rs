@@ -136,7 +136,9 @@ fn ledger_label(kind: JournalDecisionKind) -> &'static str {
         | JournalDecisionKind::GateRefused
         | JournalDecisionKind::StateWriteVerificationFailed => "OPEN",
         JournalDecisionKind::BudgetHalted => "HELD",
-        JournalDecisionKind::StepIntegrated | JournalDecisionKind::ResolvedPolicy => "DONE",
+        JournalDecisionKind::StepIntegrated
+        | JournalDecisionKind::ResolvedPolicy
+        | JournalDecisionKind::RecallConsulted => "DONE",
     }
 }
 
@@ -148,6 +150,7 @@ fn kind_title(kind: JournalDecisionKind) -> &'static str {
         JournalDecisionKind::StateWriteVerificationFailed => "state-write verification failed",
         JournalDecisionKind::BudgetHalted => "budget halted",
         JournalDecisionKind::ResolvedPolicy => "resolved policy",
+        JournalDecisionKind::RecallConsulted => "recall consulted",
     }
 }
 
@@ -298,6 +301,22 @@ mod tests {
             "test-key".to_string(),
         )
         .build()
+    }
+
+    /// `RecallConsulted` renders `DONE` (an observation, not an open item
+    /// or a hold) and its title contains the substring `recall` — the exact
+    /// string task 6's un-gateable `bastion journal ... | grep -q 'recall'`
+    /// DoD line keys on.
+    #[::core::prelude::v1::test]
+    fn recall_consulted_renders_done_and_title_contains_recall() {
+        assert_eq!(
+            super::ledger_label(engine_contract::JournalDecisionKind::RecallConsulted),
+            "DONE"
+        );
+        assert!(
+            super::kind_title(engine_contract::JournalDecisionKind::RecallConsulted)
+                .contains("recall")
+        );
     }
 
     /// No `X-API-Key` header -> 401, matching every other campaign/run route.

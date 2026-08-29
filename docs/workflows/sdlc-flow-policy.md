@@ -227,8 +227,8 @@ check whose only job is to catch a regression before the next task attempt, not 
 authoritative gate. That gate is `FinalValidationNode` (`EN.3.E`), a second, unconditional
 check-running site on the declared graph's task-loop drain branch that runs the full,
 unfiltered suite (including the `perTask: false` `build` check) exactly once per run — see
-[FinalValidationNode](sdlc-flow-workflow.md#the-two-check-site-model-per-task-tripwire-vs-final-gate)
-and [D12](../planning/decisions/D12-per-task-vs-final-check-depth.md). `test_depth`/`flow.testDepth`
+[FinalValidationNode](sdlc-flow.md#the-two-check-site-model-per-task-tripwire-vs-final-gate)
+and [D12](../../planning/decisions/D12-per-task-vs-final-check-depth.md). `test_depth`/`flow.testDepth`
 governs `TestTaskNode` only; it is deliberately never read by `FinalValidationNode`, which is
 pinned to `TestDepth::Full` regardless of policy (a policy knob may tune a per-task tripwire's
 depth, but whether the authoritative suite runs at all is not a cost lever — CLAUDE.md standing

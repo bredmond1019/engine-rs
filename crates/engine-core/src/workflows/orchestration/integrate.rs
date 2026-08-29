@@ -82,7 +82,9 @@ use super::checkpoint::{
 use super::dispatch::{execute_dispatch_step, DispatchStepError};
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
+use crate::nodes::brain_client::RECALL_NODE_NAME;
 use crate::workflows::get_result;
+use crate::workflows::recall::RECALL_WORKFLOW_TYPE;
 
 // ── Operator hold: pause-and-resume ─────────────────────────────────────
 
@@ -1447,7 +1449,26 @@ async fn integrate_chain_impl(
         .ok()
         .and_then(ReadCheckpoint::into_option)
         .unwrap_or_else(|| Checkpoint::new(campaign_id));
+    // `EN.12.L` task 4: set by a `RECALL` dispatch step whose result came
+    // back `count == 0`, consumed by the very next loop iteration only.
+    // Loop-local ONLY — no field on `ChainStep`, no persisted record, no
+    // cross-repo schema change (the block's own acceptance criteria).
+    // D23 constraint 3's branch: the Brain answers a question, the engine
+    // decides what to do with the answer, and the decision lives here,
+    // not in Synapse.
+    let mut pending_skip = false;
     for step in chain {
+        // A step skipped by the immediately preceding `RECALL` dispatch
+        // step's empty result: not executed at all — no dependency check,
+        // no hold wait, no admission permit, no `lane-log.jsonl` line, no
+        // checkpoint entry, matching what a dispatch step itself already
+        // omits. The flag is consumed (cleared) here so only the ONE step
+        // right after a `count == 0` recall is ever skipped.
+        if pending_skip {
+            pending_skip = false;
+            continue;
+        }
+
         // Checked at the top of every iteration, before anything for this
         // step starts — see the "Cancellation stops the chain BETWEEN
         // steps only" section above.
@@ -1606,18 +1627,76 @@ async fn integrate_chain_impl(
             match execute_dispatch_step(step, dispatcher, &event, on_progress).await {
                 Ok(dispatch_outcome) => {
                     let step_run_id = journal_run_id(Some(&dispatch_outcome.ctx));
-                    emit_journal(
-                        journal_sink,
-                        campaign_id,
-                        step_run_id,
-                        &step.block_id,
-                        engine_contract::JournalDecisionKind::StepIntegrated,
-                        format!(
-                            "dispatch step '{}' completed via workflow key '{}'",
-                            step.block_id, dispatch_outcome.workflow_key
-                        ),
-                        serde_json::json!({ "workflow_key": dispatch_outcome.workflow_key }),
-                    );
+                    if dispatch_outcome.workflow_key == RECALL_WORKFLOW_TYPE {
+                        // `EN.12.L` task 4: the engine's half of D23
+                        // constraint 3 — read the recall result off the
+                        // finished child's own `ctx.nodes` (never a second
+                        // call to Synapse), decide whether the NEXT chain
+                        // step runs, and journal exactly what was read and
+                        // which way it branched. This replaces the generic
+                        // `StepIntegrated` row for a RECALL step — the
+                        // `RecallConsulted` row IS this step's record.
+                        let recall_result = get_result(&dispatch_outcome.ctx, RECALL_NODE_NAME);
+                        let query = recall_result
+                            .and_then(|value| value.get("query"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let count = recall_result
+                            .and_then(|value| value.get("count"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let top_score = recall_result
+                            .and_then(|value| value.get("results"))
+                            .and_then(Value::as_array)
+                            .and_then(|results| {
+                                results
+                                    .iter()
+                                    .filter_map(|result| {
+                                        result.get("score").and_then(Value::as_f64)
+                                    })
+                                    .fold(None::<f64>, |max, score| {
+                                        Some(max.map_or(score, |m| m.max(score)))
+                                    })
+                            });
+                        pending_skip = count == 0;
+                        let branch = if pending_skip {
+                            "skipped-next"
+                        } else {
+                            "ran-next"
+                        };
+                        emit_journal(
+                            journal_sink,
+                            campaign_id,
+                            step_run_id,
+                            &step.block_id,
+                            engine_contract::JournalDecisionKind::RecallConsulted,
+                            format!(
+                                "recall step '{}' returned {count} result(s); next step {}",
+                                step.block_id,
+                                if pending_skip { "skipped" } else { "runs" }
+                            ),
+                            serde_json::json!({
+                                "query": query,
+                                "count": count,
+                                "top_score": top_score,
+                                "branch": branch,
+                            }),
+                        );
+                    } else {
+                        emit_journal(
+                            journal_sink,
+                            campaign_id,
+                            step_run_id,
+                            &step.block_id,
+                            engine_contract::JournalDecisionKind::StepIntegrated,
+                            format!(
+                                "dispatch step '{}' completed via workflow key '{}'",
+                                step.block_id, dispatch_outcome.workflow_key
+                            ),
+                            serde_json::json!({ "workflow_key": dispatch_outcome.workflow_key }),
+                        );
+                    }
                 }
                 Err(err) => {
                     // Never falls through to a block invocation — an
@@ -3871,6 +3950,258 @@ mod tests {
         // The dispatch step never appends a lane-log line — exactly one
         // line total, for the block step.
         assert_eq!(read_lane_log(roadmap_dir.path()).lines().count(), 1);
+    }
+
+    // ── RECALL branching (`EN.12.L` task 4) ─────────────────────────────
+
+    /// A stand-in for the real `RecallNode`: stamps `ctx.nodes[RECALL_NODE_NAME]`
+    /// with a `RecallResponse`-shaped body carrying exactly `count` results,
+    /// each with an ascending `score` so a `top_score` computation over the
+    /// stub has something meaningful to pick.
+    struct RecallStubNode {
+        count: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Node for RecallStubNode {
+        async fn process(
+            &self,
+            mut ctx: engine_contract::TaskContext,
+        ) -> Result<engine_contract::TaskContext, crate::NodeError> {
+            let results: Vec<Value> = (0..self.count)
+                .map(|i| json!({ "score": 0.5 + i as f64 * 0.1 }))
+                .collect();
+            ctx.nodes.insert(
+                crate::nodes::brain_client::RECALL_NODE_NAME.to_string(),
+                json!({ "query": "stub-query", "count": self.count, "results": results }),
+            );
+            Ok(ctx)
+        }
+
+        fn name(&self) -> &str {
+            crate::nodes::brain_client::RECALL_NODE_NAME
+        }
+    }
+
+    /// A [`Dispatcher`] with `RECALL_WORKFLOW_TYPE` registered against
+    /// [`RecallStubNode`] stamping `count` results — enough to drive the
+    /// branching logic under test without a live Brain or the real
+    /// `RecallNode`'s HTTP seam.
+    fn recall_dispatcher(count: usize) -> Dispatcher {
+        let mut dispatcher = Dispatcher::new();
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            crate::nodes::brain_client::RECALL_NODE_NAME.to_string(),
+            crate::NodeConfig::new(crate::nodes::brain_client::RECALL_NODE_NAME, vec![]),
+        );
+        let schema = crate::WorkflowSchema::new(
+            RECALL_WORKFLOW_TYPE,
+            crate::nodes::brain_client::RECALL_NODE_NAME,
+            nodes,
+        );
+        dispatcher.register(
+            schema.clone(),
+            Box::new(move |_event: &serde_json::Value| {
+                let mut registry = crate::NodeRegistry::new();
+                registry.register(Box::new(RecallStubNode { count }));
+                Ok(crate::Workflow::new(registry, schema.clone()))
+            }),
+        );
+        dispatcher
+    }
+
+    /// A `RECALL` step whose stub result is empty (`count == 0`) causes the
+    /// immediately following block step to be SKIPPED — no `ExecutionOutcome`,
+    /// no `lane-log.jsonl` line, no checkpoint entry for it — and a single
+    /// `RecallConsulted` row is recorded with `branch: "skipped-next"`.
+    #[tokio::test]
+    async fn a_recall_step_with_an_empty_result_skips_the_next_step() {
+        let dispatcher = recall_dispatcher(0);
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (runner, _calls) = recording_runner();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![
+            dispatch_step("repo-a", RECALL_WORKFLOW_TYPE),
+            step("repo-a", "A.1"),
+        ];
+
+        let outcomes = integrate_chain_with_dispatch(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            Some(&move |row| sink_fn(row)),
+            &dispatcher,
+        )
+        .await
+        .expect("an empty recall must skip the next step, not fail the chain");
+
+        assert!(
+            outcomes.is_empty(),
+            "the skipped block step must never produce an ExecutionOutcome: {outcomes:?}"
+        );
+        assert_eq!(
+            read_lane_log(roadmap_dir.path()),
+            "",
+            "a skipped step must write no lane-log.jsonl line"
+        );
+
+        let recorded = rows.lock().unwrap();
+        let recall_rows: Vec<_> = recorded
+            .iter()
+            .filter(|r| r.kind == engine_contract::JournalDecisionKind::RecallConsulted)
+            .collect();
+        assert_eq!(
+            recall_rows.len(),
+            1,
+            "exactly one RecallConsulted row: {recorded:?}"
+        );
+        assert_eq!(recall_rows[0].detail.get("count"), Some(&json!(0)));
+        assert_eq!(
+            recall_rows[0].detail.get("branch"),
+            Some(&json!("skipped-next"))
+        );
+        assert!(
+            !recorded.iter().any(|r| r.step == "A.1"),
+            "the skipped step must have no journal row of its own either: {recorded:?}"
+        );
+    }
+
+    /// A `RECALL` step whose stub result is non-empty (`count >= 1`) leaves
+    /// the following block step executing exactly as before, and the
+    /// `RecallConsulted` row's `branch` reads `"ran-next"`.
+    #[tokio::test]
+    async fn a_recall_step_with_a_nonempty_result_runs_the_next_step() {
+        let dispatcher = recall_dispatcher(2);
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (runner, _calls) = recording_runner();
+        let (sink, rows) = recording_journal_sink();
+        let sink_fn = sink.clone();
+
+        let chain = vec![
+            dispatch_step("repo-a", RECALL_WORKFLOW_TYPE),
+            step("repo-a", "A.1"),
+        ];
+
+        let outcomes = integrate_chain_with_dispatch(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            Some(&move |row| sink_fn(row)),
+            &dispatcher,
+        )
+        .await
+        .expect("a non-empty recall must let the next step run");
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the block step must have run and produced one ExecutionOutcome: {outcomes:?}"
+        );
+        assert_eq!(read_lane_log(roadmap_dir.path()).lines().count(), 1);
+
+        let recorded = rows.lock().unwrap();
+        let recall_row = recorded
+            .iter()
+            .find(|r| r.kind == engine_contract::JournalDecisionKind::RecallConsulted)
+            .expect("a RecallConsulted row must be present");
+        assert_eq!(recall_row.detail.get("count"), Some(&json!(2)));
+        assert_eq!(recall_row.detail.get("branch"), Some(&json!("ran-next")));
+        assert_eq!(recall_row.detail.get("top_score"), Some(&json!(0.6)));
+    }
+
+    /// A failing `RECALL` dispatch step (an unregistered key, standing in
+    /// for "the brain is unreachable") bails the chain exactly like any
+    /// other dispatch failure — it is never treated as `count == 0`, so
+    /// the following step must never be silently skipped either.
+    #[tokio::test]
+    async fn a_failing_recall_step_bails_the_chain_rather_than_skipping() {
+        let dispatcher = Dispatcher::new(); // RECALL_WORKFLOW_TYPE never registered
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let (runner, _calls) = recording_runner();
+
+        let chain = vec![
+            dispatch_step("repo-a", RECALL_WORKFLOW_TYPE),
+            step("repo-a", "A.1"),
+        ];
+
+        let err = integrate_chain_with_dispatch(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            None,
+            &dispatcher,
+        )
+        .await
+        .expect_err("an unregistered RECALL key must bail the chain, not skip past it");
+
+        assert!(matches!(err, IntegrateError::Dispatch(_)));
+        assert_eq!(
+            read_lane_log(roadmap_dir.path()),
+            "",
+            "the chain bailed before the block step ever ran"
+        );
     }
 
     /// A dispatch step naming an unregistered workflow key stops the
