@@ -16,6 +16,7 @@ pub mod aggregate;
 pub mod command_floor;
 pub mod emit_state;
 pub mod overlay;
+pub mod permission;
 pub mod profiles;
 pub mod resolve;
 pub mod shaping;
@@ -25,6 +26,7 @@ pub mod tier;
 pub use aggregate::{aggregate, aggregate_state_files, extract_policy_telemetry, PolicyAggregate};
 pub use emit_state::{CommandOutputLike, EmitStateNode, Runner as EmitStateRunner};
 pub use overlay::{merge_local, Overlay, PartialLocalConfig};
+pub use permission::{decide, Decision, GatedAction, PermissionProfile, DEFAULT_PROFILE};
 pub use profiles::{
     read_harness_policy_defaults, read_harness_policy_defaults_from, read_harness_profiles,
     read_harness_profiles_from, resolve_profile, resolve_profile_from, resolved_policy_strict,
