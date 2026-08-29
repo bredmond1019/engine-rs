@@ -127,10 +127,10 @@ the step.
 | Stage | Module | What it does |
 |---|---|---|
 | Resolve | `chain.rs` | Turns a (roadmap, lane) pair or an explicit block list into ordered `(repo, block_id)` steps. Reads mev's structured `HELD-UNTIL` / `BUDGET` / `EXCLUSIVE-REPOS` directives and `planning/lane-segments.json` — it does not re-derive segments. |
-| Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** (backed by `corpus_gates.rs`, which reads each repo's real `planning/state.json` through `okf_core::load_state`) and refuses to start a block with an unmet edge, naming the edge and its repo. `DependencyEdge` is an enum — `Block` · `Operator { slug }` · `Approval { slug }` · `External { what }` — so an **operator gate is always unmet while present** and clears only by removal from the corpus (mev is the single writer); the engine can never self-clear one. Also reads mev's `lane-frontier.json` for lane-head startability, but `startable: true` never short-circuits the per-edge check. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail, and a block parked on an operator hold releases its permit rather than starving the ceiling. |
-| Execute | `execute.rs` | For a `block`-kind step: builds and runs a **fresh in-process Rust `Workflow`** for whichever engine the block's own authored `sdlc_workflow` field names — `SDLC_FLOW` or `SDLC_TASK` — with the repo resolved through `RepoRegistry` and `event.repo` seeded. An unsupported or absent `sdlc_workflow` value errors (see above). A non-`Block` `kind` reaching `execute_step` is refused with `ExecuteError::WrongStepKind` — a `dispatch` step is routed elsewhere (below), never through this path. |
+| Gate | `gates.rs` | Resolves every `depends_on` edge against the **live graph** (backed by `corpus_gates.rs`, which reads each repo's real `planning/state.json` through `okf_core::load_state`) and refuses to start a block with an unmet edge, naming the edge and its repo. `DependencyEdge` is an enum — `Block` · `Operator { slug }` · `Approval { slug }` · `External { what }` — so an **operator gate is always unmet while present** and clears only by removal from the corpus (mev is the single writer); the engine can never self-clear one. Also reads mev's `lane-frontier.json` for lane-head startability, but `startable: true` never short-circuits the per-edge check. Then consults admission control: **at capacity the run waits** — it does not proceed and does not fail, and a block parked on an operator hold releases its permit rather than starving the ceiling. `gates.rs` also exposes `check_permission_gate` (`EN.12.C`, see "Permission profiles" below), a separate check from the `depends_on` gate above — it denies a graded action outright rather than waiting on one. |
+| Execute | `execute.rs` | For a `block`-kind step: builds and runs a **fresh in-process Rust `Workflow`** for whichever engine the block's own authored `sdlc_workflow` field names — `SDLC_FLOW` or `SDLC_TASK` — with the repo resolved through `RepoRegistry` and `event.repo` seeded. An unsupported or absent `sdlc_workflow` value errors (see above). A non-`Block` `kind` reaching `execute_step` is refused with `ExecuteError::WrongStepKind` — a `dispatch` step is routed elsewhere (below), never through this path. Every `FlowInvocation` also carries a required `permission_profile` (`EN.12.C`); `execute_step` resolves the child step's effective profile from the parent's plus an optional per-step request and errors with `ExecuteError::ProfileWidening` rather than silently widening it — see "Permission profiles" below. |
 | Dispatch | `dispatch.rs` | For a `dispatch`-kind step (`EN.12.E`, see "A chain may also mix `block` and `dispatch` steps" below): resolves the step's `block_id` as a `Dispatcher` registry key and runs the registered in-process workflow to completion, never selecting an `EngineKind`. |
-| Integrate | `integrate.rs` | Verifies the state write after a `block` step's engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. After the state write verifies and before the step's `closed` lane-log line is appended, **merges that step's branch into `main` and pushes it** (`EN.11.C`) — this is what makes block N+1's tree actually contain block N's work; without it every step cuts its branch from `origin/main` and is missing everything before it (sequence.md finding G1). The branch to merge is resolved from `PullRequestNode`'s own stamped `branch_name` (authoritative even on the `auto_pr: false` short-circuit) with a fallback to `SetupWorktreeNode`'s branch for a run that never reached `PullRequestNode`; `None` from both is a documented no-op skip, not an error. This lives in the chain, not in `SDLC_FLOW`/`PullRequestNode` — `PullRequestNode`'s "never auto-merges" contract (human review gate, D25) is unchanged for a standalone run; only the chain, integrating steps back-to-back with nobody in the loop, has grounds to merge automatically. A merge that can't complete (conflict, rejected push) is `IntegrateError::StepMergeFailed` (carrying the failing git command's stderr) and the step is never recorded as `closed`. Before each block, re-checks the run's `cancellation_token` and a campaign-scoped `CampaignLedger` against an optional `campaign_budget` ceiling (`EN.11.F`) — both checked again at every block boundary, not just once at the start. Appends exactly one `lane-log.jsonl` line per `block` step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held` \| `cancelled` \| `budget_halted`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. A `dispatch` step's outcome is journaled instead, not appended to `lane-log.jsonl` (see below). An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
+| Integrate | `integrate.rs` | Verifies the state write after a `block` step's engine returns and **fails the run loudly on a mismatch** — including a `status: "done"` run whose `final_validation.all_passed` is `false`, and a state file whose `block_id` does not match the executed block. After the state write verifies and before the step's `closed` lane-log line is appended, **merges that step's branch into `main` and pushes it** (`EN.11.C`) — this is what makes block N+1's tree actually contain block N's work; without it every step cuts its branch from `origin/main` and is missing everything before it (sequence.md finding G1). The branch to merge is resolved from `PullRequestNode`'s own stamped `branch_name` (authoritative even on the `auto_pr: false` short-circuit) with a fallback to `SetupWorktreeNode`'s branch for a run that never reached `PullRequestNode`; `None` from both is a documented no-op skip, not an error. This lives in the chain, not in `SDLC_FLOW`/`PullRequestNode` — `PullRequestNode`'s "never auto-merges" contract (human review gate, D25) is unchanged for a standalone run; only the chain, integrating steps back-to-back with nobody in the loop, has grounds to merge automatically. A merge that can't complete (conflict, rejected push) is `IntegrateError::StepMergeFailed` (carrying the failing git command's stderr) and the step is never recorded as `closed`. Before each block, re-checks the run's `cancellation_token` and a campaign-scoped `CampaignLedger` against an optional `campaign_budget` ceiling (`EN.11.F`) — both checked again at every block boundary, not just once at the start. Appends exactly one `lane-log.jsonl` line per `block` step in the on-disk contract shape `{ts, lane, repo, block, status, note}` with `status` a typed `closed` \| `bailed` \| `held` \| `cancelled` \| `budget_halted`; a **failed** step appends a `bailed` line before the error propagates, so an attempted block is never silent. Every line also stamps the resolved `permission_profile` wire identifier (`EN.12.C`, see "Permission profiles" below); the `closed` write refuses loudly (`IntegrateError::MissingPermissionProfileStamp`) if that stamp is ever absent, while the other outcome lines keep the module's existing best-effort write semantics. A `dispatch` step's outcome is journaled instead, not appended to `lane-log.jsonl` (see below). An operator hold pauses and resumes without re-running completed blocks, under a deadline rather than an unbounded poll. |
 
 Readiness always comes from the graph, never from a roadmap's hand-written wave table. A roadmap is
 an authored snapshot and has been wrong; the `depends_on` edges are the fact.
@@ -149,6 +149,11 @@ outcome. `run_id` is the executed step's engine run UUID when a child workflow a
 that step (a `closed` line, or a `bailed` line from a post-execution failure such as a state-write
 verification mismatch); it is `None` when the step never got that far — cancelled, budget-halted,
 or held/bailed before execution started, so there is no run to name.
+
+A fourth identity field, `profile` (`EN.12.C`), carries the resolved `PermissionProfile` wire
+identifier (`locked` \| `standard` \| `unrestricted`) and is likewise additive on read — an older
+reader ignores it — but is **required on write** for a `closed` line: `integrate.rs` refuses the
+write rather than append a `closed` line with no profile stamp. See "Permission profiles" below.
 
 A clean abort, a budget halt, and a node/state-write failure are three distinguishable terminal
 states in that log, not one undifferentiated stop (`EN.11.F`): a chain halted by
@@ -199,6 +204,43 @@ Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 
 Defaults are also written into `planning/harness.json` under `orchestration`, so the knob is
 discoverable without reading the Rust.
+
+## Permission profiles (`EN.12.C`)
+
+Every chain runs under a `PermissionProfile` — a closed, three-level enum (`locked` \|
+`standard` \| `unrestricted`, wire-serialized snake_case) that grades what a step is allowed to do
+without an operator in the loop, defined alongside a closed `GatedAction` enum
+(`crates/engine-core/src/policy/permission.rs`) covering `ClearOperatorGate`,
+`InstallOnMini`, `PushToMain`, and `CrossRepoWrite`. `permission::decide(profile, action)` is a
+pure grading matrix over those two enums; `ClearOperatorGate` is denied for every profile via an
+early return before the matrix is even consulted — no profile row can flip it, so an operator gate
+can never be cleared from inside a chain run, matching the Gate stage's rule above that only mev
+can clear one.
+
+**Resolving the active profile.** `resolve_permission_profile` (and its config-only sibling
+`resolve_permission_profile_from_config`) reads the `[permission_profiles]` table from a repo's
+`brain.toml` (via `mev::brain::config::load_brain_config`, resolved through
+`RepoRegistry::brain_root()`) and **fails closed to `Locked`** — with a typed
+`ProfileResolutionError` explaining why — on any absent table, empty level set, or unknown level
+id, rather than silently defaulting to something more permissive.
+
+**Enforcing it.** `gates.rs`'s `check_permission_gate` consults `permission::decide` before a
+graded action runs. On denial it calls an injected `author_operator_edge` closure to raise a
+`{"type": "operator"}` edge (a stable slug of the form `permission-<action>`, so every block
+denied the same action shares one operator gate to clear) and refuses the step —
+`PermissionGateError::Denied` or `::EdgeAuthorFailed`. It never writes `state.json` in-process;
+authoring the edge is delegated the same way `gates.rs`'s existing `depends_on` machinery treats
+mev as the single writer.
+
+**Threading it through a chain.** `execute_step` resolves each child step's effective profile from
+`resolve_child_permission_profile(parent_profile, requested_profile)` — a per-step request may
+*narrow* the parent's profile but never *widen* it; a widening request is refused with
+`ExecuteError::ProfileWidening` rather than silently clamped. The resolved profile is seeded as a
+named `permission_profile` key in both `sdlc_flow_event` and `sdlc_task_event`, and `integrate.rs`
+stamps the same resolved profile onto every `lane-log.jsonl` line (see "The lane-log contract"
+above) via `resolved_permission_profile_identifier`, refusing the write outright
+(`IntegrateError::MissingPermissionProfileStamp`) if a `closed` line would otherwise go out with
+none.
 
 ## Only sanctioned engines are reachable
 

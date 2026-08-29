@@ -515,6 +515,21 @@ pub struct LaneLogEntry {
     /// [`crate::build_info::GIT_SHA`] of the binary that wrote this line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_sha: Option<String>,
+    /// `EN.12.C` task 3: the verbatim permission-profile wire identifier
+    /// (`locked` / `standard` / `unrestricted`, from
+    /// [`crate::policy::permission::PermissionProfile`]) in force for the
+    /// run that produced this line — invariant 1 of
+    /// `docs/permission-profiles.md`: an audit must be able to tell what
+    /// grade of action a run was entitled to take. `Option` exists ONLY so
+    /// the fleet's many pre-`EN.12.C` lines (six-field and nine-field
+    /// alike) keep deserializing — every line THIS engine writes carries
+    /// `Some`. `#[serde(default)]` for that read side;
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` so an
+    /// unstamped line (there should never be one from this engine) omits
+    /// the key rather than writing `null`, matching `run_id`'s own
+    /// tri-state discipline above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// The closed vocabulary of outcomes a lane-log line can record. No
@@ -557,6 +572,7 @@ impl LaneLogEntry {
             run_id: None,
             writer: None,
             build_sha: None,
+            profile: None,
         }
     }
 
@@ -574,6 +590,7 @@ impl LaneLogEntry {
             run_id: None,
             writer: None,
             build_sha: None,
+            profile: None,
         }
     }
 
@@ -594,6 +611,7 @@ impl LaneLogEntry {
             run_id: None,
             writer: None,
             build_sha: None,
+            profile: None,
         }
     }
 
@@ -618,6 +636,7 @@ impl LaneLogEntry {
             run_id: None,
             writer: None,
             build_sha: None,
+            profile: None,
         }
     }
 
@@ -633,6 +652,22 @@ impl LaneLogEntry {
         self.run_id = run_id;
         self.writer = Some(crate::build_info::WRITER.to_string());
         self.build_sha = Some(crate::build_info::GIT_SHA.to_string());
+        self
+    }
+
+    /// Stamp the resolved permission-profile wire identifier onto this
+    /// line (`EN.12.C` task 3), verbatim (`locked`/`standard`/
+    /// `unrestricted`) — never a display string or re-worded label.
+    /// Applied at every `append_lane_log_line` call site in
+    /// [`integrate_chain_impl`], the same discipline [`with_identity`]
+    /// already follows. `None` exists only so a test can simulate the
+    /// stamp being dropped by a future regression (see
+    /// [`resolved_permission_profile_identifier`]'s call sites and the
+    /// `refuses_to_integrate_a_closed_step_with_no_profile_stamp` test) —
+    /// production code never intentionally passes `None` here.
+    #[must_use]
+    pub fn with_permission_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
         self
     }
 }
@@ -814,6 +849,18 @@ pub enum IntegrateError {
         branch: String,
         stderr: String,
     },
+    /// `EN.12.C` task 3: the about-to-be-written `closed` lane-log record
+    /// for this block carried no resolved permission-profile stamp.
+    /// Refused rather than written — invariant 1 of
+    /// `docs/permission-profiles.md` requires every record this engine
+    /// writes to say what grade of action the run was entitled to take,
+    /// so a record with no stamp is never admitted as `closed`, even if
+    /// the step itself otherwise succeeded. This guard exists precisely
+    /// so a future change that stops calling
+    /// [`resolved_permission_profile_identifier`] /
+    /// [`LaneLogEntry::with_permission_profile`] fails loudly here rather
+    /// than silently shipping an unauditable record.
+    MissingPermissionProfileStamp { repo: String, block_id: String },
 }
 
 impl fmt::Display for IntegrateError {
@@ -945,6 +992,12 @@ impl fmt::Display for IntegrateError {
                 "dispatch step '{block_id}' (repo '{repo}') has no Dispatcher configured \
                  for this chain run — cannot resolve its workflow key"
             ),
+            IntegrateError::MissingPermissionProfileStamp { repo, block_id } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') refused: its about-to-be-written \
+                 closed lane-log record carries no resolved permission-profile stamp \
+                 (docs/permission-profiles.md invariant 1)"
+            ),
         }
     }
 }
@@ -966,7 +1019,8 @@ impl std::error::Error for IntegrateError {
             | IntegrateError::AmbiguousRoadmapDir { .. }
             | IntegrateError::HoldDeadlineExceeded { .. }
             | IntegrateError::NoDispatcherConfigured { .. }
-            | IntegrateError::StepMergeFailed { .. } => None,
+            | IntegrateError::StepMergeFailed { .. }
+            | IntegrateError::MissingPermissionProfileStamp { .. } => None,
             IntegrateError::CheckpointWriteFailed(source) => Some(source),
             IntegrateError::Dispatch(err) => Some(err),
         }
@@ -1148,6 +1202,56 @@ fn resolved_policy_detail(ctx: &engine_contract::TaskContext, engine: EngineKind
         "transport": single_or_list(tiers),
         "executor": engine.to_string(),
     })
+}
+
+/// Resolve the permission profile in force for THIS chain run, as its
+/// verbatim wire identifier (`locked` / `standard` / `unrestricted`) —
+/// `EN.12.C` task 3, invariant 1 of `docs/permission-profiles.md`.
+///
+/// Reads `<registry.brain_root()>/brain.toml` via
+/// [`crate::policy::permission::resolve_permission_profile`] — the same
+/// fail-closed path `EN.12.C` task 2 established, and the SAME brain root
+/// this chain run already resolved its `RepoRegistry` against
+/// ([`RepoRegistry::brain_root`]), rather than re-deriving one fresh from
+/// the process's current working directory. That distinction matters for
+/// more than hygiene: re-deriving from cwd would let a test process
+/// (whose cwd sits inside the REAL fleet checkout) silently pick up the
+/// operator's actual `brain.toml` instead of a hermetic fixture. ALWAYS
+/// returns a concrete identifier — [`resolve_permission_profile`]'s own
+/// fail-closed contract means this never has nothing to stamp.
+fn resolved_permission_profile_identifier(registry: &RepoRegistry) -> String {
+    let (profile, _error) = crate::policy::permission::resolve_permission_profile(
+        &registry.brain_root().join("brain.toml"),
+    );
+    // The enum's `Serialize` impl IS the wire-identifier contract
+    // (`#[serde(rename_all = "snake_case")]`) — round-trip through it
+    // rather than hand-writing a second mapping that could drift from the
+    // one `permission.rs` already tests exhaustively.
+    serde_json::to_value(profile)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "locked".to_string())
+}
+
+/// The guard `EN.12.C` task 3 requires immediately before a `closed`
+/// lane-log line is written: refuse rather than write when `entry.profile`
+/// is `None`. Deliberately a small, standalone, directly-testable seam —
+/// see the `refuses_to_write_a_closed_entry_with_no_profile_stamp` test
+/// below, which DEMONSTRATES this failing (an unstamped entry is refused)
+/// as well as passing (a stamped entry is not), per the carryover
+/// `gate-scope-must-be-shown-capable-of-failing`.
+fn require_profile_stamp(
+    entry: &LaneLogEntry,
+    repo: &str,
+    block_id: &str,
+) -> Result<(), IntegrateError> {
+    if entry.profile.is_none() {
+        return Err(IntegrateError::MissingPermissionProfileStamp {
+            repo: repo.to_string(),
+            block_id: block_id.to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ── The integrated loop ─────────────────────────────────────────────────
@@ -1482,7 +1586,8 @@ async fn integrate_chain_impl(
                     step.block_id
                 ),
             )
-            .with_identity(None);
+            .with_identity(None)
+            .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             break;
@@ -1496,7 +1601,10 @@ async fn integrate_chain_impl(
         if let BudgetDecision::Halt(reason) = campaign_ledger.check(campaign_budget) {
             let entry =
                 LaneLogEntry::budget_halted(step, lane.unwrap_or(step.repo.as_str()), reason)
-                    .with_identity(None);
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             // `EN.12.D` task 4: the fifth decision point — the one decision
@@ -1554,7 +1662,10 @@ async fn integrate_chain_impl(
         {
             let entry =
                 LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string())
-                    .with_identity(None);
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             return Err(err);
@@ -1574,7 +1685,8 @@ async fn integrate_chain_impl(
                     step.block_id
                 ),
             )
-            .with_identity(None);
+            .with_identity(None)
+            .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             break;
@@ -1739,6 +1851,18 @@ async fn integrate_chain_impl(
         // `execute_step`'s signature able to carry them. `None, None` here
         // is mechanical — behavior-identical to before this task, since
         // `RunOptions::default()` was always the child's config.
+        // `EN.12.C` task 4: the chain's parent profile is the same
+        // fail-closed `resolve_permission_profile` read `resolved_
+        // permission_profile_identifier` above already performs against
+        // this run's own `brain.toml` — re-derived here as the typed
+        // `PermissionProfile` `execute_step` needs (not the wire-string
+        // form that function returns). No per-step narrowing is threaded
+        // from `ChainStep` yet (out of this task's scope), so every step
+        // inherits the chain's profile verbatim.
+        let (parent_permission_profile, _permission_profile_error) =
+            crate::policy::permission::resolve_permission_profile(
+                &registry.brain_root().join("brain.toml"),
+            );
         let outcome = match execute_step(
             step,
             resolve_engine,
@@ -1748,6 +1872,8 @@ async fn integrate_chain_impl(
             campaign_id,
             None,
             None,
+            parent_permission_profile,
+            None,
         )
         .await
         {
@@ -1755,7 +1881,10 @@ async fn integrate_chain_impl(
             Err(err) => {
                 let integrate_err = IntegrateError::from(err);
                 let entry = LaneLogEntry::bailed(step, step_lane, integrate_err.to_string())
-                    .with_identity(None);
+                    .with_identity(None)
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
                 let _ = append_lane_log_line(roadmap_dir, &entry);
                 let _ = write_checkpoint(roadmap_dir, &checkpoint);
                 // `EN.12.D` task 4: no child `ctx` exists for a step whose
@@ -1795,7 +1924,8 @@ async fn integrate_chain_impl(
             // earlier `bailed`/`cancelled`/`budget_halted` sites, where no
             // child ever started.
             let entry = LaneLogEntry::bailed(step, step_lane, err.to_string())
-                .with_identity(Some(step_run_id.to_string()));
+                .with_identity(Some(step_run_id.to_string()))
+                .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
             emit_journal(
@@ -1821,7 +1951,10 @@ async fn integrate_chain_impl(
                 merge_step_branch(&outcome.repo_path, &step.repo, &step.block_id, &branch)
             {
                 let entry = LaneLogEntry::bailed(step, step_lane, err.to_string())
-                    .with_identity(Some(step_run_id.to_string()));
+                    .with_identity(Some(step_run_id.to_string()))
+                    .with_permission_profile(Some(resolved_permission_profile_identifier(
+                        registry,
+                    )));
                 let _ = append_lane_log_line(roadmap_dir, &entry);
                 let _ = write_checkpoint(roadmap_dir, &checkpoint);
                 emit_journal(
@@ -1842,7 +1975,16 @@ async fn integrate_chain_impl(
             step_lane,
             format!("block {} closed via SDLC_FLOW", step.block_id),
         )
-        .with_identity(Some(step_run_id.to_string()));
+        .with_identity(Some(step_run_id.to_string()))
+        .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
+        // `EN.12.C` task 3: refuse to integrate a step whose about-to-be-
+        // written record carries no resolved permission-profile stamp —
+        // see [`IntegrateError::MissingPermissionProfileStamp`]. In
+        // practice `resolved_permission_profile_identifier` above always
+        // returns `Some`, fail-closed to `"locked"` rather than `None`;
+        // this check is the guard against a FUTURE change that stops
+        // stamping it, not a path reachable today.
+        require_profile_stamp(&entry, &step.repo, &step.block_id)?;
         append_lane_log_line(roadmap_dir, &entry)?;
 
         // `EN.12.D` task 4: the integrated-step decision point — the child
@@ -2863,6 +3005,92 @@ mod tests {
             let parsed: Value = serde_json::from_str(line).unwrap();
             assert_eq!(parsed["lane"], json!("backend"));
         }
+    }
+
+    /// `EN.12.C` task 3, AC "Every lane-log line this engine writes
+    /// carries a profile identifier": a `closed` step's line written by a
+    /// real `integrate_chain` run carries a `profile` key naming one of
+    /// the three closed wire identifiers, verbatim — never `null` and
+    /// never a display string. `two_repo_registry`'s `brain.toml` fixture
+    /// declares no `[permission_profiles]` table, so this resolves via
+    /// task 2's fail-closed path to `"locked"` — the exact case
+    /// `resolved_permission_profile_identifier`'s doc comment describes.
+    #[tokio::test]
+    async fn a_closed_lane_log_line_carries_the_resolved_permission_profile() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("chain should complete");
+
+        let contents = std::fs::read_to_string(roadmap_dir.path().join("lane-log.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            parsed["profile"],
+            json!("locked"),
+            "no [permission_profiles] table in the fixture brain.toml must fail closed \
+             to the verbatim wire identifier \"locked\", not null and not a display string"
+        );
+    }
+
+    /// `EN.12.C` task 3, ACs "Integration is REFUSED..." and "The stamp
+    /// test is demonstrated failing when the profile field is dropped":
+    /// [`require_profile_stamp`] refuses an entry whose `profile` is
+    /// `None` (simulating a future regression that stops calling
+    /// [`LaneLogEntry::with_permission_profile`]) with
+    /// [`IntegrateError::MissingPermissionProfileStamp`], and accepts the
+    /// same entry once stamped. DEMONSTRATED failing: the first assertion
+    /// below fails (no `MissingPermissionProfileStamp` is returned, since
+    /// `require_profile_stamp` would instead return `Ok`) if the `is_none`
+    /// check inside `require_profile_stamp` is ever weakened or removed.
+    #[test]
+    fn refuses_to_write_a_closed_entry_with_no_profile_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = outcome_for(dir.path(), "A.1");
+
+        let dropped = LaneLogEntry::closed(&outcome, "repo-a", "closed")
+            .with_identity(Some("run-1".to_string()))
+            .with_permission_profile(None);
+        let err = require_profile_stamp(&dropped, "repo-a", "A.1")
+            .expect_err("an entry with no profile stamp must be refused");
+        assert!(matches!(
+            err,
+            IntegrateError::MissingPermissionProfileStamp { repo, block_id }
+                if repo == "repo-a" && block_id == "A.1"
+        ));
+
+        let stamped = dropped.with_permission_profile(Some("locked".to_string()));
+        require_profile_stamp(&stamped, "repo-a", "A.1")
+            .expect("an entry carrying a profile stamp must be accepted");
     }
 
     /// A failing step appends exactly one `bailed` line carrying the
