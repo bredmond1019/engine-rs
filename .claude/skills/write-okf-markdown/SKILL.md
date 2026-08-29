@@ -63,7 +63,7 @@ Then subtract the **ephemeral** names, from `crawl.rs::is_ephemeral`. These are 
 
 Three fields are required — `type`, `title`, `description`. Everything else is optional but earns its
 place: `doc_id`, `layer`, `project`, `status`, `keywords`, `related` sharpen retrieval and create graph
-edges.
+edges. Two more, `created` and `updated`, are pure documentation — nothing validates them.
 
 ```yaml
 ---
@@ -76,8 +76,18 @@ project: brain                   # controlled; OMIT for cross-cutting docs
 status: active
 keywords: [three, to, seven, concrete, terms]
 related: [some-real-doc-id]
+created: 2026-08-29              # optional; when this file was first written
+updated: 2026-08-29              # optional; bump it yourself when you revise
 ---
 ```
+
+**`created` / `updated` are yours to maintain.** They were added to `okf_core::OkfFrontmatter` on
+2026-08-29 (okf-core block `OK.ticket.add-created-updated-frontmatter`) so they round-trip instead of
+being dropped. **No gate checks them, no format is enforced, and no command fills or refreshes them** —
+a stale `updated` is invisible. Use `YYYY-MM-DD`, keep them after `related:` (the order the serializer
+writes), and leave both off rather than let them go stale. Existing docs omit them; **do not backfill.**
+They are not `timestamp` (Log/ProjectStatus freshness, ISO-8601 with timezone, trap 4 below) and not
+`synced_from` (the cross-repo watermark behind `E_SYNC_DRIFT`).
 
 ### The four traps that break YAML parsing
 
@@ -273,6 +283,7 @@ separately, in that order, and re-run both after each fix.
 - [ ] Frontmatter present, with `type` / `title` / `description`
 - [ ] Every scalar containing `: ` or `#` is **quoted**
 - [ ] `timestamp` (Log / ProjectStatus only) is full ISO-8601 **with timezone**
+- [ ] If `created` / `updated` are present, they are `YYYY-MM-DD` and `updated` reflects *this* edit
 - [ ] Controlled fields (`layer` / `project` / `status`) use real vocabulary values — check the schema doc
 - [ ] Cross-scope `related:` targets carry a `<scope>:` prefix
 - [ ] A row exists in the directory's `index.md`
