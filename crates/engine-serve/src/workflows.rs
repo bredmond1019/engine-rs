@@ -874,6 +874,37 @@ pub fn register_terminal_probe(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `RECALL` workflow (`engine_core::workflows::recall::graph`,
+/// `EN.12.L` task 2) with `dispatcher`, populating both the
+/// `workflow_registry` and the `schema_registry`. Reachable as an
+/// `EN.12.E` `kind: dispatch` chain step naming registry key `RECALL`.
+///
+/// A **sixth model-free workflow** registered in this module, alongside
+/// [`register_terminal_probe`] / [`register_opportunity_set_stage`] /
+/// [`register_opportunity_add_action`] / [`register_harvest_approve`] /
+/// [`register_lead_ingest`]: `RecallNode` calls no model and reads no
+/// `harness.json` policy section (see `recall::graph`'s module doc), so
+/// this factory resolves no policy and seeds no policy stamp — there is no
+/// `resolve_policy_for_run_from` call and no `seed_resolved_policy` call.
+/// Its `BrainConfig` is resolved fresh per event from the environment
+/// (`BrainConfig::from_env`), mirroring how every other injected-transport
+/// seam here resolves its config at dispatch time rather than at process
+/// startup — a construction-time error (missing `BRAIN_API_URL`) surfaces
+/// as `DispatchError::PolicyResolutionFailed`, not a panic.
+pub fn register_recall(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::recall::graph::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            let config = engine_core::nodes::brain_client::BrainConfig::from_env()
+                .map_err(|err| err.to_string())?;
+            Ok(Workflow::new(
+                engine_core::workflows::recall::graph::registry(config),
+                engine_core::workflows::recall::graph::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register the `ORCHESTRATION` workflow (`engine_core::workflows::orchestration`,
 /// `EN.10.B`) with `dispatcher`. Like [`register_terminal_probe`], this
 /// factory resolves no policy and seeds no policy stamp at dispatch time:
@@ -1105,6 +1136,7 @@ pub fn register_builtin_workflows_with_registry(
     register_lead_ingest(dispatcher);
     register_approve_and_run(dispatcher);
     register_terminal_probe(dispatcher);
+    register_recall(dispatcher);
     register_orchestration(dispatcher);
 }
 
@@ -2318,6 +2350,74 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("TERMINAL_PROBE"));
+    }
+
+    #[test]
+    fn register_recall_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_recall(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("RECALL"));
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_recall_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_recall(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("RECALL")
+            .expect("RECALL schema should resolve");
+
+        assert_eq!(schema.start_node, "RecallNode");
+    }
+
+    #[test]
+    fn dispatch_recall_builds_a_runnable_workflow_with_no_policy_stamp() {
+        // Own process (nextest is process-per-test), so mutating the shared
+        // `BRAIN_API_URL`/`BRAIN_API_KEY` env vars here cannot race any
+        // other test.
+        std::env::set_var("BRAIN_API_URL", "http://localhost:8000");
+        std::env::remove_var("BRAIN_API_KEY");
+
+        let mut dispatcher = Dispatcher::new();
+        register_recall(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event("RECALL", &serde_json::json!({"query": "what changed"}))
+            .expect("RECALL should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+
+        std::env::remove_var("BRAIN_API_URL");
+    }
+
+    #[test]
+    fn dispatch_recall_surfaces_a_missing_brain_url_as_policy_resolution_failed() {
+        std::env::remove_var("BRAIN_API_URL");
+        std::env::remove_var("BRAIN_API_KEY");
+
+        let mut dispatcher = Dispatcher::new();
+        register_recall(&mut dispatcher);
+
+        let result =
+            dispatcher.dispatch_with_event("RECALL", &serde_json::json!({"query": "what changed"}));
+
+        match result {
+            Err(engine_core::DispatchError::PolicyResolutionFailed(_)) => {}
+            Err(other) => panic!("expected PolicyResolutionFailed, got a different error: {other}"),
+            Ok(_) => panic!("expected a missing BRAIN_API_URL to surface as a dispatch error"),
+        }
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_recall() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("RECALL"));
     }
 
     #[test]
