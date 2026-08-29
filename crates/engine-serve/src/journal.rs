@@ -143,7 +143,8 @@ fn ledger_label(kind: JournalDecisionKind) -> &'static str {
         JournalDecisionKind::BudgetHalted => "HELD",
         JournalDecisionKind::StepIntegrated
         | JournalDecisionKind::ResolvedPolicy
-        | JournalDecisionKind::RecallConsulted => "DONE",
+        | JournalDecisionKind::RecallConsulted
+        | JournalDecisionKind::DebriefRendered => "DONE",
     }
 }
 
@@ -156,6 +157,7 @@ fn kind_title(kind: JournalDecisionKind) -> &'static str {
         JournalDecisionKind::BudgetHalted => "budget halted",
         JournalDecisionKind::ResolvedPolicy => "resolved policy",
         JournalDecisionKind::RecallConsulted => "recall consulted",
+        JournalDecisionKind::DebriefRendered => "debrief rendered",
     }
 }
 
@@ -390,6 +392,20 @@ mod tests {
         assert!(
             super::kind_title(engine_contract::JournalDecisionKind::RecallConsulted)
                 .contains("recall")
+        );
+    }
+
+    /// `DebriefRendered` renders `DONE` (the brief IS the artifact, not an
+    /// open item or a hold) and its title contains the substring `debrief`.
+    #[::core::prelude::v1::test]
+    fn debrief_rendered_renders_done_and_title_contains_debrief() {
+        assert_eq!(
+            super::ledger_label(engine_contract::JournalDecisionKind::DebriefRendered),
+            "DONE"
+        );
+        assert!(
+            super::kind_title(engine_contract::JournalDecisionKind::DebriefRendered)
+                .contains("debrief")
         );
     }
 
