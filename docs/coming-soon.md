@@ -55,7 +55,6 @@ none of the pieces below exist, so an operator still chooses the work and reads 
 | Run journal | `EN.12.D` | **Ready** | Durable decision rows, a D57 renderer, and a read route — the substrate the two below render from. |
 | `WORKFLOW_DISPATCH` | `EN.12.E` | Waiting on `EN.12.D` | Lets a chain step run any registered workflow, not just an SDLC engine. |
 | `CONDUCTOR` | `EN.12.F` | Waiting on `mev:MV.14.B`, `EN.12.D`, `EN.12.E`, `OP.first-weekly-objective` | The run picks tonight's chain itself from a weekly objective, instead of being handed a block list. |
-| `DEBRIEF` | `EN.12.G` | Waiting on `EN.12.D`, `EN.12.F`, `OP.first-weekly-objective` | A morning brief rendered from the journal, readable on a phone. |
 | Research → action items | `EN.12.H` | Waiting on `EN.12.E`, `bastion:BA.21.D` | A scheduled research chain files into the operator queue. |
 | Research → demo | `EN.12.I` | Waiting on `EN.12.E`, `EN.12.F` | An overnight branded demo generated from a company name. |
 

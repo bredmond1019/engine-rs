@@ -64,7 +64,7 @@ curl -X POST $ENGINE/events/$RUN_ID/abort -H "X-API-Key: $ENGINE_EVENTS_API_KEY"
 
 ## The workflows
 
-Fifteen registered types, grouped by what you'd use them for. The registration list in
+Seventeen registered types, grouped by what you'd use them for. The registration list in
 `crates/engine-serve/src/workflows.rs` (`register_builtin_workflows`) is the source of truth; this
 table is a reader's copy.
 
@@ -75,6 +75,7 @@ table is a reader's copy.
 | `SDLC_FLOW` | Runs a whole spec end to end on one branch: implement each task, test, fix, one consolidated review, a docs pass, then opens a PR. The heavyweight option. | [sdlc-flow.md](sdlc-flow.md) |
 | `SDLC_TASK` | The lean version: implement → test → fix, and stop. No review, no docs pass, no PR. For one small unit of work. | [sdlc-task.md](sdlc-task.md) |
 | `ORCHESTRATION` | Runs an ordered *chain* of the two above, across repos, checking dependencies and merging each block before the next starts. | [orchestration.md](orchestration.md) |
+| `DEBRIEF` | Renders a morning brief from one campaign's journal — every step, every bail named with its reason — readable on a phone. | [debrief.md](debrief.md) |
 
 ### Winning and serving work
 
