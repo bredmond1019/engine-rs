@@ -344,7 +344,14 @@ corpus). All three reuse the same `X-API-Key` gate as `POST /events/` and reject
 malformed query param with a typed `422` (never `500`). No `engine_contract` Rust type changes
 shape — `RecallNode` (`crates/engine-core/src/nodes/brain_client.rs`, `EN.6.K`) is engine-rs's
 first client of the three, over `GET /recall`; `GET /walk` and `GET /pulse` still have no engine-rs
-caller. Wiring a hybrid workflow to ground a proposal draft in existing corpus content via
+caller. `EN.12.L` wired `RecallNode` into a dispatchable single-node `RECALL` workflow
+(`crates/engine-core/src/workflows/recall/`, registered via `register_recall` in
+`crates/engine-serve/src/workflows.rs`) that an `EN.12.E` `kind: dispatch` chain step can name; an
+`ORCHESTRATION` chain branches on its result (`integrate_chain_inner`,
+`crates/engine-core/src/workflows/orchestration/integrate.rs`) — an empty `results[]` skips the
+chain's next step instead of running it, and either way a `JournalDecisionKind::RecallConsulted`
+row (query/count/top_score/branch) is emitted in place of the generic `StepIntegrated` row for that
+step. Wiring a hybrid workflow to ground a proposal draft in existing corpus content via
 `RecallNode` before persisting it through `POST /ingest/proposal` remains open follow-on work.
 
 The canonical contract's v1.5.0 adds an optional `authored_at: datetime | null` field to both

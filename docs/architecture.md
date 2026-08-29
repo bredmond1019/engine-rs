@@ -736,7 +736,8 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 - Journal (`engine-serve::journal`, `engine-contract::journal`, `EN.12.D`) — a durable decision
   log distinct from the `events` snapshot table: `JournalRow` (`engine-contract`) wraps a
   `JournalDecisionKind` (`StepIntegrated`, `StepBailed`, `GateRefused`,
-  `StateWriteVerificationFailed`, `BudgetHalted`, `ResolvedPolicy`) plus a kind-specific
+  `StateWriteVerificationFailed`, `BudgetHalted`, `ResolvedPolicy`, `RecallConsulted` — `EN.12.L`,
+  added when a `RECALL` dispatch step's result branches the chain, see below) plus a kind-specific
   `serde_json::Value` detail payload, written via `engine_store::insert_journal_row` and read back
   ordered by `(campaign_id, created_at ASC)` via `list_journal_rows_for_campaign`.
   `integrate_chain_with_journal` (`engine-core::workflows::orchestration::integrate`) is the new
@@ -754,6 +755,18 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `GateRefused`/`StateWriteVerificationFailed` render as `**OPEN**`, `BudgetHalted` as `**HELD**`,
   `StepIntegrated`/`ResolvedPolicy` as plain `DONE`, matching `roadmap_status_discovery.py`'s
   `_OPEN_ROW_RE`/`_HELD_ROW_RE` parsing.
+- Recall-gated branching (`EN.12.L`) — the `RECALL` workflow (`crates/engine-core/src/workflows/
+  recall/`, a single-node graph over `RecallNode`, registered by `register_recall` in
+  `crates/engine-serve/src/workflows.rs`) is dispatchable from an `ORCHESTRATION` chain step
+  (`kind: "dispatch"`, block id `RECALL`, `EN.12.E`). `integrate_chain_inner`
+  (`crates/engine-core/src/workflows/orchestration/integrate.rs`) special-cases a `RECALL` step's
+  result instead of emitting the generic `StepIntegrated` row: it computes `top_score` as the max
+  `results[].score` from `RecallNode`'s stamped output (`None` when there are no results), records
+  a `JournalDecisionKind::RecallConsulted` row (`query`/`count`/`top_score`/`branch`), and — when
+  `count == 0` — sets a loop-local `pending_skip` flag that makes the *next* chain step a no-op
+  (no lane-log entry, no checkpoint write) rather than running it. A `RECALL` step that itself
+  fails still bails the chain the same way any other failing step does; only an empty result set
+  skips.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
