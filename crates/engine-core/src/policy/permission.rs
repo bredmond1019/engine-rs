@@ -16,6 +16,10 @@
 //! profile name out of `harness.json`) is a separate concern layered on top, not baked
 //! into this module.
 
+use std::fmt;
+use std::path::Path;
+
+use mev::brain::config::PermissionProfilesConfig;
 use serde::{Deserialize, Serialize};
 
 /// The closed vocabulary of gated engine actions.
@@ -106,6 +110,178 @@ pub fn decide(profile: PermissionProfile, action: GatedAction) -> Decision {
 
         // Unreachable: `ClearOperatorGate` already returned above for every profile.
         (_, GatedAction::ClearOperatorGate) => Decision::Deny,
+    }
+}
+
+/// The one entry `brain.toml`'s `[permission_profiles].never_allowed` must contain,
+/// exactly — restates D71 on the config side, mirroring [`GatedAction::ClearOperatorGate`]
+/// on the enforcement side.
+const CLEAR_OPERATOR_GATE_ACTION_ID: &str = "clear_operator_gate";
+
+/// Typed failure modes for resolving a [`PermissionProfile`] out of `brain.toml`'s
+/// `[permission_profiles]` table.
+///
+/// Every variant here corresponds to a shape mev's `#[serde(default)]` chain lets
+/// through *silently* (an absent table, an empty `levels` map, a `None` default, a
+/// `default` naming a level that isn't declared, a `never_allowed` that isn't exactly
+/// `["clear_operator_gate"]`, or a level id outside the closed three-value vocabulary)
+/// — [`resolve_permission_profile`] and [`resolve_permission_profile_from_config`]
+/// never treat any of these as success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileResolutionError {
+    /// `brain.toml` could not be read or parsed at all.
+    ConfigLoad { message: String },
+    /// `[permission_profiles.levels.*]` declared no entries.
+    EmptyLevels,
+    /// `[permission_profiles].default` was absent (`None`).
+    NoDefault,
+    /// `[permission_profiles].default` names a level id not present in `levels`.
+    DefaultLevelMissing { default: String },
+    /// `[permission_profiles].never_allowed` is not exactly `["clear_operator_gate"]`.
+    NeverAllowedMismatch { got: Vec<String> },
+    /// A `[permission_profiles.levels.<id>]` entry's `id` is outside the closed
+    /// three-value vocabulary (`locked` / `standard` / `unrestricted`).
+    UnknownLevelId { id: String },
+}
+
+impl fmt::Display for ProfileResolutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProfileResolutionError::ConfigLoad { message } => {
+                write!(f, "could not load brain.toml: {message}")
+            }
+            ProfileResolutionError::EmptyLevels => {
+                write!(f, "[permission_profiles.levels] declares no entries")
+            }
+            ProfileResolutionError::NoDefault => {
+                write!(f, "[permission_profiles].default is absent")
+            }
+            ProfileResolutionError::DefaultLevelMissing { default } => write!(
+                f,
+                "[permission_profiles].default = \"{default}\" names a level absent from \
+                 [permission_profiles.levels]"
+            ),
+            ProfileResolutionError::NeverAllowedMismatch { got } => write!(
+                f,
+                "[permission_profiles].never_allowed must be exactly [\"{CLEAR_OPERATOR_GATE_ACTION_ID}\"], \
+                 got {got:?}"
+            ),
+            ProfileResolutionError::UnknownLevelId { id } => write!(
+                f,
+                "[permission_profiles.levels] declares unknown level id \"{id}\" (expected one \
+                 of: locked, standard, unrestricted)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProfileResolutionError {}
+
+/// Map a `[permission_profiles.levels.<id>]` wire identifier onto the closed
+/// [`PermissionProfile`] enum. `None` for anything outside the three known ids —
+/// callers treat that as [`ProfileResolutionError::UnknownLevelId`], never a silent
+/// fallback.
+fn level_id_to_profile(id: &str) -> Option<PermissionProfile> {
+    match id {
+        "locked" => Some(PermissionProfile::Locked),
+        "standard" => Some(PermissionProfile::Standard),
+        "unrestricted" => Some(PermissionProfile::Unrestricted),
+        _ => None,
+    }
+}
+
+/// Resolve the permission profile in force from a `brain.toml` on disk.
+///
+/// Reads the file via `mev::brain::config::load_brain_config` — engine-core has no
+/// second parser for this table — and delegates the resolution logic to
+/// [`resolve_permission_profile_from_config`].
+///
+/// **Always returns a [`PermissionProfile`].** On any failure the returned profile is
+/// [`PermissionProfile::Locked`] (the tightest level) and `Some` typed error explains
+/// why; there is no path that fails open to `standard` or `unrestricted`. Callers that
+/// only need the profile can ignore the error half; callers that must surface *why* a
+/// run downgraded to `locked` read it.
+#[must_use]
+pub fn resolve_permission_profile(
+    brain_toml_path: &Path,
+) -> (PermissionProfile, Option<ProfileResolutionError>) {
+    match mev::brain::config::load_brain_config(brain_toml_path) {
+        Ok(config) => resolve_permission_profile_from_config(&config.permission_profiles),
+        Err(err) => (
+            PermissionProfile::Locked,
+            Some(ProfileResolutionError::ConfigLoad {
+                message: err.to_string(),
+            }),
+        ),
+    }
+}
+
+/// Resolve the permission profile in force from an already-parsed
+/// `[permission_profiles]` table.
+///
+/// Fail-closed at every step, in this order: an empty `levels` map; a `None` default; a
+/// `never_allowed` that is not exactly `["clear_operator_gate"]`; any level whose `id`
+/// is outside the closed three-value vocabulary; a `default` naming a level absent from
+/// `levels`. Only when every check passes does this resolve to the level named by
+/// `default`. See [`resolve_permission_profile`] for the always-returns-a-profile
+/// contract this shares.
+#[must_use]
+pub fn resolve_permission_profile_from_config(
+    config: &PermissionProfilesConfig,
+) -> (PermissionProfile, Option<ProfileResolutionError>) {
+    if config.levels.is_empty() {
+        return (
+            PermissionProfile::Locked,
+            Some(ProfileResolutionError::EmptyLevels),
+        );
+    }
+
+    let Some(default_id) = &config.default else {
+        return (
+            PermissionProfile::Locked,
+            Some(ProfileResolutionError::NoDefault),
+        );
+    };
+
+    if config.never_allowed != [CLEAR_OPERATOR_GATE_ACTION_ID.to_string()] {
+        return (
+            PermissionProfile::Locked,
+            Some(ProfileResolutionError::NeverAllowedMismatch {
+                got: config.never_allowed.clone(),
+            }),
+        );
+    }
+
+    // Every declared level id must be one of the three known ids — an unrecognised id
+    // fails closed even if it isn't the one `default` happens to name.
+    for level in config.levels.values() {
+        if level_id_to_profile(&level.id).is_none() {
+            return (
+                PermissionProfile::Locked,
+                Some(ProfileResolutionError::UnknownLevelId {
+                    id: level.id.clone(),
+                }),
+            );
+        }
+    }
+
+    let Some(default_level) = config.levels.get(default_id) else {
+        return (
+            PermissionProfile::Locked,
+            Some(ProfileResolutionError::DefaultLevelMissing {
+                default: default_id.clone(),
+            }),
+        );
+    };
+
+    match level_id_to_profile(&default_level.id) {
+        Some(profile) => (profile, None),
+        None => (
+            PermissionProfile::Locked,
+            Some(ProfileResolutionError::UnknownLevelId {
+                id: default_level.id.clone(),
+            }),
+        ),
     }
 }
 
@@ -311,5 +487,180 @@ mod tests {
                 let _ = decide(profile, action);
             }
         }
+    }
+
+    // --- EN.12.C task 2: resolving PermissionProfile from brain.toml -----------------
+
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use mev::brain::config::PermissionProfileLevel;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn level(
+        id: &str,
+        mini_install: bool,
+        main_push: bool,
+        cross_repo_write: bool,
+    ) -> PermissionProfileLevel {
+        PermissionProfileLevel {
+            id: id.to_string(),
+            meaning: String::new(),
+            mini_install,
+            main_push,
+            cross_repo_write,
+        }
+    }
+
+    fn valid_three_levels() -> BTreeMap<String, PermissionProfileLevel> {
+        let mut levels = BTreeMap::new();
+        levels.insert("locked".to_string(), level("locked", false, false, false));
+        levels.insert("standard".to_string(), level("standard", false, true, true));
+        levels.insert(
+            "unrestricted".to_string(),
+            level("unrestricted", true, true, true),
+        );
+        levels
+    }
+
+    fn valid_config(default: &str) -> PermissionProfilesConfig {
+        PermissionProfilesConfig {
+            never_allowed: vec![CLEAR_OPERATOR_GATE_ACTION_ID.to_string()],
+            default: Some(default.to_string()),
+            levels: valid_three_levels(),
+        }
+    }
+
+    /// AC: the checked-in fixture reproducing HQ's real table resolves to the three
+    /// expected levels and `default = standard` — reads through
+    /// `mev::brain::config::load_brain_config`, not a second parser.
+    #[test]
+    fn checked_in_fixture_resolves_to_standard_with_no_error() {
+        let (profile, error) =
+            resolve_permission_profile(&fixture_path("permission_profiles_brain.toml"));
+        assert_eq!(profile, PermissionProfile::Standard);
+        assert_eq!(error, None);
+    }
+
+    /// AC: the same fixture's three declared levels each map onto the expected
+    /// `PermissionProfile` variant.
+    #[test]
+    fn checked_in_fixture_declares_the_three_expected_levels() {
+        let config =
+            mev::brain::config::load_brain_config(&fixture_path("permission_profiles_brain.toml"))
+                .expect("fixture must parse");
+        let levels = &config.permission_profiles.levels;
+        assert_eq!(levels.len(), 3);
+        assert_eq!(
+            level_id_to_profile(&levels["locked"].id),
+            Some(PermissionProfile::Locked)
+        );
+        assert_eq!(
+            level_id_to_profile(&levels["standard"].id),
+            Some(PermissionProfile::Standard)
+        );
+        assert_eq!(
+            level_id_to_profile(&levels["unrestricted"].id),
+            Some(PermissionProfile::Unrestricted)
+        );
+    }
+
+    /// AC: a `brain.toml` with NO `[permission_profiles]` table resolves to `locked`
+    /// plus a typed error — mev's `#[serde(default)]` chain would otherwise silently
+    /// deserialize this to an empty, unusable config.
+    #[test]
+    fn absent_table_fails_closed_to_locked_with_a_typed_error() {
+        let (profile, error) =
+            resolve_permission_profile(&fixture_path("permission_profiles_absent_brain.toml"));
+        assert_eq!(profile, PermissionProfile::Locked);
+        assert_eq!(error, Some(ProfileResolutionError::EmptyLevels));
+    }
+
+    /// AC: empty `levels` fails closed to `locked` plus `EmptyLevels`.
+    #[test]
+    fn empty_levels_fails_closed() {
+        let config = PermissionProfilesConfig {
+            never_allowed: vec![CLEAR_OPERATOR_GATE_ACTION_ID.to_string()],
+            default: Some("standard".to_string()),
+            levels: BTreeMap::new(),
+        };
+        let (profile, error) = resolve_permission_profile_from_config(&config);
+        assert_eq!(profile, PermissionProfile::Locked);
+        assert_eq!(error, Some(ProfileResolutionError::EmptyLevels));
+    }
+
+    /// AC: `default: None` fails closed to `locked` plus `NoDefault`.
+    #[test]
+    fn none_default_fails_closed() {
+        let mut config = valid_config("standard");
+        config.default = None;
+        let (profile, error) = resolve_permission_profile_from_config(&config);
+        assert_eq!(profile, PermissionProfile::Locked);
+        assert_eq!(error, Some(ProfileResolutionError::NoDefault));
+    }
+
+    /// AC: `default` naming an absent level fails closed to `locked` plus
+    /// `DefaultLevelMissing`.
+    #[test]
+    fn default_naming_absent_level_fails_closed() {
+        let config = valid_config("nonexistent");
+        let (profile, error) = resolve_permission_profile_from_config(&config);
+        assert_eq!(profile, PermissionProfile::Locked);
+        assert_eq!(
+            error,
+            Some(ProfileResolutionError::DefaultLevelMissing {
+                default: "nonexistent".to_string()
+            })
+        );
+    }
+
+    /// AC: a `never_allowed` that is not exactly `["clear_operator_gate"]` fails closed
+    /// to `locked` plus `NeverAllowedMismatch`, whether empty or merely different.
+    #[test]
+    fn never_allowed_mismatch_fails_closed() {
+        for got in [Vec::<String>::new(), vec!["something_else".to_string()]] {
+            let mut config = valid_config("standard");
+            config.never_allowed = got.clone();
+            let (profile, error) = resolve_permission_profile_from_config(&config);
+            assert_eq!(profile, PermissionProfile::Locked);
+            assert_eq!(
+                error,
+                Some(ProfileResolutionError::NeverAllowedMismatch { got })
+            );
+        }
+    }
+
+    /// AC: an unknown level id fails closed to `locked` plus `UnknownLevelId`, even
+    /// when the unrecognised level isn't the one `default` names.
+    #[test]
+    fn unknown_level_id_fails_closed() {
+        let mut config = valid_config("standard");
+        config
+            .levels
+            .insert("beta".to_string(), level("beta", false, false, false));
+        let (profile, error) = resolve_permission_profile_from_config(&config);
+        assert_eq!(profile, PermissionProfile::Locked);
+        assert_eq!(
+            error,
+            Some(ProfileResolutionError::UnknownLevelId {
+                id: "beta".to_string()
+            })
+        );
+    }
+
+    /// A `ConfigLoad` error (nonexistent path) also fails closed to `locked`.
+    #[test]
+    fn nonexistent_brain_toml_fails_closed_with_config_load_error() {
+        let (profile, error) = resolve_permission_profile(&fixture_path("does_not_exist.toml"));
+        assert_eq!(profile, PermissionProfile::Locked);
+        assert!(matches!(
+            error,
+            Some(ProfileResolutionError::ConfigLoad { .. })
+        ));
     }
 }

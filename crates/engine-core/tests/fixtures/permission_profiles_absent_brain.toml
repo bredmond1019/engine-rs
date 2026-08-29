@@ -1,0 +1,11 @@
+# Fixture for EN.12.C task 2 — a `brain.toml`-shaped file with NO `[permission_profiles]`
+# table at all, pinning the fail-closed path against mev's `#[serde(default)]` chain:
+# `PermissionProfilesConfig` deserializes silently to `never_allowed: []`, `default: None`,
+# `levels: {}` when the table is absent, rather than raising a parse error. Resolution over
+# this fixture MUST fail closed to `PermissionProfile::Locked` plus a typed error — never
+# silently succeed at `standard` or `unrestricted`.
+
+[[repos]]
+slug = "brain"
+tier = "_root"
+repo_path = "."

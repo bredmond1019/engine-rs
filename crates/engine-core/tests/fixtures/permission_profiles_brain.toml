@@ -1,0 +1,35 @@
+# Fixture for EN.12.C task 2 — reproduces the shape of HQ's real
+# `agentic-portfolio/brain.toml` `[permission_profiles]` table
+# (see that file's own `[permission_profiles]` section for the live copy this
+# mirrors). Deliberately minimal outside that table: `mev::brain::config::BrainConfig`
+# derives `Default` with `#[serde(default)]` on every field, so a `brain.toml`
+# lacking `[vocab]`/`[crawl]`/`[[repos]]`/etc. still parses — this fixture exists to
+# pin the `[permission_profiles]` resolution path, not the whole config shape.
+
+[permission_profiles]
+# The ONLY absolutely-forbidden action at every level, regardless of profile (HQ D71).
+never_allowed = ["clear_operator_gate"]
+# The profile in force when no chain-level override is given. Must not name the most
+# permissive level.
+default = "standard"
+
+[permission_profiles.levels.locked]
+id                = "locked"
+meaning           = "Exploratory/unattended runs; no side effect outside the working tree without an operator gate"
+mini_install      = false
+main_push         = false
+cross_repo_write  = false
+
+[permission_profiles.levels.standard]
+id                = "standard"
+meaning           = "Ordinary supervised chain work: lands changes and pushes to main, never installs on the Mini"
+mini_install      = false
+main_push         = true
+cross_repo_write  = true
+
+[permission_profiles.levels.unrestricted]
+id                = "unrestricted"
+meaning           = "Explicit, deliberately-invoked runs; permits every graded action, never the default"
+mini_install      = true
+main_push         = true
+cross_repo_write  = true
