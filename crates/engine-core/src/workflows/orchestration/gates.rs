@@ -195,7 +195,10 @@ fn permission_gate_slug(action: GatedAction) -> String {
 /// never the work the denied action would itself have performed; `start` names the
 /// existing `/begin-session <slug>` entry point every operator edge in this fleet
 /// already uses (see `close_block.rs`'s fixture and `docs/state/state-schema.md`).
-fn build_operator_gate_request(action: GatedAction, profile: PermissionProfile) -> OperatorGateRequest {
+fn build_operator_gate_request(
+    action: GatedAction,
+    profile: PermissionProfile,
+) -> OperatorGateRequest {
     let slug = permission_gate_slug(action);
     OperatorGateRequest {
         exit: format!(
@@ -1116,10 +1119,17 @@ mod tests {
         let s = step("engine-rs", "EN.12.C");
         let (author, calls) = recording_author();
 
-        let result =
-            check_permission_gate(&s, GatedAction::PushToMain, PermissionProfile::Standard, &author);
+        let result = check_permission_gate(
+            &s,
+            GatedAction::PushToMain,
+            PermissionProfile::Standard,
+            &author,
+        );
 
-        assert!(result.is_ok(), "a permitted action must proceed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a permitted action must proceed: {result:?}"
+        );
         assert!(
             calls.lock().unwrap().is_empty(),
             "author_operator_edge must not be called for a permitted action"

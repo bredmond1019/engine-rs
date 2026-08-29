@@ -220,7 +220,6 @@ fn permission_profile_rank(profile: PermissionProfile) -> u8 {
 /// - `requested = Some(p)` where `p` is MORE permissive than `parent` — an
 ///   error, asserted as [`ProfileWideningError`]; the caller never falls
 ///   through to a silently-clamped or silently-widened profile.
-#[must_use]
 pub fn resolve_child_permission_profile(
     parent: PermissionProfile,
     requested: Option<PermissionProfile>,
@@ -446,7 +445,10 @@ impl fmt::Display for ExecuteError {
                 repo,
                 block_id,
                 source,
-            } => write!(f, "block '{block_id}' (repo '{repo}') cannot start: {source}"),
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') cannot start: {source}"
+            ),
         }
     }
 }
@@ -1739,7 +1741,11 @@ mod tests {
         .unwrap_err();
 
         match &err {
-            ExecuteError::ProfileWidening { repo, block_id, source } => {
+            ExecuteError::ProfileWidening {
+                repo,
+                block_id,
+                source,
+            } => {
                 assert_eq!(repo, "repo-a");
                 assert_eq!(block_id, "A.1");
                 assert_eq!(source.parent, PermissionProfile::Locked);
