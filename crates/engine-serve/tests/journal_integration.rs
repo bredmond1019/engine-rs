@@ -492,6 +492,136 @@ async fn repo_less_campaign_is_addressable_through_the_read_route() {
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
 }
 
+/// STANDING FIXTURE for the block record's declared un-gateable criterion
+/// (D64): "a debrief renders from a real overnight run on the Mini"
+/// (`EN.12.G` task 6). That criterion's own evidence requires the deployed
+/// Mini build, a live Postgres, and the bastion transport — all outside
+/// this repo — so no `engine-rs` harness check can observe it directly,
+/// and a green `cargo nextest` run is NOT proof that it holds. This test
+/// is the standing fixture that stands in for it: a checked-in
+/// MULTI-STEP campaign journal containing both a bail
+/// (`StepBailed`) and an operator-waiting item (`GateRefused`, mirroring
+/// `integrate.rs`'s "operator hold deadline exceeded" write path, per
+/// `orchestration.rs`'s own fixture (c)), rendered end to end through the
+/// real `DebriefNode` — a live [`engine_serve::journal::journal_reader_live`]
+/// over rows actually inserted via `insert_journal_row`, and a live journal
+/// sink (`DurableHandle::send_journal`, the same background writer
+/// `crate::durable` uses for every other journal row) writing the rendered
+/// `DebriefRendered` row back to the same pool. The resulting row is then
+/// asserted retrievable over the SAME `GET /campaigns/{id}/journal` route
+/// the raw rows come back through — no second derivation, no new route
+/// (AC4).
+///
+/// **This verifies SOURCE behaviour only.** It does NOT prove the deployed
+/// Mini build renders the same brief: the two diverge whenever the Mini is
+/// not rebuilt from this source, and that divergence is invisible to this
+/// test (and to every other check in this repo) — which is exactly why the
+/// Mini criterion stays declared `gateable: false` on the block record
+/// rather than being folded into an ordinary acceptance criterion.
+#[actix_web::test]
+#[ignore = "requires a live Postgres; run with DATABASE_URL set and --run-ignored ignored-only (see file header)"]
+async fn debrief_renders_end_to_end_and_is_retrievable_over_the_journal_route() {
+    let pool = live_pool().await;
+    let campaign_id = Uuid::new_v4();
+    let campaign = campaign_id.to_string();
+
+    let fixture_rows = vec![
+        {
+            let mut row = sample_row("provision", JournalDecisionKind::StepIntegrated, "ok");
+            row.campaign_id = campaign.clone();
+            row
+        },
+        {
+            let mut row = sample_row("deploy", JournalDecisionKind::StepBailed, "network timeout");
+            row.campaign_id = campaign.clone();
+            row
+        },
+        {
+            let mut row = sample_row(
+                "ship",
+                JournalDecisionKind::GateRefused,
+                "waiting on operator clearance: block still under an operator hold",
+            );
+            row.campaign_id = campaign.clone();
+            row
+        },
+    ];
+    for row in &fixture_rows {
+        insert_journal_row(&pool, row)
+            .await
+            .expect("insert_journal_row should succeed against a live Postgres");
+    }
+
+    let journal_reader = engine_serve::journal::journal_reader_live(Some(pool.clone()));
+    let durable = spawn_durable_writer(Some(pool.clone()));
+    let sink_handle = durable.clone();
+    let journal_sink: Arc<engine_core::workflows::orchestration::integrate::JournalSinkFn> =
+        Arc::new(move |row| sink_handle.send_journal(row));
+    let transport =
+        Arc::new(engine_core::nodes::channel_transport::StubChannelTransport::succeeding());
+
+    let registry = engine_core::workflows::orchestration::graph::debrief_registry(
+        journal_reader,
+        transport,
+        Some(journal_sink),
+    );
+    let workflow = engine_core::workflow::Workflow::new_validated(
+        registry,
+        engine_core::workflows::orchestration::graph::debrief_schema(),
+    )
+    .expect("DEBRIEF declared graph must pass WorkflowValidator::validate");
+
+    let ctx = workflow
+        .run(serde_json::json!(campaign), Box::new(|_| {}))
+        .await
+        .expect("DEBRIEF must run to completion");
+
+    let recorded = &ctx.nodes[engine_core::workflows::orchestration::debrief::DEBRIEF_NODE_NAME];
+    let brief = recorded["brief"]
+        .as_str()
+        .expect("brief string on node result");
+    assert!(brief.contains("deploy"));
+    assert!(brief.contains("network timeout"));
+    assert!(brief.contains("waiting on operator clearance: block still under an operator hold"));
+
+    // `send_journal` hands the row to the background durable-writer task
+    // over an unbounded channel (`crate::durable::spawn_durable_writer`);
+    // give it a moment to land before reading the row back through the
+    // route, matching the same best-effort-write contract every other
+    // journal row in this repo already relies on.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let state = route_test_app_state(Some(pool));
+    let app = actix_test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(configure),
+    )
+    .await;
+
+    let req = actix_test::TestRequest::get()
+        .uri(&format!("/campaigns/{campaign_id}/journal"))
+        .insert_header(("X-API-Key", TEST_API_KEY))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = actix_test::read_body_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let debrief_row = rows
+        .iter()
+        .find(|r| r["kind"] == "debrief_rendered")
+        .expect("expected a debrief_rendered row retrievable over the journal route");
+    let stored_brief = debrief_row["detail"]["brief"]
+        .as_str()
+        .expect("brief string in the debrief_rendered row's detail");
+    assert!(stored_brief.contains("deploy"));
+    assert!(stored_brief.contains("network timeout"));
+    assert!(
+        stored_brief.contains("waiting on operator clearance: block still under an operator hold")
+    );
+}
+
 /// With no `DATABASE_URL` (pool absent), the journal write path self-skips
 /// rather than failing (`durable.rs`'s existing contract, widened to
 /// journal rows), and the read route answers a clean 404 rather than
