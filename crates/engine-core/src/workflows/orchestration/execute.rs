@@ -57,6 +57,7 @@ use crate::workflow::node_cost_usd;
 use serde_json::json;
 
 use crate::completion::derive_terminal_status;
+use crate::policy::permission::PermissionProfile;
 use crate::policy::PolicyConfigSource;
 use crate::repo_registry::{RepoRegistry, RepoRegistryError};
 use crate::workflows::sdlc_flow;
@@ -147,6 +148,96 @@ pub struct FlowInvocation {
     /// child. Deliberately no `Default` and no builder, same reasoning as
     /// the other fields above.
     pub budget: Option<Budget>,
+    /// The permission profile this run executes under (`EN.12.C` task 4) —
+    /// resolved by [`execute_step`] via [`resolve_child_permission_profile`]
+    /// from the chain's parent profile and (optionally) this step's own
+    /// narrower request, and carried through to the child verbatim. A
+    /// child NEVER runs under a wider profile than its parent: widening is
+    /// rejected by [`execute_step`] before a [`FlowInvocation`] is ever
+    /// built, so by the time this field is populated it is already known
+    /// to be the parent's profile or narrower. Deliberately no `Default`
+    /// and no builder on this struct, same reasoning as `use_worktree`,
+    /// `campaign_id` and `engine` above: an invocation with an unstated
+    /// permission profile is exactly the defect this field exists to make
+    /// unrepresentable — a defaulted profile would silently become
+    /// whatever the compiled default is, which is the fail-open this block
+    /// exists to prevent. Lands on the wire as a named, documented
+    /// `permission_profile` key of the run's `event` JSON via
+    /// [`sdlc_flow_event`]/[`sdlc_task_event`] — never in
+    /// `TaskContext::metadata`, matching what `campaign_id`'s doc comment
+    /// already requires of itself.
+    pub permission_profile: PermissionProfile,
+}
+
+/// A step's requested permission profile would WIDEN relative to its
+/// parent's — `EN.12.C` task 4. A child run may narrow the profile it
+/// inherits from its parent (a chain may deliberately run one step
+/// tighter) but may never widen it; this is enforced here as an error, not
+/// silently clamped back down to the parent's level, so a chain author who
+/// (accidentally or otherwise) asks a step to run more permissively than
+/// its parent finds out immediately rather than getting a silently
+/// downgraded — or worse, silently upgraded — run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileWideningError {
+    pub parent: PermissionProfile,
+    pub requested: PermissionProfile,
+}
+
+impl fmt::Display for ProfileWideningError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "requested permission profile {:?} is wider than parent profile {:?} — a step \
+             may narrow its parent's permission profile, never widen it",
+            self.requested, self.parent
+        )
+    }
+}
+
+impl std::error::Error for ProfileWideningError {}
+
+/// Where a [`PermissionProfile`] sits on the tightest-to-most-permissive
+/// ladder `permission.rs`'s own grading table already fixes (`locked` <
+/// `standard` < `unrestricted`). Kept local to this module rather than as
+/// an `Ord`/`PartialOrd` impl on [`PermissionProfile`] itself — that type's
+/// module (`EN.12.C` task 1/2) is closed scope for this task; this is the
+/// one place in the crate that needs an ordering over it.
+fn permission_profile_rank(profile: PermissionProfile) -> u8 {
+    match profile {
+        PermissionProfile::Locked => 0,
+        PermissionProfile::Standard => 1,
+        PermissionProfile::Unrestricted => 2,
+    }
+}
+
+/// Resolve the permission profile a child run executes under, given the
+/// chain's parent profile and (optionally) this step's own requested
+/// profile — `EN.12.C` task 4.
+///
+/// - `requested = None` — the step inherits the parent's profile verbatim.
+/// - `requested = Some(p)` where `p` is no more permissive than `parent` —
+///   the step narrows to `p`.
+/// - `requested = Some(p)` where `p` is MORE permissive than `parent` — an
+///   error, asserted as [`ProfileWideningError`]; the caller never falls
+///   through to a silently-clamped or silently-widened profile.
+#[must_use]
+pub fn resolve_child_permission_profile(
+    parent: PermissionProfile,
+    requested: Option<PermissionProfile>,
+) -> Result<PermissionProfile, ProfileWideningError> {
+    match requested {
+        None => Ok(parent),
+        Some(requested_profile) => {
+            if permission_profile_rank(requested_profile) > permission_profile_rank(parent) {
+                Err(ProfileWideningError {
+                    parent,
+                    requested: requested_profile,
+                })
+            } else {
+                Ok(requested_profile)
+            }
+        }
+    }
 }
 
 /// A future producing a finished run's [`TaskContext`] or a [`WorkflowError`].
@@ -297,6 +388,15 @@ pub enum ExecuteError {
         block_id: String,
         failing_node: String,
     },
+    /// This step's requested permission profile would widen relative to
+    /// its parent's (`EN.12.C` task 4) — see [`ProfileWideningError`] and
+    /// [`resolve_child_permission_profile`]. No [`FlowInvocation`] is
+    /// built and `run_flow` is never called.
+    ProfileWidening {
+        repo: String,
+        block_id: String,
+        source: ProfileWideningError,
+    },
 }
 
 impl fmt::Display for ExecuteError {
@@ -342,6 +442,11 @@ impl fmt::Display for ExecuteError {
                 f,
                 "block '{block_id}' (repo '{repo}') failed: node '{failing_node}' did not succeed"
             ),
+            ExecuteError::ProfileWidening {
+                repo,
+                block_id,
+                source,
+            } => write!(f, "block '{block_id}' (repo '{repo}') cannot start: {source}"),
         }
     }
 }
@@ -354,6 +459,7 @@ impl std::error::Error for ExecuteError {
             ExecuteError::UnsupportedEngine { .. } => None,
             ExecuteError::StepFailed { source, .. } => Some(source),
             ExecuteError::ChildFailed { .. } => None,
+            ExecuteError::ProfileWidening { source, .. } => Some(source),
         }
     }
 }
@@ -457,6 +563,14 @@ fn step_spend(ctx: &TaskContext) -> (Option<f64>, u64) {
 /// into the resolved [`FlowInvocation`] for [`default_flow_runner`] to hand
 /// to the child's `RunOptions` — this function does not itself check
 /// either; the block-boundary check is `integrate.rs`'s job (task 4).
+///
+/// `parent_profile`/`requested_profile` (`EN.12.C` task 4) resolve the
+/// child's [`FlowInvocation::permission_profile`] via
+/// [`resolve_child_permission_profile`]: `requested_profile = None`
+/// inherits `parent_profile` verbatim; `Some(p)` narrows to `p` when `p` is
+/// no more permissive than `parent_profile`, and fails this call with
+/// [`ExecuteError::ProfileWidening`] — before `run_flow` is ever invoked —
+/// when `p` would widen it.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_step(
     step: &ChainStep,
@@ -467,6 +581,8 @@ pub async fn execute_step(
     campaign_id: Uuid,
     cancellation_token: Option<CancellationToken>,
     budget: Option<Budget>,
+    parent_profile: PermissionProfile,
+    requested_profile: Option<PermissionProfile>,
 ) -> Result<ExecutionOutcome, ExecuteError> {
     if step.kind != StepKind::Block {
         return Err(ExecuteError::WrongStepKind {
@@ -475,6 +591,13 @@ pub async fn execute_step(
             kind: step.kind,
         });
     }
+
+    let permission_profile = resolve_child_permission_profile(parent_profile, requested_profile)
+        .map_err(|source| ExecuteError::ProfileWidening {
+            repo: step.repo.clone(),
+            block_id: step.block_id.clone(),
+            source,
+        })?;
 
     let repo_path =
         registry
@@ -518,6 +641,7 @@ pub async fn execute_step(
         engine,
         cancellation_token,
         budget,
+        permission_profile,
     };
     let ctx = run_flow(invocation)
         .await
@@ -567,12 +691,20 @@ pub async fn execute_step(
 /// factored out of [`default_flow_runner`] so the seeded shape (including
 /// `use_worktree`) is unit-testable without spinning up a real `SDLC_FLOW`
 /// `Workflow` run.
+///
+/// `permission_profile` (`EN.12.C` task 4) lands here as a named,
+/// documented key of the event JSON — never in `TaskContext::metadata`,
+/// matching what `campaign_id`'s own doc comment already requires of
+/// itself. Its wire identifier is the enum's own `Serialize` impl
+/// (`locked` / `standard` / `unrestricted`), the same contract
+/// `permission.rs` already tests exhaustively — nothing here re-derives it.
 fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
     json!({
         "repo": invocation.repo,
         "spec_slug": invocation.block_id,
         "use_worktree": invocation.use_worktree,
         "campaign_id": invocation.campaign_id,
+        "permission_profile": invocation.permission_profile,
     })
 }
 
@@ -582,13 +714,15 @@ fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
 /// required field; `repo`/`use_worktree` deserialize the same names as
 /// `SDLC_FLOW`'s schema). Deliberately does NOT seed `auto_pr` —
 /// `SdlcTaskEventSchema` drops that field entirely (`SDLC_TASK` ships no PR
-/// ceremony), so there is nothing here to set.
+/// ceremony), so there is nothing here to set. `permission_profile` is
+/// seeded for the same reason as in [`sdlc_flow_event`].
 fn sdlc_task_event(invocation: &FlowInvocation) -> serde_json::Value {
     json!({
         "repo": invocation.repo,
         "spec_slug": invocation.block_id,
         "use_worktree": invocation.use_worktree,
         "campaign_id": invocation.campaign_id,
+        "permission_profile": invocation.permission_profile,
     })
 }
 
@@ -757,6 +891,8 @@ mod tests {
             Uuid::new_v4(),
             None,
             None,
+            PermissionProfile::Standard,
+            None,
         )
         .await
         .expect("step a should execute");
@@ -768,6 +904,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -807,6 +945,8 @@ mod tests {
             Uuid::new_v4(),
             None,
             None,
+            PermissionProfile::Standard,
+            None,
         )
         .await
         .expect("flow-engine step should execute");
@@ -840,6 +980,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -903,6 +1045,8 @@ mod tests {
             Uuid::new_v4(),
             None,
             None,
+            PermissionProfile::Standard,
+            None,
         )
         .await
         .unwrap_err();
@@ -937,6 +1081,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -973,6 +1119,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -1022,6 +1170,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -1083,6 +1233,8 @@ mod tests {
             Uuid::new_v4(),
             None,
             None,
+            PermissionProfile::Standard,
+            None,
         )
         .await
         .expect_err("a child with a failed node_run must fail the step");
@@ -1128,6 +1280,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -1194,6 +1348,8 @@ mod tests {
             Uuid::new_v4(),
             None,
             None,
+            PermissionProfile::Standard,
+            None,
         )
         .await
         .expect("step should execute");
@@ -1221,6 +1377,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -1336,6 +1494,7 @@ mod tests {
             engine: EngineKind::Flow,
             cancellation_token: None,
             budget: None,
+            permission_profile: PermissionProfile::Standard,
         };
         assert_eq!(
             sdlc_flow_event(&invocation_true)["use_worktree"],
@@ -1366,6 +1525,7 @@ mod tests {
             engine: EngineKind::Flow,
             cancellation_token: None,
             budget: None,
+            permission_profile: PermissionProfile::Standard,
         };
         assert_eq!(
             sdlc_flow_event(&invocation)["campaign_id"],
@@ -1413,6 +1573,8 @@ mod tests {
             Uuid::new_v4(),
             None,
             None,
+            PermissionProfile::Standard,
+            None,
         )
         .await
         .expect("ordinary step should execute");
@@ -1424,6 +1586,8 @@ mod tests {
             false,
             Uuid::new_v4(),
             None,
+            None,
+            PermissionProfile::Standard,
             None,
         )
         .await
@@ -1439,5 +1603,247 @@ mod tests {
             recorded[1].use_worktree,
             "base-template must resolve to worktree=true even with default_use_worktree=false"
         );
+    }
+
+    // ── EN.12.C task 4: child-profile inheritance / narrowing-only ──────
+
+    /// AC: `FlowInvocation` carries the resolved profile, with no `Default`
+    /// impl and no builder — a source scan mirroring the equivalent guard
+    /// on `use_worktree`/`campaign_id`/`engine` in this same module.
+    #[test]
+    fn flow_invocation_has_no_default_impl_and_no_builder() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/workflows/orchestration/execute.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+
+        // Isolate the derive line immediately preceding `struct FlowInvocation`
+        // rather than scanning the whole file — this module derives
+        // `Default` on other, unrelated types (e.g. `StepKind`'s re-export
+        // site), and a whole-file substring scan would false-positive on
+        // those.
+        let struct_start = source
+            .find("struct FlowInvocation")
+            .expect("FlowInvocation struct definition must exist");
+        let preceding = &source[..struct_start];
+        let derive_line = preceding
+            .lines()
+            .rev()
+            .find(|l| l.trim_start().starts_with("#[derive("))
+            .expect("FlowInvocation must be preceded by a #[derive(...)] line");
+        assert!(
+            !derive_line.contains("Default"),
+            "FlowInvocation must not derive Default, found: {derive_line}"
+        );
+        // Built via `format!` (mirroring `permission.rs`'s own
+        // `no_from_str_or_from_string_impl_for_the_closed_enums` guard)
+        // rather than a literal string, so this assertion doesn't
+        // false-positive by matching its OWN source text when scanning
+        // this very file.
+        let ty = "FlowInvocation";
+        assert!(
+            !source.contains(&format!("impl Default for {ty}")),
+            "FlowInvocation must not have a hand-written Default impl"
+        );
+        assert!(
+            !source.contains(&format!("{ty}Builder")),
+            "FlowInvocation must not have a builder"
+        );
+    }
+
+    /// AC: a child run's profile equals the parent's when the step does
+    /// not narrow — asserted end-to-end through `execute_step`'s recording
+    /// double, not merely at the pure-function level.
+    #[tokio::test]
+    async fn a_child_run_inherits_the_parents_profile_when_not_narrowed() {
+        let (_dir, registry) = two_repo_registry();
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+
+        let s = step("repo-a", "A.1");
+        execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+            None,
+            None,
+            PermissionProfile::Standard,
+            None,
+        )
+        .await
+        .expect("unnarrowed step should inherit the parent's profile");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].permission_profile, PermissionProfile::Standard);
+    }
+
+    /// AC: a step may narrow its own profile relative to the parent —
+    /// asserted through `execute_step`, both that it succeeds and that the
+    /// narrower profile (not the parent's) reaches the child.
+    #[tokio::test]
+    async fn a_step_may_narrow_its_profile_relative_to_the_parent() {
+        let (_dir, registry) = two_repo_registry();
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+
+        let s = step("repo-a", "A.1");
+        execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+            None,
+            None,
+            PermissionProfile::Unrestricted,
+            Some(PermissionProfile::Locked),
+        )
+        .await
+        .expect("narrowing to a tighter profile must succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].permission_profile, PermissionProfile::Locked);
+    }
+
+    /// AC: a tight-profile parent CANNOT produce a permissive-profile
+    /// child — a widening attempt is an error, not a silent clamp. Asserted
+    /// two ways: `execute_step` itself returns `Err`, AND the runner
+    /// double was never invoked at all (no widened `FlowInvocation` was
+    /// ever built or dispatched).
+    #[tokio::test]
+    async fn a_widening_attempt_is_an_error_not_a_silent_clamp() {
+        let (_dir, registry) = two_repo_registry();
+        let (runner, calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+
+        let s = step("repo-a", "A.1");
+        let err = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            Uuid::new_v4(),
+            None,
+            None,
+            PermissionProfile::Locked,
+            Some(PermissionProfile::Unrestricted),
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            ExecuteError::ProfileWidening { repo, block_id, source } => {
+                assert_eq!(repo, "repo-a");
+                assert_eq!(block_id, "A.1");
+                assert_eq!(source.parent, PermissionProfile::Locked);
+                assert_eq!(source.requested, PermissionProfile::Unrestricted);
+            }
+            other => panic!("expected ProfileWidening, got {other:?}"),
+        }
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "run_flow must never be consulted for a widening attempt — no FlowInvocation \
+             is ever built"
+        );
+    }
+
+    /// Same widening case at the pure-function level, plus the boundary:
+    /// requesting exactly the parent's own profile is a no-op narrowing,
+    /// never an error.
+    #[test]
+    fn resolve_child_permission_profile_narrows_but_never_widens() {
+        // No request -> inherits the parent verbatim.
+        assert_eq!(
+            resolve_child_permission_profile(PermissionProfile::Standard, None),
+            Ok(PermissionProfile::Standard)
+        );
+
+        // Requesting the same level as the parent is a no-op, not an error.
+        assert_eq!(
+            resolve_child_permission_profile(
+                PermissionProfile::Standard,
+                Some(PermissionProfile::Standard)
+            ),
+            Ok(PermissionProfile::Standard)
+        );
+
+        // Narrowing (tighter than parent) succeeds.
+        assert_eq!(
+            resolve_child_permission_profile(
+                PermissionProfile::Unrestricted,
+                Some(PermissionProfile::Locked)
+            ),
+            Ok(PermissionProfile::Locked)
+        );
+
+        // Widening (more permissive than parent) is an error.
+        assert_eq!(
+            resolve_child_permission_profile(
+                PermissionProfile::Locked,
+                Some(PermissionProfile::Standard)
+            ),
+            Err(ProfileWideningError {
+                parent: PermissionProfile::Locked,
+                requested: PermissionProfile::Standard,
+            })
+        );
+        assert_eq!(
+            resolve_child_permission_profile(
+                PermissionProfile::Standard,
+                Some(PermissionProfile::Unrestricted)
+            ),
+            Err(ProfileWideningError {
+                parent: PermissionProfile::Standard,
+                requested: PermissionProfile::Unrestricted,
+            })
+        );
+    }
+
+    /// AC: the profile reaches the child as a named key of the run's
+    /// `event` JSON (`sdlc_flow_event`/`sdlc_task_event`), never via
+    /// `TaskContext::metadata` — asserted both for the value and for the
+    /// wire identifier the closed enum's own `Serialize` impl produces.
+    #[test]
+    fn permission_profile_lands_in_sdlc_flow_event_as_a_named_key() {
+        let invocation = FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: false,
+            campaign_id: Uuid::new_v4(),
+            engine: EngineKind::Flow,
+            cancellation_token: None,
+            budget: None,
+            permission_profile: PermissionProfile::Locked,
+        };
+
+        let event = sdlc_flow_event(&invocation);
+        assert_eq!(event["permission_profile"], json!("locked"));
+    }
+
+    /// Same wire-shape contract for `SDLC_TASK`'s seeded event.
+    #[test]
+    fn permission_profile_lands_in_sdlc_task_event_as_a_named_key() {
+        let invocation = FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: false,
+            campaign_id: Uuid::new_v4(),
+            engine: EngineKind::Task,
+            cancellation_token: None,
+            budget: None,
+            permission_profile: PermissionProfile::Unrestricted,
+        };
+
+        let event = sdlc_task_event(&invocation);
+        assert_eq!(event["permission_profile"], json!("unrestricted"));
     }
 }

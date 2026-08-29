@@ -455,6 +455,7 @@ async fn recording_runner_cuts_a_real_branch_per_block_from_origin_main() {
             engine: EngineKind::Flow,
             cancellation_token: None,
             budget: None,
+            permission_profile: engine_core::policy::permission::PermissionProfile::Standard,
         };
         (flow_runner)(invocation)
             .await
@@ -710,6 +711,8 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         false,
         Uuid::new_v4(),
         None,
+        None,
+        engine_core::policy::permission::PermissionProfile::Standard,
         None,
     )
     .await

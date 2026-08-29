@@ -1851,6 +1851,18 @@ async fn integrate_chain_impl(
         // `execute_step`'s signature able to carry them. `None, None` here
         // is mechanical — behavior-identical to before this task, since
         // `RunOptions::default()` was always the child's config.
+        // `EN.12.C` task 4: the chain's parent profile is the same
+        // fail-closed `resolve_permission_profile` read `resolved_
+        // permission_profile_identifier` above already performs against
+        // this run's own `brain.toml` — re-derived here as the typed
+        // `PermissionProfile` `execute_step` needs (not the wire-string
+        // form that function returns). No per-step narrowing is threaded
+        // from `ChainStep` yet (out of this task's scope), so every step
+        // inherits the chain's profile verbatim.
+        let (parent_permission_profile, _permission_profile_error) =
+            crate::policy::permission::resolve_permission_profile(
+                &registry.brain_root().join("brain.toml"),
+            );
         let outcome = match execute_step(
             step,
             resolve_engine,
@@ -1859,6 +1871,8 @@ async fn integrate_chain_impl(
             default_use_worktree,
             campaign_id,
             None,
+            None,
+            parent_permission_profile,
             None,
         )
         .await
