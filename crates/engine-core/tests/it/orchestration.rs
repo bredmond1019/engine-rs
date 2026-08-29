@@ -23,16 +23,19 @@ use uuid::Uuid;
 
 use engine_contract::TaskContext;
 use engine_core::cancellation::CancellationToken;
+use engine_core::policy::permission::{resolve_permission_profile, GatedAction, PermissionProfile};
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{
     resolve_explicit_chain, resolve_lane_chain, ChainError, ChainStep, StepKind,
 };
 use engine_core::workflows::orchestration::debrief::{brief_names_every_bail, StubJournalReader};
 use engine_core::workflows::orchestration::dispatch::DispatchStepError;
-use engine_core::workflows::orchestration::execute::{EngineKind, FlowInvocation, FlowRunner};
+use engine_core::workflows::orchestration::execute::{
+    execute_step, EngineKind, ExecuteError, FlowInvocation, FlowRunner,
+};
 use engine_core::workflows::orchestration::gates::{
-    check_step_with_frontier_advice, load_frontier, AdmissionGate, DependencyEdge, FrontierError,
-    GateError,
+    check_permission_gate, check_step_with_frontier_advice, load_frontier, AdmissionGate,
+    DependencyEdge, FrontierError, GateError, OperatorGateRequest, PermissionGateError,
 };
 use engine_core::workflows::orchestration::graph::{
     debrief_registry, debrief_schema, OrchestrationRunNode, NODE_NAME,
@@ -63,6 +66,50 @@ fn two_repo_registry() -> (tempfile::TempDir, RepoRegistry) {
         dir.path().join("brain.toml"),
         "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n\
          [[repos]]\nslug = \"repo-b\"\nrepo_path = \"repo-b\"\n",
+    )
+    .unwrap();
+    let registry = RepoRegistry::from_brain_root(dir.path()).expect("registry");
+    (dir, registry)
+}
+
+/// Like [`two_repo_registry`], but the fixture `brain.toml` ALSO declares a real
+/// `[permission_profiles]` table (`EN.12.C` task 6) — the same three-level shape as
+/// `permission_profiles_brain.toml` (`permission.rs` task 1's own fixture), except
+/// `default` is parameterized so a test can stand up a `locked`-resolving registry
+/// and an `unrestricted`-resolving one side by side without two near-duplicate
+/// fixture files.
+fn two_repo_registry_with_profile(default: &str) -> (tempfile::TempDir, RepoRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("repo-b")).unwrap();
+    std::fs::write(
+        dir.path().join("brain.toml"),
+        format!(
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n\
+             [[repos]]\nslug = \"repo-b\"\nrepo_path = \"repo-b\"\n\
+             \n\
+             [permission_profiles]\n\
+             never_allowed = [\"clear_operator_gate\"]\n\
+             default = \"{default}\"\n\
+             \n\
+             [permission_profiles.levels.locked]\n\
+             id = \"locked\"\n\
+             mini_install = false\n\
+             main_push = false\n\
+             cross_repo_write = false\n\
+             \n\
+             [permission_profiles.levels.standard]\n\
+             id = \"standard\"\n\
+             mini_install = false\n\
+             main_push = true\n\
+             cross_repo_write = true\n\
+             \n\
+             [permission_profiles.levels.unrestricted]\n\
+             id = \"unrestricted\"\n\
+             mini_install = true\n\
+             main_push = true\n\
+             cross_repo_write = true\n"
+        ),
     )
     .unwrap();
     let registry = RepoRegistry::from_brain_root(dir.path()).expect("registry");
@@ -2293,4 +2340,283 @@ async fn debrief_renders_for_a_campaign_produced_by_an_explicit_block_list_chain
         "the rendered brief must not reference a conductor: {brief}"
     );
     assert_eq!(transport.calls().len(), 1);
+}
+
+// ── EN.12.C task 6: end-to-end coverage of the permission-profile gate ────
+//
+// Both paths through `gates::check_permission_gate` — deny-and-stop,
+// permit-and-proceed — driven against the REAL production functions
+// (`policy::permission::resolve_permission_profile`, `gates::check_permission_gate`,
+// `integrate::integrate_chain`, `execute::execute_step`), never a re-derivation of
+// their logic. `author_operator_edge` stands in for the mev CLI invocation
+// (`docs/permission-profiles.md`'s seam) as an in-process recording closure — this
+// suite is hermetic per the task's own requirement and writes to no real
+// `state.json` and shells out to no real `mev` binary.
+
+/// Path A: a graded action under `locked` raises the operator edge and stops the
+/// chain — asserted end to end by composing the real `resolve_permission_profile`
+/// (against a fixture `brain.toml` with no `[permission_profiles]` table, which
+/// fails closed to `Locked`) with the real `check_permission_gate`, then proving no
+/// step ever reached `run_flow`.
+///
+/// Demonstrated capable of failing: `permission::decide(Locked, InstallOnMini)` is
+/// the ONLY thing `check_permission_gate` consults for this verdict. If a future
+/// edit to that decision matrix ever permitted `InstallOnMini` under `Locked`, the
+/// `match` below would take the `Ok(())` arm, `proceeded` would end up containing
+/// `"A.1"`, and `assert!(proceeded.is_empty(), ...)` would fail — this is not a
+/// tautology over a mock, both sides of the assertion come from real production
+/// code (`resolve_permission_profile` + `check_permission_gate`), not from the
+/// test's own fixture data.
+#[test]
+fn path_a_locked_profile_denies_a_graded_action_and_the_chain_never_proceeds() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let (profile, _resolution_error) =
+        resolve_permission_profile(&registry.brain_root().join("brain.toml"));
+    assert_eq!(
+        profile,
+        PermissionProfile::Locked,
+        "the fixture brain.toml declares no [permission_profiles] table, so \
+         resolution must fail closed to Locked — if this assertion itself fails, \
+         Path A is not actually exercising the tight profile it claims to"
+    );
+
+    let chain = resolve_explicit_chain(vec![
+        ("repo-a".to_string(), "A.1".to_string()),
+        ("repo-b".to_string(), "B.1".to_string()),
+    ]);
+    let runner = RecordingRunner::new();
+    let _flow_runner = runner.clone().into_runner(); // never invoked in this path
+
+    let edge_calls: Arc<Mutex<Vec<OperatorGateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = edge_calls.clone();
+    // Stands in for the mev CLI invocation (`docs/permission-profiles.md`'s seam) —
+    // an in-process recording closure, never a real `mev` process.
+    let author_operator_edge = move |edge: &OperatorGateRequest| {
+        recorder.lock().unwrap().push(edge.clone());
+        Ok(())
+    };
+
+    // Mirrors what a real caller of `check_permission_gate` does at each chain
+    // boundary: gate the graded action before the step is ever dispatched, and
+    // stop iterating the moment one denies.
+    let mut proceeded = Vec::new();
+    for step in &chain {
+        match check_permission_gate(
+            step,
+            GatedAction::InstallOnMini,
+            profile,
+            &author_operator_edge,
+        ) {
+            Ok(()) => proceeded.push(step.block_id.clone()),
+            Err(PermissionGateError::Denied { .. }) => break,
+            Err(other) => panic!("unexpected permission-gate failure: {other}"),
+        }
+    }
+
+    assert!(
+        proceeded.is_empty(),
+        "a Locked profile must deny InstallOnMini before the first step even \
+         proceeds: {proceeded:?}"
+    );
+    let recorded = edge_calls.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one operator-gate edge must be authored, for the first denied step"
+    );
+    assert_eq!(recorded[0].slug, "permission-install_on_mini");
+    assert_eq!(
+        runner.call_count(),
+        0,
+        "a denied graded action must stop the chain — no block may ever run"
+    );
+}
+
+/// Path B: the SAME action under `unrestricted` proceeds to completion — the
+/// contrast with Path A that proves `InstallOnMini` is graded rather than
+/// universally forbidden or universally allowed. Runs the real
+/// `check_permission_gate` first (asserting it permits and never authors an edge),
+/// then drives the real `integrate_chain` to completion so the chain's own record
+/// of the run exists to inspect.
+#[tokio::test]
+async fn path_b_the_same_action_under_unrestricted_permits_and_the_chain_completes() {
+    let (repos_dir, registry) = two_repo_registry_with_profile("unrestricted");
+    let (profile, resolution_error) =
+        resolve_permission_profile(&registry.brain_root().join("brain.toml"));
+    assert_eq!(profile, PermissionProfile::Unrestricted);
+    assert_eq!(resolution_error, None);
+
+    let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
+
+    let edge_calls: Arc<Mutex<Vec<OperatorGateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = edge_calls.clone();
+    let author_operator_edge = move |edge: &OperatorGateRequest| {
+        recorder.lock().unwrap().push(edge.clone());
+        Ok(())
+    };
+
+    let gate_result = check_permission_gate(
+        &chain[0],
+        GatedAction::InstallOnMini,
+        profile,
+        &author_operator_edge,
+    );
+    assert!(
+        gate_result.is_ok(),
+        "unrestricted must permit InstallOnMini — the same action Path A denied \
+         under locked: {gate_result:?}"
+    );
+    assert!(
+        edge_calls.lock().unwrap().is_empty(),
+        "a permitted action must never author an operator-gate edge"
+    );
+
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("permission-path-b");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        false,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("the same action under unrestricted must complete the chain");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].repo_path, repos_dir.path().join("repo-a"));
+    assert_eq!(
+        runner.call_count(),
+        1,
+        "the chain actually proceeded and ran the block, unlike Path A"
+    );
+
+    let lines = lane_log_lines(&roadmap_dir);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["profile"], "unrestricted");
+}
+
+/// Path C: the run record written by both `locked`- and `unrestricted`-configured
+/// runs carries the resolved profile identifier in force — driven twice through the
+/// real `integrate_chain`, once per profile, reading back the actual
+/// `lane-log.jsonl` line each run produced (never a hand-constructed record).
+///
+/// Demonstrated capable of failing: if `integrate.rs`'s `closed`-entry call site
+/// ever dropped its `.with_permission_profile(...)` stamp, `lines[0]["profile"]`
+/// would be JSON `null` for both iterations and every `assert_eq!` below would fail
+/// against the literal `"locked"`/`"unrestricted"` strings.
+#[tokio::test]
+async fn path_c_the_run_record_written_under_each_profile_carries_that_profiles_identifier() {
+    for default in ["locked", "unrestricted"] {
+        let (_repos_dir, registry) = two_repo_registry_with_profile(default);
+        let (_planning_root, roadmap_dir) =
+            fixture_roadmap_dir(&format!("permission-path-c-{default}"));
+        let runner = RecordingRunner::new();
+        let flow_runner = runner.clone().into_runner();
+        let admission = AdmissionGate::with_default_policy();
+        let chain = resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]);
+
+        integrate_chain(
+            &chain,
+            &no_deps,
+            &always_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(5),
+            None,
+            None,
+            None,
+            &always_flow,
+            &registry,
+            &flow_runner,
+            &roadmap_dir,
+            None,
+            &|_: &StepProgress| {},
+            false,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("chain under profile '{default}' should integrate: {err}"));
+
+        let lines = lane_log_lines(&roadmap_dir);
+        assert_eq!(lines.len(), 1, "one closed record for profile '{default}'");
+        assert_eq!(
+            lines[0]["profile"], default,
+            "the closed record written under a '{default}'-configured brain.toml \
+             must carry that same profile identifier"
+        );
+    }
+}
+
+/// Path D: a `locked` parent cannot produce an `unrestricted` child — asserted end
+/// to end through the real `execute_step` (the same function `integrate_chain`
+/// calls internally for every block-kind step), never through
+/// `resolve_child_permission_profile` in isolation. Proves both that the call
+/// fails with the typed widening error AND that no child ever ran.
+///
+/// Demonstrated capable of failing: if `execute_step` stopped calling
+/// `resolve_child_permission_profile` before building a `FlowInvocation` — or that
+/// function stopped comparing ranks and returned `requested` unconditionally — this
+/// call would succeed, `runner.call_count()` would be `1` instead of `0`, and both
+/// the `expect_err` and the trailing `assert_eq!` would fail.
+#[tokio::test]
+async fn path_d_a_locked_parent_cannot_produce_an_unrestricted_child() {
+    let (_repos_dir, registry) = two_repo_registry();
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let step = ChainStep {
+        repo: "repo-a".to_string(),
+        block_id: "A.1".to_string(),
+        ..Default::default()
+    };
+
+    let err = execute_step(
+        &step,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        false,
+        Uuid::new_v4(),
+        None,
+        None,
+        PermissionProfile::Locked,
+        Some(PermissionProfile::Unrestricted),
+    )
+    .await
+    .expect_err("a Locked parent must refuse to produce an Unrestricted child");
+
+    match err {
+        ExecuteError::ProfileWidening {
+            repo,
+            block_id,
+            source,
+        } => {
+            assert_eq!(repo, "repo-a");
+            assert_eq!(block_id, "A.1");
+            assert_eq!(source.parent, PermissionProfile::Locked);
+            assert_eq!(source.requested, PermissionProfile::Unrestricted);
+        }
+        other => panic!("expected ProfileWidening, got {other:?}"),
+    }
+
+    assert_eq!(
+        runner.call_count(),
+        0,
+        "the rejected widening must never invoke the flow runner — no child ran"
+    );
 }
