@@ -867,6 +867,86 @@ pub fn workflow() -> Workflow {
         .expect("ORCHESTRATION declared graph must pass WorkflowValidator::validate")
 }
 
+// ── `DEBRIEF` workflow assembly (`EN.12.G` task 4) ──────────────────────
+//
+// `DEBRIEF` is a **separate registered workflow**, not a graph node wired
+// into `ORCHESTRATION`'s single-node shape above. The operator's stated
+// intent (block record `notes`, AMENDMENT 2026-08-29) is a plain `POST
+// /events/` trigger carrying nothing but a campaign id, reachable with no
+// conductor, no chain, no roadmap and no lane present — so it is dispatched
+// exactly like `RECALL` (`EN.12.L` task 2, `recall::graph`): a single node,
+// both start and terminal, registered under its own `workflow_type` string
+// so an `EN.12.E` `kind: dispatch` chain step can also name it as
+// `block_id: "DEBRIEF"`. [`EngineKind`] (two variants: `Task`/`Flow`) is
+// untouched by this — a dispatch step never resolves through it at all
+// (`dispatch.rs`'s dispatch-step path bypasses `execute::resolve_engine`
+// entirely), and this module adds no third variant.
+//
+// Registering `DEBRIEF` changes nothing about how an *existing* chain's
+// steps are resolved: [`resolve_explicit_chain`]/[`resolve_lane_chain`]
+// above build exactly one [`ChainStep`] per declared block/lane entry and
+// know nothing of `DEBRIEF` at all — see
+// `resolve_explicit_chain_never_gains_an_implicit_debrief_step` below.
+
+/// `DEBRIEF`'s registered workflow type string — the wire spelling an
+/// `EN.12.E` dispatch step's `block_id` names, and the `POST /events/`
+/// body's `workflow_type` a caller (`routine.sh`, once wired on the HQ
+/// side — out of scope for this repo) sends. See
+/// `crate::workflows::orchestration::debrief`'s module doc for the node's
+/// own behaviour and `engine_serve::workflows::register_debrief`'s doc for
+/// the full trigger contract (body shape + required header).
+pub const DEBRIEF_WORKFLOW_TYPE: &str = "DEBRIEF";
+
+/// Build the declared `WorkflowSchema` for `DEBRIEF`: a single node
+/// ([`super::debrief::DebriefNode`], keyed by
+/// [`super::debrief::DEBRIEF_NODE_NAME`]), both start and terminal, with no
+/// forward connection — mirrors `recall::graph::schema`'s micro-workflow
+/// shape.
+#[must_use]
+pub fn debrief_schema() -> WorkflowSchema {
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        super::debrief::DEBRIEF_NODE_NAME.to_string(),
+        NodeConfig::new(super::debrief::DEBRIEF_NODE_NAME, vec![]),
+    );
+    WorkflowSchema::new(
+        DEBRIEF_WORKFLOW_TYPE,
+        super::debrief::DEBRIEF_NODE_NAME,
+        nodes,
+    )
+}
+
+/// Build a fresh `NodeRegistry` for `DEBRIEF`: one
+/// [`super::debrief::DebriefNode`] wired to `journal_reader`/`transport`,
+/// registered under its default `Node::name()` identity
+/// ([`super::debrief::DEBRIEF_NODE_NAME`]).
+///
+/// `journal_sink` is `None` for the production entry point
+/// (`engine_serve::workflows::register_debrief`, `EN.12.G` task 4): a
+/// `Dispatcher` factory closure runs before `engine-serve`'s `AppState`/
+/// `DurableHandle` exist (`Dispatcher::register` happens at process
+/// start-up, `DurableHandle` is minted per served request — see
+/// `register_orchestration`'s own `StepFanoutContext` doc for the same gap
+/// on `ORCHESTRATION`), so there is no live durable-writer seam to wire in
+/// at this call site yet. A caller that already holds a
+/// [`super::integrate::JournalSinkFn`] (a hermetic test, or a future wiring
+/// of that gap) passes `Some(sink)` to get a `DebriefNode` that writes its
+/// rendered brief back through it.
+#[must_use]
+pub fn debrief_registry(
+    journal_reader: Arc<dyn super::debrief::JournalReader>,
+    transport: Arc<dyn crate::nodes::channel_transport::ChannelTransport>,
+    journal_sink: Option<Arc<super::integrate::JournalSinkFn>>,
+) -> NodeRegistry {
+    let mut node = super::debrief::DebriefNode::new(journal_reader, transport);
+    if let Some(sink) = journal_sink {
+        node = node.with_journal_sink(sink);
+    }
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(node));
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1619,5 +1699,70 @@ mod tests {
             "a step that reported no cost must stay `null`, never collapse to 0"
         );
         assert_eq!(members[1]["total_tokens"], 0);
+    }
+
+    // ── `DEBRIEF` workflow assembly (`EN.12.G` task 4) ──────────────────
+
+    #[test]
+    fn debrief_schema_declares_the_debrief_workflow_type_and_single_node() {
+        let schema = debrief_schema();
+        assert_eq!(schema.workflow_type, DEBRIEF_WORKFLOW_TYPE);
+        assert_eq!(DEBRIEF_WORKFLOW_TYPE, "DEBRIEF");
+        assert_eq!(schema.start_node, super::super::debrief::DEBRIEF_NODE_NAME);
+        assert_eq!(schema.nodes.len(), 1);
+    }
+
+    #[test]
+    fn debrief_registry_contains_exactly_one_node() {
+        let registry = debrief_registry(
+            Arc::new(super::super::debrief::StubJournalReader::succeeding(vec![])),
+            Arc::new(crate::nodes::channel_transport::StubChannelTransport::succeeding()),
+            None,
+        );
+        assert!(registry.contains(super::super::debrief::DEBRIEF_NODE_NAME));
+        assert_eq!(registry.len(), 1);
+    }
+
+    /// `EN.12.G` AC6: a `DEBRIEF` run is invocable for any finished campaign
+    /// id with no conductor present — the event below carries nothing but
+    /// the bare campaign id string, no `blocks`/`roadmap_slug`/`lane`/
+    /// `brain_root` anywhere, proving the node needs nothing else.
+    #[tokio::test]
+    async fn debrief_workflow_runs_end_to_end_from_a_bare_campaign_id_alone() {
+        let campaign_id = Uuid::new_v4();
+        let registry = debrief_registry(
+            Arc::new(super::super::debrief::StubJournalReader::succeeding(vec![])),
+            Arc::new(crate::nodes::channel_transport::StubChannelTransport::succeeding()),
+            None,
+        );
+        let workflow = Workflow::new_validated(registry, debrief_schema())
+            .expect("DEBRIEF declared graph must pass WorkflowValidator::validate");
+
+        let ctx = workflow
+            .run(json!(campaign_id.to_string()), Box::new(|_| {}))
+            .await
+            .expect("DEBRIEF should run to completion from a bare campaign id alone");
+
+        let recorded = &ctx.nodes[super::super::debrief::DEBRIEF_NODE_NAME];
+        assert_eq!(recorded["campaign_id"], campaign_id.to_string());
+        assert_eq!(recorded["row_count"], 0);
+    }
+
+    /// `EN.12.G` AC5: registering `DEBRIEF` never rewires how an existing
+    /// explicit block-list chain resolves its own steps — `resolve_explicit_chain`
+    /// builds exactly one `StepKind::Block` `ChainStep` per declared entry
+    /// and never inserts anything else, `DEBRIEF` included.
+    #[test]
+    fn resolve_explicit_chain_never_gains_an_implicit_debrief_step() {
+        let steps = resolve_explicit_chain(vec![
+            ("repo-a".to_string(), "A.1".to_string()),
+            ("repo-b".to_string(), "B.1".to_string()),
+        ]);
+
+        assert_eq!(steps.len(), 2);
+        assert!(steps
+            .iter()
+            .all(|s| s.kind == super::super::chain::StepKind::Block));
+        assert!(steps.iter().all(|s| s.block_id != DEBRIEF_WORKFLOW_TYPE));
     }
 }

@@ -1087,11 +1087,75 @@ pub fn register_orchestration_with_registry(
     );
 }
 
+/// Register the `DEBRIEF` workflow
+/// (`engine_core::workflows::orchestration::debrief`, `EN.12.G` task 4)
+/// with `dispatcher`, populating both the `workflow_registry` and the
+/// `schema_registry`. Reachable as an `EN.12.E` `kind: dispatch` chain step
+/// naming registry key `DEBRIEF`, and — the operator's stated goal
+/// (block record `notes`, AMENDMENT 2026-08-29) — as a plain `POST
+/// /events/` trigger carrying nothing but a campaign id, with no
+/// conductor, chain, roadmap or lane present:
+///
+/// ```text
+/// POST /events/
+/// X-API-Key: <this deployment's configured API key>
+/// Content-Type: application/json
+///
+/// { "workflow_type": "DEBRIEF", "data": "<campaign-id-uuid>" }
+/// ```
+///
+/// `data` may also be a JSON object carrying a `"campaign_id"` string
+/// field instead of a bare string — see
+/// `engine_core::workflows::orchestration::debrief`'s
+/// `campaign_id_from_value` two-shape extraction. This is the stated
+/// contract HQ's `routine.sh` wiring (out of this repo, per the block's
+/// `notes`) is written against, once it exists.
+///
+/// An **eighth model-free workflow** registered in this module, alongside
+/// [`register_terminal_probe`] / [`register_recall`] / the four
+/// opportunity/harvest/lead workflows: `DebriefNode` calls no model and
+/// reads no `harness.json` policy section, so this factory resolves no
+/// policy and seeds no policy stamp. Wires the live
+/// [`crate::journal::journal_reader_live`] (task 1) — with no pool, since a
+/// `Dispatcher` factory closure runs at process start-up, before
+/// `engine-serve`'s `AppState`/`DurableHandle` (and the Postgres pool it
+/// carries) exist for any served request (see `register_orchestration`'s
+/// own `StepFanoutContext` doc for the identical gap on `ORCHESTRATION`);
+/// `journal_reader_live(None)` self-skips to an empty campaign rather than
+/// erroring, per that constructor's own doc — wiring a real pool through
+/// this seam is a separate concern from this task. `transport` is
+/// `channel_transport_live` pointed at [`events_url_from_env`], mirroring
+/// [`register_research_agent`]'s / [`register_content_pipeline`]'s own
+/// transport wiring. No journal sink is wired here either, for the same
+/// no-pool-yet reason — [`engine_core::workflows::orchestration::graph::debrief_registry`]'s
+/// `journal_sink` parameter exists precisely so a caller that DOES have a
+/// live sink (a hermetic test, or a future wiring of this gap) can pass
+/// one without this function's signature changing.
+pub fn register_debrief(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::orchestration::graph::debrief_schema(),
+        Box::new(|_event: &serde_json::Value| {
+            let registry = engine_core::workflows::orchestration::graph::debrief_registry(
+                crate::journal::journal_reader_live(None),
+                engine_core::nodes::channel_transport::channel_transport_live(
+                    events_url_from_env(),
+                ),
+                None,
+            );
+            Ok(Workflow::new(
+                registry,
+                engine_core::workflows::orchestration::graph::debrief_schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `SDLC_TASK`, `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `LINKEDIN_POST`, `OPPORTUNITY_SET_STAGE`,
 /// `OPPORTUNITY_ADD_ACTION`, `HARVEST_APPROVE`, `LEAD_INGEST`,
-/// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, and `ORCHESTRATION`; future
+/// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, `RECALL`, `ORCHESTRATION`, and
+/// `DEBRIEF`; future
 /// builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
@@ -1138,6 +1202,7 @@ pub fn register_builtin_workflows_with_registry(
     register_terminal_probe(dispatcher);
     register_recall(dispatcher);
     register_orchestration(dispatcher);
+    register_debrief(dispatcher);
 }
 
 #[cfg(test)]
@@ -2418,6 +2483,52 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("RECALL"));
+    }
+
+    // ── `DEBRIEF` (`EN.12.G` task 4) ─────────────────────────────────────
+
+    #[test]
+    fn register_debrief_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_debrief(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("DEBRIEF"));
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "DEBRIEF",
+                &serde_json::json!("00000000-0000-0000-0000-000000000000"),
+            )
+            .expect("DEBRIEF should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn resolve_schema_returns_schema_with_debrief_start_node() {
+        let mut dispatcher = Dispatcher::new();
+        register_debrief(&mut dispatcher);
+
+        let schema = dispatcher
+            .resolve_schema("DEBRIEF")
+            .expect("DEBRIEF schema should resolve");
+
+        assert_eq!(schema.start_node, "DebriefNode");
+    }
+
+    /// `EN.12.G` AC1/AC6: `DEBRIEF` is reachable through
+    /// `register_builtin_workflows_with_registry` alone — no conductor,
+    /// chain, roadmap or lane is registered or referenced anywhere in this
+    /// path.
+    #[test]
+    fn register_builtin_workflows_registers_debrief() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.registered_types().iter().any(|t| t == "DEBRIEF"));
+        assert!(dispatcher.is_registered("DEBRIEF"));
     }
 
     #[test]
