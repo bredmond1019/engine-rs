@@ -1002,9 +1002,14 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
             .collect();
     // EN.11.A task 5 adds `run_id`, `writer`, `build_sha` as additive,
     // `skip_serializing_if = "Option::is_none"` identity fields — legal on
-    // an engine-written line. Anything else is a renamed or unexpected key.
+    // an engine-written line. EN.12.C task 6 adds `profile`, the resolved
+    // permission-profile stamp required on every closed record
+    // (docs/permission-profiles.md invariant 1). Anything else is a
+    // renamed or unexpected key.
     let allowed_extra_keys: std::collections::BTreeSet<&str> =
-        ["run_id", "writer", "build_sha"].into_iter().collect();
+        ["run_id", "writer", "build_sha", "profile"]
+            .into_iter()
+            .collect();
 
     let mut statuses = Vec::new();
     for line in &lines {
