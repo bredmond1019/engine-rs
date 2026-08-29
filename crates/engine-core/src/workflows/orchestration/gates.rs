@@ -25,6 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::nodes::terminal::admission::{AdmissionControl, AdmissionPermit};
+use crate::policy::permission::{self, Decision, GatedAction, PermissionProfile};
 
 use super::chain::ChainStep;
 
@@ -149,6 +150,180 @@ pub fn check_dependencies(
         }
     }
     Ok(())
+}
+
+// ── Permission gate ──────────────────────────────────────────────────────
+//
+// `EN.12.C` Task 5 — the enforcement wiring for `crate::policy::permission`: consult
+// [`permission::decide`] before a graded action, alongside the dependency and
+// admission gates above. On denial, author a `{"type":"operator"}` edge (through the
+// caller-supplied `author_operator_edge` seam, never an in-process `state.json` write —
+// `state.json` has a single writer, `mev`, per `seams.md` seam 6) and refuse the step.
+// A permitted action is a pure no-op: `Ok(())`, and `author_operator_edge` is never
+// invoked at all.
+
+/// One `{"type":"operator", slug, exit, start}` edge this gate asks its caller to
+/// author on denial. Field names and meaning mirror the edit-state-json contract
+/// exactly: `exit` names an ARTIFACT whose existence ends the gate (never a
+/// description of the work itself), and `slug` is the join key — deliberately derived
+/// from `action` alone (see [`permission_gate_slug`]), never from the denied step's
+/// `repo`/`block_id`, so every block denied the SAME action under the SAME run shares
+/// ONE gate rather than raising a fresh operator edge per block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorGateRequest {
+    pub slug: String,
+    pub exit: String,
+    pub start: String,
+}
+
+/// Derive the stable `slug` for the operator gate a denied [`GatedAction`] raises.
+/// Built from the action's own wire identifier (`GatedAction`'s
+/// `#[serde(rename_all = "snake_case")]` contract, the same round-trip discipline
+/// `resolved_permission_profile_identifier` in `integrate.rs` already follows for
+/// [`PermissionProfile`]) rather than a hand-written string, so it cannot drift from
+/// the closed action vocabulary `permission.rs` owns.
+fn permission_gate_slug(action: GatedAction) -> String {
+    let wire_id = serde_json::to_value(action)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown-action".to_string());
+    format!("permission-{wire_id}")
+}
+
+/// Build the [`OperatorGateRequest`] a denial of `action` under `profile` raises.
+/// `exit` names an artifact — a decision doc recording the operator's authorization —
+/// never the work the denied action would itself have performed; `start` names the
+/// existing `/begin-session <slug>` entry point every operator edge in this fleet
+/// already uses (see `close_block.rs`'s fixture and `docs/state/state-schema.md`).
+fn build_operator_gate_request(action: GatedAction, profile: PermissionProfile) -> OperatorGateRequest {
+    let slug = permission_gate_slug(action);
+    OperatorGateRequest {
+        exit: format!(
+            "planning/decisions/{slug}.md exists and records the operator's decision to \
+             authorize {action:?} under permission profile {profile:?}"
+        ),
+        start: format!("/begin-session {slug}"),
+        slug,
+    }
+}
+
+/// Everything that can go wrong at the permission gate. Distinct from [`GateError`]
+/// (the dependency gate's own error type) so the two concerns — an unmet
+/// `depends_on` edge versus a denied graded action — stay independently readable at
+/// the call site, exactly as `FrontierError` stays independent of both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionGateError {
+    /// `action` is denied for `profile`; an operator-gate edge naming `edge.slug` was
+    /// (or was attempted to be) authored via the caller's `author_operator_edge` seam.
+    Denied {
+        repo: String,
+        block_id: String,
+        action: GatedAction,
+        profile: PermissionProfile,
+        edge: OperatorGateRequest,
+    },
+    /// `action` was denied, but the caller's `author_operator_edge` seam itself
+    /// returned an error while trying to raise the gate. The chain still stops —
+    /// this is reported as a DISTINCT failure from [`PermissionGateError::Denied`]
+    /// so a caller (and a test) can tell "the gate is raised, blocking as designed"
+    /// from "the gate could not even be raised", which is a mev-CLI-availability
+    /// problem, not a permission decision.
+    EdgeAuthorFailed {
+        repo: String,
+        block_id: String,
+        action: GatedAction,
+        profile: PermissionProfile,
+        reason: String,
+    },
+}
+
+impl fmt::Display for PermissionGateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PermissionGateError::Denied {
+                repo,
+                block_id,
+                action,
+                profile,
+                edge,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') cannot proceed: {action:?} is denied \
+                 at permission profile {profile:?}; operator gate '{}' raised, blocking \
+                 the chain",
+                edge.slug
+            ),
+            PermissionGateError::EdgeAuthorFailed {
+                repo,
+                block_id,
+                action,
+                profile,
+                reason,
+            } => write!(
+                f,
+                "block '{block_id}' (repo '{repo}') cannot proceed: {action:?} is denied \
+                 at permission profile {profile:?}, and authoring the operator-gate edge \
+                 failed: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PermissionGateError {}
+
+/// Gate `step`'s use of `action` under the permission `profile` in force for this run.
+///
+/// Consults [`permission::decide`] — the closed `(profile, action)` decision matrix
+/// `EN.12.C` task 1 built — never re-derives a decision of its own. On
+/// [`Decision::Permit`] this is a pure no-op: `Ok(())`, and `author_operator_edge` is
+/// never called, so a run whose profile already permits `action` sees no new gate, no
+/// new latency, and no behaviour change.
+///
+/// On [`Decision::Deny`] this calls `author_operator_edge` with the
+/// [`OperatorGateRequest`] the denial raises, THEN refuses the step. Both the deny
+/// decision and the authored edge happen unconditionally on denial — the step never
+/// proceeds regardless of whether `author_operator_edge` itself succeeds (see
+/// [`PermissionGateError::EdgeAuthorFailed`] for that distinct failure mode).
+///
+/// `author_operator_edge` is the seam through which the edge is actually written —
+/// production wiring implements it as an out-of-process invocation of the `mev` CLI
+/// (never an in-process `state.json` write; `state.json` has a single writer per
+/// `seams.md` seam 6), mirroring how [`check_dependencies`] above takes
+/// `resolve_depends_on`/`is_edge_met` as closures rather than owning a concrete graph
+/// reader. This module contains, and calls, nothing capable of *clearing* an operator
+/// gate — no reference to mev's gate-closing verb anywhere in this file (see the
+/// `gates_rs_never_references_the_gate_closing_verb` test) — clearing a gate raised
+/// here is a human decision routed through `mev close-operator-gate --exit-verified`,
+/// exactly like every other operator edge in the fleet, never something this path can
+/// do to itself.
+pub fn check_permission_gate(
+    step: &ChainStep,
+    action: GatedAction,
+    profile: PermissionProfile,
+    author_operator_edge: &dyn Fn(&OperatorGateRequest) -> Result<(), String>,
+) -> Result<(), PermissionGateError> {
+    match permission::decide(profile, action) {
+        Decision::Permit => Ok(()),
+        Decision::Deny => {
+            let edge = build_operator_gate_request(action, profile);
+            if let Err(reason) = author_operator_edge(&edge) {
+                return Err(PermissionGateError::EdgeAuthorFailed {
+                    repo: step.repo.clone(),
+                    block_id: step.block_id.clone(),
+                    action,
+                    profile,
+                    reason,
+                });
+            }
+            Err(PermissionGateError::Denied {
+                repo: step.repo.clone(),
+                block_id: step.block_id.clone(),
+                action,
+                profile,
+                edge,
+            })
+        }
+    }
 }
 
 // ── Frontier reader ─────────────────────────────────────────────────────
@@ -913,5 +1088,219 @@ mod tests {
         assert_eq!(gate.available_permits(), 0);
         drop(second);
         assert_eq!(gate.available_permits(), 1);
+    }
+
+    // ── Task 5: the permission gate ─────────────────────────────────────
+
+    /// A closure double that records every [`OperatorGateRequest`] it is called
+    /// with, so a test can assert both "called exactly once with this shape" and
+    /// "never called at all".
+    fn recording_author() -> (
+        impl Fn(&OperatorGateRequest) -> Result<(), String>,
+        Arc<std::sync::Mutex<Vec<OperatorGateRequest>>>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = calls.clone();
+        let author = move |edge: &OperatorGateRequest| {
+            recorder.lock().unwrap().push(edge.clone());
+            Ok(())
+        };
+        (author, calls)
+    }
+
+    /// AC "A permitted graded action proceeds with no behaviour change": `standard`
+    /// permits `PushToMain` (permission.rs's own grading table) — `check_permission_gate`
+    /// returns `Ok(())` and never invokes `author_operator_edge` at all.
+    #[test]
+    fn a_permitted_graded_action_proceeds_and_never_authors_an_edge() {
+        let s = step("engine-rs", "EN.12.C");
+        let (author, calls) = recording_author();
+
+        let result =
+            check_permission_gate(&s, GatedAction::PushToMain, PermissionProfile::Standard, &author);
+
+        assert!(result.is_ok(), "a permitted action must proceed: {result:?}");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "author_operator_edge must not be called for a permitted action"
+        );
+    }
+
+    /// AC "A denied graded action authors a {"type":"operator"} edge and STOPS the
+    /// chain — it does not proceed": `locked` denies `InstallOnMini` — the gate
+    /// authors an edge and returns `Err`.
+    #[test]
+    fn a_denied_graded_action_authors_an_edge_and_stops_the_chain() {
+        let s = step("engine-rs", "EN.12.C");
+        let (author, calls) = recording_author();
+
+        let result = check_permission_gate(
+            &s,
+            GatedAction::InstallOnMini,
+            PermissionProfile::Locked,
+            &author,
+        );
+
+        let err = result.expect_err("a denied action must stop the chain, not proceed");
+        match err {
+            PermissionGateError::Denied {
+                repo,
+                block_id,
+                action,
+                profile,
+                edge,
+            } => {
+                assert_eq!(repo, "engine-rs");
+                assert_eq!(block_id, "EN.12.C");
+                assert_eq!(action, GatedAction::InstallOnMini);
+                assert_eq!(profile, PermissionProfile::Locked);
+                assert_eq!(edge.slug, "permission-install_on_mini");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one edge must be authored");
+        assert_eq!(recorded[0].slug, "permission-install_on_mini");
+    }
+
+    /// AC "The authored edge's `exit` names an artifact ... its `slug` is stable
+    /// across every block the same denial gates": two different blocks, both denied
+    /// the same action, author edges sharing the identical `slug` — the join key
+    /// mev's operator-gate machinery groups on — and `exit` reads as an artifact
+    /// path/existence claim, never a restatement of the work.
+    #[test]
+    fn the_authored_edges_slug_is_stable_across_every_block_the_same_denial_gates() {
+        let s1 = step("engine-rs", "EN.12.C");
+        let s2 = step("mev", "MV.ticket.unrelated");
+        let (author, calls) = recording_author();
+
+        let _ = check_permission_gate(
+            &s1,
+            GatedAction::CrossRepoWrite,
+            PermissionProfile::Locked,
+            &author,
+        );
+        let _ = check_permission_gate(
+            &s2,
+            GatedAction::CrossRepoWrite,
+            PermissionProfile::Locked,
+            &author,
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0].slug, recorded[1].slug,
+            "the same denied action must raise the SAME operator-gate slug regardless \
+             of which block hit it, so mev's clustering treats them as one gate"
+        );
+        assert!(
+            recorded[0].exit.contains("exists"),
+            "exit must name an artifact whose existence ends the gate: {}",
+            recorded[0].exit
+        );
+        assert!(
+            !recorded[0].exit.contains("CrossRepoWrite is complete"),
+            "exit must never restate the denied work itself"
+        );
+    }
+
+    /// AC "`clear_operator_gate` is unreachable from this path at EVERY profile
+    /// including `unrestricted` — asserted, not assumed": drive `check_permission_gate`
+    /// itself (not merely `permission::decide` in isolation) with `ClearOperatorGate`
+    /// across all three profiles and confirm every one denies (raises the gate rather
+    /// than permitting).
+    #[test]
+    fn clear_operator_gate_is_denied_through_this_gate_at_every_profile() {
+        for profile in [
+            PermissionProfile::Locked,
+            PermissionProfile::Standard,
+            PermissionProfile::Unrestricted,
+        ] {
+            let s = step("engine-rs", "EN.12.C");
+            let (author, _calls) = recording_author();
+            let result =
+                check_permission_gate(&s, GatedAction::ClearOperatorGate, profile, &author);
+            assert!(
+                result.is_err(),
+                "ClearOperatorGate must never be permitted through this gate at profile \
+                 {profile:?}"
+            );
+        }
+    }
+
+    /// Companion source-scan guard: this module never references mev's
+    /// gate-closing verb (snake_case or CamelCase form) at all — the concrete proof
+    /// that clearing a gate is not merely denied by `decide()` but structurally
+    /// unreachable from this file, since it contains no call capable of doing it.
+    #[test]
+    fn gates_rs_never_references_the_gate_closing_verb() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/workflows/orchestration/gates.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+        // Built via `concat!` rather than as string literals so this assertion's OWN
+        // banned-substring text (necessarily naming what it forbids) doesn't trip
+        // itself when scanning this very file — the same discipline
+        // `permission.rs`'s `no_from_str_or_from_string_impl_for_the_closed_enums`
+        // guard and `close_block.rs`'s `never_writes_state_json_directly` guard both
+        // already follow.
+        let snake_needle = ["close", "_operator", "_gate"].concat();
+        let camel_needle = ["Close", "OperatorGate"].concat();
+        assert!(
+            !source.contains(&snake_needle) && !source.contains(&camel_needle),
+            "gates.rs must never reference mev's operator-gate-closing verb — \
+             clearing an operator gate is a human decision routed through the mev \
+             CLI directly, never something this file can invoke"
+        );
+    }
+
+    /// Companion guard: this file contains no in-process `state.json` write of its
+    /// own (no `fs::write`/`std::fs::write` call anywhere in production code) — the
+    /// authored edge always goes through the injected `author_operator_edge` seam,
+    /// mirroring `close_block.rs`'s `never_writes_state_json_directly` guard.
+    #[test]
+    fn gates_rs_never_writes_state_json_in_process() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/workflows/orchestration/gates.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+        let production_code = source
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(before, _)| before)
+            .expect("this module has a #[cfg(test)] boundary");
+        assert!(
+            !production_code.contains("fs::write"),
+            "gates.rs's production code must never write state.json in-process — the \
+             authored operator edge must go through author_operator_edge, mirroring \
+             close_block.rs's own never_writes_state_json_directly guard"
+        );
+    }
+
+    /// AC "on a denied action ... the caller's `author_operator_edge` seam ... failing
+    /// is a distinct, reported failure": when the injected closure itself errors, the
+    /// chain still stops, and the failure is reported as
+    /// [`PermissionGateError::EdgeAuthorFailed`], not silently swallowed or conflated
+    /// with an ordinary [`PermissionGateError::Denied`].
+    #[test]
+    fn a_failing_author_seam_still_stops_the_chain_with_a_distinct_error() {
+        let s = step("engine-rs", "EN.12.C");
+        let failing_author =
+            |_edge: &OperatorGateRequest| Err("mev CLI not found on PATH".to_string());
+
+        let result = check_permission_gate(
+            &s,
+            GatedAction::PushToMain,
+            PermissionProfile::Locked,
+            &failing_author,
+        );
+
+        match result {
+            Err(PermissionGateError::EdgeAuthorFailed { reason, .. }) => {
+                assert_eq!(reason, "mev CLI not found on PATH");
+            }
+            other => panic!("expected EdgeAuthorFailed, got {other:?}"),
+        }
     }
 }
