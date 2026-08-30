@@ -692,6 +692,35 @@ impl Node for SetupWorktreeNode {
 /// D31-committed path — see
 /// `D10-committed-state-path-schema-alignment.md`) or `tasks.json`, else to
 /// `GenerateTasksNode`.
+///
+/// **Missing-spec-directory guard** (half (b) of
+/// `EN.ticket.planning-symlink-guard-accepts-a-stale-tracked-directory`).
+/// The planning fallback is a legitimate feature — "the caller named a spec
+/// that exists but has not been broken into tasks yet, plan it" — and it is
+/// distinguished from a spec the run simply cannot *see* by exactly one
+/// signal: **whether the spec directory itself exists** under the tree this
+/// run is operating on. That is the same distinction `post_events`'
+/// pre-flight already draws against the *source* root
+/// (`crates/engine-serve/src/http.rs`: an absent spec directory is a 422,
+/// a spec directory with no `tasks.json` is explicitly allowed through as
+/// the `GenerateTasksNode` path). It is NOT the same as "did the caller
+/// name a slug": `SDLCFlowEventSchema::spec_slug` is a required,
+/// non-optional `String`, so a run that reaches this router always names
+/// one. A raw event with no `spec_slug` at all cannot be produced by the
+/// typed schema; that case is left exactly as it was (`route` returns
+/// `None`, the walk follows the declared `connections[0]`,
+/// `GenerateTasksNode`).
+///
+/// Measured 2026-08-30 (jynx lane): a stale *tracked* `planning/` directory
+/// inside a worktree shadowed the planning symlink, so
+/// `planning/JX.3.A/tasks.json` — present in the source repo — did not
+/// exist in the tree this run walked. The pre-flight passed (it checks the
+/// source root), this router saw no spec, diverted to the Opus planning
+/// fallback, and the engine ran a **fabricated** task list under the
+/// operator's spec slug. Silent fabrication is strictly worse than a bail,
+/// so [`Node::process`] now fails the run with a [`NodeError`] naming the
+/// slug and every path it searched, and the fallback survives only for the
+/// case it was built for.
 pub struct SpecExistsRouterNode {
     state_filename: &'static str,
 }
@@ -723,8 +752,89 @@ impl Default for SpecExistsRouterNode {
 
 #[async_trait::async_trait]
 impl Node for SpecExistsRouterNode {
+    /// Fail the run — through this node's ordinary [`NodeError`] path, no
+    /// new node and no new edge — when the caller named a spec slug whose
+    /// spec directory does not exist in the tree this run walks. See the
+    /// struct's doc comment for why directory existence, and not
+    /// slug-named-ness, is the signal.
+    ///
+    /// Left deliberately permissive in three places:
+    ///
+    /// - **No `spec_slug` key at all** (not reachable through
+    ///   [`SDLCFlowEventSchema`], which requires it): unchanged — `Ok`, and
+    ///   `route` returns `None` so the walk takes `connections[0]`.
+    /// - **Spec directory present, no `tasks.json`/state file**: unchanged
+    ///   — this is the legitimate planning fallback.
+    /// - **Spec file present but unreadable or malformed**: routed to
+    ///   `LoadTaskStateNode` as before, which reads it and fails loudly with
+    ///   the real I/O or parse error. Presence is decided by `exists()`, so
+    ///   a `chmod 000` file is *present*; treating an unreadable file as
+    ///   "absent" would be the same silent-fabrication bug in a new coat.
     async fn process(&self, ctx: TaskContext) -> Result<TaskContext, NodeError> {
-        Ok(ctx)
+        let Some(spec_slug) = ctx.event.get("spec_slug").and_then(|value| value.as_str()) else {
+            return Ok(ctx);
+        };
+        let spec_slug = spec_slug.trim();
+        if spec_slug.is_empty() {
+            return Ok(ctx);
+        }
+
+        let dir = spec_dir(&ctx, spec_slug);
+        let state_path = dir.join("sdlc").join(self.state_filename);
+        let tasks_path = dir.join("tasks.json");
+
+        if dir.is_dir() {
+            // A dangling symlink is invisible to `exists()` (which follows
+            // links) yet visible to `symlink_metadata` — the same
+            // "the file is there but this tree cannot see it" class as the
+            // stale-`planning/` defect, so it must not fall through to the
+            // planning fallback either.
+            for path in [&state_path, &tasks_path] {
+                if !path.exists() && std::fs::symlink_metadata(path).is_ok() {
+                    return Err(NodeError::new(format!(
+                        "SDLC_FLOW named spec_slug {spec_slug:?}, whose spec file {} is an \
+                         unresolvable symlink (it exists as a link but its target does not). \
+                         Refusing to fall back to the planning path, which would FABRICATE a \
+                         task list under a spec slug the caller named.",
+                        path.display()
+                    )));
+                }
+            }
+            return Ok(ctx);
+        }
+
+        // The directory is missing from the tree this run walks. Say so, and
+        // say where we looked — the failure mode this guards is a file being
+        // *invisible* rather than missing, and "spec not found" without a
+        // path is nearly useless against that.
+        let mut message = format!(
+            "SDLC_FLOW named spec_slug {spec_slug:?} but its spec directory does not exist. \
+             Searched: {dir} (for {tasks_path} and {state_path}). Refusing to fall back to the \
+             planning path, which would FABRICATE a task list under a spec slug the caller \
+             named. If the spec exists in the repo, this run's tree is not seeing it — check \
+             for a stale tracked `planning/` directory shadowing the `planning` symlink.",
+            dir = dir.display(),
+            tasks_path = tasks_path.display(),
+            state_path = state_path.display(),
+        );
+
+        // Strongest possible diagnostic when it applies: the spec IS there in
+        // the run's target root and only the walked tree cannot see it. That
+        // is the jynx failure exactly.
+        if let Some(source_dir) = parse_event(&ctx)
+            .ok()
+            .and_then(|event| resolve_target_root(&event, None).ok())
+            .map(|root| root.join("planning").join(spec_slug))
+            .filter(|source_dir| *source_dir != dir && source_dir.is_dir())
+        {
+            message.push_str(&format!(
+                " NOTE: the spec DOES exist at {} — it is present in the target root and \
+                 absent from the tree above, which is that stale-`planning/` shadowing.",
+                source_dir.display()
+            ));
+        }
+
+        Err(NodeError::new(message))
     }
 
     fn name(&self) -> &str {
@@ -737,12 +847,16 @@ impl Node for SpecExistsRouterNode {
 }
 
 impl Router for SpecExistsRouterNode {
-    // EN.3.K task 5: no change needed here. `post_events`'s pre-flight
-    // 422 (crates/engine-serve/src/http.rs) already rejects an absent spec
-    // directory before a run is spawned, so a run that reaches this router
-    // provably has an existing spec dir — the `else` branch below only ever
-    // fires for the legitimate "dir exists, no tasks.json yet" case that
-    // routes to `GenerateTasksNode`.
+    // EN.3.K task 5: `post_events`'s pre-flight 422
+    // (crates/engine-serve/src/http.rs) rejects an absent spec directory
+    // under the *source* root before a run is spawned. That is not enough
+    // on its own — the jynx defect had a spec dir at the source root and no
+    // spec dir in the worktree this router resolves against — so
+    // `Node::process` above now enforces the same property on the walked
+    // tree and fails the run before this `route` is ever consulted. By the
+    // time it runs, the `else` branch below only ever fires for the
+    // legitimate "dir exists, no tasks.json yet" case that routes to
+    // `GenerateTasksNode`.
     fn route(&self, ctx: &TaskContext) -> Option<String> {
         let spec_slug = ctx.event.get("spec_slug")?.as_str()?;
         let dir = spec_dir(ctx, spec_slug);
@@ -1431,6 +1545,180 @@ mod tests {
         let ctx = ctx_with_worktree("my-spec", &worktree);
         let router = SpecExistsRouterNode::new();
         assert_eq!(router.route(&ctx), Some("GenerateTasksNode".to_string()));
+    }
+
+    // --- SpecExistsRouterNode: missing-spec-directory guard ---------------
+    //
+    // Half (b) of
+    // `EN.ticket.planning-symlink-guard-accepts-a-stale-tracked-directory`.
+
+    #[tokio::test]
+    async fn spec_exists_process_errors_when_named_spec_dir_is_absent() {
+        // The jynx failure: the slug is named, the spec directory is not in
+        // the tree this run walks. Must fail loudly rather than divert to
+        // the Opus planning fallback and fabricate a task list.
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning")).unwrap();
+
+        let ctx = ctx_with_worktree("JX.3.A", &worktree);
+        let err = SpecExistsRouterNode::new()
+            .process(ctx)
+            .await
+            .expect_err("an absent spec directory must fail the run");
+        let message = err.to_string();
+
+        // Names the slug ...
+        assert!(message.contains("JX.3.A"), "message: {message}");
+        // ... and every path it searched.
+        let dir = worktree.join("planning").join("JX.3.A");
+        assert!(
+            message.contains(&dir.display().to_string()),
+            "message must name the spec directory searched: {message}"
+        );
+        assert!(
+            message.contains(&dir.join("tasks.json").display().to_string()),
+            "message must name the tasks.json path searched: {message}"
+        );
+        assert!(
+            message.contains(
+                &dir.join("sdlc")
+                    .join("sdlc-flow-state.json")
+                    .display()
+                    .to_string()
+            ),
+            "message must name the state-file path searched: {message}"
+        );
+        // ... and says what it refused to do, so the operator does not read
+        // this as a transient blip.
+        assert!(
+            message.contains("FABRICATE"),
+            "message must say what the fallback would have done: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_exists_process_error_names_the_custom_state_filename() {
+        // `SDLC_TASK` reuses this node under its own state filename
+        // (`with_state_filename`); the diagnostic must name the path that
+        // engine actually searched, not the flow default.
+        let worktree = temp_dir();
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let err = SpecExistsRouterNode::new()
+            .with_state_filename("sdlc-task-state.json")
+            .process(ctx)
+            .await
+            .expect_err("an absent spec directory must fail the run");
+        assert!(
+            err.to_string().contains("sdlc-task-state.json"),
+            "message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_exists_process_allows_planning_fallback_when_dir_exists_without_tasks() {
+        // THE REGRESSION THAT MATTERS: the planning fallback is a real
+        // feature — a named spec whose directory exists but holds no
+        // tasks.json yet is planned from scratch, exactly as before.
+        let worktree = temp_dir();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec")).unwrap();
+
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let router = SpecExistsRouterNode::new();
+        let ctx = router
+            .process(ctx)
+            .await
+            .expect("an existing spec dir with no tasks.json is the planning path");
+        assert_eq!(router.route(&ctx), Some("GenerateTasksNode".to_string()));
+    }
+
+    #[tokio::test]
+    async fn spec_exists_process_leaves_a_slugless_event_on_the_planning_fallback() {
+        // `spec_slug` is required by `SDLCFlowEventSchema`, so a raw event
+        // without it is not reachable through the typed schema. Behavior is
+        // nonetheless left byte-for-byte unchanged: `process` is a no-op and
+        // `route` returns `None`, so the walk follows the declared
+        // `connections[0]` — `GenerateTasksNode` (see `graph.rs`).
+        let ctx = empty_context(json!({}));
+        let router = SpecExistsRouterNode::new();
+        let ctx = router
+            .process(ctx)
+            .await
+            .expect("an event naming no slug must not be failed by this guard");
+        assert_eq!(router.route(&ctx), None);
+    }
+
+    #[tokio::test]
+    async fn spec_exists_process_passes_and_routes_normally_when_spec_is_present() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "[]").unwrap();
+
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let router = SpecExistsRouterNode::new();
+        let ctx = router.process(ctx).await.expect("present spec must pass");
+        assert_eq!(router.route(&ctx), Some("LoadTaskStateNode".to_string()));
+    }
+
+    #[tokio::test]
+    async fn spec_exists_routes_malformed_tasks_json_to_load_which_fails_loudly() {
+        // CHOSEN BEHAVIOR for an unreadable/malformed spec: presence is
+        // decided by `exists()`, so a corrupt (or `chmod 000`) tasks.json is
+        // PRESENT. The router hands it to `LoadTaskStateNode`, which
+        // surfaces the real parse/IO error. Silently treating it as "absent"
+        // would reintroduce the fabrication bug.
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tasks.json"), "{ not json").unwrap();
+
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let router = SpecExistsRouterNode::new();
+        let ctx = router
+            .process(ctx)
+            .await
+            .expect("a present-but-corrupt spec file is present, not absent");
+        assert_eq!(router.route(&ctx), Some("LoadTaskStateNode".to_string()));
+
+        let err = LoadTaskStateNode::new()
+            .process(ctx)
+            .await
+            .expect_err("a corrupt tasks.json must fail the run");
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to parse")
+                && message.contains(&dir.join("tasks.json").display().to_string()),
+            "message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spec_exists_process_errors_on_a_dangling_tasks_json_symlink() {
+        // `exists()` follows symlinks, so a dangling `tasks.json` link reads
+        // as absent — the same "present in the repo, invisible to this tree"
+        // class as the stale-`planning/` directory. It must not reach the
+        // planning fallback either.
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere.json"), dir.join("tasks.json")).unwrap();
+
+        let ctx = ctx_with_worktree("my-spec", &worktree);
+        let err = SpecExistsRouterNode::new()
+            .process(ctx)
+            .await
+            .expect_err("a dangling spec-file symlink must fail the run");
+        let message = err.to_string();
+        assert!(message.contains("my-spec"), "message: {message}");
+        assert!(
+            message.contains(&dir.join("tasks.json").display().to_string()),
+            "message must name the unresolvable link: {message}"
+        );
+        assert!(
+            message.contains("unresolvable symlink"),
+            "message: {message}"
+        );
     }
 
     // --- LoadTaskStateNode ------------------------------------------------
