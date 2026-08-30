@@ -405,6 +405,30 @@ fn net_new_diagnostics(before: &Report, after: &Report) -> Vec<String> {
         .collect()
 }
 
+/// Collect the full derived-file write manifest from a completed
+/// `mev::set_block_status` report: every `I_EMIT_WROTE` diagnostic's
+/// `file`, in first-seen order, de-duplicated.
+///
+/// This reads the SAME diagnostic stream the `wrote` probe in
+/// [`attempt_close_with_validator`] reads (`d.locator == "I_EMIT_WROTE"`)
+/// — it is an extension of that existing read, not a new data source
+/// (`EN.ticket.close-block-node-leaves-derived-output-uncommitted`, task
+/// 1). It must never influence, and does not influence, the `wrote`
+/// boolean or the rollback decision that boolean drives — that guard
+/// belongs to `EN.ticket.wrap-up-closes-the-block` and stays scoped to
+/// exactly `d.file == state_path`. A report with zero `I_EMIT_WROTE`
+/// diagnostics yields an empty manifest, never a panic.
+fn write_manifest(report: &Report) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut manifest = Vec::new();
+    for d in &report.diagnostics {
+        if d.locator == "I_EMIT_WROTE" && seen.insert(d.file.clone()) {
+            manifest.push(d.file.clone());
+        }
+    }
+    manifest
+}
+
 /// Classify a completed `mev::set_block_status` [`Report`] into a
 /// [`CloseOutcome`]. `E_BLOCK_NOT_FOUND` maps to [`CloseOutcome::NotFound`]
 /// (not an error — see the ticket's acceptance criteria); any other
@@ -566,6 +590,15 @@ fn attempt_close_with_validator(
         .diagnostics
         .iter()
         .any(|d| d.locator == "I_EMIT_WROTE" && d.file == state_path);
+
+    // The full derived-file write manifest — every `I_EMIT_WROTE` file,
+    // not just this repo's own `state.json`. Computed here, alongside
+    // `wrote`, because both read the same diagnostic stream; does not
+    // affect the `wrote` boolean or the rollback decision below. Not yet
+    // staged/committed (task 2) or surfaced on `CloseOutcome` (task 3) —
+    // this task only collects it.
+    let _write_manifest = write_manifest(&close_report);
+
     if !wrote {
         return outcome;
     }
@@ -746,6 +779,106 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    // --- write_manifest / wrote probe (task 1) ---------------------------
+
+    fn wrote_diag(file: &str) -> Diagnostic {
+        Diagnostic {
+            severity: Severity::Warning,
+            file: PathBuf::from(file),
+            locator: "I_EMIT_WROTE".to_string(),
+            message: "wrote".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_manifest_collects_all_i_emit_wrote_files_deduplicated() {
+        let report = Report {
+            diagnostics: vec![
+                wrote_diag("core/planning/master-plan.md"),
+                wrote_diag("core/docs/projects/mev.md"),
+                // duplicate of the first entry — must appear only once.
+                wrote_diag("core/planning/master-plan.md"),
+                // a non-I_EMIT_WROTE diagnostic must be ignored entirely.
+                Diagnostic {
+                    severity: Severity::Error,
+                    file: PathBuf::from("some/other/file.md"),
+                    locator: "E_SOMETHING_ELSE".to_string(),
+                    message: "unrelated".to_string(),
+                },
+                wrote_diag("core/_planning/jynx/status.md"),
+            ],
+        };
+
+        let manifest = write_manifest(&report);
+
+        assert_eq!(
+            manifest,
+            vec![
+                PathBuf::from("core/planning/master-plan.md"),
+                PathBuf::from("core/docs/projects/mev.md"),
+                PathBuf::from("core/_planning/jynx/status.md"),
+            ],
+            "manifest must contain every I_EMIT_WROTE file, in first-seen order, de-duplicated"
+        );
+    }
+
+    #[test]
+    fn write_manifest_is_empty_for_a_report_with_no_i_emit_wrote_diagnostics() {
+        let report = Report {
+            diagnostics: vec![Diagnostic {
+                severity: Severity::Error,
+                file: PathBuf::from("x.md"),
+                locator: "E_BLOCK_NOT_FOUND".to_string(),
+                message: "no such block".to_string(),
+            }],
+        };
+
+        assert_eq!(write_manifest(&report), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn write_manifest_is_empty_for_a_report_with_no_diagnostics_at_all() {
+        let report = Report {
+            diagnostics: vec![],
+        };
+        assert_eq!(write_manifest(&report), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn wrote_probe_is_scoped_to_exactly_the_state_path_unaffected_by_other_i_emit_wrote_entries() {
+        let state_path = PathBuf::from("acme/planning/state.json");
+        let report = Report {
+            diagnostics: vec![
+                wrote_diag("core/planning/master-plan.md"),
+                wrote_diag("core/docs/projects/mev.md"),
+            ],
+        };
+
+        // The pre-existing `wrote` probe: the manifest now collects every
+        // I_EMIT_WROTE file, but the boolean the rollback decision reads
+        // must remain scoped to exactly `d.file == state_path` and must
+        // NOT go true just because the manifest is non-empty.
+        let wrote = report
+            .diagnostics
+            .iter()
+            .any(|d| d.locator == "I_EMIT_WROTE" && d.file == state_path);
+        assert!(!wrote, "wrote probe must stay scoped to state_path only");
+        assert_eq!(write_manifest(&report).len(), 2);
+
+        // Now include the state_path itself among the manifest entries —
+        // the probe must go true, and the manifest must still contain
+        // every entry (including the ones that are not state_path).
+        let mut diags = report.diagnostics.clone();
+        diags.push(wrote_diag("acme/planning/state.json"));
+        let report_with_state = Report { diagnostics: diags };
+        let wrote2 = report_with_state
+            .diagnostics
+            .iter()
+            .any(|d| d.locator == "I_EMIT_WROTE" && d.file == state_path);
+        assert!(wrote2);
+        assert_eq!(write_manifest(&report_with_state).len(), 3);
+    }
 
     /// This module must never write `state.json` directly — every write
     /// goes through `mev::set_block_status`. Guards against a future
