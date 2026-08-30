@@ -7359,6 +7359,122 @@ mod tests {
         assert!(value["bail_reason"].is_null());
     }
 
+    // EN.ticket.a-task-marked-done-must-have-actually-committed task 1: drive
+    // `SaveStateNode` through the three `git commit` outcomes directly (no
+    // `is_noop_commit` re-implementation at the test level — the runner
+    // stubs the real exit code/stderr `commit_all` would see). Case (i) is
+    // RED on purpose: `SaveStateNode::process` today always returns `Ok`
+    // regardless of whether the commit genuinely failed, so a task whose
+    // commit failed is still recorded done. Task 2 closes this by gating
+    // completion on the commit result.
+
+    /// (i) A genuine `git commit` failure (a real git error, not the
+    /// ordinary "nothing to commit" no-op) must NOT let the task be
+    /// recorded done — `SaveStateNode::process` must surface it as an
+    /// `Err`, the same way this node's siblings surface a failure.
+    #[tokio::test]
+    async fn save_state_fails_the_task_when_commit_genuinely_fails() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            if args.first() == Some(&"commit") {
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "fatal: unable to write new index file".to_string(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        });
+
+        let node = SaveStateNode::new().with_runner(runner);
+        let result = node.process(ctx).await;
+
+        // RED today: this currently returns `Ok`, so the task is recorded
+        // done even though `git commit` genuinely failed.
+        assert!(
+            result.is_err(),
+            "expected SaveStateNode::process to fail when git commit genuinely \
+             fails, but it succeeded: {result:?}"
+        );
+    }
+
+    /// (ii) `is_noop_commit`'s legitimate "nothing to commit" case must
+    /// still complete the task normally — this is the distinction that
+    /// must not collapse. Already passes today, since `commit_all`'s
+    /// `false` return (noop or failure alike) is currently never consulted.
+    #[tokio::test]
+    async fn save_state_completes_normally_on_noop_commit() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, args, _cwd| {
+            if args.first() == Some(&"commit") {
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "nothing to commit, working tree clean".to_string(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        });
+
+        let node = SaveStateNode::new().with_runner(runner);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a no-op commit must still complete the task normally");
+        assert!(out.nodes["SaveStateNode"]["saved_to"].as_str().is_some());
+    }
+
+    /// (iii) An ordinary successful `git commit` is unaffected.
+    #[tokio::test]
+    async fn save_state_completes_normally_when_commit_succeeds() {
+        let worktree = temp_worktree();
+        let state = state_with_tasks(vec![SDLCTask::new(1, "One", "d1")]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let node = SaveStateNode::new().with_runner(runner);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("a successful commit must complete the task normally");
+        assert!(out.nodes["SaveStateNode"]["saved_to"].as_str().is_some());
+    }
+
     // --- select_task_checks --------------------------------------------------
 
     fn cmd_check(name: &str, command: &str) -> serde_json::Value {
