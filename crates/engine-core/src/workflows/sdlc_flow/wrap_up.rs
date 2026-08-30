@@ -2407,6 +2407,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
+    // --- EN.ticket.stamp-engine-sha-on-every-run task 2 ---------------------
+
+    #[test]
+    fn write_terminal_blocked_state_stamps_engine_build_sha_matching_the_accessor() {
+        // Real write, real read-back off disk — not a unit test on the
+        // constant alone, per this task's testing strategy: a unit test on
+        // a constant proves the constant, not the write.
+        let worktree = temp_worktree();
+
+        let state = SDLCState::new("EN.stamp-sha-terminal-fixture");
+        seed_state_file(&worktree, &state.spec_slug, &state);
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+
+        let saved_to = write_terminal_blocked_state(&ctx, "boom", DEFAULT_STATE_FILENAME)
+            .expect("worktree + loaded state present, parent dir exists");
+
+        let on_disk = std::fs::read_to_string(&saved_to).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        let engine_build_sha = value["engine_build_sha"]
+            .as_str()
+            .expect("engine_build_sha is a string on a freshly written artifact");
+        assert!(!engine_build_sha.is_empty());
+        assert_eq!(engine_build_sha, crate::build_info::engine_build_sha());
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
     #[test]
     fn write_terminal_blocked_state_returns_none_without_a_worktree() {
         let state = SDLCState::new("EN.6.J-terminal-fixture");

@@ -528,6 +528,20 @@ impl SDLCState {
     /// site, so a parameter would just make every call site pass the same
     /// value. `run_id` (on [`RunMeta`]) stays a parameter because it
     /// genuinely varies per run.
+    ///
+    /// `engine_build_sha` (`EN.ticket.stamp-engine-sha-on-every-run` task 2)
+    /// is a further additive top-level key carrying
+    /// [`build_info::engine_build_sha`]'s single accessor value — the
+    /// dirty-aware label (`"<sha>-dirty"`/`"unknown"`) that `GET /health`
+    /// (task 3) must also report, so the two can never disagree. It is
+    /// named for what it is (the engine build that produced this run), not
+    /// for how it was obtained, and it deliberately duplicates
+    /// `build.git_sha` above rather than replacing it: `build.git_sha` is
+    /// the raw EN.11.A compile-time constant an existing test pins byte-for-
+    /// byte, while `engine_build_sha` is the one place a consumer should
+    /// read to find out which build produced the run, dirty tree included.
+    /// Artifacts written before this task simply lack the key, which a
+    /// consumer reads as absent, never as an empty string.
     #[must_use]
     pub fn to_committed_state_json(
         &self,
@@ -575,6 +589,7 @@ impl SDLCState {
                 "git_sha": build_info::GIT_SHA,
                 "built_at": build_info::BUILT_AT,
             },
+            "engine_build_sha": build_info::engine_build_sha(),
             "writer": build_info::WRITER,
             "host": {
                 "hostname": hostname,
@@ -1504,6 +1519,40 @@ mod tests {
         assert!(json["host"]["hostname"]
             .as_str()
             .is_some_and(|s| !s.is_empty()));
+    }
+
+    // --- EN.ticket.stamp-engine-sha-on-every-run task 2 ---------------------
+
+    #[test]
+    fn to_committed_state_json_carries_engine_build_sha_matching_accessor() {
+        let state = SDLCState::new("EN.stamp-sha-fixture");
+        let json = state.to_committed_state_json(&run_meta(), None, None, None, None, None);
+        let engine_build_sha = json["engine_build_sha"]
+            .as_str()
+            .expect("engine_build_sha is a string");
+        assert!(!engine_build_sha.is_empty());
+        assert_eq!(engine_build_sha, build_info::engine_build_sha());
+    }
+
+    #[test]
+    fn from_committed_state_json_missing_engine_build_sha_key_still_parses() {
+        // An artifact written before this task lacks the key entirely — it
+        // must still parse, reading as absent rather than an empty string.
+        let value = serde_json::json!({
+            "spec_slug": "pre-task2-fixture",
+            "branch": "sdlc/pre-task2-fixture",
+            "worktree_path": "trees/sdlc/pre-task2-fixture",
+            "started_at": "2026-07-25T00:00:00Z",
+            "updated_at": "2026-07-25T00:10:00Z",
+            "status": "running",
+            "current_task": 1,
+            "tasks": {},
+        });
+        assert!(value.get("engine_build_sha").is_none());
+
+        let state = SDLCState::from_committed_state_json(&value)
+            .expect("state with no engine_build_sha key should still parse");
+        assert_eq!(state.spec_slug, "pre-task2-fixture");
     }
 
     #[test]
