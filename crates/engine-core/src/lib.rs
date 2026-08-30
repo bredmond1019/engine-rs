@@ -31,6 +31,12 @@ pub mod workflows;
 
 pub use brain_root::{resolve_brain_root, resolve_brain_root_from, BrainRootError};
 pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger, CampaignLedger};
+/// Re-exported so every caller — the run-artifact writer (`wrap_up.rs`, task 2) and `GET
+/// /health` (`engine-serve`'s `http.rs`, task 3) — reaches "which build am I" through one path
+/// (`engine_core::engine_build_sha()`) rather than composing `build_info::GIT_SHA`/`DIRTY`
+/// themselves, so the two responses can never drift apart
+/// (`EN.ticket.stamp-engine-sha-on-every-run`).
+pub use build_info::engine_build_sha;
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
 pub use completion::{
     derive_terminal_status, is_complete, stamp_completion, COMPLETION_METADATA_KEY,

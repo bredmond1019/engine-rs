@@ -288,13 +288,18 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/campaigns/{id}", web::get().to(get_campaign));
 }
 
+/// `EN.ticket.stamp-engine-sha-on-every-run` task 3: `engine_build_sha` here must equal the
+/// value the run artifact carries (task 2) — both read `engine_core::engine_build_sha()`, the
+/// single accessor, so the two can never disagree. Unauthenticated and cheap: every value is a
+/// `build.rs` compile-time constant, no I/O.
 async fn health() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "build": {
             "git_sha": engine_core::build_info::GIT_SHA,
             "built_at": engine_core::build_info::BUILT_AT,
-        }
+        },
+        "engine_build_sha": engine_core::engine_build_sha(),
     }))
 }
 
@@ -1001,6 +1006,34 @@ mod tests {
             .as_str()
             .expect("build.git_sha present and a string");
         assert!(!git_sha.is_empty(), "build.git_sha must be non-empty");
+    }
+
+    // --- EN.ticket.stamp-engine-sha-on-every-run task 3 ---------------------
+
+    /// `GET /health`'s `engine_build_sha` must equal `engine_core::engine_build_sha()` — the
+    /// same accessor the run artifact (task 2, `wrap_up.rs`) stamps — so the health response and
+    /// a run's artifact can never report two different builds.
+    #[actix_web::test]
+    async fn health_engine_build_sha_matches_the_shared_accessor() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let engine_build_sha = body["engine_build_sha"]
+            .as_str()
+            .expect("engine_build_sha present and a string");
+
+        assert!(!engine_build_sha.is_empty());
+        assert_eq!(engine_build_sha, engine_core::engine_build_sha());
     }
 
     #[actix_web::test]
