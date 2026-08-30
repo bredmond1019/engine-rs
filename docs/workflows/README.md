@@ -76,6 +76,7 @@ table is a reader's copy.
 | `SDLC_TASK` | The lean version: implement → test → fix, and stop. No review, no docs pass, no PR. For one small unit of work. | [sdlc-task.md](sdlc-task.md) |
 | `ORCHESTRATION` | Runs an ordered *chain* of the two above, across repos, checking dependencies and merging each block before the next starts. | [orchestration.md](orchestration.md) |
 | `DEBRIEF` | Renders a morning brief from one campaign's journal — every step, every bail named with its reason — readable on a phone. | [debrief.md](debrief.md) |
+| `RECALL` | Asks the Brain a question mid-run via Synapse's `GET /recall`, so a chain step can branch on what the corpus already knows instead of carrying it in the event payload. | [recall.md](recall.md) |
 
 ### Winning and serving work
 
