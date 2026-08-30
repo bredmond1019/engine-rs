@@ -1,7 +1,6 @@
 ---
 name: write-okf-markdown
 description: How to create or edit a markdown file in this brain without red-gating the fleet — whether the file needs OKF frontmatter at all, the five traps that red-gate it (four break YAML parsing; the fifth parses fine and only `--sync` catches it), the index.md row Standing Rule 7 requires, the cross-repo `related:` prefix, and why a relative markdown link that climbs out of `planning/` resolves against the vault instead of the repo. Use BEFORE writing any new `.md` file anywhere in agentic-portfolio or a sub-repo, before adding frontmatter to an existing one, before linking from a planning doc to anything outside `planning/`, and when `bastion validate-brain` reports E_STRUCT_ORPHAN_FILE, E_GRAPH_DANGLING_RELATED, W_GRAPH_ISOLATED_NODE, E_LINK_DEAD_MARKDOWN, E_SYNC_WATERMARK_MALFORMED, or "mapping values are not allowed in this context".
-allowed-tools: Bash(bastion:*) Bash(mev:*) Bash(python3:*) Bash(grep:*) Bash(ls:*) Bash(test:*)
 ---
 
 # Writing markdown in this brain
