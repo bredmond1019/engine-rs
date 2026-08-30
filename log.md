@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-29T22:05:00Z"
+timestamp: "2026-08-30T13:35:12Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,13 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-08-30]
+
+### engine-tickets chain — the build-SHA stamp and the close-block commit manifest
+- **What:** Closed `EN.ticket.stamp-engine-sha-on-every-run` and `EN.ticket.close-block-node-leaves-derived-output-uncommitted` via `/orchestrate`, both `/sdlc-task` in place on `main`, PASS 4/4 each. The first compiles the build commit SHA into the binary behind one accessor, `engine_core::engine_build_sha()`, which both the run artifact (`wrap_up.rs`) and `GET /health` (`http.rs`) read, with a dirty tree reporting `<sha>-dirty`. The second widens `close_block.rs`'s existing `I_EMIT_WROTE` read into a full write manifest and stages each path one at a time behind a `realpath`, with the result surfaced on `CloseOutcome::Closed`. Followed by `/close-out`: 5/5 gating checks, no blocking coverage gaps, and two stale docs patched (the `GET /health` contract row, and `CloseBlockNode`'s behaviour in the SDLC_TASK doc).
+- **Why:** A run artifact recorded nothing about which build produced it, and because `bastion serve` is a launch-time snapshot that label cannot be backfilled — every unattended run made before this is permanently unlabelled. Requested by the jynx lane as the prerequisite for its engine-comparison phase. The second was reported by the mev lane: closing a block regenerates derived surfaces fleet-wide and committed none of them, which cost 24 uncommitted files across four repos and surfaced later as a red gate in a lane that never touched them — a defect this chain reproduced live, twice, while closing its own blocks.
+- **Refs:** `planning/orchestration-run/engine-tickets/{notes.md,review.md}`; `planning/handoff.md`; blocks `EN.ticket.stamp-engine-sha-on-every-run` / `EN.ticket.close-block-node-leaves-derived-output-uncommitted`.
 
 ## [run: 2026-08-29]
 
