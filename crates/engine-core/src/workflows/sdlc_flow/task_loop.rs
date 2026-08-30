@@ -2768,9 +2768,11 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMe
 /// (the D31-committed path/schema shared with base-template's JS
 /// `sdlc-flow.js` engine — see `D10-committed-state-path-schema-alignment.md`)
 /// and commits it via the injectable [`CommandRunner`] seam, so state
-/// survives across resumed runs. A non-zero `git commit` (e.g. "nothing to
-/// commit") is logged, not treated as a failure — mirrors the Python
-/// behavior.
+/// survives across resumed runs. A `git commit` that no-ops (e.g. "nothing to
+/// commit", per [`super::is_noop_commit`]) is logged, not treated as a
+/// failure — mirrors the Python behavior. A *genuine* `git commit` failure is
+/// different: the node returns a [`NodeError`], because a task whose work was
+/// never committed must not be recorded done.
 ///
 /// This per-task save point never has `review`/`docs`/`pr` yet (those are
 /// end-of-run outputs from `ConsolidatedReviewNode`/`PatchDocsNode`/
@@ -2840,20 +2842,30 @@ impl Node for SaveStateNode {
         })?;
 
         let state_path_str = state_path.to_string_lossy().to_string();
-        // Stamped, not discarded: a `false` here means HEAD did not advance,
-        // so the NEXT task's `git diff HEAD` will include this task's work —
-        // the exact miscount this ticket exists to kill, just quieter. Making
-        // it visible in `ctx.nodes` is what lets telemetry catch it.
-        let committed = super::commit_all(
+        // Consulted, not merely stamped: a genuine `git commit` failure means
+        // this task's work was never recorded, so the task must NOT be
+        // reported done — the node fails, the same `NodeError` way every
+        // other failure in this loop surfaces. The ordinary "nothing to
+        // commit" no-op (`super::is_noop_commit`, which is where that
+        // classification lives) stays benign and completes normally: in this
+        // repo `planning/` is a gitignored symlink, so most state commits are
+        // no-ops and failing them would break every run.
+        let outcome = super::commit_all(
             &self.runner,
             Path::new(&worktree),
             &save_state_commit_message(&ctx),
         );
+        if let Some(detail) = outcome.failure_detail() {
+            return Err(NodeError::new(format!(
+                "git commit failed while saving {state_path_str}; refusing to record the task as \
+                 done with its work uncommitted: {detail}"
+            )));
+        }
 
         put_result(
             &mut ctx,
             "SaveStateNode",
-            json!({ "saved_to": state_path_str, "committed": committed }),
+            json!({ "saved_to": state_path_str, "committed": outcome.is_committed() }),
         );
         Ok(ctx)
     }

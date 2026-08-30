@@ -215,23 +215,73 @@ pub fn default_command_runner() -> CommandRunner {
 /// Prefer `use_worktree: true` anyway for any run you do not want touching
 /// the ambient tree at all.
 ///
-/// Returns `true` when the commit actually landed. A `false` means `HEAD` did
-/// **not** advance, which silently breaks the topology invariant for the next
-/// task (its `git diff HEAD` would then include this task's work too), so
-/// callers stamp the outcome where telemetry can see it rather than
-/// discarding it.
-pub(crate) fn commit_all(runner: &CommandRunner, worktree: &Path, message: &str) -> bool {
+/// Returns a [`CommitOutcome`] rather than a bare `bool`: a `false` used to
+/// collapse the ordinary "nothing to commit" no-op into the same value as a
+/// genuine git failure, so no caller could gate on the difference. A
+/// [`CommitOutcome::Failed`] means `HEAD` did **not** advance while there was
+/// real work to record — which silently breaks the topology invariant for the
+/// next task (its `git diff HEAD` would then include this task's work too) —
+/// and callers that record a unit of work as done must refuse to do so on it.
+/// [`CommitOutcome::NoOp`] is the benign case and must stay benign.
+///
+/// The classification lives in [`is_noop_commit`], the single place that
+/// decides which of the two a non-zero `git commit` exit is; never
+/// re-implement its string matching at a call site.
+pub(crate) fn commit_all(runner: &CommandRunner, worktree: &Path, message: &str) -> CommitOutcome {
     let _ = runner("git", &["add", "-A"], worktree);
     let commit = runner("git", &["commit", "-m", message], worktree);
     match &commit {
-        Ok(output) if output.status == 0 => true,
+        Ok(output) if output.status == 0 => CommitOutcome::Committed,
         Ok(output) => {
             // "nothing to commit" or an equivalent no-op — logged, not
-            // an error, mirroring `save_state_node.py`.
+            // an error, mirroring `save_state_node.py`. A genuine failure
+            // is logged too, and additionally handed back to the caller.
             log_noop_commit(message, output);
-            false
+            if is_noop_commit(&output.stderr, &output.stdout) {
+                CommitOutcome::NoOp
+            } else {
+                CommitOutcome::Failed {
+                    detail: output.stderr.trim().to_string(),
+                }
+            }
         }
-        Err(_) => false,
+        Err(err) => CommitOutcome::Failed {
+            detail: format!("git commit could not be run: {err}"),
+        },
+    }
+}
+
+/// The three distinguishable outcomes of a [`commit_all`] call.
+///
+/// Split out of the former `bool` because the two `false` cases mean opposite
+/// things: `NoOp` is the routine "nothing to commit, working tree clean"
+/// (every state commit in this repo, where `planning/` is a gitignored
+/// symlink) and must not fail anything, while `Failed` is a real git error
+/// whose work was never recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommitOutcome {
+    /// `git commit` exited 0 — `HEAD` advanced.
+    Committed,
+    /// `git commit` exited non-zero with a "nothing to commit" style message,
+    /// per [`is_noop_commit`]. Benign.
+    NoOp,
+    /// `git commit` genuinely failed; `detail` carries the git stderr.
+    Failed { detail: String },
+}
+
+impl CommitOutcome {
+    /// `true` only when `HEAD` actually advanced.
+    pub(crate) fn is_committed(&self) -> bool {
+        matches!(self, CommitOutcome::Committed)
+    }
+
+    /// The git error text when this is a genuine failure, else `None` — the
+    /// accessor callers gate on.
+    pub(crate) fn failure_detail(&self) -> Option<&str> {
+        match self {
+            CommitOutcome::Failed { detail } => Some(detail.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -288,7 +338,69 @@ fn log_noop_commit(label: &str, output: &CommandOutput) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_command_runner, is_noop_commit, strip_json_fence};
+    use super::{
+        commit_all, default_command_runner, is_noop_commit, strip_json_fence, CommandOutput,
+        CommandRunner, CommitOutcome,
+    };
+    use std::sync::Arc;
+
+    /// A runner whose `git commit` returns the given exit code/stderr and
+    /// whose every other invocation succeeds.
+    fn commit_runner(status: i32, stderr: &'static str) -> CommandRunner {
+        Arc::new(move |_program, args: &[&str], _cwd| {
+            if args.first() == Some(&"commit") {
+                Ok(CommandOutput {
+                    status,
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                })
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        })
+    }
+
+    #[test]
+    fn commit_all_reports_a_successful_commit_as_committed() {
+        let outcome = commit_all(&commit_runner(0, ""), std::path::Path::new("."), "chore: x");
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert!(outcome.is_committed());
+        assert_eq!(outcome.failure_detail(), None);
+    }
+
+    #[test]
+    fn commit_all_reports_nothing_to_commit_as_a_noop_not_a_failure() {
+        let outcome = commit_all(
+            &commit_runner(1, "nothing to commit, working tree clean"),
+            std::path::Path::new("."),
+            "chore: x",
+        );
+        assert_eq!(outcome, CommitOutcome::NoOp);
+        assert!(!outcome.is_committed());
+        assert_eq!(
+            outcome.failure_detail(),
+            None,
+            "a no-op must never present as a failure — that distinction is the point"
+        );
+    }
+
+    #[test]
+    fn commit_all_reports_a_genuine_git_error_as_a_failure_carrying_its_stderr() {
+        let outcome = commit_all(
+            &commit_runner(1, "fatal: unable to write new index file"),
+            std::path::Path::new("."),
+            "chore: x",
+        );
+        assert!(!outcome.is_committed());
+        assert_eq!(
+            outcome.failure_detail(),
+            Some("fatal: unable to write new index file")
+        );
+    }
 
     #[test]
     fn bare_json_passes_through_unchanged_but_trimmed() {
