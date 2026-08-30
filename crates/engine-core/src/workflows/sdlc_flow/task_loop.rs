@@ -1934,13 +1934,18 @@ impl Node for TriageTaskNode {
         }
 
         if attempt_count >= max_attempts {
+            let task_id = task.task_id;
             put_result(
                 &mut ctx,
                 "TriageTaskNode",
                 json!({
                     "verdict": "MAJOR_BAIL",
                     "reason": format!(
-                        "Max attempts ({max_attempts}) reached without a passing run."
+                        "Max attempts ({max_attempts}) reached without a passing run. \
+                         To recover: re-run just this task with `retry_task: {task_id}` \
+                         (keeps every other task's status, attempt count and commits), \
+                         or restart the whole spec with `resume: false` (archives the \
+                         current state and reruns from scratch)."
                     ),
                 }),
             );
@@ -3371,6 +3376,35 @@ mod tests {
             json!({ "all_passed": all_passed, "check_results": [], "failure_summary": "" }),
         );
         ctx
+    }
+
+    /// `EN.ticket.retry-one-exhausted-task-without-restarting-the-spec`
+    /// (task 2): the attempts-exhausted bail reason must name BOTH supported
+    /// recoveries — the new per-task `retry_task` and the pre-existing
+    /// `resume: false` full restart — so an operator reading the failure
+    /// learns how to recover without opening the source.
+    #[tokio::test]
+    async fn exhausted_attempts_bail_reason_names_the_supported_recoveries() {
+        let mut task = SDLCTask::new(7, "Seven", "d7");
+        task.max_attempts = 3;
+        task.attempt_count = 3;
+
+        let node = TriageTaskNode::new().with_transport(panicking_transport());
+        let ctx = ctx_with_test_result(false, &task);
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+        let reason = out.nodes["TriageTaskNode"]["reason"]
+            .as_str()
+            .expect("reason is a string");
+        assert!(
+            reason.contains("retry_task: 7"),
+            "reason names the per-task retry with this task's id: {reason}"
+        );
+        assert!(
+            reason.contains("resume: false"),
+            "reason names the existing full-restart recovery: {reason}"
+        );
     }
 
     #[tokio::test]
