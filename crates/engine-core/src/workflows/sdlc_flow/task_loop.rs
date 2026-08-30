@@ -23,6 +23,7 @@ use engine_contract::TaskContext;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
 use crate::nodes::{ClaudeCodeStep, MetaTransport};
 use crate::routing::Router;
@@ -812,6 +813,12 @@ pub(super) const PATH_DISCIPLINE_PREAMBLE: &str = "PATH DISCIPLINE. Work only \
 pub struct ImplementTaskNode {
     config: Config,
     transport: Option<ModelTransport>,
+    /// Taken through this node's OWN builder, never inferred from context —
+    /// mirrors `OrchestrationRunNode::with_cancellation_token` /
+    /// `ClaudeCodeStep::with_cancellation_token`. `None` (the default) is
+    /// behavior-stable: no token, no cancellation check, identical to
+    /// today. See [`Self::with_cancellation_token`].
+    cancellation_token: Option<CancellationToken>,
 }
 
 /// Model output shape `ImplementTaskNode` expects. Non-JSON model output is
@@ -850,6 +857,7 @@ impl ImplementTaskNode {
                 ..Config::default()
             },
             transport: None,
+            cancellation_token: None,
         }
     }
 
@@ -859,6 +867,18 @@ impl ImplementTaskNode {
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Attach a `CancellationToken`, raced against the composed
+    /// `ClaudeCodeStep`'s in-flight model call (`ClaudeCodeStep::
+    /// with_cancellation_token`'s `tokio::select!`) so an abort issued
+    /// mid-call interrupts this node instead of only taking effect at the
+    /// next node boundary. With no token attached (the default), behavior
+    /// is unchanged from before this builder existed.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 
@@ -965,6 +985,9 @@ impl Node for ImplementTaskNode {
             .with_retry_policy(policy.transport_retry);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
+        }
+        if let Some(token) = self.cancellation_token.clone() {
+            step = step.with_cancellation_token(token);
         }
 
         let mut ctx = step.process(ctx).await?;
@@ -1815,6 +1838,11 @@ pub struct TriageTaskNode {
     config: Config,
     transport: TransportSlot,
     runner: CommandRunner,
+    /// Taken through this node's OWN builder, never inferred from context —
+    /// mirrors `ImplementTaskNode::with_cancellation_token`. `None` (the
+    /// default) is behavior-stable: no token, no cancellation check,
+    /// identical to today. See [`Self::with_cancellation_token`].
+    cancellation_token: Option<CancellationToken>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1845,6 +1873,7 @@ impl TriageTaskNode {
             },
             transport: TransportSlot::default(),
             runner: super::default_command_runner(),
+            cancellation_token: None,
         }
     }
 
@@ -1854,6 +1883,17 @@ impl TriageTaskNode {
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
         self.transport.set_plain(transport);
+        self
+    }
+
+    /// Attach a `CancellationToken`, raced against the composed
+    /// `ClaudeCodeStep`'s in-flight `llm_triage` model call so an abort
+    /// issued mid-call interrupts this node instead of only taking effect
+    /// at the next node boundary. With no token attached (the default),
+    /// behavior is unchanged from before this builder existed.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 
@@ -2016,10 +2056,13 @@ impl Node for TriageTaskNode {
             apply_policy(self.config.clone(), prompt, &policy, Stage::Triage);
         config.json_schema = Some(triage_output_schema());
 
-        let step = self.transport.apply(
+        let mut step = self.transport.apply(
             ClaudeCodeStep::new("TriageTaskNode", config, prompt)
                 .with_retry_policy(policy.transport_retry),
         );
+        if let Some(token) = self.cancellation_token.clone() {
+            step = step.with_cancellation_token(token);
+        }
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -2156,6 +2199,11 @@ pub struct ConsolidatedReviewNode {
     config: Config,
     transport: TransportSlot,
     runner: CommandRunner,
+    /// Taken through this node's OWN builder, never inferred from context —
+    /// mirrors `ImplementTaskNode::with_cancellation_token`. `None` (the
+    /// default) is behavior-stable: no token, no cancellation check,
+    /// identical to today. See [`Self::with_cancellation_token`].
+    cancellation_token: Option<CancellationToken>,
 }
 
 /// The model's raw review reply shape — shared with `end_review::EndReviewNode`
@@ -2194,6 +2242,7 @@ impl ConsolidatedReviewNode {
             },
             transport: TransportSlot::default(),
             runner: super::default_command_runner(),
+            cancellation_token: None,
         }
     }
 
@@ -2201,6 +2250,17 @@ impl ConsolidatedReviewNode {
     #[must_use]
     pub fn with_transport(mut self, transport: ModelTransport) -> Self {
         self.transport.set_plain(transport);
+        self
+    }
+
+    /// Attach a `CancellationToken`, raced against the composed
+    /// `ClaudeCodeStep`'s in-flight review model call so an abort issued
+    /// mid-call interrupts this node instead of only taking effect at the
+    /// next node boundary. With no token attached (the default), behavior
+    /// is unchanged from before this builder existed.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 
@@ -2301,10 +2361,13 @@ impl Node for ConsolidatedReviewNode {
         config.cwd = Some(std::path::PathBuf::from(&worktree));
         config.json_schema = Some(review_output_schema());
 
-        let step = self.transport.apply(
+        let mut step = self.transport.apply(
             ClaudeCodeStep::new("ConsolidatedReviewNode", config, prompt)
                 .with_retry_policy(policy.transport_retry),
         );
+        if let Some(token) = self.cancellation_token.clone() {
+            step = step.with_cancellation_token(token);
+        }
 
         let mut ctx = step.process(ctx).await?;
         let content = ctx
@@ -2886,7 +2949,10 @@ mod tests {
     use crate::workflows::sdlc_flow::policy::{ModelTiers, TransportRetry};
     use claude_code_rs::Outcome;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn empty_context(event: serde_json::Value) -> TaskContext {
         TaskContext {
@@ -7884,5 +7950,203 @@ mod tests {
         assert!(!results
             .iter()
             .any(|r| r["name"] == json!("harness-missing")));
+    }
+
+    // --- with_cancellation_token (EN.ticket.abort-must-interrupt-an-in-flight-agent-node) ---
+
+    /// Sets a shared flag when dropped — lets a stub transport future prove
+    /// it was actually dropped (not awaited to completion) by a
+    /// cancellation win. Mirrors `claude_code_step.rs`'s own `DropSignal`.
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A `ModelTransport` whose future never resolves on its own
+    /// (`std::future::pending`), but notifies `entered` the instant it is
+    /// invoked (so the test can wait for the call to genuinely be in
+    /// flight before firing the token) and reports via `dropped` once
+    /// something races the future away rather than awaiting it out.
+    fn blocking_transport(entered: Arc<Notify>, dropped: Arc<AtomicBool>) -> ModelTransport {
+        Arc::new(move |_config, _prompt| {
+            let entered = entered.clone();
+            let signal = DropSignal(dropped.clone());
+            Box::pin(async move {
+                entered.notify_one();
+                let _signal = signal; // held for the future's lifetime; Drop fires on cancel
+                std::future::pending::<()>().await;
+                unreachable!("this transport future must be cancelled before it ever resolves")
+            })
+        })
+    }
+
+    /// `ImplementTaskNode` must observe a `with_cancellation_token` token:
+    /// a cancel fired WHILE the composed `ClaudeCodeStep`'s model call is
+    /// in flight must interrupt it promptly rather than waiting for that
+    /// call to return — the transport future is dropped, never resolved.
+    /// A test that aborts between nodes proves nothing here; this fires the
+    /// token mid-call.
+    #[tokio::test]
+    async fn implement_task_node_mid_call_abort_interrupts_the_in_flight_transport() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let token = CancellationToken::new();
+
+        let node = ImplementTaskNode::new()
+            .with_transport(blocking_transport(entered.clone(), dropped.clone()))
+            .with_cancellation_token(token.clone());
+
+        let handle = tokio::spawn(async move { node.process(ctx).await });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("transport must be entered promptly");
+        token.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a mid-call cancel must return promptly, not hang")
+            .expect("the spawned task must not panic");
+
+        assert!(
+            result.is_ok(),
+            "a cancel win must not surface as a NodeError: {result:?}"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the in-flight transport future must have been dropped by the \
+             cancellation race, never polled to completion (the stub \
+             `unreachable!()`s if it were)"
+        );
+    }
+
+    /// Same proof as above for `TriageTaskNode`'s `llm_triage` model call —
+    /// all three agent nodes must observe the token, not just
+    /// `ImplementTaskNode`.
+    #[tokio::test]
+    async fn triage_task_node_mid_call_abort_interrupts_the_in_flight_transport() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let token = CancellationToken::new();
+
+        let node = TriageTaskNode::new()
+            .with_transport(blocking_transport(entered.clone(), dropped.clone()))
+            .with_cancellation_token(token.clone());
+
+        let handle = tokio::spawn(async move { node.process(ctx).await });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("transport must be entered promptly");
+        token.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a mid-call cancel must return promptly, not hang")
+            .expect("the spawned task must not panic");
+
+        // A cancel win leaves `ClaudeCodeStep::process` returning `Ok(ctx)`
+        // unchanged (no `TriageTaskNode` entry stamped); this node's own
+        // subsequent `content` lookup then errors on the missing entry
+        // rather than hanging. Either outcome proves the point this test
+        // exists for — promptness — so both are accepted; what matters is
+        // that it never waited on the release that never came.
+        let _ = result;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the in-flight transport future must have been dropped by the \
+             cancellation race, never polled to completion (the stub \
+             `unreachable!()`s if it were)"
+        );
+    }
+
+    /// Same proof as above for `ConsolidatedReviewNode`'s review model call.
+    #[tokio::test]
+    async fn consolidated_review_node_mid_call_abort_interrupts_the_in_flight_transport() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let runner: CommandRunner = Arc::new(move |_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let token = CancellationToken::new();
+
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(blocking_transport(entered.clone(), dropped.clone()))
+            .with_cancellation_token(token.clone());
+
+        let handle = tokio::spawn(async move { node.process(ctx).await });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("transport must be entered promptly");
+        token.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a mid-call cancel must return promptly, not hang")
+            .expect("the spawned task must not panic");
+
+        let _ = result;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the in-flight transport future must have been dropped by the \
+             cancellation race, never polled to completion (the stub \
+             `unreachable!()`s if it were)"
+        );
+    }
+
+    /// A node constructed WITHOUT `with_cancellation_token` must behave
+    /// exactly as before this builder existed: no token means no
+    /// cancellation check ever races the transport, so a call that never
+    /// resolves on its own simply never resolves — proven here by racing
+    /// it against a short timeout and asserting the timeout wins, not the
+    /// node. This is the additive/optional contract task 1's acceptance
+    /// criteria require.
+    #[tokio::test]
+    async fn implement_task_node_without_a_token_is_unaffected_by_a_never_firing_one() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        // No `with_cancellation_token` call at all.
+        let node = ImplementTaskNode::new().with_transport(blocking_transport(entered, dropped));
+
+        let result = tokio::time::timeout(Duration::from_millis(200), node.process(ctx)).await;
+
+        assert!(
+            result.is_err(),
+            "with no token attached, an in-flight call must NOT be \
+             interrupted — behavior must match today exactly"
+        );
     }
 }
