@@ -97,6 +97,21 @@
 //! - `SKIPPED` — the close was not attempted at all: a blocked run, no
 //!   `block_id` on this run, no worktree to resolve a root from, or no
 //!   `planning/state.json` under it.
+//!
+//! ### `committed_paths` / `commit_failures` (task 3 of
+//! ### `EN.ticket.close-block-node-leaves-derived-output-uncommitted`)
+//!
+//! Present ONLY alongside a `CLOSED:<repo:id>` outcome — every other
+//! outcome variant never stamps these keys at all (absent, not an empty
+//! array), and an artifact from before this block never had them either.
+//! `committed_paths` is the full, ordered list of derived-fallout paths
+//! (from the write manifest — see [`write_manifest`]) that were staged and
+//! landed in a commit via [`commit_write_manifest`]. `commit_failures` is
+//! every manifest path that could NOT be staged/committed, each paired
+//! with a human-readable reason. A non-empty `commit_failures` is never a
+//! reason the outcome stops being `CLOSED` — the block itself is closed
+//! regardless; this is a loud report of the derived fallout, not a second
+//! gate on the close.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -128,8 +143,22 @@ pub const DEFAULT_REPO_SLUG: &str = "engine-rs";
 /// `state_write_validated`/`state_write_rejected` into the committed state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseOutcome {
-    /// The block closed cleanly. Carries the full `"<repo>:<id>"` key.
-    Closed { key: String },
+    /// The block closed cleanly. Carries the full `"<repo>:<id>"` key, plus
+    /// (task 3 of `EN.ticket.close-block-node-leaves-derived-output-uncommitted`)
+    /// the derived-fallout staging result: `committed` is every manifest
+    /// path that was staged and landed in a commit; `commit_failures` is
+    /// every manifest path that could not be, paired with a human-readable
+    /// reason. Both are empty (never omitted on the Rust type — omission is
+    /// a JSON-shape concern, handled in `process()`) when the close's write
+    /// produced no `I_EMIT_WROTE` manifest, or produced one with nothing
+    /// left to stage. A staging failure here is reported, never a reason to
+    /// make the close itself anything other than `Closed` — see the module
+    /// doc comment's `## Outcomes` section.
+    Closed {
+        key: String,
+        committed: Vec<PathBuf>,
+        commit_failures: Vec<(PathBuf, String)>,
+    },
     /// `block_id` named no registered block (`E_BLOCK_NOT_FOUND`).
     NotFound { key: String },
     /// A net-new diagnostic appeared after the write and mev's own history
@@ -147,13 +176,28 @@ pub enum CloseOutcome {
 }
 
 impl CloseOutcome {
+    /// Build a [`CloseOutcome::Closed`] with no staging result — the shape
+    /// every call site had before task 3 added the two fields. Kept as a
+    /// convenience constructor (rather than requiring every call site to
+    /// spell out two empty `Vec`s) for the classification path and for
+    /// tests that only care about the closed/not-closed distinction, not
+    /// the staging result.
+    #[must_use]
+    fn closed(key: impl Into<String>) -> Self {
+        Self::Closed {
+            key: key.into(),
+            committed: Vec::new(),
+            commit_failures: Vec::new(),
+        }
+    }
+
     /// The stamped `outcome` string — the ticket's outcome vocabulary
     /// verbatim: `CLOSED:<id>` / `NOT_FOUND` / `REJECTED:<id>` /
     /// `LOCK_HELD` / `OPERATOR_GATED` / `UNVALIDATED:<reason>` / `SKIPPED`.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
-            Self::Closed { key } => format!("CLOSED:{key}"),
+            Self::Closed { key, .. } => format!("CLOSED:{key}"),
             Self::NotFound { .. } => "NOT_FOUND".to_string(),
             Self::Rejected { key, .. } => format!("REJECTED:{key}"),
             Self::LockHeld { .. } => "LOCK_HELD".to_string(),
@@ -169,7 +213,7 @@ impl CloseOutcome {
     #[must_use]
     pub fn detail(&self) -> String {
         match self {
-            Self::Closed { key } => format!("closed block '{key}'"),
+            Self::Closed { key, .. } => format!("closed block '{key}'"),
             Self::NotFound { key } => format!("no registered block matches '{key}'"),
             Self::Rejected { key, net_new } => format!(
                 "close of '{key}' introduced net-new diagnostic(s), rolled back via mev's \
@@ -197,7 +241,7 @@ impl CloseOutcome {
     #[must_use]
     pub fn key(&self) -> Option<&str> {
         match self {
-            Self::Closed { key }
+            Self::Closed { key, .. }
             | Self::NotFound { key }
             | Self::Rejected { key, .. }
             | Self::OperatorGated { key } => Some(key.as_str()),
@@ -673,9 +717,7 @@ fn classify_report(key: &str, report: &Report) -> CloseOutcome {
         };
     }
 
-    CloseOutcome::Closed {
-        key: key.to_string(),
-    }
+    CloseOutcome::closed(key)
 }
 
 /// The guarded close itself: operator gate, then the advisory lock (held
@@ -831,8 +873,15 @@ fn attempt_close_with_validator(
         // because this call sits only in this branch). A staging/commit
         // failure is reported on `CloseOutcome` (task 3), never fatal —
         // the block itself IS closed regardless.
-        let _commit_result = commit_write_manifest(&write_manifest_paths);
-        return outcome;
+        let commit_result = commit_write_manifest(&write_manifest_paths);
+        let CloseOutcome::Closed { key, .. } = outcome else {
+            unreachable!("classify_report already matched Closed above")
+        };
+        return CloseOutcome::Closed {
+            key,
+            committed: commit_result.committed,
+            commit_failures: commit_result.failed,
+        };
     }
 
     // Net-new diagnostic(s) — roll back via mev's own `.mev-history` undo,
@@ -980,6 +1029,29 @@ impl Node for CloseBlockNode {
         });
         if let Some(key) = outcome.key() {
             result["block_key"] = json!(key);
+        }
+        // Additive only (task 3): these two keys exist ONLY on a `Closed`
+        // outcome. An artifact from before this block never had them, and
+        // every other outcome variant still never has them — a consumer
+        // must see them as absent, not present-but-empty, on any outcome
+        // that isn't a real close.
+        if let CloseOutcome::Closed {
+            committed,
+            commit_failures,
+            ..
+        } = &outcome
+        {
+            result["committed_paths"] = json!(committed
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>());
+            result["commit_failures"] = json!(commit_failures
+                .iter()
+                .map(|(p, reason)| json!({
+                    "path": p.to_string_lossy().to_string(),
+                    "reason": reason,
+                }))
+                .collect::<Vec<_>>());
         }
 
         put_result(&mut ctx, "CloseBlockNode", result);
@@ -1327,6 +1399,38 @@ mod tests {
         (dir, repo_dir)
     }
 
+    /// [`brain_fixture`], additionally `git init`'d and committed at the
+    /// brain root — the shape a real close's `commit_write_manifest` call
+    /// needs in order to actually land a commit (task 3's surfacing tests
+    /// need a manifest path that resolves to a real git toplevel, unlike
+    /// the plain [`brain_fixture`] tests above, which deliberately have no
+    /// enclosing git repo and so exercise the staging-FAILURE path).
+    fn brain_fixture_with_git(
+        repo: &str,
+        blocks: &[(&str, &str, bool)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, repo_dir) = brain_fixture(repo, blocks);
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .status()
+                .expect("failed to run git");
+            assert!(
+                status.success(),
+                "git {args:?} failed in {}",
+                root.display()
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+        (dir, repo_dir)
+    }
+
     fn ctx_for(
         worktree: &Path,
         repo: Option<&str>,
@@ -1367,10 +1471,7 @@ mod tests {
     #[test]
     fn outcome_labels_match_the_ticket_vocabulary() {
         assert_eq!(
-            CloseOutcome::Closed {
-                key: "mev:MV.10.A".to_string()
-            }
-            .label(),
+            CloseOutcome::closed("mev:MV.10.A").label(),
             "CLOSED:mev:MV.10.A"
         );
         assert_eq!(
@@ -1438,9 +1539,7 @@ mod tests {
 
     #[test]
     fn validated_and_rejected_flags_are_mutually_exclusive_and_precise() {
-        let closed = CloseOutcome::Closed {
-            key: "acme:AC.1".to_string(),
-        };
+        let closed = CloseOutcome::closed("acme:AC.1");
         assert!(closed.is_validated());
         assert!(!closed.is_rejected());
 
@@ -1573,6 +1672,123 @@ mod tests {
 
         let raw = std::fs::read_to_string(repo_dir.join("planning/state.json")).unwrap();
         assert!(raw.contains("\"closed\""));
+    }
+
+    // --- task 3: committed_paths / commit_failures surfaced on outcome --
+
+    #[tokio::test]
+    async fn close_result_surfaces_committed_paths_on_a_real_close() {
+        let (dir, repo_dir) = brain_fixture_with_git("acme", &[("AC.1", "open", false)]);
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "done");
+        let node = CloseBlockNode::new();
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+        assert_eq!(result["outcome"], json!("CLOSED:acme:AC.1"));
+
+        let committed = result["committed_paths"]
+            .as_array()
+            .expect("committed_paths must be an array on a real close");
+        assert!(
+            !committed.is_empty(),
+            "expected at least the state.json path to have been staged and committed"
+        );
+        let failures = result["commit_failures"]
+            .as_array()
+            .expect("commit_failures must be an array on a real close");
+        assert!(
+            failures.is_empty(),
+            "expected no staging failures in a real git repo, got {failures:?}"
+        );
+
+        // The manifest actually landed in a NEW commit in the real repo,
+        // not merely something the outcome claims happened.
+        let log = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["log", "-1", "--pretty=%s"])
+            .output()
+            .expect("git log");
+        assert!(log.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "chore: commit derived fleet state regenerated by CloseBlockNode"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_result_surfaces_commit_failures_when_staging_cannot_land() {
+        // No enclosing git repo (plain `brain_fixture`, not
+        // `brain_fixture_with_git`) — every manifest path fails to
+        // resolve a git toplevel, which must be reported on the outcome,
+        // never silently dropped and never fatal to the close itself.
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "done");
+        let node = CloseBlockNode::new();
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+        assert_eq!(
+            result["outcome"],
+            json!("CLOSED:acme:AC.1"),
+            "a staging failure must not change the close's own outcome"
+        );
+
+        let failures = result["commit_failures"]
+            .as_array()
+            .expect("commit_failures must be an array on a real close");
+        assert!(
+            !failures.is_empty(),
+            "expected staging to fail with no enclosing git repo"
+        );
+        for entry in failures {
+            assert!(
+                entry.get("path").is_some(),
+                "each failure must name its path"
+            );
+            assert!(
+                entry.get("reason").is_some(),
+                "each failure must carry a human-readable reason"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_task3_artifact_shape_still_parses_with_new_fields_absent() {
+        // The exact shape `process()` stamped before this block added
+        // `committed_paths`/`commit_failures`.
+        let pre_existing: serde_json::Value = serde_json::from_str(
+            r#"{
+                "outcome": "CLOSED:acme:AC.1",
+                "detail": "closed block 'acme:AC.1'",
+                "state_write_validated": true,
+                "state_write_rejected": false,
+                "block_key": "acme:AC.1"
+            }"#,
+        )
+        .expect("pre-task-3 artifact shape must still parse as valid JSON");
+
+        assert_eq!(pre_existing["outcome"], json!("CLOSED:acme:AC.1"));
+        assert_eq!(pre_existing["block_key"], json!("acme:AC.1"));
+        assert!(
+            pre_existing.get("committed_paths").is_none(),
+            "the new field must be ABSENT on an old artifact, not present-but-empty"
+        );
+        assert!(
+            pre_existing.get("commit_failures").is_none(),
+            "the new field must be ABSENT on an old artifact, not present-but-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_closed_outcomes_never_carry_the_new_fields() {
+        // `NOT_FOUND` never got far enough to compute a manifest at all —
+        // the new keys must be absent, not empty arrays.
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.999"), "done");
+        let node = CloseBlockNode::new();
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+        assert_eq!(result["outcome"], json!("NOT_FOUND"));
+        assert!(result.get("committed_paths").is_none());
+        assert!(result.get("commit_failures").is_none());
     }
 
     #[tokio::test]
@@ -1813,12 +2029,10 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            outcome,
-            CloseOutcome::Closed {
-                key: "acme:AC.1".to_string()
-            }
-        );
+        match &outcome {
+            CloseOutcome::Closed { key, .. } => assert_eq!(key, "acme:AC.1"),
+            other => panic!("expected Closed, got {other:?}"),
+        }
 
         let raw =
             std::fs::read_to_string(repo_dir.join("planning").join("state.json")).expect("read");
