@@ -264,6 +264,20 @@ pub struct SDLCFlowEventSchema {
     /// [`Self::block_id`].
     #[serde(default)]
     pub phase_id: Option<String>,
+    /// Optional per-task retry selector (`EN.ticket.retry-one-exhausted-task-
+    /// without-restarting-the-spec`): the `task_id` of ONE task whose attempt
+    /// budget should be reset and re-run, while every other task's status,
+    /// counters and commits are preserved exactly as committed.
+    ///
+    /// This is a fifth case in `LoadTaskStateNode`'s restart-vs-resume
+    /// contract (see that node's doc comment), not a variant of `resume`:
+    /// when present, it takes priority over `resume`'s own two values and
+    /// always loads the existing committed state (there is nothing to
+    /// preserve otherwise), then resets the named task. `None`/absent
+    /// preserves today's behavior exactly — both existing `resume` values
+    /// are byte-identical to before this field existed.
+    #[serde(default)]
+    pub retry_task: Option<u32>,
 }
 
 /// Parse a task-range string like `"1-3,5"` into a sorted, deduplicated list
@@ -1185,6 +1199,28 @@ mod tests {
         assert!(!event.use_worktree);
         assert_eq!(event.policy, None);
         assert_eq!(event.profile, None);
+        assert_eq!(event.retry_task, None);
+    }
+
+    /// `EN.ticket.retry-one-exhausted-task-without-restarting-the-spec` task
+    /// 1: the new `retry_task` field is additive and `#[serde(default)]` —
+    /// an event JSON without it round-trips exactly as before this field
+    /// existed.
+    #[test]
+    fn sdlc_flow_event_schema_deserializes_without_retry_task_unchanged() {
+        let json = serde_json::json!({ "spec_slug": "EN.3.A", "resume": true });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes without retry_task");
+        assert_eq!(event.retry_task, None);
+        assert!(event.resume);
+    }
+
+    #[test]
+    fn sdlc_flow_event_schema_deserializes_retry_task() {
+        let json = serde_json::json!({ "spec_slug": "EN.3.A", "retry_task": 3 });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes with retry_task");
+        assert_eq!(event.retry_task, Some(3));
     }
 
     #[test]

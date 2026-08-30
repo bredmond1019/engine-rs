@@ -28,7 +28,7 @@ use crate::policy::PolicyConfigSource;
 
 use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
-use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask};
+use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::task_loop::{apply_policy, resolved_policy, worktree_path, Stage};
 use super::{get_result, parse_structured_or_fenced, put_result, DEFAULT_STATE_FILENAME};
 
@@ -891,6 +891,21 @@ impl Router for SpecExistsRouterNode {
 ///
 /// The old state is never deleted or overwritten: the corpse is forensics.
 /// See [`archive_superseded_state`] for the naming/collision rules.
+///
+/// **Fifth case — `retry_task`** (`EN.ticket.retry-one-exhausted-task-
+/// without-restarting-the-spec`). `SDLCFlowEventSchema::retry_task` names
+/// ONE task whose attempt budget should be reset and re-run while every
+/// other task's status, counters and commits are preserved exactly. It is
+/// not a third value of `resume` — it takes priority over whatever `resume`
+/// says, because resetting one task only makes sense against the existing
+/// committed state, never a restart-from-`tasks.json`:
+///
+/// | `retry_task` | state file | behavior |
+/// |---|---|---|
+/// | `Some(id)` | present | load it (as `resume: true` would), then reset task `id`: `status` -> `Pending`, `attempt_count` -> `0`, `review_attempt_count` -> `0`. Every other task is untouched. Run-level `SDLCTelemetry::total_attempts` is deliberately left alone — it is charged by `ImplementTaskNode` when the retried attempt actually runs, so re-running honestly adds to it rather than rewriting history. |
+/// | `Some(id)` | absent | `Err` — there is no committed state to preserve, so a retry has nothing to reset |
+/// | `Some(id)` naming an unknown task id | present | `Err` — a silent no-op here would be indistinguishable from "already fixed" |
+/// | `None` | — | unchanged: falls through to the four-row table above exactly as before this field existed |
 pub struct LoadTaskStateNode {
     state_filename: &'static str,
 }
@@ -1043,6 +1058,50 @@ impl Node for LoadTaskStateNode {
         } else {
             None
         };
+
+        // Fifth case, ahead of the restart-vs-resume decision below:
+        // `retry_task` names one task to reset against the EXISTING
+        // committed state and always wins over whatever `resume` says —
+        // resetting one task only makes sense when there is a committed
+        // state to preserve the rest of. See the node's doc comment for the
+        // full table.
+        if let Some(task_id) = event.retry_task {
+            let value = existing_state.as_ref().ok_or_else(|| {
+                NodeError::new(format!(
+                    "SDLC_FLOW named retry_task {task_id} for spec {:?}, but no committed state \
+                     file exists at {} to retry it from — there is nothing to reset.",
+                    event.spec_slug,
+                    state_path.display()
+                ))
+            })?;
+            let mut state = SDLCState::from_committed_state_json(value)?;
+            let known_ids: Vec<u32> = state.tasks.iter().map(|task| task.task_id).collect();
+            let task = state
+                .tasks
+                .iter_mut()
+                .find(|task| task.task_id == task_id)
+                .ok_or_else(|| {
+                    NodeError::new(format!(
+                        "SDLC_FLOW named retry_task {task_id} for spec {:?}, but no task with \
+                         that id exists in the loaded state. Known task ids: {known_ids:?}.",
+                        event.spec_slug
+                    ))
+                })?;
+            task.status = SDLCTaskStatus::Pending;
+            task.attempt_count = 0;
+            task.review_attempt_count = 0;
+
+            if let Some(ids) =
+                parse_task_range(event.task_range.as_deref()).map_err(NodeError::new)?
+            {
+                state.tasks.retain(|task| ids.contains(&task.task_id));
+            }
+
+            let value = serde_json::to_value(&state)
+                .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+            put_result(&mut ctx, "LoadTaskStateNode", value);
+            return Ok(ctx);
+        }
 
         // A restart (`resume: false`) only makes sense when there is a
         // `tasks.json` to bootstrap back from; otherwise the state file is
@@ -1365,7 +1424,6 @@ impl Node for GenerateTasksNode {
 #[cfg(test)]
 mod tests {
     use super::super::policy::{CallTimeouts, ModelTier, ModelTiers};
-    use super::super::schema::SDLCTaskStatus;
     use super::*;
     use claude_code_rs::Outcome;
     use std::collections::HashMap;
@@ -2119,6 +2177,179 @@ mod tests {
         let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
         assert_eq!(loaded["tasks"].as_array().unwrap().len(), 1);
         assert_eq!(loaded["tasks"][0]["status"], "pending");
+    }
+
+    // --- retry_task (fifth case) -------------------------------------------
+
+    /// Seed a spec whose committed state has task 1 DONE, task 2 DONE, and
+    /// task 3 FAILED with `attempt_count == max_attempts` (exhausted) — the
+    /// exact shape `retry_task` exists to recover. Also writes a matching
+    /// `tasks.json` so the `resume: false` comparison test (iii) can exercise
+    /// the ordinary restart path. Returns `(spec_dir, sdlc_dir)`.
+    fn seed_mixed_state(worktree: &Path, slug: &str) -> (PathBuf, PathBuf) {
+        let dir = worktree.join("planning").join(slug);
+        let sdlc_dir = dir.join("sdlc");
+        std::fs::create_dir_all(&sdlc_dir).unwrap();
+
+        let tasks_json = json!([
+            { "task_id": 1, "title": "T1", "description": "d" },
+            { "task_id": 2, "title": "T2", "description": "d" },
+            { "task_id": 3, "title": "T3", "description": "d" },
+        ]);
+        std::fs::write(
+            dir.join("tasks.json"),
+            serde_json::to_string(&tasks_json).unwrap(),
+        )
+        .unwrap();
+
+        let mut state = SDLCState::new(slug);
+        let mut t1 = SDLCTask::new(1, "T1", "d");
+        t1.status = SDLCTaskStatus::Done;
+        t1.attempt_count = 1;
+        state.tasks.push(t1);
+
+        let mut t2 = SDLCTask::new(2, "T2", "d");
+        t2.status = SDLCTaskStatus::Done;
+        state.tasks.push(t2);
+
+        let mut t3 = SDLCTask::new(3, "T3", "d");
+        t3.status = SDLCTaskStatus::Failed;
+        t3.attempt_count = t3.max_attempts;
+        t3.review_attempt_count = 2;
+        state.tasks.push(t3);
+
+        let run_meta = super::super::schema::RunMeta {
+            branch: format!("sdlc/{slug}"),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            started_at: "2026-08-30T00:00:00Z".to_string(),
+            updated_at: "2026-08-30T00:00:00Z".to_string(),
+            run_id: Some("run-mixed".to_string()),
+        };
+        let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
+        std::fs::write(
+            sdlc_dir.join("sdlc-flow-state.json"),
+            serde_json::to_string(&committed).unwrap(),
+        )
+        .unwrap();
+
+        (dir, sdlc_dir)
+    }
+
+    /// (i): resetting task 3 gives it a full allowance while tasks 1 and 2
+    /// keep their status and attempt_count exactly.
+    #[tokio::test]
+    async fn retry_task_resets_only_the_named_task() {
+        let worktree = temp_dir();
+        let (_dir, _sdlc_dir) = seed_mixed_state(&worktree, "my-spec");
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "retry_task": 3 });
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+
+        let tasks = loaded["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["status"], "done", "task 1 must be preserved");
+        assert_eq!(
+            tasks[0]["attempt_count"], 1,
+            "task 1's attempt_count must be preserved"
+        );
+        assert_eq!(tasks[1]["status"], "done", "task 2 must be preserved");
+        assert_eq!(
+            tasks[1]["attempt_count"], 0,
+            "task 2's attempt_count must be preserved"
+        );
+        assert_eq!(
+            tasks[2]["status"], "pending",
+            "the reset task must not still read Failed — it must not re-bail immediately"
+        );
+        assert_eq!(
+            tasks[2]["attempt_count"], 0,
+            "the reset task must get its full allowance"
+        );
+        assert_eq!(tasks[2]["review_attempt_count"], 0);
+    }
+
+    /// (iv): a `retry_task` naming a task id that does not exist must error
+    /// loudly rather than silently no-op.
+    #[tokio::test]
+    async fn retry_task_unknown_id_errors_loudly() {
+        let worktree = temp_dir();
+        let (_dir, _sdlc_dir) = seed_mixed_state(&worktree, "my-spec");
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "retry_task": 99 });
+        let err = LoadTaskStateNode::new()
+            .process(ctx)
+            .await
+            .expect_err("an unknown task id must error, not silently no-op");
+        let message = err.to_string();
+        assert!(
+            message.contains("99"),
+            "error should name the offending task id: {message}"
+        );
+    }
+
+    /// `retry_task` naming a task, but with no committed state file to
+    /// preserve, must error rather than silently falling back to a fresh
+    /// bootstrap.
+    #[tokio::test]
+    async fn retry_task_without_a_state_file_errors() {
+        let worktree = temp_dir();
+        let dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tasks.json"),
+            r#"[{"task_id":1,"title":"One","description":"d"}]"#,
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "retry_task": 1 });
+        let err = LoadTaskStateNode::new()
+            .process(ctx)
+            .await
+            .expect_err("retrying against a nonexistent state file must error");
+        assert!(err.to_string().contains("retry_task"));
+    }
+
+    /// (ii): with `retry_task` absent, `resume: true` is byte-identical to
+    /// today — the exhausted task stays exhausted.
+    #[tokio::test]
+    async fn retry_task_absent_with_resume_true_is_unchanged() {
+        let worktree = temp_dir();
+        let (_dir, _sdlc_dir) = seed_mixed_state(&worktree, "my-spec");
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec", "resume": true });
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+
+        let tasks = loaded["tasks"].as_array().unwrap();
+        assert_eq!(tasks[2]["status"], "failed");
+        assert_eq!(tasks[2]["attempt_count"], 3);
+    }
+
+    /// (iii): with `retry_task` absent, `resume: false` archives and
+    /// bootstraps fresh exactly as before this field existed.
+    #[tokio::test]
+    async fn retry_task_absent_with_resume_false_restarts_as_before() {
+        let worktree = temp_dir();
+        let (_dir, sdlc_dir) = seed_mixed_state(&worktree, "my-spec");
+
+        let mut ctx = ctx_with_worktree("my-spec", &worktree);
+        ctx.event = json!({ "spec_slug": "my-spec" }); // resume defaults false, retry_task absent
+        let out = LoadTaskStateNode::new().process(ctx).await.expect("load");
+        let loaded = out.nodes.get("LoadTaskStateNode").unwrap();
+
+        for task in loaded["tasks"].as_array().unwrap() {
+            assert_eq!(task["status"], "pending");
+            assert_eq!(task["attempt_count"], 0);
+        }
+        assert_eq!(
+            archived_names(&sdlc_dir).len(),
+            1,
+            "old state must still be archived, as before this field existed"
+        );
     }
 
     #[tokio::test]
