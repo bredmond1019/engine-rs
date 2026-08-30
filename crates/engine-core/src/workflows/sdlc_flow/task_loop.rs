@@ -730,6 +730,30 @@ impl Router for TaskQueueRouterNode {
 
 // --- ImplementTaskNode ------------------------------------------------------
 
+/// Run-invariant path-discipline preamble prepended to every
+/// [`ImplementTaskNode`] prompt, first attempt and retry alike.
+///
+/// Under `use_worktree: true` the model's subprocess `cwd` is scoped to the
+/// engine's worktree (see `process`), but `cwd` constrains only the
+/// *subprocess*, never the model's choice of an ABSOLUTE path. The target
+/// repos' `CLAUDE.md` files are full of literal
+/// `/Users/.../core/<repo>/...` and `file:///Users/...` references, and an
+/// agent that resolves one of those writes into the MAIN checkout from any
+/// cwd — which is exactly how a validated run left its worktree
+/// byte-identical to `origin/main` while ~784 lines of real work landed in
+/// the main tree.
+///
+/// Deliberately carries **no run-specific path**: the worktree root is
+/// per-run text and is appended separately in `process`, so this constant
+/// stays cache-stable (standing rule 6) and the first-attempt prompt stays
+/// deterministic.
+pub(super) const PATH_DISCIPLINE_PREAMBLE: &str = "PATH DISCIPLINE. Work only \
+     through paths relative to your current working directory. Never resolve \
+     an absolute path taken from a CLAUDE.md, a doc link, or a `file://` URL \
+     — those point at a DIFFERENT checkout, and writing there silently loses \
+     your work. Before your first write, confirm the tree you are in is the \
+     intended one.\n\n";
+
 /// Model node (Sonnet): drives Claude Code to implement the current task.
 /// Composes a `ClaudeCodeStep` under its own identity so it can post-process
 /// the model's JSON output into `{summary, modified_files, tests_added}`.
@@ -830,12 +854,32 @@ impl Node for ImplementTaskNode {
         // `apply_policy` below (no second resolve).
         let policy = resolved_policy(&ctx)?;
 
-        let mut prompt = format!(
+        // Resolved once and reused: the same worktree root names the
+        // per-run half of the path-discipline preamble below and scopes
+        // `config.cwd` further down. Best-effort — a ctx with no
+        // `SetupWorktreeNode` result (a unit test, or `use_worktree:
+        // false`) yields `None` and the prompt simply omits the path
+        // sentence rather than naming a path we do not have.
+        let worktree = worktree_path(&ctx).ok();
+
+        // Path discipline goes FIRST, ahead of the task text: the
+        // run-invariant sentences from the constant, then (when known) the
+        // per-run worktree root. `apply_policy` only ever APPENDS to the
+        // prompt (`apply_verbosity_directive`), and the retry block below
+        // also appends, so a leading preamble survives both untouched.
+        let mut prompt = String::from(PATH_DISCIPLINE_PREAMBLE);
+        if let Some(worktree) = worktree.as_deref() {
+            prompt.push_str(&format!(
+                "Your working tree root is {worktree} — `git rev-parse \
+                 --show-toplevel` must resolve there before you write.\n\n"
+            ));
+        }
+        prompt.push_str(&format!(
             "Implement the following SDLC task. Respond with strict JSON of \
              the shape {{\"summary\": str, \"modified_files\": [str], \
              \"tests_added\": [str]}}.\n\nTitle: {title}\nDescription: \
              {description}\nAcceptance criteria: {acceptance_criteria}"
-        );
+        ));
 
         // On a retry, tell the model what the previous attempt broke.
         // Without this the retry request is byte-identical to the first
@@ -852,7 +896,7 @@ impl Node for ImplementTaskNode {
         // cwd. Best-effort: a ctx driven directly (no `SetupWorktreeNode`
         // run, e.g. a unit test) falls back to today's behavior (no `cwd`
         // override) instead of failing the node.
-        if let Ok(worktree) = worktree_path(&ctx) {
+        if let Some(worktree) = worktree.as_deref() {
             config.cwd = Some(std::path::PathBuf::from(worktree));
         }
 
@@ -5480,9 +5524,12 @@ mod tests {
         assert_eq!(prompts.len(), 1);
         assert_eq!(
             prompts[0],
-            "Implement the following SDLC task. Respond with strict JSON of the shape \
-             {\"summary\": str, \"modified_files\": [str], \"tests_added\": [str]}.\n\nTitle: \
-             One\nDescription: d1\nAcceptance criteria: []"
+            format!(
+                "{PATH_DISCIPLINE_PREAMBLE}Implement the following SDLC task. Respond with \
+                 strict JSON of the shape {{\"summary\": str, \"modified_files\": [str], \
+                 \"tests_added\": [str]}}.\n\nTitle: One\nDescription: d1\nAcceptance \
+                 criteria: []"
+            )
         );
     }
 
@@ -5507,8 +5554,12 @@ mod tests {
 
         let prompts = seen.lock().unwrap().clone();
         let prompt = &prompts[0];
-        // The base prompt is still there in full...
-        assert!(prompt.starts_with("Implement the following SDLC task."));
+        // The base prompt is still there in full, behind the preamble...
+        assert!(
+            prompt.starts_with(PATH_DISCIPLINE_PREAMBLE),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("Implement the following SDLC task."));
         assert!(prompt.contains("Title: One"));
         // ...with the prior attempt's failure appended.
         assert!(
@@ -5547,10 +5598,79 @@ mod tests {
         let prompts = seen.lock().unwrap().clone();
         assert_eq!(
             prompts[0],
-            "Implement the following SDLC task. Respond with strict JSON of the shape \
-             {\"summary\": str, \"modified_files\": [str], \"tests_added\": [str]}.\n\nTitle: \
-             One\nDescription: d1\nAcceptance criteria: []"
+            format!(
+                "{PATH_DISCIPLINE_PREAMBLE}Implement the following SDLC task. Respond with \
+                 strict JSON of the shape {{\"summary\": str, \"modified_files\": [str], \
+                 \"tests_added\": [str]}}.\n\nTitle: One\nDescription: d1\nAcceptance \
+                 criteria: []"
+            )
         );
+    }
+
+    /// The P0 fix: with a worktree stamped, the implement prompt carries
+    /// BOTH the run-invariant path-discipline sentences and the actual
+    /// per-run worktree root. `cwd` alone does not constrain the model's
+    /// choice of an absolute path; this text does.
+    #[tokio::test]
+    async fn implement_node_prompt_carries_path_discipline_and_worktree_root() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "/tmp/some-worktree" }),
+        );
+
+        let (seen, transport) = prompt_recording_transport();
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        let prompt = &prompts[0];
+        assert!(
+            prompt.starts_with(PATH_DISCIPLINE_PREAMBLE),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("relative to your current working directory"));
+        assert!(prompt.contains("CLAUDE.md"), "prompt: {prompt}");
+        assert!(prompt.contains("file://"), "prompt: {prompt}");
+        assert!(prompt.contains("/tmp/some-worktree"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("git rev-parse --show-toplevel"),
+            "prompt: {prompt}"
+        );
+        // The task text still follows the preamble.
+        assert!(prompt.contains("Title: One"), "prompt: {prompt}");
+    }
+
+    /// No `SetupWorktreeNode` result (a unit-test-driven ctx, or
+    /// `use_worktree: false`): the node still succeeds, still carries the
+    /// run-invariant discipline text, and names no path it does not have.
+    #[tokio::test]
+    async fn implement_node_prompt_omits_worktree_line_without_worktree() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let (seen, transport) = prompt_recording_transport();
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx).await.expect("process should succeed");
+
+        let prompts = seen.lock().unwrap().clone();
+        let prompt = &prompts[0];
+        assert!(
+            prompt.starts_with(PATH_DISCIPLINE_PREAMBLE),
+            "prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Your working tree root is"),
+            "prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("git rev-parse --show-toplevel"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("Title: One"), "prompt: {prompt}");
     }
 
     /// When `SetupWorktreeNode` has stamped a `worktree_path`, the model's

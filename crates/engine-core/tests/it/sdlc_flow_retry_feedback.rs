@@ -317,8 +317,10 @@ async fn retry_prompt_contains_the_previous_attempts_failure_output() {
     );
 
     // ...and it is strictly a superset of the first attempt's request, not a
-    // replacement: the task's own brief still leads.
-    assert!(prompts[1].starts_with("Implement the following SDLC task."));
+    // replacement: the path-discipline preamble leads and the task's own
+    // brief follows it, both unchanged from the first attempt.
+    assert!(prompts[1].starts_with("PATH DISCIPLINE."));
+    assert!(prompts[1].contains("Implement the following SDLC task."));
     assert!(prompts[1].contains("Title: Implement the thing"));
     assert_ne!(
         prompts[0], prompts[1],
