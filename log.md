@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-19T20:54:53Z"
+timestamp: "2026-08-29T22:05:00Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,13 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-08-29]
+
+### EN.12 lane — the unattended-run trio (EN.12.L, EN.12.G, EN.12.C)
+- **What:** Closed all three blocks of `/orchestrate EN.12.C EN.12.G EN.12.L` (PRs #61, #62, #63, all merged). `EN.12.L` typed the `GET /recall` envelope and made recall reachable as a `RECALL` dispatch step that branches the chain and journals the branch; `EN.12.G` shipped the `JournalReader` seam and `DebriefNode` rendering a morning brief from a campaign's journal; `EN.12.C` shipped permission-profile enforcement — closed `GatedAction`/`PermissionProfile` enums, `ClearOperatorGate` denied by an early-return guard, the profile stamped into every run record, and narrowing-only inheritance into child runs. Also added the missing `docs/workflows/recall.md` and its catalogue rows.
+- **Why:** These three are what make an overnight run trustworthy rather than merely unattended — context, a voice, and boundaries. The operator cut `EN.12.F` (CONDUCTOR) mid-run and asked for the debrief standalone, so `EN.12.G` was decoupled from it and takes a campaign id alone, triggerable from `routine.sh`.
+- **Refs:** `planning/orchestration-run/orchestration-extensions/{notes.md,review.md}`; `planning/decisions/D23-brain-read-seam.md`; blocks `EN.12.L`/`EN.12.G`/`EN.12.C`.
 
 ## [run: 2026-08-29]
 
