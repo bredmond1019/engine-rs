@@ -432,17 +432,133 @@ impl Node for SetupWorktreeNode {
                 }
             }
 
-            // Ensure the planning symlink exists in the worktree
-            let worktree_planning = worktree_path_buf.join("planning");
-            if !worktree_planning.exists() {
+            // Ensure the worktree's `planning` path is a symlink pointing at
+            // this repo's real planning vault.
+            //
+            // This guard used to be `if !worktree_planning.exists()`.
+            // `Path::exists()` FOLLOWS symlinks and is equally true for a
+            // plain directory, so it could not tell "the correct symlink is
+            // already here" from "git checked out a stale, tracked
+            // `planning/` directory". The second case is not hypothetical: a
+            // lane whose `origin/main` still tracked a real `planning/`
+            // directory got that directory checked out into the worktree,
+            // `exists()` was true, no symlink was created, and the spec at
+            // `planning/<slug>/tasks.json` was invisible to the engine.
+            // `symlink_metadata` does NOT follow symlinks, so it can tell the
+            // two apart; "already correct" means "is a symlink whose
+            // resolved target is the canonicalized planning source".
+            //
+            // Failures below are reported rather than swallowed — the old
+            // `if let Ok(..)` / `let _ =` pair hid exactly this class of bug.
+            #[cfg(unix)]
+            {
+                let worktree_planning = worktree_path_buf.join("planning");
                 let planning_source = if is_default_target {
                     PathBuf::from("planning")
                 } else {
                     root.join("planning")
                 };
-                if let Ok(canonical_planning) = std::fs::canonicalize(&planning_source) {
-                    #[cfg(unix)]
-                    let _ = std::os::unix::fs::symlink(canonical_planning, worktree_planning);
+
+                // Two skip conditions, both pre-existing behavior:
+                //  * no worktree directory on disk — there is nothing to
+                //    install into (only reachable behind a stubbed command
+                //    runner, since a successful `git worktree add` creates
+                //    it), and
+                //  * no planning path in the source repo — nothing to link,
+                //    which is the status quo for repos without a vault.
+                if worktree_path_buf.is_dir() && std::fs::symlink_metadata(&planning_source).is_ok()
+                {
+                    let canonical_planning =
+                        std::fs::canonicalize(&planning_source).map_err(|err| {
+                            NodeError::new(format!(
+                                "planning source {} exists but does not resolve \
+                                 (dangling symlink?): {err}",
+                                planning_source.display()
+                            ))
+                        })?;
+
+                    let existing = std::fs::symlink_metadata(&worktree_planning);
+                    let existing_is_symlink =
+                        matches!(&existing, Ok(meta) if meta.file_type().is_symlink());
+                    let already_correct = existing_is_symlink
+                        && std::fs::canonicalize(&worktree_planning)
+                            .map(|target| target == canonical_planning)
+                            .unwrap_or(false);
+
+                    if !already_correct {
+                        match existing {
+                            // Nothing there: the common, first-run case.
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(err) => {
+                                return Err(NodeError::new(format!(
+                                    "failed to inspect {}: {err}",
+                                    worktree_planning.display()
+                                )))
+                            }
+                            // A symlink pointing somewhere else (or nowhere).
+                            // Removing it deletes the link only, never the
+                            // directory it pointed at.
+                            Ok(_) if existing_is_symlink => {
+                                std::fs::remove_file(&worktree_planning).map_err(|err| {
+                                    NodeError::new(format!(
+                                        "failed to remove the stale planning symlink at {}: {err}",
+                                        worktree_planning.display()
+                                    ))
+                                })?;
+                            }
+                            // A real directory. We remove it ONLY when it is
+                            // empty — an empty directory holds nobody's work.
+                            // A populated one is refused loudly: deleting
+                            // real files here would be far worse than the bug
+                            // this guard fixes.
+                            Ok(meta) if meta.is_dir() => {
+                                let mut entries =
+                                    std::fs::read_dir(&worktree_planning).map_err(|err| {
+                                        NodeError::new(format!(
+                                            "failed to read {}: {err}",
+                                            worktree_planning.display()
+                                        ))
+                                    })?;
+                                if entries.next().is_some() {
+                                    return Err(NodeError::new(format!(
+                                        "{} is a non-empty directory where the planning symlink \
+                                         to {} belongs — most likely the base branch still tracks \
+                                         a real `planning/` directory. Refusing to delete it. \
+                                         Untrack/remove `planning/` on the base branch (or delete \
+                                         this directory by hand if it holds nothing you need), \
+                                         then re-run.",
+                                        worktree_planning.display(),
+                                        canonical_planning.display()
+                                    )));
+                                }
+                                std::fs::remove_dir(&worktree_planning).map_err(|err| {
+                                    NodeError::new(format!(
+                                        "failed to remove the empty directory at {}: {err}",
+                                        worktree_planning.display()
+                                    ))
+                                })?;
+                            }
+                            // A regular file (or anything else). Never removed.
+                            Ok(_) => {
+                                return Err(NodeError::new(format!(
+                                    "{} exists and is not a directory or symlink; refusing to \
+                                     replace it with the planning symlink to {}. Remove it by \
+                                     hand, then re-run.",
+                                    worktree_planning.display(),
+                                    canonical_planning.display()
+                                )))
+                            }
+                        }
+
+                        std::os::unix::fs::symlink(&canonical_planning, &worktree_planning)
+                            .map_err(|err| {
+                                NodeError::new(format!(
+                                    "failed to create the planning symlink {} -> {}: {err}",
+                                    worktree_planning.display(),
+                                    canonical_planning.display()
+                                ))
+                            })?;
+                    }
                 }
             }
 
@@ -3155,6 +3271,184 @@ repo_path = "alpha"
         // The sibling-crate symlinks must also be present alongside the
         // unaffected planning symlink.
         assert_sibling_symlinks_resolve(&worktree_path, brain.path());
+    }
+
+    // --- planning-symlink guard (EN.ticket.planning-symlink-guard) --------
+
+    /// A brain root with `alpha` + siblings and a real, populated
+    /// `planning/` vault at alpha's root (so a spec lives at
+    /// `planning/my-spec/tasks.json`, the path the stale-directory defect
+    /// made invisible).
+    #[cfg(unix)]
+    fn brain_with_real_planning() -> (tempfile::TempDir, Arc<RepoRegistry>, PathBuf) {
+        let brain = brain_root_with_alpha_and_siblings();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(brain.path()).expect("registry builds"));
+        let alpha_root = registry.resolve("alpha").expect("alpha resolves");
+        let real_planning = alpha_root.join("planning");
+        std::fs::create_dir_all(real_planning.join("my-spec")).expect("mkdir planning/my-spec");
+        std::fs::write(real_planning.join("my-spec").join("tasks.json"), "{}")
+            .expect("write tasks.json");
+        (brain, registry, real_planning)
+    }
+
+    #[cfg(unix)]
+    async fn planning_setup_run(
+        registry: &Arc<RepoRegistry>,
+        resume: bool,
+    ) -> Result<PathBuf, NodeError> {
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner(0))
+            .with_registry(registry.clone());
+        let mut event = json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" });
+        if resume {
+            event["resume"] = json!(true);
+        }
+        let out = node.process(empty_context(event)).await?;
+        Ok(PathBuf::from(
+            out.nodes.get("SetupWorktreeNode").expect("output present")["worktree_path"]
+                .as_str()
+                .expect("worktree_path is a string"),
+        ))
+    }
+
+    #[cfg(unix)]
+    fn assert_planning_symlink_resolves(worktree_planning: &Path, real_planning: &Path) {
+        let meta = std::fs::symlink_metadata(worktree_planning).expect("planning path exists");
+        assert!(
+            meta.file_type().is_symlink(),
+            "{} must be a symlink, not a plain directory",
+            worktree_planning.display()
+        );
+        assert_eq!(
+            std::fs::canonicalize(worktree_planning).expect("symlink resolves"),
+            std::fs::canonicalize(real_planning).expect("real planning canonicalizes"),
+            "planning symlink should resolve to the real planning vault"
+        );
+        assert!(
+            worktree_planning
+                .join("my-spec")
+                .join("tasks.json")
+                .exists(),
+            "the spec must be visible through the planning symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planning_symlink_is_created_when_no_path_exists() {
+        let (_brain, registry, real_planning) = brain_with_real_planning();
+        let worktree = planning_setup_run(&registry, false)
+            .await
+            .expect("setup should succeed");
+        assert_planning_symlink_resolves(&worktree.join("planning"), &real_planning);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn correct_planning_symlink_is_left_alone_not_recreated() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_brain, registry, real_planning) = brain_with_real_planning();
+        let worktree = planning_setup_run(&registry, false)
+            .await
+            .expect("first setup should succeed");
+        let link = worktree.join("planning");
+        let before = std::fs::symlink_metadata(&link).expect("symlink exists");
+
+        let worktree_again = planning_setup_run(&registry, true)
+            .await
+            .expect("reattach should succeed");
+        assert_eq!(worktree_again, worktree);
+
+        let after = std::fs::symlink_metadata(&link).expect("symlink still exists");
+        assert_eq!(
+            (before.ino(), before.dev()),
+            (after.ino(), after.dev()),
+            "an already-correct planning symlink must not be removed and recreated"
+        );
+        assert_planning_symlink_resolves(&link, &real_planning);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tracked_planning_directory_is_refused_and_never_deleted() {
+        let (_brain, registry, _real_planning) = brain_with_real_planning();
+        let worktree = planning_setup_run(&registry, false)
+            .await
+            .expect("first setup should succeed");
+        let link = worktree.join("planning");
+
+        // Simulate `git worktree add` checking out a base branch that still
+        // tracks a real, populated `planning/` directory.
+        std::fs::remove_file(&link).expect("drop the symlink");
+        std::fs::create_dir_all(link.join("other-spec")).expect("mkdir stale planning");
+        std::fs::write(
+            link.join("other-spec").join("tasks.json"),
+            "{\"keep\":true}",
+        )
+        .expect("write stale content");
+
+        let err = planning_setup_run(&registry, true)
+            .await
+            .expect_err("a populated stale directory must fail loudly");
+        let message = err.to_string();
+        assert!(
+            message.contains("non-empty directory"),
+            "error should name the non-empty directory; got: {message}"
+        );
+
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .expect("the stale directory must still be there")
+                .file_type()
+                .is_symlink(),
+            "the stale directory must not have been replaced by a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("other-spec").join("tasks.json"))
+                .expect("stale content must survive"),
+            "{\"keep\":true}",
+            "no file inside a populated directory may be deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_planning_directory_is_replaced_by_the_symlink() {
+        let (_brain, registry, real_planning) = brain_with_real_planning();
+        let worktree = planning_setup_run(&registry, false)
+            .await
+            .expect("first setup should succeed");
+        let link = worktree.join("planning");
+        std::fs::remove_file(&link).expect("drop the symlink");
+        std::fs::create_dir(&link).expect("mkdir empty planning dir");
+
+        planning_setup_run(&registry, true)
+            .await
+            .expect("an empty directory holds nobody's work and may be replaced");
+        assert_planning_symlink_resolves(&link, &real_planning);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrong_target_planning_symlink_is_replaced() {
+        let (brain, registry, real_planning) = brain_with_real_planning();
+        let worktree = planning_setup_run(&registry, false)
+            .await
+            .expect("first setup should succeed");
+        let link = worktree.join("planning");
+
+        let decoy = brain.path().join("decoy-planning");
+        std::fs::create_dir_all(&decoy).expect("mkdir decoy");
+        std::fs::remove_file(&link).expect("drop the symlink");
+        std::os::unix::fs::symlink(&decoy, &link).expect("install wrong-target symlink");
+
+        planning_setup_run(&registry, true)
+            .await
+            .expect("a wrong-target symlink must be replaced, not accepted");
+        assert_planning_symlink_resolves(&link, &real_planning);
+        assert!(decoy.is_dir(), "only the link is removed, never its target");
     }
 
     #[tokio::test]
