@@ -1345,33 +1345,66 @@ impl TestTaskNode {
             .collect()
     }
 
-    /// Write-verification guard: checks [`Self::changed_files`]'s report of
-    /// what actually changed in the worktree against `ImplementTaskNode`'s
-    /// claimed `modified_files` from ctx.
+    /// Write-verification guard: asks [`Self::changed_files`] whether the
+    /// worktree shows ANY change at all, and fails the task when it does
+    /// not.
     ///
-    /// The pass condition is deliberately "the worktree shows ANY change at
-    /// all", not "the specific claimed paths changed": a real (non-stubbed)
-    /// `claude` call was observed live to leave `modified_files` empty even
-    /// on a genuinely successful write (the model's own JSON self-report is
-    /// not a reliable enumeration of what it touched — see
-    /// `sdlc_flow_live.rs`'s `live_full_workflow_real_implement_and_review`).
-    /// Gating on exact claim-vs-disk matching would false-fail a real,
-    /// useful write whose self-reported paths are incomplete or off by a
-    /// prefix/suffix quirk; gating on "did anything change" is robust to
-    /// that unreliability while still catching the guard's actual target —
-    /// the original bug this exists for (`planning/decisions/
-    /// D8-autonomous-node-write-permission.md`): a claimed, narrated write
-    /// that never touched disk at all.
+    /// **The question is asked unconditionally, and the answer does not
+    /// depend on `ImplementTaskNode`'s self-reported `modified_files`.**
+    /// That self-report is documented-unreliable in both directions: a real
+    /// (non-stubbed) `claude` call was observed live leaving it EMPTY on a
+    /// genuinely successful write (see `sdlc_flow_live.rs`'s
+    /// `live_full_workflow_real_implement_and_review`), and a run whose
+    /// implement work landed in the WRONG TREE also reported it empty while
+    /// the worktree was untouched. So the claim is not evidence of a write,
+    /// and its absence is not evidence of a no-op — only the worktree is
+    /// evidence. Note what this does NOT do: it never compares claimed
+    /// paths against changed paths. The self-report is unreliable about
+    /// WHICH files; "did anything change" is the robust question.
     ///
-    /// Only trips (a failed [`CheckResult`], routed through the normal
-    /// triage/retry machinery exactly like a harness-check failure) when
-    /// the worktree shows ZERO changes AND the claim was non-empty — the
-    /// model asserted specific writes but nothing happened anywhere. A
-    /// claim-empty-and-nothing-changed pair passes: a genuinely no-op task
-    /// (e.g. investigation-only) is legitimate and indistinguishable from
-    /// this state without a task-level "expected to write" signal this
-    /// node doesn't have.
-    fn verify_claimed_writes(&self, ctx: &TaskContext, worktree: &Path) -> Option<CheckResult> {
+    /// This guard is the only check that can distinguish "task done" from
+    /// "task never ran". Measured on a pristine worktree with zero task
+    /// work, `cargo nextest run --workspace --all-features` reported
+    /// `187 tests run: 187 passed`; a real run's `check_results` showed
+    /// `fmt`, `clippy`, `test` and `build` ALL PASSED beside a failing
+    /// `write-verification`. A green check on a tree nobody wrote to
+    /// carries no information about the task, so the harness suite cannot
+    /// be allowed to stand in for this.
+    ///
+    /// The legitimately no-op task (investigation-only) is handled by an
+    /// EXPLICIT task-level signal — [`SDLCTask::expects_writes`] — rather
+    /// than by inferring consent from an empty claim. A task that says
+    /// nothing defaults to `expects_writes: true` and is therefore guarded;
+    /// only an explicit `"expects_writes": false` in `tasks.json` disarms
+    /// it.
+    ///
+    /// Still catches the guard's original target
+    /// (`planning/decisions/D8-autonomous-node-write-permission.md`): a
+    /// claimed, narrated write that never touched disk. That case is now a
+    /// strict subset of "nothing changed", and the emitted message names
+    /// the claim when there was one so triage keeps the same evidence.
+    ///
+    /// Trips as a failed [`CheckResult`], routed through the normal
+    /// triage/retry machinery exactly like a harness-check failure — never
+    /// a `NodeError` and never a hard bail.
+    fn verify_claimed_writes(
+        &self,
+        ctx: &TaskContext,
+        task: &SDLCTask,
+        worktree: &Path,
+    ) -> Option<CheckResult> {
+        // An explicitly no-op task is the ONE way out. Checked before the
+        // runner call because a task that is not expected to write has no
+        // question to ask of the worktree.
+        if !task.expects_writes {
+            return None;
+        }
+
+        let changed = self.changed_files(worktree);
+        if !changed.is_empty() {
+            return None;
+        }
+
         let modified_files: Vec<String> = get_result(ctx, "ImplementTaskNode")
             .and_then(|value| value.get("modified_files"))
             .and_then(|value| value.as_array())
@@ -1383,30 +1416,25 @@ impl TestTaskNode {
             })
             .unwrap_or_default();
 
-        // Short-circuit BEFORE invoking `changed_files` (which calls the
-        // injected runner): an empty claim never trips the guard, so there
-        // is no need to spend a `git status` call on it. This also keeps
-        // this guard's runner-call count at zero for empty claims, matching
-        // callers (tests and otherwise) that assume `TestTaskNode`'s runner
-        // is only invoked for actual harness-check commands when
-        // `ImplementTaskNode` made no write claim.
-        if modified_files.is_empty() {
-            return None;
-        }
-
-        let changed = self.changed_files(worktree);
-        if !changed.is_empty() {
-            return None;
-        }
+        let claim = if modified_files.is_empty() {
+            "ImplementTaskNode claimed no modified_files".to_string()
+        } else {
+            format!("ImplementTaskNode claimed modified_files {modified_files:?}")
+        };
 
         Some(CheckResult {
             name: "write-verification".to_string(),
             kind: "write-verification".to_string(),
             passed: false,
-            output: changed.join("\n"),
+            output: String::new(),
             message: format!(
-                "ImplementTaskNode claimed modified_files {modified_files:?} but the worktree \
-                 shows no changes at all (git status --porcelain: {changed:?})"
+                "{claim} and the worktree shows no changes at all (git status --porcelain \
+                 reported nothing) — task {} is expected to write, so an unchanged worktree \
+                 means the implement work never reached this tree. Harness checks passing \
+                 against an untouched checkout say nothing about this task. If this task is \
+                 genuinely investigation-only, declare \"expects_writes\": false on it in \
+                 tasks.json.",
+                task.task_id
             ),
         })
     }
@@ -1623,7 +1651,7 @@ impl Node for TestTaskNode {
         // Write-verification guard runs before the harness suite so a
         // claimed-but-empty implement never gets a free pass through checks
         // that happen to already be green (e.g. no `harness.json`).
-        let write_verification = self.verify_claimed_writes(&ctx, worktree);
+        let write_verification = self.verify_claimed_writes(&ctx, &task, worktree);
 
         let harness_path = worktree.join("planning").join("harness.json");
         let harness_exists = harness_path.exists();
@@ -4227,6 +4255,27 @@ mod tests {
 
     // --- TestTaskNode --------------------------------------------------------
 
+    /// `TestTaskNode`'s write-verification guard probes the worktree with a
+    /// direct `git status --porcelain` on EVERY run — it is no longer
+    /// short-circuitable by an empty `modified_files` claim — so every
+    /// stubbed [`CommandRunner`] in these tests now sees that call in
+    /// addition to the check commands it exists to observe.
+    ///
+    /// Runners whose job is to record or score CHECK invocations answer the
+    /// probe through this helper and neither record nor count it: the
+    /// porcelain line below models the ordinary case these tests are
+    /// about — a task that did write — so the guard passes and the test
+    /// keeps asserting on what it was written to assert on. A test that
+    /// specifically wants a CLEAN worktree stubs `git status` itself (see
+    /// [`porcelain_runner`]).
+    fn write_verification_probe(program: &str, args: &[&str]) -> Option<CommandOutput> {
+        (program == "git" && args.first() == Some(&"status")).then(|| CommandOutput {
+            status: 0,
+            stdout: " M src/lib.rs\n".to_string(),
+            stderr: String::new(),
+        })
+    }
+
     fn temp_worktree() -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4239,6 +4288,27 @@ mod tests {
         // Remove the ROOT dir before recreating the `planning` subdir.
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("planning")).unwrap();
+        // Make the fixture an actual git worktree that HAS changes in it.
+        // `TestTaskNode` always runs after an implement step, and its
+        // write-verification guard now asks `git status --porcelain`
+        // unconditionally (it can no longer be short-circuited by an empty
+        // `modified_files` claim), so a bare directory — where `git status`
+        // fails and reports nothing — would read as "the implement work
+        // never reached this tree" and fail every check-dispatch test for a
+        // reason none of them are about. `git init` alone is enough: the
+        // seed file below is then untracked, so porcelain reports
+        // `?? planning/`. Tests that specifically want a CLEAN worktree
+        // stub `git status` through the injected `CommandRunner` instead.
+        //
+        // The seed FILE is not optional: git does not report an empty
+        // directory, so `git init` on a tree whose only content is the
+        // empty `planning/` dir still yields empty porcelain output.
+        std::fs::write(dir.join("planning").join(".worktree-seed"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output()
+            .expect("git init should succeed for the test worktree fixture");
         dir
     }
 
@@ -4296,7 +4366,12 @@ mod tests {
         let attempt: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let attempt_clone = attempt.clone();
-        let runner: CommandRunner = Arc::new(move |_program, _args, _cwd| {
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            // The guard's probe must not consume an attempt — this test
+            // scores CHECK invocations, not worktree inspections.
+            if let Some(probe) = write_verification_probe(program, args) {
+                return Ok(probe);
+            }
             let n = attempt_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(CommandOutput {
                 status: if n == 0 { 1 } else { 0 },
@@ -4391,6 +4466,30 @@ mod tests {
             .contains("write-verification"));
     }
 
+    /// LOAD-BEARING: an EMPTY `modified_files` claim on a task that is
+    /// expected to write, with a completely clean worktree, must FAIL the
+    /// guard. The model's self-report is documented-unreliable, so an empty
+    /// claim carries no information; the worktree does. Measured twice on
+    /// real runs: an implement attempt that landed in the WRONG TREE
+    /// reported `modified_files: []`, and every harness check then ran
+    /// green against an untouched checkout.
+    #[tokio::test]
+    async fn write_verification_fires_on_empty_claim_and_clean_worktree() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_implement_claim(&worktree, &[]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert_eq!(results[0]["passed"], false);
+    }
+
     /// A claimed file that DOES show up in `git status --porcelain` passes
     /// the guard, and (with no `harness.json`) the task overall passes.
     #[tokio::test]
@@ -4412,13 +4511,22 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    /// An empty `modified_files` claim (a genuinely no-op task) never trips
-    /// the guard, even when the worktree is completely clean.
+    /// An EXPLICITLY no-op task (`expects_writes: false` — investigation
+    /// only) passes on a completely clean worktree. This is the one and
+    /// only way out of the guard, and it must be DECLARED: consent to a
+    /// silent no-op is never inferred from an empty claim.
     #[tokio::test]
-    async fn write_verification_does_not_trip_on_empty_claim() {
+    async fn write_verification_does_not_trip_on_explicitly_no_op_task() {
         let worktree = temp_worktree();
         write_harness(&worktree, json!([]));
-        let ctx = ctx_with_implement_claim(&worktree, &[]);
+        let mut task = SDLCTask::new(1, "investigate", "read only");
+        task.expects_writes = false;
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({ "summary": "looked around", "modified_files": [], "tests_added": [] }),
+        );
 
         let node = TestTaskNode::new().with_runner(porcelain_runner(""));
         let out = node.process(ctx).await.expect("process should succeed");
@@ -4430,10 +4538,13 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    /// No `ImplementTaskNode` output at all (e.g. a ctx driven directly in a
-    /// unit test) behaves like an empty claim — the guard never trips.
+    /// No `ImplementTaskNode` output at all, on a clean worktree, FIRES the
+    /// guard for a task expected to write. Previously this was read as
+    /// "behaves like an empty claim — never trips", which is the same
+    /// mistake the empty claim was: the absence of a self-report is not
+    /// evidence that nothing needed to happen.
     #[tokio::test]
-    async fn write_verification_does_not_trip_when_implement_never_ran() {
+    async fn write_verification_fires_when_implement_never_ran() {
         let worktree = temp_worktree();
         write_harness(&worktree, json!([]));
         let ctx = ctx_for_worktree(&worktree);
@@ -4441,7 +4552,78 @@ mod tests {
         let node = TestTaskNode::new().with_runner(porcelain_runner(""));
         let out = node.process(ctx).await.expect("process should succeed");
 
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert!(results[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("claimed no modified_files"));
+    }
+
+    /// ANY worktree change passes the guard regardless of the claim — here
+    /// with an EMPTY claim, the case a live `claude` call was observed
+    /// producing on a genuinely successful write. The claim is never
+    /// compared against the changed paths.
+    #[tokio::test]
+    async fn write_verification_passes_on_empty_claim_when_worktree_changed() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_implement_claim(&worktree, &[]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner("?? src/new.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// A change on a path the claim never mentioned still passes: the guard
+    /// asks "did anything change", never "did the claimed paths change".
+    #[tokio::test]
+    async fn write_verification_passes_when_changed_path_differs_from_claim() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_implement_claim(&worktree, &["src/claimed.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" M src/other.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// BACKWARD COMPATIBILITY: a task deserialized from a `tasks.json`
+    /// entry with no `expects_writes` field — every such file in the fleet
+    /// today — defaults to `true` and is therefore GUARDED. The default is
+    /// the safe direction: a forgotten field costs one retry, an unguarded
+    /// task reports work that never ran as done.
+    #[tokio::test]
+    async fn write_verification_guards_task_json_without_the_new_field() {
+        let task: SDLCTask = serde_json::from_value(json!({
+            "task_id": 1,
+            "title": "One",
+            "description": "d1",
+        }))
+        .expect("a tasks.json entry without expects_writes must still parse");
+        assert!(
+            task.expects_writes,
+            "absent expects_writes must default to true"
+        );
+
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
     }
 
     /// A guard failure and a harness-check failure both surface in
@@ -4558,6 +4740,9 @@ mod tests {
         let recorded: RecordedArgvCalls = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
         let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            if let Some(probe) = write_verification_probe(program, args) {
+                return Ok(probe);
+            }
             recorded_clone.lock().unwrap().push((
                 program.to_string(),
                 args.iter().map(|a| (*a).to_string()).collect(),
@@ -7034,7 +7219,10 @@ mod tests {
     fn recording_command_runner() -> (CommandRunner, Arc<Mutex<Vec<String>>>) {
         let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
-        let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            if let Some(probe) = write_verification_probe(program, args) {
+                return Ok(probe);
+            }
             if let Some(command) = args.get(1) {
                 recorded_clone.lock().unwrap().push((*command).to_string());
             }

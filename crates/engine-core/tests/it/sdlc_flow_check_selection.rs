@@ -38,6 +38,21 @@ fn temp_worktree() -> PathBuf {
     // optional. Remove the ROOT dir before recreating the `planning` subdir.
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(dir.join("planning")).unwrap();
+    // Make the fixture an actual git worktree that HAS a change in it.
+    // `TestTaskNode`'s write-verification guard now asks
+    // `git status --porcelain` unconditionally (it can no longer be
+    // short-circuited by an empty `modified_files` claim), so a bare
+    // directory — where `git status` fails and reports nothing — would read
+    // as "the implement work never reached this tree" and fail every
+    // check-SELECTION test for a reason none of them are about. The seed
+    // file is required: git does not report an empty directory, so
+    // `git init` over an empty `planning/` still yields empty porcelain.
+    std::fs::write(dir.join("planning").join(".worktree-seed"), "").unwrap();
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .output()
+        .expect("git init should succeed for the test worktree fixture");
     dir
 }
 
@@ -114,10 +129,23 @@ fn ctx_for(worktree: &Path, task: &SDLCTask, policy: &SdlcPolicy) -> TaskContext
 
 /// A recording [`CommandRunner`] that always succeeds and records every
 /// `sh -c <command>` invocation's `<command>` string, in order.
+///
+/// `TestTaskNode`'s write-verification guard also probes the worktree with
+/// a direct `git status --porcelain` on every run. That is not an `sh -c`
+/// check invocation, so it is answered here — with a NON-EMPTY porcelain
+/// line, modelling the ordinary case these tests are about, a task that did
+/// write — and deliberately kept out of the recorded list.
 fn recording_command_runner() -> (CommandRunner, Arc<Mutex<Vec<String>>>) {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let recorded_clone = recorded.clone();
-    let runner: CommandRunner = Arc::new(move |_program, args, _cwd| {
+    let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+        if program == "git" && args.first() == Some(&"status") {
+            return Ok(CommandOutput {
+                status: 0,
+                stdout: " M src/lib.rs\n".to_string(),
+                stderr: String::new(),
+            });
+        }
         if let Some(command) = args.get(1) {
             recorded_clone.lock().unwrap().push((*command).to_string());
         }

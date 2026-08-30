@@ -119,6 +119,20 @@ fn ctx_with_task(worktree: &std::path::Path, base_sha: Option<&str>) -> TaskCont
     ctx
 }
 
+/// Mark the fixture's single task as explicitly investigation-only
+/// (`expects_writes: false`) — the ONLY declared way out of the
+/// write-verification guard.
+fn as_no_op_task(mut ctx: TaskContext) -> TaskContext {
+    let mut state: SDLCState =
+        serde_json::from_value(ctx.nodes["LoadTaskStateNode"].clone()).expect("state parses");
+    state.tasks[0].expects_writes = false;
+    ctx.nodes.insert(
+        "LoadTaskStateNode".to_string(),
+        serde_json::to_value(&state).expect("SDLCState serializes"),
+    );
+    ctx
+}
+
 /// Stamp an `ImplementTaskNode` output claiming `modified_files`, mirroring
 /// what the (stubbed, in production write-permitted) implement step writes.
 fn with_implement_claim(mut ctx: TaskContext, modified_files: &[&str]) -> TaskContext {
@@ -230,14 +244,38 @@ async fn guard_match_passes_through_to_triage_pass() {
     assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "PASS");
 }
 
-// --- write-verification guard: empty claim never trips ---------------------
+// --- write-verification guard: the worktree question is unconditional ------
 
-/// A genuinely no-op task (`modified_files: []`) never trips the guard, even
-/// against a completely clean worktree with nothing in `git status`.
+/// An EMPTY `modified_files` claim against a completely clean worktree
+/// TRIPS the guard for a task expected to write. This replaced the previous
+/// `empty_claim_never_trips_the_guard`: an implement attempt that landed in
+/// the wrong tree reported exactly this pair, the guard short-circuited on
+/// it, and the harness checks then ran green against an untouched checkout.
 #[tokio::test]
-async fn empty_claim_never_trips_the_guard() {
+async fn empty_claim_on_a_clean_worktree_trips_the_guard() {
     let worktree = temp_worktree();
     let ctx = with_implement_claim(ctx_with_task(&worktree, None), &[]);
+
+    let test_node = TestTaskNode::new().with_runner(porcelain_runner(""));
+    let ctx = test_node
+        .process(ctx)
+        .await
+        .expect("TestTaskNode should not error");
+
+    assert_eq!(ctx.nodes["TestTaskNode"]["all_passed"], false);
+    let results = ctx.nodes["TestTaskNode"]["check_results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(results[0]["kind"], "write-verification");
+    assert_eq!(results[0]["passed"], false);
+}
+
+/// A task that DECLARES itself investigation-only (`expects_writes: false`)
+/// passes on a clean worktree — the explicit signal, not an inferred one.
+#[tokio::test]
+async fn explicitly_no_op_task_never_trips_the_guard() {
+    let worktree = temp_worktree();
+    let ctx = with_implement_claim(as_no_op_task(ctx_with_task(&worktree, None)), &[]);
 
     let test_node = TestTaskNode::new().with_runner(porcelain_runner(""));
     let ctx = test_node

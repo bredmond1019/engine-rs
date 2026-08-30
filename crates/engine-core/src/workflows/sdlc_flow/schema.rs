@@ -56,6 +56,10 @@ fn default_max_attempts() -> u32 {
     3
 }
 
+fn default_expects_writes() -> bool {
+    true
+}
+
 /// A single task within an SDLC spec's task list (`SDLCTask` in Python).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SDLCTask {
@@ -115,6 +119,31 @@ pub struct SDLCTask {
     /// and implement/test counters must stay independent.
     #[serde(default)]
     pub review_attempt_count: u32,
+    /// Whether this task is expected to change the worktree — the explicit
+    /// "expected to write" signal `TestTaskNode`'s write-verification guard
+    /// needs in order to ask "did anything change?" unconditionally.
+    ///
+    /// **Defaults to `true` when the field is absent** (`tasks.json` files
+    /// across the fleet predate it), which is the SAFE direction: a task
+    /// that says nothing is treated as expected to write, so a run whose
+    /// implement work never reached this worktree fails the guard instead
+    /// of collecting four green harness checks on an untouched tree. The
+    /// false-positive costs one retry through the normal triage machinery;
+    /// the false-negative reports a task as done when it never ran.
+    ///
+    /// Set to `false` ONLY for a genuinely no-op task — investigation,
+    /// measurement, a read-only review — whose successful outcome really is
+    /// an unchanged worktree. It is an opt-OUT, never an opt-in, precisely
+    /// so that forgetting it is safe.
+    ///
+    /// Deliberately NOT inferred from a task's authored `files[]` list: the
+    /// default is already "expected to write", so a non-empty `files[]`
+    /// could only ever confirm what the default assumes, and inference from
+    /// an EMPTY `files[]` would recreate exactly the bug this replaces —
+    /// consent to a silent no-op inferred from an absent signal rather than
+    /// declared.
+    #[serde(default = "default_expects_writes")]
+    pub expects_writes: bool,
 }
 
 impl SDLCTask {
@@ -131,6 +160,7 @@ impl SDLCTask {
             attempt_count: 0,
             max_attempts: default_max_attempts(),
             review_attempt_count: 0,
+            expects_writes: default_expects_writes(),
         }
     }
 }
