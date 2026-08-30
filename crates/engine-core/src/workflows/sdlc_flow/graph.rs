@@ -60,6 +60,7 @@ use std::sync::Arc;
 
 use claude_code_rs::Config;
 
+use crate::cancellation::CancellationToken;
 use crate::node::NodeRegistry;
 use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
@@ -370,18 +371,66 @@ fn real_cloud_transport() -> ModelTransport {
 /// `local` model tier has nothing on it to rewire.
 #[must_use]
 pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
+    registry_for_policy_with_cancellation(policy, None)
+}
+
+/// Like [`registry_for_policy`], but additionally wires `token` — when
+/// given — into all three long-running agent nodes (`ImplementTaskNode`,
+/// `TriageTaskNode`, `ConsolidatedReviewNode`) via their
+/// `with_cancellation_token` builder (`EN.ticket.abort-must-interrupt-an-
+/// in-flight-agent-node`), so a served run's abort interrupts an in-flight
+/// model call instead of only taking effect at the next node boundary.
+/// `token: None` reproduces [`registry_for_policy`] exactly — this function
+/// is additive, not a behavior change for any existing caller.
+///
+/// Applying the token is orthogonal to the local-tier `meta_transport`
+/// rewiring above: both are independent builder fields on the same node, so
+/// a node can carry a local-tier transport override AND a cancellation
+/// token at once. This function threads the token onto whichever variant of
+/// each node this call ends up registering (local-tier-wired or plain).
+#[must_use]
+pub fn registry_for_policy_with_cancellation(
+    policy: &SdlcPolicy,
+    token: Option<CancellationToken>,
+) -> NodeRegistry {
     let mut registry = registry();
 
-    if policy.model_tiers.triage == ModelTier::Local {
-        registry.register(Box::new(TriageTaskNode::new().with_meta_transport(
-            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
-        )));
+    let triage_local = policy.model_tiers.triage == ModelTier::Local;
+    if triage_local || token.is_some() {
+        let mut node = TriageTaskNode::new();
+        if triage_local {
+            node = node.with_meta_transport(openai_compat_meta_transport_live(
+                policy.local.clone(),
+                real_cloud_transport(),
+            ));
+        }
+        if let Some(t) = token.clone() {
+            node = node.with_cancellation_token(t);
+        }
+        registry.register(Box::new(node));
     }
 
-    if policy.model_tiers.review == ModelTier::Local {
-        registry.register(Box::new(ConsolidatedReviewNode::new().with_meta_transport(
-            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
-        )));
+    let review_local = policy.model_tiers.review == ModelTier::Local;
+    if review_local || token.is_some() {
+        let mut node = ConsolidatedReviewNode::new();
+        if review_local {
+            node = node.with_meta_transport(openai_compat_meta_transport_live(
+                policy.local.clone(),
+                real_cloud_transport(),
+            ));
+        }
+        if let Some(t) = token.clone() {
+            node = node.with_cancellation_token(t);
+        }
+        registry.register(Box::new(node));
+    }
+
+    if let Some(t) = token {
+        registry.register(Box::new(
+            ImplementTaskNode::new()
+                .with_config(agentic_write_config("claude-sonnet-4-5"))
+                .with_cancellation_token(t),
+        ));
     }
 
     registry
@@ -547,6 +596,72 @@ mod tests {
             assert!(policy_registry.contains("EndReviewNode"));
             assert!(policy_registry.contains("EndReviewRouterNode"));
         }
+    }
+
+    // --- registry_for_policy_with_cancellation
+    //     (EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2) ---
+
+    #[test]
+    fn registry_for_policy_with_cancellation_none_matches_registry_for_policy() {
+        // `token: None` must reproduce `registry_for_policy` exactly — the
+        // additive/optional contract this ticket requires.
+        let policy = SdlcPolicy::default();
+        let plain = registry_for_policy(&policy);
+        let with_none = registry_for_policy_with_cancellation(&policy, None);
+
+        assert_eq!(plain.len(), with_none.len());
+        assert!(with_none.contains("ImplementTaskNode"));
+        assert!(with_none.contains("TriageTaskNode"));
+        assert!(with_none.contains("ConsolidatedReviewNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_with_cancellation_some_still_contains_all_three_agent_nodes() {
+        // Structural check that supplying a token doesn't change the
+        // declared node set (CLAUDE.md standing rule 6: a policy/knob-shaped
+        // change must not rewire the graph's node set) — the node COUNT and
+        // IDENTITIES are unchanged whether or not a token is threaded in,
+        // only what each of the three agent nodes carries internally
+        // changes. Behavioral proof that the SAME token instance reaches
+        // each node lives in `crates/engine-core/src/workflows/sdlc_flow/
+        // task_loop.rs`'s `with_cancellation_token` tests (task 1) plus
+        // `engine-serve`'s `mint_and_publish_run_token_stashes_the_exact_
+        // token_it_returns` (task 2), which together cover: (a) a node
+        // given a token observes it, and (b) the token the factory embeds
+        // is the exact instance `spawn_run` registers under `run_id`.
+        let policy = SdlcPolicy::default();
+        let plain = registry_for_policy(&policy);
+        let token = CancellationToken::new();
+        let with_token = registry_for_policy_with_cancellation(&policy, Some(token));
+
+        assert_eq!(plain.len(), with_token.len());
+        assert!(with_token.contains("ImplementTaskNode"));
+        assert!(with_token.contains("TriageTaskNode"));
+        assert!(with_token.contains("ConsolidatedReviewNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_with_cancellation_some_and_local_tiers_still_matches_local_tier_identities(
+    ) {
+        // A token combined with the local-tier `meta_transport` rewiring
+        // must still leave the same node identities registered — the two
+        // are orthogonal builder fields on the same node (see this
+        // function's doc comment).
+        let policy = SdlcPolicy {
+            model_tiers: super::super::policy::ModelTiers {
+                triage: ModelTier::Local,
+                review: ModelTier::Local,
+                ..super::super::policy::ModelTiers::default()
+            },
+            ..SdlcPolicy::default()
+        };
+        let token = CancellationToken::new();
+
+        let registry = registry_for_policy_with_cancellation(&policy, Some(token));
+
+        assert!(registry.contains("ImplementTaskNode"));
+        assert!(registry.contains("TriageTaskNode"));
+        assert!(registry.contains("ConsolidatedReviewNode"));
     }
 
     #[test]

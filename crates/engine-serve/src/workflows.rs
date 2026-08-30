@@ -62,7 +62,9 @@ use engine_core::workflows::sdlc_flow::setup::SetupWorktreeNode;
 use engine_core::{CancellationToken, Workflow};
 use serde::Serialize;
 
-// ── ORCHESTRATION abort/progress handoff (EN.ticket.orchestration-abort-and-progress task 4) ──
+// ── Pending-run token handoff (EN.ticket.orchestration-abort-and-progress
+// task 4; generalized beyond ORCHESTRATION by
+// EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2) ──
 //
 // `register_orchestration_with_registry`'s factory (below) builds a fresh
 // `OrchestrationRunNode` -- including its `CancellationToken` and
@@ -82,15 +84,27 @@ use serde::Serialize;
 // landing on different worker threads; this cannot, because each request's
 // un-awaited segment owns its thread for the whole handoff.
 //
-// Every other workflow type never calls [`set_pending_orchestration_run`],
-// so [`take_pending_orchestration_run`] returns `None` for them and
-// `suspend::spawn_run` falls back to exactly its pre-existing behavior.
+// `SDLC_FLOW`/`SDLC_TASK` reuse this same handoff (task 2 above) to get
+// their own agent nodes' `CancellationToken` adopted by `spawn_run` under
+// the run's id -- but they carry no step-progress fan-out and no campaign,
+// so [`PendingRunToken`]'s `fanout`/`campaign_id` fields are `Option`s that
+// stay `None` for them. Renamed from the ORCHESTRATION-specific
+// `PendingOrchestrationRun`/`set_pending_orchestration_run`/
+// `take_pending_orchestration_run`/`PENDING_ORCHESTRATION_RUN` to these
+// generic names for that reason -- the mechanism was always generic, only
+// the names were ORCHESTRATION-specific, and leaving an SDLC run publish
+// through a type called `PendingOrchestrationRun` would have cost the next
+// reader an hour.
+//
+// A dispatch that never calls [`set_pending_run_token`] leaves
+// [`take_pending_run_token`] returning `None`, and `suspend::spawn_run`
+// falls back to exactly its pre-existing behavior.
 
 /// Everything an ORCHESTRATION step-progress observer needs to publish
 /// through `suspend.rs`'s three-way fan-out (live state, the durable
 /// writer, SSE), but cannot know at factory-build time. Filled in by
-/// `suspend::spawn_run` — via [`take_pending_orchestration_run`] — before
-/// the workflow it is embedded in ever runs.
+/// `suspend::spawn_run` — via [`take_pending_run_token`] — before the
+/// workflow it is embedded in ever runs.
 #[derive(Clone)]
 pub(crate) struct StepFanoutContext {
     pub run_id: uuid::Uuid,
@@ -100,44 +114,53 @@ pub(crate) struct StepFanoutContext {
     pub data: serde_json::Value,
 }
 
-/// The token + fan-out cell a freshly-built ORCHESTRATION node captured at
-/// factory time, handed off to `suspend::spawn_run` via the thread-local
-/// below.
-pub(crate) struct PendingOrchestrationRun {
+/// The token (plus, for ORCHESTRATION, a fan-out cell and campaign id) a
+/// freshly-built node captured at factory time, handed off to
+/// `suspend::spawn_run` via the thread-local below. Generic across every
+/// workflow type that wants `spawn_run` to adopt a node-embedded token
+/// under the run's id — `fanout`/`campaign_id` are `None` for a dispatch
+/// (e.g. `SDLC_FLOW`/`SDLC_TASK`) with no step-progress fan-out and no
+/// campaign concept.
+pub(crate) struct PendingRunToken {
     pub token: CancellationToken,
-    pub fanout: Arc<RwLock<Option<StepFanoutContext>>>,
+    /// `Some` only for ORCHESTRATION — see [`StepFanoutContext`].
+    pub fanout: Option<Arc<RwLock<Option<StepFanoutContext>>>>,
     /// This run's resolved campaign id (`EN.11.F` task 2 follow-up) —
     /// `spawn_run` registers `token` under this id in `AppState::campaigns`
     /// so `POST /campaigns/{id}/abort` can find and trigger it, mirroring
-    /// how it registers `token` under `run_id` in `AppState::runs`.
-    pub campaign_id: uuid::Uuid,
+    /// how it registers `token` under `run_id` in `AppState::runs`. `Some`
+    /// only for ORCHESTRATION; `SDLC_FLOW`/`SDLC_TASK` have no campaign
+    /// concept and leave this `None`.
+    pub campaign_id: Option<uuid::Uuid>,
 }
 
 thread_local! {
-    static PENDING_ORCHESTRATION_RUN: RefCell<Option<PendingOrchestrationRun>> =
+    static PENDING_RUN_TOKEN: RefCell<Option<PendingRunToken>> =
         const { RefCell::new(None) };
 }
 
 /// Stash `pending` for the very next `suspend::spawn_run` call on THIS
-/// thread to consume via [`take_pending_orchestration_run`]. Called once
-/// per ORCHESTRATION dispatch, from inside
-/// [`register_orchestration_with_registry`]'s factory closure.
-pub(crate) fn set_pending_orchestration_run(pending: PendingOrchestrationRun) {
-    PENDING_ORCHESTRATION_RUN.with(|cell| *cell.borrow_mut() = Some(pending));
+/// thread to consume via [`take_pending_run_token`]. Called once per
+/// dispatch that wants its node-embedded token adopted by `spawn_run` —
+/// from inside [`register_orchestration_with_registry`]'s,
+/// [`register_sdlc_flow_with_registry`]'s, and
+/// [`register_sdlc_task_with_registry`]'s factory closures.
+pub(crate) fn set_pending_run_token(pending: PendingRunToken) {
+    PENDING_RUN_TOKEN.with(|cell| *cell.borrow_mut() = Some(pending));
 }
 
-/// Take (and clear) whatever [`set_pending_orchestration_run`] stashed on
-/// this thread. `None` for every non-ORCHESTRATION dispatch (nothing ever
-/// calls the setter for them), and also for the pathological case of an
-/// ORCHESTRATION dispatch and its following `spawn_run` call landing on
-/// different threads — `suspend::spawn_run` falls back to its
-/// already-correct un-injected behavior in that case; see its call site.
-pub(crate) fn take_pending_orchestration_run() -> Option<PendingOrchestrationRun> {
-    PENDING_ORCHESTRATION_RUN.with(|cell| cell.borrow_mut().take())
+/// Take (and clear) whatever [`set_pending_run_token`] stashed on this
+/// thread. `None` for a dispatch that never called the setter, and also for
+/// the pathological case of a setter call and its following `spawn_run`
+/// call landing on different threads — `suspend::spawn_run` falls back to
+/// its already-correct un-injected behavior in that case; see its call
+/// site.
+pub(crate) fn take_pending_run_token() -> Option<PendingRunToken> {
+    PENDING_RUN_TOKEN.with(|cell| cell.borrow_mut().take())
 }
 
 /// Build a fresh `CancellationToken` + step-progress observer for one
-/// ORCHESTRATION dispatch, and stash the handoff [`set_pending_orchestration_run`]
+/// ORCHESTRATION dispatch, and stash the handoff [`set_pending_run_token`]
 /// so `suspend::spawn_run` can pick it up. Used by
 /// [`register_orchestration_with_registry`]'s factory (the production
 /// path), and directly by tests that build an `OrchestrationRunNode`
@@ -152,8 +175,8 @@ pub(crate) fn take_pending_orchestration_run() -> Option<PendingOrchestrationRun
 ///
 /// `campaign_id` is this run's already-resolved campaign id (via
 /// [`engine_core::workflows::orchestration::graph::resolve_campaign_id`]) —
-/// carried through [`PendingOrchestrationRun`] so `spawn_run` can register
-/// `token` under it in `AppState::campaigns`, which is what makes `POST
+/// carried through [`PendingRunToken`] so `spawn_run` can register `token`
+/// under it in `AppState::campaigns`, which is what makes `POST
 /// /campaigns/{id}/abort` reach a live campaign at all.
 /// The step-progress observer type `with_step_observer` takes — aliased so
 /// [`build_orchestration_seams`]'s return type reads cleanly.
@@ -164,10 +187,10 @@ pub(crate) fn build_orchestration_seams(
 ) -> (CancellationToken, StepObserverArc) {
     let token = CancellationToken::new();
     let fanout: Arc<RwLock<Option<StepFanoutContext>>> = Arc::new(RwLock::new(None));
-    set_pending_orchestration_run(PendingOrchestrationRun {
+    set_pending_run_token(PendingRunToken {
         token: token.clone(),
-        fanout: fanout.clone(),
-        campaign_id,
+        fanout: Some(fanout.clone()),
+        campaign_id: Some(campaign_id),
     });
 
     let observer_fanout = fanout.clone();
@@ -192,6 +215,24 @@ pub(crate) fn build_orchestration_seams(
     });
 
     (token, step_observer)
+}
+
+/// Mint a fresh `CancellationToken` for one `SDLC_FLOW`/`SDLC_TASK`
+/// dispatch and stash the handoff [`set_pending_run_token`] so
+/// `suspend::spawn_run` adopts it under the run's id — the same journey
+/// [`build_orchestration_seams`] makes for ORCHESTRATION, minus the
+/// step-progress fan-out and campaign id neither SDLC workflow has
+/// (`fanout`/`campaign_id` are left `None`). Returns the token so the
+/// factory can wire it into the three agent nodes via
+/// `registry_for_policy_with_cancellation` before this dispatch returns.
+pub(crate) fn mint_and_publish_run_token() -> CancellationToken {
+    let token = CancellationToken::new();
+    set_pending_run_token(PendingRunToken {
+        token: token.clone(),
+        fanout: None,
+        campaign_id: None,
+    });
+    token
 }
 
 /// The process-global repo registry (EN.3.K): `set_repo_registry` /
@@ -337,8 +378,17 @@ pub fn register_sdlc_flow_with_registry(
                 &ctx, &source,
             )
             .map_err(|err| err.to_string())?;
+            // EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2:
+            // mint this run's token and publish it the same way ORCHESTRATION
+            // does, so `suspend::spawn_run` adopts it under the run_id and
+            // `POST /events/{run_id}/abort` reaches the exact token the three
+            // agent nodes below hold.
+            let token = mint_and_publish_run_token();
             let mut registry =
-                engine_core::workflows::sdlc_flow::graph::registry_for_policy(&policy);
+                engine_core::workflows::sdlc_flow::graph::registry_for_policy_with_cancellation(
+                    &policy,
+                    Some(token),
+                );
             if let Some(reg) = repo_reg.clone() {
                 registry.register(Box::new(SetupWorktreeNode::new().with_registry(reg)));
             }
@@ -420,8 +470,17 @@ pub fn register_sdlc_task_with_registry(
                 &ctx, &source,
             )
             .map_err(|err| err.to_string())?;
+            // EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2:
+            // mint this run's token and publish it the same way ORCHESTRATION
+            // does, so `suspend::spawn_run` adopts it under the run_id and
+            // `POST /events/{run_id}/abort` reaches the exact token the agent
+            // nodes below hold.
+            let token = mint_and_publish_run_token();
             let mut registry =
-                engine_core::workflows::sdlc_task::graph::registry_for_policy(&policy);
+                engine_core::workflows::sdlc_task::graph::registry_for_policy_with_cancellation(
+                    &policy,
+                    Some(token),
+                );
             if let Some(reg) = repo_reg.clone() {
                 registry.register(Box::new(
                     SetupWorktreeNode::new()
@@ -1279,6 +1338,116 @@ mod tests {
             Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
             Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
         }
+    }
+
+    // --- pending-run token handoff, generalized to SDLC_FLOW/SDLC_TASK
+    //     (EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2) ---
+
+    /// [`mint_and_publish_run_token`] must stash the EXACT SAME token
+    /// instance it returns — not a fresh clone that could diverge — since
+    /// `suspend::spawn_run` registers `pending.token` under `run_id` (what
+    /// `POST /events/{run_id}/abort` triggers) while the SDLC factory embeds
+    /// the *returned* token into its three agent nodes. Two tokens that can
+    /// diverge would look like a fix while being none (spec acceptance
+    /// criterion), so this is asserted directly: cancelling the returned
+    /// token must be visible through the pending one, proving they share
+    /// the same underlying `watch` channel rather than merely starting
+    /// equal.
+    #[test]
+    fn mint_and_publish_run_token_stashes_the_exact_token_it_returns() {
+        let token = mint_and_publish_run_token();
+        let pending = take_pending_run_token()
+            .expect("mint_and_publish_run_token must stash a pending run token");
+
+        assert!(
+            pending.fanout.is_none(),
+            "SDLC_FLOW/SDLC_TASK have no step-progress fan-out, unlike ORCHESTRATION"
+        );
+        assert!(
+            pending.campaign_id.is_none(),
+            "SDLC_FLOW/SDLC_TASK have no campaign concept, unlike ORCHESTRATION"
+        );
+        assert!(!token.is_cancelled());
+        assert!(!pending.token.is_cancelled());
+
+        token.cancel();
+
+        assert!(
+            pending.token.is_cancelled(),
+            "pending.token must be the SAME instance mint_and_publish_run_token \
+             returned to the caller, not an independent copy"
+        );
+    }
+
+    /// `SDLC_FLOW`'s served factory (`register_sdlc_flow_with_registry`)
+    /// must publish a pending run token on every dispatch — the same
+    /// journey `build_orchestration_seams` makes for ORCHESTRATION — so
+    /// `suspend::spawn_run` adopts a node-embedded token under the run's id
+    /// and an abort issued mid-call actually reaches the agent nodes. No
+    /// fan-out/campaign id, unlike ORCHESTRATION: `SDLC_FLOW` has neither
+    /// concept.
+    #[test]
+    fn sdlc_flow_dispatch_publishes_a_pending_run_token() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_flow_with_registry(&mut dispatcher, None);
+
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_FLOW", &serde_json::json!({ "spec_slug": "my-spec" }))
+            .expect("SDLC_FLOW should dispatch to a runnable Workflow");
+        let _ = workflow;
+
+        let pending = take_pending_run_token().expect(
+            "SDLC_FLOW's factory must publish a pending run token \
+             (EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2)",
+        );
+        assert!(!pending.token.is_cancelled());
+        assert!(pending.fanout.is_none());
+        assert!(pending.campaign_id.is_none());
+    }
+
+    /// Same proof as above for `SDLC_TASK`'s served factory.
+    #[test]
+    fn sdlc_task_dispatch_publishes_a_pending_run_token() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task_with_registry(&mut dispatcher, None);
+
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_TASK", &serde_json::json!({ "spec_slug": "my-spec" }))
+            .expect("SDLC_TASK should dispatch to a runnable Workflow");
+        let _ = workflow;
+
+        let pending = take_pending_run_token().expect(
+            "SDLC_TASK's factory must publish a pending run token \
+             (EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2)",
+        );
+        assert!(!pending.token.is_cancelled());
+        assert!(pending.fanout.is_none());
+        assert!(pending.campaign_id.is_none());
+    }
+
+    /// Two separate dispatches must each mint their OWN token — a shared
+    /// token across two runs would let one run's abort silently cancel the
+    /// other.
+    #[test]
+    fn sdlc_flow_dispatch_mints_a_fresh_token_per_dispatch() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_flow_with_registry(&mut dispatcher, None);
+
+        dispatcher
+            .dispatch_with_event("SDLC_FLOW", &serde_json::json!({ "spec_slug": "spec-one" }))
+            .expect("first dispatch should succeed");
+        let first = take_pending_run_token().expect("first dispatch should publish a token");
+
+        dispatcher
+            .dispatch_with_event("SDLC_FLOW", &serde_json::json!({ "spec_slug": "spec-two" }))
+            .expect("second dispatch should succeed");
+        let second = take_pending_run_token().expect("second dispatch should publish a token");
+
+        first.token.cancel();
+        assert!(
+            !second.token.is_cancelled(),
+            "each dispatch must mint an independent token, not reuse one"
+        );
     }
 
     // --- repo registry seam (EN.3.K task 4) ---------------------------------

@@ -69,6 +69,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cancellation::CancellationToken;
 use crate::node::NodeRegistry;
 use crate::nodes::openai_compat_transport::openai_compat_meta_transport_live;
 use crate::schema::{NodeConfig, WorkflowSchema};
@@ -277,12 +278,44 @@ fn real_cloud_transport() -> ModelTransport {
 /// no longer needs the `to_sdlc_policy()` projection at all.
 #[must_use]
 pub fn registry_for_policy(policy: &SdlcTaskPolicy) -> NodeRegistry {
+    registry_for_policy_with_cancellation(policy, None)
+}
+
+/// Like [`registry_for_policy`], but additionally wires `token` — when
+/// given — into `ImplementTaskNode` and `TriageTaskNode` via their
+/// `with_cancellation_token` builder (`EN.ticket.abort-must-interrupt-an-
+/// in-flight-agent-node`), mirroring
+/// `sdlc_flow::graph::registry_for_policy_with_cancellation`. `SDLC_TASK`
+/// registers no `ConsolidatedReviewNode`, so there is no third node here.
+/// `token: None` reproduces [`registry_for_policy`] exactly.
+#[must_use]
+pub fn registry_for_policy_with_cancellation(
+    policy: &SdlcTaskPolicy,
+    token: Option<CancellationToken>,
+) -> NodeRegistry {
     let mut registry = registry();
 
-    if policy.model_tiers.triage == ModelTier::Local {
-        registry.register(Box::new(TriageTaskNode::new().with_meta_transport(
-            openai_compat_meta_transport_live(policy.local.clone(), real_cloud_transport()),
-        )));
+    let triage_local = policy.model_tiers.triage == ModelTier::Local;
+    if triage_local || token.is_some() {
+        let mut node = TriageTaskNode::new();
+        if triage_local {
+            node = node.with_meta_transport(openai_compat_meta_transport_live(
+                policy.local.clone(),
+                real_cloud_transport(),
+            ));
+        }
+        if let Some(t) = token.clone() {
+            node = node.with_cancellation_token(t);
+        }
+        registry.register(Box::new(node));
+    }
+
+    if let Some(t) = token {
+        registry.register(Box::new(
+            ImplementTaskNode::new()
+                .with_config(agentic_write_config("claude-sonnet-4-5"))
+                .with_cancellation_token(t),
+        ));
     }
 
     registry
@@ -466,6 +499,37 @@ mod tests {
         for identity in EXPECTED_IDENTITIES {
             assert!(policy_registry.contains(identity));
         }
+    }
+
+    // --- registry_for_policy_with_cancellation
+    //     (EN.ticket.abort-must-interrupt-an-in-flight-agent-node task 2) ---
+
+    #[test]
+    fn registry_for_policy_with_cancellation_none_matches_registry_for_policy() {
+        let policy = SdlcTaskPolicy::default();
+        let plain = registry_for_policy(&policy);
+        let with_none = registry_for_policy_with_cancellation(&policy, None);
+
+        assert_eq!(plain.len(), with_none.len());
+        assert!(with_none.contains("ImplementTaskNode"));
+        assert!(with_none.contains("TriageTaskNode"));
+    }
+
+    #[test]
+    fn registry_for_policy_with_cancellation_some_still_contains_both_agent_nodes() {
+        // Structural check only — behavioral proof that the SAME token
+        // instance reaches each node lives in `task_loop.rs`'s
+        // `with_cancellation_token` tests (task 1) plus `engine-serve`'s
+        // `mint_and_publish_run_token_stashes_the_exact_token_it_returns`
+        // (task 2).
+        let policy = SdlcTaskPolicy::default();
+        let plain = registry_for_policy(&policy);
+        let token = CancellationToken::new();
+        let with_token = registry_for_policy_with_cancellation(&policy, Some(token));
+
+        assert_eq!(plain.len(), with_token.len());
+        assert!(with_token.contains("ImplementTaskNode"));
+        assert!(with_token.contains("TriageTaskNode"));
     }
 
     #[test]

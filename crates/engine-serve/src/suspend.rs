@@ -264,9 +264,10 @@ pub(crate) struct SpawnedRun {
     pub runs: RunRegistry,
     /// `EN.11.F` task 2 follow-up: the campaign-scoped registry `spawn_run`
     /// registers this run's token into, keyed by campaign id, when this
-    /// dispatch is an ORCHESTRATION run carrying a `PendingOrchestrationRun`
-    /// -- a no-op for every other workflow type. See
-    /// `crate::abort::CampaignRegistry` and `AppState::campaigns`.
+    /// dispatch is an ORCHESTRATION run carrying a `PendingRunToken` with a
+    /// `campaign_id` -- a no-op for every other workflow type, including
+    /// `SDLC_FLOW`/`SDLC_TASK`, whose `PendingRunToken` has no campaign id.
+    /// See `crate::abort::CampaignRegistry` and `AppState::campaigns`.
     pub campaigns: CampaignRegistry,
     pub token: CancellationToken,
     pub pause: PauseSignal,
@@ -412,45 +413,58 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
         budget,
     } = spawned;
 
-    // Set below when this dispatch's `PENDING_ORCHESTRATION_RUN` carries a
-    // campaign id (`EN.11.F` task 2 follow-up) -- `None` for every
-    // non-ORCHESTRATION run. Captured here, outside the `if let` below, so
-    // it survives to the deregistration at the end of this function.
+    // Set below when this dispatch's `PENDING_RUN_TOKEN` carries a campaign
+    // id (`EN.11.F` task 2 follow-up) -- `None` for every non-ORCHESTRATION
+    // run, `SDLC_FLOW`/`SDLC_TASK` included (`EN.ticket.abort-must-
+    // interrupt-an-in-flight-agent-node` task 2: they publish a pending
+    // token with no campaign concept). Captured here, outside the `if let`
+    // below, so it survives to the deregistration at the end of this
+    // function.
     let mut campaign_id: Option<uuid::Uuid> = None;
 
-    // EN.ticket.orchestration-abort-and-progress task 4: an ORCHESTRATION
-    // dispatch's factory (`workflows::register_orchestration_with_registry`)
-    // builds its own `CancellationToken` and step-progress fan-out cell up
-    // front — it runs *before* this run's `run_id`/`token` above even exist
-    // — and hands both off via a thread-local; see
-    // `workflows::PENDING_ORCHESTRATION_RUN`'s doc for why a thread-local
-    // (not a process-global) is what's race-safe here. When present, this
-    // run's *effective* token becomes that node-embedded one, re-registered
-    // under `run_id` so `POST /events/{run_id}/abort` triggers the exact
-    // token `integrate_chain` is checking — not the one just discarded —
-    // and the fan-out context the node's step observer needs is filled in
-    // before the workflow ever runs. Every other workflow type (and a
-    // pathological cross-thread ORCHESTRATION dispatch) never has anything
-    // pending here, so `token` stays exactly what it was before this seam
-    // existed.
-    let token = if let Some(pending) = crate::workflows::take_pending_orchestration_run() {
-        if let Ok(mut guard) = pending.fanout.write() {
-            *guard = Some(crate::workflows::StepFanoutContext {
-                run_id,
-                live: live.clone(),
-                durable: durable.clone(),
-                workflow_type: workflow_type.clone(),
-                data: data.clone(),
-            });
+    // EN.ticket.orchestration-abort-and-progress task 4 (generalized beyond
+    // ORCHESTRATION by EN.ticket.abort-must-interrupt-an-in-flight-agent-node
+    // task 2): a dispatch's factory
+    // (`workflows::register_orchestration_with_registry`,
+    // `workflows::register_sdlc_flow_with_registry`, or
+    // `workflows::register_sdlc_task_with_registry`) builds its own
+    // `CancellationToken` (and, for ORCHESTRATION only, a step-progress
+    // fan-out cell + campaign id) up front — it runs *before* this run's
+    // `run_id`/`token` above even exist — and hands it off via a
+    // thread-local; see `workflows::PENDING_RUN_TOKEN`'s doc for why a
+    // thread-local (not a process-global) is what's race-safe here. When
+    // present, this run's *effective* token becomes that node-embedded one,
+    // re-registered under `run_id` so `POST /events/{run_id}/abort` triggers
+    // the exact token the run's nodes are checking — not the one just
+    // discarded — and, when a fan-out cell is present (ORCHESTRATION only),
+    // the context the node's step observer needs is filled in before the
+    // workflow ever runs. Every other dispatch (and a pathological
+    // cross-thread dispatch whose setter and this call land on different
+    // threads) never has anything pending here, so `token` stays exactly
+    // what it was before this seam existed.
+    let token = if let Some(pending) = crate::workflows::take_pending_run_token() {
+        if let Some(fanout) = &pending.fanout {
+            if let Ok(mut guard) = fanout.write() {
+                *guard = Some(crate::workflows::StepFanoutContext {
+                    run_id,
+                    live: live.clone(),
+                    durable: durable.clone(),
+                    workflow_type: workflow_type.clone(),
+                    data: data.clone(),
+                });
+            }
         }
         runs.register(run_id, pending.token.clone());
         // `EN.11.F` task 2 follow-up: register the SAME token under this
         // run's campaign id too, so `POST /campaigns/{id}/abort` can find
         // and trigger it -- without this, `AppState::campaigns` is never
         // populated in production and every campaign abort 404s regardless
-        // of whether the campaign is actually live.
-        campaigns.register(pending.campaign_id, pending.token.clone());
-        campaign_id = Some(pending.campaign_id);
+        // of whether the campaign is actually live. `SDLC_FLOW`/`SDLC_TASK`
+        // publish no campaign id, so this is a no-op for them.
+        if let Some(cid) = pending.campaign_id {
+            campaigns.register(cid, pending.token.clone());
+            campaign_id = Some(cid);
+        }
         pending.token
     } else {
         token
