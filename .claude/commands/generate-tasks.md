@@ -247,6 +247,13 @@ $ARGUMENTS — one of two input modes:
      behaviour — the two diverge, and the divergence is invisible unless named.
    - **Validation Commands are present** (or `planning/harness.json` → `validation.checks[]` supplies
      them as the fallback).
+   - **Every `expect_red` entry is a subset of that same task's own `validation_commands`, and never
+     names a project-wide harness check.** A task with no `expect_red` field is unaffected by this
+     rule and needs no further check. Where `expect_red` is set, confirm each entry string also
+     appears, verbatim, in that task's own `validation_commands` array — an entry that does not is a
+     spec error, revise it in place — and confirm no entry names one of
+     `planning/harness.json` → `validation.checks[]`'s `gates: true` commands; `expect_red` may only
+     invert a command the task itself declared, never a harness gate shared by every concurrent lane.
    - **No leftover template sentinels** — no `{{TOKEN}}`, no literal seed strings the Output Format
      ships (`<placeholder>`-style angle stubs left unfilled, empty AC/Validation bullets, or a
      `tasks.json` task still reading `<Foundational step>`). Do **not** treat legitimate `<...>` in
@@ -443,6 +450,20 @@ comes from skipping the expensive `command` form, not the gating checks themselv
 `max_attempts` — defaults to 3, only set per-task to override. `files` — every task but the final
 Validate task needs ≥1 entry. `dependsOn` — ids that must complete first; the final Validate task
 depends on every other id.
+
+**`expect_red`** — optional; omit it entirely for the ordinary case, which is unaffected: a task with
+no `expect_red` behaves exactly as it always has, no new ceremony required. Set it only for a task
+whose declared deliverable IS a test observed FAILING (D68) — e.g. the first task of a TDD-shaped
+spec that writes a fixture and must show it red against the unfixed target before anything fixes it.
+Shape: `"expect_red": ["<command>", ...]`, a list of command strings. **Every entry MUST also be
+present, verbatim, in that same task's own `validation_commands`** — `expect_red` never introduces a
+new command, it only marks an existing one as inverted. For each named command the fast-test stage
+inverts the verdict: the check PASSES when the command exits NON-ZERO and FAILS when it exits 0.
+`expect_red` can **never** name a project-wide `gates:true` harness check — it is scoped strictly to
+commands the task itself declared, so a task cannot use it to invert a check that guards every
+concurrent lane in the repo; the harness gating checks still render and still gate normally for a
+task carrying `expect_red`. Example:
+`{ "task_id": 1, "title": "Write the fixture and observe it failing", "validation_commands": ["python3 scripts/test_new_thing.py"], "expect_red": ["python3 scripts/test_new_thing.py"], ... }`
 
 
 ### State refresh (do not hand-author `state.json`'s `tasks` field)

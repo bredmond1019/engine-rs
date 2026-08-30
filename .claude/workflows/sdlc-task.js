@@ -454,6 +454,24 @@ const ENUMERATE_SCHEMA = {
         }
       }
     },
+    // expect_red — BT.ticket.sdlc-task-cannot-express-a-deliberate-failing-test. A task whose
+    // declared deliverable IS a test observed FAILING (D68) may name a subset of its own
+    // validation_commands whose verdict is inverted: the check PASSES when that command exits
+    // NON-ZERO and FAILS when it exits 0. Scoped strictly to that task's own validationCommands —
+    // it can never touch a project-wide gates:true harness check (those are computed separately by
+    // gatingChecks() and this field is never consulted there).
+    taskExpectRed: {
+      type: 'array',
+      description: "One entry per task that declares a non-empty expect_red array. Omit tasks whose expect_red is absent or empty. Every command listed here MUST also appear in that same task's own validationCommands entry above — an expect_red command names ONE of the task's own declared checks and inverts its verdict, it does not add a new command.",
+      items: {
+        type: 'object',
+        required: ['taskId', 'commands'],
+        properties: {
+          taskId:   { type: 'integer' },
+          commands: { type: 'array', items: { type: 'string' }, description: "Subset of this task's own validationCommands whose verdict is inverted: PASSES on non-zero exit, FAILS on exit 0." }
+        }
+      }
+    },
     // Hardcoded engine-parse gate — mechanism, not project policy (see renderCheckList). Captures,
     // per task, ONLY the entries of that task's "files" array that live under .claude/workflows/ —
     // never the full files[] list. Omit tasks with no such path.
@@ -1334,7 +1352,13 @@ STEP 4 — Engine-parse gate scan. For each task, look at its "files" array. If 
   engineFiles, where files is ONLY the matching .claude/workflows/ path(s) from that task (never the
   task's other files). Skip every task whose "files" has no such path.
 
-Return via StructuredOutput: hasTasks, allTasks (integers in order), taskChecks, engineFiles, notes.
+STEP 5 — Deliberate-failing-test overrides (D68). For each task whose "expect_red" is present AND a
+  non-empty array, add {taskId, commands} to taskExpectRed. Skip every task whose "expect_red" is
+  absent, null, or []. Copy the command strings VERBATIM. Do NOT validate the subset rule yourself —
+  the engine enforces it after this call; just report exactly what tasks.json contains.
+
+Return via StructuredOutput: hasTasks, allTasks (integers in order), taskChecks, taskExpectRed,
+engineFiles, notes.
 `
 
 let enumResult = await tracedAgent(ENUMERATE_PROMPT, withModel({ label: 'enumerate', schema: ENUMERATE_SCHEMA, phase: 'Plan' }, MODEL.enumerate))
@@ -1478,6 +1502,38 @@ if (taskCheckMap.size) {
   log(`Per-task validation overrides (tasks.json validation_commands): ${[...taskCheckMap.keys()].sort((a, b) => a - b).join(', ')} — D63: these AUGMENT the project's gates:true harness checks (fast form) rather than replacing them; each task's own commands run in addition, never instead.`)
 }
 
+// expect_red (BT.ticket.sdlc-task-cannot-express-a-deliberate-failing-test, D68) — a task whose
+// declared deliverable IS a test observed FAILING may invert the verdict of a NAMED SUBSET of its
+// own validation_commands. Enforced here, in the engine, not only in the docs: every expect_red
+// entry MUST also appear in that same task's own validationCommands (taskCheckMap above) — an entry
+// that does not is a hard spec error, refused outright, never silently ignored or downgraded to a
+// warning. BOUNDARY (D68): expect_red can never touch a project-wide gates:true harness check — it
+// is scoped strictly to that task's own validation_commands, so it can never invert or suppress a
+// harness check; gatingChecks() below computes the harness gating set and never consults this map.
+//
+// NOTE: this block sits ABOVE the manifest-pinned isolation-and-branch-naming /
+// triage-bail-taxonomy / bookkeep-vault-commit anchor line ranges scripts/skill_sync_manifest.json
+// and scripts/engine_docs_sync_manifest.json pin — inserting it here shifts every one of those
+// ranges even though none of their described behavior changed. That is expected (see this ticket's
+// task 4 description) and is fixed by re-reading the anchor content against the guide/docs, then
+// `python3 scripts/check_skill_sync.py --update` and `python3 scripts/check_engine_docs_sync.py
+// --update` — never by moving this block to dodge the shift.
+const taskExpectRedMap = new Map()
+for (const er of (enumResult.taskExpectRed || [])) {
+  if (!er || !Number.isInteger(er.taskId) || !Array.isArray(er.commands) || !er.commands.length) continue
+  const ownCommands = taskCheckMap.get(er.taskId) || []
+  const invalidEntries = er.commands.filter(c => !ownCommands.includes(c))
+  if (invalidEntries.length) {
+    log(`ABORTED (spec error) — task ${er.taskId}'s expect_red names command(s) not present in its own validation_commands: ${JSON.stringify(invalidEntries)}. expect_red must be a subset of that task's own validation_commands (it can never invert a project-wide gates:true harness check).`)
+    return { error: 'expect_red not a subset of validation_commands', blockId, taskId: er.taskId, invalidEntries }
+  }
+  taskExpectRedMap.set(er.taskId, new Set(er.commands))
+}
+function expectRedFor(taskNum) { return taskExpectRedMap.get(taskNum) || new Set() }
+if (taskExpectRedMap.size) {
+  log(`Per-task expect_red overrides (inverted-verdict, D68): ${[...taskExpectRedMap.keys()].sort((a, b) => a - b).join(', ')} — each named command PASSES on a NON-ZERO exit and FAILS on exit 0; every other check on that task's list is judged normally.`)
+}
+
 // D63 — shared validated: vocabulary (identical strings in sdlc-flow.js, per the ADR). A pass
 // always lands on exactly one of these three; never a fourth ad hoc label.
 const VALIDATED_LABEL = {
@@ -1586,10 +1642,25 @@ const BAIL_REASONS = [
 // renderCheckList emits, so the test agent's instructions are identical either way. `startIndex`
 // (D63) lets this continue the numbering after the harness gating checks it now augments, rather
 // than restarting at CHECK 1 and colliding with them.
-function renderTaskCheckList(commands, cwd, startIndex = 1) {
+function renderTaskCheckList(commands, cwd, startIndex = 1, expectRedSet = new Set()) {
   const cd = cwd ? `cd ${cwd} && ` : ''
   return commands.map((cmd, i) => {
     const n = startIndex + i
+    if (expectRedSet.has(cmd)) {
+      // expect_red (D68) — this task's declared DELIVERABLE is a test observed FAILING, so this
+      // ONE named command's verdict is inverted from every other check on this list: it PASSES on
+      // a NON-ZERO exit and FAILS on exit 0. The CHECK${n}_EXIT convention is unchanged so the
+      // test agent's parsing stays identical to every other check — only the pass/fail JUDGMENT
+      // of that same exit code is reversed for this command.
+      return `CHECK ${n} — task_validation_${i + 1} (per-task validation_commands override from tasks.json — additive, per D63) [GATING — a failure here blocks the verdict] — EXPECT_RED (D68, INVERTED VERDICT — do not read this as an ordinary check):
+  ${cd}${cmd}
+  echo "CHECK${n}_EXIT:$?"
+  This check's verdict is INVERTED: it PASSES on a NON-ZERO exit and FAILS on exit 0 — the exact
+  opposite of every other check on this list. Judge CHECK${n} ONLY by that inverted rule:
+  CHECK${n}_EXIT != 0 → PASS; CHECK${n}_EXIT == 0 → FAIL. This task's own deliverable is a test
+  that must be observed failing (D68); a zero exit here means the deliverable is missing, not that
+  the task succeeded.`
+    }
     return `CHECK ${n} — task_validation_${i + 1} (per-task validation_commands override from tasks.json — additive, per D63) [GATING — a failure here blocks the verdict]:
   ${cd}${cmd}
   echo "CHECK${n}_EXIT:$?"`
@@ -1717,7 +1788,7 @@ function buildBailPayload(taskNum, t, majorFallback, exhaustionFallback = null) 
   return { stateFile, stateJson: JSON.stringify(snapshot, null, 2), majorFallback, exhaustionFallback }
 }
 
-async function runTests(label, { gatingOnly, taskCommands = null, onPass = null, engineFiles = [] }) {
+async function runTests(label, { gatingOnly, taskCommands = null, expectRedSet = new Set(), onPass = null, engineFiles = [] }) {
   const usingOverride = Array.isArray(taskCommands) && taskCommands.length > 0
   const cd = runDir ? `cd ${runDir} && ` : ''
 
@@ -1745,7 +1816,7 @@ async function runTests(label, { gatingOnly, taskCommands = null, onPass = null,
     const harnessPart = harnessGatingCheckCount > 0
       ? renderCheckList(harnessCfg, { gatingOnly: true, cwd: runDir, engineFiles: [] })
       : ''
-    const taskPart = renderTaskCheckList(taskCommands, runDir, harnessGatingCheckCount + 1)
+    const taskPart = renderTaskCheckList(taskCommands, runDir, harnessGatingCheckCount + 1, expectRedSet)
     const engineChecks = renderEngineParseChecks(engineFiles, cd, harnessGatingCheckCount + taskCommands.length + 1)
     checklistBody = [harnessPart, taskPart, engineChecks].filter(Boolean).join('\n\n')
     overrideNote = harnessGatingCheckCount > 0
@@ -2059,7 +2130,7 @@ Return via StructuredOutput:
       ? VALIDATED_LABEL.ranHarnessList
       : (harnessGatingCheckCount > 0 ? VALIDATED_LABEL.substitutedSubset : VALIDATED_LABEL.ranNoneOfHarnessList)
     const passPayload = buildPassPayload(taskNum, t, passValidatedLabel)
-    const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast', taskCommands: taskCommandsFor(taskNum), onPass: passPayload, engineFiles: engineFilesFor(taskNum) })
+    const testResult = await runTests(`test-${taskNum}-${attempt}`, { gatingOnly: testDepth === 'fast', taskCommands: taskCommandsFor(taskNum), expectRedSet: expectRedFor(taskNum), onPass: passPayload, engineFiles: engineFilesFor(taskNum) })
     if (testResult && testResult.allPassed) {
       t.validated = passValidatedLabel
       // D63 — a task that ran ZERO harness.json gating checks must be VISIBLE in terminal output,

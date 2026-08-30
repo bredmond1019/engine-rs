@@ -383,3 +383,41 @@ Then, only if non-empty:
 
 Silence on the empty lines is the normal case for most of the ~48+ drains a day; do not pad the
 report to look busy.
+
+**Collapsed shape — `no change since`.** When a drain's observed remainder, queue and lease sets
+match the previous drain's exactly, AND all three conditional sections above are empty, emit a
+single collapsed line instead of the full shape:
+
+```
+<UTC timestamp> · no change since <ts of the drain it matched>
+```
+
+Read the two shapes side by side: the full shape is the default whenever anything is uncertain or
+different; the collapsed shape is the exception, earned only when the comparison below proves
+nothing moved.
+
+**Comparison basis — on-disk, not carried between drains.** The commander itself carries nothing
+across drains (see "Stateless per drain" below, unchanged). The basis for "no change" is the last
+`record: "drain"` line already written to `planning/roadmaps/<roadmap>/drain-log.jsonl` by step 6
+— on-disk state that any drain can re-read fresh, not anything held in commander memory. This does
+not weaken statelessness: nothing is carried between drains; the log is read fresh each time.
+
+**The full shape is required, not merely preferred, on any delta** — an unsure full shape drain
+always wins over a guessed collapse.
+
+**Three cases that must never collapse — never collapse in any of these**, as rules, not
+judgement calls:
+1. Non-empty conditional section: any of the three conditional sections above is non-empty — a
+   named recovery item, an alert sent, or anything routed at P0. A collapsed line hiding a P0
+   would turn a recoverable loss (a bored operator) into an unrecoverable one (an unread P0), so
+   this case always wins.
+2. Never collapse when no roadmap resolved: step 6 already degrades-and-reports there, so there
+   is no drain-log record to compare against and therefore no basis for claiming nothing changed.
+3. No prior `drain` record exists in the log for this roadmap. The first drain against a roadmap
+   has nothing to compare to, so it always emits the full shape.
+
+**The drain-log ledger is never collapsed.** `planning/roadmaps/<roadmap>/drain-log.jsonl` keeps
+recording every drain unconditionally, regardless of what the operator-facing report above shows —
+the collapse applies only to this report, never to the ledger. (Its writer, `drain_log.py`, lives
+in the brain repo, outside this document's reach; this section states only what the rule is, not
+how the writer enforces it.)

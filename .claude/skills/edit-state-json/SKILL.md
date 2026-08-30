@@ -344,7 +344,7 @@ Then regenerate derived surfaces — but **rebuild the binary first**:
 ```bash
 mev conformance --check toolchain-freshness   # "rebuild before any --write run" is a real warning
 cargo install --path core/mev                 # if drifted
-mev emit-state --write
+mev emit-state --write --require-fresh
 ```
 
 A stale installed `mev` **reverts** generated boards to an older format. This has happened: an

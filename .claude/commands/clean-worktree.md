@@ -197,7 +197,7 @@ The literal single-token form is output by `/sdlc-task` when it creates a suffix
    from the authored graph — this is the one-way derivation (`focus`, rollups, cache `synced_from`
    watermarks, tier tables, the HQ Operating Board, `master-plan.md` wave tables):
    ```bash
-   mev emit-state --write
+   mev emit-state --write --require-fresh
    ```
    Run it from the main working tree (never a linked worktree — `emit-state` refuses there). If `mev`
    or `brain.toml` is absent (a standalone repo), skip this step silently — the authored flip already

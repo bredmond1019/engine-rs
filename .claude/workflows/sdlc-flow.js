@@ -607,10 +607,11 @@ const PR_VERIFY_SCHEMA = {
   type: 'object',
   required: ['exitCode'],
   properties: {
-    exitCode: { type: 'integer', description: 'the exact process exit code `gh pr view <branch> --json number,url,state` returned — 0 only if a PR was actually found (the branch MUST be passed as the positional argument, never via --head, which is a `gh pr list`-only flag that `gh pr view` rejects as an unknown flag)' },
+    exitCode: { type: 'integer', description: 'the exact process exit code `gh pr view <branch> --json number,url,state,isDraft` returned — 0 only if a PR was actually found (the branch MUST be passed as the positional argument, never via --head, which is a `gh pr list`-only flag that `gh pr view` rejects as an unknown flag)' },
     url:      { type: 'string', description: 'the PR URL if exitCode == 0, else ""' },
     number:   { type: 'integer', description: 'the PR number if exitCode == 0, else 0' },
-    state:    { type: 'string', description: 'OPEN/MERGED/CLOSED if exitCode == 0, else ""' }
+    state:    { type: 'string', description: 'OPEN/MERGED/CLOSED if exitCode == 0, else ""' },
+    isDraft:  { type: 'boolean', description: 'the REMOTE draft state read from `gh pr view`, if exitCode == 0, else false — never the engine\'s own earlier intent' }
   }
 }
 
@@ -622,6 +623,7 @@ const MERGE_SCHEMA = {
     worktreeRemoved: { type: 'boolean', description: 'true if a worktree was removed; false in branch mode (there is none)' },
     branchDeleted: { type: 'boolean' },
     emitStateRan:  { type: 'boolean', description: 'true if `mev emit-state --write` regenerated derived surfaces on the base; false when skipped (mev/brain.toml absent or merge did not complete)' },
+    nonMergeReason: { type: 'string', enum: ['', 'checks-failed', 'attempted-too-early'], description: "when merged == false: 'checks-failed' if `gh pr checks` reported a failing/cancelled check, 'attempted-too-early' if the checks poll never reached a fully non-pending state (or `gh pr merge` itself reported the PR not yet mergeable), '' if merged == true or the non-merge had some other cause. The two failure reasons have opposite remedies, so `merged: false` alone cannot stand in for this." },
     notes:         { type: 'string' }
   }
 }
@@ -2936,22 +2938,23 @@ Return via StructuredOutput: outcome, url, number, draft=${isDraft}, pushed, ghP
     prVerify = await tracedAgent(`${W}
 You independently verify whether a PR exists for a branch. Do NOT trust any other agent's report of
 whether a PR was created — only trust what this command actually returns.
-   cd ${worktreePath} && gh pr view ${branchName} --json number,url,state 2>&1; echo "EXIT:$?"
+   cd ${worktreePath} && gh pr view ${branchName} --json number,url,state,isDraft 2>&1; echo "EXIT:$?"
    The branch MUST be passed as the POSITIONAL argument, exactly as above — do NOT use \`--head
    ${branchName}\`. \`--head\` is a \`gh pr list\`-only flag; \`gh pr view --head <branch>\` fails with
    "unknown flag: --head" and exits 1 before it even looks anything up, which makes every genuinely
    created PR misreport as absent. Run the command exactly as written above.
 Read the literal number after "EXIT:" as the process exit code — do not infer success from output text.
-If exitCode == 0, parse number/url/state from the JSON printed above it. If exitCode != 0, set
-url="", number=0, state="".
-Return via StructuredOutput: exitCode, url, number, state.
+If exitCode == 0, parse number/url/state/isDraft from the JSON printed above it — isDraft is the
+REMOTE's own answer and MUST be read from this call, never assumed from any earlier step. If
+exitCode != 0, set url="", number=0, state="", isDraft=false.
+Return via StructuredOutput: exitCode, url, number, state, isDraft.
 `, withModel({ label: 'pr-verify', schema: PR_VERIFY_SCHEMA, phase: 'Wrap-up' }, MODEL.prVerify))
   }
 
   const verifiedPr = (prVerify && prVerify.exitCode === 0 && prVerify.number) ? prVerify : null
   if (verifiedPr) {
     prOutcome = 'created'
-    state.pr = { url: verifiedPr.url || prInfo?.url || null, number: verifiedPr.number || prInfo?.number || null }
+    state.pr = { url: verifiedPr.url || prInfo?.url || null, number: verifiedPr.number || prInfo?.number || null, draft: !!verifiedPr.isDraft }
     log(`${isDraft ? 'Draft PR' : 'PR'} opened: ${state.pr.url || '(see gh)'}${state.pr.number ? ` (#${state.pr.number})` : ''}`)
     await writeFlowState(`pr #${state.pr.number || '?'}`, `## PR\n${isDraft ? 'Draft ' : ''}${state.pr.url || ''}`, { cwd: worktreePath })
   } else if (prInfo?.outcome === 'impossible') {
@@ -2980,10 +2983,33 @@ surfaces on the base. Be careful and report honestly.
 Branch:   ${branchName}
 ${useWorktree ? `Worktree: ${worktreePath}\n` : ''}PR:       ${state.pr?.number ? '#' + state.pr.number : state.pr?.url || '(look it up)'}
 Base:     ${prBase}
+Verified remote draft state at pr-verify time: ${state.pr?.draft ? 'draft' : 'not draft'}
+
+0. GitHub enforces two prerequisites the merge itself needs — wait for both BEFORE attempting the
+   merge, in this order:
+
+   a. Poll required checks until none is pending:
+      gh pr checks ${state.pr?.number || state.pr?.url}; echo "EXIT:$?"
+      Read the literal number after "EXIT:" as the process exit code — do not infer completion from
+      the output text. Re-run this poll (with a short pause between attempts) until every check
+      reports a terminal, non-pending state. The terminating condition is "no check is pending" —
+      not "the exit code is 0" (a failing check still exits non-zero and is itself terminal). If any
+      check has FAILED, CANCELLED, or otherwise terminally failed (not merely pending), STOP — do NOT
+      attempt the merge. Report merged=false, nonMergeReason="checks-failed", and the failing check
+      name(s) in notes.
+
+   b. If the verified PR is a draft (state.pr.draft above, or re-confirm live with
+      \`gh pr view ${state.pr?.number || state.pr?.url} --json isDraft\`), mark it ready before
+      merging:
+      gh pr ready ${state.pr?.number || state.pr?.url}
 
 1. Merge the PR via gh (delete the remote branch as part of the merge):
    gh pr merge ${state.pr?.number || state.pr?.url} --merge --delete-branch
-   If gh errors (not mergeable, checks pending), STOP — do NOT clean up. Report merged=false + the error in notes.
+   If gh errors because the PR is not yet mergeable (e.g. checks still show as pending despite step
+   0a, or a branch-protection wait condition), STOP — do NOT clean up. Report merged=false,
+   nonMergeReason="attempted-too-early", and the actual error text in notes. If gh errors for any
+   other reason, STOP — do NOT clean up. Report merged=false + the error in notes (nonMergeReason=""
+   unless it is genuinely one of the two cases above).
 
 2. Bring local ${prBase} up to date (this also moves the working tree onto ${prBase}):
    ${GIT} checkout ${prBase} && ${GIT} pull --ff-only
@@ -3014,12 +3040,12 @@ ${useWorktree ? `
    emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement any derived surface. If it warns
    W_EMIT_NO_SENTINEL, surface it in notes rather than hand-authoring the sentinel.
 
-Return via StructuredOutput: merged, worktreeRemoved, branchDeleted, emitStateRan, notes.
+Return via StructuredOutput: merged, worktreeRemoved, branchDeleted, emitStateRan, nonMergeReason, notes.
 `, withModel({ label: 'auto-merge', schema: MERGE_SCHEMA, phase: 'Wrap-up' }, MODEL.merge))
   if (mergeInfo?.merged) {
     log(`Merged into ${prBase}.${useWorktree ? ` Worktree ${mergeInfo.worktreeRemoved ? 'removed' : 'NOT removed'};` : ''} branch ${mergeInfo.branchDeleted ? 'deleted' : 'kept'}; emit-state ${mergeInfo.emitStateRan ? 'ran' : 'skipped'}.`)
   } else {
-    log(`Auto-merge did not complete: ${mergeInfo?.notes || 'unknown'}. ${useWorktree ? `Worktree left intact at ${worktreePath}.` : `Branch ${branchName} left intact.`}`)
+    log(`Auto-merge did not complete${mergeInfo?.nonMergeReason ? ` (${mergeInfo.nonMergeReason})` : ''}: ${mergeInfo?.notes || 'unknown'}. ${useWorktree ? `Worktree left intact at ${worktreePath}.` : `Branch ${branchName} left intact.`}`)
   }
 } else if (autoMerge) {
   log(`--auto-merge skipped: ${bailed ? 'run bailed' : finalVerdict !== 'PASS' ? `verdict ${finalVerdict}` : `no PR created (outcome: ${prOutcome})`}. ${useWorktree ? 'Worktree' : 'Branch'} left intact for review.`)

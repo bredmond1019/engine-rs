@@ -114,16 +114,59 @@ and re-filed as "only a gate prevents recurrence"
   in staged frontmatter does.
 - **`git commit --no-verify` skips it**, same escape hatch as the other hooks.
 
+#### The `created` / `updated` date gate — written, tested, **OFF**
+
+`created` and `updated` were added to `okf_core::OkfFrontmatter` on 2026-08-29 (okf-core
+block `OK.ticket.add-created-updated-frontmatter`). **Nothing in the fleet validates
+them**: okf-core models both as free strings, and mev's OKF validator has no rule for
+either — so a malformed or impossible date is invisible everywhere. `check_frontmatter.py`
+now carries the gate that would catch it, and it is **opt-in and off by default**:
+
+```bash
+OKF_DATE_GATE=1 git commit -m "..."     # gate on, for this commit only
+```
+
+With the gate on, a staged `.md` whose frontmatter parses is additionally checked for:
+
+| Rejected | Why |
+|---|---|
+| `updated: soon` — any non-date value | Not a `YYYY-MM-DD` date |
+| `created: "2026-13-40"` | Shaped like a date, is not one |
+| `created: 2026-08-29T10:00:00Z` | A full timestamp; that shape belongs in `timestamp:` |
+| `updated` earlier than `created` | A doc cannot be revised before it existed |
+
+Absent fields pass — both are optional and the corpus is **not** backfilled. The trap the
+implementation has to handle: PyYAML parses an unquoted `created: 2026-08-29` into a
+`datetime.date`, not a `str`, so a plain regex over the value would reject the commonest
+correct spelling; and `datetime.datetime` is a *subclass* of `date`, so the timestamp case
+must be rejected before the date check, not after.
+
+**Why it is not on.** Turning it on fleet-wide is a separate, deliberate step. The blast
+radius is now measured, and it is nil: of **4,850 tracked `.md` files, 12 carry a
+`created:`/`updated:` field and 0 would be blocked** (scanned 2026-08-29). So the reason
+to wait is not risk to existing files — it is that the hook is inert fleet-wide anyway
+(`pre-push` is `chmod -x`'d; `pre-commit` runs only where `core.hooksPath` is set), and
+nobody has yet decided these fields are worth enforcing at all. To enable: flip
+`date_gate_enabled()` in `hooks/check_frontmatter.py` to default true, re-run the suite,
+then re-sync downstream.
+
 ```bash
 bash hooks/test_pre-commit.sh   # exit 0 = all pass
 ```
 
-10 cases: clean frontmatter passes, an unquoted colon blocks (and names the file:line),
+19 cases — clean frontmatter passes, an unquoted colon blocks (and names the file:line),
 the same value quoted passes, no-frontmatter passes, a non-`.md` staged file with
 YAML-shaped content is ignored, an unstaged broken file is ignored, re-staging a broken
 edit over a clean one blocks (proves it checks the staged blob, not the first `git add`),
 no staged `.md` files at all is a silent no-op, and PyYAML being unimportable (isolated
 PATH to the bare system `python3`, which has no PyYAML) degrades non-fatally.
+
+The date-gate cases pin both halves of the opt-in: one proves a plainly bad date commits
+cleanly with `OKF_DATE_GATE` unset, and the rest set it explicitly and cover the unquoted
+date, the quoted date, a non-date value, a full timestamp, reversed ordering, an
+impossible date, and both fields absent. The env var passes through `git commit` into the
+hook and on into the checker, so they exercise the real path rather than calling the
+function directly.
 
 ### `post-commit` — Brain RAG delete/rename freshness
 

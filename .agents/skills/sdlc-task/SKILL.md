@@ -529,6 +529,15 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
        override, /sdlc-flow end review will reconcile)"**, logged to terminal output too (never
        folded silently into a bare "validated" claim). Otherwise, on a normal project, the label is
        **"substituted a documented subset (gates:true checks still ran)"**.
+     - **`expect_red` (D68) — a task whose declared deliverable is a test observed FAILING.** A task
+       may carry `"expect_red": [<command>, ...]` in `tasks.json`, where every entry MUST also
+       appear in that same task's own `validation_commands` — an entry that does not is a hard spec
+       error (`ABORTED (spec error)`), never silently ignored. For each named command, **invert the
+       verdict**: the check **PASSES on a NON-ZERO exit** and **FAILS on exit 0** — read this
+       explicitly when transcribing the check list, since it is the opposite of every other check.
+       `expect_red` can never touch a project-wide `gates:true` harness check — it is scoped strictly
+       to the task's own declared commands, so the harness checks above still render and still gate
+       normally even on a task that uses it. A task with no `expect_red` is unaffected.
      - Else, render the harness checks (label **"ran the harness list"**): if `testDepth == fast`,
        filter to checks with `gates:true` AND `perTask !== false`; if `full`, run the whole
        `validation.checks[]` list. If no `harness.json`/no matching checks, fall back to the spec's

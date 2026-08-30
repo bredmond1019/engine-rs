@@ -147,11 +147,38 @@ a measurement ("64 structure / 601 state errors versus 0/0 in the main tree") th
 moment the corpus or the worktree machinery changes. The same applies to any carryover caveat this
 lane inherits from a prior run or a sibling lane's notes file. Before treating either as fact:
 re-derive it — the HQ row from a fresh `bastion validate-brain --structure` / `--state` inside a
-real worktree, `base-template`'s from the launch-time-snapshot argument it rests on, and any
-carried-forward caveat from whatever the carryover names — and record the result. An orchestration
-run inherited at least one caveat that had since changed and planned a block on it — this is the
-same failure class `/generate-roadmap`'s Step 2 exists to close ("Inventory, and re-verify before you
-plan on it"); this step is its equivalent for isolation decisions and carryovers.
+real worktree; `base-template`'s row by confirming the launch-time-snapshot argument it rests on is
+still live — list the real `sdlc-*-wf_*.js` engine snapshot copies under
+`~/.claude/projects/<proj>/<session>/workflows/scripts/`. Finding none is the expected state before
+this session's first engine launch, not a failure — it is copies accumulated by *prior* sessions
+that make the control positive, by showing the executed engine already lives outside any worktree
+so a worktree could never have protected a running chain. And re-derive any carried-forward caveat
+from whatever the carryover names — and record the result. An orchestration run inherited at least
+one caveat that had since changed and planned a block on it — this is the same failure class
+`/generate-roadmap`'s Step 2 exists to close ("Inventory, and re-verify before you plan on it");
+this step is its equivalent for isolation decisions and carryovers.
+
+**A re-verification control must exercise the same code path the system actually takes**, not an
+equivalent-looking one — the rule is HQ `CLAUDE.md` standing rule 11 as amended by
+`BT.ticket.positive-control-must-take-the-same-code-path`, and its enforceable form is
+`scripts/check_command_hazards.py`'s `H1_FIX` ("a control must run the SAME tool as the claim it
+licenses, not a substitute that happens to sound related"). It is cited here, not restated. The
+measured failure that earned it: five lanes ran a positive control on 2026-08-23 and all five ran
+it down a path the engine never takes.
+
+**A lane record's own `isolation` field is not exempt from re-verification.** When a lane record
+carries an `isolation` value that differs from the table's row for this repo, the lane must do one
+of two things before planning on it — a bare override is never honoured:
+
+- **record the basis it checked and the command it ran to check it** (e.g. the engine-snapshot
+  listing above, or the fresh `validate-brain` re-run for HQ); or
+- **fall back to the table's value** when no such basis can be produced.
+
+Naming a reason is not the same as checking one: `engine-rs-37` inherited a `--worktree` override
+and justified it as "sibling native-build lanes hold the shared index" — a single command,
+`git -C core/engine-rs rev-parse --git-common-dir`, returns `.git`, a separate repo with a separate
+index, disproving the stated basis outright. A stated-but-unchecked basis is worse than a silent
+pass-through, because it makes an unexamined value look examined.
 
 ## Step 3 — Concurrency
 

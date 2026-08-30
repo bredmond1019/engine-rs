@@ -46,6 +46,10 @@ The spec slug is the directory name under `planning/` (e.g. `<spec-slug>`,
    ```bash
    mkdir -p trees
    ```
+   A Rust repo whose manifest uses `path = "../<crate>"` needs its `trees/` sibling symlinks
+   present before this worktree is usable — see
+   [`docs/workflows/worktrees-in-rust-repos.md`](../../docs/workflows/worktrees-in-rust-repos.md)
+   for why and how to check.
 
 7. **Create the worktree without checkout:**
    ```bash
