@@ -44,6 +44,35 @@ pub fn stamp_completion(metadata: &mut serde_json::Value, status: &str) {
     });
 }
 
+/// The `TaskContext::metadata` key under which a run-level failure marker is
+/// recorded — contract v1.2.0's `metadata.failure`. See [`stamp_failure`].
+pub const FAILURE_METADATA_KEY: &str = "failure";
+
+/// Stamps `metadata.failure = { failed: true, error: message }` so
+/// [`derive_terminal_status`] reports `"failed"` instead of falling through to
+/// its `"succeeded"` default.
+///
+/// Lives here rather than in `engine-serve` (where it started, as a
+/// `pub(crate)` helper) because `engine-core`'s own SDLC wrap-up path needs it
+/// too: a terminal-blocked run routes NORMALLY to `WrapUpNode`, so no node is
+/// `Failed` and nothing else would keep it out of the `succeeded` default.
+/// `engine-serve` depends on `engine-core` and not the reverse, so this is the
+/// only direction that compiles; `engine-serve::http::stamp_failure` is now a
+/// thin `TaskContext`-shaped wrapper over this.
+///
+/// If `metadata` is not already a JSON object it is replaced with one first —
+/// same defensive branch as [`stamp_completion`]. Sibling annotations are
+/// untouched.
+pub fn stamp_failure(metadata: &mut serde_json::Value, message: &str) {
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+    metadata[FAILURE_METADATA_KEY] = serde_json::json!({
+        "failed": true,
+        "error": message,
+    });
+}
+
 /// Returns `true` only when `metadata.completion.terminal == true`.
 ///
 /// Absent, malformed, or explicitly `terminal: false` metadata all return
@@ -66,7 +95,7 @@ pub fn is_complete(metadata: &serde_json::Value) -> bool {
 /// |-----------------------------------------------------------------------|-----------------|
 /// | `metadata.cancellation.cancelled == true` (`CANCELLATION_METADATA_KEY`, [`crate::cancellation::stamp_cancelled`]) | `cancelled` |
 /// | `metadata.budget.halted == true` (`BUDGET_METADATA_KEY`, [`crate::workflow::stamp_budget_halt`]) | `budget_halted` |
-/// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
+/// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, [`stamp_failure`] — stamped by the SDLC `WrapUpNode` on a terminal-blocked/`reconcile_failed` run, by the suspension and orphan sweeps, and by any external producer), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
 /// | none of the above                                                    | `succeeded`     |
 pub fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
     let cancelled = snapshot
@@ -91,7 +120,7 @@ pub fn derive_terminal_status(snapshot: &TaskContext) -> &'static str {
 
     let failure_marker = snapshot
         .metadata
-        .get("failure")
+        .get(FAILURE_METADATA_KEY)
         .and_then(|v| v.get("failed"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -275,6 +304,52 @@ mod derive_terminal_status_tests {
             },
         );
         assert_eq!(derive_terminal_status(&ctx), "failed");
+    }
+
+    #[test]
+    fn stamp_failure_keeps_a_terminal_blocked_run_out_of_the_succeeded_default() {
+        // An SDLC MAJOR_BAIL run: routed NORMALLY to `WrapUpNode`, so its
+        // `node_runs` are all clean and nothing but the stamped marker
+        // distinguishes it from a success.
+        let mut ctx = empty_context(serde_json::json!({}));
+        assert_eq!(
+            derive_terminal_status(&ctx),
+            "succeeded",
+            "unstamped: the defect's baseline"
+        );
+
+        super::stamp_failure(
+            &mut ctx.metadata,
+            "SDLC run ended blocked: Max attempts (3) reached without a passing run.",
+        );
+
+        assert_ne!(derive_terminal_status(&ctx), "succeeded");
+        assert_eq!(derive_terminal_status(&ctx), "failed");
+        assert_eq!(ctx.metadata["failure"]["failed"], serde_json::json!(true));
+        assert!(ctx.metadata["failure"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Max attempts"));
+    }
+
+    #[test]
+    fn stamp_failure_replaces_non_object_metadata_and_preserves_siblings() {
+        let mut metadata = serde_json::Value::Null;
+        super::stamp_failure(&mut metadata, "boom");
+        assert_eq!(metadata["failure"]["failed"], serde_json::json!(true));
+
+        let mut metadata = serde_json::json!({
+            "completion": { "terminal": true, "status": "failed" },
+            "budget": { "halted": false },
+        });
+        super::stamp_failure(&mut metadata, "boom");
+        assert_eq!(
+            metadata["completion"]["terminal"],
+            serde_json::json!(true),
+            "sibling annotations survive"
+        );
+        assert_eq!(metadata["budget"]["halted"], serde_json::json!(false));
+        assert_eq!(metadata["failure"]["error"], serde_json::json!("boom"));
     }
 
     #[test]

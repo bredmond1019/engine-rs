@@ -915,6 +915,31 @@ impl Node for WrapUpNode {
 
         put_result(&mut ctx, "WrapUpNode", output);
 
+        // A terminal-blocked run reached this node NORMALLY: `TriageRouterNode`'s
+        // `MAJOR_BAIL` arm and `ReviewRouterNode`'s structural arm both route
+        // straight here rather than erroring, so no `node_runs[..]` entry is
+        // `Failed` and `metadata.failure` was never stamped. `derive_terminal_status`
+        // (`crate::completion`) therefore fell through to its `succeeded` default,
+        // and `GET /events/{event_id}` reported a bailed run as a success (observed
+        // on run 5be90c46: `succeeded` against an artifact reading
+        // `status: "blocked"`, `tasks_passed: 0`,
+        // `review_verdicts: ["TriageTaskNode:MAJOR_BAIL"]`, empty worktree diff).
+        //
+        // Stamping the existing `metadata.failure` marker — rather than teaching
+        // `derive_terminal_status` about SDLC-specific state — keeps the readback
+        // vocabulary at `succeeded|failed|cancelled|budget_halted` and keeps that
+        // function free of any knowledge of one particular workflow. `cancellation`
+        // and `budget` are checked ahead of `failure`, so a cancelled or
+        // budget-halted run still reports its own more specific status.
+        if terminal_signal.is_some() {
+            let reason = state.bail_reason.as_deref().unwrap_or("terminal signal");
+            let global_status = &state.global_status;
+            crate::completion::stamp_failure(
+                &mut ctx.metadata,
+                &format!("SDLC run ended {global_status}: {reason}"),
+            );
+        }
+
         Ok(ctx)
     }
 
@@ -1074,6 +1099,70 @@ mod tests {
         let stamped: SDLCState = serde_json::from_value(result["state"].clone()).unwrap();
         assert_eq!(stamped.telemetry.tasks_failed, 0);
         assert_eq!(stamped.global_status, "blocked");
+    }
+
+    /// The P0 this fixes (run `5be90c46`): `GET /events/{event_id}` reported
+    /// `succeeded` for a `MAJOR_BAIL` run whose artifact read
+    /// `status: "blocked"`, `tasks_passed: 0`,
+    /// `review_verdicts: ["TriageTaskNode:MAJOR_BAIL"]`, with an empty
+    /// worktree diff. A bail routes NORMALLY here, so no `node_runs[..]` is
+    /// `Failed` and `metadata.failure` was never stamped — the run fell
+    /// through `derive_terminal_status`'s `succeeded` default. Pins that the
+    /// terminal snapshot this node hands back no longer derives `succeeded`.
+    #[tokio::test]
+    async fn wrap_up_stamps_failure_metadata_on_major_bail() {
+        let mut state = SDLCState::new("EN.3.B-sdlc-flow-docs-wrapup-pr");
+        state.telemetry.tasks_passed = 0;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 3;
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            "TriageTaskNode".to_string(),
+            json!({
+                "verdict": "MAJOR_BAIL",
+                "reason": "Max attempts (3) reached without a passing run.",
+            }),
+        );
+
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-30"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.metadata["failure"]["failed"], json!(true));
+        let error = out.metadata["failure"]["error"].as_str().unwrap();
+        assert!(error.contains("blocked"), "error names the status: {error}");
+        assert!(
+            error.contains("Max attempts (3) reached without a passing run."),
+            "error carries the bail reason: {error}"
+        );
+
+        assert_ne!(crate::completion::derive_terminal_status(&out), "succeeded");
+        assert_eq!(crate::completion::derive_terminal_status(&out), "failed");
+    }
+
+    /// The negative control for
+    /// `wrap_up_stamps_failure_metadata_on_major_bail`: a clean run must NOT
+    /// be stamped, or every successful run would read back as `failed`.
+    #[tokio::test]
+    async fn wrap_up_does_not_stamp_failure_metadata_on_a_clean_run() {
+        let mut state = SDLCState::new("EN.3.B-sdlc-flow-docs-wrapup-pr");
+        state.telemetry.tasks_passed = 2;
+        state.telemetry.tasks_failed = 0;
+        state.telemetry.total_attempts = 2;
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+
+        let ctx = ctx_with_state(&state);
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-08-30"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert!(
+            out.metadata.get("failure").is_none(),
+            "a clean run must not be stamped: {}",
+            out.metadata
+        );
+        assert_eq!(crate::completion::derive_terminal_status(&out), "succeeded");
     }
 
     /// The other terminal-signal source: a structural `ConsolidatedReviewNode`

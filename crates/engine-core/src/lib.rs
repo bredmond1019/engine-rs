@@ -39,7 +39,8 @@ pub use budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger, Campaig
 pub use build_info::engine_build_sha;
 pub use cancellation::{stamp_cancelled, CancellationToken, CANCELLATION_METADATA_KEY};
 pub use completion::{
-    derive_terminal_status, is_complete, stamp_completion, COMPLETION_METADATA_KEY,
+    derive_terminal_status, is_complete, stamp_completion, stamp_failure, COMPLETION_METADATA_KEY,
+    FAILURE_METADATA_KEY,
 };
 pub use dispatch::{DispatchError, Dispatcher, WorkflowFactory};
 pub use locale::{Currency, Locale};

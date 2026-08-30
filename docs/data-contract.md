@@ -171,9 +171,19 @@ the orchestrator's Celery worker when a workflow raises inside `process_incoming
 fresh session that survives the enclosing transaction's rollback: `{ "failure": { "failed": true,
 "error": "<ExcType>: <msg>", "at": "<iso8601>" } }`. Like `cancellation` and `budget`, it lives in
 the existing `TaskContext::metadata: serde_json::Value` free-form field — no `engine_contract`
-Rust type changes shape. engine-rs's own execution path (`Workflow::run_with`) does not yet stamp
-`metadata.failure` on a raising run; whether it should is future work, not this re-pin — `§6`'s
-`pending|running|success|failed` `NodeRunStatus` vocabulary is unchanged either way.
+Rust type changes shape. engine-rs's own execution path (`Workflow::run_with`) does not stamp
+`metadata.failure` on a raising run — a raising node is already `NodeRunStatus::Failed`, which the
+derivation table below catches on its own. `§6`'s `pending|running|success|failed` `NodeRunStatus`
+vocabulary is unchanged either way.
+
+engine-rs stamps this marker through `engine_core::stamp_failure(&mut metadata, message)` (the
+`engine-serve` helper of the same name is a thin `TaskContext`-shaped wrapper over it) from three
+places: the suspension path, the orphan sweep, and — since 2026-08-30 — the SDLC `WrapUpNode`, on
+any run that ends `blocked` or `reconcile_failed`. That last case is the one that is not
+self-evident: a terminal-blocked run (`MAJOR_BAIL`, a structural review FAIL, review exhaustion, a
+failed final-validation gate) routes **normally** to `WrapUpNode`, so no `node_runs[..]` entry is
+`Failed` and, unstamped, the run fell through the derivation table to `succeeded`. The `error`
+string carries the derived `global_status` and the run's `bail_reason`.
 
 ### Campaign identity (`§8`, new in v1.8.0, `EN.11.E`)
 
@@ -262,7 +272,7 @@ registers the run but before the first `on_progress` snapshot lands does not get
 |---|---|
 | `metadata.cancellation.cancelled == true` (`engine_core::stamp_cancelled`) | `cancelled` |
 | `metadata.budget.halted == true` (`engine_core::workflow::stamp_budget_halt`) | `budget_halted` |
-| `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
+| `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, stamped by `engine_core::stamp_failure` — the SDLC `WrapUpNode` on a terminal-blocked/`reconcile_failed` run, the suspension and orphan sweeps, and any external producer), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
 | none of the above | `succeeded` |
 
 **Semantic change: `POST /events/` no longer returns `500` on a failed run.** Before EN.5.F, a
@@ -453,3 +463,4 @@ time, not a gate).
 | — | 2026-08-24 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** `EN.4.D` registers a new `workflow_type` value POSTable at the existing `POST /events/` route: `DELIVERABLE_RENDER` (see [deliverable-render-workflow.md](workflows/deliverable-render.md)). Engine-rs-side workflow type only — no new HTTP route, and no `engine_contract` Rust type changed shape (its event payload, carrying an inline `AutomationRoadmap`, is ordinary `data: serde_json::Value` on `POST /events/`, same as every other `workflow_type`). Mirrors the 2026-07-27 `OPPORTUNITY_SET_STAGE`/`OPPORTUNITY_ADD_ACTION` row above. |
 | — | 2026-08-30 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** `EN.ticket.stamp-engine-sha-on-every-run` (engine-rs-side) adds an `engine_build_sha` field to the engine-rs-only `GET /health` response (§ HTTP surface parity above) and to the `SDLC_FLOW`/`SDLC_TASK` run artifact written at wrap-up. Both read the single accessor `engine_core::engine_build_sha()`, so they cannot disagree. **No re-pin**, for the same reason as the 2026-08-24 `GET /c…` row: `/health` has no canonical counterpart, and the run artifact is engine-rs's own `sdlc-*state.json`, not one of the versioned `events`/`task_context`/`NodeRun`/`Usage` shapes this pin tracks. Additive and backward-compatible — an artifact written before this block has no such field and every consumer must read it as **absent**, never as an empty string or a placeholder (`jynx:JX.ticket.record-the-engine-sha` marks an absent SHA `unknown` and refuses to pool such runs, which only works if absent is genuinely absent). A binary built from a dirty tree reports `<sha>-dirty`. |
 | — | 2026-08-29 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** `EN.12.G` registers a new `workflow_type` value POSTable at the existing `POST /events/` route: `DEBRIEF` — a single-node micro-workflow (see [debrief.md](workflows/debrief.md)) that renders a morning brief from one campaign's journal and writes it back as a `JournalDecisionKind::DebriefRendered` row, readable via the existing `GET /campaigns/{id}/journal` route (§ HTTP surface parity above, row updated to list the kind). Engine-rs-side workflow type and a new enum variant on the already engine-rs-only `JournalDecisionKind` only — no `engine_contract::events`/`task_context`/`NodeRun`/`Usage` type changed shape, mirroring the reasoning the `EN.12.L` `RecallConsulted` addition and the `EN.12.D` row above both give for `JournalDecisionKind` sitting outside this contract's pinned shapes. |
+| — | 2026-08-30 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** Fixes a P0 in the engine-rs-only server-derived `status` of `GET /events/{event_id}` (§ HTTP surface parity above): a terminal-**blocked** `SDLC_FLOW`/`SDLC_TASK` run read back as `succeeded` (observed on run `5be90c46`, whose artifact simultaneously read `status: "blocked"`, `tasks_passed: 0`, `review_verdicts: ["TriageTaskNode:MAJOR_BAIL"]`, with an empty worktree diff). A `MAJOR_BAIL` routes **normally** to `WrapUpNode`, so no `node_runs[..].status` is `Failed` and nothing stamped `metadata.failure` — the run fell through the derivation table to its `succeeded` default. `WrapUpNode` now stamps `metadata.failure` (§ Run-level `metadata` annotations above) whenever it derives a `blocked`/`reconcile_failed` `global_status`, so the existing table's `failed` row catches it; `stamp_failure` moved from `engine-serve` into `engine_core::completion` so `engine-core` can reach it, with the `engine-serve` helper kept as a wrapper. **No re-pin**: no `engine_contract` `events`/`task_context`/`NodeRun`/`Usage` type changed shape, no route was added, and the readback vocabulary is unchanged at `succeeded|failed|cancelled|budget_halted` — this is engine-rs stamping an annotation the canonical contract has defined since v1.2.0. `cancellation` and `budget` are still checked ahead of `failure`, so a cancelled or budget-halted run keeps its own more specific status. |

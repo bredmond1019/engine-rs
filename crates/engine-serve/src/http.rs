@@ -439,7 +439,7 @@ pub fn live_run_workflow_type(run_id: Uuid) -> Option<(String, DateTime<Utc>)> {
 /// |-----------------------------------------------------------------------|-----------------|
 /// | `metadata.cancellation.cancelled == true` (`CANCELLATION_METADATA_KEY`, `engine_core::stamp_cancelled`) | `cancelled` |
 /// | `metadata.budget.halted == true` (`BUDGET_METADATA_KEY`, `engine_core::workflow::stamp_budget_halt`) | `budget_halted` |
-/// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, not currently stamped by engine-rs, checked defensively), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
+/// | `metadata.failure.failed == true` (contract v1.2.0's `metadata.failure`, [`stamp_failure`] — stamped by the SDLC `WrapUpNode` on a terminal-blocked/`reconcile_failed` run, by the suspension and orphan sweeps, and by any external producer), or any `node_runs[..].status == NodeRunStatus::Failed` | `failed` |
 /// | none of the above                                                    | `succeeded`     |
 /// An empty `TaskContext`, used as the fallback when a run fails or panics
 /// before `on_progress` ever recorded a snapshot to fall back to.
@@ -455,14 +455,17 @@ pub(crate) fn empty_task_context() -> TaskContext {
 /// Stamp `ctx.metadata.failure = { failed: true, error: message }` so
 /// [`derive_terminal_status`] reports `"failed"` instead of falling through
 /// to its `"succeeded"` default.
+///
+/// The implementation moved into `engine_core::completion::stamp_failure`
+/// (2026-08-30) so `engine-core`'s SDLC `WrapUpNode` can stamp the same
+/// marker — a terminal-blocked run routes normally to that node, so no node
+/// is `Failed` and nothing else keeps the run out of the `succeeded`
+/// default. `engine-serve` depends on `engine-core` and not the reverse, so
+/// the move is the only direction that compiles; this stays as the
+/// `TaskContext`-shaped wrapper the in-crate call sites (`suspend.rs`,
+/// `orphan.rs`) already use.
 pub(crate) fn stamp_failure(ctx: &mut TaskContext, message: &str) {
-    let failure = serde_json::json!({ "failed": true, "error": message });
-    match ctx.metadata.as_object_mut() {
-        Some(metadata) => {
-            metadata.insert("failure".to_string(), failure);
-        }
-        None => ctx.metadata = serde_json::json!({ "failure": failure }),
-    }
+    engine_core::stamp_failure(&mut ctx.metadata, message);
 }
 
 /// Extract a human-readable message from a `catch_unwind` panic payload —
