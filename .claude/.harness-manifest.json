@@ -1,5 +1,5 @@
 {
-  "version": "e489f482729300a5207fa0b4f8f854c59118abe0",
+  "version": "6df2f6c7a73ab01a3fe89c35ad6595d934459163",
   "generated": "2026-08-30",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -69,7 +69,7 @@
     ".claude/workflows/block-registration.md": "f833d6f13c5be896fb020d36845c3df1798611dda419451bc4386faa6b8afdae",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
-    ".claude/skills/write-okf-markdown/SKILL.md": "d5d2b65d7e3982dd5d07412340f6f5b9f78a4a2ba0223d94f19eab50a024f42e",
+    ".claude/skills/write-okf-markdown/SKILL.md": "4c09b29c9c2eee98fe06042b86382e277279524e72021e6932a50570b8a0aadd",
     ".claude/skills/edit-state-json/SKILL.md": "d46a91fb0383b59cb835b7b5ab4812918b55e174eb1d867a7f149c4d8e442262",
     ".claude/skills/commit-in-this-fleet/SKILL.md": "efed90e58188d18556829f513d244f7511bc8f3e68fdd43ec7f56d02b0868333",
     ".claude/skills/derive-state-safely/SKILL.md": "9b02329afbb0ad47b1c91b6075eb20ceef3def424f460572f5b1deb868a63283",
@@ -82,7 +82,7 @@
     "scripts/check_block_records.py": "78e305f58442d8e928c1e05aae031fd8ef84873461c725f3ecda98ff6d1a30e5",
     ".agents/skills/sdlc-task/SKILL.md": "8208a958125b50361d449b303885766f436f5ace985872a9af4909a66f4b2b8c",
     ".agents/skills/sdlc-flow/SKILL.md": "28cee2e886044f8335f60daf9027cd3eab066cb6bff560f79d8592a0275d4616",
-    ".agents/skills/write-okf-markdown/SKILL.md": "d32b82fe0fef2aef6899606fbd02604a0a41c77044024192fdc0690a8a9ceb30",
+    ".agents/skills/write-okf-markdown/SKILL.md": "4c09b29c9c2eee98fe06042b86382e277279524e72021e6932a50570b8a0aadd",
     ".agents/skills/edit-state-json/SKILL.md": "ccc2728a263222d93253f8e9d5e4cd5b474e11d6525d49989afc5fa2df1ab44d",
     ".agents/skills/commit-in-this-fleet/SKILL.md": "a69d0ae450ea9a9839fab1181b28946c4e21e982e67605100cdc440b13698b32",
     ".agents/skills/derive-state-safely/SKILL.md": "bd6e23ea1a953e916d0818ff0dec6752c96d89d101af3ec55b0d38f292d5a608",

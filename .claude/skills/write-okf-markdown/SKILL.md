@@ -1,6 +1,6 @@
 ---
 name: write-okf-markdown
-description: How to create or edit a markdown file in this brain without red-gating the fleet — whether the file needs OKF frontmatter at all, the four traps that break YAML parsing, the index.md row Standing Rule 7 requires, the cross-repo `related:` prefix, and why a relative markdown link that climbs out of `planning/` resolves against the vault instead of the repo. Use BEFORE writing any new `.md` file anywhere in agentic-portfolio or a sub-repo, before adding frontmatter to an existing one, before linking from a planning doc to anything outside `planning/`, and when `bastion validate-brain` reports E_STRUCT_ORPHAN_FILE, E_GRAPH_DANGLING_RELATED, W_GRAPH_ISOLATED_NODE, E_LINK_DEAD_MARKDOWN, or "mapping values are not allowed in this context".
+description: How to create or edit a markdown file in this brain without red-gating the fleet — whether the file needs OKF frontmatter at all, the five traps that red-gate it (four break YAML parsing; the fifth parses fine and only `--sync` catches it), the index.md row Standing Rule 7 requires, the cross-repo `related:` prefix, and why a relative markdown link that climbs out of `planning/` resolves against the vault instead of the repo. Use BEFORE writing any new `.md` file anywhere in agentic-portfolio or a sub-repo, before adding frontmatter to an existing one, before linking from a planning doc to anything outside `planning/`, and when `bastion validate-brain` reports E_STRUCT_ORPHAN_FILE, E_GRAPH_DANGLING_RELATED, W_GRAPH_ISOLATED_NODE, E_LINK_DEAD_MARKDOWN, E_SYNC_WATERMARK_MALFORMED, or "mapping values are not allowed in this context".
 allowed-tools: Bash(bastion:*) Bash(mev:*) Bash(python3:*) Bash(grep:*) Bash(ls:*) Bash(test:*)
 ---
 
@@ -89,11 +89,13 @@ writes), and leave both off rather than let them go stale. Existing docs omit th
 They are not `timestamp` (Log/ProjectStatus freshness, ISO-8601 with timezone, trap 4 below) and not
 `synced_from` (the cross-repo watermark behind `E_SYNC_DRIFT`).
 
-### The four traps that break YAML parsing
+### The five traps that break the gates
 
 `hooks/pre-commit` exists solely because of the first one. It recurred **three times on 2026-08-06
 alone, across three independent agent sessions**, after already being fixed and re-filed as a systemic
 gate the day before.
+
+Traps 1-4 break YAML parsing. Trap 5 parses fine and fails a different gate.
 
 | # | Trap | Why it breaks |
 |---|---|---|
@@ -101,6 +103,48 @@ gate the day before.
 | 2 | **An unquoted `#`** | Starts a comment; the rest of your line vanishes. |
 | 3 | **An em-dash clause in an unquoted plain scalar** | Combined with a colon or `#`, same failure class. Em dashes alone are fine — this is about what surrounds them. |
 | 4 | **A date-only `timestamp`** | `timestamp: 2026-08-19` where full ISO-8601 with timezone is required. This had the pre-push gate **red fleet-wide** on 2026-08-14. |
+| 5 | **A `+0000` UTC offset in `timestamp` or `synced_from`** | Valid ISO-8601, **invalid RFC3339** — the offset needs a colon: `+00:00`. Parses as YAML, passes `--structure`/`--links`/`--graph`/`--state`, then fails `--sync` with `E_SYNC_WATERMARK_MALFORMED`. Measured 2026-08-30. |
+
+#### Trap 5 in detail — the one that looks right
+
+```yaml
+timestamp: "2026-08-30T21:18:50+0000"    # WRONG — no colon in the offset
+timestamp: "2026-08-30T21:18:50+00:00"   # right
+timestamp: "2026-08-30T21:18:50Z"        # also right, and shorter
+```
+
+**Where it comes from.** `date` produces the broken form by default, and **the obvious fix does not
+work on this fleet's machines**. Measured on macOS 2026-08-30:
+
+```bash
+date -u +%Y-%m-%dT%H:%M:%S%z     # 2026-08-30T21:54:54+0000   WRONG (%z has no colon)
+date -u +%Y-%m-%dT%H:%M:%S%:z    # 2026-08-30T21:54:54:z      WORSE — see below
+date -u +%Y-%m-%dT%H:%M:%SZ      # 2026-08-30T21:54:54Z       correct, and the one to use
+```
+
+**`%:z` is a GNU coreutils extension.** BSD `date` — which is what macOS ships, so both a dev Mac
+and the Mac Mini — does not implement it and emits a literal `:z` instead of failing. That is a
+worse value than the bug it was meant to fix, and it fails the same gate. **On this fleet, use the
+`Z` form.**
+
+In Python, `datetime.now(timezone.utc).isoformat()` is correct (`…+00:00`); `strftime("%z")` has
+exactly the same defect as `date` (`…+0000`).
+
+**Why it is worth its own row.** Trap 4 is a *date-only* value, which looks obviously incomplete.
+This one is a full timestamp with a timezone and reads as correct at a glance — and the four gates
+you would normally run all pass, so a careful agent can check its work and still miss it.
+
+**Why it matters more than a one-file mistake.** `--sync` is **corpus-wide**: it compares every
+repo's `status_file` `timestamp` against its `cache_doc` `synced_from`. One malformed value fails
+**every repo's push**, not just the one you touched — the same blast radius as `E_SYNC_DRIFT`
+(see `fleet-push-discipline` §5). Worse, `/log-work` writes both fields from one timestamp, so a
+single bad `date` call plants it in two files at once.
+
+**Check it explicitly.** The four usual flags will not catch it:
+
+```bash
+bastion validate-brain --sync    # the ONLY flag that reads these two fields
+```
 
 **The fix is always the same: quote the scalar.**
 
@@ -282,7 +326,10 @@ separately, in that order, and re-run both after each fix.
 - [ ] In corpus? (Step 1) — if not, none of this applies
 - [ ] Frontmatter present, with `type` / `title` / `description`
 - [ ] Every scalar containing `: ` or `#` is **quoted**
-- [ ] `timestamp` (Log / ProjectStatus only) is full ISO-8601 **with timezone**
+- [ ] `timestamp` (Log / ProjectStatus only) is full ISO-8601 **with timezone**, and the offset is
+      RFC3339 — `Z` or `+00:00`, never `+0000` (trap 5). Same for `synced_from`.
+- [ ] If you touched `timestamp` or `synced_from`, `bastion validate-brain --sync` is clean — no
+      other flag reads them, and this one gates the whole fleet's pushes
 - [ ] If `created` / `updated` are present, they are `YYYY-MM-DD` and `updated` reflects *this* edit
 - [ ] Controlled fields (`layer` / `project` / `status`) use real vocabulary values — check the schema doc
 - [ ] Cross-scope `related:` targets carry a `<scope>:` prefix
