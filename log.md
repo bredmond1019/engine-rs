@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-30T13:35:12Z"
+timestamp: "2026-08-30T18:47:47Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,13 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-08-30]
+
+### jynx defect sweep — eight engine fixes, four tickets, and a stale-harness sync
+- **What:** Fixed eight defects the jynx lane found driving Phase 3 specs through `bastion serve`: a bailed run reporting `succeeded` over HTTP (`e8ad0ef`); implement work escaping the worktree (`9933f98`); `verify_claimed_writes` short-circuiting on the model's own empty self-report (`e5908ee`); passing reviews spending later tasks' review budget (`b451c85`); attempts counted at their outcome so a bail counted none (`f4d57bf`); the worktree planning guard accepting a stale directory and `SpecExistsRouterNode` fabricating a task list for a named spec (`3bdb46a`, `07c8057`); an undeclared router edge (`7fa2629`); and a task marked done whose commit silently failed (`2d9985b`). Plus `engine_build_sha` on bastion's own `/health` (`efb46bf`). Ticketed the four that remained, three still open. Synced 12 stale harness files from base-template (`4b76f6a`).
+- **Why:** The jynx lane pins a daemon build and advances it deliberately, so it needed each run labelled with the build that produced it — and while proving that out it kept finding layers of this engine reporting success on work that never happened. The sweep is those reports worked through. The harness sync came last because a tests-first ticket bailed and left `main` red: engine-rs's engines had no `expect_red`, which base-template has had for a while. Not a missing feature, a sync gap.
+- **Refs:** `planning/orchestration-run/engine-tickets/{notes.md,review.md}`; `planning/handoff.md`; blocks `EN.ticket.bailed-run-reports-succeeded-over-http` and seven siblings.
 
 ## [run: 2026-08-30]
 
