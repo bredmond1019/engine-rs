@@ -20,7 +20,8 @@
 //!
 //! EndReviewRouterNode -> { PatchDocsNode | WrapUpNode }
 //!
-//! TriageRouterNode    -> { ConsolidatedReviewNode | IncrementAttemptNode | WrapUpNode }
+//! TriageRouterNode    -> { ConsolidatedReviewNode | UpdateTaskStatusNode
+//!                        | IncrementAttemptNode | WrapUpNode }
 //! ReviewRouterNode    -> { UpdateTaskStatusNode | IncrementAttemptNode | WrapUpNode }
 //! IncrementAttemptNode -> ImplementTaskNode
 //! ```
@@ -142,6 +143,18 @@ pub fn schema() -> WorkflowSchema {
             "TriageRouterNode",
             vec![
                 "ConsolidatedReviewNode".to_string(),
+                // `UpdateTaskStatusNode` is the review-skipping `PASS`
+                // target: `route`'s `PASS` arm returns it under
+                // `ReviewMode::EndOnly` (always) and under
+                // `ReviewMode::TrivialSkip` (trivial diffs). It was an
+                // UNDECLARED edge until 2026-08-30 — runs worked, because
+                // nothing enforces declared connections at walk time, but
+                // the published `GET /workflows/{type}/graph` shape and any
+                // reachability analysis over it were wrong for two of the
+                // three review modes. Keep this list a superset of every
+                // target `TriageRouterNode::route` can return; the
+                // `router_connections_declared` integration test enforces it.
+                "UpdateTaskStatusNode".to_string(),
                 "IncrementAttemptNode".to_string(),
                 "WrapUpNode".to_string(),
             ],

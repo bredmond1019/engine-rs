@@ -50,6 +50,7 @@ mod research_agent_e2e;
 mod research_agent_grounding_e2e;
 mod research_ingress_dispatch_e2e;
 mod review_retry_loop_bound;
+mod router_connections_declared;
 mod run_failure_notification;
 mod sdlc_flow_check_selection;
 mod sdlc_flow_e2e;
