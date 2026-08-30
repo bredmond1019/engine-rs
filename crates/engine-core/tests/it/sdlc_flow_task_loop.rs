@@ -26,9 +26,9 @@
 //! `ImplementTaskNode` for the retry. The wiring lives in the real
 //! `graph::schema()` (EN.3.B task 6) now, so this test uses it unamended.
 //! For this single-task, one-retry fixture, `SDLCTelemetry.total_attempts`
-//! now correctly reaches `2` (one `IncrementAttemptNode` bump for the retry,
-//! one `UpdateTaskStatusNode` bump at the task's eventual PASS) and
-//! `task.attempt_count` reaches `1`.
+//! reaches `2` — one per implement -> test attempt actually made, both
+//! charged by `ImplementTaskNode` — and `task.attempt_count`, which counts
+//! RETRIES rather than attempts, reaches `1`.
 //!
 //! **Bottom-half tail (EN.3.B task 6):** the declared graph no longer stops
 //! at `PatchDocsNode` — it continues `PatchDocsNode -> WrapUpNode ->
@@ -436,10 +436,10 @@ async fn full_task_loop_triggers_retry_back_edge_and_completes() {
     );
     assert_eq!(state.telemetry.tasks_passed, 1);
     assert_eq!(state.telemetry.tasks_failed, 0);
-    // Retry-bail fix (EN.3.B task 5): IncrementAttemptNode bumps
-    // attempt_count/total_attempts once for the retry back-edge, then
-    // UpdateTaskStatusNode bumps total_attempts again at the eventual PASS —
-    // see the module doc's "Retry-bail fix" note.
+    // Two different quantities: `attempt_count` counts the one RETRY
+    // (IncrementAttemptNode, the back-edge), `total_attempts` counts the two
+    // attempts actually MADE (ImplementTaskNode, once per attempt) — see the
+    // module doc's "Retry-bail fix" note.
     assert_eq!(state.tasks[0].attempt_count, 1);
     assert_eq!(state.telemetry.total_attempts, 2);
 

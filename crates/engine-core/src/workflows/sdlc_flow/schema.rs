@@ -78,7 +78,23 @@ pub struct SDLCTask {
     /// Shell commands used to validate this task's implementation.
     #[serde(default)]
     pub validation_commands: Vec<String>,
-    /// Number of implement -> test attempts made so far.
+    /// Number of RETRIES of this task so far — **not** the number of
+    /// attempts it has made.
+    ///
+    /// Charged by `task_loop::IncrementAttemptNode`, the target of both
+    /// retry back-edges (`TriageRouterNode`'s `RETRYABLE` and
+    /// `ReviewRouterNode`'s minor `FAIL`/`PARTIAL`), so a task that passes
+    /// on its first try ends at `0` and a task on its Nth attempt reads
+    /// `N - 1`. This is the number [`Self::max_attempts`] bounds.
+    ///
+    /// **A different quantity from `SDLCTelemetry::total_attempts`, and the
+    /// two are not reconcilable into one number** — do not try. That one is
+    /// run-level and counts attempts MADE (one per `ImplementTaskNode` run,
+    /// charged where the attempt happens); this one is per-task and counts
+    /// only the times an attempt was sent round again. Across a run,
+    /// `total_attempts == (tasks dispatched) + Σ attempt_count`. Two wrong
+    /// diagnoses have already come from reading them as the same counter
+    /// off by a constant.
     #[serde(default)]
     pub attempt_count: u32,
     /// Maximum number of attempts before a MAJOR_BAIL.
@@ -292,7 +308,28 @@ pub fn parse_task_range(task_range: Option<&str>) -> Result<Option<Vec<u32>>, St
 /// Python).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SDLCTelemetry {
-    /// Total implement -> test attempts made.
+    /// Total implement -> test attempts MADE across the whole run — one per
+    /// `task_loop::ImplementTaskNode` execution, charged there,
+    /// unconditionally, before the model call.
+    ///
+    /// Counted where the attempt is made rather than at the outcome it
+    /// reaches, because the outcomes do not cover the paths: a `MAJOR_BAIL`
+    /// (attempt exhaustion, or an LLM triage verdict) leaves
+    /// `TriageRouterNode` straight for `WrapUpNode` and never touches
+    /// `UpdateTaskStatusNode`, so an outcome-charged counter had no site at
+    /// all on that path and run R4 reported `0` after genuinely making an
+    /// attempt. `ImplementTaskNode` cannot be bypassed — no attempt exists
+    /// without it — so the same hole cannot reopen for a future terminal
+    /// path.
+    ///
+    /// **A different quantity from `SDLCTask::attempt_count`, which counts
+    /// RETRIES per task** (see its doc comment). A task passing first try
+    /// contributes 1 here and 0 there; a task taking N attempts contributes
+    /// N here and N-1 there. Do not reconcile them into one number.
+    ///
+    /// Also one of the four counters `task_loop::logical_clock` sums; every
+    /// state write in the task loop advances exactly one of them by exactly
+    /// one, which is what makes `latest_state`'s ordering total.
     #[serde(default)]
     pub total_attempts: u32,
     /// Cumulative token/dollar cost spent.
@@ -301,7 +338,12 @@ pub struct SDLCTelemetry {
     /// Number of tasks that reached DONE.
     #[serde(default)]
     pub tasks_passed: u32,
-    /// Number of tasks that reached FAILED.
+    /// Number of tasks that reached FAILED. **Nothing writes it**: the only
+    /// site was `UpdateTaskStatusNode`'s `MajorBail` arm, which was
+    /// unreachable (bails route around that node entirely) and is deleted.
+    /// A bailed run therefore has `tasks_failed == 0` structurally —
+    /// `wrap_up.rs` derives a run's outcome from the terminal signal for
+    /// exactly this reason.
     #[serde(default)]
     pub tasks_failed: u32,
     /// Number of `ConsolidatedReviewNode` verdicts produced so far
@@ -320,8 +362,9 @@ pub struct SDLCTelemetry {
     /// for the measured R6 case). That per-run scope came from JS's
     /// `reviewAttempts` (`base-template/.claude/workflows/sdlc-flow.js:252-253`);
     /// the divergence is deliberate. Deliberately NOT folded into
-    /// `total_attempts`/`attempt_count` (both bumped by `IncrementAttemptNode` on both
-    /// back-edges and consumed by `RunTelemetry`/`PolicyAggregate` to mean
+    /// `total_attempts` (bumped by `ImplementTaskNode`, once per attempt)
+    /// or `attempt_count` (bumped by `IncrementAttemptNode` on both
+    /// back-edges), both consumed by `RunTelemetry`/`PolicyAggregate` to mean
     /// "an implement/test attempt ran") — overloading them would make a
     /// task that burned test retries arrive at review with a reduced review
     /// budget, which is not the bound this ticket asks for, and would

@@ -30,9 +30,7 @@ use crate::routing::Router;
 #[cfg(test)]
 use super::policy::OutputVerbosity;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
-use super::schema::{
-    RunMeta, SDLCState, SDLCTask, SDLCTaskStatus, SDLCTelemetry, SDLCTriageVerdict,
-};
+use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
     ModelTransport, TransportSlot,
@@ -209,27 +207,62 @@ fn classify_trivial(ctx: &TaskContext, runner: &CommandRunner, policy: &SdlcPoli
 pub(crate) const STRUCTURAL_ISSUE_THRESHOLD: usize = 5;
 
 /// The monotonically increasing logical clock `latest_state` orders
-/// candidates by: `total_attempts` (bumped by `IncrementAttemptNode`/
-/// `UpdateTaskStatusNode`) plus `review_attempts` (bumped by
-/// `ConsolidatedReviewNode`, EN.ticket.review-retry-loop-unbounded task 2).
-/// Every state-mutating node in this loop advances exactly ONE of the two
-/// counters by exactly one per write, never both — so their sum still
-/// increases by exactly one on every write and remains a valid tie-breaking
-/// clock across the whole run.
-fn logical_clock(telemetry: &SDLCTelemetry) -> u64 {
-    u64::from(telemetry.total_attempts) + u64::from(telemetry.review_attempts)
+/// candidates by. It sums the four counters this loop's four
+/// state-mutating nodes advance, one counter each:
+///
+/// | writer | counter it advances |
+/// |---|---|
+/// | [`ImplementTaskNode`] | `telemetry.total_attempts` (the attempt it is about to make) |
+/// | [`IncrementAttemptNode`] | the retried task's `attempt_count` |
+/// | [`ConsolidatedReviewNode`] | `telemetry.review_attempts` |
+/// | [`UpdateTaskStatusNode`] | `telemetry.tasks_passed` |
+///
+/// **Every state write in the loop advances exactly ONE of these by exactly
+/// one**, never zero and never two — so the sum increases by exactly one per
+/// write, no two writes in a run ever hold the same value, and the ordering
+/// `latest_state` derives from it has no ties to break. Adding a counting
+/// site, moving one, or adding a state-writing node without a counter of its
+/// own silently breaks that: `latest_state` starts picking a stale state
+/// instead of the newest one. `tasks_failed` is deliberately absent — nothing
+/// writes it (see [`UpdateTaskStatusNode`], and `wrap_up.rs`'s note that a
+/// bailed run has `tasks_failed == 0` structurally), so it would contribute a
+/// constant.
+///
+/// Takes the whole [`SDLCState`], not just its telemetry: one of the four
+/// counters (`attempt_count`) is per-task.
+fn logical_clock(state: &SDLCState) -> u64 {
+    u64::from(state.telemetry.total_attempts)
+        + u64::from(state.telemetry.review_attempts)
+        + u64::from(state.telemetry.tasks_passed)
+        + state
+            .tasks
+            .iter()
+            .map(|task| u64::from(task.attempt_count))
+            .sum::<u64>()
 }
+
+/// The node identities whose `ctx.nodes` result carries the durable
+/// `SDLCState` nested under a `"state"` key instead of BEING that state.
+/// Read by [`latest_state`]; written by the two nodes named.
+const STATE_NESTED_IDENTITIES: [&str; 2] = ["ConsolidatedReviewNode", "ImplementTaskNode"];
 
 /// Return the most recently mutated `SDLCState` among every node identity
 /// that can write one: `IncrementAttemptNode` (the retry back-edge target,
-/// EN.3.B), `UpdateTaskStatusNode` (a task's eventual PASS/MAJOR_BAIL),
-/// `ConsolidatedReviewNode` (its own `review_attempts` bump, EN.ticket.
-/// review-retry-loop-unbounded task 2 — nested under its result's `"state"`
-/// key rather than being the whole result, since that result is also the
-/// review verdict `ReviewRouterNode` reads), and `LoadTaskStateNode` (the
-/// initial load). Mirrors the `_latest_state_dict` helper shared by
-/// `TaskQueueRouterNode`/`UpdateTaskStatusNode`/`SaveStateNode` in Python,
-/// extended for the new retry-increment source.
+/// EN.3.B), `UpdateTaskStatusNode` (a task's PASS), `ConsolidatedReviewNode`
+/// (its own `review_attempts` bump, EN.ticket.review-retry-loop-unbounded
+/// task 2), `ImplementTaskNode` (the attempt it charges to
+/// `total_attempts` — every attempt passes through it, including one that
+/// goes on to bail), and `LoadTaskStateNode` (the initial load). Mirrors the
+/// `_latest_state_dict` helper shared by `TaskQueueRouterNode`/
+/// `UpdateTaskStatusNode`/`SaveStateNode` in Python, extended for the new
+/// retry-increment source.
+///
+/// `ConsolidatedReviewNode` and `ImplementTaskNode` nest their `SDLCState`
+/// under their result's `"state"` key rather than being the whole result,
+/// because those results are also read for their own payload (the review
+/// verdict `ReviewRouterNode` routes on; the `modified_files` the
+/// write-verification guard checks). Every other candidate's result IS the
+/// whole `SDLCState`. [`STATE_NESTED_IDENTITIES`] is the list.
 ///
 /// A fixed priority order (`IncrementAttemptNode` before `UpdateTaskStatusNode`
 /// before `LoadTaskStateNode`) is NOT correct here: across a whole run,
@@ -255,16 +288,16 @@ pub(crate) fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
         "IncrementAttemptNode",
         "UpdateTaskStatusNode",
         "ConsolidatedReviewNode",
+        "ImplementTaskNode",
         "LoadTaskStateNode",
     ] {
         let Some(mut value) = get_result(ctx, identity).cloned() else {
             continue;
         };
-        // `ConsolidatedReviewNode`'s result is the review verdict
-        // (`verdict`/`summary`/`issues`/...) with the durable `SDLCState`
-        // nested under `"state"` — see its `process` impl below. Every
-        // other candidate's result IS the whole `SDLCState`.
-        if identity == "ConsolidatedReviewNode" {
+        // See [`STATE_NESTED_IDENTITIES`]: these two nodes' results carry
+        // their own payload with the durable `SDLCState` nested under
+        // `"state"`. Every other candidate's result IS the whole `SDLCState`.
+        if STATE_NESTED_IDENTITIES.contains(&identity) {
             let Some(state_value) = value.get_mut("state").map(std::mem::take) else {
                 continue;
             };
@@ -274,7 +307,7 @@ pub(crate) fn latest_state(ctx: &TaskContext) -> Result<SDLCState, NodeError> {
             .map_err(|err| NodeError::new(format!("failed to parse SDLCState: {err}")))?;
         let is_newer = best
             .as_ref()
-            .map(|current| logical_clock(&state.telemetry) > logical_clock(&current.telemetry))
+            .map(|current| logical_clock(&state) > logical_clock(current))
             .unwrap_or(true);
         if is_newer {
             best = Some(state);
@@ -757,6 +790,25 @@ pub(super) const PATH_DISCIPLINE_PREAMBLE: &str = "PATH DISCIPLINE. Work only \
 /// Model node (Sonnet): drives Claude Code to implement the current task.
 /// Composes a `ClaudeCodeStep` under its own identity so it can post-process
 /// the model's JSON output into `{summary, modified_files, tests_added}`.
+///
+/// **This node is where `telemetry.total_attempts` is charged** — one per
+/// attempt, unconditionally, before the model call, exactly as
+/// [`ConsolidatedReviewNode`] charges `telemetry.review_attempts`. An attempt
+/// is counted where it is MADE, not at the outcome it happens to reach: this
+/// is the one node every attempt passes through — a first dispatch from
+/// `TaskQueueRouterNode`, a triage retry and a review retry alike (both
+/// arrive via `IncrementAttemptNode`) — including an attempt that goes on to
+/// bail. Counting at the outcome instead is the R4 defect: attempt
+/// exhaustion and an LLM `MAJOR_BAIL` both leave `TriageRouterNode` for
+/// `WrapUpNode` and never touch `UpdateTaskStatusNode`, so a run that made a
+/// real attempt reported `total_attempts: 0`. A per-outcome site would have
+/// to be re-added for every future terminal path that bypasses
+/// `UpdateTaskStatusNode`; this one cannot be bypassed, because no attempt
+/// happens without it.
+///
+/// The counted state rides in this node's result under a `"state"` key
+/// ([`STATE_NESTED_IDENTITIES`]) alongside the implement payload, so
+/// [`latest_state`] sees it without any reader of `modified_files` changing.
 pub struct ImplementTaskNode {
     config: Config,
     transport: Option<ModelTransport>,
@@ -854,6 +906,13 @@ impl Node for ImplementTaskNode {
         // `apply_policy` below (no second resolve).
         let policy = resolved_policy(&ctx)?;
 
+        // Charge this attempt BEFORE the call, whatever it goes on to
+        // conclude — see this node's doc comment for why the count lives
+        // here and not at the outcome, and [`logical_clock`] for the
+        // exactly-one-counter-per-write invariant this write upholds.
+        let mut counted_state = latest_state(&ctx)?;
+        counted_state.telemetry.total_attempts += 1;
+
         // Resolved once and reused: the same worktree root names the
         // per-run half of the path-discipline preamble below and scopes
         // `config.cwd` further down. Best-effort — a ctx with no
@@ -927,15 +986,18 @@ impl Node for ImplementTaskNode {
                 },
             );
 
-        put_result(
-            &mut ctx,
-            "ImplementTaskNode",
-            json!({
-                "summary": parsed.summary,
-                "modified_files": parsed.modified_files,
-                "tests_added": parsed.tests_added,
-            }),
-        );
+        let mut result = json!({
+            "summary": parsed.summary,
+            "modified_files": parsed.modified_files,
+            "tests_added": parsed.tests_added,
+        });
+        // Nested under `"state"`, not instead of the payload above: this
+        // result is also what the write-verification guard reads
+        // `modified_files` from. `latest_state` knows to unwrap this key for
+        // this identity (see [`STATE_NESTED_IDENTITIES`]).
+        result["state"] = serde_json::to_value(&counted_state)
+            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        put_result(&mut ctx, "ImplementTaskNode", result);
 
         Ok(ctx)
     }
@@ -1844,7 +1906,7 @@ impl Node for TriageTaskNode {
         // that snapshot is now re-stamped by `IncrementAttemptNode`
         // (`ticket-restamp-attempt-count`), so the two agree — but the durable
         // state stays the single authority for the bail gate: it is what
-        // `bump_attempt` actually mutates, and `max_attempts` is only ever
+        // `bump_task_attempt` actually mutates, and `max_attempts` is only ever
         // sourced from there. See this spec's Amendment Log (EN.3.B
         // retry-bail fix).
         let task = current_task_state(&ctx, "TriageTaskNode")?;
@@ -2182,7 +2244,7 @@ impl Node for ConsolidatedReviewNode {
 
         // Bump the run-level `telemetry.review_attempts` ACCOUNTING counter
         // (EN.ticket.review-retry-loop-unbounded task 2) BEFORE the model
-        // call, same as `bump_attempt` counts the attempt regardless of its
+        // call, same as `ImplementTaskNode` counts the attempt regardless of its
         // outcome — this node is about to produce a verdict, so the review
         // pass it spends counts whether that verdict is PASS, FAIL, or
         // PARTIAL. This is also what keeps `logical_clock` monotonic across
@@ -2425,8 +2487,8 @@ fn task_review_attempts(state: &SDLCState, task_id: u32) -> u32 {
 /// Bump the task identified by `task_id`'s `review_attempt_count` by exactly
 /// one and return the new value. Charged only for a NON-PASS
 /// `ConsolidatedReviewNode` verdict — the one that can send the run back
-/// around the review loop. Deliberately separate from [`bump_attempt`]'s
-/// `attempt_count`/`total_attempts` (see `SDLCTelemetry::review_attempts`)
+/// around the review loop. Deliberately separate from [`bump_task_attempt`]'s
+/// `attempt_count` (see `SDLCTelemetry::review_attempts`)
 /// and from `telemetry.review_attempts`' run-level accounting.
 fn bump_task_review_attempt(state: &mut SDLCState, task_id: u32) -> Result<u32, NodeError> {
     let spec_slug = state.spec_slug.clone();
@@ -2473,12 +2535,19 @@ pub(crate) fn bounded_review_attempts(ctx: &TaskContext, review: &serde_json::Va
     task_review_attempts(&state, task_id as u32)
 }
 
-/// Bump the task identified by `task_id`'s `attempt_count` and the state's
-/// `telemetry.total_attempts`, both by exactly one. Shared by
-/// [`IncrementAttemptNode`] (the live retry back-edge target) and
-/// `UpdateTaskStatusNode`'s now-unreachable `Retryable` arm (see its doc
-/// comment) so the two counters can never drift apart.
-fn bump_attempt(state: &mut SDLCState, task_id: u32) -> Result<(), NodeError> {
+/// Bump the task identified by `task_id`'s `attempt_count` by exactly one.
+///
+/// **`attempt_count` counts RETRIES, not attempts** — a task that passes on
+/// its first try ends with `attempt_count == 0` — which is why this is
+/// charged here, on the retry back-edge, and not once per attempt. The
+/// run-level `telemetry.total_attempts` is a different quantity and is
+/// charged in a different place ([`ImplementTaskNode`], once per attempt
+/// made); the two are deliberately not reconcilable into one number. See
+/// `SDLCTask::attempt_count` and `SDLCTelemetry::total_attempts`.
+///
+/// Sole caller: [`IncrementAttemptNode`], the target of both retry
+/// back-edges.
+fn bump_task_attempt(state: &mut SDLCState, task_id: u32) -> Result<(), NodeError> {
     let spec_slug = state.spec_slug.clone();
     let task = state
         .tasks
@@ -2490,7 +2559,6 @@ fn bump_attempt(state: &mut SDLCState, task_id: u32) -> Result<(), NodeError> {
             ))
         })?;
     task.attempt_count += 1;
-    state.telemetry.total_attempts += 1;
     Ok(())
 }
 
@@ -2499,10 +2567,14 @@ fn bump_attempt(state: &mut SDLCState, task_id: u32) -> Result<(), NodeError> {
 /// Deterministic node: the retry back-edge target for both
 /// `TriageRouterNode`'s `RETRYABLE` verdict and `ReviewRouterNode`'s minor
 /// `FAIL`/`PARTIAL` verdict (EN.3.B retry-bail fix). Bumps the current
-/// task's `attempt_count` and `telemetry.total_attempts` in the durable
-/// `SDLCState` via [`bump_attempt`], then hands off to `ImplementTaskNode`
-/// for the retry (the forward hop is a declared graph connection — see
-/// `graph.rs`).
+/// task's `attempt_count` — the RETRY counter — in the durable `SDLCState`
+/// via [`bump_task_attempt`], then hands off to `ImplementTaskNode` for the
+/// retry (the forward hop is a declared graph connection — see `graph.rs`).
+///
+/// It does NOT touch `telemetry.total_attempts`: the retry it is about to
+/// send round is counted as an attempt by `ImplementTaskNode` when that
+/// attempt is actually made, one site for every attempt in the run. Charging
+/// it here as well would double-count every retry.
 ///
 /// `Router::route(&self, ctx: &TaskContext)` takes `&ctx` and cannot mutate
 /// state, so the increment cannot live in `TriageRouterNode`'s or
@@ -2529,10 +2601,10 @@ impl Node for IncrementAttemptNode {
             as u32;
 
         let mut state = latest_state(&ctx)?;
-        bump_attempt(&mut state, current_task_id)?;
+        bump_task_attempt(&mut state, current_task_id)?;
 
         // Re-stamp the router snapshot's `attempt_count` with the value
-        // `bump_attempt` just wrote, so `current_task_fields` stops lying on
+        // `bump_task_attempt` just wrote, so `current_task_fields` stops lying on
         // the retry back-edge. Read-modify-write: touch only this one key.
         let bumped = state
             .tasks
@@ -2562,8 +2634,35 @@ impl Node for IncrementAttemptNode {
 
 // --- UpdateTaskStatusNode --------------------------------------------------
 
-/// Deterministic node: mutates the current task's status in the durable
-/// `SDLCState`, keeping `SDLCTelemetry` counters in lockstep.
+/// Deterministic node: marks the current task DONE in the durable
+/// `SDLCState` and charges it to `telemetry.tasks_passed`.
+///
+/// **Only ever entered with a `PASS` triage verdict, in both workflows**, so
+/// PASS is the only verdict it accepts; anything else is a graph defect and
+/// fails closed with an error rather than being silently counted:
+///
+/// - `SDLC_FLOW`: two inbound routes, both PASS arms. `ReviewRouterNode`'s
+///   `PASS` — reachable only via `TriageRouterNode`'s own `PASS` arm ->
+///   `ConsolidatedReviewNode` — and, under `review_mode: EndOnly` (or
+///   `TrivialSkip` on a task classified trivial), `TriageRouterNode`'s
+///   `PASS` arm routing here directly. The verdict read below comes from
+///   `TriageTaskNode`, not from the review, so either way what arrives is a
+///   PASS triage verdict. `RETRYABLE` goes to `IncrementAttemptNode` and
+///   `MAJOR_BAIL` to `WrapUpNode` (EN.3.B).
+/// - `SDLC_TASK`: its only inbound route is `TaskTriageRouterNode`, which
+///   has three arms and only three — `PASS` here, under-budget `RETRYABLE`
+///   to `IncrementAttemptNode`, everything else (`MAJOR_BAIL`, exhausted
+///   `RETRYABLE`, unparseable) to `LeanBookkeepNode`, fail-closed.
+///
+/// The former `MajorBail` and `Retryable` arms were dead code on both
+/// counts. `Retryable` was already labelled unreachable "as of EN.3.B";
+/// `MajorBail` was the same class and simply never labelled, and its
+/// `total_attempts += 1` was one of the outcome-charged sites that made a
+/// bail's attempt uncountable (see [`ImplementTaskNode`]). Both are deleted:
+/// a counter must not have a site on a path that cannot execute, and
+/// `tasks_failed` consequently has no writer at all — which is the state
+/// `wrap_up.rs` already documents and derives its outcome around ("a bailed
+/// run has `tasks_failed == 0` structurally").
 pub struct UpdateTaskStatusNode;
 
 #[async_trait::async_trait]
@@ -2579,65 +2678,33 @@ impl Node for UpdateTaskStatusNode {
             .and_then(|v| v.as_str())
             .ok_or_else(|| NodeError::new("TriageTaskNode has not run yet"))?
             .to_string();
-        let verdict: SDLCTriageVerdict = match verdict_str.as_str() {
-            "PASS" => SDLCTriageVerdict::Pass,
-            "RETRYABLE" => SDLCTriageVerdict::Retryable,
-            "MAJOR_BAIL" => SDLCTriageVerdict::MajorBail,
-            other => {
-                return Err(NodeError::new(format!(
-                    "UpdateTaskStatusNode: unknown triage verdict {other:?}"
-                )))
-            }
-        };
+        if verdict_str != "PASS" {
+            return Err(NodeError::new(format!(
+                "UpdateTaskStatusNode: reached with a non-PASS triage verdict \
+                 {verdict_str:?}; every route into this node in both SDLC_FLOW \
+                 and SDLC_TASK carries PASS (see this node's doc comment)"
+            )));
+        }
 
         let mut state = latest_state(&ctx)?;
         let spec_slug = state.spec_slug.clone();
 
-        match verdict {
-            SDLCTriageVerdict::Pass => {
-                let task = state
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.task_id == current_task_id)
-                    .ok_or_else(|| {
-                        NodeError::new(format!(
-                            "UpdateTaskStatusNode: no task with task_id={current_task_id} found \
-                             in state for spec {spec_slug:?}"
-                        ))
-                    })?;
-                task.status = SDLCTaskStatus::Done;
-                state.telemetry.tasks_passed += 1;
-                state.telemetry.total_attempts += 1;
-            }
-            SDLCTriageVerdict::MajorBail => {
-                let task = state
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.task_id == current_task_id)
-                    .ok_or_else(|| {
-                        NodeError::new(format!(
-                            "UpdateTaskStatusNode: no task with task_id={current_task_id} found \
-                             in state for spec {spec_slug:?}"
-                        ))
-                    })?;
-                task.status = SDLCTaskStatus::Failed;
-                state.telemetry.tasks_failed += 1;
-                state.telemetry.total_attempts += 1;
-            }
-            SDLCTriageVerdict::Retryable => {
-                // Unreachable via the assembled graph as of EN.3.B: both
-                // `TriageRouterNode`'s `RETRYABLE` and `ReviewRouterNode`'s
-                // minor `FAIL`/`PARTIAL` back-edges now target
-                // `IncrementAttemptNode` directly (see their `Router::route`
-                // impls above), so `UpdateTaskStatusNode` is only ever
-                // reached with a `PASS` verdict (via `ReviewRouterNode`) —
-                // never `RETRYABLE`. Kept for defensive completeness and
-                // direct unit-test coverage (`update_status_mutations`),
-                // reusing `bump_attempt` so the counters can't drift apart
-                // from `IncrementAttemptNode`'s if this is ever hit.
-                bump_attempt(&mut state, current_task_id)?;
-            }
-        }
+        let task = state
+            .tasks
+            .iter_mut()
+            .find(|task| task.task_id == current_task_id)
+            .ok_or_else(|| {
+                NodeError::new(format!(
+                    "UpdateTaskStatusNode: no task with task_id={current_task_id} found \
+                     in state for spec {spec_slug:?}"
+                ))
+            })?;
+        task.status = SDLCTaskStatus::Done;
+        // The one counter this write advances — see [`logical_clock`]. The
+        // attempt that produced this PASS was already counted where it was
+        // made, in `ImplementTaskNode`; counting it again here would
+        // double-charge every task's last attempt.
+        state.telemetry.tasks_passed += 1;
 
         let value = serde_json::to_value(&state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
@@ -3880,7 +3947,11 @@ mod tests {
             serde_json::from_value(out.nodes["IncrementAttemptNode"].clone()).unwrap();
 
         assert_eq!(bumped.tasks[0].attempt_count, 1);
-        assert_eq!(bumped.telemetry.total_attempts, 1);
+        // The retry counter, and ONLY the retry counter: the attempt this
+        // back-edge is about to send round is charged to `total_attempts`
+        // by `ImplementTaskNode` when it is actually made, and no
+        // `ImplementTaskNode` ran in this isolated drive.
+        assert_eq!(bumped.telemetry.total_attempts, 0);
     }
 
     #[tokio::test]
@@ -3897,12 +3968,16 @@ mod tests {
             .expect("second retry should succeed");
 
         // `latest_state` must pick up its own prior write (via the
-        // `total_attempts` logical clock), not fall back to the stale
-        // `LoadTaskStateNode` snapshot, or this would still read 1.
+        // `logical_clock`, to which this node contributes the task's
+        // `attempt_count`), not fall back to the stale `LoadTaskStateNode`
+        // snapshot, or this would still read 1.
         let bumped: SDLCState =
             serde_json::from_value(out.nodes["IncrementAttemptNode"].clone()).unwrap();
         assert_eq!(bumped.tasks[0].attempt_count, 2);
-        assert_eq!(bumped.telemetry.total_attempts, 2);
+        assert_eq!(
+            bumped.telemetry.total_attempts, 0,
+            "attempts are charged at ImplementTaskNode, which never ran here"
+        );
     }
 
     /// `ticket-restamp-attempt-count`: the router snapshot's `attempt_count`
@@ -4004,7 +4079,11 @@ mod tests {
         let final_state: SDLCState =
             serde_json::from_value(ctx.nodes["IncrementAttemptNode"].clone()).unwrap();
         assert_eq!(final_state.tasks[0].attempt_count, 2);
-        assert_eq!(final_state.telemetry.total_attempts, 2);
+        // This drive walks triage and the back-edge only — no
+        // `ImplementTaskNode`, so no attempt is charged. `total_attempts`
+        // on a real bail is covered by
+        // `triage_major_bail_counts_the_attempt_it_made`.
+        assert_eq!(final_state.telemetry.total_attempts, 0);
     }
 
     #[tokio::test]
@@ -4035,9 +4114,232 @@ mod tests {
             serde_json::from_value(after_review_retry.nodes["IncrementAttemptNode"].clone())
                 .unwrap();
         assert_eq!(state_after_review.tasks[0].attempt_count, 2);
-        assert_eq!(state_after_review.telemetry.total_attempts, 2);
+        assert_eq!(
+            state_after_review.telemetry.total_attempts, 0,
+            "both back-edges charge the RETRY counter only; the attempts \
+             themselves are charged at ImplementTaskNode"
+        );
     }
 
+    // --- attempt counting: `total_attempts` is charged where an attempt is
+    // MADE (`ImplementTaskNode`), not at the outcome it happens to reach ---
+
+    /// A transport that answers `ImplementTaskNode`'s prompt with a canned
+    /// implement reply, so these drives never spawn a model.
+    fn implement_transport() -> ModelTransport {
+        Arc::new(|_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({
+                    "summary": "done",
+                    "modified_files": ["src/lib.rs"],
+                    "tests_added": [],
+                })
+                .to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        })
+    }
+
+    /// Re-stamp `TaskQueueRouterNode`'s per-dispatch snapshot for `task`,
+    /// exactly as the router does when it dequeues the next task. Lets one
+    /// accumulated `ctx` carry a multi-task run.
+    fn dispatch_task(ctx: &mut TaskContext, task: &SDLCTask) {
+        ctx.nodes.insert(
+            "TaskQueueRouterNode".to_string(),
+            json!({
+                "current_task_id": task.task_id,
+                "title": task.title,
+                "description": task.description,
+                "acceptance_criteria": task.acceptance_criteria,
+                "attempt_count": task.attempt_count,
+                "max_attempts": task.max_attempts,
+            }),
+        );
+    }
+
+    /// One implement -> test -> triage attempt: runs the real
+    /// `ImplementTaskNode` (stub transport), stamps the test outcome, and
+    /// runs the real `TriageTaskNode` (deterministic, `llm_triage` off by
+    /// default, so the panicking transport is never called).
+    async fn drive_attempt(ctx: TaskContext, all_passed: bool) -> TaskContext {
+        let mut ctx = ImplementTaskNode::new()
+            .with_transport(implement_transport())
+            .process(ctx)
+            .await
+            .expect("implement should succeed");
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({ "all_passed": all_passed, "check_results": [], "failure_summary": "" }),
+        );
+        TriageTaskNode::new()
+            .with_transport(panicking_transport())
+            .process(ctx)
+            .await
+            .expect("triage should succeed")
+    }
+
+    /// Drive one task to a PASS after `retries` failed attempts: `retries`
+    /// failing attempts each followed by the `IncrementAttemptNode` back
+    /// edge, then a passing attempt closed out by `UpdateTaskStatusNode`.
+    async fn drive_task_to_pass(
+        mut ctx: TaskContext,
+        task: &SDLCTask,
+        retries: u32,
+    ) -> TaskContext {
+        dispatch_task(&mut ctx, task);
+        for _ in 0..retries {
+            ctx = drive_attempt(ctx, false).await;
+            assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "RETRYABLE");
+            ctx = IncrementAttemptNode
+                .process(ctx)
+                .await
+                .expect("increment should succeed");
+        }
+        ctx = drive_attempt(ctx, true).await;
+        assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "PASS");
+        UpdateTaskStatusNode
+            .process(ctx)
+            .await
+            .expect("update status should succeed")
+    }
+
+    /// LOAD-BEARING (the R4 defect): a run that terminates through a TRIAGE
+    /// `MAJOR_BAIL` must still report the attempt it actually made.
+    ///
+    /// `TriageRouterNode` routes `MAJOR_BAIL` straight to `WrapUpNode`,
+    /// bypassing `UpdateTaskStatusNode` entirely — so an outcome-charged
+    /// counter has NO site on this path and R4 reported `total_attempts: 0`
+    /// after genuinely running one implement -> test attempt. Charging the
+    /// attempt at `ImplementTaskNode` — the one node every attempt passes
+    /// through, whatever it goes on to conclude — is what closes it.
+    #[tokio::test]
+    async fn triage_major_bail_counts_the_attempt_it_made() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        // One attempt, made in full: implement runs, the checks fail, and
+        // triage's model call returns MAJOR_BAIL on the FIRST attempt (not
+        // attempt exhaustion — the retry back-edge never fires, so no
+        // `IncrementAttemptNode` write happens either).
+        let mut ctx = ImplementTaskNode::new()
+            .with_transport(implement_transport())
+            .process(ctx)
+            .await
+            .expect("implement should succeed");
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({ "all_passed": false, "check_results": [], "failure_summary": "boom" }),
+        );
+        let bail_transport: ModelTransport = Arc::new(|_config, _prompt| {
+            let outcome = canned_outcome(
+                json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        let ctx = TriageTaskNode::new()
+            .with_transport(bail_transport)
+            .process(ctx)
+            .await
+            .expect("triage should succeed");
+
+        assert_eq!(ctx.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+        assert_eq!(
+            TriageRouterNode.route(&ctx),
+            Some("WrapUpNode".to_string()),
+            "precondition: the bail path bypasses UpdateTaskStatusNode"
+        );
+        assert!(
+            !ctx.nodes.contains_key("UpdateTaskStatusNode"),
+            "precondition: no outcome-charged site runs on this path"
+        );
+        assert!(
+            !ctx.nodes.contains_key("IncrementAttemptNode"),
+            "precondition: no retry back-edge fires on this path"
+        );
+
+        let state = latest_state(&ctx).expect("a state must be readable at the bail");
+        assert!(
+            state.telemetry.total_attempts >= 1,
+            "a run that made one attempt and bailed must not report \
+             total_attempts: {} (the R4 defect)",
+            state.telemetry.total_attempts
+        );
+        assert_eq!(state.telemetry.total_attempts, 1);
+        assert_eq!(
+            state.tasks[0].attempt_count, 0,
+            "attempt_count counts RETRIES: a first-attempt bail has none"
+        );
+    }
+
+    /// REGRESSION (run R5's shape): two tasks, the first passing first try,
+    /// the second taking one retry. Four implement -> test attempts is not
+    /// what happened; three is. Must hold identically before and after the
+    /// counting site moved.
+    #[tokio::test]
+    async fn r5_shape_two_tasks_one_retry_totals_three_attempts() {
+        let task1 = SDLCTask::new(1, "One", "d1");
+        let task2 = SDLCTask::new(2, "Two", "d2");
+        let state = state_with_tasks(vec![task1.clone(), task2.clone()]);
+        let ctx = ctx_with_state(&state);
+        let mut ctx = ctx;
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let ctx = drive_task_to_pass(ctx, &task1, 0).await;
+        let ctx = drive_task_to_pass(ctx, &task2, 1).await;
+
+        let state = latest_state(&ctx).expect("state readable");
+        assert_eq!(state.telemetry.total_attempts, 3);
+        assert_eq!(
+            state
+                .tasks
+                .iter()
+                .map(|task| task.attempt_count)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "attempt_count still counts RETRIES, unchanged"
+        );
+        assert_eq!(state.telemetry.tasks_passed, 2);
+    }
+
+    /// REGRESSION (run R6's shape): three tasks taking 1, 2 and 3 retries,
+    /// all of which eventually pass — 2 + 3 + 4 = 9 implement -> test
+    /// attempts. Must hold identically before and after the counting site
+    /// moved. (The live R6 reported 8 for a run whose third task BAILED:
+    /// that run's uncounted final attempt is exactly the R4 defect above.)
+    #[tokio::test]
+    async fn r6_shape_three_tasks_retrying_totals_nine_attempts() {
+        let task1 = SDLCTask::new(1, "One", "d1");
+        let task2 = SDLCTask::new(2, "Two", "d2");
+        let task3 = SDLCTask::new(3, "Three", "d3");
+        let state = state_with_tasks(vec![task1.clone(), task2.clone(), task3.clone()]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let ctx = drive_task_to_pass(ctx, &task1, 1).await;
+        let ctx = drive_task_to_pass(ctx, &task2, 2).await;
+        let ctx = drive_task_to_pass(ctx, &task3, 3).await;
+
+        let state = latest_state(&ctx).expect("state readable");
+        assert_eq!(state.telemetry.total_attempts, 9);
+        assert_eq!(
+            state
+                .tasks
+                .iter()
+                .map(|task| task.attempt_count)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "attempt_count still counts RETRIES, unchanged"
+        );
+        assert_eq!(state.telemetry.tasks_passed, 3);
+    }
     // --- ReviewRouterNode --------------------------------------------------
 
     fn review_ctx(verdict: &str, issue_count: usize) -> TaskContext {
@@ -4204,7 +4506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_status_mutations() {
+    async fn update_status_marks_the_task_done_and_counts_the_pass() {
         let task = SDLCTask::new(1, "One", "d1");
 
         let node = UpdateTaskStatusNode;
@@ -4214,24 +4516,33 @@ mod tests {
             serde_json::from_value(out.nodes["UpdateTaskStatusNode"].clone()).unwrap();
         assert_eq!(state.tasks[0].status, SDLCTaskStatus::Done);
         assert_eq!(state.telemetry.tasks_passed, 1);
-        assert_eq!(state.telemetry.total_attempts, 1);
+        // `tasks_passed` is the ONE counter this write advances (see
+        // `logical_clock`). The attempt that produced the PASS was already
+        // charged where it was made, in `ImplementTaskNode` — which did not
+        // run in this isolated drive, hence 0 rather than a re-charge here.
+        assert_eq!(state.telemetry.total_attempts, 0);
+    }
 
-        let node = UpdateTaskStatusNode;
-        let ctx = ctx_for_update(&task, "RETRYABLE");
-        let out = node.process(ctx).await.expect("process should succeed");
-        let state: SDLCState =
-            serde_json::from_value(out.nodes["UpdateTaskStatusNode"].clone()).unwrap();
-        assert_eq!(state.tasks[0].attempt_count, 1);
-        assert_eq!(state.tasks[0].status, SDLCTaskStatus::Pending);
-        assert_eq!(state.telemetry.total_attempts, 1);
-
-        let node = UpdateTaskStatusNode;
-        let ctx = ctx_for_update(&task, "MAJOR_BAIL");
-        let out = node.process(ctx).await.expect("process should succeed");
-        let state: SDLCState =
-            serde_json::from_value(out.nodes["UpdateTaskStatusNode"].clone()).unwrap();
-        assert_eq!(state.tasks[0].status, SDLCTaskStatus::Failed);
-        assert_eq!(state.telemetry.tasks_failed, 1);
+    /// Neither `RETRYABLE` nor `MAJOR_BAIL` can reach this node in either
+    /// workflow (see its doc comment for the route-by-route argument), so
+    /// both fail closed instead of silently mutating status or counters.
+    /// The deleted arms were the outcome-charged `total_attempts` sites; a
+    /// counter must not keep a site on a path that cannot execute.
+    #[tokio::test]
+    async fn update_status_rejects_every_non_pass_verdict() {
+        for verdict in ["RETRYABLE", "MAJOR_BAIL", "NONSENSE"] {
+            let task = SDLCTask::new(1, "One", "d1");
+            let ctx = ctx_for_update(&task, verdict);
+            let err = UpdateTaskStatusNode
+                .process(ctx)
+                .await
+                .expect_err("a non-PASS verdict must fail closed");
+            assert!(
+                err.message.contains("non-PASS triage verdict"),
+                "unexpected error for {verdict}: {}",
+                err.message
+            );
+        }
     }
 
     #[tokio::test]

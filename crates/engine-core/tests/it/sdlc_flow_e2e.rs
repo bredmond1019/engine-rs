@@ -646,20 +646,31 @@ async fn never_passing_task_bails_at_max_attempts_and_reaches_wrap_up_tail() {
 
     // --- The task bailed exactly at max_attempts, never further -------------
     // `TriageRouterNode`'s `MAJOR_BAIL` verdict routes straight to
-    // `WrapUpNode` (never through `UpdateTaskStatusNode`), so the durable
-    // state's last write is `IncrementAttemptNode`'s (task 5's retry-bail
-    // fix): `attempt_count`/`telemetry.total_attempts` reached exactly
-    // `max_attempts`, no further.
-    let increment_result = final_ctx
+    // `WrapUpNode`, never through `UpdateTaskStatusNode` — so the terminal
+    // state `WrapUpNode` reports is the one this asserts on.
+    //
+    // The two counters are different quantities and must not be reconciled:
+    // `attempt_count` counts RETRIES and stops at exactly `max_attempts`
+    // (task 5's retry-bail fix), while `telemetry.total_attempts` counts
+    // implement -> test attempts MADE — the initial dispatch plus each retry,
+    // i.e. `max_attempts + 1`. Charging the attempt at `ImplementTaskNode`
+    // is what makes the last one — the one that produced the bail — appear
+    // at all; charged at the outcome it was invisible, because no
+    // outcome-charging site sits on this path (run R4 reported 0).
+    let wrap_up_result = final_ctx
         .nodes
-        .get("IncrementAttemptNode")
-        .expect("IncrementAttemptNode should have run on every retry back-edge");
+        .get("WrapUpNode")
+        .expect("WrapUpNode should have run on the bail path");
     let state: engine_core::workflows::sdlc_flow::schema::SDLCState =
-        serde_json::from_value(increment_result.clone()).expect("state should deserialize");
+        serde_json::from_value(wrap_up_result["state"].clone()).expect("state should deserialize");
 
     assert_eq!(state.tasks.len(), 1);
     assert_eq!(state.tasks[0].attempt_count, max_attempts);
-    assert_eq!(state.telemetry.total_attempts, max_attempts);
+    assert_eq!(state.telemetry.total_attempts, max_attempts + 1);
+    assert!(
+        final_ctx.nodes.contains_key("IncrementAttemptNode"),
+        "the retry back-edge should still have run on every retry"
+    );
     assert!(
         !final_ctx.nodes.contains_key("UpdateTaskStatusNode"),
         "UpdateTaskStatusNode should not run on the MAJOR_BAIL path"
