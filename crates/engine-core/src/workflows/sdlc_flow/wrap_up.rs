@@ -36,7 +36,7 @@ use super::schema::{
     CommittedDocs, CommittedFinalValidation, CommittedPr, CommittedReview, RunMeta, RunOutcomes,
     SDLCState, TerminalSignal,
 };
-use super::task_loop::{latest_state, STRUCTURAL_ISSUE_THRESHOLD};
+use super::task_loop::{bounded_review_attempts, latest_state, STRUCTURAL_ISSUE_THRESHOLD};
 #[cfg(test)]
 use super::DEFAULT_STATE_FILENAME;
 use super::{commit_all, get_result, put_result, CommandRunner};
@@ -316,17 +316,16 @@ fn derive_terminal_signal(ctx: &TaskContext) -> Option<TerminalSignal> {
             // `IncrementAttemptNode` (`ReviewRouterNode`'s retry back-edge)
             // and never reaches `WrapUpNode` at all — so reaching this node
             // with a minor verdict still on the board means the router
-            // redirected here because the durable `review_attempts` counter
-            // had hit `policy.max_review_attempts`. Confirm that reading
+            // redirected here because the CURRENT task's durable
+            // `review_attempt_count` (its non-PASS review verdicts) had hit
+            // `policy.max_review_attempts`. Confirm that reading
             // (rather than trusting routing alone, since `WrapUpNode` is
             // also the MAJOR_BAIL/structural target and this branch must
             // stay inert for those) before reporting exhaustion, so a
             // genuinely under-bound minor verdict — reachable only via a
             // test driving `WrapUpNode` directly — never gets misreported
             // as exhaustion.
-            let review_attempts = latest_state(ctx)
-                .map(|state| state.telemetry.review_attempts)
-                .unwrap_or(0);
+            let review_attempts = bounded_review_attempts(ctx, review);
             let max_review_attempts = resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
             if matches!(max_review_attempts, Some(max) if review_attempts >= max) {
                 let summary = review
@@ -1778,9 +1777,11 @@ mod tests {
             "SetupWorktreeNode".to_string(),
             json!({ "worktree_path": worktree.to_string_lossy(), "branch_name": "sdlc/x" }),
         );
+        // The per-task counter the bound is measured against (stamped by
+        // `ConsolidatedReviewNode` alongside the verdict), at the bound.
         ctx.nodes.insert(
             "ConsolidatedReviewNode".to_string(),
-            json!({ "verdict": "PARTIAL", "summary": "still missing the edge case", "issues": ["one small thing"] }),
+            json!({ "verdict": "PARTIAL", "summary": "still missing the edge case", "issues": ["one small thing"], "task_review_attempts": 3 }),
         );
         let policy = SdlcPolicy {
             max_review_attempts: 3,

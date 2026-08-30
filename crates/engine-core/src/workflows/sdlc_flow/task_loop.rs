@@ -2152,14 +2152,19 @@ impl Node for ConsolidatedReviewNode {
             .cloned()
             .unwrap_or_else(|| json!([]));
 
-        // Bump the durable, per-run `review_attempts` counter (EN.ticket.
-        // review-retry-loop-unbounded task 2) BEFORE the model call, same
-        // as `bump_attempt` counts the attempt regardless of its outcome —
-        // this node is about to produce a verdict, so the review pass it
-        // spends counts whether that verdict is PASS, FAIL, or PARTIAL.
-        // Deliberately NOT `attempt_count`/`total_attempts` — see
-        // `SDLCTelemetry::review_attempts`'s doc comment for why the two
-        // counters must stay independent.
+        // Bump the run-level `telemetry.review_attempts` ACCOUNTING counter
+        // (EN.ticket.review-retry-loop-unbounded task 2) BEFORE the model
+        // call, same as `bump_attempt` counts the attempt regardless of its
+        // outcome — this node is about to produce a verdict, so the review
+        // pass it spends counts whether that verdict is PASS, FAIL, or
+        // PARTIAL. This is also what keeps `logical_clock` monotonic across
+        // every state write in the loop.
+        //
+        // It is NOT the retry bound. The bound is charged per-task and only
+        // by a NON-PASS verdict, below, once the verdict is known — see
+        // [`bump_task_review_attempt`]. Neither counter is
+        // `attempt_count`/`total_attempts`; see `SDLCTelemetry::
+        // review_attempts`'s doc comment for why they must stay independent.
         let mut counted_state = latest_state(&ctx)?;
         counted_state.telemetry.review_attempts += 1;
 
@@ -2256,6 +2261,26 @@ impl Node for ConsolidatedReviewNode {
         if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
             result["unrecognized_verdict"] = json!(normalized_verdict);
         }
+        // The retry bound's counter: charged to THIS task, and only when the
+        // verdict is one that can send the run back around the loop. A PASS
+        // ends this task's review cycle rather than extending it, so it costs
+        // nothing — before this, two earlier tasks' PASSes could exhaust a
+        // third task's whole budget on its FIRST verdict (measured, run R6).
+        let current_task_id = current_task_fields(&ctx)?
+            .get("current_task_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
+            as u32;
+        let task_review_attempts = if normalized_verdict == "PASS" {
+            task_review_attempts(&counted_state, current_task_id)
+        } else {
+            bump_task_review_attempt(&mut counted_state, current_task_id)?
+        };
+        // Standing rule 6: stamp the counter the bound is measured against
+        // right next to the verdict that moved it, so `ReviewRouterNode` and
+        // `wrap_up::derive_terminal_signal` read the same number this pass
+        // produced rather than each re-deriving it.
+        result["task_review_attempts"] = json!(task_review_attempts);
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
         }
@@ -2326,14 +2351,19 @@ impl Router for ReviewRouterNode {
                     // Review(FAIL/PARTIAL, minor) -> IncrementAttempt ->
                     // Implement had no exit. The bound has to close here,
                     // where the back-edge is actually chosen: once the
-                    // durable, per-run `review_attempts` counter (bumped by
-                    // `ConsolidatedReviewNode`, task 2) reaches
-                    // `policy.max_review_attempts`, route to `WrapUpNode`
-                    // with the last verdict's summary instead of looping
-                    // again.
-                    let review_attempts = latest_state(ctx)
-                        .map(|state| state.telemetry.review_attempts)
-                        .unwrap_or(0);
+                    // CURRENT TASK's durable `review_attempt_count` (its
+                    // non-PASS verdicts, bumped by `ConsolidatedReviewNode`)
+                    // reaches `policy.max_review_attempts`, route to
+                    // `WrapUpNode` with the last verdict's summary instead of
+                    // looping again.
+                    //
+                    // Per-task and non-PASS-only, NOT the run-level
+                    // `telemetry.review_attempts` this used to read: that
+                    // counter charges successful reviews and never resets,
+                    // so on a default profile the third task to reach review
+                    // was the last one that could be reviewed at all (run
+                    // R6). See `SDLCTask::review_attempt_count`.
+                    let review_attempts = bounded_review_attempts(ctx, review);
                     let max_review_attempts =
                         resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
                     match max_review_attempts {
@@ -2351,6 +2381,68 @@ impl Router for ReviewRouterNode {
             _ => Some("WrapUpNode".to_string()),
         }
     }
+}
+
+/// The current task's `review_attempt_count` in `state`, or `0` when no such
+/// task exists (a ctx assembled by a test that drives a node in isolation).
+fn task_review_attempts(state: &SDLCState, task_id: u32) -> u32 {
+    state
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .map(|task| task.review_attempt_count)
+        .unwrap_or(0)
+}
+
+/// Bump the task identified by `task_id`'s `review_attempt_count` by exactly
+/// one and return the new value. Charged only for a NON-PASS
+/// `ConsolidatedReviewNode` verdict — the one that can send the run back
+/// around the review loop. Deliberately separate from [`bump_attempt`]'s
+/// `attempt_count`/`total_attempts` (see `SDLCTelemetry::review_attempts`)
+/// and from `telemetry.review_attempts`' run-level accounting.
+fn bump_task_review_attempt(state: &mut SDLCState, task_id: u32) -> Result<u32, NodeError> {
+    let spec_slug = state.spec_slug.clone();
+    let task = state
+        .tasks
+        .iter_mut()
+        .find(|task| task.task_id == task_id)
+        .ok_or_else(|| {
+            NodeError::new(format!(
+                "no task with task_id={task_id} found in state for spec {spec_slug:?}"
+            ))
+        })?;
+    task.review_attempt_count += 1;
+    Ok(task.review_attempt_count)
+}
+
+/// The number `policy.max_review_attempts` is compared against: the CURRENT
+/// task's non-PASS review verdicts, including the one on the board.
+///
+/// Reads `ConsolidatedReviewNode`'s own `task_review_attempts` stamp first —
+/// the value that node computed when it wrote the verdict `review` — and
+/// falls back to looking the current task up in the durable state for a ctx
+/// assembled without the stamp (a test driving a node directly, or a state
+/// file written before the field existed). `0` when neither is available,
+/// which leaves the retry back-edge open rather than bailing a run on a
+/// number nobody wrote.
+pub(crate) fn bounded_review_attempts(ctx: &TaskContext, review: &serde_json::Value) -> u32 {
+    if let Some(stamped) = review
+        .get("task_review_attempts")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return stamped as u32;
+    }
+    let Ok(state) = latest_state(ctx) else {
+        return 0;
+    };
+    let Some(task_id) = current_task_fields(ctx)
+        .ok()
+        .and_then(|fields| fields.get("current_task_id"))
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return 0;
+    };
+    task_review_attempts(&state, task_id as u32)
 }
 
 /// Bump the task identified by `task_id`'s `attempt_count` and the state's
@@ -3980,10 +4072,11 @@ mod tests {
         assert_eq!(router.route(&ctx), None);
     }
 
-    /// `review_ctx` plus a stamped durable `review_attempts` counter and a
-    /// `max_review_attempts` policy — the shape `ReviewRouterNode::route`
-    /// reads via `latest_state`/`resolved_policy` (EN.ticket.review-retry-
-    /// loop-unbounded task 3).
+    /// `review_ctx` plus the CURRENT task's stamped `review_attempt_count`
+    /// and a `max_review_attempts` policy — the shape
+    /// `ReviewRouterNode::route` reads via `bounded_review_attempts`/
+    /// `resolved_policy` (EN.ticket.review-retry-loop-unbounded task 3, made
+    /// per-task by the R6 fix).
     fn review_ctx_with_bound(
         verdict: &str,
         issue_count: usize,
@@ -3991,12 +4084,24 @@ mod tests {
         max_review_attempts: u32,
     ) -> TaskContext {
         let mut ctx = review_ctx(verdict, issue_count);
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.review_attempt_count = review_attempts;
         let mut state = SDLCState::new("my-spec");
-        state.telemetry.review_attempts = review_attempts;
+        state.tasks = vec![task];
         ctx.nodes.insert(
             "LoadTaskStateNode".to_string(),
             serde_json::to_value(&state).unwrap(),
         );
+        ctx.nodes.insert(
+            "TaskQueueRouterNode".to_string(),
+            json!({ "current_task_id": 1 }),
+        );
+        ctx.nodes
+            .get_mut("ConsolidatedReviewNode")
+            .expect("review_ctx stamps a ConsolidatedReviewNode result")
+            .as_object_mut()
+            .expect("review result is an object")
+            .insert("task_review_attempts".to_string(), json!(review_attempts));
         let policy = SdlcPolicy {
             max_review_attempts,
             ..SdlcPolicy::default()
@@ -6011,6 +6116,173 @@ mod tests {
             serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
                 .expect("ConsolidatedReviewNode result carries a durable SDLCState");
         assert_eq!(bumped.telemetry.review_attempts, 3);
+    }
+
+    /// A `ConsolidatedReviewNode` whose reviewer always returns `verdict`
+    /// with `issue_count` distinct issues — the non-PASS counterpart to
+    /// [`passing_review_node`].
+    fn failing_review_node(verdict: &'static str, issue_count: usize) -> ConsolidatedReviewNode {
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let issues: Vec<String> = (0..issue_count).map(|i| format!("issue {i}")).collect();
+            let outcome = canned_outcome(
+                json!({ "verdict": verdict, "summary": "still not there", "issues": issues })
+                    .to_string(),
+            );
+            Box::pin(async move { Ok(outcome) })
+        });
+        ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport)
+    }
+
+    /// Run one `ConsolidatedReviewNode` pass for `task` against `state`,
+    /// returning the ctx it produced plus the durable state it wrote — so a
+    /// test can chain several reviews across several tasks the way a real
+    /// run does.
+    async fn review_once(
+        node: &ConsolidatedReviewNode,
+        state: &SDLCState,
+        task: &SDLCTask,
+    ) -> (TaskContext, SDLCState) {
+        let ctx = ctx_for_review(state, task);
+        let out = node.process(ctx).await.expect("process should succeed");
+        let next: SDLCState =
+            serde_json::from_value(out.nodes["ConsolidatedReviewNode"]["state"].clone())
+                .expect("ConsolidatedReviewNode result carries a durable SDLCState");
+        (out, next)
+    }
+
+    /// **The R6 regression.** Measured on a real 6-task `pragmatist` run:
+    /// task 1 passed review, task 2 passed review, and task 3's FIRST
+    /// review verdict — a minor `PARTIAL` — was routed straight to
+    /// `WrapUpNode` because two SUCCESSFUL reviews had already consumed the
+    /// whole run's review budget. The retry bound exists to stop an
+    /// unbounded review loop on ONE task; a PASS is not a retry, and an
+    /// earlier task's spend is not this task's.
+    #[tokio::test]
+    async fn earlier_tasks_passing_reviews_do_not_consume_a_later_tasks_retry_budget() {
+        let tasks = vec![
+            SDLCTask::new(1, "One", "d1"),
+            SDLCTask::new(2, "Two", "d2"),
+            SDLCTask::new(3, "Three", "d3"),
+        ];
+        let mut state = state_with_tasks(tasks.clone());
+
+        // Tasks 1 and 2 each pass review on their first pass.
+        let passing = passing_review_node();
+        for task in &tasks[..2] {
+            let (_ctx, next) = review_once(&passing, &state, task).await;
+            state = next;
+        }
+
+        // Task 3 now gets its FIRST review verdict: a minor PARTIAL.
+        let failing = failing_review_node("PARTIAL", 2);
+        let (ctx, _next) = review_once(&failing, &state, &tasks[2]).await;
+
+        assert_eq!(
+            ReviewRouterNode.route(&ctx),
+            Some("IncrementAttemptNode".to_string()),
+            "task 3's FIRST non-PASS review must take the retry back-edge — \
+             two earlier tasks' PASSING reviews must not have spent its \
+             review budget"
+        );
+    }
+
+    /// The same shape, carried all the way out: after two earlier tasks
+    /// passed review, the third task must still get its FULL
+    /// `max_review_attempts` allowance — retry, retry, then bail on the
+    /// third non-PASS verdict.
+    #[tokio::test]
+    async fn a_later_task_still_receives_its_full_review_allowance() {
+        let tasks = vec![
+            SDLCTask::new(1, "One", "d1"),
+            SDLCTask::new(2, "Two", "d2"),
+            SDLCTask::new(3, "Three", "d3"),
+        ];
+        let mut state = state_with_tasks(tasks.clone());
+
+        let passing = passing_review_node();
+        for task in &tasks[..2] {
+            let (_ctx, next) = review_once(&passing, &state, task).await;
+            state = next;
+        }
+
+        let max = SdlcPolicy::default().max_review_attempts;
+        let failing = failing_review_node("FAIL", 2);
+        for attempt in 1..=max {
+            let (ctx, next) = review_once(&failing, &state, &tasks[2]).await;
+            state = next;
+            let expected = if attempt < max {
+                "IncrementAttemptNode"
+            } else {
+                "WrapUpNode"
+            };
+            assert_eq!(
+                ReviewRouterNode.route(&ctx),
+                Some(expected.to_string()),
+                "review attempt {attempt} of {max} on task 3 routed wrongly"
+            );
+        }
+    }
+
+    /// The independence constraint `SDLCTelemetry::review_attempts` argues
+    /// for, restated over the per-task bound: a task that already burned
+    /// its test retries (`attempt_count`/`total_attempts` at 2) still
+    /// arrives at review with a FULL review budget, and a review pass
+    /// advances neither attempt counter.
+    #[tokio::test]
+    async fn review_budget_is_independent_of_the_attempt_counters() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.attempt_count = 2;
+        let mut state = state_with_tasks(vec![task.clone()]);
+        state.telemetry.total_attempts = 2;
+
+        let failing = failing_review_node("FAIL", 2);
+        let (ctx, next) = review_once(&failing, &state, &task).await;
+
+        assert_eq!(
+            ReviewRouterNode.route(&ctx),
+            Some("IncrementAttemptNode".to_string()),
+            "burned test retries must not reduce the review budget"
+        );
+        assert_eq!(next.tasks[0].review_attempt_count, 1);
+        // Untouched by the review pass.
+        assert_eq!(next.tasks[0].attempt_count, 2);
+        assert_eq!(next.telemetry.total_attempts, 2);
+        // And the run-level accounting counter still counts the verdict.
+        assert_eq!(next.telemetry.review_attempts, 1);
+    }
+
+    /// The genuine bound is untouched: ONE task burning minor non-PASS
+    /// verdicts is still stopped at exactly `max_review_attempts`.
+    #[tokio::test]
+    async fn one_task_burning_non_pass_verdicts_is_still_bounded() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let mut state = state_with_tasks(vec![task.clone()]);
+
+        let max = SdlcPolicy::default().max_review_attempts;
+        let failing = failing_review_node("FAIL", 2);
+        for attempt in 1..=max {
+            let (ctx, next) = review_once(&failing, &state, &task).await;
+            state = next;
+            let expected = if attempt < max {
+                "IncrementAttemptNode"
+            } else {
+                "WrapUpNode"
+            };
+            assert_eq!(
+                ReviewRouterNode.route(&ctx),
+                Some(expected.to_string()),
+                "review attempt {attempt} of {max} routed wrongly"
+            );
+        }
     }
 
     #[test]

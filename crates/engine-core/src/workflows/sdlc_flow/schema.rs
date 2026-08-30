@@ -92,6 +92,29 @@ pub struct SDLCTask {
     /// be conflated.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
+    /// Number of NON-PASS `ConsolidatedReviewNode` verdicts this task has
+    /// received — the counter `ReviewRouterNode`'s minor-issue back-edge
+    /// bounds against via `policy.max_review_attempts`.
+    ///
+    /// **Per-task, and charged only by a retry.** The bound exists to stop
+    /// an unbounded review-retry loop on ONE task, so it is measured the
+    /// same way `attempt_count` is: reset for each task, and advanced only
+    /// by a verdict that actually causes a retry. A `PASS` ends this task's
+    /// review cycle rather than extending it, so it is not charged here
+    /// (`SDLCTelemetry::review_attempts` still counts every verdict for
+    /// run-level accounting).
+    ///
+    /// This replaced a per-run bound that charged PASSes: measured on run
+    /// R6 (6 tasks, `pragmatist`, `max_review_attempts = 3`), tasks 1 and 2
+    /// each PASSED review (+1 each) and task 3's FIRST `PARTIAL` (+1 = 3)
+    /// hit the bound — task 3 got one review attempt instead of three, and
+    /// no task after the third could be reviewed at all.
+    ///
+    /// Deliberately NOT folded into [`Self::attempt_count`] — see
+    /// `SDLCTelemetry::review_attempts`'s doc comment for why the review
+    /// and implement/test counters must stay independent.
+    #[serde(default)]
+    pub review_attempt_count: u32,
 }
 
 impl SDLCTask {
@@ -107,6 +130,7 @@ impl SDLCTask {
             validation_commands: Vec::new(),
             attempt_count: 0,
             max_attempts: default_max_attempts(),
+            review_attempt_count: 0,
         }
     }
 }
@@ -251,17 +275,22 @@ pub struct SDLCTelemetry {
     #[serde(default)]
     pub tasks_failed: u32,
     /// Number of `ConsolidatedReviewNode` verdicts produced so far
-    /// (EN.ticket.review-retry-loop-unbounded task 2) — the durable counter
-    /// `ReviewRouterNode` bounds against, independent of `total_attempts`.
+    /// (EN.ticket.review-retry-loop-unbounded task 2), independent of
+    /// `total_attempts`.
     ///
-    /// **Scoped per-run, not per-task**, matching JS's `reviewAttempts`
-    /// (`base-template/.claude/workflows/sdlc-flow.js:252-253`), a single
-    /// loop counter for the run's review cycle — not per-task like
-    /// `SDLCTask::attempt_count`. This also matches where the field
-    /// physically lives: `SDLCTelemetry` is a whole-run aggregate on
-    /// `SDLCState`, not a per-`SDLCTask` field, so a fresh task does not
-    /// reset it. Deliberately NOT folded into `total_attempts`/
-    /// `attempt_count` (both bumped by `IncrementAttemptNode` on both
+    /// **A run-level ACCOUNTING aggregate, not the retry bound.** It counts
+    /// every verdict the run produced — PASS included — across every task,
+    /// and is never reset by a fresh task; that is what makes it a valid
+    /// contribution to `task_loop::logical_clock` (every state-mutating
+    /// node in the loop advances exactly one counter by exactly one). The
+    /// bound `ReviewRouterNode` enforces is `SDLCTask::review_attempt_count`
+    /// — per-task, and charged only by a NON-PASS verdict. It used to be
+    /// this field, which made a run's earlier tasks' successful reviews
+    /// eat a later task's retry budget (see `review_attempt_count`'s doc
+    /// for the measured R6 case). That per-run scope came from JS's
+    /// `reviewAttempts` (`base-template/.claude/workflows/sdlc-flow.js:252-253`);
+    /// the divergence is deliberate. Deliberately NOT folded into
+    /// `total_attempts`/`attempt_count` (both bumped by `IncrementAttemptNode` on both
     /// back-edges and consumed by `RunTelemetry`/`PolicyAggregate` to mean
     /// "an implement/test attempt ran") — overloading them would make a
     /// task that burned test retries arrive at review with a reduced review
@@ -839,9 +868,9 @@ pub enum TerminalSignal {
     EndReviewFail(String),
     /// `ReviewRouterNode`'s minor-issue back-edge (`FAIL`/`PARTIAL`, 1..=
     /// `STRUCTURAL_ISSUE_THRESHOLD` issues) hit `policy.max_review_attempts`
-    /// (EN.ticket.review-retry-loop-unbounded task 3) — the run's per-run,
-    /// durable `telemetry.review_attempts` counter reached the bound before
-    /// the reviewer returned a clean `PASS`. Distinguished from
+    /// (EN.ticket.review-retry-loop-unbounded task 3) — the CURRENT task's
+    /// durable `SDLCTask::review_attempt_count` (its non-PASS verdicts)
+    /// reached the bound before the reviewer returned a clean `PASS`. Distinguished from
     /// [`Self::ReviewFail`]/[`Self::StructuralFail`], which fire on the
     /// FIRST structural verdict regardless of attempt count: this variant
     /// only fires after the retry budget itself is exhausted. An explicit
