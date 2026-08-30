@@ -108,9 +108,38 @@ reconcile at all.
 
 | Status | When | What it leaves behind |
 |---|---|---|
-| `"done"` | A clean full run, or a clean partial-range run | State committed; block closed via `CloseBlockNode` (full run only) |
+| `"done"` | A clean full run, or a clean partial-range run | State committed; block closed via `CloseBlockNode` (full run only), which also stages and commits the derived fallout of its own close — see below |
 | `"blocked"` | A `MAJOR_BAIL` triage verdict, a budget-exhausted `RETRYABLE`, or any unrecognized triage verdict | State committed; per-task commits stand |
 | `"reconcile_failed"` | The D56 reconcile ran (full run only) and stamped `all_passed: false` | State still committed; per-task commits stand; the bookkeep **flip is skipped** — `CloseBlockNode` widens its skip predicate to also skip on `"reconcile_failed"`, naming D56 in the skip reason, so a failed reconcile can never close the block |
+
+### Closing a block also commits what closing it regenerated
+
+`CloseBlockNode` closes the block through `mev::set_block_status` with a write. That call chains
+internally into `emit-state --write`, which regenerates derived surfaces **across the whole fleet** —
+master-plan wave tables, project caches, tier rollups, boards. Until
+`EN.ticket.close-block-node-leaves-derived-output-uncommitted` (2026-08-30) the node wrote all of
+that and committed none of it, leaving correct-but-uncommitted files in repos the run never touched;
+they surfaced later as a red gate in some unrelated lane. The measured cost was 24 files across four
+repos.
+
+The node now collects every `I_EMIT_WROTE` diagnostic from `set_block_status`'s report into a write
+manifest, and commits it. Three properties are load-bearing and are each pinned by a test in
+[`crates/engine-core/tests/it/close_block_commit_manifest.rs`](../../crates/engine-core/tests/it/close_block_commit_manifest.rs):
+
+- **Paths are resolved through the `planning/` symlink face** before staging. Every sub-repo's
+  `planning/` is a symlink into the brain's `_planning/` vault, so an unresolved path does not exist
+  from git's point of view.
+- **Each path is staged one at a time, with an explicit pathspec.** A single bad path silently fails
+  a whole batched `git add`, which is exactly how the 24 files were lost. Per-path staging turns that
+  into a per-path error that gets reported. There is never a `git add -A`, a `git add .`, or a
+  pathspec-less `commit` — one HQ git repo tracks *every* repo's `planning/`, so a bare commit would
+  sweep concurrent lanes' work into this one.
+- **A rolled-back close commits nothing.** If the close introduced a net-new corpus diagnostic and
+  was restored, the write should not have landed, so neither should the commit.
+
+A staging failure is never fatal: the block is still closed, and `CloseOutcome::Closed` carries both
+`committed` (the paths that landed) and `commit_failures` (each failed path with its reason) so the
+result is visible in the run artifact rather than silent.
 
 **`reconcile_failed` is terminal** (base-template D56 CALL 2, decided 2026-08-19) — the chain
 stops there. In an `ORCHESTRATION` chain this means nothing downstream of this `SDLC_TASK` block
