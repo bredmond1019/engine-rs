@@ -919,6 +919,69 @@ pub(super) const PATH_DISCIPLINE_PREAMBLE: &str = "PATH DISCIPLINE. Work only \
      your work. Before your first write, confirm the tree you are in is the \
      intended one.\n\n";
 
+/// Run-invariant preamble prepended to [`TriageTaskNode`]'s `llm_triage`
+/// prompt — the bin-1 half of the JS engines' `renderTriagePrompt`
+/// (`base-template/.claude/workflows/prompts/shared.js`), ported under
+/// `EN.ticket.prompt-parity-with-the-js-engines`.
+///
+/// **Classification, recorded as the ticket's first acceptance criterion
+/// requires.** Of the JS prompt's content: the role sentence, the cost
+/// asymmetry, the five immediate-bail reasons, the evidence clause, the
+/// self-inflicted-environment caution and the RETRYABLE/`MAJOR_BAIL`
+/// definitions are **bin 1** and are ported here verbatim in substance.
+/// `${bailRecipe}` — JS's folded state write — is **bin 2** and is dropped:
+/// engine-rs writes state in Rust nodes (`SaveStateNode`/`EmitStateNode`),
+/// and a prompted state write is one a model can skip. The `Return via
+/// StructuredOutput: …` field list is **bin 4**; its *shape* is carried by
+/// [`triage_output_schema`] instead, while the *semantics* of `evidence` and
+/// `base_state_checked` — which a model cannot infer from a JSON schema —
+/// stay here as bin 1.
+///
+/// Two deliberate wording changes from the JS source: `MAJOR` is spelled
+/// `MAJOR_BAIL` (the Rust verdict vocabulary `TriageRouterNode` exact-matches,
+/// so the JS spelling would emit a verdict the router rejects), and the
+/// per-run engine name is generalized to "an SDLC run" — that is what lets
+/// this one block serve `SDLC_FLOW` and `SDLC_TASK`, which share this node.
+///
+/// **Carries no per-run value, deliberately** (standing rule 6): interpolating
+/// one would destroy the cache breakpoint on every call, a cost regression
+/// wearing the costume of a prompt improvement. `triage_stable_prompt_
+/// interpolates_nothing_per_run` pins that as a test failure rather than a
+/// review catch. Same discipline, and the same shape, as
+/// [`PATH_DISCIPLINE_PREAMBLE`].
+pub(super) const TRIAGE_STABLE_PROMPT: &str = r#"You are the failure-triage agent for an SDLC run. Classify a failure so the pipeline either makes
+a bounded fix or bails to a human NOW. Bailing is cheap; a wasted retry loop is not — when unsure, BAIL.
+
+IMMEDIATE-BAIL reasons — if the failure is ANY of these, the verdict is MAJOR_BAIL and the reason is a
+short human-readable description of which one and where:
+  1. Missing/undefined upstream dependency or symbol the spec assumes exists.
+  2. Spec ambiguity/contradiction — intended behavior is genuinely undeterminable.
+  3. Environment/credential/auth/network failure (not a code defect).
+  4. Change would require a destructive or out-of-scope action.
+  5. Same failure twice with no progress (stuck), or a structural design flaw needing a re-plan.
+
+This does NOT widen the bail set above — it only constrains what you may ASSERT once you bail.
+Before writing any reason that claims a failure PRE-DATES this task / exists "at baseline" / is
+"unrelated to this task's scope": you MUST first re-run ONLY the failing check against the base state
+(the main working tree, or the task's base commit). If you do so, set base_state_checked=true and put
+the actual result in evidence. If you cannot re-run it in this run's context, set
+base_state_checked=false and phrase the claim explicitly as a HYPOTHESIS ("possibly pre-existing; NOT
+verified against base"), never as observed fact.
+
+Self-inflicted-environment caution: harness-created workspace state (the worktree, sparse checkout,
+copied .env files, a repaired planning/ symlink) is a CANDIDATE CAUSE, not a fixed backdrop. An
+identical failure before and after the change is NOT evidence of pre-existence when both states share
+the same possibly-broken environment.
+
+Otherwise:
+  RETRYABLE  — transient/infra (agent died, flaky), OR the failure CHANGED from the previous attempt
+               (it is making progress and a bounded fix can plausibly close it).
+  MAJOR_BAIL — the SAME failure again with no progress, OR structural (one of the bail reasons above).
+
+evidence must be what was actually OBSERVED, quoting output — no causal guessing.
+
+"#;
+
 /// Model node (Sonnet): drives Claude Code to implement the current task.
 /// Composes a `ClaudeCodeStep` under its own identity so it can post-process
 /// the model's JSON output into `{summary, modified_files, tests_added}`.
@@ -1991,19 +2054,41 @@ pub struct TriageTaskNode {
     cancellation_token: Option<CancellationToken>,
 }
 
+/// The three fields below `reason` are what [`TRIAGE_STABLE_PROMPT`]'s
+/// evidence clause needs somewhere to land — without `base_state_checked` in
+/// particular the clause is unenforceable, because the model can assert a
+/// pre-existing failure with nothing recording whether it actually checked.
+///
+/// All three are `#[serde(default)]` and **not** in the schema's `required`
+/// list: a model that omits them still parses, so this port cannot turn a
+/// previously-working run into a `NodeError`.
 #[derive(Debug, Deserialize)]
 struct TriageOutput {
     verdict: String,
     reason: String,
+    /// What was actually OBSERVED, quoting output. No causal claims.
+    #[serde(default)]
+    evidence: String,
+    /// True **only** if the failing check was re-run against the base state.
+    #[serde(default)]
+    base_state_checked: bool,
+    /// Whether this failure matches the previous attempt's — the progress
+    /// signal that separates `RETRYABLE` from stuck.
+    #[serde(default)]
+    same_failure_as_before: bool,
 }
 
-/// JSON schema matching [`TriageOutput`].
+/// JSON schema matching [`TriageOutput`]. `required` stays `verdict`/`reason`
+/// so the added fields are behavior-stable — see [`TriageOutput`].
 fn triage_output_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
             "verdict": { "type": "string" },
             "reason": { "type": "string" },
+            "evidence": { "type": "string" },
+            "base_state_checked": { "type": "boolean" },
+            "same_failure_as_before": { "type": "boolean" },
         },
         "required": ["verdict", "reason"],
     })
@@ -2193,11 +2278,18 @@ impl Node for TriageTaskNode {
             .unwrap_or_default()
             .to_string();
 
+        // `TRIAGE_STABLE_PROMPT` leads and carries no run-varying text, so it
+        // is a byte-stable prefix on every triage call; everything after it is
+        // this run's evidence. Ported from the JS engines under
+        // `EN.ticket.prompt-parity-with-the-js-engines` — see that constant for
+        // the four-bin classification of what was and was not brought over.
         let mut prompt = format!(
-            "Classify this task's test failure as RETRYABLE or MAJOR_BAIL. \
-             Respond with strict JSON of the shape {{\"verdict\": str, \
-             \"reason\": str}}.\n\nTask: {title}\nAttempt {} of \
-             {max_attempts}.\nFailure summary: {failure_summary}",
+            "{TRIAGE_STABLE_PROMPT}Classify this task's test failure as \
+             RETRYABLE or MAJOR_BAIL. Respond with strict JSON of the shape \
+             {{\"verdict\": str, \"reason\": str, \"evidence\": str, \
+             \"base_state_checked\": bool, \"same_failure_as_before\": \
+             bool}}.\n\nTask: {title}\nAttempt {} of {max_attempts}.\nFailure \
+             summary: {failure_summary}",
             attempt_count + 1
         );
 
@@ -2262,6 +2354,13 @@ impl Node for TriageTaskNode {
             // arm below to guarantee the walk reaches `WrapUpNode`.
             "verdict": normalized_verdict,
             "reason": parsed.reason,
+            // Stamped so a reviewer can see whether a "pre-existing failure"
+            // claim was actually verified against base state, rather than
+            // having to take the reason prose at its word. `false`/`""` when
+            // the model omitted the field, which is itself the honest reading.
+            "evidence": parsed.evidence,
+            "base_state_checked": parsed.base_state_checked,
+            "same_failure_as_before": parsed.same_failure_as_before,
         });
         if !matches!(
             normalized_verdict.as_str(),
@@ -4048,11 +4147,106 @@ mod tests {
     /// The base triage prompt, exactly as built for a task titled `One` on
     /// attempt 1 of 3 with an empty `failure_summary`. Held as a literal so
     /// the enrichment tests below can assert against
-    /// `format!("{TRIAGE_BASE_PROMPT}{block}")` shapes rather than restating
+    /// `format!("{}{block}", triage_base_prompt())` shapes rather than restating
     /// it, and so the byte-identical pin has something to pin *to*.
-    const TRIAGE_BASE_PROMPT: &str = "Classify this task's test failure as RETRYABLE or \
-         MAJOR_BAIL. Respond with strict JSON of the shape {\"verdict\": str, \"reason\": \
-         str}.\n\nTask: One\nAttempt 1 of 3.\nFailure summary: ";
+    ///
+    /// **Updated deliberately, not deleted**, by the JS prompt port
+    /// (`EN.ticket.prompt-parity-with-the-js-engines`): the request line is
+    /// now preceded by [`TRIAGE_STABLE_PROMPT`] and names the three fields
+    /// that port added to [`triage_output_schema`]. The detector's job is to
+    /// make a prompt change visible in review, which is exactly what this
+    /// diff does.
+    fn triage_base_prompt() -> String {
+        format!(
+            "{TRIAGE_STABLE_PROMPT}Classify this task's test failure as RETRYABLE or \
+             MAJOR_BAIL. Respond with strict JSON of the shape {{\"verdict\": str, \
+             \"reason\": str, \"evidence\": str, \"base_state_checked\": bool, \
+             \"same_failure_as_before\": bool}}.\n\nTask: One\nAttempt 1 of 3.\n\
+             Failure summary: "
+        )
+    }
+
+    // --- TriageTaskNode: the ported stable preamble ------------------------
+
+    /// The ticket's headline acceptance criterion: the prompt must state what
+    /// makes a failure retryable versus fatal. Before the port it said only
+    /// "Classify this task's test failure as RETRYABLE or MAJOR_BAIL" and
+    /// never what either word meant.
+    #[test]
+    fn triage_prompt_states_the_retryable_versus_fatal_distinction() {
+        let p = TRIAGE_STABLE_PROMPT;
+        assert!(p.contains("RETRYABLE"), "must name the retryable class");
+        assert!(
+            p.contains("MAJOR_BAIL"),
+            "must name the fatal class using the SCHEMA's vocabulary, not JS's `MAJOR`"
+        );
+        assert!(
+            p.contains("CHANGED from the previous attempt"),
+            "the progress signal is what distinguishes retryable from stuck"
+        );
+        assert!(
+            p.contains("SAME failure again with no progress"),
+            "and its converse is what makes a bail correct"
+        );
+    }
+
+    /// The cost asymmetry. The ticket names it explicitly: the classifier has
+    /// to know which direction the cheap error lies in.
+    #[test]
+    fn triage_prompt_signals_that_bailing_is_cheap_relative_to_a_retry_loop() {
+        assert!(TRIAGE_STABLE_PROMPT.contains("when unsure, BAIL"));
+        assert!(TRIAGE_STABLE_PROMPT.contains("Bailing is cheap"));
+    }
+
+    /// **The R4 clause.** The implementer had written into the wrong tree —
+    /// harness-created workspace state — and the classifier treated the
+    /// environment as a given, inventing a premise mismatch to explain "the
+    /// test failed" when the true fact was "no code was written here".
+    #[test]
+    fn triage_prompt_carries_the_self_inflicted_environment_caution() {
+        assert!(TRIAGE_STABLE_PROMPT.contains("CANDIDATE CAUSE, not a fixed backdrop"));
+    }
+
+    /// The evidence clause is judgement discipline Rust cannot enforce, so it
+    /// has to be prose — but `base_state_checked` is what makes an unverified
+    /// claim visible afterwards.
+    #[test]
+    fn triage_prompt_requires_base_state_to_be_rechecked_before_claiming_pre_existence() {
+        let p = TRIAGE_STABLE_PROMPT;
+        assert!(p.contains("re-run ONLY the failing check against the base state"));
+        assert!(p.contains("base_state_checked=true"));
+        assert!(p.contains("HYPOTHESIS"));
+    }
+
+    /// Cache discipline (standing rule 6): a per-run value in the stable
+    /// prefix destroys the breakpoint on every call. A literal `const` with no
+    /// `format!` is the cheapest way to make that unrepresentable — this test
+    /// turns a future regression into a test failure rather than a review
+    /// catch.
+    #[test]
+    fn triage_stable_prompt_interpolates_nothing_per_run() {
+        assert!(
+            !TRIAGE_STABLE_PROMPT.contains('{'),
+            "no format placeholders in the cached prefix"
+        );
+        assert!(
+            TRIAGE_STABLE_PROMPT.ends_with("\n\n"),
+            "must end with the separator that keeps the per-run body distinct"
+        );
+    }
+
+    /// Bin 2 is the trap the ticket exists to avoid: JS folds a state write
+    /// into its triage prompt because it has no engine. engine-rs writes state
+    /// in Rust nodes, so that text must NOT be here.
+    #[test]
+    fn triage_prompt_ports_no_bin_two_state_write() {
+        let p = TRIAGE_STABLE_PROMPT;
+        assert!(
+            !p.contains("state.json"),
+            "state writes are Rust nodes, not prose"
+        );
+        assert!(!p.contains("stateWritten"));
+    }
 
     /// Records the prompt handed to the transport and answers with a valid
     /// [`TriageOutput`]. (`prompt_recording_transport` answers with an
@@ -4100,9 +4294,10 @@ mod tests {
         let prompts = seen.lock().unwrap().clone();
         assert_eq!(prompts.len(), 1);
         let prompt = &prompts[0];
-        // The base prompt is intact and still leads...
+        // The ported preamble leads, and the base request is intact behind it...
+        assert!(prompt.starts_with(TRIAGE_STABLE_PROMPT), "prompt: {prompt}");
         assert!(
-            prompt.starts_with("Classify this task's test failure"),
+            prompt.contains("Classify this task's test failure"),
             "prompt: {prompt}"
         );
         assert!(prompt.contains("Failure summary: Failed checks: test"));
@@ -4149,7 +4344,7 @@ mod tests {
 
         let prompts = seen.lock().unwrap().clone();
         let prompt = &prompts[0];
-        let base_len = TRIAGE_BASE_PROMPT.chars().count() + "Failed checks: test".chars().count();
+        let base_len = triage_base_prompt().chars().count() + "Failed checks: test".chars().count();
         assert!(
             prompt.chars().count() <= base_len + 900,
             "prompt was {} chars, expected <= {}",
@@ -4184,7 +4379,7 @@ mod tests {
 
         let prompts = seen.lock().unwrap().clone();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], TRIAGE_BASE_PROMPT);
+        assert_eq!(prompts[0], triage_base_prompt());
     }
 
     /// The shared knob's off switch covers triage too.
@@ -4210,7 +4405,7 @@ mod tests {
         let prompts = seen.lock().unwrap().clone();
         assert_eq!(
             prompts[0],
-            format!("{TRIAGE_BASE_PROMPT}Failed checks: test")
+            format!("{}Failed checks: test", triage_base_prompt())
         );
     }
 
