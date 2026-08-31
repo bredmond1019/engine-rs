@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-30T18:47:47Z"
+timestamp: "2026-08-31T15:44:41Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,13 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-08-31]
+
+### engine-updates-and-fixes chain (1st run) — retry-one-exhausted-task, abort-interrupts-agent-node, run-telemetry's structural zeros
+- **What:** Closed the three tickets left open by the 2026-08-30 jynx defect sweep, via `/orchestrate` driving `sdlc-task` for each, in place on `main`. `LoadTaskStateNode` gained a fifth restart-vs-resume case — an additive `retry_task: Option<u32>` event field that resets one named task's status/attempt_count/review_attempt_count against the existing committed state while leaving every other task and the resume:true/false paths untouched (`23fa483`, `8334ec0`); the three agent nodes in `sdlc_flow`/`sdlc_task` gained a cancellation-token builder, minted and published by the SDLC factories and threaded through `engine-serve`'s suspend/dispatch path, so an abort request can now interrupt a node mid-agent-call (`0f483cd`, `fc6f3e7`); and `run_telemetry`'s four permanently-zero counters (`total_attempts`/`total_retries`/`tasks_passed`/`tasks_failed`) were documented at their origin and at `docs/architecture.md`, with a new pinning test (`stamp_run_telemetry_counters_stay_structurally_zero_on_a_successful_run`) forcing the docs to be revisited if a future change starts populating them (`ea50741`, `d5fe94e`, `00bed02`). All three PASS, `bastion validate-brain --state` 0 errors after each. Full workspace re-run at chain close: 2985/2985 tests passed.
+- **Why:** These were the three remaining open tickets from the prior session's jynx-driven defect sweep, queued for a follow-up `/orchestrate` run rather than closed inline that session.
+- **Refs:** `planning/orchestration-run/engine-updates-and-fixes/{notes.md,review.md}` (renamed 2026-08-31 from `en-three-tickets` and reopened for a second run of jynx-filed tickets — see that session's log entry below); blocks `EN.ticket.retry-one-exhausted-task-without-restarting-the-spec` / `EN.ticket.abort-must-interrupt-an-in-flight-agent-node` / `EN.ticket.run-telemetry-publishes-four-permanently-zero-counters`.
 
 ## [run: 2026-08-30]
 
