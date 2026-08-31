@@ -6943,6 +6943,100 @@ mod tests {
         }
     }
 
+    /// EN.ticket.unknown-review-verdict-must-not-hard-bail task 3: a
+    /// two-task run where task 1 passes cleanly (implement, test, triage
+    /// PASS -> `UpdateTaskStatusNode`, honestly counted) and task 2's
+    /// review returns the literal jynx-observed unrecognized verdict
+    /// (`CANNOT_VERIFY`) on every attempt until `max_review_attempts` is
+    /// exhausted and the run bails. Proves `tasks_passed` stays honest
+    /// through the whole cycle — task 1's already-correct count must not
+    /// be poisoned by task 2's own unresolved review (the R8b defect: jynx
+    /// run bad42551-6d60-44a1-9d80-d5b28cf2cc75 reported `tasks_passed: 0`
+    /// for a task whose code was committed and gate-green) — and that the
+    /// run's own committed `bail_reason` names task 2's real outcome
+    /// rather than silently reading as a clean success.
+    #[tokio::test]
+    async fn tasks_passed_stays_honest_through_a_later_tasks_unrecognized_verdict_exhaustion() {
+        let task1 = SDLCTask::new(1, "One", "d1");
+        let task2 = SDLCTask::new(2, "Two", "d2");
+        let state = state_with_tasks(vec![task1.clone(), task2.clone()]);
+        let mut ctx = ctx_with_state(&state);
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        // Task 1: a clean first-attempt PASS, counted immediately.
+        let ctx = drive_task_to_pass(ctx, &task1, 0).await;
+        let mut state: SDLCState =
+            serde_json::from_value(ctx.nodes["UpdateTaskStatusNode"].clone())
+                .expect("UpdateTaskStatusNode result carries a durable SDLCState");
+        assert_eq!(
+            state.telemetry.tasks_passed, 1,
+            "precondition: task 1's PASS is counted before task 2 ever reviews"
+        );
+
+        // Task 2: the reviewer returns CANNOT_VERIFY on every attempt,
+        // retrying via the bounded back-edge (task 1's fix) until the cap
+        // is hit and the router falls through to WrapUpNode.
+        let max = SdlcPolicy::default().max_review_attempts;
+        let failing = failing_review_node("CANNOT_VERIFY", 2);
+        let mut exhausted_ctx = None;
+        for attempt in 1..=max {
+            let (review_ctx, next) = review_once(&failing, &state, &task2).await;
+            state = next;
+            let expected = if attempt < max {
+                "IncrementAttemptNode"
+            } else {
+                "WrapUpNode"
+            };
+            assert_eq!(
+                ReviewRouterNode.route(&review_ctx),
+                Some(expected.to_string()),
+                "task 2 review attempt {attempt} of {max} routed wrongly"
+            );
+            exhausted_ctx = Some(review_ctx);
+        }
+        let mut wrap_ctx = exhausted_ctx.expect("loop ran at least once (max >= 1)");
+
+        // Task 1's honest count must survive task 2's own review never
+        // resolving — and task 2 must not be fabricated into `tasks_failed`
+        // either, since its review never actually resolved to FAIL.
+        assert_eq!(
+            state.telemetry.tasks_passed, 1,
+            "task 1's committed, gate-passing work must not be zeroed out \
+             by task 2's unresolved review (the R8b defect)"
+        );
+        assert_eq!(
+            state.telemetry.tasks_failed, 0,
+            "tasks_failed has no writer at all (see UpdateTaskStatusNode's \
+             doc comment) — crediting task 2's unresolved review as a FAIL \
+             would be dishonest in the other direction"
+        );
+
+        // Drive the exhaustion all the way through WrapUpNode (in-memory
+        // only — no `SetupWorktreeNode` stamp, so no disk persistence runs)
+        // and confirm the committed terminal state agrees: honest
+        // counters, and a `bail_reason` naming task 2's real verdict rather
+        // than silently reporting a clean run.
+        wrap_ctx.nodes.remove("SetupWorktreeNode");
+        let out = crate::workflows::sdlc_flow::wrap_up::WrapUpNode::new()
+            .process(wrap_ctx)
+            .await
+            .expect("wrap-up should succeed");
+        let final_state: SDLCState =
+            serde_json::from_value(out.nodes["WrapUpNode"]["state"].clone())
+                .expect("WrapUpNode result carries the terminal SDLCState");
+        assert_eq!(final_state.telemetry.tasks_passed, 1);
+        assert_eq!(final_state.telemetry.tasks_failed, 0);
+        assert_eq!(
+            final_state.bail_reason.as_deref(),
+            Some("unrecognized review verdict: CANNOT_VERIFY"),
+            "the run's own bail_reason must name task 2's real outcome, \
+             not report a clean PASS"
+        );
+    }
+
     #[test]
     fn latest_state_prefers_consolidated_review_node_over_a_stale_load() {
         // `ConsolidatedReviewNode`'s bump must be visible to `latest_state`
