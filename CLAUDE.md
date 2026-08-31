@@ -7,6 +7,15 @@ divested every execution workflow: all business workflows, artifact generation, 
 harness are engine-rs's. Synapse keeps knowledge only — corpus, embeddings, structural graph, memory,
 retrieval.
 
+## Workflow engine telemetry
+
+**After invoking `Workflow({name: 'sdlc-task'|'sdlc-flow', ...})`, load the `stamp-workflow-run-id`
+skill.** The engine script can't read its own Workflow run id back — the Workflow script API has no
+`runId` global and no filesystem access — so joining a run's `sdlc-task-state.json`/
+`sdlc-flow-state.json` to the exact Claude Code session transcript for cost telemetry relies on the
+*invoking* agent patching the id in after the call returns. Skip this and `workflow_run_id` simply
+stays `null` — a normal, expected state, never a defect to chase.
+
 ## THE BOUNDARY TEST — read this before scoping any new work
 
 Brain (Synapse), Engine (engine-rs), or Factory/Doc (mev/okf-core)? Ask in order. Governed by brain **D51** & **D53**; this block is
