@@ -862,7 +862,13 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
    stamp (`ctx.nodes[stage]["transport"]["tier"]`, written by `ClaudeCodeStep`/
    `openai_compat_transport`'s tier-aware `MetaTransport` seam) over the resolved policy's intent,
    so a `local`-tier stage that silently fell back to cloud (endpoint unreachable) is reported as
-   what actually ran, not what the policy asked for.
+   what actually ran, not what the policy asked for. **Four of this snapshot's fields —
+   `total_attempts`, `total_retries`, `tasks_passed`, `tasks_failed` — are hardcoded to `0` on every
+   workflow, every path, including a fresh and fully successful run.** `run_with` is graph-agnostic
+   by design and cannot see workflow-specific state, so it cannot derive these; a reader who needs
+   the real per-spec numbers wants `ctx.nodes["WrapUpNode"]` or the on-disk SDLC state file instead,
+   populated by `finalize_outcomes` — see `docs/workflows/sdlc-flow-policy.md`'s "Aggregating across
+   runs" section for the two-writer design.
 5. Local Console reads live state directly via `LiveStateStore::get`/`list_active` (in-memory,
    no DB poll); remote observers (BastionUI) subscribe to serve's `GET /workflows` /
    `GET /workflows/{type}/graph` read-API rather than polling Postgres. The durable writer
