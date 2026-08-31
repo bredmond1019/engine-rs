@@ -1903,6 +1903,144 @@ mod tests {
         );
     }
 
+    /// `EN.ticket.sdlc-task-resolved-policy-writer-reader-mismatch` task 2 —
+    /// the same served-dispatch fixture as
+    /// `sdlc_task_served_dispatch_loads_task_state_without_policy_deserialize_error`
+    /// (task 1's reproduction), but naming an explicit `profile:` on the
+    /// event so the resolved policy runs through
+    /// `sdlc_task::profiles::resolve_policy_for_run_from`'s named-profile
+    /// branch rather than the built-in default before being seeded. Task 1
+    /// only proved the built-in default profile round-trips; this proves
+    /// all three named profiles do, through the exact factory the AC names
+    /// (`register_sdlc_task_with_registry` — the served path, never
+    /// `sdlc_task_e2e.rs`'s direct `registry()`/`registry_for_policy()`
+    /// calls). Returns the `LoadTaskStateNode` node-run so each profile's
+    /// test asserts on it independently, matching this file's existing
+    /// one-test-per-profile convention (see `sdlc_task_e2e.rs`'s
+    /// `baseline_profile_...`/`cheap_fast_profile_...`/
+    /// `thorough_profile_...` tests, referenced from `policy.rs`'s module
+    /// doc) rather than a shared parameterized loop.
+    async fn dispatch_sdlc_task_for_profile_and_load_task_state(
+        profile: &str,
+    ) -> engine_contract::NodeRun {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(alpha.join("planning").join("my-spec"))
+            .expect("mkdir alpha/planning/my-spec");
+        std::fs::write(
+            alpha.join("planning").join("my-spec").join("tasks.json"),
+            serde_json::json!([
+                {
+                    "task_id": 1,
+                    "title": "Do a thing",
+                    "description": "Do the work",
+                    "acceptance_criteria": ["it works"],
+                    "max_attempts": 2,
+                }
+            ])
+            .to_string(),
+        )
+        .expect("write tasks.json");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&alpha)
+                .status()
+                .unwrap_or_else(|err| panic!("git {args:?} should spawn: {err}"));
+            assert!(status.success(), "git {args:?} must succeed for this test");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(alpha.join("README.md"), "fixture\n").expect("write README");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        run_git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n",
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task_with_registry(&mut dispatcher, Some(registry));
+
+        let event =
+            serde_json::json!({ "spec_slug": "my-spec", "repo": "alpha", "profile": profile });
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_TASK", &event)
+            .unwrap_or_else(|err| {
+                panic!("SDLC_TASK should dispatch under profile {profile:?}: {err}")
+            });
+
+        let token = engine_core::CancellationToken::new();
+        let cancel_token = token.clone();
+        let on_progress: engine_core::OnProgress<'_> = Box::new(move |ctx| {
+            if ctx
+                .node_runs
+                .get("LoadTaskStateNode")
+                .is_some_and(|run| run.status != engine_contract::NodeRunStatus::Pending)
+            {
+                cancel_token.cancel();
+            }
+        });
+        let options = engine_core::RunOptions {
+            cancellation_token: Some(token),
+            budget: None,
+            pause_signal: None,
+            run_id: None,
+        };
+
+        let ctx = workflow
+            .run_with(event, on_progress, options)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("run should not error at the harness level under profile {profile:?}: {err}")
+            });
+
+        ctx.node_runs
+            .get("LoadTaskStateNode")
+            .unwrap_or_else(|| {
+                panic!("LoadTaskStateNode should have run before cancellation under profile {profile:?}")
+            })
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn sdlc_task_served_dispatch_loads_task_state_under_baseline_profile() {
+        let run = dispatch_sdlc_task_for_profile_and_load_task_state("baseline").await;
+        assert_eq!(
+            run.status,
+            engine_contract::NodeRunStatus::Success,
+            "LoadTaskStateNode must succeed under the baseline profile (error: {:?})",
+            run.error
+        );
+    }
+
+    #[tokio::test]
+    async fn sdlc_task_served_dispatch_loads_task_state_under_cheap_fast_profile() {
+        let run = dispatch_sdlc_task_for_profile_and_load_task_state("cheap-fast").await;
+        assert_eq!(
+            run.status,
+            engine_contract::NodeRunStatus::Success,
+            "LoadTaskStateNode must succeed under the cheap-fast profile (error: {:?})",
+            run.error
+        );
+    }
+
+    #[tokio::test]
+    async fn sdlc_task_served_dispatch_loads_task_state_under_thorough_profile() {
+        let run = dispatch_sdlc_task_for_profile_and_load_task_state("thorough").await;
+        assert_eq!(
+            run.status,
+            engine_contract::NodeRunStatus::Success,
+            "LoadTaskStateNode must succeed under the thorough profile (error: {:?})",
+            run.error
+        );
+    }
+
     #[test]
     fn sdlc_flow_registration_and_dispatch_unchanged_alongside_sdlc_task() {
         let mut dispatcher = Dispatcher::new();
