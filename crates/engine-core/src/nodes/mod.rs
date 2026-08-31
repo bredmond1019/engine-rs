@@ -129,6 +129,7 @@ pub mod fan_out;
 pub mod harvest_approve;
 pub mod harvest_gate;
 pub mod http_post;
+pub mod http_request;
 pub mod materialize_doc;
 pub mod merge_contacts;
 pub mod openai_compat_transport;
@@ -157,6 +158,7 @@ pub use fan_out::FanOutNode;
 pub use harvest_approve::HarvestApproveNode;
 pub use harvest_gate::{pending_harvest_record, HarvestDecision, HarvestGate, HarvestMode};
 pub use http_post::{http_post_live, HttpPost, HttpPostResponse, ReqwestHttpPost, StubHttpPost};
+pub use http_request::HttpRequestNode;
 pub use materialize_doc::MaterializeDocNode;
 pub use merge_contacts::MergeContactsNode;
 pub use openai_compat_transport::{
