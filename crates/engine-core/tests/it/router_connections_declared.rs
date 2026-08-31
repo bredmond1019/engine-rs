@@ -28,7 +28,9 @@
 //! * It only sees targets written as a literal in that exact shape. A
 //!   target built by `format!`, read from a constant, or returned by a
 //!   helper function would be missed.
-//! * It only reads the router impl's own body, not helpers it calls.
+//! * It only reads the router impl's own body, plus any helper functions
+//!   explicitly named in that router's `helper_fns` — a helper NOT named
+//!   there is invisible to the scan, same as before.
 //! * It cannot tell a reachable arm from a dead one, so it is a superset
 //!   check: over-declaring a connection is not flagged.
 //!
@@ -65,6 +67,15 @@ struct RouterUnderCheck {
     identity: &'static str,
     source: &'static str,
     expected_targets: &'static [&'static str],
+    /// Names of free-standing helper functions the router's `route()` body
+    /// calls to produce a target (e.g. `bounded_review_retry_route`), whose
+    /// bodies must also be scanned for `Some("...".to_string())` literals.
+    /// Documented limit above ("only reads the router impl's own body, not
+    /// helpers it calls") holds for any helper NOT listed here — add one
+    /// explicitly rather than widening the scan to the whole file, so an
+    /// unrelated function's literal can never be mistaken for a routing
+    /// target.
+    helper_fns: &'static [&'static str],
 }
 
 /// Every router reachable from the `SDLC_FLOW` declared graph.
@@ -74,11 +85,13 @@ fn sdlc_flow_routers() -> Vec<RouterUnderCheck> {
             identity: "SpecExistsRouterNode",
             source: SDLC_FLOW_SETUP,
             expected_targets: &["GenerateTasksNode", "LoadTaskStateNode"],
+            helper_fns: &[],
         },
         RouterUnderCheck {
             identity: "TaskQueueRouterNode",
             source: SDLC_FLOW_TASK_LOOP,
             expected_targets: &["FinalValidationNode", "ImplementTaskNode"],
+            helper_fns: &[],
         },
         RouterUnderCheck {
             identity: "TriageRouterNode",
@@ -90,16 +103,19 @@ fn sdlc_flow_routers() -> Vec<RouterUnderCheck> {
                 "UpdateTaskStatusNode",
                 "WrapUpNode",
             ],
+            helper_fns: &[],
         },
         RouterUnderCheck {
             identity: "ReviewRouterNode",
             source: SDLC_FLOW_TASK_LOOP,
             expected_targets: &["IncrementAttemptNode", "UpdateTaskStatusNode", "WrapUpNode"],
+            helper_fns: &["bounded_review_retry_route"],
         },
         RouterUnderCheck {
             identity: "EndReviewRouterNode",
             source: SDLC_FLOW_END_REVIEW,
             expected_targets: &["PatchDocsNode", "WrapUpNode"],
+            helper_fns: &[],
         },
     ]
 }
@@ -114,11 +130,13 @@ fn sdlc_task_routers() -> Vec<RouterUnderCheck> {
             identity: "SpecExistsRouterNode",
             source: SDLC_FLOW_SETUP,
             expected_targets: &["GenerateTasksNode", "LoadTaskStateNode"],
+            helper_fns: &[],
         },
         RouterUnderCheck {
             identity: "TaskQueueRouterNode",
             source: SDLC_FLOW_TASK_LOOP,
             expected_targets: &["FinalValidationNode", "ImplementTaskNode"],
+            helper_fns: &[],
         },
         RouterUnderCheck {
             identity: "TaskTriageRouterNode",
@@ -128,26 +146,28 @@ fn sdlc_task_routers() -> Vec<RouterUnderCheck> {
                 "LeanBookkeepNode",
                 "UpdateTaskStatusNode",
             ],
+            helper_fns: &[],
         },
     ]
 }
 
 // --- the lexical extractor --------------------------------------------------
 
-/// The body of `impl Router for <identity> { ... }` in `source`, brace-
-/// balanced, with `//` line comments and string literals skipped so a brace
-/// inside either cannot unbalance the scan. Panics if the block is absent
-/// or unbalanced — a silent miss here would turn this whole file into a
-/// vacuous pass.
-fn router_impl_body(source: &str, identity: &str) -> String {
-    let header = format!("impl Router for {identity} ");
+/// Brace-balanced block extraction shared by `router_impl_body` and
+/// `helper_fn_body`: given `source` and the exact text immediately
+/// preceding the block's opening `{` (e.g. `"impl Router for Foo "` or
+/// `"fn bar("`), returns the `{ ... }` block, comment- and string-literal-
+/// safe so a brace inside either cannot unbalance the scan. Panics if the
+/// header or a balanced block is absent — a silent miss here would turn
+/// the caller into a vacuous pass.
+fn brace_balanced_block(source: &str, header_needle: &str, label: &str) -> String {
     let start = source
-        .find(&header)
-        .unwrap_or_else(|| panic!("no `{header}{{` block found in source"));
-    let rest = &source[start + header.len()..];
+        .find(header_needle)
+        .unwrap_or_else(|| panic!("no `{header_needle}` found in source for {label}"));
+    let rest = &source[start + header_needle.len()..];
     let open = rest
         .find('{')
-        .unwrap_or_else(|| panic!("`{header}` is not followed by `{{`"));
+        .unwrap_or_else(|| panic!("`{header_needle}` is not followed by `{{` for {label}"));
 
     let bytes: Vec<char> = rest[open..].chars().collect();
     let mut depth = 0usize;
@@ -185,21 +205,33 @@ fn router_impl_body(source: &str, identity: &str) -> String {
         }
         i += 1;
     }
-    panic!("unbalanced braces scanning `impl Router for {identity}`");
+    panic!("unbalanced braces scanning {label}");
 }
 
-/// Every `Some("X".to_string())` target literal in a router impl body.
+/// The body of `impl Router for <identity> { ... }` in `source`.
+fn router_impl_body(source: &str, identity: &str) -> String {
+    let header = format!("impl Router for {identity} ");
+    brace_balanced_block(source, &header, &format!("`impl Router for {identity}`"))
+}
+
+/// The body of a free-standing `fn <name>(...) { ... }` in `source` — used
+/// to pull in a routing helper a router's own `route()` body delegates to
+/// (see `RouterUnderCheck::helper_fns`).
+fn helper_fn_body(source: &str, fn_name: &str) -> String {
+    let header = format!("fn {fn_name}(");
+    brace_balanced_block(source, &header, &format!("`fn {fn_name}`"))
+}
+
+/// Every `Some("X".to_string())` target literal found in `text`.
 ///
 /// Deliberately anchored on the full `Some("` … `".to_string())` shape:
 /// bare `"SomeNode"` literals inside a body are usually READS of an
 /// upstream node's result (`get_result(ctx, "TriageTaskNode")`), not routing
 /// targets, and matching those would produce false positives.
-fn declared_route_targets(source: &str, identity: &str) -> BTreeSet<String> {
-    let body = router_impl_body(source, identity);
-    let mut out = BTreeSet::new();
+fn extract_target_literals(text: &str, out: &mut BTreeSet<String>) {
     let open = "Some(\"";
     let close = "\".to_string())";
-    let mut rest = body.as_str();
+    let mut rest = text;
     while let Some(idx) = rest.find(open) {
         let after = &rest[idx + open.len()..];
         if let Some(end) = after.find(close) {
@@ -211,6 +243,17 @@ fn declared_route_targets(source: &str, identity: &str) -> BTreeSet<String> {
         } else {
             rest = after;
         }
+    }
+}
+
+/// Every `Some("X".to_string())` target literal in a router's `route()`
+/// body, plus (per `helper_fns`) any free-standing helper functions that
+/// body delegates to for its actual `Option<String>` result.
+fn declared_route_targets(router: &RouterUnderCheck) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    extract_target_literals(&router_impl_body(router.source, router.identity), &mut out);
+    for helper in router.helper_fns {
+        extract_target_literals(&helper_fn_body(router.source, helper), &mut out);
     }
     out
 }
@@ -227,7 +270,7 @@ fn assert_routers_declared(schema: &WorkflowSchema, routers: &[RouterUnderCheck]
         // 1. The extractor still works: what it found matches the
         //    hand-written expectation exactly. Guards against a lexical
         //    parse that silently returned a truncated (or empty) set.
-        let found = declared_route_targets(router.source, router.identity);
+        let found = declared_route_targets(router);
         let expected: BTreeSet<String> = router
             .expected_targets
             .iter()
@@ -293,7 +336,12 @@ fn triage_router_declares_update_task_status_node() {
 /// an empty or truncated scan would make every assertion above vacuous.
 #[test]
 fn extractor_finds_the_known_bad_triage_router_arm() {
-    let found = declared_route_targets(SDLC_FLOW_TASK_LOOP, "TriageRouterNode");
+    let found = declared_route_targets(&RouterUnderCheck {
+        identity: "TriageRouterNode",
+        source: SDLC_FLOW_TASK_LOOP,
+        expected_targets: &[],
+        helper_fns: &[],
+    });
     assert!(
         found.contains("UpdateTaskStatusNode"),
         "extractor failed to find `TriageRouterNode`'s `UpdateTaskStatusNode` arm; found {found:?}"
@@ -348,7 +396,12 @@ impl Router for FakeRouterNode {
     }
 }
 "#;
-    let found = declared_route_targets(synthetic, "FakeRouterNode");
+    let found = declared_route_targets(&RouterUnderCheck {
+        identity: "FakeRouterNode",
+        source: synthetic,
+        expected_targets: &[],
+        helper_fns: &[],
+    });
     assert_eq!(
         found,
         ["BrandNewUndeclaredNode", "DeclaredNode"]
