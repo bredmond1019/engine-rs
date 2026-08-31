@@ -2521,23 +2521,42 @@ impl Router for ReviewRouterNode {
                     // so on a default profile the third task to reach review
                     // was the last one that could be reviewed at all (run
                     // R6). See `SDLCTask::review_attempt_count`.
-                    let review_attempts = bounded_review_attempts(ctx, review);
-                    let max_review_attempts =
-                        resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
-                    match max_review_attempts {
-                        Some(max) if review_attempts >= max => Some("WrapUpNode".to_string()),
-                        _ => Some("IncrementAttemptNode".to_string()),
-                    }
+                    bounded_review_retry_route(ctx, review)
                 }
             }
-            // An unrecognized verdict must never silently halt the walk
-            // mid-graph — `WrapUpNode` is already a declared connection
-            // from this router (see `graph.rs`). `ConsolidatedReviewNode`
+            // An unrecognized verdict (EN.ticket.unknown-review-verdict-
+            // must-not-hard-bail task 1): the model's own reviewer will
+            // eventually say something outside PASS/FAIL/PARTIAL no matter
+            // how the prompt is worded (see the schema/prompt constraints
+            // added in task 2 — defense in depth, not a substitute for
+            // this). Such a verdict must NOT hard-bail the run on first
+            // sight and discard already-committed, gate-green work — it is
+            // routed through the SAME bounded-retry path as a minor
+            // FAIL/PARTIAL: retry via `IncrementAttemptNode` while under
+            // `policy.max_review_attempts`, and only fall through to the
+            // terminal `WrapUpNode` bail once that cap is exhausted, exactly
+            // like FAIL/PARTIAL's exhaustion case. `ConsolidatedReviewNode`
             // stamps `unrecognized_verdict` alongside the (unchanged)
             // `verdict` key so `derive_terminal_signal` can surface the
-            // offending string in the run's `bail_reason`.
-            _ => Some("WrapUpNode".to_string()),
+            // offending string in the run's `bail_reason` once the retry
+            // budget is actually spent.
+            _ => bounded_review_retry_route(ctx, review),
         }
+    }
+}
+
+/// Shared bounded-retry decision for `ReviewRouterNode`'s minor-`FAIL`/
+/// `PARTIAL` arm and its unrecognized-verdict arm: route to
+/// `IncrementAttemptNode` while the CURRENT task's non-PASS review attempts
+/// remain under `policy.max_review_attempts`, else fall through to the
+/// terminal `WrapUpNode` bail. Factored out so the two arms cannot drift —
+/// see `EN.ticket.unknown-review-verdict-must-not-hard-bail` task 1.
+fn bounded_review_retry_route(ctx: &TaskContext, review: &serde_json::Value) -> Option<String> {
+    let review_attempts = bounded_review_attempts(ctx, review);
+    let max_review_attempts = resolved_policy(ctx).map(|p| p.max_review_attempts).ok();
+    match max_review_attempts {
+        Some(max) if review_attempts >= max => Some("WrapUpNode".to_string()),
+        _ => Some("IncrementAttemptNode".to_string()),
     }
 }
 
@@ -4490,17 +4509,46 @@ mod tests {
         );
     }
 
-    /// EN.3.G task 1: an unrecognized review verdict must never silently
-    /// halt the walk mid-graph — it routes to `WrapUpNode`, which is already
-    /// a declared connection from this router (see `graph.rs`).
+    /// EN.3.G task 1 (superseded by
+    /// EN.ticket.unknown-review-verdict-must-not-hard-bail task 1): an
+    /// unrecognized review verdict must never silently halt the walk
+    /// mid-graph — but it also must not hard-bail on first sight. With no
+    /// policy stamp present (so `resolved_policy` fails and the bound is
+    /// treated as open, matching `review_router_structural_vs_minor`'s
+    /// unbounded FAIL/PARTIAL cases above), an unrecognized verdict takes
+    /// the SAME bounded-retry back-edge as a minor FAIL/PARTIAL:
+    /// `IncrementAttemptNode`, not a terminal `WrapUpNode` bail.
     #[test]
-    fn review_router_unrecognized_verdict_routes_to_wrap_up() {
+    fn review_router_unrecognized_verdict_routes_to_increment_attempt() {
         let router = ReviewRouterNode;
         let mut ctx = empty_context(json!({}));
         ctx.nodes.insert(
             "ConsolidatedReviewNode".to_string(),
             json!({ "verdict": "WAT", "summary": "s", "issues": [], "unrecognized_verdict": "WAT" }),
         );
+        assert_eq!(router.route(&ctx), Some("IncrementAttemptNode".to_string()));
+    }
+
+    /// EN.ticket.unknown-review-verdict-must-not-hard-bail task 1: the
+    /// literal verdict jynx observed (`CANNOT_VERIFY`), under the
+    /// review-attempt cap, retries via `IncrementAttemptNode` instead of
+    /// bailing on first sight.
+    #[test]
+    fn review_router_cannot_verify_under_bound_retries() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("CANNOT_VERIFY", 0, 1, 3);
+        assert_eq!(router.route(&ctx), Some("IncrementAttemptNode".to_string()));
+    }
+
+    /// Same unrecognized verdict, but the CURRENT task's review-attempt
+    /// count is already at `max_review_attempts` — matching FAIL/PARTIAL's
+    /// existing exhaustion semantics exactly: the run bails to `WrapUpNode`,
+    /// which still surfaces `unrecognized_verdict` in the `bail_reason`
+    /// (see `derive_terminal_signal`).
+    #[test]
+    fn review_router_cannot_verify_at_bound_routes_to_wrap_up() {
+        let router = ReviewRouterNode;
+        let ctx = review_ctx_with_bound("CANNOT_VERIFY", 0, 3, 3);
         assert_eq!(router.route(&ctx), Some("WrapUpNode".to_string()));
     }
 
