@@ -326,6 +326,21 @@ endpoint — it prompts for confirmation and reports 202/404/401/connection-fail
 |---|---|---|
 | `true` | Reattaches to the existing worktree if it's on disk; `git checkout <branch>` | Loads `sdlc/sdlc-flow-state.json` when present — statuses, attempt counts, telemetry all carry forward |
 | `false` | `git worktree add … -b <branch>` / `git checkout -B <branch>` — recreates the branch | **Archives** any existing state file, then bootstraps fresh from `tasks.json` (every task back to `pending`, `attempt_count` 0) |
+| (`retry_task` set) | Unaffected by this field | A FIFTH case, checked ahead of the `resume` decision above — see below |
+
+**A fifth case: `retry_task`.** An additive `retry_task: Option<u32>` event field
+(`SDLCFlowEventSchema::retry_task`) retries one specific exhausted task without discarding the
+tasks that already passed — the gap the `resume`/`false`-restart choice above didn't cover: a
+restart re-bootstraps every task from `tasks.json`, and `resume: true` alone cannot reset a single
+task's exhausted attempt budget. When `retry_task` is set, `LoadTaskStateNode` loads the existing
+committed state (it always loads — never bootstraps from `tasks.json` — and errors if no state
+file exists to preserve) and resets only the named task's `status`/`attempt_count`/
+`review_attempt_count` to a full allowance, leaving every other task's status, attempt count, and
+recorded commits untouched. It takes priority over whatever `resume` is set to. `task_range`
+filtering still applies afterward, consistent with the ordinary bootstrap/resume paths. A
+`retry_task` naming a task id that doesn't exist in the loaded state is a loud error, not a silent
+no-op. `TriageTaskNode`'s attempts-exhausted bail message names both recovery routes
+(`retry_task: <id>` and `resume: false`) so an operator reading a bail knows what re-runs it.
 
 **The archive.** A restart never deletes or overwrites the previous run's state — the corpse is
 forensics. The file is renamed beside itself to:
@@ -392,7 +407,9 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
 
 - **Event fields** (`SDLCFlowEventSchema`): `spec_slug` (required), `task_range` (e.g. `"1-3,5"`,
   1-indexed inclusive, rejects `end < start`), `resume` (default `false` — continue the previous run
-  vs. archive its state and restart; see [Restart vs. resume](#restart-vs-resume--what-resume-actually-does)), `auto_pr` (default
+  vs. archive its state and restart; see [Restart vs. resume](#restart-vs-resume--what-resume-actually-does)),
+  `retry_task` (optional task id — retry one exhausted task without discarding the rest, wins over
+  `resume`; see the fifth case in [Restart vs. resume](#restart-vs-resume--what-resume-actually-does)), `auto_pr` (default
   **`true`**), `branch_name` (defaults to `sdlc/<spec_slug>`), `llm_triage` (default `false`),
   `policy` (optional per-run override), `profile` (optional named policy-profile bundle — see
   [sdlc-flow-policy.md](sdlc-flow-policy.md)), `repo` (optional, `EN.3.K` — see below).
