@@ -27,21 +27,118 @@ struct PatchDocsOutput {
     summary: String,
     #[serde(default)]
     files_patched: Vec<String>,
+    /// Docs created from scratch in BOOTSTRAP MODE. Kept distinct from
+    /// `files_patched` because a reviewer needs to know which files are new.
+    #[serde(default)]
+    created: Vec<String>,
+    /// Paths flagged `NEEDS_REVIEW`: a top-level architecture/overview/index
+    /// doc that needs changing, or a doc needing a genuine rewrite.
+    ///
+    /// **Without this field the flagging instruction is worse than absent** —
+    /// the model is told to flag rather than edit and given nowhere to put the
+    /// flag, so it either edits the file anyway or drops the finding silently.
+    #[serde(default)]
+    flagged: Vec<String>,
 }
 
 /// JSON schema matching [`PatchDocsOutput`], passed as `Config.json_schema`
 /// so `claude-code-rs` requests (and pre-parses) a schema-constrained reply
 /// via `Outcome.structured_output` instead of relying solely on prompt text.
+///
+/// `created` and `flagged` were added by the JS prompt port
+/// (`EN.ticket.prompt-parity-with-the-js-engines`, stage 3). Both are
+/// `#[serde(default)]` and stay out of `required`, so a model that omits them
+/// still parses and the port is behavior-stable.
 fn patch_docs_output_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
             "summary": { "type": "string" },
             "files_patched": { "type": "array", "items": { "type": "string" } },
+            "created": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Docs created from scratch in BOOTSTRAP MODE.",
+            },
+            "flagged": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Paths flagged NEEDS_REVIEW rather than edited, each with the \
+                                specific gaps: a top-level architecture/overview/index doc, or \
+                                a doc needing a genuine rewrite.",
+            },
         },
         "required": ["summary"],
     })
 }
+
+/// Run-invariant preamble prepended to [`PatchDocsNode`]'s prompt — the bin-1
+/// half of the JS engines' docs stage
+/// (`base-template/.claude/workflows/sdlc-flow.js`), ported under
+/// `EN.ticket.prompt-parity-with-the-js-engines`.
+///
+/// The prompt this replaces was four lines — *"Search docs/ for stale
+/// references to the following modified files/symbols and patch them"* — and
+/// never said **how** to patch: surgically or wholesale, what to leave alone,
+/// what to escalate. It also had no bootstrap path at all, so a repo with no
+/// `docs/` got a silent no-op from this stage.
+///
+/// **Classification.** Ported: the surgical-scope framing, the grep-for-
+/// references method, BOOTSTRAP MODE, the four patch rules (never rewrite a
+/// whole file, source is authoritative, never delete a still-existing
+/// documented item, never edit CLAUDE.md / no emoji), the `write-repo-doc`
+/// standard with its four gap types in priority order, and the
+/// flag-don't-edit rule for top-level docs.
+///
+/// **Dropped as bin 2:** JS's step 5 `git add`/`git commit` sequence and the
+/// D46 vaulted-`planning/` commit recipe — engine-rs commits in Rust
+/// (`super::commit_all`), and a prompted commit is one a model can skip or get
+/// wrong. `docs_prompt_never_asks_the_model_to_commit` pins that. The vault
+/// recipe is **also bin 3** (fleet-specific routing). Dropped as bin 2:
+/// `renderDocsStateWriteRecipe` — Rust nodes write state. Dropped as bin 4:
+/// the `Return via StructuredOutput:` field list, carried by
+/// [`patch_docs_output_schema`] instead — except `created`/`flagged`, which
+/// needed real schema fields before the instructions naming them could mean
+/// anything.
+///
+/// The `write-repo-doc` reference is a soft dependency: the skill lives in
+/// `.claude/skills/write-repo-doc/`, delivered by the harness sync. Where a
+/// target repo lacks it, the instruction degrades to the four self-contained
+/// gap bullets spelled out below, which is why they are spelled out.
+///
+/// Carries no per-run value (standing rule 6) — the modified-files list stays
+/// in the per-call body, built in `PatchDocsNode`'s prompt-builder closure.
+pub(super) const DOCS_STABLE_PROMPT: &str = r#"You are the documentation agent for an SDLC run: a SURGICAL patch over only the surface this run
+changed. You are not doing a docs sweep.
+
+For each changed source file, find the docs that reference it — by component, function, route or file
+name (`grep -rl "<name>" docs/`) — and patch only the sections that describe the changed code:
+
+  - Surgical only. Never rewrite a whole file, and never touch a section the changed source does
+    not cover.
+  - Source is authoritative. Where a doc and the code disagree, the code wins.
+  - Never delete a documented item that still exists.
+  - Never edit CLAUDE.md. No emoji.
+
+If docs/ contains no project-facing docs at all, switch to BOOTSTRAP MODE instead: read the changed
+source in full and create reference docs from what it actually contains — at minimum an architecture
+overview (module map, key types, data flow), plus a CLI, API or pages reference as the project
+warrants. Create docs/index.md if absent and add a row per created doc. Every new file opens with OKF
+frontmatter (type, title, description). Report these in created[], not files_patched[].
+
+Apply the `write-repo-doc` standard to everything you patch or create, scoped to those files only.
+The gaps that matter most, in order: no quickstart, so the reader must read prose to find the first
+command; a command or script named but not linked, or named without saying WHERE it is typed (a
+Claude Code slash command and a shell command look identical on the page); vocabulary used
+confidently and defined nowhere; a section opening in jargon with no plain-English sentence first.
+Fix small gaps here. A doc needing a genuine rewrite is NOT started now — record it in flagged[] with
+the path and the specific gaps. A half-finished rewrite inside a docs patch is worse than an
+unpatched doc.
+
+Flag any top-level architecture, overview or index doc that needs changing in flagged[] rather than
+editing it directly.
+
+"#;
 
 /// Model node (Sonnet): patches documentation referencing the task's
 /// modified files. Composes a `ClaudeCodeStep` under the `PatchDocsNode`
@@ -149,10 +246,11 @@ impl Node for PatchDocsNode {
             move |ctx: &TaskContext| {
                 let modified_files = Self::collect_modified_files(ctx);
                 let prompt = format!(
-                    "Search docs/ for stale references to the following \
-                     modified files/symbols and patch them. Respond with \
-                     strict JSON of the shape {{\"summary\": str, \
-                     \"files_patched\": [str]}}.\n\nModified files: {}",
+                    "{DOCS_STABLE_PROMPT}Search docs/ for stale references to \
+                     the following modified files/symbols and patch them. \
+                     Respond with strict JSON of the shape {{\"summary\": \
+                     str, \"files_patched\": [str], \"created\": [str], \
+                     \"flagged\": [str]}}.\n\nModified files: {}",
                     json!(modified_files)
                 );
                 crate::policy::apply_verbosity_directive(prompt, verbosity)
@@ -186,6 +284,11 @@ impl Node for PatchDocsNode {
             json!({
                 "summary": parsed.summary,
                 "files_patched": parsed.files_patched,
+                // Bootstrap creations and NEEDS_REVIEW flags, stamped so
+                // `/close-out` can route a flagged rewrite to a ticket or a
+                // carryover instead of it dying in the model's reply.
+                "created": parsed.created,
+                "flagged": parsed.flagged,
                 // Stamp the resolved knob values so `RunTelemetry` /
                 // `PolicyAggregate` can attribute this stage's observed cost
                 // to the settings that caused it (standing rule 6).
@@ -213,6 +316,86 @@ mod tests {
 
     /// A stub worktree path — never touched on disk, only compared.
     const WORKTREE: &str = "/tmp/engine-rs-patch-docs-worktree";
+
+    // --- The ported docs preamble (prompt parity, stage 3) ----------------
+
+    /// The scope discipline the four-line prompt lacked entirely: it said
+    /// what to look for and never how to change it.
+    #[test]
+    fn docs_prompt_states_the_surgical_discipline() {
+        let p = DOCS_STABLE_PROMPT;
+        assert!(p.contains("SURGICAL"));
+        assert!(p.contains("Never rewrite a whole file"));
+        assert!(p.contains("Source is authoritative"));
+        assert!(p.contains("Never delete a documented item that still exists"));
+        assert!(p.contains("Never edit CLAUDE.md"));
+    }
+
+    /// A whole capability engine-rs did not have: a repo with no `docs/`
+    /// previously got a silent no-op from this stage.
+    #[test]
+    fn docs_prompt_carries_bootstrap_mode() {
+        let p = DOCS_STABLE_PROMPT;
+        assert!(p.contains("BOOTSTRAP MODE"));
+        // Wrapped across a line break in the constant, so match the two words
+        // independently rather than the phrase.
+        assert!(
+            p.contains("OKF") && p.contains("frontmatter (type, title, description)"),
+            "a bootstrapped doc that fails the corpus gate is not a doc"
+        );
+    }
+
+    /// The four gap types are spelled out rather than delegated, so the
+    /// instruction still works in a repo without the `write-repo-doc` skill.
+    #[test]
+    fn docs_prompt_carries_the_write_repo_doc_gaps_self_containedly() {
+        let p = DOCS_STABLE_PROMPT;
+        assert!(p.contains("write-repo-doc"));
+        assert!(p.contains("no quickstart"));
+        assert!(p.contains("named but not linked"));
+        assert!(p.contains("defined nowhere"));
+        assert!(p.contains("plain-English sentence first"));
+    }
+
+    /// **Bin 2.** engine-rs commits in Rust (`super::commit_all`); the JS
+    /// text's `git add`/commit sequence and vault recipe must not come across.
+    #[test]
+    fn docs_prompt_never_asks_the_model_to_commit() {
+        let p = DOCS_STABLE_PROMPT;
+        assert!(!p.contains("git add"));
+        assert!(!p.contains("git commit"));
+        assert!(!p.contains("planning/"), "vault routing is bin 2 + bin 3");
+    }
+
+    /// The prompt tells the model to flag rather than edit. Without somewhere
+    /// to put the flag the instruction is worse than absent: it either edits
+    /// anyway or drops the finding silently.
+    #[test]
+    fn flagged_and_created_output_fields_exist_for_the_instructions_naming_them() {
+        let schema = patch_docs_output_schema();
+        assert!(schema["properties"]["flagged"].is_object());
+        assert!(schema["properties"]["created"].is_object());
+        assert!(DOCS_STABLE_PROMPT.contains("flagged[]"));
+        assert!(DOCS_STABLE_PROMPT.contains("created[]"));
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, vec!["summary"], "both stay behavior-stable");
+    }
+
+    /// Cache discipline (standing rule 6): the modified-files list is built
+    /// per call, so nothing run-varying may reach this constant.
+    #[test]
+    fn docs_stable_prompt_interpolates_nothing_per_run() {
+        assert!(
+            !DOCS_STABLE_PROMPT.contains('{'),
+            "no format placeholders in the cached prefix"
+        );
+        assert!(DOCS_STABLE_PROMPT.ends_with("\n\n"));
+    }
 
     /// A bare ctx with NO resolved-policy stamp and NO `SetupWorktreeNode`
     /// output — used to pin the two strict failure modes.
@@ -556,7 +739,10 @@ mod tests {
         let (terse_config, terse_prompt) =
             captured.lock().unwrap().clone().expect("transport called");
         assert!(terse_prompt.contains("Be terse"));
-        assert!(terse_prompt.starts_with("Search docs/"));
+        // Since the JS prompt port, the run-invariant `DOCS_STABLE_PROMPT`
+        // leads the built prompt and the request line follows it.
+        assert!(terse_prompt.starts_with(DOCS_STABLE_PROMPT));
+        assert!(terse_prompt.contains("Search docs/"));
 
         let policy = SdlcPolicy {
             output_verbosity: OutputVerbosity::Verbose,

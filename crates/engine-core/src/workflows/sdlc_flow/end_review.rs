@@ -49,7 +49,7 @@ use crate::routing::Router;
 use super::policy::ReviewMode;
 use super::task_loop::{
     apply_policy, bound_review_diff, latest_state, resolved_policy, review_output_schema,
-    stage_untracked_intent, worktree_path, ReviewOutput, Stage,
+    stage_untracked_intent, worktree_path, ReviewOutput, Stage, REVIEW_STABLE_PROMPT,
 };
 use super::{
     get_result, parse_structured_or_fenced, put_result, CommandRunner, ModelTransport,
@@ -195,11 +195,13 @@ impl Node for EndReviewNode {
         // Policy-varying text lives in the per-run prompt BODY only — never
         // in a `STABLE_SYSTEM_PROMPT` prefix (CLAUDE.md standing rule 6).
         let prompt = format!(
-            "This is the END-OF-RUN review for spec {spec_slug:?}. Review the \
-             WHOLE run's accumulated diff against the COMPLETE Acceptance \
-             Criteria below — every task's criteria, not just one task's. \
-             Respond with strict JSON of the shape {{\"verdict\": str, \
-             \"summary\": str, \"issues\": [str]}}. \"verdict\" must be \
+            "{REVIEW_STABLE_PROMPT}This is the END-OF-RUN review for spec \
+             {spec_slug:?} — ONE review over the whole integrated tree, \
+             replacing per-task review entirely. Review the WHOLE run's \
+             accumulated diff against the COMPLETE Acceptance Criteria below \
+             — every task's criteria, not just one task's. Respond with \
+             strict JSON of the shape {{\"verdict\": str, \"summary\": str, \
+             \"issues\": [str], \"localized\": bool}}. \"verdict\" must be \
              PASS, FAIL, or PARTIAL.\n\n{acceptance_criteria}\n\nDiff:\n{diff}",
             spec_slug = state.spec_slug,
         );
@@ -244,6 +246,10 @@ impl Node for EndReviewNode {
             "verdict": normalized_verdict,
             "summary": parsed.summary,
             "issues": parsed.issues,
+            // See `ReviewOutput::localized` — stamped for the operator and
+            // `/fix` routing; no Rust branch reads it, so this is
+            // behavior-stable.
+            "localized": parsed.localized,
             "review_diff_max_chars": diff_budget,
             "review_diff_truncated": diff_truncated,
         });

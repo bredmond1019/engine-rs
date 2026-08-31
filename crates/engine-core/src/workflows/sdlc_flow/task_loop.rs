@@ -436,7 +436,8 @@ const RETRY_FEEDBACK_HEADER: &str = "\n\n--- PREVIOUS ATTEMPT FAILED — READ TH
      ANYTHING ---\nA previous attempt at this exact task already ran in this worktree and its \
      validation FAILED. Its edits are still present, so the task is NOT done. Diagnose the \
      failure below, fix its root cause, and re-verify. Do not report success without addressing \
-     it.\n\n";
+     it. Do NOT re-implement from scratch — make the MINIMUM targeted changes that address THIS \
+     failure.\n\n";
 
 /// Opening line of the failure block appended to `TriageTaskNode`'s prompt on
 /// the `llm_triage` branch.
@@ -919,6 +920,53 @@ pub(super) const PATH_DISCIPLINE_PREAMBLE: &str = "PATH DISCIPLINE. Work only \
      your work. Before your first write, confirm the tree you are in is the \
      intended one.\n\n";
 
+/// The rest of the JS implement stage's bin-1 content, appended directly after
+/// [`PATH_DISCIPLINE_PREAMBLE`] so all run-invariant text stays contiguous at
+/// the front of `ImplementTaskNode`'s prompt. Ported under
+/// `EN.ticket.prompt-parity-with-the-js-engines`; commit `9933f98` had already
+/// taken the environment/orientation half.
+///
+/// **Classification.** Ported: read CLAUDE.md and treat it as the authority,
+/// the universal harness rules, scope containment (this task only), the
+/// verify-identifiers rule, and — the substantive addition — the **D8
+/// completeness self-check**, which no Rust node performs. `verify_claimed_
+/// writes` proves the attempt wrote *something*; it cannot tell a finished
+/// function from a `todo!()`, so a stub check has to be prose.
+///
+/// **Dropped as bin 2:** JS's step 7 explicit-staging commit sequence, step 7a
+/// work assertion, and step 7b vaulted-`planning/` recipe. engine-rs commits in
+/// Rust (`super::commit_all`) and enforces the work assertion in code
+/// (`verify_claimed_writes`) — **this is the case where engine-rs is ahead of
+/// the JS engine, and porting the prose would be a downgrade wearing the
+/// costume of parity**, exactly as the ticket warns. Step 7b is also bin 3
+/// (fleet-specific vault routing). **Bin 4:** the `Return via StructuredOutput`
+/// field list, carried by `implement_output_schema()`.
+///
+/// **Bin 3, deliberately left out:** JS's step 2/2.5 `cat` recipes for the
+/// spec, `tasks.json` and a `/breakdown` file. engine-rs already passes the
+/// title, description and acceptance criteria in the body, so those reads
+/// would be redundant filesystem work, not orientation.
+///
+/// Carries no per-run value (standing rule 6) — the worktree root and the task
+/// text are appended separately by `process`.
+pub(super) const IMPLEMENT_STANDARDS_PREAMBLE: &str = r#"Read CLAUDE.md before you start and follow its standing rules; it is the authority for this repo, and
+you should assume no stack, locale or content rule that is not written there. These harness rules
+always apply regardless: no fabricated metrics or quotes, no emoji, and every change ships with
+tests. Verify any model id, package name or version against the claude-api skill or the actual
+manifest — never from memory.
+
+Implement ONLY the task described below. Do not start, finish or refactor another task, however
+tempting it looks from here.
+
+Before you report success, run a completeness self-check: no path an acceptance criterion requires
+may be left as a stub or placeholder — no todo!(), unimplemented!(), unreachable!(),
+NotImplementedError, "not implemented" throw, empty pass-only body, or TODO/FIXME on a required
+path — every deliverable the task names actually exists, and any criterion calling for a test has a
+real, hermetic one. Grep only the files the in-scope criteria touch. If something required is
+incomplete, finish it now rather than reporting a partial task.
+
+"#;
+
 /// Run-invariant preamble prepended to [`TriageTaskNode`]'s `llm_triage`
 /// prompt — the bin-1 half of the JS engines' `renderTriagePrompt`
 /// (`base-template/.claude/workflows/prompts/shared.js`), ported under
@@ -1141,6 +1189,9 @@ impl Node for ImplementTaskNode {
         // prompt (`apply_verbosity_directive`), and the retry block below
         // also appends, so a leading preamble survives both untouched.
         let mut prompt = String::from(PATH_DISCIPLINE_PREAMBLE);
+        // Both preambles are run-invariant, so they stay contiguous at the
+        // front: the per-run worktree line and the task text follow.
+        prompt.push_str(IMPLEMENT_STANDARDS_PREAMBLE);
         if let Some(worktree) = worktree.as_deref() {
             prompt.push_str(&format!(
                 "Your working tree root is {worktree} — `git rev-parse \
@@ -2477,6 +2528,18 @@ pub(super) struct ReviewOutput {
     pub(super) summary: String,
     #[serde(default)]
     pub(super) issues: Vec<String>,
+    /// Whether a non-PASS verdict's issues are small and bounded — a targeted
+    /// fix can close them — rather than broad or structural. JS spends four
+    /// prose lines explaining this boolean; it is a bounded two-valued
+    /// judgement, so the schema carries it (bin 4) and only its *meaning*
+    /// stays in [`REVIEW_STABLE_PROMPT`] (bin 1).
+    ///
+    /// `#[serde(default)]` and outside the schema's `required` list, so a
+    /// model that omits it still parses. Defaults to `false`, which is the
+    /// conservative reading: an unstated scope is not a claim of boundedness.
+    /// Irrelevant on `PASS`.
+    #[serde(default)]
+    pub(super) localized: bool,
 }
 
 /// JSON schema matching [`ReviewOutput`]. Also used by
@@ -2488,10 +2551,80 @@ pub(super) fn review_output_schema() -> serde_json::Value {
             "verdict": { "type": "string", "enum": ["PASS", "PARTIAL", "FAIL"] },
             "summary": { "type": "string" },
             "issues": { "type": "array", "items": { "type": "string" } },
+            "localized": {
+                "type": "boolean",
+                "description": "True if the FAIL/PARTIAL issues are small and bounded \
+                                (a few files, clear cause, a targeted fix can close them); \
+                                false if broad or structural (cross-cutting, ambiguous, or \
+                                needing a human re-plan). Irrelevant on PASS.",
+            },
         },
         "required": ["verdict", "summary"],
     })
 }
+
+/// Run-invariant strictness rules prepended to BOTH review prompts —
+/// `ConsolidatedReviewNode` (per-task) and `end_review::EndReviewNode`
+/// (end-of-run). The bin-1 half of the JS engines' review stage
+/// (`base-template/.claude/workflows/sdlc-flow.js`), ported under
+/// `EN.ticket.prompt-parity-with-the-js-engines`.
+///
+/// **Classification.** Ported: the "verify against the ACTUAL code" framing,
+/// the run-state-is-an-INDEX rule, per-criterion three-valued MET / PARTIAL /
+/// NOT_MET marking with cited evidence, CLAUDE.md standing-rule and
+/// identity-integrity compliance, the do-not-repair-infra rule, and the
+/// criteria half of the verdict definitions.
+///
+/// **Dropped as bin 2 — and this is the trap the ticket exists to avoid.**
+/// The single largest block of the JS prompt is step 3, "Run the FRESH
+/// AUTHORITATIVE checks … Re-run the FULL gating suite below. A fresh failure
+/// of any GATING check ALWAYS prevents PASS", plus its rendered check list and
+/// the emoji-gate re-run. engine-rs runs those in Rust through `run_checks`
+/// with an injectable runner, before the model is asked anything. Porting the
+/// text would move an enforced invariant back into a place a model can skip.
+/// Every gating clause is likewise cut from the verdict definitions below, so
+/// the model rules on the criteria alone and the Rust node combines that with
+/// the check results — which is strictly *better* than the JS engine, because
+/// the model cannot pass a run whose gates failed when it is not the thing
+/// consulting the gates. `review_prompt_does_not_ask_the_model_to_run_gating_
+/// checks` fails if a later well-meaning edit ports the block back.
+///
+/// **Deliberately not from the JS.** The second paragraph's "not at a weaker
+/// paraphrase of it that happens to hold", and its concrete example, are new.
+/// JX.3.A's criterion — *"the three render-spec entries correlate to one
+/// finding"* — was accepted as *"SOME finding spans 3 repos"*, a criterion
+/// never met, passed by reinterpretation; the JS wording did not prevent that
+/// in the manual command either. Porting the failure's own shape into the
+/// prompt is the point of doing this at all.
+///
+/// **Scope-neutral on purpose**: it names neither "this task" nor "the whole
+/// run", so both review nodes share one cache-stable block and each states its
+/// own scope in the per-call body. Carries no per-run value (standing rule 6);
+/// `review_stable_prompt_interpolates_nothing_per_run` pins that.
+pub(super) const REVIEW_STABLE_PROMPT: &str = r#"You are the review agent for an SDLC run. Verify the acceptance criteria against the ACTUAL code and
+issue a verdict.
+
+Any run-state summary you are given is an INDEX, not evidence. Read it, but it does NOT replace
+verifying each criterion against the code itself. A criterion is MET only when you can point at
+code or test output that satisfies it as WRITTEN — not at a summary claiming it,
+and not at a weaker paraphrase of it that happens to hold.
+If the criterion says three things correlate to one finding, "some finding spans three repos"
+is NOT that criterion.
+
+For each acceptance criterion, read the relevant source and mark it MET, PARTIAL or NOT_MET,
+citing the evidence (file and symbol, test name, or command output). Spot-check the key files
+rather than reading the summary. Also check the repo's CLAUDE.md standing rules — a violation is
+itself a failing criterion — and flag any handle or URL that contradicts the verified identities
+CLAUDE.md records.
+
+Do NOT fix environment or infrastructure issues yourself. Report them; the fix loop resolves them.
+
+Verdict, on the criteria alone:
+  PASS    — every in-scope criterion is MET.
+  PARTIAL — one or more criteria are PARTIAL, and none is NOT_MET.
+  FAIL    — any criterion is NOT_MET.
+
+"#;
 
 impl ConsolidatedReviewNode {
     #[must_use]
@@ -2605,11 +2738,12 @@ impl Node for ConsolidatedReviewNode {
         // in a `STABLE_SYSTEM_PROMPT` prefix, whose cache breakpoint must
         // stay run-invariant (CLAUDE.md standing rule 6).
         let prompt = format!(
-            "Review this task's diff against its acceptance criteria. \
-             Respond with strict JSON of the shape {{\"verdict\": str, \
-             \"summary\": str, \"issues\": [str]}}. \"verdict\" must be \
-             exactly one of \"PASS\", \"PARTIAL\", or \"FAIL\" — no other \
-             value is accepted.\n\nAcceptance criteria: \
+            "{REVIEW_STABLE_PROMPT}Review this task's diff against its \
+             acceptance criteria. Respond with strict JSON of the shape \
+             {{\"verdict\": str, \"summary\": str, \"issues\": [str], \
+             \"localized\": bool}}. \"verdict\" must be exactly one of \
+             \"PASS\", \"PARTIAL\", or \"FAIL\" — no other value is \
+             accepted.\n\nAcceptance criteria: \
              {acceptance_criteria}\n\nDiff:\n{diff}"
         );
 
@@ -2672,6 +2806,10 @@ impl Node for ConsolidatedReviewNode {
             "verdict": normalized_verdict,
             "summary": parsed.summary,
             "issues": parsed.issues,
+            // Whether a non-PASS is bounded enough for a targeted fix. Stamped
+            // for the operator and for `/fix` routing; nothing in the Rust
+            // walk branches on it today, so this port is behavior-stable.
+            "localized": parsed.localized,
             // Standing rule 6: stamp the RESOLVED knob value (and whether it
             // actually bit) so `RunTelemetry`/`PolicyAggregate` can attribute
             // an observed cost — or a thin verdict — to the setting that
@@ -4232,6 +4370,182 @@ mod tests {
         assert!(
             TRIAGE_STABLE_PROMPT.ends_with("\n\n"),
             "must end with the separator that keeps the per-run body distinct"
+        );
+    }
+
+    // --- ImplementTaskNode: the rest of the JS implement stage -------------
+
+    /// The substantive addition of the implement port. `verify_claimed_writes`
+    /// proves the attempt wrote *something*; nothing in Rust can tell a
+    /// finished function from a `todo!()`, so the D8 stub check has to be
+    /// prose.
+    #[test]
+    fn implement_prompt_carries_the_d8_completeness_self_check() {
+        let p = IMPLEMENT_STANDARDS_PREAMBLE;
+        assert!(p.contains("completeness self-check"));
+        for marker in [
+            "todo!()",
+            "unimplemented!()",
+            "NotImplementedError",
+            "TODO/FIXME",
+        ] {
+            assert!(p.contains(marker), "missing the {marker} stub marker");
+        }
+        assert!(p.contains("hermetic"));
+    }
+
+    /// CLAUDE.md is the authority, and the harness rules hold regardless.
+    #[test]
+    fn implement_prompt_points_at_claude_md_and_the_universal_harness_rules() {
+        let p = IMPLEMENT_STANDARDS_PREAMBLE;
+        assert!(p.contains("Read CLAUDE.md"));
+        assert!(p.contains("no fabricated metrics or quotes"));
+        assert!(p.contains("every change ships with"));
+        assert!(p.contains("never from memory"));
+    }
+
+    /// Scope containment — the rule that keeps one task's dispatch from
+    /// wandering into the next task's files.
+    #[test]
+    fn implement_prompt_contains_scope_to_this_task_only() {
+        assert!(IMPLEMENT_STANDARDS_PREAMBLE.contains("Implement ONLY the task described below"));
+    }
+
+    /// **Bin 2 — where engine-rs is AHEAD of the JS engine.** JS prompts for
+    /// the commit, the work assertion and the vault recipe; engine-rs does all
+    /// three in Rust (`commit_all`, `verify_claimed_writes`). Porting that
+    /// prose would replace enforced code with text a model can skip, which is
+    /// the downgrade the ticket exists to prevent.
+    #[test]
+    fn implement_prompt_ports_no_commit_or_work_assertion_prose() {
+        let p = IMPLEMENT_STANDARDS_PREAMBLE;
+        assert!(!p.contains("git add"));
+        assert!(!p.contains("git commit"));
+        assert!(!p.contains("WORK_ASSERTION"));
+        assert!(!p.contains("planning/"), "vault routing is bin 2 + bin 3");
+    }
+
+    /// Cache discipline (standing rule 6), same guard as the other preambles.
+    #[test]
+    fn implement_standards_preamble_interpolates_nothing_per_run() {
+        assert!(
+            !IMPLEMENT_STANDARDS_PREAMBLE.contains('{'),
+            "no format placeholders in the cached prefix"
+        );
+        assert!(IMPLEMENT_STANDARDS_PREAMBLE.ends_with("\n\n"));
+    }
+
+    /// The fix path's own rule, which the first-attempt prompt must not carry:
+    /// a retry makes the minimum targeted change, it does not start over.
+    #[test]
+    fn retry_feedback_header_demands_a_minimum_targeted_fix() {
+        assert!(RETRY_FEEDBACK_HEADER.contains("Do NOT re-implement from scratch"));
+        assert!(RETRY_FEEDBACK_HEADER.contains("MINIMUM targeted changes"));
+        assert!(
+            !IMPLEMENT_STANDARDS_PREAMBLE.contains("re-implement from scratch"),
+            "a first attempt has nothing to re-implement; this belongs on the retry path only"
+        );
+    }
+
+    // --- ConsolidatedReviewNode / EndReviewNode: the ported strictness -----
+
+    /// **The JX.3.A clause.** *"The three render-spec entries correlate to one
+    /// finding"* was accepted as *"SOME finding spans 3 repos"* — a criterion
+    /// never met, passed by reinterpretation. The prompt must rule that out
+    /// explicitly; the JS wording alone did not.
+    #[test]
+    fn review_prompt_forbids_accepting_a_weaker_paraphrase_of_a_criterion() {
+        let p = REVIEW_STABLE_PROMPT;
+        assert!(p.contains("as WRITTEN"));
+        assert!(p.contains("weaker paraphrase"));
+        assert!(
+            p.contains("is NOT that criterion"),
+            "the concrete example is what makes the rule actionable"
+        );
+    }
+
+    /// Per-criterion and three-valued, against source — the payload of this
+    /// stage. The prompt used to say only "review the diff against its
+    /// acceptance criteria".
+    #[test]
+    fn review_prompt_marks_each_criterion_three_valued() {
+        let p = REVIEW_STABLE_PROMPT;
+        for v in ["MET", "PARTIAL", "NOT_MET"] {
+            assert!(p.contains(v), "missing the {v} marking");
+        }
+        assert!(
+            p.contains("citing the evidence"),
+            "a marking without evidence is an opinion"
+        );
+    }
+
+    /// A summary is an index, not evidence — the rule that forbids reviewing
+    /// the run-state instead of the source.
+    #[test]
+    fn review_prompt_refuses_to_take_the_run_state_summary_as_evidence() {
+        assert!(REVIEW_STABLE_PROMPT.contains("INDEX, not evidence"));
+    }
+
+    /// **The bin-2 guard, and the test that keeps this port honest over
+    /// time.** `run_checks` owns the gating suite in Rust, before the model is
+    /// asked anything. Asking the model to re-run it would move an enforced
+    /// invariant into prose it can skip — so the verdict definitions rule on
+    /// the criteria alone and this test fails if a later well-meaning edit
+    /// ports the dropped block back.
+    #[test]
+    fn review_prompt_does_not_ask_the_model_to_run_gating_checks() {
+        let p = REVIEW_STABLE_PROMPT;
+        assert!(
+            !p.contains("gating check"),
+            "gate results must not depend on the model agreeing"
+        );
+        assert!(!p.contains("Re-run the FULL"));
+        assert!(!p.contains("AUTHORITATIVE"));
+        assert!(
+            p.contains("on the criteria alone"),
+            "the verdict definitions must say what they rule on"
+        );
+    }
+
+    /// Cache discipline (standing rule 6), same guard as triage's.
+    #[test]
+    fn review_stable_prompt_interpolates_nothing_per_run() {
+        assert!(
+            !REVIEW_STABLE_PROMPT.contains('{'),
+            "no format placeholders in the cached prefix"
+        );
+        assert!(REVIEW_STABLE_PROMPT.ends_with("\n\n"));
+    }
+
+    /// Scope-neutral on purpose: one block serves the per-task and
+    /// end-of-run reviewers, each of which states its own scope in the body.
+    /// A scope word here would make the shared constant wrong for one of them.
+    #[test]
+    fn review_stable_prompt_is_scope_neutral() {
+        let p = REVIEW_STABLE_PROMPT;
+        assert!(!p.contains("this task's"));
+        assert!(!p.contains("END-OF-RUN"));
+    }
+
+    /// `localized` is a bounded two-valued judgement, so the schema carries
+    /// it rather than four lines of prose (bin 4). It stays out of `required`
+    /// so an omitting model still parses.
+    #[test]
+    fn review_schema_carries_localized_without_requiring_it() {
+        let schema = review_output_schema();
+        assert!(schema["properties"]["localized"].is_object());
+        assert!(schema["properties"]["localized"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("targeted fix")));
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !required.contains(&"localized"),
+            "must stay behavior-stable"
         );
     }
 
@@ -6778,6 +7092,12 @@ mod tests {
     /// pre-ticket behavior — the retry-feedback knob buys a retry block, not
     /// a rewritten first request. Any future perturbation of this string is
     /// caught here rather than in production.
+    ///
+    /// **Updated deliberately** by the JS prompt port
+    /// (`EN.ticket.prompt-parity-with-the-js-engines`) to admit
+    /// [`IMPLEMENT_STANDARDS_PREAMBLE`] between the path-discipline block and
+    /// the request. Updating the pin is the intended way to make a prompt
+    /// change visible in review; deleting it is not.
     #[tokio::test]
     async fn implement_node_first_attempt_prompt_is_byte_identical() {
         let task = SDLCTask::new(1, "One", "d1");
@@ -6793,10 +7113,10 @@ mod tests {
         assert_eq!(
             prompts[0],
             format!(
-                "{PATH_DISCIPLINE_PREAMBLE}Implement the following SDLC task. Respond with \
-                 strict JSON of the shape {{\"summary\": str, \"modified_files\": [str], \
-                 \"tests_added\": [str]}}.\n\nTitle: One\nDescription: d1\nAcceptance \
-                 criteria: []"
+                "{PATH_DISCIPLINE_PREAMBLE}{IMPLEMENT_STANDARDS_PREAMBLE}Implement the \
+                 following SDLC task. Respond with strict JSON of the shape {{\"summary\": \
+                 str, \"modified_files\": [str], \"tests_added\": [str]}}.\n\nTitle: \
+                 One\nDescription: d1\nAcceptance criteria: []"
             )
         );
     }
@@ -6867,10 +7187,10 @@ mod tests {
         assert_eq!(
             prompts[0],
             format!(
-                "{PATH_DISCIPLINE_PREAMBLE}Implement the following SDLC task. Respond with \
-                 strict JSON of the shape {{\"summary\": str, \"modified_files\": [str], \
-                 \"tests_added\": [str]}}.\n\nTitle: One\nDescription: d1\nAcceptance \
-                 criteria: []"
+                "{PATH_DISCIPLINE_PREAMBLE}{IMPLEMENT_STANDARDS_PREAMBLE}Implement the \
+                 following SDLC task. Respond with strict JSON of the shape {{\"summary\": \
+                 str, \"modified_files\": [str], \"tests_added\": [str]}}.\n\nTitle: \
+                 One\nDescription: d1\nAcceptance criteria: []"
             )
         );
     }
