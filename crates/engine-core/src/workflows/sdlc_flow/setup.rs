@@ -2839,6 +2839,191 @@ mod tests {
         );
     }
 
+    // -- real-git re-dispatch after a setup-phase teardown
+    // (EN.ticket.failed-run-leaves-worktree-and-branch-behind, task 2) ----
+
+    /// Runs a real `git` subprocess synchronously in `dir`, panicking with
+    /// stderr on a non-zero exit so a fixture-setup failure is loud rather
+    /// than producing a confusing downstream assertion failure. Returns
+    /// trimmed stdout for the callers that inspect it (`worktree list`,
+    /// `branch`, `rev-parse`).
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to spawn git {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A minimal real git repo with one commit on `main` and a
+    /// `refs/remotes/origin/main` ref pointing at it (no actual `origin`
+    /// remote is configured — `SetupWorktreeNode`'s own `git fetch origin
+    /// main` is best-effort and its failure is silently ignored, so this
+    /// synthetic ref is all `git worktree add ... origin/main` needs to
+    /// resolve its base).
+    ///
+    /// Lives one level down inside a wrapper temp dir (`<wrapper>/fixture`)
+    /// rather than at the temp dir's own root, because [`RepoRegistry`]
+    /// requires `repo_path` to be a subdirectory of the brain root it reads
+    /// `brain.toml` from — mirrors `two_repo_registry` above.
+    fn real_git_fixture_repo() -> (tempfile::TempDir, PathBuf) {
+        let wrapper = tempfile::tempdir().expect("tempdir");
+        let repo = wrapper.path().join("fixture");
+        std::fs::create_dir_all(&repo).expect("mkdir fixture");
+
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "test@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-q", "-m", "initial"]);
+        let head_sha = run_git(&repo, &["rev-parse", "HEAD"]);
+        run_git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/main", &head_sha],
+        );
+
+        std::fs::write(
+            wrapper.path().join("brain.toml"),
+            "[[repos]]\nslug = \"fixture\"\nrepo_path = \"fixture\"\n",
+        )
+        .expect("write brain.toml");
+
+        (wrapper, repo)
+    }
+
+    /// AC 1 + 2 (task 2): the actual harm the ticket describes — a
+    /// branch-collision retry — is gone, proved against a REAL git repo
+    /// (not a stubbed `CommandRunner`), driving `SetupWorktreeNode` twice in
+    /// sequence exactly as `bastion serve` would dispatch the same spec
+    /// twice: once to fail (mirroring jynx's `LoadTaskStateNode` crash,
+    /// simulated here by simply not proceeding past setup and instead
+    /// invoking the new `remove_worktree_and_branch` teardown directly, the
+    /// same call `engine-serve`'s `suspend.rs` makes for this exact case —
+    /// see task 1), and once to succeed.
+    ///
+    /// `git worktree list` / `git branch` are asserted identical to their
+    /// pre-first-dispatch baseline both right after teardown (proving the
+    /// leak is gone) and again after the second dispatch's own worktree is
+    /// cleaned up at the end of the test (proving the run, taken as a
+    /// whole, leaves the repo exactly as it found it).
+    #[tokio::test]
+    async fn setup_redispatch_after_teardown_succeeds_without_branch_collision() {
+        let (wrapper, repo) = real_git_fixture_repo();
+        let repo = repo.as_path();
+        let runner = default_command_runner();
+
+        let baseline_worktrees = run_git(repo, &["worktree", "list"]);
+        let baseline_branches = run_git(repo, &["branch"]);
+
+        // A registry so `SetupWorktreeNode` resolves this fixture as its
+        // target root instead of the real process `current_dir()` — no
+        // `std::env::set_current_dir` needed, which would be unsafe to rely
+        // on if this file's tests ever stopped running one-per-process.
+        let registry = Arc::new(RepoRegistry::from_brain_root(wrapper.path()).expect("registry"));
+
+        let node = SetupWorktreeNode::new()
+            .with_runner(runner.clone())
+            .with_registry(registry.clone());
+
+        // First dispatch: setup succeeds, creating a real worktree + branch.
+        let ctx1 = empty_context(json!({
+            "spec_slug": "my-spec",
+            "use_worktree": true,
+            "repo": "fixture",
+        }));
+        let first = node
+            .process(ctx1)
+            .await
+            .expect("first setup dispatch should succeed");
+        let setup_result = first
+            .nodes
+            .get("SetupWorktreeNode")
+            .expect("SetupWorktreeNode result present");
+        let worktree_path = setup_result["worktree_path"]
+            .as_str()
+            .expect("worktree_path is a string")
+            .to_string();
+        let branch = setup_result["branch_name"]
+            .as_str()
+            .expect("branch_name is a string")
+            .to_string();
+
+        // Simulate the run failing before LoadTaskStateNode ever succeeds
+        // (jynx's exact scenario) by invoking the same teardown call
+        // `engine-serve::suspend::teardown_worktree_on_setup_phase_failure`
+        // makes in that case (task 1) — this test's file scope is `setup.rs`
+        // only, so it exercises the shared `remove_worktree_and_branch`
+        // function directly rather than the `engine-serve` call site.
+        remove_worktree_and_branch(&runner, &worktree_path, &branch, repo);
+
+        assert_eq!(
+            run_git(repo, &["worktree", "list"]),
+            baseline_worktrees,
+            "worktree must be gone after teardown"
+        );
+        assert_eq!(
+            run_git(repo, &["branch"]),
+            baseline_branches,
+            "branch must be gone after teardown"
+        );
+
+        // Second dispatch of the IDENTICAL spec must now succeed rather than
+        // failing with "a branch named '...' already exists" — this is the
+        // criterion that reflects the actual harm described in the ticket.
+        let ctx2 = empty_context(json!({
+            "spec_slug": "my-spec",
+            "use_worktree": true,
+            "repo": "fixture",
+        }));
+        let second = node.process(ctx2).await;
+        assert!(
+            second.is_ok(),
+            "re-dispatch of the same spec after teardown must succeed \
+             instead of hitting a branch collision, got: {second:?}"
+        );
+        let second_ctx = second.unwrap();
+        let second_result = second_ctx
+            .nodes
+            .get("SetupWorktreeNode")
+            .expect("SetupWorktreeNode result present on the second dispatch");
+        let worktree_path_2 = second_result["worktree_path"]
+            .as_str()
+            .expect("worktree_path is a string")
+            .to_string();
+        let branch_2 = second_result["branch_name"]
+            .as_str()
+            .expect("branch_name is a string")
+            .to_string();
+        assert_eq!(
+            branch_2, branch,
+            "the retry must reuse the same branch name — that IS the collision case"
+        );
+
+        // Clean up the second dispatch's own worktree + branch so the run,
+        // taken as a whole, leaves the repo exactly as it found it —
+        // matching jynx's own before/after assertion shape.
+        remove_worktree_and_branch(&runner, &worktree_path_2, &branch_2, repo);
+
+        assert_eq!(
+            run_git(repo, &["worktree", "list"]),
+            baseline_worktrees,
+            "worktree must be gone once more after the run completes"
+        );
+        assert_eq!(
+            run_git(repo, &["branch"]),
+            baseline_branches,
+            "branch must be gone once more after the run completes"
+        );
+    }
+
     #[tokio::test]
     async fn setup_stamps_base_sha_from_rev_parse() {
         const FIXED_SHA: &str = "abc1234def5678900000000000000000000000";
