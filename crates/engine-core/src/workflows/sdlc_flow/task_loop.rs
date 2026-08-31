@@ -508,6 +508,100 @@ struct FeedbackEntry {
     detail: String,
 }
 
+/// Line-count above which [`compact_check_output`] kicks in. Below this, raw
+/// output is left untouched — most checks never get near it, and there is no
+/// point paying the compaction pass for a handful of lines.
+const COMPACT_LINE_THRESHOLD: usize = 200;
+
+/// How many lines immediately *after* a failure-signal line are kept as
+/// context. Assertion detail (`left:`/`right:` diffs, panic backtraces)
+/// conventionally follows the line that announces the failure, not precedes
+/// it, so context only looks forward.
+const COMPACT_CONTEXT_LINES: usize = 4;
+
+/// Marker `compact_check_output` inserts in place of an elided run of lines,
+/// naming how many were dropped so a reader can tell this is not a verbatim
+/// transcript.
+fn elision_marker(omitted: usize) -> String {
+    format!(
+        "... [{omitted} line{} omitted] ...",
+        if omitted == 1 { "" } else { "s" }
+    )
+}
+
+/// Does `line` look like part of a failure — a test name, an assertion, a
+/// panic, or a run summary — as opposed to ordinary passing-test noise?
+///
+/// Deliberately broad (a case-insensitive substring match, not a parser for
+/// any one tool's exact grammar): this compacts raw output from ANY check
+/// (`cargo nextest`, `cargo fmt --check`, `cargo clippy`, an arbitrary shell
+/// command), not nextest specifically, so it has to work as a heuristic
+/// rather than a format-specific parse.
+fn is_failure_signal_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("FAIL ") || trimmed.starts_with("FAILED ") {
+        return true;
+    }
+    let lower = line.to_lowercase();
+    lower.contains("fail")
+        || lower.contains("error")
+        || lower.contains("panicked")
+        || lower.contains("assertion")
+        || trimmed.starts_with("left:")
+        || trimmed.starts_with("right:")
+        || lower.contains("summary")
+}
+
+/// Compact a check's raw combined `stdout`+`stderr` so that failure-signal
+/// content (a failing test's name, its assertion/diff, the run summary)
+/// survives preferentially over passing-test noise, **regardless of where in
+/// the stream it falls** — a naive "keep the first N characters" truncation
+/// (which is what [`truncate_chars`] alone does) loses exactly this when the
+/// failure isn't near the very start of a large transcript.
+///
+/// A no-op below [`COMPACT_LINE_THRESHOLD`] lines. Above it, every line
+/// matching [`is_failure_signal_line`] is kept along with
+/// [`COMPACT_CONTEXT_LINES`] lines of trailing context; runs of non-matching
+/// lines are collapsed into a visible [`elision_marker`] rather than dropped
+/// silently. This runs *before* [`truncate_chars`]'s hard character-budget
+/// cap, which still applies afterward to the (now much denser) result — this
+/// function does not replace that bound, it feeds it something worth
+/// keeping.
+fn compact_check_output(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= COMPACT_LINE_THRESHOLD {
+        return output.to_string();
+    }
+
+    let mut keep = vec![false; lines.len()];
+    for (i, line) in lines.iter().enumerate() {
+        if is_failure_signal_line(line) {
+            let end = (i + COMPACT_CONTEXT_LINES + 1).min(lines.len());
+            for slot in keep.iter_mut().take(end).skip(i) {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if keep[i] {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        } else {
+            let start = i;
+            while i < lines.len() && !keep[i] {
+                i += 1;
+            }
+            out.push_str(&elision_marker(i - start));
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Truncate `text` to at most `max` **characters** (not bytes — the model
 /// output can contain multi-byte characters, and slicing by byte would panic).
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -521,6 +615,43 @@ fn truncate_chars(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max - marker_len).collect();
     out.push_str(RETRY_FEEDBACK_TRUNCATED);
     out
+}
+
+/// The first line of failure detail found across a set of `check_results[]`
+/// (name + assertion for a test, the offending line for fmt/clippy) — used
+/// to fold at least one concrete failure into a deterministic bail reason
+/// rather than a generic "exhausted" message with no diagnosis.
+///
+/// Prefers a `FAIL `/`FAILED `-prefixed line (`cargo nextest`'s own marker,
+/// carrying the test's crate + name), falling back to the first line
+/// matching [`is_failure_signal_line`] for check kinds that don't use that
+/// marker (fmt/clippy/build). Elision markers themselves never match. `None`
+/// when no failing check has any output to draw from.
+fn first_failure_detail(check_results: &[serde_json::Value]) -> Option<String> {
+    for check in check_results {
+        if check.get("passed").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        let output = check.get("output").and_then(|v| v.as_str()).unwrap_or("");
+        let candidate = output
+            .lines()
+            .find(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("FAIL ") || trimmed.starts_with("FAILED ")
+            })
+            .or_else(|| {
+                output.lines().find(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty()
+                        && !trimmed.starts_with("... [")
+                        && is_failure_signal_line(line)
+                })
+            });
+        if let Some(line) = candidate {
+            return Some(line.trim().to_string());
+        }
+    }
+    None
 }
 
 /// The failed entries of the last `TestTaskNode` run, if it recorded a
@@ -1108,16 +1239,31 @@ impl TestTaskNode {
                 stderr,
             }) => {
                 let passed = status == 0;
+                let combined = format!("{stdout}{stderr}");
+                // Compact BEFORE any character-budget truncation runs
+                // downstream (`truncate_chars`, called later from
+                // `render_feedback_block`): a raw multi-thousand-line test
+                // transcript otherwise gets truncated from the front, which
+                // keeps early PASS-line noise and drops the failure detail
+                // that might be anywhere else in the stream.
+                let output = compact_check_output(&combined);
+                let message = if passed {
+                    String::new()
+                } else {
+                    // Fold a short failure excerpt in alongside the exit
+                    // code so it is visible even before `output`/`detail` is
+                    // read — `output` stays the primary, fuller carrier.
+                    match output.lines().find(|line| is_failure_signal_line(line)) {
+                        Some(excerpt) => format!("exit code {status}: {}", excerpt.trim()),
+                        None => format!("exit code {status}"),
+                    }
+                };
                 CheckResult {
                     name,
                     kind,
                     passed,
-                    output: format!("{stdout}{stderr}"),
-                    message: if passed {
-                        String::new()
-                    } else {
-                        format!("exit code {status}")
-                    },
+                    output,
+                    message,
                 }
             }
             Err(err) => CheckResult {
@@ -1975,18 +2121,34 @@ impl Node for TriageTaskNode {
 
         if attempt_count >= max_attempts {
             let task_id = task.task_id;
+            let mut reason = format!(
+                "Max attempts ({max_attempts}) reached without a passing run. \
+                 To recover: re-run just this task with `retry_task: {task_id}` \
+                 (keeps every other task's status, attempt count and commits), \
+                 or restart the whole spec with `resume: false` (archives the \
+                 current state and reruns from scratch)."
+            );
+            // Name the failure, not just the exhaustion — jynx's escalation
+            // (this ticket) reached the operator saying only "test output
+            // truncated... without visibility into which tests failed" when
+            // the failing test's name and assertion were sitting right there
+            // in `check_results[].output` (compacted by
+            // `compact_check_output` above so it survives even a huge
+            // transcript). Best-effort: absent/garbled `check_results` still
+            // bails with the reason above, unchanged.
+            if let Some(detail) = test_result
+                .get("check_results")
+                .and_then(|v| v.as_array())
+                .and_then(|checks| first_failure_detail(checks))
+            {
+                reason.push_str(&format!("\nFailing check detail: {detail}"));
+            }
             put_result(
                 &mut ctx,
                 "TriageTaskNode",
                 json!({
                     "verdict": "MAJOR_BAIL",
-                    "reason": format!(
-                        "Max attempts ({max_attempts}) reached without a passing run. \
-                         To recover: re-run just this task with `retry_task: {task_id}` \
-                         (keeps every other task's status, attempt count and commits), \
-                         or restart the whole spec with `resume: false` (archives the \
-                         current state and reruns from scratch)."
-                    ),
+                    "reason": reason,
                 }),
             );
             return Ok(ctx);
@@ -3494,6 +3656,77 @@ mod tests {
         );
     }
 
+    /// A large, deliberately buried failure (many passing lines before AND
+    /// after the one failing test — modeled on jynx's own repro) plus a
+    /// summary line.
+    fn large_output_with_buried_failure() -> String {
+        let mut out = String::new();
+        for i in 0..300 {
+            out.push_str(&format!(
+                "PASS [   0.001s] my-crate tests::passing_test_{i}\n"
+            ));
+        }
+        out.push_str(
+            "FAIL [   0.012s] my-crate rerun::tests::shared_state_path_yields_distinct_stored_observations_per_invocation\n",
+        );
+        out.push_str(
+            "assertion `left == right` failed: k=3 invocations writing to ONE SHARED artifact \
+             path must yield 3 DISTINCT stored observations, got 1\n",
+        );
+        out.push_str("  left: 1\n");
+        out.push_str(" right: 3\n");
+        out.push_str("Summary [   0.500s] 235 tests run: 234 passed, 1 failed, 1 skipped\n");
+        for i in 300..600 {
+            out.push_str(&format!(
+                "PASS [   0.001s] my-crate tests::passing_test_{i}\n"
+            ));
+        }
+        out
+    }
+
+    /// EN.ticket.triage-cannot-see-which-test-failed task 1: the deterministic
+    /// attempts-exhausted bail reason must name at least one failing test,
+    /// not just report that attempts ran out — this is the exact information
+    /// gap jynx's escalation surfaced (a bail reason saying "test output
+    /// truncated... without visibility into which tests failed" while the
+    /// failing test's name and assertion were present in `check_results[]`
+    /// the whole time).
+    #[tokio::test]
+    async fn exhausted_attempts_bail_reason_names_the_failing_test() {
+        let mut task = SDLCTask::new(9, "Nine", "d9");
+        task.max_attempts = 3;
+        task.attempt_count = 3;
+
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "TestTaskNode".to_string(),
+            json!({
+                "all_passed": false,
+                "failure_summary": "1 check failed",
+                "check_results": [{
+                    "name": "cargo nextest run --workspace",
+                    "kind": "command",
+                    "passed": false,
+                    "output": large_output_with_buried_failure(),
+                    "message": "exit code 100",
+                }],
+            }),
+        );
+
+        let node = TriageTaskNode::new().with_transport(panicking_transport());
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TriageTaskNode"]["verdict"], "MAJOR_BAIL");
+        let reason = out.nodes["TriageTaskNode"]["reason"]
+            .as_str()
+            .expect("reason is a string");
+        assert!(
+            reason.contains("shared_state_path_yields_distinct_stored_observations_per_invocation"),
+            "bail reason must name the failing test, not just report exhaustion: {reason}"
+        );
+    }
+
     #[tokio::test]
     async fn triage_deterministic_branches() {
         let mut task = SDLCTask::new(1, "One", "d1");
@@ -4862,6 +5095,83 @@ mod tests {
         let node = TestTaskNode::new().with_runner(runner);
         let out = node.process(ctx).await.unwrap();
         assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// POSITIVE CONTROL (EN.ticket.triage-cannot-see-which-test-failed task 1,
+    /// AC #1): a suite that emits a large volume of passing output, one
+    /// failing test BURIED IN THE MIDDLE (more passing lines both before and
+    /// after it — a naive tail-only fix would also fail this), and a summary
+    /// line. Neither the failing test's name nor its assertion is anywhere
+    /// near the front of the raw stream, so the pre-fix "keep the first N
+    /// characters" truncation would drop both. Assert they survive into the
+    /// check's captured `output` — the text `test_failure_entries` /
+    /// `triage_failure_feedback` render into the retry/triage prompt.
+    #[tokio::test]
+    async fn buried_test_failure_survives_output_compaction() {
+        let worktree = temp_worktree();
+        write_harness(
+            &worktree,
+            json!([{ "name": "cargo nextest run --workspace", "command": "does-not-matter", "gates": true }]),
+        );
+
+        let runner: CommandRunner = Arc::new(move |program, args, _cwd| {
+            if let Some(probe) = write_verification_probe(program, args) {
+                return Ok(probe);
+            }
+            Ok(CommandOutput {
+                status: 100,
+                stdout: large_output_with_buried_failure(),
+                stderr: String::new(),
+            })
+        });
+
+        let ctx = ctx_for_worktree(&worktree);
+        let node = TestTaskNode::new().with_runner(runner);
+        let out = node.process(ctx).await.unwrap();
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let check_output = out.nodes["TestTaskNode"]["check_results"][0]["output"]
+            .as_str()
+            .expect("check output is a string");
+
+        assert!(
+            check_output
+                .contains("shared_state_path_yields_distinct_stored_observations_per_invocation"),
+            "failing test's name must survive compaction: {check_output}"
+        );
+        assert!(
+            check_output.contains("left == right"),
+            "failing test's assertion message must survive compaction: {check_output}"
+        );
+        assert!(
+            check_output.contains("234 passed, 1 failed"),
+            "the summary line must survive compaction: {check_output}"
+        );
+        // AC #2: the compaction visibly marks where lines were omitted,
+        // rather than silently dropping them.
+        assert!(
+            check_output.contains("omitted"),
+            "elided passing-line runs must be visibly marked, not silently dropped: {check_output}"
+        );
+        // Proves elision actually happened (not merely that the failure
+        // survived by luck) — an early passing-test line well before the
+        // failure must be gone.
+        assert!(
+            !check_output.contains("passing_test_5\n"),
+            "early passing-test noise should have been elided: {check_output}"
+        );
+
+        // The same content must still be present after the full prompt-block
+        // render + character-budget truncation — this is what actually
+        // reaches the triage/retry prompt.
+        let cfg = crate::workflows::sdlc_flow::policy::RetryFeedback::default();
+        let feedback =
+            triage_failure_feedback(&out, &cfg).expect("a failed check produces feedback");
+        assert!(
+            feedback
+                .contains("shared_state_path_yields_distinct_stored_observations_per_invocation"),
+            "the rendered triage feedback block must still name the failing test: {feedback}"
+        );
     }
 
     /// Builds a `ctx` with a `SetupWorktreeNode` output plus everything
