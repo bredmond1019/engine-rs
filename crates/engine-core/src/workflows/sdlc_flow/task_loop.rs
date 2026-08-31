@@ -2224,7 +2224,7 @@ pub(super) fn review_output_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "verdict": { "type": "string" },
+            "verdict": { "type": "string", "enum": ["PASS", "PARTIAL", "FAIL"] },
             "summary": { "type": "string" },
             "issues": { "type": "array", "items": { "type": "string" } },
         },
@@ -2346,7 +2346,9 @@ impl Node for ConsolidatedReviewNode {
         let prompt = format!(
             "Review this task's diff against its acceptance criteria. \
              Respond with strict JSON of the shape {{\"verdict\": str, \
-             \"summary\": str, \"issues\": [str]}}.\n\nAcceptance criteria: \
+             \"summary\": str, \"issues\": [str]}}. \"verdict\" must be \
+             exactly one of \"PASS\", \"PARTIAL\", or \"FAIL\" — no other \
+             value is accepted.\n\nAcceptance criteria: \
              {acceptance_criteria}\n\nDiff:\n{diff}"
         );
 
