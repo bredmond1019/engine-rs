@@ -88,12 +88,29 @@ pub struct RunTelemetryInputs<'a> {
     /// (see [`total_cost_usd`]).
     pub cost_bearing_stages: &'a [&'a str],
     /// Total attempts across every unit of work this run (caller-derived).
+    ///
+    /// The only production caller, `workflow::stamp_run_telemetry`, is
+    /// graph-agnostic by design and has no workflow-specific attempt/retry/
+    /// pass/fail bookkeeping to derive this (or the three fields below)
+    /// from — so it always passes `0` here, on every workflow, on every
+    /// path, successful runs included. If you are filling in this struct,
+    /// know that a `0` in these four fields is not evidence the run made no
+    /// attempts; it is evidence the caller is `stamp_run_telemetry` and had
+    /// nothing to report. The real, per-spec numbers for these same four
+    /// quantities are computed separately by a workflow that tracks them
+    /// (e.g. SDLC's `SDLCState`) via its own `finalize_outcomes`
+    /// (`wrap_up.rs::finalize_outcomes`), landing in `ctx.nodes["WrapUpNode"]`
+    /// and the SDLC state file — not in the `RunTelemetry` this struct
+    /// produces. See also `docs/workflows/sdlc-flow-policy.md:345-352`.
     pub total_attempts: u32,
     /// Total retries across every unit of work this run (caller-derived).
+    /// Structurally `0` from `stamp_run_telemetry` — see `total_attempts`.
     pub total_retries: u32,
     /// Number of units of work that passed (caller-derived).
+    /// Structurally `0` from `stamp_run_telemetry` — see `total_attempts`.
     pub tasks_passed: u32,
     /// Number of units of work that failed (caller-derived).
+    /// Structurally `0` from `stamp_run_telemetry` — see `total_attempts`.
     pub tasks_failed: u32,
     /// Per-stage model tier actually used this run — an explicit **fallback**
     /// used only for stages [`model_stages`] observes no transport stamp for

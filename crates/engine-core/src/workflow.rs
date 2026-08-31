@@ -562,12 +562,25 @@ impl Workflow {
 /// per-workflow stage list — `policy::telemetry::{review_verdicts,
 /// total_cost_usd, observed_model_tiers}` simply find nothing to report for
 /// an identity whose output carries none of `"verdict"`/`"cost_usd"`/
-/// `"transport"`. `total_attempts`/`total_retries`/`tasks_passed`/
-/// `tasks_failed` stay `0` here (not derivable without workflow-specific
-/// state); a workflow that tracks those (e.g. SDLC's `SDLCState`) still
-/// computes its own precise `RunOutcomes` via its own `finalize_outcomes` —
-/// that write is not disturbed by this one, they sit at different `ctx`
-/// locations (`ctx.nodes["WrapUpNode"]` vs `ctx.metadata`).
+/// `"transport"`.
+///
+/// `total_attempts`/`total_retries`/`tasks_passed`/`tasks_failed` are hardcoded
+/// to `0` here on EVERY workflow, on EVERY path — a fresh, fully successful,
+/// never-resumed run reports zeros for these four too. This is not "no data
+/// yet"; it is structural: `stamp_run_telemetry` is deliberately
+/// graph-agnostic (see above) and so has no access to workflow-specific
+/// attempt/retry/pass/fail bookkeeping, which only a specific workflow's own
+/// state can supply. A `0` read here carries no information about the run —
+/// do not read it as a true zero.
+///
+/// The real, per-spec numbers for these same four quantities live elsewhere:
+/// a workflow that tracks them (e.g. SDLC's `SDLCState`) computes its own
+/// precise `RunOutcomes` via its own `finalize_outcomes` (see
+/// `wrap_up.rs::finalize_outcomes`), which writes to `ctx.nodes["WrapUpNode"]`
+/// and the SDLC state file — a different `ctx` location entirely from this
+/// function's `ctx.metadata` write, and not disturbed by it. See also
+/// `docs/workflows/sdlc-flow-policy.md:345-352` and the doc comment on
+/// `RunTelemetryInputs` in `policy/telemetry.rs`.
 ///
 /// Never fails the run: a `RunTelemetry` that somehow won't serialize is
 /// simply not stamped, rather than turning an otherwise-successful run into
@@ -581,6 +594,9 @@ fn stamp_run_telemetry(ctx: &mut TaskContext, start_node_identity: &str) {
         verdict_stages: &stages,
         cost_bearing_stages: &stages,
         model_stages: &stages,
+        // Structurally zero on every path, not merely absent — see this
+        // function's doc comment above for why and where the real numbers
+        // live. Do not "fix" this by threading workflow state through here.
         total_attempts: 0,
         total_retries: 0,
         tasks_passed: 0,
