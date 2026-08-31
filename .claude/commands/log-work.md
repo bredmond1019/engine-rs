@@ -124,10 +124,16 @@ adding value here.
 
 ### Step 3 — Regenerate derived surfaces (`mev emit-state --write`)
 
-9. Shell out to `mev emit-state --write` (it walks up from the current directory to find
-   `brain.toml` itself — no need to `cd` to `BRAIN_ROOT` first). This is the **single derivation
-   engine** and it regenerates, in place, every generated surface from the `tracks[]` you just
-   authored in Step 2:
+9. **If `$BRAIN_ROOT/scripts/sync/emit_state_write.sh` exists, run it instead of the bare command
+   below.** Some brains wrap `emit-state --write` in a script that adds content-loss guards and
+   commits what it wrote — **locally only**, never pushing on its own (that class of wrapper is
+   opt-in to push, gated behind an env var only a nightly cron sets). This repo's harness stays
+   project-agnostic, so it never assumes that script exists — it only checks for it. If it's
+   absent, shell out to `mev emit-state --write` directly (it walks up from the current directory
+   to find `brain.toml` itself — no need to `cd` to `BRAIN_ROOT` first), and leave the resulting
+   changes uncommitted for `/commit`, `/wrap-up`, or `/handoff` to pick up — never commit them here
+   yourself with a broad `git add`. Either way, this step regenerates, in place, every generated
+   surface from the `tracks[]` you just authored in Step 2:
    - this repo's leaf `state.json` focus fields (`now` / `next` / `blocked`);
    - the brain `state.json`'s `repos[]` / `cross_repo[]` rollup and its own `focus`;
    - the per-project cache doc's focus headline + `synced_from` watermark

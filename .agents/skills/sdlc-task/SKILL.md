@@ -586,6 +586,12 @@ For each `taskNum` in `taskList` (skip any already in the resume skip-set, loggi
        4. The needed change would be destructive or out-of-scope.
        5. The SAME failure twice with no progress (stuck), or a structural design flaw needing a
           re-plan.
+
+       Those five are hardcoded mechanism. A project may APPEND its own via
+       `planning/harness.json`'s `flow.bailReasons[]` — read that key and treat any entry there as
+       reason 6, 7, … with exactly the same force as the five above. (The config block is named
+       `flow` for historical reasons; this engine reads `testDepth` and `bailReasons` out of it and
+       ignores `autoMerge`/`prBase`, which really are flow-only.)
      - Before asserting a failure "pre-dates this task" / "exists at baseline" / "is unrelated to this
        task's scope": that claim requires re-running ONLY the failing check against the base state
        (main working tree, or the task's base commit) FIRST. If actually re-run, record

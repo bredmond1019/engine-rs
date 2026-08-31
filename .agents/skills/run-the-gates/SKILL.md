@@ -106,6 +106,26 @@ normal mid-flight. A red `conformance` is information, not a blocker — but if 
 - **`timeout` does not exist on this macOS shell.** A command that hangs will hang; do not wrap it in
   `timeout` and assume a bound.
 
+## 5b. When `--graph` is red, look at the graph
+
+`mev validate-brain --graph` names the broken edges one line at a time, which is hard to read when a
+rename broke a cluster. Two non-gating instruments show the shape instead:
+
+```bash
+mev emit-graph --pretty | head -40        # nodes / related: edges / leaves as JSON — writes nothing
+mev generate-graph                        # interactive HTML — WRITES to <root>/planning/doc-graph
+mev generate-graph --out /tmp/docgraph    # ...send it somewhere disposable instead
+```
+
+**`generate-graph` writes files.** Its default output lands inside `planning/`, which this one HQ git
+repo tracks — so an unscoped `git commit` afterwards sweeps the artifact in (see
+`commit-in-this-fleet`). Pass `--out` to a scratch directory unless you actually want the artifact
+committed. Neither verb is a gate, and neither is in `harness.json`; they are for reading a failure,
+not for proving one is fixed — re-run `validate-brain --graph` for that.
+
+For "what breaks if I change this doc", use the `check-blast-radius` skill: `bastion brain` answers
+a different question (`[[wikilinks]]`, not `related:`) and reports an empty result with exit 0.
+
 ## 6. Report what actually ran
 
 If a check was skipped, say so. If it failed, quote the real error text rather than summarising it.

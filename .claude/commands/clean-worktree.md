@@ -189,16 +189,31 @@ The literal single-token form is output by `/sdlc-task` when it creates a suffix
    **If log file not found:** report "No task log found — STATUS/Log not updated.
    If this task was run with /sdlc-task, check that the pipeline completed its wrap-up stage."
 
-6.6. **Regenerate derived surfaces (`mev emit-state --write`):**
+6.6. **Regenerate derived surfaces:**
 
    The merged branch may carry an authored `planning/state.json` block-status flip to `"closed"`
    (written by `/sdlc-flow`'s or `/sdlc-task`'s in-worktree wrap-up, which could not run `emit-state`
    inside the linked worktree). Now that it has landed on `main`, regenerate every derived surface
    from the authored graph — this is the one-way derivation (`focus`, rollups, cache `synced_from`
-   watermarks, tier tables, the HQ Operating Board, `master-plan.md` wave tables):
+   watermarks, tier tables, the HQ Operating Board, `master-plan.md` wave tables).
+
+   If `$BRAIN_ROOT/scripts/sync/emit_state_write.sh` exists (resolve `BRAIN_ROOT` the way `/log-work`
+   Step 0 does), run it instead of the bare command: it adds content-loss guards and, on success,
+   commits what it wrote **locally only** — push stays opt-in behind an env var only a nightly cron
+   sets, so this never pushes on its own. This harness stays project-agnostic, so it only checks for
+   the script; it never assumes one exists. Otherwise:
    ```bash
    mev emit-state --write --require-fresh
    ```
+   and then **commit the result yourself, locally, before removing the worktree** — leaving the
+   regenerated surfaces uncommitted on `main` after a "successful" cleanup is a real defect, not a
+   cosmetic gap:
+   ```bash
+   git add planning/state.json planning/status.md docs/projects/*.md  # only what emit-state touched — never `git add -A`
+   git commit -m "chore: regenerate derived state after merging <worktreeName>"
+   ```
+   **Never push** — this command does not push under any flag.
+
    Run it from the main working tree (never a linked worktree — `emit-state` refuses there). If `mev`
    or `brain.toml` is absent (a standalone repo), skip this step silently — the authored flip already
    merged and still stands. Do NOT hand-reimplement any derived surface. If it reports a

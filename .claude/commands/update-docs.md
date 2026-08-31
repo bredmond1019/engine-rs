@@ -5,10 +5,10 @@ Produces a structured gap report (stale sections, missing coverage, confirmed-cu
 Optionally fixes STALE sections and creates MISSING docs with `--patch`, or skips the audit
 and creates all missing docs from scratch with `--bootstrap`.
 
-This is the **ad-hoc maintenance** counterpart to `/document` (which gates on `sdlc/state.json`'s
-recorded `review.verdict` being PASS, not a prose report — see `/document`'s Record section).
-Use `/update-docs` for periodic doc health checks and bootstrapping outside the SDLC pipeline;
-use `/document` inside it.
+This is the **ad-hoc maintenance** entry point for docs. Inside the SDLC pipeline you do not run it
+by hand: `/sdlc-flow`'s Docs stage performs the same surgical patch (and the same `write-repo-doc`
+standard pass) automatically, gated on a PASS review verdict. Use `/update-docs` for periodic doc
+health checks and for bootstrapping a repo that has no `docs/` yet.
 
 **Governed by the `write-repo-doc` skill** for anything this command writes or rewrites — quickstart
 first, plain-English openers, vocabulary linked, every named command/script/schema linked inline.

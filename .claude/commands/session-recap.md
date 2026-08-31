@@ -75,7 +75,7 @@ there are none. Flag any `kind: env` caveat that gates the next step (e.g. "rebu
 
 ## Next Pipeline Step
 <Single line: the exact command to run next, with the full argument.>
-Example: `/test planning/<spec-slug>/tasks.md 2`
+Example: `/sdlc-task <spec-slug> 2`
 If the block is complete: `Run /log-work to wrap up, then /start-block for the next block.`
 
 ---

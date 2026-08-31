@@ -11,7 +11,7 @@ $ARGUMENTS — optional. Parsed left to right:
     (`/handoff`). Designed for automated per-block close-out from a roadmap orchestration run
     where handing off mid-run makes no sense. Preserves all gating and coverage logic.
   - `--skip-coverage` — skip Step 2 (coverage scan + gap fill); use when coverage is
-    already known good or was verified by a prior `/review-task`.
+    already known good or was verified by a prior `/sdlc-flow` end review.
   - `--clean-worktree` — run Step 5 (clean-worktree) at the very end to merge a **worktree** branch
     into `main` and remove the worktree. Default is false (do not clean) to protect the "never
     auto-merge" rule.
@@ -233,8 +233,9 @@ PYEOF
 If any **gating** check (`gates: true`) fails, or the emoji gate fails:
 - Surface the failure with the exact command and relevant output.
 - **Stop. Do not proceed to Steps 2–4.**
-- Tell the user: which check failed and what it produced; suggest `/fix <spec>` if a
-  spec is in flight, or direct the failing command at the problem.
+- Tell the user: which check failed and what it produced; suggest re-running the spec through
+  `/sdlc-task <spec>` (or `/sdlc-flow <spec>`) if a spec is in flight, or direct the failing
+  command at the problem.
 - Do NOT attempt to fix failures here — this command closes out done work, not in-flight work.
 
 If all gating checks pass (non-gating failures are surfaced but don't block): proceed.
@@ -385,14 +386,32 @@ If `--merge-branch` was passed:
      step 5 or 6. (The branch-mode `/sdlc-flow` wrap-up already committed status.md / log.md / the
      amendment log on the branch, so a successful merge carries them onto the base automatically — no
      separate task-log application is needed.)
-5. **Regenerate derived surfaces (`mev emit-state --write`):** the merged branch carries an authored
-   `planning/state.json` block-status flip to `"closed"` (the branch-mode wrap-up deferred emit-state
-   because it ran on the feature branch, not the base). Now that it has landed on `<base>`, regenerate
-   every derived surface from the authored graph — the one-way derivation (`focus`, rollups, cache
-   `synced_from` watermarks, tier tables, the HQ Operating Board, `master-plan.md` wave tables):
+5. **Regenerate derived surfaces.** The merged branch carries an authored `planning/state.json`
+   block-status flip to `"closed"` (the branch-mode wrap-up deferred emit-state because it ran on
+   the feature branch, not the base). Now that it has landed on `<base>`, regenerate every derived
+   surface from the authored graph — the one-way derivation (`focus`, rollups, cache `synced_from`
+   watermarks, tier tables, the HQ Operating Board, `master-plan.md` wave tables).
+
+   If `$BRAIN_ROOT/scripts/sync/emit_state_write.sh` exists (resolve `BRAIN_ROOT` the way `/log-work`
+   Step 0 does — walk up for `brain.toml`), run it instead of the bare command: it adds content-loss
+   guards and, on success, commits what it wrote **locally only** — push stays opt-in behind an env
+   var only a nightly cron sets, so this never pushes on its own. This harness stays project-agnostic,
+   so it only checks for the script; it never assumes one exists. Otherwise:
    ```bash
    mev emit-state --write --require-fresh
    ```
+   and then **commit the result yourself, locally, before deleting the branch** — this step used to
+   leave the regenerated surfaces uncommitted on `<base>` after emit-state ran, which is a real defect
+   fixed here: an emit-state run always changes something, and a merge that lands looking clean while
+   leaving derived files dirty in the working tree is worse than the merge failing outright.
+   ```bash
+   git add planning/state.json planning/status.md docs/projects/*.md  # only the surfaces emit-state touched — never `git add -A`
+   git commit -m "chore: regenerate derived state after merging <branch-name>"
+   ```
+   Scope the `git add` to whatever `emit-state`'s own output named as touched, per the
+   `commit-in-this-fleet` skill where this repo has one — never a broad `git add -A`/`git add .`.
+   **Never push** — this command does not push under any flag; pushing is a separate, explicit step.
+
    Run it from the base branch (never a linked worktree — `emit-state` refuses there). If `mev` or
    `brain.toml` is absent (a standalone repo), skip this silently — the authored flip already merged
    and still stands. Do NOT hand-reimplement any derived surface. If it reports a `W_EMIT_NO_SENTINEL`
@@ -401,7 +420,8 @@ If `--merge-branch` was passed:
    ```bash
    git branch -d <branch-name>
    ```
-   Report: "Branch '<branch-name>' merged into <base> and deleted; derived surfaces regenerated."
+   Report: "Branch '<branch-name>' merged into <base> and deleted; derived surfaces regenerated and
+   committed locally (not pushed)."
 
 ## Context / Files to Read
 

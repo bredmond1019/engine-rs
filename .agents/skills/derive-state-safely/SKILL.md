@@ -186,6 +186,28 @@ in `edit-state-json` enforceable across concurrent lanes.
 engines run in worktrees, so this is the common case, not the exotic one: a gate-clearing verb
 invoked mid-block fails rather than writing. Run it from the main tree.
 
+## Step 5b — A bad write is undoable: `mev state-history`
+
+Every write that overwrites existing content records an append-only revision first, so you do not
+have to reconstruct a clobbered file from git or by hand.
+
+```bash
+mev state-history planning/state.json                 # revisions, NEWEST FIRST: seq, UTC time, bytes
+mev state-history planning/state.json --restore 3     # put revision 3 back
+```
+
+- **Listing is read-only** and never takes the advisory lock — safe to run alongside another lane.
+- **`--restore` snapshots the current on-disk content as a new revision before restoring**, so a
+  wrong restore is itself undoable with a second restore.
+- `--restore` is a writer: same `.mev-emit.lock`, same linked-worktree refusal, same quiesce-lease
+  check as `emit-state --write` (`E_EMIT_LOCK_HELD`, `E_EMIT_LINKED_WORKTREE`,
+  `E_QUIESCE_LEASE_HELD` — do not retry the last one; wait, or pass `--agent` to self-exempt).
+- "no revisions recorded" **exits 0** — an empty history is a normal state, not a failure, and not
+  evidence the file was never written. A `W_HISTORY_FAILED` on a restore means the pre-restore
+  snapshot was not recorded; the restore still proceeds, so that one undo is not available.
+- Restoring `state.json` puts back **authored and derived alike**. Re-run the derivation afterwards
+  rather than leaving a restored file's generated regions describing an older corpus.
+
 ## Step 6 — Read the run's warnings
 
 - `I_EMIT_WROTE` — informational, one per surface written. This is your blast-radius list; read it.
@@ -215,3 +237,5 @@ Applies to **every** verb in the table at the top, not only a bare `emit-state -
 - [ ] If committing by hand instead: pathspec scoped to `.emit_wrote`'s contents, each path
       resolved through `realpath` first, other lanes' files left alone, never `git add -A`
 - [ ] Generated boards spot-checked — a format regression looks like a successful run
+- [ ] If a write went wrong: recovered with `mev state-history --restore <seq>` rather than
+      hand-repairing the file, then re-ran the derivation

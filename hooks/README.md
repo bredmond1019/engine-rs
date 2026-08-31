@@ -114,19 +114,19 @@ and re-filed as "only a gate prevents recurrence"
   in staged frontmatter does.
 - **`git commit --no-verify` skips it**, same escape hatch as the other hooks.
 
-#### The `created` / `updated` date gate — written, tested, **OFF**
+#### The `created` / `updated` date gate — **ON** since 2026-08-31
 
 `created` and `updated` were added to `okf_core::OkfFrontmatter` on 2026-08-29 (okf-core
-block `OK.ticket.add-created-updated-frontmatter`). **Nothing in the fleet validates
-them**: okf-core models both as free strings, and mev's OKF validator has no rule for
-either — so a malformed or impossible date is invisible everywhere. `check_frontmatter.py`
-now carries the gate that would catch it, and it is **opt-in and off by default**:
+block `OK.ticket.add-created-updated-frontmatter`). **This hook is the only thing in the
+fleet that validates them**: okf-core models both as free strings, and mev's OKF validator
+still has no rule for either — so outside a commit that runs this hook, a malformed or
+impossible date remains invisible. `check_frontmatter.py` carries the gate, on by default:
 
 ```bash
-OKF_DATE_GATE=1 git commit -m "..."     # gate on, for this commit only
+OKF_DATE_GATE=0 git commit -m "..."     # gate off, for this commit only
 ```
 
-With the gate on, a staged `.md` whose frontmatter parses is additionally checked for:
+A staged `.md` whose frontmatter parses is additionally checked for:
 
 | Rejected | Why |
 |---|---|
@@ -141,28 +141,38 @@ implementation has to handle: PyYAML parses an unquoted `created: 2026-08-29` in
 correct spelling; and `datetime.datetime` is a *subclass* of `date`, so the timestamp case
 must be rejected before the date check, not after.
 
-**Why it is not on.** Turning it on fleet-wide is a separate, deliberate step. The blast
-radius is now measured, and it is nil: of **4,850 tracked `.md` files, 12 carry a
-`created:`/`updated:` field and 0 would be blocked** (scanned 2026-08-29). So the reason
-to wait is not risk to existing files — it is that the hook is inert fleet-wide anyway
-(`pre-push` is `chmod -x`'d; `pre-commit` runs only where `core.hooksPath` is set), and
-nobody has yet decided these fields are worth enforcing at all. To enable: flip
-`date_gate_enabled()` in `hooks/check_frontmatter.py` to default true, re-run the suite,
-then re-sync downstream.
+**Out of scope: code test fixtures.** The hook checks every staged `.md`, but the corpus
+is only `docs/` + `planning/`. A markdown file under a source tree is test data meant to be
+*parsed*, and may carry an odd field precisely because that is what a test asserts on — so
+`is_code_fixture()` exempts any path containing `/fixtures/` from the **date** gate. The
+YAML **parse** gate still applies to them: a fixture that will not parse is broken either way.
+
+**Blast radius, re-measured 2026-08-31 before enabling** — over **7,425 tracked `.md` files
+across every repo in the fleet** (the 2026-08-29 note below it measured 4,850 / 12 / 0 and is
+superseded): **45 carry a `created:`/`updated:` field, and 5 would have been rejected** — all
+five bastion fixtures under `src/**/fixtures/`, each carrying an RFC3339 `updated:` that no
+bastion parser reads. With `is_code_fixture()` in place the count is **0 blocked**, verified by
+re-running the same sweep. Re-measure before widening the gate's scope again.
+
+Note the hook is still only *live* where `core.hooksPath` is set (HQ is; `pre-push` remains
+`chmod -x`'d fleet-wide), so enabling this is a change to author-time behaviour in HQ and in
+every repo that opts in, not a fleet-wide flag day.
 
 ```bash
 bash hooks/test_pre-commit.sh   # exit 0 = all pass
 ```
 
-19 cases — clean frontmatter passes, an unquoted colon blocks (and names the file:line),
+26 cases — clean frontmatter passes, an unquoted colon blocks (and names the file:line),
 the same value quoted passes, no-frontmatter passes, a non-`.md` staged file with
 YAML-shaped content is ignored, an unstaged broken file is ignored, re-staging a broken
 edit over a clean one blocks (proves it checks the staged blob, not the first `git add`),
 no staged `.md` files at all is a silent no-op, and PyYAML being unimportable (isolated
 PATH to the bare system `python3`, which has no PyYAML) degrades non-fatally.
 
-The date-gate cases pin both halves of the opt-in: one proves a plainly bad date commits
-cleanly with `OKF_DATE_GATE` unset, and the rest set it explicitly and cover the unquoted
+The date-gate cases pin both halves of the default: one proves a plainly bad date is now
+**blocked** with no env var set, one proves `OKF_DATE_GATE=0` still lets it through, one
+proves a `src/**/fixtures/*.md` file is exempt from the date gate while the parse gate still
+blocks an unquoted colon in it, and the rest set `OKF_DATE_GATE=1` explicitly and cover the unquoted
 date, the quoted date, a non-date value, a full timestamp, reversed ordering, an
 impossible date, and both fields absent. The env var passes through `git commit` into the
 hook and on into the checker, so they exercise the real path rather than calling the

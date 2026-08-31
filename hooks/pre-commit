@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# pre-commit — author-time OKF frontmatter YAML gate.
+#
+# Why this exists: a `: ` (colon-space), unquoted `#`, or an em-dash clause inside an
+# unquoted plain scalar in OKF frontmatter (typically `description:`/`title:`) breaks
+# YAML parsing with `mapping values are not allowed in this context` — and because
+# `mev validate-brain`'s --structure/--links/--graph/--state flags all load the same
+# frontmatter, one bad description fails all four simultaneously and looks like four
+# broken gates for a change unrelated to any of them. This recurred three separate
+# times on 2026-08-06 alone, across three independent agent sessions (see
+# planning/state.json carryover `okf-frontmatter-unquoted-colon-trap`) after already
+# being fixed once and re-filed as a systemic gate a day earlier
+# (core/_planning/orchestrator/state.json carryover
+# `frontmatter-colon-parse-failures-recur-fleet-wide`). This hook is that gate: catch it
+# at commit time, before it ever reaches validate-brain.
+#
+# Scope: staged .md files only, checked against their STAGED content (`git show :<path>`),
+# not the working tree — so this reflects exactly what is about to be committed, and is
+# immune to unrelated unstaged edits sitting in the same file.
+#
+# Degrades gracefully, same spirit as hooks/post-commit and hooks/pre-push:
+#   - no staged .md files                    -> exit 0, silent
+#   - python3 not on PATH                    -> exit 0, warning only
+#   - PyYAML not importable                  -> exit 0, warning only
+#   - hooks/check_frontmatter.py missing     -> exit 0, warning only
+# The checker itself never blocks a commit by failing to run — only a real YAML parse
+# error in a staged file's frontmatter does.
+#
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+staged="$(git diff --cached --name-only --diff-filter=ACM -- '*.md')"
+[ -z "$staged" ] && exit 0
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: warning: 'python3' not found on PATH — skipping frontmatter YAML gate." >&2
+  exit 0
+fi
+
+if ! python3 -c "import yaml" >/dev/null 2>&1; then
+  echo "pre-commit: warning: PyYAML not importable — skipping frontmatter YAML gate." >&2
+  exit 0
+fi
+
+checker="$repo_root/hooks/check_frontmatter.py"
+if [ ! -f "$checker" ]; then
+  echo "pre-commit: warning: $checker not found — skipping frontmatter YAML gate." >&2
+  exit 0
+fi
+
+fail=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  # Staged blob content, not the working tree — reflects exactly what will be committed.
+  if ! git show ":$f" 2>/dev/null | python3 "$checker" "$f"; then
+    fail=1
+  fi
+done <<< "$staged"
+
+if [ "$fail" -ne 0 ]; then
+  echo "" >&2
+  echo "pre-commit: BLOCKED — malformed YAML frontmatter (see above)." >&2
+  echo "pre-commit: bypass with 'git commit --no-verify' if you must." >&2
+  echo "" >&2
+  exit 1
+fi
+
+exit 0

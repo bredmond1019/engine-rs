@@ -199,10 +199,23 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
      semantics):** a task whose `validation_commands` is a non-empty array runs ONLY those commands
      on its per-task tripwire — zero `planning/harness.json` `gates:true` checks — and the end
      review's full gating suite is the backstop that still runs everything at the end.
-   - Only if `tasks.md` is also missing, or has no derivable step content, abort: report `ABORTED
+   - **`expect_red` (D68) — an INVERTED verdict, easy to get backwards.** A task may carry
+     `"expect_red": ["<command>", ...]`, and every command listed there must also appear in that
+     same task's own `validation_commands`. Each named command **passes on a NON-ZERO exit and
+     fails on exit 0** — the opposite of every other check. This is for a task whose deliverable IS
+     a test observed failing; a zero exit means the deliverable is missing, not that the task
+     succeeded. Every other check on that task's list is judged normally. If an `expect_red` entry
+     names a command that is NOT in that task's `validation_commands`, that is a hard spec error:
+     abort with `ABORTED (spec error)` — never silently ignore it, and never invert a project-wide
+     `gates:true` harness check, which `expect_red` can never reach.
+   - **The derive source follows `specSource`.** If the spec came from an authored block record
+     (`planning/blocks/<BlockID>.json`), derive `tasks.json` by decomposing its `what`, `why`,
+     `files`, `acceptance_criteria`, `testing_strategy` and `validation_commands`. Otherwise derive
+     from `tasks.md`'s step list. Either way it is a real decomposition, never a verbatim copy.
+   - Only if that source is also missing, or has no derivable content, abort: report `ABORTED
      (D16)` and tell the user to run `/generate-tasks <blockId>` to author `tasks.json`, commit,
-     then re-run. Deriving from an authored `tasks.md` is not guessing the task structure;
-     fabricating one from nothing is what D16 still refuses to do.
+     then re-run. Deriving from an authored block record or `tasks.md` is not guessing the task
+     structure; fabricating one from nothing is what D16 still refuses to do.
 3. **Execute Tasks sequentially in the worktree**:
    - For each task in the specified range (or all if not specified):
      - Run `/update-task` to flip status to `In progress` in the worklog and local files.

@@ -223,10 +223,16 @@ Bump `log.md`'s frontmatter `timestamp` to the current ISO-8601 time.
 hand-maintained prose (`## Momentum`, narrative callouts) that this session changed. Do **not**
 hand-write the focus line — Step 4c derives it. Never edit `master-plan.md` from this command.
 
-**4c — Run `mev emit-state --write`.** It walks up to find `brain.toml` itself; no `cd` needed.
-This regenerates every derived surface from the state you authored in Step 2a: leaf `state.json`
-focus fields, the brain rollup, the per-project cache doc + `synced_from` watermark, tier
-rollups, the HQ Operating Board, and `master-plan.md`'s wave tables.
+**4c — Regenerate derived surfaces.** If `$BRAIN_ROOT/scripts/sync/emit_state_write.sh` exists,
+run it instead of the bare command — some brains wrap `emit-state --write` in a script that adds
+content-loss guards and commits what it wrote **locally only** (push stays opt-in behind an env
+var only a nightly cron sets, never something this session's use triggers). This harness stays
+project-agnostic, so it only checks for the script; it never assumes one exists. Otherwise run
+`mev emit-state --write` directly — it walks up to find `brain.toml` itself; no `cd` needed —
+and let Step 4d's commit below pick up the result. This regenerates every derived surface from
+the state you authored in Step 2a: leaf `state.json` focus fields, the brain rollup, the
+per-project cache doc + `synced_from` watermark, tier rollups, the HQ Operating Board, and
+`master-plan.md`'s wave tables.
 
 Do not reimplement any of that by hand. If the run reports `W_EMIT_NO_SENTINEL` against a
 target this repo feeds, report it rather than inventing the missing sentinel pair.
