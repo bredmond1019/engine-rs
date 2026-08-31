@@ -319,6 +319,40 @@ separately, in that order, and re-run both after each fix.
   engine leaves prose that still describes it as live. Removing the link makes the gate green; it
   does not make the sentence true. Say what changed, or delete the sentence.
 
+### When the target is gone, not misspelled
+
+The dangling-edge fixes above assume the target still exists and you named it wrong — a missing
+`<scope>:` prefix, a typo, a `doc_id` that differs from the filename. `E_GRAPH_DANGLING_RELATED`
+says so when that is the case: it ends with **`did you mean <scope>:<doc_id>?`**, and taking the
+suggestion is the whole fix.
+
+**With no `did you mean` clause, the target is genuinely gone**, and there are exactly two correct
+moves. Pick by whether something replaced it:
+
+| Situation | Do this |
+|---|---|
+| A successor doc exists (superseded, renamed, split, merged) | Repoint the edge at the successor's `doc_id` — cross-repo-prefixed if it lives in another vault |
+| Nothing replaced it — the thing itself is gone | **Delete the edge**, and fix the prose that referenced it |
+
+Deleting the edge is a real answer, not a cop-out. `related:` is a structural claim that two live
+documents are connected; an edge to a document that no longer exists asserts something false, and
+keeping it costs every future `--graph` run.
+
+**Never repoint at the archived copy.** `archive` is in `brain.toml`'s `skip_dirs`, so archived docs
+are not in the corpus at all — measured 2026-08-31, the manifest holds 1,482 entries and **zero**
+under any `planning/archive/`. An edge pointing into the archive dangles exactly like the one you
+were fixing, so this move converts a resolved error back into an open one.
+
+If you cannot tell which row applies, that is a question about the *content*, not the frontmatter:
+read the deleting commit. `git log --diff-filter=D -- <path>` names it, and its message usually says
+whether the doc was superseded or dropped.
+
+**Do not leave it dangling because it is not your file.** A `related:` error is corpus-wide, so
+whoever runs `--graph` next inherits it, and they have less context than you do. If the fix genuinely
+belongs to another lane — the file is mid-write, or the successor is theirs to name — say so
+explicitly where it will be seen (a `carryover[]` entry, or a message to that lane), rather than
+leaving a red gate with no owner.
+
 ---
 
 ## Before you commit
@@ -333,6 +367,8 @@ separately, in that order, and re-run both after each fix.
 - [ ] If `created` / `updated` are present, they are `YYYY-MM-DD` and `updated` reflects *this* edit
 - [ ] Controlled fields (`layer` / `project` / `status`) use real vocabulary values — check the schema doc
 - [ ] Cross-scope `related:` targets carry a `<scope>:` prefix
+- [ ] Any dangling edge whose target is *gone* was repointed at a successor or deleted — never
+      repointed into `planning/archive/`, which is outside the corpus
 - [ ] A row exists in the directory's `index.md`
 - [ ] No relative markdown link climbs **out of** `planning/` — bare backticked path instead
 - [ ] `--structure`, `--graph` and `--links` all run clean
