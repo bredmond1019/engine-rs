@@ -491,7 +491,18 @@ pub fn register_sdlc_task_with_registry(
                         ),
                 ));
             }
-            let seeded = seed_resolved_policy(&policy)?;
+            // Seed the PROJECTED `SdlcPolicy` (via `.to_sdlc_policy()`), not
+            // the raw `SdlcTaskPolicy` — `SdlcTaskPolicy` deliberately omits
+            // `model_tiers.implement_simple` (SDLC_TASK has no such tier),
+            // but `LoadTaskStateNode`'s strict `resolved_policy()` read
+            // requires the shared `SdlcPolicy` shape, which does carry it.
+            // `SetupWorktreeNode::process`'s idempotency guard skips its
+            // own (correctly-projecting) resolver whenever a policy is
+            // already seeded, so an unprojected seed here would survive
+            // untouched into that strict deserialize and fail on every
+            // dispatch — see
+            // `EN.ticket.sdlc-task-resolved-policy-writer-reader-mismatch`.
+            let seeded = seed_resolved_policy(&policy.to_sdlc_policy())?;
             Workflow::new_validated(registry, engine_core::workflows::sdlc_task::graph::schema())
                 .map(|workflow| workflow.with_seeded_nodes(seeded))
                 .map_err(|err| err.to_string())
@@ -1785,6 +1796,110 @@ mod tests {
                 || ctx.node_runs["SpecExistsRouterNode"].status
                     == engine_contract::NodeRunStatus::Pending,
             "the walk must have halted before the next node ran"
+        );
+    }
+
+    /// `EN.ticket.sdlc-task-resolved-policy-writer-reader-mismatch` task 1 —
+    /// the reproduction. Before the fix, `register_sdlc_task_with_registry`
+    /// seeded the raw, unprojected `SdlcTaskPolicy` (no
+    /// `model_tiers.implement_simple`) directly into
+    /// `ctx.nodes[RESOLVED_POLICY_IDENTITY]`; `SetupWorktreeNode`'s
+    /// idempotency guard then skipped its own correctly-projecting
+    /// resolver because a policy was already seeded, so the bad seed
+    /// survived untouched into `LoadTaskStateNode`'s strict `SdlcPolicy`
+    /// deserialize and failed every served SDLC_TASK dispatch with
+    /// `missing field \`implement_simple\``. This drives a real dispatch
+    /// through `register_sdlc_task_with_registry` (the served path — the
+    /// hermetic `sdlc_task_e2e.rs` suite never exercises this factory) far
+    /// enough to run `LoadTaskStateNode` against a minimal fixture spec,
+    /// and asserts that node succeeded.
+    #[tokio::test]
+    async fn sdlc_task_served_dispatch_loads_task_state_without_policy_deserialize_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(alpha.join("planning").join("my-spec"))
+            .expect("mkdir alpha/planning/my-spec");
+        std::fs::write(
+            alpha.join("planning").join("my-spec").join("tasks.json"),
+            serde_json::json!([
+                {
+                    "task_id": 1,
+                    "title": "Do a thing",
+                    "description": "Do the work",
+                    "acceptance_criteria": ["it works"],
+                    "max_attempts": 2,
+                }
+            ])
+            .to_string(),
+        )
+        .expect("write tasks.json");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&alpha)
+                .status()
+                .unwrap_or_else(|err| panic!("git {args:?} should spawn: {err}"));
+            assert!(status.success(), "git {args:?} must succeed for this test");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(alpha.join("README.md"), "fixture\n").expect("write README");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        run_git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n",
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_task_with_registry(&mut dispatcher, Some(registry));
+
+        let event = serde_json::json!({ "spec_slug": "my-spec", "repo": "alpha" });
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_TASK", &event)
+            .expect("SDLC_TASK should dispatch to a runnable Workflow");
+
+        let token = engine_core::CancellationToken::new();
+        let cancel_token = token.clone();
+        let on_progress: engine_core::OnProgress<'_> = Box::new(move |ctx| {
+            // `node_runs` gets a `Pending` entry the moment a node is about
+            // to run, before it actually runs — cancel only once
+            // `LoadTaskStateNode` has reached a terminal status, not merely
+            // on first appearance in the map.
+            if ctx
+                .node_runs
+                .get("LoadTaskStateNode")
+                .is_some_and(|run| run.status != engine_contract::NodeRunStatus::Pending)
+            {
+                cancel_token.cancel();
+            }
+        });
+        let options = engine_core::RunOptions {
+            cancellation_token: Some(token),
+            budget: None,
+            pause_signal: None,
+            run_id: None,
+        };
+
+        let ctx = workflow.run_with(event, on_progress, options).await.expect(
+            "run should not error at the harness level — a node failure halts via status, not Err",
+        );
+
+        let load_task_state_run = ctx
+            .node_runs
+            .get("LoadTaskStateNode")
+            .expect("LoadTaskStateNode should have run before cancellation");
+        assert_eq!(
+            load_task_state_run.status,
+            engine_contract::NodeRunStatus::Success,
+            "LoadTaskStateNode must deserialize the served-dispatch-seeded ResolvedPolicy \
+             successfully (error: {:?})",
+            load_task_state_run.error
         );
     }
 

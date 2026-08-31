@@ -362,6 +362,28 @@ mod tests {
         );
     }
 
+    /// `EN.ticket.sdlc-task-resolved-policy-writer-reader-mismatch` task 1
+    /// — the round-trip the AC demands: stamp a `SdlcTaskPolicy` the way a
+    /// served-dispatch factory now seeds `ResolvedPolicy` (projected
+    /// through `.to_sdlc_policy()` first, matching
+    /// `engine-serve/src/workflows.rs`'s `register_sdlc_task_with_registry`
+    /// and `SetupWorktreeNode`'s own resolver), then deserialize that JSON
+    /// as `SdlcPolicy` — the exact type `LoadTaskStateNode`'s
+    /// `resolved_policy()` reads (`sdlc_flow::task_loop::resolved_policy`).
+    /// Fails if either side's shape drifts again: a writer that reverts to
+    /// seeding the raw, unprojected `SdlcTaskPolicy` would fail this
+    /// deserialize on the missing `implement_simple` field, exactly as it
+    /// did in production before this fix.
+    #[test]
+    fn sdlc_task_policy_round_trips_through_projected_json_as_sdlc_policy() {
+        let policy = SdlcTaskPolicy::default();
+        let value = serde_json::to_value(policy.to_sdlc_policy())
+            .expect("projected SdlcTaskPolicy should serialize");
+        let reloaded: SdlcPolicy = serde_json::from_value(value)
+            .expect("projected SdlcTaskPolicy JSON must deserialize as SdlcPolicy");
+        assert_eq!(reloaded, policy.to_sdlc_policy());
+    }
+
     #[test]
     fn builtin_default_matches_pre_en_11_o_baseline() {
         let policy = SdlcTaskPolicy::default();
