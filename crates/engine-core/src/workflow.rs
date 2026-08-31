@@ -1118,6 +1118,35 @@ mod tests {
         stamped_run_telemetry(&ctx);
     }
 
+    /// Guards the documentation on `stamp_run_telemetry` (above) and on
+    /// `RunTelemetryInputs` (`policy/telemetry.rs`), not the behaviour: those
+    /// comments say the four counters are structurally zero on every path,
+    /// even a fully successful run, because `stamp_run_telemetry` is
+    /// graph-agnostic and has no access to workflow-specific attempt/retry/
+    /// pass/fail bookkeeping. If a future change starts populating any of
+    /// these four here, this test fails on purpose — that is the point: it
+    /// forces the doc comments (and `docs/architecture.md`'s readback
+    /// description) to be revisited rather than silently going stale. Do NOT
+    /// delete this as a tautology; zero is not asserted because it is
+    /// desirable, but because it is presently true and must stay documented
+    /// if it stops being true.
+    #[tokio::test]
+    async fn stamp_run_telemetry_counters_stay_structurally_zero_on_a_successful_run() {
+        let workflow = two_node_workflow();
+        let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let ctx = workflow
+            .run(serde_json::json!({}), on_progress)
+            .await
+            .expect("run should succeed");
+
+        let telemetry = stamped_run_telemetry(&ctx);
+        assert_eq!(telemetry.total_attempts, 0);
+        assert_eq!(telemetry.total_retries, 0);
+        assert_eq!(telemetry.tasks_passed, 0);
+        assert_eq!(telemetry.tasks_failed, 0);
+    }
+
     #[tokio::test]
     async fn cancelled_run_still_stamps_run_telemetry_alongside_the_cancelled_marker() {
         let workflow = two_node_workflow();
