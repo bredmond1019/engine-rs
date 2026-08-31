@@ -379,6 +379,56 @@ fn failed_node_reason(ctx: &TaskContext) -> Option<String> {
     })
 }
 
+/// Tears down the worktree + branch `SetupWorktreeNode` stamped into `ctx`
+/// (`EN.ticket.failed-run-leaves-worktree-and-branch-behind`), IF AND ONLY
+/// IF `LoadTaskStateNode` never completed successfully for this run.
+///
+/// **THE RULE**: a run that fails before `LoadTaskStateNode` succeeds has
+/// established no real task-level state, so its worktree + branch are pure
+/// leak — remove them (jynx's exact scenario: a crash inside/around
+/// `LoadTaskStateNode` itself, nothing downstream ever ran). A run that
+/// fails AFTER `LoadTaskStateNode` succeeds may carry real progress worth
+/// resuming (a loaded `SDLCState`, possibly already-committed tasks), and
+/// `resume: true` / this chain's own `retry_task` field reattach to exactly
+/// this worktree and branch (see `SetupWorktreeNode`'s reattach doc,
+/// `setup.rs` ~line 376) — tearing them down there would make resume
+/// impossible, so this function is a deliberate no-op in that case.
+///
+/// Also a no-op when `SetupWorktreeNode` never ran at all (nothing was
+/// created to tear down) or when it ran but stamped no
+/// `worktree_path`/`branch_name` (a malformed/synthetic snapshot).
+///
+/// Callers are expected to gate this on "the run actually failed" — it does
+/// not itself inspect `failure_reason`, only `ctx`'s own node-run record.
+fn teardown_worktree_on_setup_phase_failure(
+    ctx: &TaskContext,
+    runner: &engine_core::workflows::CommandRunner,
+) {
+    let task_state_established = matches!(
+        ctx.node_runs
+            .get("LoadTaskStateNode")
+            .map(|run| &run.status),
+        Some(NodeRunStatus::Success)
+    );
+    if task_state_established {
+        return;
+    }
+
+    let Some(setup_result) = ctx.nodes.get("SetupWorktreeNode") else {
+        return;
+    };
+    let worktree_path = setup_result.get("worktree_path").and_then(|v| v.as_str());
+    let branch = setup_result.get("branch_name").and_then(|v| v.as_str());
+    if let (Some(worktree_path), Some(branch)) = (worktree_path, branch) {
+        engine_core::workflows::sdlc_flow::setup::remove_worktree_and_branch(
+            runner,
+            worktree_path,
+            branch,
+            std::path::Path::new("."),
+        );
+    }
+}
+
 /// Runs `spawned.workflow` to completion (or suspension) on
 /// `actix_web::rt::spawn`, then forks the exit path on
 /// `engine_core::suspend::is_suspended(&final_ctx.metadata)`:
@@ -603,6 +653,32 @@ pub(crate) fn spawn_run(spawned: SpawnedRun) {
                     state_filename,
                 );
             }
+
+            // EN.ticket.failed-run-leaves-worktree-and-branch-behind: tear
+            // down the worktree + branch `SetupWorktreeNode` created for
+            // this run, but ONLY when the run failed before establishing
+            // any real task-level state.
+            //
+            // THE RULE (interfaces criterion #1): tear down if and only if
+            // `LoadTaskStateNode` never completed successfully for this
+            // run. A run that fails AFTER that point may carry real
+            // progress worth resuming — a loaded `SDLCState`, possibly
+            // already-committed tasks — and `resume: true` / this chain's
+            // own `retry_task` field reattach to exactly this worktree and
+            // branch (see `SetupWorktreeNode`'s reattach doc, `setup.rs`
+            // ~line 376); tearing them down there would make resume
+            // impossible. jynx's own failure (a crash inside/around
+            // `LoadTaskStateNode` itself, with no task list ever loaded) is
+            // the case this DOES tear down: nothing downstream of it ever
+            // ran, so nothing is lost by removing them.
+            //
+            // This is separate from `write_terminal_blocked_state` above
+            // deliberately: that write is unconditional on any failure, this
+            // teardown is conditional on which node failed.
+            if failure_reason.is_some() {
+                let runner = engine_core::workflows::default_command_runner();
+                teardown_worktree_on_setup_phase_failure(&final_ctx, &runner);
+            }
         }
 
         if suspended {
@@ -736,6 +812,122 @@ mod tests {
             metadata,
             node_runs: StdHashMap::new(),
         }
+    }
+
+    // -- teardown_worktree_on_setup_phase_failure (EN.ticket.failed-run-
+    // leaves-worktree-and-branch-behind, task 1) -------------------------
+
+    /// A recording stub `CommandRunner`: pushes every invocation's argv onto
+    /// a shared `Vec` and always reports success, mirroring `setup.rs`'s own
+    /// `recording_git_runner`-style test doubles so the two crates' tests
+    /// read the same way.
+    fn recording_runner() -> (
+        engine_core::workflows::CommandRunner,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) {
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: engine_core::workflows::CommandRunner =
+            std::sync::Arc::new(move |_program, args, _cwd| {
+                calls_clone
+                    .lock()
+                    .unwrap()
+                    .push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(engine_core::workflows::CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+        (runner, calls)
+    }
+
+    fn ctx_with_setup_result(worktree_path: &str, branch: &str) -> TaskContext {
+        let mut ctx = context_with_metadata(serde_json::json!({}));
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            serde_json::json!({
+                "worktree_path": worktree_path,
+                "branch_name": branch,
+            }),
+        );
+        ctx
+    }
+
+    /// AC 1: `SetupWorktreeNode` succeeded, `LoadTaskStateNode` never
+    /// succeeded (jynx's exact scenario) -> the worktree and its branch are
+    /// removed.
+    #[test]
+    fn tears_down_when_load_task_state_never_succeeded() {
+        let ctx = ctx_with_setup_result("trees/task/JX.4.A", "task/JX.4.A");
+        let (runner, calls) = recording_runner();
+
+        teardown_worktree_on_setup_phase_failure(&ctx, &runner);
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "expected worktree remove + branch delete, got: {recorded:?}"
+        );
+        assert_eq!(
+            recorded[0],
+            vec![
+                "worktree".to_string(),
+                "remove".to_string(),
+                "--force".to_string(),
+                "trees/task/JX.4.A".to_string(),
+            ]
+        );
+        assert_eq!(
+            recorded[1],
+            vec![
+                "branch".to_string(),
+                "-D".to_string(),
+                "task/JX.4.A".to_string()
+            ]
+        );
+    }
+
+    /// AC 2 (the resume-safety case): `SetupWorktreeNode` succeeded,
+    /// `LoadTaskStateNode` DID succeed -> no teardown call fires, so a later
+    /// `resume: true` / `retry_task` dispatch still has a worktree and
+    /// branch to reattach to.
+    #[test]
+    fn preserves_worktree_when_load_task_state_succeeded() {
+        let mut ctx = ctx_with_setup_result("trees/task/JX.4.A", "task/JX.4.A");
+        ctx.node_runs.insert(
+            "LoadTaskStateNode".to_string(),
+            engine_contract::NodeRun {
+                status: NodeRunStatus::Success,
+                started_at: None,
+                completed_at: None,
+                error: None,
+                input: None,
+                usage: None,
+            },
+        );
+        let (runner, calls) = recording_runner();
+
+        teardown_worktree_on_setup_phase_failure(&ctx, &runner);
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no teardown call should fire once LoadTaskStateNode succeeded"
+        );
+    }
+
+    /// A no-op, not a panic, when `SetupWorktreeNode` never ran at all --
+    /// e.g. a run that failed even earlier, before setup.
+    #[test]
+    fn no_teardown_when_setup_worktree_node_never_ran() {
+        let ctx = context_with_metadata(serde_json::json!({}));
+        let (runner, calls) = recording_runner();
+
+        teardown_worktree_on_setup_phase_failure(&ctx, &runner);
+
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]

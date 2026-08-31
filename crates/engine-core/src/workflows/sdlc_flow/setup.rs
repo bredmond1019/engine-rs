@@ -213,6 +213,33 @@ fn spec_dir(ctx: &TaskContext, spec_slug: &str) -> PathBuf {
 pub type PolicyResolverFn =
     dyn Fn(&TaskContext, &Path) -> Result<SdlcPolicy, NodeError> + Send + Sync;
 
+/// Best-effort teardown of a worktree and its branch: `git worktree remove
+/// --force` followed by `git branch -D`, in that order. Both calls run
+/// unconditionally — neither call's own outcome is surfaced or changes the
+/// other's — because every caller uses this as best-effort cleanup
+/// alongside a failure it is already reporting through some other channel
+/// (a returned [`NodeError`], or a run's own `failure_reason`), and a
+/// failing cleanup step must never mask or alter that failure.
+///
+/// Extracted from [`SetupWorktreeNode`]'s own immediate self-failure cleanup
+/// (below, where `git worktree add` itself fails) so `engine-serve`'s
+/// post-run teardown (`EN.ticket.failed-run-leaves-worktree-and-branch-
+/// behind`) can reuse the exact same git invocations — same args, same
+/// order — rather than duplicating them at a second call site.
+pub fn remove_worktree_and_branch(
+    runner: &CommandRunner,
+    worktree_path: &str,
+    branch: &str,
+    git_cwd: &Path,
+) {
+    let _ = runner(
+        "git",
+        &["worktree", "remove", "--force", worktree_path],
+        git_cwd,
+    );
+    let _ = runner("git", &["branch", "-D", branch], git_cwd);
+}
+
 pub struct SetupWorktreeNode {
     runner: CommandRunner,
     registry: Option<Arc<RepoRegistry>>,
@@ -419,12 +446,7 @@ impl Node for SetupWorktreeNode {
                     // why the operator resorted to hand-deleting branches.
                     // Deleting the branch too makes a retry of a failed
                     // setup start from a clean slate.
-                    let _ = (self.runner)(
-                        "git",
-                        &["worktree", "remove", "--force", &worktree_path],
-                        &git_cwd,
-                    );
-                    let _ = (self.runner)("git", &["branch", "-D", &branch], &git_cwd);
+                    remove_worktree_and_branch(&self.runner, &worktree_path, &branch, &git_cwd);
                     return Err(NodeError::new(format!(
                         "git worktree add failed (status {}): {}",
                         output.status, output.stderr
