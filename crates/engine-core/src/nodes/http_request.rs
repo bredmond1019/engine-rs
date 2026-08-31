@@ -260,4 +260,78 @@ mod tests {
     fn default_constructs_without_panicking() {
         let _node = HttpRequestNode::default();
     }
+
+    // -- Task 2: error paths (non-2xx and transport failure) ----------------
+    //
+    // `ReqwestHttpPost::post_with_headers` already turns a non-2xx response
+    // into an `Err(format!("HTTP POST endpoint returned HTTP {status}"))`
+    // and a transport-level failure into an `Err(format!("HTTP POST request
+    // failed: {err}"))` (see `http_post.rs`). Both shapes reach
+    // `HttpRequestNode::process` through the same `Result<_, String>` the
+    // injectable `HttpPost` seam returns, so these tests configure
+    // `StubHttpPost::failing` with each message shape and pin that
+    // `process` surfaces a `NodeError` naming it — never a panic, never a
+    // silently-stored "success".
+
+    #[tokio::test]
+    async fn process_surfaces_a_non_2xx_response_as_a_node_error_naming_the_status() {
+        let stub =
+            StubHttpPost::failing("HTTP POST endpoint returned HTTP 500 Internal Server Error");
+        let node = HttpRequestNode::new()
+            .with_http_post(std::sync::Arc::new(stub))
+            .with_url("http://mini:8010/api/jobs/watch-run")
+            .with_body(json!({"trigger": "nightly"}));
+
+        let err = node
+            .process(empty_ctx())
+            .await
+            .expect_err("a non-2xx response must fail the node, not succeed");
+
+        assert!(
+            err.message.contains("500"),
+            "NodeError message should name the failing status, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn process_surfaces_a_transport_failure_as_a_node_error_without_panicking() {
+        let stub = StubHttpPost::failing("HTTP POST request failed: connection refused");
+        let node = HttpRequestNode::new()
+            .with_http_post(std::sync::Arc::new(stub))
+            .with_url("http://mini:8010/api/jobs/watch-run");
+
+        // No panic: a plain `expect_err` on the returned `Result` is enough
+        // proof `process` returned normally (a panic would abort the test
+        // task instead of reaching this assertion).
+        let err = node
+            .process(empty_ctx())
+            .await
+            .expect_err("a transport failure must fail the node, not panic");
+
+        assert!(
+            err.message.contains("connection refused"),
+            "NodeError message should carry the transport failure detail, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_does_not_store_a_result_under_the_node_identity() {
+        let stub =
+            StubHttpPost::failing("HTTP POST endpoint returned HTTP 500 Internal Server Error");
+        let node = HttpRequestNode::new()
+            .with_http_post(std::sync::Arc::new(stub))
+            .with_url("http://mini:8010/api/jobs/watch-run");
+
+        // process() itself never returns a TaskContext on the error path, so
+        // there is no way for a caller to observe a stored `{status, body}`
+        // for a failed call — pin that contract by construction rather than
+        // inspecting a ctx that was never produced.
+        let err = node
+            .process(empty_ctx())
+            .await
+            .expect_err("a failed request must not be treated as success");
+        assert!(!err.message.is_empty());
+    }
 }
