@@ -4562,6 +4562,64 @@ mod tests {
         assert!(!p.contains("stateWritten"));
     }
 
+    /// The triage counterpart of `review_schema_carries_localized_without_
+    /// requiring_it` and `flagged_and_created_output_fields_exist_for_the_
+    /// instructions_naming_them`. The prompt asks for three judgements; the
+    /// schema has to give them somewhere to land, and has to keep them
+    /// OPTIONAL so the port stays behavior-stable.
+    #[test]
+    fn triage_schema_carries_the_evidence_fields_without_requiring_them() {
+        let schema = triage_output_schema();
+        for field in ["evidence", "base_state_checked", "same_failure_as_before"] {
+            assert!(
+                !schema["properties"][field].is_null(),
+                "the prompt asks for {field}; the schema must carry it"
+            );
+        }
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            required,
+            vec!["verdict", "reason"],
+            "the three added fields must stay optional — a model that omits them still parses"
+        );
+    }
+
+    /// The behavior-stability claim the whole port rests on, exercised rather
+    /// than asserted: a model reply carrying only the ORIGINAL two fields must
+    /// still parse, and must stamp the added fields at their conservative
+    /// defaults. Before `#[serde(default)]` this reply would have been a
+    /// `NodeError` and every pre-port run would have started failing.
+    #[tokio::test]
+    async fn triage_output_omitting_the_added_fields_still_parses() {
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.max_attempts = 3;
+        task.attempt_count = 0;
+        let ctx = triage_ctx_with_failure(&task, "error[E0308]: mismatched types");
+
+        // Only `verdict` + `reason` — a pre-port model reply.
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let outcome =
+                canned_outcome(json!({ "verdict": "RETRYABLE", "reason": "flaky" }).to_string());
+            Box::pin(async move { Ok(outcome) })
+        });
+        let node = TriageTaskNode::new().with_transport(transport);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("an omitting reply must still parse");
+
+        let result = &out.nodes["TriageTaskNode"];
+        assert_eq!(result["verdict"], "RETRYABLE");
+        assert_eq!(result["evidence"], "");
+        assert_eq!(result["base_state_checked"], false);
+        assert_eq!(result["same_failure_as_before"], false);
+    }
+
     /// Records the prompt handed to the transport and answers with a valid
     /// [`TriageOutput`]. (`prompt_recording_transport` answers with an
     /// `ImplementOutput`, which `TriageTaskNode` cannot parse.)

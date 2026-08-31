@@ -157,6 +157,17 @@ reused `sdlc_flow` nodes already read (`OutputVerbosity`, `TestDepth`, `RetryFee
 `TransportRetry`) are imported straight from `sdlc_flow::policy`, and `ModelTier`/`LocalConfig`
 from `crate::policy::tier`, so the two engines can never drift on what these types mean.
 
+### Stage prompts
+
+`SDLC_TASK` reuses `ImplementTaskNode` and `TriageTaskNode` from `sdlc_flow` **unmodified**, so it
+inherits their ported stage preambles — `PATH_DISCIPLINE_PREAMBLE` + `IMPLEMENT_STANDARDS_PREAMBLE`
+and `TRIAGE_STABLE_PROMPT` respectively. See
+[Stage prompts: what the model is actually told](sdlc-flow.md#stage-prompts-what-the-model-is-actually-told)
+for what each one says and what was deliberately left in Rust rather than prose.
+
+`REVIEW_STABLE_PROMPT` and `DOCS_STABLE_PROMPT` do **not** apply here: this workflow ships no review
+stage and no docs stage, so neither node is registered in its graph.
+
 ### Knob table
 
 | Field | Built-in default | Node that reads it (via the projection below) |
