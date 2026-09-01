@@ -287,7 +287,12 @@ Record non-blocking gaps for the handoff note (Step 4).
 
 ### Step 3 — Patch documentation
 
-Invoke the `/update-docs --patch` skill. Wait for it to complete.
+Invoke the `/update-docs --patch` skill. Wait for it to complete. This run's check 5 sweeps
+`planning/context.md` (or the project's orientation-router equivalent) for staleness against what
+this session actually changed — a new decision, a new `docs/` page, a structural change — and
+patches it surgically when it drifts; nothing else in the harness keeps that file current, so this
+is the one reliable place it gets fixed. If `/update-docs` reports it `NEEDS_REVIEW` (a genuine
+rewrite, not a surgical patch), route it through Step 3b's size table below like any other doc.
 
 #### 3b — Bring every doc you touched up to the current standard
 

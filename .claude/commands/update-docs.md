@@ -51,6 +51,7 @@ what the docs claim.
 | Harness schema | `.claude/workflows/harness.schema.json` | Fields, types, new keys |
 | Scaffold | `scaffold/planning/harness.json`, `scaffold/planning/harness.examples.md` | Profiles match docs |
 | Decisions | `planning/decisions/` (list files, read titles) | New ADRs not reflected in docs |
+| Orientation router | `planning/context.md` (or the project's equivalent — see below) | The Document Set table, "two halves"/structure summary, and Fast Facts still match what's actually on disk |
 
 ### Phase 3 — Documentation inventory
 
@@ -93,7 +94,29 @@ the authority, not a 5–10 line summary that will drift out of sync with the do
 Flag any `index.md` row longer than ~2 lines and propose cutting it, grouping rows into task-
 oriented sections instead of a flat alphabetical list.
 
-**5. Links that 404 publicly.** Any relative link into a path this repo's `.gitignore` excludes
+**5. `context.md` (or the project's orientation-router equivalent) is stale.** This file is the one
+doc every other command (`/prime`, `/close-out`, `/session-recap`, a fresh agent orienting itself)
+is told to read first, and — unlike `status.md` — **nothing regenerates it automatically**. Check
+it directly against source truth:
+- Its Document Set / file-role table names files that still exist, and is missing none that now
+  exist (a new `docs/` tree, a renamed `planning/` file).
+- Its "two halves" / structural summary (harness vs. scaffold vs. template-meta, or the project's
+  equivalent split) still matches the actual repo layout.
+- Its Fast Facts read as evergreen claims, not a dated snapshot that has since gone false (e.g. "17
+  commands" when there are now 30, or a "Stable, nothing active" line sitting next to a `status.md`
+  full of in-progress work — point that kind of fact at `status.md` instead of asserting a number
+  here).
+- **If it carries a condensed Governing Principles / standing-rules list, diff its count and
+  content against the numbered standing rules in the project's `CLAUDE.md`.** A partial list is
+  the most common way this file goes stale silently: `CLAUDE.md` grows a new numbered rule (a real
+  incident usually prompts it) and the condensed copy in `context.md` is never told. Missing rules
+  read as "fine" because nothing else fails — no gate catches a doc that is merely incomplete.
+
+This is a known gap class: `context.md` is read constantly and written by nothing, so it drifts
+silently and every command that trusts it inherits the staleness. Report it as STALE (not NO-DOC)
+when found, and prefer surgical fixes here over a rewrite — see Part A below.
+
+**6. Links that 404 publicly.** Any relative link into a path this repo's `.gitignore` excludes
 (a vaulted `planning/` symlink, a local-only cache dir) passes local validation but is dead on
 GitHub. Cross-check every link target against `.gitignore` — if the target is excluded, replace the
 link with a bare backticked path, per `write-okf-markdown`'s "linking out of `planning/`" section
@@ -203,7 +226,10 @@ a small gap — it's for when the catalogue problem is structural, not a missing
   docs from scratch. Never rewrite a STALE section beyond the identified fix.
 - **Architecture-level changes → flag, don't edit.** Cross-cutting changes to existing docs
   go to `NEEDS_REVIEW`. Creating new architecture docs is fine.
-- **Do not touch** `planning/` files, `log.md`, `status.md`, or `CLAUDE.md`.
+- **Do not touch** `planning/` files, `log.md`, `status.md`, or `CLAUDE.md` — **except
+  `planning/context.md`** (or the project's equivalent orientation router, per check 5 above),
+  which this command may patch surgically the same way it patches any other STALE doc. It is
+  the one `planning/` file this exclusion does not cover, because nothing else keeps it current.
 
 ### Non-negotiables
 

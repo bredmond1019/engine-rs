@@ -1,5 +1,5 @@
 {
-  "version": "12333d905a94302e04079c564c2da092c355176d",
+  "version": "f9c45547a1634f97189efa85a9efcc8c9c246e12",
   "generated": "2026-08-31",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -25,7 +25,7 @@
     ".claude/commands/generate-master-plan.md": "28c96669f9601840d94f9d4943e0b0837cbee46f82cad57592f0c25a1240b0e7",
     ".claude/commands/define-design-system.md": "d06d842a0ff4e00f0ef3462f31033c43db21c3de940a0b228173c028bf372ba7",
     ".claude/commands/orchestration-commander.md": "4d306e06f42b378e19c2d2ad3a546b7ebca2f18c7c0cbbea09697a10cf609daa",
-    ".claude/commands/update-docs.md": "f5160d6aec7834ca0fc2460caf56734ac60ed15d6c5f0950b7ca56a79293f5bc",
+    ".claude/commands/update-docs.md": "7059f2be76a1983ac3e50a4b60faa1e06d2a172d9f0810930dd1c136542f8de7",
     ".claude/commands/generate-tasks.md": "5e1fee0662887a819c6194a8986d906deb13ece10532cd8ac428e74eaffd9a3f",
     ".claude/commands/breakdown.md": "d26fc0ee89ee385bfba9c008b1b3f991684ea47084793809757162d53b73eae6",
     ".claude/commands/README.md": "a674c694d7594e8ae489d0764dde3a0feab4e9b17c78f2ae0da64d559424b326",
@@ -42,7 +42,7 @@
     ".claude/commands/roadmap-status.md": "cafbf6908cc52cb2e996896efea69afbedf7281f702b14b25b0833565b1671d5",
     ".claude/commands/prime.md": "6635e8c48638d5720ea270666460e536eb87d49b4785518080e8040628785f73",
     ".claude/commands/plan.md": "0c49e3b6bad706d35891a18594a844fb74c0da693e241fa636008c30638d7763",
-    ".claude/commands/close-out.md": "dce9a6539eef9922fdb75ca37bb4b025ca43d40bfdfce78713ffc1d28890c345",
+    ".claude/commands/close-out.md": "346c5c9161be1497d5e8ca69baf7abdaa018ce82f70f0442b4959badc595d2fc",
     ".claude/commands/commit.md": "fb9c00d28a9db7f05e731d31aad40fb43e8327c9d6fe9a30a374fd41afa8f9bb",
     ".claude/commands/orchestrate.md": "39c4eb528f62ef1fbebe45186f7273cb2f8b6e76d11f5e7d5d54e181578b112d",
     ".claude/commands/test_auth_gate.md": "4c38bfdfd6172f001ead3912bfab139ccde1e7d4eee65053e890c93eb5df391c",
