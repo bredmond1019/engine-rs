@@ -1,5 +1,5 @@
 {
-  "version": "2a3ba35a1e07c8abc4ae231ac9bd5131fd51c384",
+  "version": "a584c273194812244877ad4d4cb1dbe9f8ce78d6",
   "generated": "2026-09-01",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -59,7 +59,7 @@
     ".claude/workflows/lane.schema.json": "5dc6dca4c5f990671a2c33263578ab0cdfa8fbb837cba67212d1ab44de8c1864",
     ".claude/workflows/lease.schema.json": "e77d2e42f37e2164f03e24ca6ab565248080587546f26c3e9bf06ca18a6607a2",
     ".claude/workflows/message.schema.json": "535db36bc8d3aaac301020f565f8dda4184a0b34d92c63001f9b74be39fc7512",
-    ".claude/workflows/block-registration.md": "f833d6f13c5be896fb020d36845c3df1798611dda419451bc4386faa6b8afdae",
+    ".claude/workflows/block-registration.md": "49a528b362dc5a3e96ae540b70705c49a2d1b3cff796fe9f17cca1e658b4b083",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
     ".claude/workflows/prompts/shared.js": "b4b3ac3a4a52d50326ebaa955e3e97e1862d67f05e5310815a6d397846e62901",
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
@@ -76,7 +76,7 @@
     ".claude/skills/check-blast-radius/SKILL.md": "965d95bf22484132b4c35a362461edba87bd7ed43590e0b3b24e56e301a8bf1c",
     ".claude/skills/pick-the-next-block/SKILL.md": "ad953b99f80a4c9648a95b2904e95a067fc4c4943d291538194b42a01082b358",
     ".claude/skills/stamp-workflow-run-id/SKILL.md": "53de128ade77ba3e200ddcfe94a07e3cb601feff838b73369d49f45f8258ec0b",
-    "scripts/check_block_records.py": "78e305f58442d8e928c1e05aae031fd8ef84873461c725f3ecda98ff6d1a30e5",
+    "scripts/check_block_records.py": "cfeff56da1a9410cd0b246e153d80f1236d9aac4cf3b5250d2ec300f6043e560",
     ".agents/skills/sdlc-task/SKILL.md": "9f526f815472123a098c42ca6f795a5962d0312ac22480148947774d379d045a",
     ".agents/skills/sdlc-flow/SKILL.md": "98e852d6842f431743bf20c857f83452609da25f407f3449673fa2e9510d27f9",
     ".agents/skills/write-okf-markdown/SKILL.md": "ebe8c47dbbd7a436486b7db452228f560af1a6e65b1ba50a0274313fb1bbd5da",
