@@ -44,7 +44,8 @@ use crate::node::{Node, NodeError};
 
 use super::policy::TestDepth;
 use super::task_loop::{
-    resolved_policy, select_task_checks, worktree_path, CheckResult, TestTaskNode,
+    resolve_harness_path, resolved_policy, select_task_checks, worktree_path, CheckResult,
+    TestTaskNode,
 };
 use super::{put_result, CommandRunner};
 
@@ -217,7 +218,7 @@ impl Node for FinalValidationNode {
         let worktree = worktree_path(&ctx)?;
         let worktree = Path::new(&worktree);
 
-        let harness_path = worktree.join("planning").join("harness.json");
+        let harness_path = resolve_harness_path(&ctx, worktree);
         let harness_checks: Vec<serde_json::Value> = if harness_path.exists() {
             let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", harness_path.display()))
@@ -333,6 +334,25 @@ mod tests {
         ctx
     }
 
+    /// Same as [`ctx_with_worktree`] but stamps `spec_slug` on the inbound
+    /// event, as a real `SDLC_FLOW` dispatch would — required to exercise
+    /// [`resolve_harness_path`]'s per-spec override branch.
+    fn ctx_with_worktree_and_spec_slug(worktree: &std::path::Path, spec_slug: &str) -> TaskContext {
+        let mut ctx = ctx_with_worktree(worktree);
+        ctx.event = json!({ "spec_slug": spec_slug });
+        ctx
+    }
+
+    fn write_per_spec_harness(dir: &std::path::Path, spec_slug: &str, checks: serde_json::Value) {
+        let spec_dir = dir.join("planning").join(spec_slug);
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(
+            spec_dir.join("harness.json"),
+            serde_json::to_string(&json!({ "validation": { "checks": checks } })).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// Seed a resolved [`super::super::policy::SdlcPolicy`] into `ctx`, as
     /// `SetupWorktreeNode`/dispatch would — required for
     /// [`ValidationScope::Reconcile`], which reads `resolved_policy` to
@@ -440,6 +460,41 @@ mod tests {
             .map(|c| c["name"].as_str().unwrap())
             .collect();
         assert!(check_names.contains(&"build"));
+    }
+
+    #[tokio::test]
+    async fn runs_checks_from_per_spec_harness_not_repo_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        // The repo harness declares a DIFFERENT check name than the
+        // per-spec override — a resolver wired correctly must run only the
+        // override's checks.
+        write_harness(dir.path());
+        write_per_spec_harness(
+            dir.path(),
+            "my-spec",
+            json!([{ "name": "per_spec_only_check", "command": "exit 0", "gates": true }]),
+        );
+        let (runner, _recorded) = recording_command_runner();
+
+        let node = FinalValidationNode::new().with_runner(runner);
+        let ctx = ctx_with_worktree_and_spec_slug(dir.path(), "my-spec");
+        let ctx = node.process(ctx).await.unwrap();
+
+        let result = get_result(&ctx, "FinalValidationNode").unwrap();
+        let check_names: Vec<&str> = result["check_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            check_names.contains(&"per_spec_only_check"),
+            "expected the per-spec check to run: {check_names:?}"
+        );
+        assert!(
+            !check_names.contains(&"test") && !check_names.contains(&"build"),
+            "the repo harness's checks must NOT run when a per-spec override exists: {check_names:?}"
+        );
     }
 
     #[tokio::test]

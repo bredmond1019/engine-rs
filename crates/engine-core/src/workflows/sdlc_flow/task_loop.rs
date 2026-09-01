@@ -16,7 +16,7 @@
 //! `policy` override). Everything else here — the routers, `TestTaskNode`,
 //! `UpdateTaskStatusNode`, `SaveStateNode` — is pure Rust.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
@@ -328,6 +328,35 @@ pub(crate) fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .ok_or_else(|| NodeError::new("SetupWorktreeNode output missing worktree_path"))
+}
+
+/// Resolve which `harness.json` a run gates on (`EN.ticket.per-spec-harness-override`).
+///
+/// Resolution order:
+/// 1. `worktree/planning/<spec_slug>/harness.json` — when `ctx.event` carries
+///    a `spec_slug` (read the same way `emit_state.rs::spec_slug` does) AND
+///    that file exists.
+/// 2. `worktree/planning/harness.json` — otherwise.
+///
+/// Behavior-stable by construction: a spec with no per-spec harness of its
+/// own (no `spec_slug` on the event, or a `spec_slug` whose directory
+/// carries no `harness.json`) resolves to exactly the path every existing
+/// run used before this knob existed. A malformed per-spec harness is
+/// **not** this function's concern — it returns the per-spec path as long
+/// as the file exists, and the caller's existing read/parse error path
+/// (which already names `harness_path` in its message) surfaces the
+/// failure without any silent fallback to the repo harness.
+pub(crate) fn resolve_harness_path(ctx: &TaskContext, worktree: &Path) -> PathBuf {
+    if let Some(spec_slug) = ctx.event.get("spec_slug").and_then(|v| v.as_str()) {
+        let per_spec_path = worktree
+            .join("planning")
+            .join(spec_slug)
+            .join("harness.json");
+        if per_spec_path.exists() {
+            return per_spec_path;
+        }
+    }
+    worktree.join("planning").join("harness.json")
 }
 
 /// Best-effort `git add -N -A` ("intent to add") in `worktree`, run
@@ -1998,7 +2027,7 @@ impl Node for TestTaskNode {
         // that happen to already be green (e.g. no `harness.json`).
         let write_verification = self.verify_claimed_writes(&ctx, &task, worktree);
 
-        let harness_path = worktree.join("planning").join("harness.json");
+        let harness_path = resolve_harness_path(&ctx, worktree);
         let harness_exists = harness_path.exists();
         let harness_checks: Vec<serde_json::Value> = if harness_exists {
             let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
@@ -5595,6 +5624,131 @@ mod tests {
             serde_json::to_string(&harness).unwrap(),
         )
         .unwrap();
+    }
+
+    fn write_per_spec_harness(dir: &Path, spec_slug: &str, checks: serde_json::Value) {
+        let spec_dir = dir.join("planning").join(spec_slug);
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let harness = json!({ "validation": { "checks": checks } });
+        std::fs::write(
+            spec_dir.join("harness.json"),
+            serde_json::to_string(&harness).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // ---- resolve_harness_path (EN.ticket.per-spec-harness-override) ----
+
+    #[test]
+    fn resolve_harness_path_prefers_per_spec_override_when_it_exists() {
+        let worktree = temp_worktree();
+        write_per_spec_harness(&worktree, "my-spec", json!([]));
+        // The repo-level harness also exists, to prove the override wins
+        // rather than merely being the only file present.
+        write_harness(&worktree, json!([]));
+
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let resolved = resolve_harness_path(&ctx, &worktree);
+
+        assert_eq!(
+            resolved,
+            worktree
+                .join("planning")
+                .join("my-spec")
+                .join("harness.json")
+        );
+    }
+
+    #[test]
+    fn resolve_harness_path_falls_back_to_repo_harness_when_override_absent() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let resolved = resolve_harness_path(&ctx, &worktree);
+
+        // The exact-path assertion IS the behavior-stability claim this
+        // knob rests on: with no per-spec harness.json present, resolution
+        // must land on the same path every run used before this knob
+        // existed.
+        assert_eq!(resolved, worktree.join("planning").join("harness.json"));
+    }
+
+    #[test]
+    fn resolve_harness_path_falls_back_to_repo_harness_when_no_spec_slug_on_event() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        // Even a per-spec harness for SOME slug existing on disk must not
+        // matter when the event carries no spec_slug at all.
+        write_per_spec_harness(&worktree, "my-spec", json!([]));
+
+        let ctx = empty_context(json!({}));
+        let resolved = resolve_harness_path(&ctx, &worktree);
+
+        assert_eq!(resolved, worktree.join("planning").join("harness.json"));
+    }
+
+    #[tokio::test]
+    async fn test_task_malformed_per_spec_harness_errors_with_its_own_path_no_fallback() {
+        let worktree = temp_worktree();
+        // A valid repo harness exists too, to prove a malformed override
+        // does NOT silently fall back to it.
+        write_harness(
+            &worktree,
+            json!([{ "name": "repo_check", "command": "exit 0", "gates": true }]),
+        );
+        let spec_dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(spec_dir.join("harness.json"), "{ not valid json").unwrap();
+
+        let ctx = ctx_for_worktree(&worktree);
+        let node = TestTaskNode::new();
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("malformed per-spec harness must error");
+        let expected_path = spec_dir.join("harness.json");
+        assert!(
+            err.message.contains(&expected_path.display().to_string()),
+            "error must name the per-spec path, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_runs_checks_from_per_spec_harness_not_repo_harness() {
+        let worktree = temp_worktree();
+        // The repo harness declares a DIFFERENT check name than the
+        // per-spec override — a resolver wired correctly must run only the
+        // override's checks.
+        write_harness(
+            &worktree,
+            json!([{ "name": "repo_only_check", "command": "exit 0", "gates": true }]),
+        );
+        write_per_spec_harness(
+            &worktree,
+            "my-spec",
+            json!([{ "name": "per_spec_only_check", "command": "exit 0", "gates": true }]),
+        );
+
+        let ctx = ctx_for_worktree(&worktree);
+        let node = TestTaskNode::new();
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let check_names: Vec<&str> = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            check_names.contains(&"per_spec_only_check"),
+            "expected the per-spec check to run: {check_names:?}"
+        );
+        assert!(
+            !check_names.contains(&"repo_only_check"),
+            "the repo harness's check must NOT run when a per-spec override exists: {check_names:?}"
+        );
     }
 
     #[tokio::test]
