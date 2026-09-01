@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-08-31T23:56:02Z"
+timestamp: "2026-09-01T10:13:33Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,13 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-01]
+
+### Sequenced the ctx.nodes work — and found a dead spend cap and a wrong decision on the way
+- **What:** Ran `/seams` then `/sequence` over the `context-handling-between-nodes` assessment, producing `seams.md` (9 seams, 9 forks, one spike) and `sequence.md` (5 waves + 1 parallel track, 12 candidate blocks `EN.14.A`-`EN.14.J` plus a bastion and two HQ rows, 4 operator errands). The spike — ~45 throwaway lines appending a per-invocation record in `workflow::node_context` — passed 3456/3456 and was reverted; it proved the write is one function, and the red team then proved the record it writes sees *wrappers*, not LLM calls, since 22 production node bodies dispatch an inner `ClaudeCodeStep` outside the envelope. **Two reversals matter more than the cut.** (1) The assessment's headline is wrong: engine-rs ALREADY writes an append-only per-invocation array to disk (`claude_sessions`, both write paths) — it has just never been observed, 0 of 2,631 artifacts, because the ledger landed ~23h after the newest artifact. (2) The real defect is not lost history but **deleted money**: all four SDLC `COST_BEARING_STAGES` overwrite their own `ctx.nodes` entry via `put_result` carrying only `"transport"`, so `total_cost_usd`'s fallback is structurally `$0.00` **and `Budget::max_cost_usd` cannot fire on any SDLC run** despite a live `$5` default on every HTTP-triggered run. Logged brain decision **D84** (engine-rs owns the engine tables), then had to amend it twice: **Amendment 1** refutes its own central premise — `events` is the shared dispatch table for *both* runtimes and Synapse's four workflows on it are Brain workflows, so the drafted `SY.4.A` would have amputated the Brain's own ingest, QA and memory *while its gate passed*; the corrected mechanism (one dispatch table per runtime) removed Synapse from the cut entirely and made the split cheaper. **Amendment 2** withdraws D84's `sqlx` clause after the operator pushed back, since engine-rs has zero compile-time query checking today and diesel would be an upgrade rather than a trade.
+- **Why:** Two `carryover[]` entries described the `ctx.nodes` defect from two directions and neither was sequenced; the operator asked for the pre-plan pipeline to be run to a cut. Three fresh Opus red-team agents were given the draft with one brief each — **10 attacks landed, 1 rejected** — and four concerns nobody owned got rows: no backup for the new engine database, nothing repointing two launchd plists or bastion's single `database_url`, no unattended migration runner on the Mini at all, and no `.sqlx`/CI-Postgres row while `harness.json` gates `clippy --all-features`. The handoff's own `state.json` read then caught a last defect in this session's work: **`EN.13.A` is claimed by two roadmaps' lane files but registered in no `state.json`**, so the standard allocation procedure reports phase 13 free and silently collides — the cut was renumbered to phase 14 and 13 left free.
+- **Refs:** `planning/context-handling-between-nodes/{seams,sequence}.md`, `docs/decisions/D84-engine-rs-owns-the-engine-tables.md` (+ Amendments 1-2), carryover `budget-max-cost-usd-cannot-fire-on-any-sdlc-run` (p0).
 
 ## [run: 2026-08-31]
 
