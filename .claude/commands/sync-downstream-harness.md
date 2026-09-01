@@ -1,7 +1,7 @@
 ---
 type: Guide
 title: sync-downstream-harness — Pull the harness into every scaffolded repo
-description: Runs scripts/sync_downstream_harness.py to copy changed .claude/commands/*.md + .claude/workflows/ files into every repo scaffolded from base-template, then reports what changed per repo so each can be reviewed and committed.
+description: Runs scripts/sync_downstream_harness.py to copy changed .claude/commands/*.md + .claude/workflows/ files into every repo scaffolded from base-template, reports what changed per repo, and can commit both halves (--commit) across the repo and the brain vault.
 doc_id: sync-downstream-harness
 layer: [factory]
 project: base-template
@@ -26,8 +26,12 @@ $ARGUMENTS — optional flags, space-separated:
 - `--repo <slug>` — limit to one repo (repeatable: `--repo bastion --repo mev`). Default: all
   eligible repos.
 - `--apply` — write changes. Default is dry-run (report only, nothing written).
-- `--message "<text>"` — description recorded in each synced repo's `planning/.template-version`.
-  Default: `"harness pull"`. Use something specific (e.g. the decision id driving the pull).
+- `--message "<text>"` — description recorded in each synced repo's `planning/.template-version`,
+  and used as the commit subject under `--commit`. Default: `"harness pull"`. Use something
+  specific (e.g. the decision id driving the pull).
+- `--commit` — after applying, commit each repo's own half and make one brain commit for all the
+  `planning/.template-version` stamps. **Requires `--apply`** (a dry run writes nothing to commit;
+  passing `--commit` alone is a usage error and exits 2). See step 6.
 
 ## Instructions
 
@@ -59,11 +63,12 @@ $ARGUMENTS — optional flags, space-separated:
    shows a live lane in a repo this run would touch, **stop and do not pass `--apply`** until that
    lane finishes or the operator confirms it's safe:
    ```bash
-   python3 scripts/fleet_concurrency_check.py list
+   python3 scripts/fleet_concurrency_check.py status
    grep -l 'lifecycle: active' planning/orchestration-run/*/notes.md 2>/dev/null
    ```
-   The first names any repo holding a registered heavy-lane lock (`scripts/fleet_concurrency_check.py`,
-   D61). The second finds any `planning/orchestration-run/<roadmap>/notes.md` whose frontmatter is
+   The first prints the registry as JSON — `active` lists every registered lane and
+   `exclusive_leases` every held repo lock (`scripts/fleet_concurrency_check.py`, D61). Both empty
+   means no lane is live. (The subcommand is `status`; there is no `list`.) The second finds any `planning/orchestration-run/<roadmap>/notes.md` whose frontmatter is
    still `lifecycle: active` — run it inside each target repo, not just here, since a lane can be
    live in a downstream repo this command is about to overwrite.
 
@@ -72,7 +77,7 @@ $ARGUMENTS — optional flags, space-separated:
    python3 scripts/sync_downstream_harness.py <$ARGUMENTS>
    ```
    This writes the changed files and updates each synced repo's `planning/.template-version`
-   (`commit:` + `synced:` fields). It does **not** commit.
+   (`commit:` + `synced:` fields). Without `--commit` it does **not** commit — go to step 5.
 
 5. **Per repo, before committing:** check for pre-existing unrelated dirty state so it doesn't get
    swept into the harness-pull commit by accident:
@@ -82,8 +87,28 @@ $ARGUMENTS — optional flags, space-separated:
    If that prints anything, it's unrelated in-progress work in that repo — leave it out of the
    commit (stage `.claude/` and `planning/.template-version` explicitly, never `git add -A`).
 
-6. **Commit in each repo that changed** — but in **two** commits, in different repos, because the
-   synced files do not all belong to the same git repo:
+6. **Commit.** Prefer `--commit`; the manual recipe below is the fallback and the explanation.
+
+   **(0) The one-command path:**
+   ```bash
+   python3 scripts/sync_downstream_harness.py --apply --commit --message "<what this pull is>"
+   ```
+   It makes **N+1** commits: one per repo for that repo's own `.claude/`/`.agents/`/`scripts/`/
+   `hooks/` half, then **one** brain commit carrying every `planning/.template-version` stamp. Each
+   pathspec is explicit and derived from what that run actually wrote — the script never runs
+   `git add -A` (there is a test asserting that against its source). A repo whose harness tree
+   lives in the brain's own index (the `engines_only` brain root) is folded into the brain commit
+   rather than committed twice. Per repo it prints the short sha, `nothing to commit`, or
+   `COMMIT FAILED: <reason>`; any failure makes the whole run exit 1, so a red run is visible
+   rather than buried in the middle of a 19-repo report.
+
+   `--commit` does **not** relax step 5: run that dirty-state check first. The script only stages
+   the paths it wrote, so unrelated in-progress work is never swept in — but a repo carrying
+   uncommitted edits to a file this sync also overwrites will have those edits gone, and that is
+   step 5's job to catch, not the script's.
+
+   **Doing it by hand** takes **two** commits, in different repos, because the synced files do not
+   all belong to the same git repo:
 
    **(a) The sub-repo owns `.claude/` and `.agents/`:**
    ```bash
@@ -125,7 +150,8 @@ $ARGUMENTS — optional flags, space-separated:
    `core/bastion/planning/13.1-persistent-agent-panel/` for a worked example of this conversion.
 
 9. **Report:** which repos were synced, how many files each, which repos had nothing to sync, any
-   repo skipped (no `.claude/workflows/`, or gitignored), and any spec found + fixed in step 8.
+   repo skipped (no `.claude/workflows/`, or gitignored), any spec found + fixed in step 8, and —
+   if `--commit` was used — the commit count and every `COMMIT FAILED` line, never summarised away.
 
 ## Notes
 
@@ -136,3 +162,10 @@ $ARGUMENTS — optional flags, space-separated:
   base-template (a repo's own command) is left untouched, always.
 - `--repo` accepts the `slug` field from `brain.toml`'s `[[repos]]` entries, not the directory name
   (usually the same, but check `brain.toml` if unsure).
+- **Why `--commit` is N+1 commits and not one.** Each repo's `planning/` is a symlink into the
+  brain's `_planning/` vault, so `<repo>/planning/.template-version` is tracked by the brain, not by
+  the repo. Staging both halves in one `git add` fails with `beyond a symbolic link` **and aborts
+  the whole add** — committing nothing while appearing to run. The script stages the stamp through
+  its real vault path (`<tier>/_planning/<slug>/.template-version`) instead. There is a positive
+  control in `scripts/test_sync_downstream_harness.py` asserting that staging the symlinked face
+  still fails, so the split cannot quietly become superstition if git's behaviour ever changes.
