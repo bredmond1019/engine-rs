@@ -185,6 +185,85 @@ failed final-validation gate) routes **normally** to `WrapUpNode`, so no `node_r
 `Failed` and, unstamped, the run fell through the derivation table to `succeeded`. The `error`
 string carries the derived `global_status` and the run's `bail_reason`.
 
+**`metadata.claude_sessions` — the run's Claude CLI session ledger.** Which transcripts hold this
+run's real token usage. The CLI writes one per invocation to
+`~/.claude/projects/<project>/<session_id>.jsonl` — the id is literally the filename stem — and the
+`session_id` it returns on every envelope is the only exact way to find them. Joining by a
+`started_at`/`updated_at` timestamp window instead is inference.
+
+```jsonc
+{
+  "metadata": {
+    "claude_sessions": [
+      { "node": "ImplementNode", "session_id": "<uuid>", "ok": true,
+        "cost_usd": 0.31, "input_tokens": 1200, "output_tokens": 340,
+        "cache_read_input_tokens": 88000, "cache_creation_input_tokens": 1200 },
+      { "node": "TestNode", "session_id": "<uuid>", "ok": false,
+        "cost_usd": 0.02, "input_tokens": 700, "output_tokens": 20,
+        "cache_read_input_tokens": 40, "cache_creation_input_tokens": 3 }
+    ]
+  }
+}
+```
+
+**This ledger is what a run's cost and token totals are summed from** —
+`sessions::ledger_totals`, consumed by `policy::telemetry::harvest` and so by
+`RunOutcomes`/`RunTelemetry`. It replaced a per-stage scan of `ctx.nodes` that read each stage's
+**last recorded** `cost_usd`. Because `ctx.nodes` is keyed by node identity and overwritten on every
+re-run, a stage the task loop ran six times contributed only its sixth call: a systematic
+**undercount that grew with the number of retries and review rounds**, worst on exactly the runs
+whose cost mattered most. The scan survives as the fallback for an EMPTY ledger, which is not the
+same as a free run — a state written before this ledger existed, or a workflow whose cost-bearing
+nodes are not `ClaudeCodeStep` and stamp `cost_usd` themselves, both land there.
+
+`session_id` is `Option`: an invocation that established no Claude session (a local
+OpenAI-compatible transport) is still recorded, because it still cost money — only its transcript
+join is missing. A failure with no envelope at all (`Spawn`/`BinaryNotFound`/`Timeout`/`Parse`) is
+recorded **nowhere**: nothing about its cost is known, and a zero-cost entry would assert a
+measurement never made.
+
+**A LIST, never a scalar — an engine-rs run is 1:N with Claude sessions.** Every LLM stage is a
+separate headless `claude` invocation (`ClaudeCodeStep`, which never passes `--resume`), so one
+`SDLC_FLOW` run spans one session per stage per attempt. A single "the run's session id" would name
+one segment and silently lose the rest, and the segment it named would look exact, so nothing would
+appear wrong. Entries are append-only and in invocation order, which is what makes per-stage cost
+attribution (cost per SDLC stage per attempt, not merely per run) readable off the list.
+`append_session` performs **no de-duplication**, deliberately: it is called exactly once per
+invocation, nothing replays it (a resumed run rehydrates the array as data rather than re-appending
+its entries), and now that entries carry money any collapse can only undercount. Two invocations
+can legitimately be identical in every recorded field — same stage, same outcome, same cost, and
+`session_id: None` for a local transport — and merging them would silently halve that stage's
+reported spend.
+
+`ok: false` marks an invocation that reached the API and came back `is_error` — **billed, and
+deliberately kept**, since dropping it would understate exactly the attempts a cost comparison cares
+about most. Failures with no envelope at all (`Spawn`/`BinaryNotFound`/`Timeout`/`Parse`) never
+established a session and so appear here not at all: an absent entry means no session existed, never
+a session that went unrecorded. A local OpenAI-compatible transport writes no Claude transcript and
+likewise records nothing rather than a synthesized id.
+
+Written by `engine_core::sessions::{append_session, read_sessions}`, keyed
+`SESSIONS_METADATA_KEY = "claude_sessions"`, alongside `cancellation`/`budget`/`completion`. A
+node that FAILS carries its billed sessions out on `NodeError::sessions`, because
+`workflow::node_context` discards a failing node's `TaskContext` and reverts to its pre-call
+snapshot — without that hand-off the billed failure would vanish. The SDLC committed-state artifact
+surfaces the same ledger as a top-level `claude_sessions` key (see below).
+
+**Not `workflow_run_id`.** base-template's JS engines carry a nullable, caller-stamped
+`workflow_run_id` — a Workflow-tool run id (`wf_*`) whose transcript lives at a different path
+shape, `subagents/workflows/wf_*/agent-*.jsonl`. engine-rs has no such id: it runs as a workflow
+graph inside `bastion serve`, not as a Workflow-tool script, so no enclosing Claude Code session
+exists for a caller to stamp. Putting Claude session UUIDs behind that field name would make a
+consumer join under the wrong path, find nothing, and report the data **absent rather than
+erroring** — a silent wrong answer. The divergence between the two engines' shapes belongs in the
+consumer's normalizer, not in this field's name. (The same 1:N truth applies to the JS engines: a
+run paused and resumed has its state file written by the *resuming* invocation, so its scalar names
+only the second segment — measured 2026-08-31, that lost 34% of one run's tokens.)
+
+Distinct from `run_id`, which stays the run's own identity (the engine's `events.id`, joining to
+Postgres). Neither substitutes for the other, and a consumer should treat any exact id as an
+**anchor** rather than the answer — one exactly-anchored segment does not make a sum exact.
+
 ### Campaign identity (`§8`, new in v1.8.0, `EN.11.E`)
 
 A **campaign** is the parent identity for the N runs of one orchestration chain — the unit the
@@ -464,3 +543,5 @@ time, not a gate).
 | — | 2026-08-30 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** `EN.ticket.stamp-engine-sha-on-every-run` (engine-rs-side) adds an `engine_build_sha` field to the engine-rs-only `GET /health` response (§ HTTP surface parity above) and to the `SDLC_FLOW`/`SDLC_TASK` run artifact written at wrap-up. Both read the single accessor `engine_core::engine_build_sha()`, so they cannot disagree. **No re-pin**, for the same reason as the 2026-08-24 `GET /c…` row: `/health` has no canonical counterpart, and the run artifact is engine-rs's own `sdlc-*state.json`, not one of the versioned `events`/`task_context`/`NodeRun`/`Usage` shapes this pin tracks. Additive and backward-compatible — an artifact written before this block has no such field and every consumer must read it as **absent**, never as an empty string or a placeholder (`jynx:JX.ticket.record-the-engine-sha` marks an absent SHA `unknown` and refuses to pool such runs, which only works if absent is genuinely absent). A binary built from a dirty tree reports `<sha>-dirty`. |
 | — | 2026-08-29 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** `EN.12.G` registers a new `workflow_type` value POSTable at the existing `POST /events/` route: `DEBRIEF` — a single-node micro-workflow (see [debrief.md](workflows/debrief.md)) that renders a morning brief from one campaign's journal and writes it back as a `JournalDecisionKind::DebriefRendered` row, readable via the existing `GET /campaigns/{id}/journal` route (§ HTTP surface parity above, row updated to list the kind). Engine-rs-side workflow type and a new enum variant on the already engine-rs-only `JournalDecisionKind` only — no `engine_contract::events`/`task_context`/`NodeRun`/`Usage` type changed shape, mirroring the reasoning the `EN.12.L` `RecallConsulted` addition and the `EN.12.D` row above both give for `JournalDecisionKind` sitting outside this contract's pinned shapes. |
 | — | 2026-08-30 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** Fixes a P0 in the engine-rs-only server-derived `status` of `GET /events/{event_id}` (§ HTTP surface parity above): a terminal-**blocked** `SDLC_FLOW`/`SDLC_TASK` run read back as `succeeded` (observed on run `5be90c46`, whose artifact simultaneously read `status: "blocked"`, `tasks_passed: 0`, `review_verdicts: ["TriageTaskNode:MAJOR_BAIL"]`, with an empty worktree diff). A `MAJOR_BAIL` routes **normally** to `WrapUpNode`, so no `node_runs[..].status` is `Failed` and nothing stamped `metadata.failure` — the run fell through the derivation table to its `succeeded` default. `WrapUpNode` now stamps `metadata.failure` (§ Run-level `metadata` annotations above) whenever it derives a `blocked`/`reconcile_failed` `global_status`, so the existing table's `failed` row catches it; `stamp_failure` moved from `engine-serve` into `engine_core::completion` so `engine-core` can reach it, with the `engine-serve` helper kept as a wrapper. **No re-pin**: no `engine_contract` `events`/`task_context`/`NodeRun`/`Usage` type changed shape, no route was added, and the readback vocabulary is unchanged at `succeeded|failed|cancelled|budget_halted` — this is engine-rs stamping an annotation the canonical contract has defined since v1.2.0. `cancellation` and `budget` are still checked ahead of `failure`, so a cancelled or budget-halted run keeps its own more specific status. |
+| — | 2026-08-31 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** Adds `metadata.claude_sessions` (§ Run-level `metadata` annotations above): the run's ordered ledger of Claude CLI sessions, each `{node, session_id, ok}`, and the same ledger as a top-level `claude_sessions` key on the `SDLC_FLOW`/`SDLC_TASK` run artifact. It exists so a run can be joined **exactly** to the transcripts holding its real token usage (`~/.claude/projects/<project>/<session_id>.jsonl`) instead of by a `started_at`/`updated_at` timestamp window — the join a `promptTokEst` estimate measured ~113x low was being checked against. Requires `claude_sdk_rs::Outcome::session_id` and a `session_id` on `claude_sdk_rs::Error::Api`, both additive, so a **billed failure stays attributable**; `NodeError::sessions` carries a failing node's sessions past `workflow::node_context`'s discard of its `TaskContext`. **No re-pin**, for the same reason as the 2026-08-30 `engine_build_sha` row: the annotation lives in the existing free-form `TaskContext::metadata` (D6), and the artifact is engine-rs's own `sdlc-*state.json`, not one of the versioned `events`/`task_context`/`NodeRun`/`Usage` shapes this pin tracks. Additive and backward-compatible — an artifact written before this ticket has no such key and every consumer must read it as an **empty ledger**, never as "this run made no LLM calls". **Deliberately NOT named `workflow_run_id`** (base-template's JS-engine field): that is a scalar `wf_*` Workflow-tool run id with a different transcript path shape, and reusing the name would make a consumer join under the wrong path and report data absent rather than erroring. Engine-rs has no `wf_*` id to report at all — it runs as a workflow graph inside `bastion serve`, not as a Workflow-tool script. |
+| — | 2026-08-31 | Not a re-pin — **Pinned Contract Version stays 1.8.0.** Extends the `metadata.claude_sessions` entries added earlier today (§ Run-level `metadata` annotations above) with the CLI's own billing per invocation — `cost_usd`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` — and makes `session_id` optional so a call that established no Claude session is still recorded for its cost. `sessions::ledger_totals` now feeds `policy::telemetry::harvest`, and so `RunOutcomes`/`RunTelemetry`. **This fixes a real undercount, not only a missing field:** the previous accounting summed each cost-bearing stage's LAST recorded `cost_usd` out of `ctx.nodes`, which is keyed by node identity and overwritten on every re-run — so a stage the SDLC task loop ran six times contributed one call, and the error grew with retries and review rounds. Verified by `a_retried_stage_reports_every_attempt_it_was_billed_for`: three invocations totalling $0.52 reported as $0.02 under the old read. Requires `claude_sdk_rs::Error::Api` to carry `cost_usd`/`usage` alongside `session_id` — the error envelope reports all three, and `execute` was discarding the whole `Outcome`. The per-stage scan remains the fallback for an empty ledger (pre-ledger states; workflows whose cost-bearing nodes are not `ClaudeCodeStep`), so no existing caller's reported figures change. **No re-pin**: free-form `TaskContext::metadata` per D6, and the artifact is engine-rs's own `sdlc-*state.json`. |

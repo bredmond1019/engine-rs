@@ -49,6 +49,7 @@ fn stub_outcome() -> Outcome {
         )]
         .into_iter()
         .collect(),
+        session_id: None,
         structured_output: None,
         text: "ok".to_string(),
         is_error: false,
@@ -289,6 +290,14 @@ async fn attempt_count_is_bounded_and_does_not_hang() {
             claude_code_rs::Error::Api {
                 status: Some(503),
                 message: "service unavailable".to_string(),
+                session_id: None,
+                cost_usd: 0.0,
+                usage: SdkUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
             }
         }));
 
@@ -625,4 +634,244 @@ async fn live_claude_code_step_produces_populated_usage() {
     // The output must be JSON-serializable (it already is a serde_json::Value
     // by construction) and re-serialize without error.
     serde_json::to_string(output).expect("output should serialize");
+}
+
+// ---------------------------------------------------------------------------
+// Claude session ledger (`engine_core::sessions`)
+//
+// An engine-rs run is 1:N with Claude sessions — one headless invocation per
+// LLM stage per attempt, never `--resume` — so the ledger, not a scalar, is
+// what lets a consumer join a run to the transcripts carrying its real token
+// usage. These tests pin the three things that make the ledger trustworthy:
+// every successful call lands in it, every BILLED failed attempt lands in it,
+// and a node that fails outright still contributes despite its `TaskContext`
+// being discarded by `workflow::node_context`.
+// ---------------------------------------------------------------------------
+
+fn outcome_with_session(session_id: &str) -> Outcome {
+    Outcome {
+        session_id: Some(session_id.to_string()),
+        ..stub_outcome()
+    }
+}
+
+/// A billed failure: the CLI reached the API, was charged, and came back `is_error`.
+fn api_error_with_session(session_id: &'static str) -> claude_code_rs::Error {
+    claude_code_rs::Error::Api {
+        status: Some(529),
+        message: "overloaded".to_string(),
+        session_id: Some(session_id.to_string()),
+        cost_usd: 0.25,
+        usage: SdkUsage {
+            input_tokens: 700,
+            output_tokens: 20,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 40,
+        },
+    }
+}
+
+/// The success path: the CLI's `session_id` reaches BOTH the node's own result
+/// (per-stage, latest invocation) and the run-scoped ledger (every invocation).
+#[tokio::test]
+async fn successful_call_records_its_session_in_the_ledger_and_node_result() {
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_transport(|_c, _p| Box::pin(async { Ok(outcome_with_session("sess-success")) }));
+
+    let ctx = TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let ctx = step.process(ctx).await.expect("stubbed success");
+
+    assert_eq!(
+        engine_core::sessions::read_session_ids(&ctx.metadata),
+        vec!["sess-success"]
+    );
+    let recorded = &engine_core::sessions::read_sessions(&ctx.metadata)[0];
+    assert_eq!(recorded.node, NODE_NAME, "per-stage attribution key");
+    assert!(recorded.ok);
+    assert_eq!(
+        ctx.nodes[NODE_NAME]["session_id"],
+        serde_json::json!("sess-success")
+    );
+}
+
+/// A transport with no session id (a local OpenAI-compatible endpoint, or an older CLI) is still a
+/// billed call and must still be recorded — the ledger is what the run's cost total is summed
+/// from, so skipping it would drop real spend. What is absent is the transcript join, and only
+/// that: `session_id` stays `None` and the entry contributes no id, but it does contribute cost.
+///
+/// This test asserted the opposite when the ledger only carried ids and costs lived elsewhere.
+#[tokio::test]
+async fn a_call_without_a_session_id_is_still_recorded_for_its_cost() {
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_transport(|_c, _p| Box::pin(async { Ok(stub_outcome()) }));
+
+    let ctx = TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let ctx = step.process(ctx).await.expect("stubbed success");
+
+    let sessions = engine_core::sessions::read_sessions(&ctx.metadata);
+    assert_eq!(sessions.len(), 1, "the call happened and cost money");
+    assert_eq!(
+        sessions[0].session_id, None,
+        "but it joins to no transcript"
+    );
+    assert!((sessions[0].cost_usd - 0.02).abs() < 1e-9);
+    assert!(
+        engine_core::sessions::read_session_ids(&ctx.metadata).is_empty(),
+        "contributes no transcript id"
+    );
+    assert_eq!(ctx.nodes[NODE_NAME]["session_id"], serde_json::Value::Null);
+}
+
+/// A retried attempt that reached the API was BILLED. It must appear in the
+/// ledger as `ok: false`, ahead of the success that followed it — the ledger's
+/// order is invocation order. Dropping it would understate the run's real cost
+/// by exactly the attempts a cost comparison cares about most.
+#[tokio::test]
+async fn a_billed_failed_attempt_is_recorded_before_the_retry_that_succeeded() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_retry_policy(fast_retry(3))
+        .with_transport(move |_c, _p| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    Err(api_error_with_session("sess-failed-attempt"))
+                } else {
+                    Ok(outcome_with_session("sess-succeeded"))
+                }
+            })
+        });
+
+    let ctx = TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let ctx = step.process(ctx).await.expect("retry must recover");
+
+    let sessions = engine_core::sessions::read_sessions(&ctx.metadata);
+    assert_eq!(
+        sessions
+            .iter()
+            .filter_map(|s| s.session_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["sess-failed-attempt", "sess-succeeded"],
+        "the failed attempt happened first and must be recorded first"
+    );
+    assert!(
+        !sessions[0].ok,
+        "the billed failed attempt is marked ok: false"
+    );
+    assert!(sessions[1].ok);
+}
+
+/// The hard case. `workflow::node_context` DISCARDS a failing node's
+/// `TaskContext` and reverts to its pre-call snapshot, so anything `process`
+/// stamped before returning `Err` is lost. A billed failure must still reach
+/// the ledger — it rides out on `NodeError::sessions` and is replayed into the
+/// reverted context. Driven through the real `Workflow`, not `process`
+/// directly, because the discard only happens on that path.
+#[tokio::test]
+async fn a_failing_node_still_contributes_its_billed_sessions_to_the_ledger() {
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_retry_policy(fast_retry(1))
+        .with_transport(|_c, _p| {
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                Err(api_error_with_session("sess-billed-then-failed"))
+            })
+        });
+
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(step));
+
+    let workflow = Workflow::new(registry, single_node_schema());
+    let on_progress: engine_core::OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+    let ctx = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("a node failure halts the walk but still returns a context");
+
+    assert_eq!(
+        ctx.node_runs[NODE_NAME].status,
+        NodeRunStatus::Failed,
+        "the node really did fail"
+    );
+    assert_eq!(
+        engine_core::sessions::read_session_ids(&ctx.metadata),
+        vec!["sess-billed-then-failed"],
+        "a billed failure must survive the discarded TaskContext"
+    );
+    assert!(!engine_core::sessions::read_sessions(&ctx.metadata)[0].ok);
+}
+
+/// End-to-end on the undercount this ledger exists to fix.
+///
+/// One node, one `process` call, three CLI invocations: two billed failures then a success. The
+/// old accounting read `ctx.nodes["ClaudeCodeStep"]["cost_usd"]` — the LAST value written — and
+/// would report only the success, 0.02 of the 0.52 actually spent. The ledger holds all three.
+#[tokio::test]
+async fn a_retried_stage_reports_every_attempt_it_was_billed_for() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+        .with_retry_policy(fast_retry(4))
+        .with_transport(move |_c, _p| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt <= 2 {
+                    Err(api_error_with_session("sess-billed-failure"))
+                } else {
+                    Ok(outcome_with_session("sess-succeeded"))
+                }
+            })
+        });
+
+    let ctx = TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+
+    let ctx = step.process(ctx).await.expect("retry must recover");
+
+    let totals = engine_core::sessions::ledger_totals(&ctx.metadata);
+    assert_eq!(totals.invocations, 3, "two failures and one success");
+
+    // 0.25 + 0.25 (the billed failures) + 0.02 (stub_outcome's success).
+    assert!(
+        (totals.cost_usd - 0.52).abs() < 1e-9,
+        "expected 0.52, got {} — the failed attempts were billed too",
+        totals.cost_usd
+    );
+
+    // The old per-stage read, still visible, showing exactly what it would have missed.
+    let last_write_only = ctx.nodes[NODE_NAME]["cost_usd"].as_f64().unwrap();
+    assert!((last_write_only - 0.02).abs() < 1e-9);
+    assert!(
+        totals.cost_usd > last_write_only * 25.0,
+        "the ledger must catch spend the last-write-wins read structurally cannot"
+    );
+
+    // 700 + 700 + 100 (stub_outcome) uncached input; cache channels sum the same way.
+    assert_eq!(totals.input_tokens, 1500);
+    assert_eq!(totals.cache_read_input_tokens, 80);
 }

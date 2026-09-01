@@ -1934,6 +1934,7 @@ mod tests {
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:00:00Z".to_string(),
             run_id: None,
+            claude_sessions: Vec::new(),
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
@@ -2007,6 +2008,7 @@ mod tests {
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:00:00Z".to_string(),
             run_id: None,
+            claude_sessions: Vec::new(),
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
@@ -2069,6 +2071,7 @@ mod tests {
             started_at: "2026-08-01T00:00:00Z".to_string(),
             updated_at: "2026-08-01T00:00:00Z".to_string(),
             run_id: run_id.map(str::to_string),
+            claude_sessions: Vec::new(),
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
@@ -2246,6 +2249,7 @@ mod tests {
             started_at: "2026-08-30T00:00:00Z".to_string(),
             updated_at: "2026-08-30T00:00:00Z".to_string(),
             run_id: Some("run-mixed".to_string()),
+            claude_sessions: Vec::new(),
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
@@ -2446,6 +2450,7 @@ mod tests {
             started_at: "2026-08-01T00:00:00Z".to_string(),
             updated_at: "2026-08-01T00:00:00Z".to_string(),
             run_id: Some("run-bbbb".to_string()),
+            claude_sessions: Vec::new(),
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
@@ -2571,6 +2576,7 @@ mod tests {
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:00:00Z".to_string(),
             run_id: None,
+            claude_sessions: Vec::new(),
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         std::fs::write(
@@ -4221,12 +4227,14 @@ repo_path = "alpha"
             text: text.to_string(),
             is_error: false,
             api_error_status: None,
+            session_id: None,
             structured_output: None,
         }
     }
 
     fn stub_outcome_with_structured(text: &str, structured: serde_json::Value) -> Outcome {
         Outcome {
+            session_id: None,
             structured_output: Some(structured),
             ..stub_outcome_with_text(text)
         }

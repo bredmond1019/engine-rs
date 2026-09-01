@@ -24,6 +24,7 @@ pub mod policy;
 pub mod repo_registry;
 pub mod routing;
 pub mod schema;
+pub mod sessions;
 pub mod suspend;
 pub mod validate;
 pub mod workflow;

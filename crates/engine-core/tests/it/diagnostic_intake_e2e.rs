@@ -115,6 +115,7 @@ fn stub_outcome(structured: serde_json::Value, input_tokens: u64, output_tokens:
         text: serde_json::to_string(&structured).unwrap(),
         is_error: false,
         api_error_status: None,
+        session_id: None,
         structured_output: Some(structured),
     }
 }

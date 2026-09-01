@@ -72,6 +72,7 @@ fn seed_state_file(worktree: &Path, spec_slug: &str, state: &SDLCState) {
         started_at: "2026-07-01T00:00:00Z".to_string(),
         updated_at: "2026-07-01T00:00:00Z".to_string(),
         run_id: None,
+        claude_sessions: Vec::new(),
     };
     let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
     let json_str = serde_json::to_string_pretty(&committed).unwrap();
@@ -323,6 +324,7 @@ fn committed_json_without_run_id_key_parses_as_none_and_preserves_other_d31_fiel
         started_at: parsed.started_at.clone().unwrap_or_default(),
         updated_at: "2026-07-03T00:00:00Z".to_string(),
         run_id: None,
+        claude_sessions: Vec::new(),
     };
     let rewritten = parsed.to_committed_state_json(&run_meta, None, None, None, None, None);
     assert_eq!(rewritten["run_id"], serde_json::Value::Null);

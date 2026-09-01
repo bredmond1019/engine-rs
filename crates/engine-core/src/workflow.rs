@@ -733,6 +733,14 @@ async fn node_context(
         }
         Err(err) => {
             let mut err_ctx = pre_call_ctx;
+            // The pre-call snapshot predates anything the node stamped, so a
+            // billed-but-failed LLM invocation would be lost with the
+            // discarded context. Replay the sessions the node carried out on
+            // its error (see `NodeError::sessions`) before anything else, so
+            // the `on_progress` snapshot below already includes them.
+            for session in err.sessions.iter().cloned() {
+                crate::sessions::append_session(&mut err_ctx.metadata, session);
+            }
             if let Some(run) = err_ctx.node_runs.get_mut(&identity) {
                 run.status = NodeRunStatus::Failed;
                 run.completed_at = Some(Utc::now());

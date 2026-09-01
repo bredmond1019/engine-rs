@@ -85,6 +85,7 @@ mod tests {
             text,
             is_error: false,
             api_error_status: None,
+            session_id: None,
             structured_output: None,
         }
     }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::build_info;
 use crate::node::NodeError;
+use crate::sessions::ClaudeSession;
 
 use super::policy::{PartialPolicy, SdlcPolicy};
 
@@ -579,6 +580,26 @@ pub struct SDLCState {
     /// sets it), or for a run that had no run_id stamped.
     #[serde(default)]
     pub run_id: Option<String>,
+    /// The Claude CLI sessions this run consumed, in invocation order — the
+    /// exact join keys to their transcripts at
+    /// `~/.claude/projects/<project>/<session_id>.jsonl`, where the real token
+    /// usage lives.
+    ///
+    /// Deliberately NOT named `workflow_run_id` (base-template's JS-engine
+    /// field). That field is a scalar Workflow-tool run id whose transcript
+    /// lives at a different path shape; putting Claude session UUIDs behind
+    /// that name would make a consumer join under
+    /// `subagents/workflows/wf_*/agent-*.jsonl`, find nothing, and report the
+    /// data absent rather than erroring — a silent wrong answer.
+    ///
+    /// Distinct from [`Self::run_id`], which stays the run's own identity
+    /// (the engine's `events.id`, joining to Postgres). Neither substitutes
+    /// for the other.
+    ///
+    /// Empty for states written before this field existed, for runs that made
+    /// no LLM call, and for anything written by the JS engines.
+    #[serde(default)]
+    pub claude_sessions: Vec<ClaudeSession>,
 }
 
 impl SDLCState {
@@ -600,6 +621,7 @@ impl SDLCState {
             updated_at: None,
             bail_reason: None,
             run_id: None,
+            claude_sessions: Vec::new(),
         }
     }
 
@@ -688,6 +710,7 @@ impl SDLCState {
             "started_at": run_meta.started_at,
             "updated_at": run_meta.updated_at,
             "run_id": run_meta.run_id,
+            "claude_sessions": run_meta.claude_sessions,
             "status": status,
             "current_task": current_task,
             "tasks": serde_json::Value::Object(tasks_obj),
@@ -798,6 +821,18 @@ impl SDLCState {
             .get("run_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // Absent key, `null`, or a malformed entry all read as an empty ledger —
+        // this is a telemetry channel and must never fail a state load.
+        let claude_sessions = value
+            .get("claude_sessions")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| serde_json::from_value::<ClaudeSession>(e.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
         let global_status = value
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -819,6 +854,7 @@ impl SDLCState {
             updated_at,
             bail_reason,
             run_id,
+            claude_sessions,
         })
     }
 }
@@ -828,7 +864,8 @@ impl SDLCState {
 /// outside `SDLCState`'s own long-lived data (see that method's doc comment
 /// for why `branch`/`worktree_path`/`started_at`/`updated_at` are parameters
 /// rather than read from `self`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: `ClaudeSession` carries `f64` costs.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunMeta {
     /// The git branch this run executed on.
     pub branch: String,
@@ -845,6 +882,15 @@ pub struct RunMeta {
     /// for any engine-rs run that (for whatever reason) never had a run_id
     /// stamped into `ctx.metadata` (see `Workflow::run_with`/`run_from`).
     pub run_id: Option<String>,
+    /// Every Claude CLI session this run consumed, in invocation order, read
+    /// out of `ctx.metadata`'s ledger (`crate::sessions`).
+    ///
+    /// A LIST, never a scalar: an engine-rs run is 1:N with Claude sessions
+    /// (one headless invocation per LLM stage per attempt, no `--resume`), so
+    /// a single id would name one segment and silently lose the rest.
+    /// Empty for a run that made no LLM call, and for states written by
+    /// base-template's JS engines, which do not carry this ledger.
+    pub claude_sessions: Vec<ClaudeSession>,
 }
 
 /// The `ConsolidatedReviewNode` verdict block, reshaped into the D31
@@ -1385,6 +1431,7 @@ mod tests {
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:10:00Z".to_string(),
             run_id: None,
+            claude_sessions: Vec::new(),
         }
     }
 
@@ -1469,6 +1516,128 @@ mod tests {
         assert_eq!(
             round_tripped.run_id,
             Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string())
+        );
+    }
+
+    /// The ledger is the whole point of the field: an engine-rs run spans one
+    /// Claude session per LLM stage per attempt, so every entry must survive
+    /// the committed-state write, in order, failures included.
+    #[test]
+    fn claude_sessions_round_trip_through_committed_json_in_order() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![task(1, SDLCTaskStatus::Done)];
+        let mut meta = run_meta();
+        meta.claude_sessions = vec![
+            ClaudeSession {
+                node: "ImplementNode".to_string(),
+                session_id: Some("sess-1".to_string()),
+                ok: true,
+                ..Default::default()
+            },
+            ClaudeSession {
+                node: "TestNode".to_string(),
+                session_id: Some("sess-2".to_string()),
+                ok: false,
+                ..Default::default()
+            },
+            ClaudeSession {
+                node: "TestNode".to_string(),
+                session_id: Some("sess-3".to_string()),
+                ok: true,
+                ..Default::default()
+            },
+        ];
+
+        let json = state.to_committed_state_json(&meta, None, None, None, None, None);
+        assert_eq!(json["claude_sessions"][0]["session_id"], "sess-1");
+        assert_eq!(json["claude_sessions"][1]["ok"], false);
+
+        let round_tripped =
+            SDLCState::from_committed_state_json(&json).expect("round-trip should parse");
+
+        assert_eq!(
+            round_tripped
+                .claude_sessions
+                .iter()
+                .filter_map(|s| s.session_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["sess-1", "sess-2", "sess-3"],
+            "invocation order is the ledger's meaning and must survive the write"
+        );
+        assert!(!round_tripped.claude_sessions[1].ok);
+        assert_eq!(round_tripped.claude_sessions[1].node, "TestNode");
+    }
+
+    /// `claude_sessions` must never be confused with, or overwrite, `run_id` —
+    /// they answer different questions (which transcripts vs. which engine run)
+    /// and a consumer needs both.
+    #[test]
+    fn claude_sessions_and_run_id_are_independent_fields() {
+        let mut state = SDLCState::new("EN.4.1-fixture");
+        state.tasks = vec![task(1, SDLCTaskStatus::Done)];
+        let mut meta = run_meta();
+        meta.run_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string());
+        meta.claude_sessions = vec![ClaudeSession {
+            node: "ImplementNode".to_string(),
+            session_id: Some("sess-1".to_string()),
+            ok: true,
+            ..Default::default()
+        }];
+
+        let json = state.to_committed_state_json(&meta, None, None, None, None, None);
+
+        assert_eq!(json["run_id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert_eq!(json["claude_sessions"][0]["session_id"], "sess-1");
+    }
+
+    /// A state written by base-template's JS engines carries no
+    /// `claude_sessions` key at all. That must read as an empty ledger, never
+    /// as a parse failure — this is a telemetry channel and must not be able to
+    /// fail a state load.
+    #[test]
+    fn from_committed_state_json_without_claude_sessions_reports_an_empty_ledger() {
+        let value = serde_json::json!({
+            "spec_slug": "js-engine-fixture",
+            "branch": "sdlc/js-engine-fixture",
+            "worktree_path": "trees/sdlc/js-engine-fixture",
+            "started_at": "2026-07-25T00:00:00Z",
+            "updated_at": "2026-07-25T00:10:00Z",
+            "status": "running",
+            "current_task": 1,
+            "tasks": {},
+        });
+
+        let state = SDLCState::from_committed_state_json(&value).expect("must parse");
+        assert!(state.claude_sessions.is_empty());
+    }
+
+    /// A malformed entry is skipped, and never takes the valid entries around
+    /// it (or the whole state load) down with it.
+    #[test]
+    fn malformed_claude_sessions_entries_are_skipped_not_fatal() {
+        let value = serde_json::json!({
+            "spec_slug": "fixture",
+            "branch": "b",
+            "worktree_path": "w",
+            "started_at": "2026-07-25T00:00:00Z",
+            "updated_at": "2026-07-25T00:10:00Z",
+            "status": "running",
+            "tasks": {},
+            "claude_sessions": [
+                { "node": "ImplementNode", "session_id": "sess-1", "ok": true },
+                "not an object",
+                { "node": "TestNode", "session_id": "sess-2", "ok": false },
+            ],
+        });
+
+        let state = SDLCState::from_committed_state_json(&value).expect("must parse");
+        assert_eq!(
+            state
+                .claude_sessions
+                .iter()
+                .filter_map(|s| s.session_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["sess-1", "sess-2"]
         );
     }
 
@@ -2009,6 +2178,7 @@ mod tests {
             started_at: "2026-07-25T00:00:00Z".to_string(),
             updated_at: "2026-07-25T00:10:00Z".to_string(),
             run_id: None,
+            claude_sessions: Vec::new(),
         };
         let review = CommittedReview {
             verdict: "PASS".to_string(),

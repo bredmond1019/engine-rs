@@ -443,6 +443,7 @@ mod tests {
                 text: json!({ "summary": "ok", "files_patched": [] }).to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
@@ -463,6 +464,7 @@ mod tests {
                 text: reply.to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
@@ -486,6 +488,7 @@ mod tests {
                 text: "not fence-parseable json".to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: Some(structured.clone()),
             };
             Box::pin(async move { Ok(outcome) })
@@ -587,6 +590,7 @@ mod tests {
                 text: reply.to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
@@ -807,6 +811,7 @@ mod tests {
                 text: "not json".to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })

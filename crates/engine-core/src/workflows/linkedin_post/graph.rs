@@ -865,6 +865,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                     },
                     model_usage: BTreeMap::new(),
+                    session_id: None,
                     structured_output: Some(structured),
                     is_error: false,
                     api_error_status: None,

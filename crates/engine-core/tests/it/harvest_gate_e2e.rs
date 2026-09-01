@@ -70,6 +70,7 @@ fn stub_outcome(structured: Value) -> Outcome {
         text: serde_json::to_string(&structured).unwrap(),
         is_error: false,
         api_error_status: None,
+        session_id: None,
         structured_output: Some(structured),
     }
 }

@@ -382,6 +382,7 @@ async fn patch_docs_node_with_the_write_grant_is_scoped_to_the_worktree() {
                 text: json!({ "summary": "ok", "files_patched": [] }).to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })

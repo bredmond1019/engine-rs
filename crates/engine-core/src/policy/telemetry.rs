@@ -259,9 +259,41 @@ pub fn harvest(
     now: DateTime<Utc>,
     inputs: RunTelemetryInputs<'_>,
 ) -> RunTelemetry {
-    let (total_input_tokens, total_output_tokens) = total_tokens(ctx);
-    let (total_cache_read_tokens, total_cache_creation_tokens) =
-        total_cache_tokens(ctx, inputs.cost_bearing_stages);
+    // Prefer the per-invocation ledger (`crate::sessions`) over the per-stage scans below.
+    //
+    // The scans read each stage's LAST recorded value out of `ctx.nodes`/`ctx.node_runs`, both of
+    // which are keyed by node identity and overwritten every time that node runs again. A task
+    // loop that ran `ImplementNode` six times therefore contributed only its sixth call — a
+    // systematic UNDERCOUNT that grew with the number of retries and review rounds, i.e. worst
+    // exactly on the expensive runs. The ledger holds one entry per invocation, so summing it is
+    // the run's real spend.
+    //
+    // The scans remain the fallback for an empty ledger, which is not the same as a free run: a
+    // state written before the ledger existed, or a workflow whose cost-bearing nodes are not
+    // `ClaudeCodeStep` and stamp `cost_usd` themselves, both land here. Preferring a populated
+    // ledger and falling back otherwise keeps every such caller reporting exactly what it did
+    // before.
+    let ledger = crate::sessions::ledger_totals(&ctx.metadata);
+    let use_ledger = ledger.invocations > 0;
+
+    let (total_input_tokens, total_output_tokens) = if use_ledger {
+        (ledger.input_tokens, ledger.output_tokens)
+    } else {
+        total_tokens(ctx)
+    };
+    let (total_cache_read_tokens, total_cache_creation_tokens) = if use_ledger {
+        (
+            ledger.cache_read_input_tokens,
+            ledger.cache_creation_input_tokens,
+        )
+    } else {
+        total_cache_tokens(ctx, inputs.cost_bearing_stages)
+    };
+    let resolved_cost_usd = if use_ledger {
+        ledger.cost_usd
+    } else {
+        total_cost_usd(ctx, inputs.cost_bearing_stages)
+    };
 
     // Observed (task 9's transport stamp) overlays caller-supplied (the
     // resolved policy's intent): the caller-supplied map is the fallback
@@ -279,7 +311,7 @@ pub fn harvest(
         review_verdicts: review_verdicts(ctx, inputs.verdict_stages),
         total_input_tokens,
         total_output_tokens,
-        total_cost_usd: total_cost_usd(ctx, inputs.cost_bearing_stages),
+        total_cost_usd: resolved_cost_usd,
         total_cache_read_tokens,
         total_cache_creation_tokens,
         model_tier_used,

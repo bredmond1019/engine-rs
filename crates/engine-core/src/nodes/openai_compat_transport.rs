@@ -147,6 +147,10 @@ fn outcome_from_chat_completion(model: &str, response: &Value) -> Result<Outcome
         text,
         is_error: false,
         api_error_status: None,
+        // A local OpenAI-compatible endpoint is not a Claude CLI session and writes no transcript,
+        // so there is genuinely no session id to report. `None` says exactly that; a synthesized
+        // id would be worse than absence.
+        session_id: None,
         structured_output: None,
     })
 }
@@ -402,6 +406,7 @@ mod tests {
                     text,
                     is_error: false,
                     api_error_status: None,
+                    session_id: None,
                     structured_output: None,
                 })
             })

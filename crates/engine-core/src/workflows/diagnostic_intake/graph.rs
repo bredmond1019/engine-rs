@@ -368,6 +368,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                     },
                     model_usage: std::collections::BTreeMap::new(),
+                    session_id: None,
                     structured_output: Some(serde_json::json!({
                         "company_name": "Loja da Ana",
                         "company_type": "retail SMB",

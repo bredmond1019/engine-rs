@@ -138,6 +138,7 @@ pub(crate) fn build_run_meta(
         started_at,
         updated_at: now,
         run_id: crate::read_run_id(&ctx.metadata),
+        claude_sessions: crate::sessions::read_sessions(&ctx.metadata),
     }
 }
 
@@ -2452,6 +2453,7 @@ mod tests {
             started_at: "2026-07-01T00:00:00Z".to_string(),
             updated_at: "2026-07-01T00:00:00Z".to_string(),
             run_id: None,
+            claude_sessions: Vec::new(),
         };
         let committed = state.to_committed_state_json(&run_meta, None, None, None, None, None);
         let json = serde_json::to_string_pretty(&committed).unwrap();

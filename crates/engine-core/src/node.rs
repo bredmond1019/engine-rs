@@ -45,16 +45,37 @@ use crate::routing::Router;
 /// Error returned by a node's `process` when it fails. Carries a human-readable
 /// message; the runner stores this in the node's `NodeRun.error` field and
 /// halts the walk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeError {
     pub message: String,
+    /// LLM sessions the node had already established when it failed
+    /// (`crate::sessions`). Empty for every node that makes no LLM call, and
+    /// for a failure that never reached a session at all.
+    ///
+    /// This field exists because a failing node's `TaskContext` is DISCARDED:
+    /// `crate::workflow::node_context` reverts to its pre-call snapshot on
+    /// `Err`, so anything `process` stamped before returning is lost. A
+    /// billed-but-failed invocation would therefore vanish from the ledger —
+    /// understating exactly the attempts a cost comparison cares about most.
+    /// Carrying them on the error is the only path back into the context;
+    /// `node_context` appends them to the reverted snapshot.
+    pub sessions: Vec<crate::sessions::ClaudeSession>,
 }
 
 impl NodeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            sessions: Vec::new(),
         }
+    }
+
+    /// Attach the sessions this node had established before it failed, so they
+    /// survive the discarded `TaskContext`. See [`NodeError::sessions`].
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: Vec<crate::sessions::ClaudeSession>) -> Self {
+        self.sessions = sessions;
+        self
     }
 }
 

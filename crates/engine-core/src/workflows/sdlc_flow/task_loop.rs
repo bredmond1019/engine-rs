@@ -3248,6 +3248,7 @@ fn build_run_meta(ctx: &TaskContext, worktree: &str, state_path: &Path) -> RunMe
         started_at,
         updated_at: now,
         run_id: crate::read_run_id(&ctx.metadata),
+        claude_sessions: crate::sessions::read_sessions(&ctx.metadata),
     }
 }
 
@@ -4014,6 +4015,7 @@ mod tests {
                 text: json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
@@ -4058,6 +4060,7 @@ mod tests {
                 text: json!({ "verdict": "MAJOR_BAIL", "reason": "hopeless" }).to_string(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
@@ -6397,6 +6400,7 @@ mod tests {
                 text: canned.clone(),
                 is_error: false,
                 api_error_status: None,
+                session_id: None,
                 structured_output: None,
             };
             Box::pin(async move { Ok(outcome) })
@@ -6992,6 +6996,7 @@ mod tests {
             text,
             is_error: false,
             api_error_status: None,
+            session_id: None,
             structured_output: None,
         }
     }

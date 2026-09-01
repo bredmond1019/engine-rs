@@ -18,6 +18,7 @@ use futures::future::BoxFuture;
 
 use crate::cancellation::CancellationToken;
 use crate::node::{Node, NodeError};
+use crate::sessions::{append_session, ClaudeSession};
 use crate::workflows::sdlc_flow::policy::TransportRetry;
 
 /// Stand-in for `Usage::model` when the SDK reports no model.
@@ -49,6 +50,41 @@ fn is_retryable_transport_error(err: &claude_code_rs::Error) -> bool {
             | claude_code_rs::Error::Cli { .. }
             | claude_code_rs::Error::Api { .. }
     )
+}
+
+/// Append `sessions` to `ctx`'s run-scoped ledger, in order.
+fn record_sessions(ctx: &mut TaskContext, sessions: Vec<ClaudeSession>) {
+    for session in sessions {
+        append_session(&mut ctx.metadata, session);
+    }
+}
+
+/// A ledger entry for a failed attempt that was nonetheless BILLED, if this error describes one.
+///
+/// Only [`claude_code_rs::Error::Api`] does: that is the failure where the CLI ran, reached the
+/// API, and was charged for the attempt — the envelope reports `session_id`, `total_cost_usd` and
+/// `usage` exactly as a success does. `Spawn`/`BinaryNotFound`/`Timeout`/`Parse` never got an
+/// envelope, so nothing about their cost is known; they return `None` and are recorded nowhere,
+/// because a zero-cost entry would assert a measurement that was never made.
+fn billed_failure(err: &claude_code_rs::Error, node: &str) -> Option<ClaudeSession> {
+    match err {
+        claude_code_rs::Error::Api {
+            session_id,
+            cost_usd,
+            usage,
+            ..
+        } => Some(ClaudeSession {
+            node: node.to_string(),
+            session_id: session_id.clone(),
+            ok: false,
+            cost_usd: *cost_usd,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        }),
+        _ => None,
+    }
 }
 
 /// Result of [`call_with_retry`]: either the transport eventually succeeded,
@@ -95,12 +131,17 @@ async fn race_one_attempt<T>(
 /// - A persistent error (non-retryable, or the budget exhausted) becomes a
 ///   [`NodeError`] carrying the underlying transport message — never a
 ///   generic "retries exhausted" string.
+/// - Every attempt that failed with an established CLI session pushes a
+///   `ok: false` entry onto `failed_sessions`, so a billed failure stays
+///   attributable even though its `TaskContext` is discarded.
 /// - `max_attempts <= 1` behaves exactly as the pre-retry code did: one
 ///   attempt, no backoff, first error is fatal.
 async fn call_with_retry<T, F>(
     mut make_attempt: F,
     retry: TransportRetry,
     token: Option<&CancellationToken>,
+    node: &str,
+    failed_sessions: &mut Vec<ClaudeSession>,
 ) -> RetriedCall<T>
 where
     F: FnMut() -> BoxFuture<'static, claude_code_rs::Result<T>>,
@@ -114,6 +155,15 @@ where
             None => return RetriedCall::Cancelled,
             Some(Ok(value)) => return RetriedCall::Ok(value),
             Some(Err(err)) => {
+                // Every failed attempt that reached the API is its own billed call — a retried
+                // timeout can burn as many tokens as the attempt that finally succeeded. Record
+                // each one, not just the last. A failure with no envelope
+                // (`Spawn`/`Timeout`/`Parse`) reports no billing and is not recorded: we know
+                // nothing about it, and a zero-cost entry would assert something we did not
+                // measure.
+                if let Some(session) = billed_failure(&err, node) {
+                    failed_sessions.push(session);
+                }
                 let budget_exhausted = attempt >= total_attempts;
                 if budget_exhausted || !is_retryable_transport_error(&err) {
                     return RetriedCall::Err(NodeError::new(err.to_string()));
@@ -356,6 +406,11 @@ impl Node for ClaudeCodeStep {
             PromptSource::Builder(builder) => builder(&ctx),
         };
 
+        // Sessions established by attempts that FAILED. Collected separately from the context
+        // because `process` may return `Err` below, and `workflow::node_context` discards the
+        // context on `Err` — they ride out on the `NodeError` instead (see `NodeError::sessions`).
+        let mut failed_sessions: Vec<ClaudeSession> = Vec::new();
+
         let (outcome, transport_info) = match &self.meta_transport {
             Some(meta_transport) => {
                 let meta_transport = Arc::clone(meta_transport);
@@ -364,15 +419,21 @@ impl Node for ClaudeCodeStep {
                     move || meta_transport(config.clone(), prompt.clone()),
                     self.retry,
                     self.cancellation_token.as_ref(),
+                    &self.name,
+                    &mut failed_sessions,
                 )
                 .await;
 
                 match call_result {
                     // A cancel win returns `Ok(ctx)` rather than `Err` — see
                     // `with_cancellation_token`'s doc comment. `call_with_retry`
-                    // never retries past a cancellation.
-                    RetriedCall::Cancelled => return Ok(ctx),
-                    RetriedCall::Err(err) => return Err(err),
+                    // never retries past a cancellation. The context survives here,
+                    // so any billed failed attempt goes straight into its ledger.
+                    RetriedCall::Cancelled => {
+                        record_sessions(&mut ctx, failed_sessions);
+                        return Ok(ctx);
+                    }
+                    RetriedCall::Err(err) => return Err(err.with_sessions(failed_sessions)),
                     RetriedCall::Ok(value) => value,
                 }
             }
@@ -383,6 +444,8 @@ impl Node for ClaudeCodeStep {
                     move || transport(config.clone(), prompt.clone()),
                     self.retry,
                     self.cancellation_token.as_ref(),
+                    &self.name,
+                    &mut failed_sessions,
                 )
                 .await;
 
@@ -392,8 +455,11 @@ impl Node for ClaudeCodeStep {
                     // completion, and is never retried. Returning `Ok(ctx)`
                     // unchanged here — not `Err` — is deliberate: see
                     // `with_cancellation_token`'s doc comment.
-                    RetriedCall::Cancelled => return Ok(ctx),
-                    RetriedCall::Err(err) => return Err(err),
+                    RetriedCall::Cancelled => {
+                        record_sessions(&mut ctx, failed_sessions);
+                        return Ok(ctx);
+                    }
+                    RetriedCall::Err(err) => return Err(err.with_sessions(failed_sessions)),
                     RetriedCall::Ok(value) => value,
                 };
 
@@ -434,8 +500,35 @@ impl Node for ClaudeCodeStep {
             // two fields are most of the real spend on a warm run.
             "cache_read_input_tokens": outcome.usage.cache_read_input_tokens,
             "cache_creation_input_tokens": outcome.usage.cache_creation_input_tokens,
+            // The exact join key to this invocation's CLI transcript
+            // (`~/.claude/projects/<project>/<session_id>.jsonl`), stamped per rule 6's
+            // telemetry convention. Also appended to the run-scoped ledger below — this
+            // per-node copy is the LATEST invocation only, since a task loop re-runs the
+            // same node identity and overwrites its `ctx.nodes` entry; the ledger is what
+            // keeps every one of them.
+            "session_id": outcome.session_id,
         });
         ctx.nodes.insert(self.name.clone(), output);
+
+        // Order matters: the failed attempts happened BEFORE the one that succeeded, and the
+        // ledger's order is the order of invocation.
+        record_sessions(&mut ctx, failed_sessions);
+        // Recorded unconditionally, even with no `session_id` (a local OpenAI-compatible transport
+        // establishes no Claude session): the call still cost money, and the ledger is what the
+        // run's cost total is summed from. Only the transcript join is missing.
+        append_session(
+            &mut ctx.metadata,
+            ClaudeSession {
+                node: self.name.clone(),
+                session_id: outcome.session_id.clone(),
+                ok: true,
+                cost_usd: outcome.cost_usd,
+                input_tokens: outcome.usage.input_tokens,
+                output_tokens: outcome.usage.output_tokens,
+                cache_read_input_tokens: outcome.usage.cache_read_input_tokens,
+                cache_creation_input_tokens: outcome.usage.cache_creation_input_tokens,
+            },
+        );
 
         let usage = Usage {
             input_tokens: Some(outcome.usage.input_tokens),
@@ -511,6 +604,7 @@ mod tests {
             text: "ok".to_string(),
             is_error: false,
             api_error_status: None,
+            session_id: None,
             structured_output: None,
         }
     }
