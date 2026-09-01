@@ -1,6 +1,6 @@
 {
-  "version": "f9c45547a1634f97189efa85a9efcc8c9c246e12",
-  "generated": "2026-08-31",
+  "version": "2a3ba35a1e07c8abc4ae231ac9bd5131fd51c384",
+  "generated": "2026-09-01",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
     ".claude/commands/backlog-ticket.md": "300b15c584866e1beb86e6b12ae9aa1941f0373b94da635da39030970514c925",
@@ -65,7 +65,7 @@
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
     ".claude/skills/write-okf-markdown/SKILL.md": "4351d746da220e56483a0721afba54a827c9465c20270c8f57a640a8ae7e1e58",
     ".claude/skills/edit-state-json/SKILL.md": "d46a91fb0383b59cb835b7b5ab4812918b55e174eb1d867a7f149c4d8e442262",
-    ".claude/skills/commit-in-this-fleet/SKILL.md": "efed90e58188d18556829f513d244f7511bc8f3e68fdd43ec7f56d02b0868333",
+    ".claude/skills/commit-in-this-fleet/SKILL.md": "742bc5ff5c8d1396e83845eaae397591384da4b17652462f003f7c521e177311",
     ".claude/skills/derive-state-safely/SKILL.md": "6a635a9f89f94ee6c55c297f35e3e71d3349e406a2fc7eb98e89e94d4517a162",
     ".claude/skills/run-the-gates/SKILL.md": "4e8879060ec8c6adc9cb56b274d27b4b841c43160c3593fdf0ad8aec31182d5f",
     ".claude/skills/stop-or-continue/SKILL.md": "1b67799b753f527f9b5f9c842e861e0bafcd575784dcbb43877c864e0e44a9ba",
@@ -81,7 +81,7 @@
     ".agents/skills/sdlc-flow/SKILL.md": "98e852d6842f431743bf20c857f83452609da25f407f3449673fa2e9510d27f9",
     ".agents/skills/write-okf-markdown/SKILL.md": "ebe8c47dbbd7a436486b7db452228f560af1a6e65b1ba50a0274313fb1bbd5da",
     ".agents/skills/edit-state-json/SKILL.md": "ccc2728a263222d93253f8e9d5e4cd5b474e11d6525d49989afc5fa2df1ab44d",
-    ".agents/skills/commit-in-this-fleet/SKILL.md": "a69d0ae450ea9a9839fab1181b28946c4e21e982e67605100cdc440b13698b32",
+    ".agents/skills/commit-in-this-fleet/SKILL.md": "d328f24ac934aba098a0fbbec5878e9712d1968107e130f7cb6157f45583b302",
     ".agents/skills/derive-state-safely/SKILL.md": "6383944e85741d6dbdeb2038ec44d697b689b976cb675c8409e7aee0fe453d76",
     ".agents/skills/run-the-gates/SKILL.md": "f440a0bdf3421966a1a497bce29452b9b7adec8759cb3ab1422c0259316b3a6e",
     ".agents/skills/stop-or-continue/SKILL.md": "1b67799b753f527f9b5f9c842e861e0bafcd575784dcbb43877c864e0e44a9ba",
@@ -91,11 +91,12 @@
     ".agents/skills/notify-operator/SKILL.md": "f03c1c71ed913af454ff2085ad56edddb5c5c6824fe837880a42d70dc1c9cd43",
     ".agents/skills/check-blast-radius/SKILL.md": "75f94560df69a84f97ff7b272a1e5538e331f7cc11c950860a38736fc1bb35e9",
     ".agents/skills/pick-the-next-block/SKILL.md": "9654dde6a74942dde60a56f0ac082b14bb66db4cc0ca929ee30e4a437dbcaf09",
-    "hooks/pre-push": "1d690176202897306e6643258c73fe50c05db608c1622e590d08ba07cf794cc9",
-    "hooks/test_pre_push.sh": "bfa8d5fdca6642611dcf680fe5502902be34acb7387b84b61b1ddfade429948b",
-    "hooks/README.md": "56ec7fa9341bd6ee9e50ec4ef07866274d7cc46de9dfd603de9af5e93d5c0f88",
-    "hooks/pre-commit": "71fb44a4ca632d2cc2de530197e120bd38b8e2345b09ff5954076ddc0064b32e",
+    "hooks/pre-push": "cfa9992dcd433d2bb5851d3ede8af83c2d4193c28b2544c26e0a1e4f89b0efe6",
+    "hooks/test_pre_push.sh": "1609949cc90574cdbbfc56839dec391bf40ec21037fe44f25aad43b52113d7d1",
+    "hooks/README.md": "9d62e5a6935ecb7666aa689bca367b1ccbb3767210f234795575a4b714815b2c",
+    "hooks/pre-commit": "c83a57c8aaa9bc19603a7a46f0b1e84bf93455914d9ad22bb26fa41aa59d2cb9",
     "hooks/check_frontmatter.py": "17fae8bdee56afd63f935e432d519d37d1fb4e4b1371dbbe635c9e304a7300e8",
-    "hooks/test_pre-commit.sh": "397820d2fdf680905147910f2a71ff672759bf159821f8bf41e145599d9d4fed"
+    "hooks/test_pre-commit.sh": "796f3db371bc2ce5e51f9192fd7b7f3805df469c98747ab5c7e3c6e2e2bb44cb",
+    "hooks/validate_brain_gate.sh": "304c66c3940089624ebbc96d978473c1bce3e21ed5f0d41788692498e1b4011f"
   }
 }

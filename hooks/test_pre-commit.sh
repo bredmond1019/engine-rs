@@ -24,6 +24,7 @@ unset -v GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
 
 HOOK_SRC="$(cd "$(dirname "$0")" && pwd)/pre-commit"
 CHECKER_SRC="$(cd "$(dirname "$0")" && pwd)/check_frontmatter.py"
+GATE_SRC="$(cd "$(dirname "$0")" && pwd)/validate_brain_gate.sh"
 BRAIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # check_frontmatter.py's two escape hatches delegate to base-template's
 # scripts/check_frontmatter_presence.py (BT.ticket.engine-docs-drift-tripwire HALF A).
@@ -64,6 +65,7 @@ new_repo() { # new_repo <dir>
     mkdir -p hooks
     cp "$HOOK_SRC" hooks/pre-commit; chmod +x hooks/pre-commit
     cp "$CHECKER_SRC" hooks/check_frontmatter.py
+    cp "$GATE_SRC" hooks/validate_brain_gate.sh
     # Mirror the sibling-repo layout check_frontmatter.py's _presence_check() expects:
     # <this test repo>/base-template/scripts/check_frontmatter_presence.py.
     if [ -n "$PRESENCE_SRC" ] && [ -f "$PRESENCE_SRC" ]; then
@@ -374,6 +376,179 @@ write_md "$R19/d.md" 'created: "2026-13-40"' "updated: 2026-08-29"
 ( cd "$R19" && git add d.md )
 commit_dated "$R19"
 check "date gate on: impossible date (2026-13-40) blocked" "$([ "$RC" -ne 0 ]; echo $?)"
+
+# ── gate 2: corpus graph/structure delta gate (added 2026-09-01) ──────────────
+# Fake `bastion`: the gate calls `bastion validate-brain <flag>` once per flag in
+# --graph --structure (that order — see hooks/pre-commit's own call). The shim reads the
+# desired per-invocation error count from $BASTION_SHIM_ERRORS (space-separated, one per
+# flag in that order) and prints a canned summary line, plus one `error [...]` diagnostic
+# line per reported error — same shape hooks/test_pre_push.sh's shim uses for stage 1, so
+# the two suites exercise the identical shared hooks/validate_brain_gate.sh contract.
+GATE_BIN="$WORK/gate-bin"; mkdir -p "$GATE_BIN"
+cat > "$GATE_BIN/bastion" <<'SH'
+#!/usr/bin/env bash
+# invoked as: bastion validate-brain <flag>
+flag="$2"
+flags=(--graph --structure)
+idx=-1
+for i in "${!flags[@]}"; do
+  [ "${flags[$i]}" = "$flag" ] && idx="$i"
+done
+read -r -a errs <<< "${BASTION_SHIM_ERRORS:-0 0}"
+n="${errs[$idx]:-0}"
+n="${n:-0}"
+# Real directory, inside THIS fixture's own git repo, so the gate's repo-ownership
+# classifier (`git -C <dir> rev-parse --show-toplevel`) can resolve it and correctly
+# attribute these diagnostics to this repo rather than falling back to unattributable
+# (never-blocking) advisory.
+mkdir -p shim
+i=0
+while [ "$i" -lt "$n" ]; do
+  echo "error [E_FAKE] shim/doc-$i.md — fake diagnostic for $flag"
+  i=$((i + 1))
+done
+# One more, ONLY on the flag NESTED_ERROR_ON_FLAG names, pointing at NESTED_REPO_ERROR_PATH
+# — used by the cross-repo advisory cases below, which need an error attributable to a
+# DIFFERENT git repo than the one committing. Counted into the reported total so the
+# summary line and the diagnostic count stay consistent.
+total="$n"
+if [ -n "${NESTED_REPO_ERROR_PATH:-}" ] && [ "${NESTED_ERROR_ON_FLAG:-}" = "$flag" ]; then
+  echo "error [E_FAKE] $NESTED_REPO_ERROR_PATH — fake diagnostic for a DIFFERENT repo's file"
+  total=$((total + 1))
+fi
+echo "validated $PWD: $total error(s), 0 warning(s)"
+[ "$total" -gt 0 ] && exit 1
+exit 0
+SH
+chmod +x "$GATE_BIN/bastion"
+
+new_gated_repo() { # new_gated_repo <dir> -- new_repo() plus a brain.toml, so gate 2 engages
+  local d="$1"
+  new_repo "$d"
+  printf '[[repos]]\n' > "$d/brain.toml"
+}
+
+commit_ok_gated() { # commit_ok_gated <dir> [env-assignment ...] -> sets RC, OUT; bastion shim on PATH
+  local d="$1"; shift
+  OUT="$(cd "$d" && env "$@" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"
+  RC=$?
+}
+
+# --- Case 20: gate 2, brain.toml present, bastion shim reports 0 errors -> commit succeeds,
+# and the gate visibly ran (not silently skipped) ---
+R20="$WORK/r20"; new_gated_repo "$R20"
+cat > "$R20/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R20" && git add clean.md )
+commit_ok_gated "$R20" BASTION_SHIM_ERRORS="0 0"
+check "gate 2: brain.toml + bastion, 0 errors: commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+check "gate 2: ran (not silently skipped)" "$(printf '%s' "$OUT" | grep -q "running validate-brain gate" ; echo $?)"
+
+# --- Case 21: gate 2, a fresh fixture (no .git/validate-last-good.json yet) introduces
+# 1 --graph error -> falls back to the tracked baseline (0, no hooks/validate-baseline.json
+# in this fixture either) -> BLOCKED ---
+R21="$WORK/r21"; new_gated_repo "$R21"
+cat > "$R21/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R21" && git add clean.md )
+commit_ok_gated "$R21" BASTION_SHIM_ERRORS="1 0"
+check "gate 2: new error, no baseline: commit blocked" "$([ "$RC" -ne 0 ]; echo $?)"
+check "gate 2: block message names the new diagnostic" "$(printf '%s' "$OUT" | grep -q "E_FAKE" ; echo $?)"
+
+# --- Case 22: gate 2, the SAME error already recorded in .git/validate-last-good.json
+# (simulating: someone else's earlier commit already let this one through) -> this commit
+# is NOT blocked for it — the fairness property the whole gate exists for ---
+R22="$WORK/r22"; new_gated_repo "$R22"
+git_dir="$(cd "$R22" && git rev-parse --git-dir)"
+cat > "$R22/$git_dir/validate-last-good.json" <<'EOF'
+{"errors": ["error [E_FAKE] shim/doc-0.md — fake diagnostic for --graph"]}
+EOF
+cat > "$R22/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R22" && git add clean.md )
+commit_ok_gated "$R22" BASTION_SHIM_ERRORS="1 0"
+check "gate 2: pre-existing (already-known) error: commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+check "gate 2: pre-existing error reported as non-blocking" "$(printf '%s' "$OUT" | grep -q "no NEW errors" ; echo $?)"
+
+# --- Case 23: gate 2, brain.toml present but bastion NOT on PATH -> degrades gracefully,
+# commit succeeds, warning printed (same non-fatal contract as gate 1's missing-tool cases) ---
+R23="$WORK/r23"; new_gated_repo "$R23"
+cat > "$R23/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R23" && git add clean.md )
+OUT="$(cd "$R23" && PATH="/usr/bin:/bin" git commit -q -m test 2>&1)"; RC=$?
+check "gate 2: bastion absent: non-fatal, commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+check "gate 2: bastion absent: warning printed" "$(printf '%s' "$OUT" | grep -q "'bastion' not found on PATH" ; echo $?)"
+
+# ── repo-scoped blocking: a NEW error owned by a DIFFERENT repo is advisory, not
+# blocking (added 2026-09-01, same day as gate 2 itself — the concurrent-agents fairness
+# fix) ────────────────────────────────────────────────────────────────────────
+# Mirrors the real HQ / core/bastion-ui relationship: an OUTER repo (this fixture's own
+# git, with brain.toml) containing a NESTED repo (its own separate .git, no brain.toml —
+# find_brain_root walks up through it to the outer one, exactly like a real sub-repo).
+new_nested_repo() { # new_nested_repo <outer-dir> -> also creates <outer-dir>/nested (own git)
+  local d="$1"
+  new_gated_repo "$d"
+  mkdir -p "$d/nested"
+  ( cd "$d/nested" && git init -q && git config user.email t@t; git config user.name t )
+}
+
+# --- Case 24: a NEW error OWNED BY THE NESTED REPO does not block a commit in the outer
+# repo — it is reported as an advisory notice instead ---
+R24="$WORK/r24"; new_nested_repo "$R24"
+cat > "$R24/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R24" && git add clean.md )
+commit_ok_gated "$R24" BASTION_SHIM_ERRORS="0 0" NESTED_ERROR_ON_FLAG="--graph" NESTED_REPO_ERROR_PATH="nested/doc.md"
+check "cross-repo: error owned by a NESTED repo does not block the OUTER repo's commit" "$([ "$RC" -eq 0 ]; echo $?)"
+check "cross-repo: reported as a NOTICE, not a block" "$(printf '%s' "$OUT" | grep -q "NOTICE" ; echo $?)"
+check "cross-repo: notice names the nested repo's file" "$(printf '%s' "$OUT" | grep -q "nested/doc.md" ; echo $?)"
+
+# --- Case 25: same setup, but the error is owned by the OUTER repo itself (a path with
+# no nested .git between it and the outer root) -> blocks normally ---
+R25="$WORK/r25"; new_nested_repo "$R25"
+cat > "$R25/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R25" && git add clean.md )
+commit_ok_gated "$R25" BASTION_SHIM_ERRORS="0 0" NESTED_ERROR_ON_FLAG="--graph" NESTED_REPO_ERROR_PATH="own-doc.md"
+check "cross-repo: error owned by THIS (outer) repo still blocks" "$([ "$RC" -ne 0 ]; echo $?)"
+check "cross-repo: block names the outer repo's own file" "$(printf '%s' "$OUT" | grep -q "own-doc.md" ; echo $?)"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi

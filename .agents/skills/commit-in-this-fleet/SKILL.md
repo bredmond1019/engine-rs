@@ -33,13 +33,40 @@ So a sub-repo working tree spans **two** git repos: the repo's own files, and HQ
 
 ### 1. Never `git add -A`, `git add .`, `git reset`, or `git stash` here
 
-Not style — these stage the **whole index**, which includes any other session's in-flight work in the
-shared vault. This has happened repeatedly and is recorded as a fleet trap
+Not style — these stage or discard against the **whole working tree**, which includes any other
+session's in-flight work in the shared vault. `git add -A`/`git add .` sweep it into your commit;
+`git reset --hard`, `git checkout --`, and `git clean -f` **destroy** it, no commit involved. This
+has happened repeatedly and is recorded as a fleet trap
 (`bastion-web:emit-state-rewrites-sibling-repos`): one lane's `emit-state` run modified
 `core/_planning/bastion/state.json`, `core/_planning/engine-rs/state.json`, `README.md` and
 `client/_planning/<client-repo>/status.md`, *several carrying other sessions' uncommitted work* —
 a new block, a dependency-edge removal, hand-written focus prose. A bare `git add -A` after that
 sweeps all of it into your commit.
+
+**`git reset --hard` is the sharpest edge here, and it is easy to reach for it without
+recognizing the risk** — "just undo my last commit" doesn't *feel* like a fleet-wide operation
+the way `git add -A` does, but `--hard` discards **every uncommitted change in the working
+tree**, not just the commit you're undoing. Measured 2026-09-01: an agent used `git reset --hard
+HEAD~1` in HQ root to discard one unwanted demo commit, and it silently destroyed a separate,
+real, uncommitted feature (a hook rewrite, still in the working tree, never yet committed) sitting
+in the same tree — recovered only because the agent still had the content in its own conversation
+context. A concurrent session's uncommitted work would not have had that safety net.
+
+**To undo an already-made commit, use `git revert <sha>` instead — it never touches the working
+tree, only ever adds a new commit.** If you truly need to move `HEAD` without a revert commit,
+`git reset --soft` (never `--hard`) leaves the working tree and staged changes untouched.
+
+| Goal | Safe | Never (destroys the working tree) |
+|---|---|---|
+| Undo an already-made commit | `git revert <sha>` | `git reset --hard HEAD~1` |
+| Move HEAD, keep the changes staged | `git reset --soft <sha>` | `git reset --hard <sha>` |
+| Discard ONE file's edits | `git restore -- <path>` (after confirming via `git status` it's yours) | `git checkout .` / `git clean -f` |
+
+Before ANY of `git reset --hard`, `git checkout -- <path>`, or `git clean -f` — even when you are
+certain the change is your own — run `git status --porcelain` first. This is the standing
+system-level rule too (measure twice, cut once); it failed here specifically because the operation
+was framed as "clean up my own mistake" rather than "destructive git command in a shared repo,"
+which is exactly the framing that makes people skip the check.
 
 **Always commit with an explicit pathspec:**
 

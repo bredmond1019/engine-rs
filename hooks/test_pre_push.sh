@@ -33,6 +33,7 @@ unset -v GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
 unset PREPUSH_STRICT
 
 HOOK_SRC="$(cd "$(dirname "$0")" && pwd)/pre-push"
+GATE_SRC="$(cd "$(dirname "$0")" && pwd)/validate_brain_gate.sh"
 fail=0
 check() { # check <description> <result: 0=pass>
   if [ "$2" -eq 0 ]; then printf 'PASS: %s\n' "$1"
@@ -61,6 +62,10 @@ done
 read -r -a errs <<< "${BASTION_SHIM_ERRORS:-0 0 0 0 0}"
 n="${errs[$idx]:-0}"
 n="${n:-0}"
+# Real directory, inside THIS fixture'"'"'s own git repo, so the new gate'"'"'s repo-ownership
+# classifier (`git -C <dir> rev-parse --show-toplevel`) can resolve it and correctly
+# attribute these diagnostics to this repo.
+mkdir -p shim
 i=0
 while [ "$i" -lt "$n" ]; do
   echo "error [E_FAKE] shim/doc-$i.md — fake diagnostic for $flag"
@@ -139,6 +144,7 @@ new_repo() { # new_repo <dir>
     printf '[[repos]]\n' > brain.toml
     mkdir -p hooks
     cp "$HOOK_SRC" hooks/pre-push; chmod +x hooks/pre-push
+    cp "$GATE_SRC" hooks/validate_brain_gate.sh
   )
 }
 
@@ -241,6 +247,10 @@ done
 read -r -a errs <<< "${BASTION_SHIM_ERRORS:-0 0 0 0 0}"
 n="${errs[$idx]:-0}"
 n="${n:-0}"
+# Real directory, inside THIS fixture'"'"'s own git repo, so the new gate'"'"'s repo-ownership
+# classifier (`git -C <dir> rev-parse --show-toplevel`) can resolve it and correctly
+# attribute these diagnostics to this repo.
+mkdir -p shim
 i=0
 while [ "$i" -lt "$n" ]; do
   echo "error [E_FAKE] shim/doc-$i.md — fake diagnostic for $flag"
@@ -361,7 +371,7 @@ JSON
 touch "$R14/package.json"
 BASTION_SHIM_ERRORS="1 0 0 0 0" run_hook "$R14"   # stage 1: total 1 > baseline 0
 { [ "$HOOK_RC" -eq 1 ]; }; check "combined: stage 1 alone still blocks" $?
-printf '%s' "$HOOK_OUT" | grep -q "BLOCKED (stage 1)"; check "combined: stage 1 block message present" $?
+printf '%s' "$HOOK_OUT" | grep -qF "[stage 1/2]: BLOCKED"; check "combined: stage 1 block message present" $?
 printf '%s' "$HOOK_OUT" | grep -q "stage 2/2"; check "combined: stage 2 still ran and reported" $?
 
 # =========================================================================================
