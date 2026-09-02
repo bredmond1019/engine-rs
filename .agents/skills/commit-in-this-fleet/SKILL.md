@@ -121,6 +121,40 @@ into `.claude/worktrees/` and reports **another agent's** in-flight failures as 
 belonged to a different tree, a full diagnostic cycle wasted). Scope the command, or check
 `git worktree list` before believing a red gate.
 
+## Committing everything lingering at HQ root
+
+When the ask is "commit everything currently dirty at HQ root," not just your own change,
+don't hand-pick pathspecs file by file — use the same grouping tool `push_routine.sh`'s own
+Step 1 uses:
+
+```bash
+python3 scripts/sync/push_routine_group.py --hq-root .
+```
+
+It groups every dirty HQ-root path by project/doc-area (one sub-repo's `_planning/<slug>/`
+vault, `core/`'s own docs, `.agents/`, `.claude/`, etc.) and prints `<group>\t<path>` lines.
+Commit each group with its own explicit pathspec and message — one commit per group, never
+one commit for the whole sweep:
+
+```python
+for gkey, paths in groups.items():           # from the tab-separated output above
+    subprocess.run(["git", "add", "-A", "--", *paths])
+    subprocess.run(["git", "commit", "-o", "-q", "-m", f"chore: ... — {gkey}", "--", *paths])
+```
+
+**A file that appears mid-sweep belongs to whoever just wrote it, not to you.** Re-run
+`git status --porcelain` after the grouped commits land — if a NEW untracked or modified
+path shows up that wasn't in the original grouping, a concurrent session wrote it while you
+were committing. Leave it for the next sweep; do not fold it into your last group just
+because it happens to be dirty at the same moment. Measured 2026-09-02: a grouped 18-commit
+HQ-root sweep left exactly one file behind this way (`planning/<slug>/evidence/*.txt`,
+written by another session mid-run) — correctly, not a bug in the sweep.
+
+A single group's commit can transiently fail with `fatal: repository has been updated, but
+unable to write new index file` under concurrent git activity on the same working tree —
+this is a git-index race, not data loss. Check `git log --oneline -1 -- <path>` before
+retrying; the commit frequently already landed despite the error.
+
 ## Scripting a multi-repo commit loop
 
 Two shell traps, both measured driving an 18-repo commit loop for a harness sync.

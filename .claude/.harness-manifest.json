@@ -1,5 +1,5 @@
 {
-  "version": "3b535fbea9dd0a498f9b3e0bb922db8f26f41f45",
+  "version": "9791caad901418539bc6b11507c6a7ce44658c66",
   "generated": "2026-09-02",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -67,7 +67,7 @@
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
     ".claude/skills/write-okf-markdown/SKILL.md": "4351d746da220e56483a0721afba54a827c9465c20270c8f57a640a8ae7e1e58",
     ".claude/skills/edit-state-json/SKILL.md": "d46a91fb0383b59cb835b7b5ab4812918b55e174eb1d867a7f149c4d8e442262",
-    ".claude/skills/commit-in-this-fleet/SKILL.md": "742bc5ff5c8d1396e83845eaae397591384da4b17652462f003f7c521e177311",
+    ".claude/skills/commit-in-this-fleet/SKILL.md": "657380874a70bae850b0e830599a2a9f0a90fd4c5316527dfd9374503e482db7",
     ".claude/skills/derive-state-safely/SKILL.md": "e6183160b22c9cf4a37e97ce4d5a095e0fd96f35bf879bedf1331a96dc6e0291",
     ".claude/skills/run-the-gates/SKILL.md": "4e8879060ec8c6adc9cb56b274d27b4b841c43160c3593fdf0ad8aec31182d5f",
     ".claude/skills/stop-or-continue/SKILL.md": "1b67799b753f527f9b5f9c842e861e0bafcd575784dcbb43877c864e0e44a9ba",
@@ -85,7 +85,7 @@
     ".agents/skills/sdlc-flow/SKILL.md": "98e852d6842f431743bf20c857f83452609da25f407f3449673fa2e9510d27f9",
     ".agents/skills/write-okf-markdown/SKILL.md": "ebe8c47dbbd7a436486b7db452228f560af1a6e65b1ba50a0274313fb1bbd5da",
     ".agents/skills/edit-state-json/SKILL.md": "ccc2728a263222d93253f8e9d5e4cd5b474e11d6525d49989afc5fa2df1ab44d",
-    ".agents/skills/commit-in-this-fleet/SKILL.md": "d328f24ac934aba098a0fbbec5878e9712d1968107e130f7cb6157f45583b302",
+    ".agents/skills/commit-in-this-fleet/SKILL.md": "2c01358ec17e2c9101d6664d16f9650ebdc0e847f1a62e24385124c044ff5a1e",
     ".agents/skills/derive-state-safely/SKILL.md": "f72b7d9e402da8eee24a619b26e2a5ff7a1280fa455932a4290f787d614e456a",
     ".agents/skills/run-the-gates/SKILL.md": "f440a0bdf3421966a1a497bce29452b9b7adec8759cb3ab1422c0259316b3a6e",
     ".agents/skills/stop-or-continue/SKILL.md": "1b67799b753f527f9b5f9c842e861e0bafcd575784dcbb43877c864e0e44a9ba",
