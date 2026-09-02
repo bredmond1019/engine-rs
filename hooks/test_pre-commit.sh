@@ -430,16 +430,17 @@ new_gated_repo() { # new_gated_repo <dir> -- new_repo() plus a brain.toml, so ga
 
 commit_ok_gated() { # commit_ok_gated <dir> [env-assignment ...] -> sets RC, OUT; bastion shim on PATH
   local d="$1"; shift
-  # BRAIN_GRAPH_GATE=1: gate 2 is opt-in as of 2026-09-01 (see hooks/pre-commit's note).
-  # The suite sets it so every case below still exercises the real gate contract; case 19b
-  # pins the default-off behaviour.
-  OUT="$(cd "$d" && env BRAIN_GRAPH_GATE=1 "$@" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"
+  # Gate 2 is ON by default since 2026-09-02 (re-enabled after the lane-scoping fix — see
+  # hooks/pre-commit's note). No env var needed here; case 19b pins the BRAIN_GRAPH_GATE=0
+  # opt-out explicitly instead.
+  OUT="$(cd "$d" && env "$@" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"
   RC=$?
 }
 
-# --- Case 19b: gate 2 is OFF unless BRAIN_GRAPH_GATE=1 (default changed 2026-09-01) ---
-# Same fixture as case 21, which IS blocked when the gate runs. With no BRAIN_GRAPH_GATE in
-# the environment the commit must succeed and the gate must not announce itself at all.
+# --- Case 19b: gate 2 is ON by default (re-enabled 2026-09-02); BRAIN_GRAPH_GATE=0 is the
+# opt-out escape hatch ---
+# Same fixture shape as case 21, which IS blocked with no env override at all — proving the
+# default really is on. A second sub-case proves BRAIN_GRAPH_GATE=0 still suppresses it.
 R19B="$WORK/r19b"; new_gated_repo "$R19B"
 cat > "$R19B/clean.md" <<'EOF'
 ---
@@ -451,8 +452,22 @@ description: fine
 EOF
 ( cd "$R19B" && git add clean.md )
 OUT="$(cd "$R19B" && env BASTION_SHIM_ERRORS="1 0" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"; RC=$?
-check "gate 2: OFF by default, an error that would block does not" "$([ "$RC" -eq 0 ]; echo $?)"
-check "gate 2: OFF by default, gate does not announce itself" "$(if printf '%s' "$OUT" | grep -q "running validate-brain gate"; then echo 1; else echo 0; fi)"
+check "gate 2: ON by default, no env var needed, a new error blocks" "$([ "$RC" -ne 0 ]; echo $?)"
+check "gate 2: ON by default, gate does announce itself" "$(printf '%s' "$OUT" | grep -q "running validate-brain gate" ; echo $?)"
+
+R19C="$WORK/r19c"; new_gated_repo "$R19C"
+cat > "$R19C/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R19C" && git add clean.md )
+OUT="$(cd "$R19C" && env BRAIN_GRAPH_GATE=0 BASTION_SHIM_ERRORS="1 0" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"; RC=$?
+check "gate 2: BRAIN_GRAPH_GATE=0 opts out, an error that would block does not" "$([ "$RC" -eq 0 ]; echo $?)"
+check "gate 2: BRAIN_GRAPH_GATE=0 opts out, gate does not announce itself" "$(if printf '%s' "$OUT" | grep -q "running validate-brain gate"; then echo 1; else echo 0; fi)"
 
 # --- Case 20: gate 2, brain.toml present, bastion shim reports 0 errors -> commit succeeds,
 # and the gate visibly ran (not silently skipped) ---
@@ -569,6 +584,56 @@ EOF
 commit_ok_gated "$R25" BASTION_SHIM_ERRORS="0 0" NESTED_ERROR_ON_FLAG="--graph" NESTED_REPO_ERROR_PATH="own-doc.md"
 check "cross-repo: error owned by THIS (outer) repo still blocks" "$([ "$RC" -ne 0 ]; echo $?)"
 check "cross-repo: block names the outer repo's own file" "$(printf '%s' "$OUT" | grep -q "own-doc.md" ; echo $?)"
+
+# ── lane-scoped blocking WITHIN one physical git repo (added 2026-09-02) ─────────
+# The residual bug the nested-repo cases above don't cover: TWO different sub-repos'
+# planning vaults both live inside the SAME HQ git repo (no nested .git at all — every
+# planning/ is a symlink INTO core/_planning/<slug>/, tracked directly by HQ's own git,
+# CLAUDE.md standing rule 10). A commit scoped to one sub-repo's vault must not block on a
+# break in a DIFFERENT sub-repo's vault just because git says they're "the same repo."
+# Measured live 2026-09-01: a commit scoped to core/_planning/mev/ was blocked by an
+# untracked file in core/_planning/bella/.
+new_planning_vaults_repo() { # new_planning_vaults_repo <dir> -> also creates two lane dirs
+  local d="$1"
+  new_gated_repo "$d"
+  mkdir -p "$d/core/_planning/lane-a" "$d/core/lane-b/planning"
+}
+
+# --- Case 26: staged in lane-a's REAL vault path; error in lane-b via the SYMLINKED-FACE
+# shape (mirrors how validate-brain actually reports it, e.g. core/bella/planning/...) ->
+# different lane, must NOT block ---
+R26="$WORK/r26"; new_planning_vaults_repo "$R26"
+cat > "$R26/core/_planning/lane-a/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R26" && git add core/_planning/lane-a/clean.md )
+commit_ok_gated "$R26" BASTION_SHIM_ERRORS="0 0" NESTED_ERROR_ON_FLAG="--graph" NESTED_REPO_ERROR_PATH="core/lane-b/planning/other.md"
+check "planning-lane: different sub-repo vault (symlinked-face shape) does not block" "$([ "$RC" -eq 0 ]; echo $?)"
+check "planning-lane: reported as a NOTICE" "$(printf '%s' "$OUT" | grep -q "NOTICE" ; echo $?)"
+
+# --- Case 27: SAME lane (lane-a), but staged via the real vault path shape while the error
+# is reported via the symlinked-face shape -> must still BLOCK. This is the exact
+# path-shape-equivalence bug: without it, staging the offending file's own real path never
+# matched validate-brain's symlinked-face diagnostic, so it read as advisory even for the
+# lane's own author. ---
+R27="$WORK/r27"; new_planning_vaults_repo "$R27"
+cat > "$R27/core/_planning/lane-a/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R27" && git add core/_planning/lane-a/clean.md )
+commit_ok_gated "$R27" BASTION_SHIM_ERRORS="0 0" NESTED_ERROR_ON_FLAG="--graph" NESTED_REPO_ERROR_PATH="core/lane-a/planning/other.md"
+check "planning-lane: same sub-repo vault, symlinked-face shape, still blocks" "$([ "$RC" -ne 0 ]; echo $?)"
+check "planning-lane: block names lane-a's file" "$(printf '%s' "$OUT" | grep -q "core/lane-a/planning/other.md" ; echo $?)"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
