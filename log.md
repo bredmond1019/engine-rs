@@ -16,6 +16,32 @@ related: [status, context]
 
 ## [run: 2026-09-02]
 
+### EN.ticket.externalize-node-prompts — Node prompts move out of the .rs files
+- **What:** Ran `/sdlc-flow` end to end on branch `EN.ticket.externalize-node-prompts-flow`, all 5
+  tasks passed, PASS review. Sixteen stable-prompt consts across six workflows (`sdlc_flow`'s four,
+  `content_pipeline`'s four, `proposal_generator`'s five, `research_agent`'s two,
+  `diagnostic_intake`'s one) moved from inline `&str` literals to `include_str!` of colocated
+  `prompts/<node>.md` files, each verified byte-identical to the literal it replaced via a
+  before/after sha256 pair recorded per task (tasks 1-4). A regression guard
+  (`crates/engine-core/tests/it/prompt_externalization.rs`) scans `workflows/**/*.rs` for any
+  `const *PROMPT*: &str` not defined as `include_str!`, and was proven FAIL against a deliberately
+  reintroduced inline literal, then PASS after revert (task 4). Task 5 documented the D24 convention
+  as CLAUDE.md standing rule 7 (adjacent to the cache-breakpoint rule it complements), renumbering
+  the prior rules 7-9 to 8-10 and fixing the two stale "CLAUDE.md rule 8" cross-references that broke
+  in `docs/architecture.md` and `docs/orphan-recovery.md`, plus a `docs/workflows/README.md` section
+  naming where each workflow's prompts live. Per-run body construction (`build_prompt`/`format!`)
+  stayed in Rust throughout, per standing rule 6 and the ticket's explicit out-of-scope list. This
+  closes `EN.ticket.externalize-node-prompts`. Next: pick up the next queued ticket per
+  `planning/status.md`'s frontmatter `next` list.
+  ```
+  fd2be0d fix: review pass 1 for EN.ticket.externalize-node-prompts
+  bdc724f docs: document the prompt-externalization convention (D24)
+  3441741 feat: implement EN.ticket.externalize-node-prompts-task4
+  3213d6b feat: implement EN.ticket.externalize-node-prompts-task3
+  d792677 feat: implement EN.ticket.externalize-node-prompts-task2
+  9df180c feat: sdlc_flow's four stable prompts move to prompts/, byte-identical (EN.ticket.externalize-node-prompts task 1)
+  ```
+
 ### Lane close — context-handling-between-nodes, six blocks, five cost-reporting leaks
 - **What:** Drove the `engine` lane of the `context-handling-between-nodes` roadmap end to end:
   `EN.14.A`, `EN.14.B`, `EN.14.C`, `EN.14.J`, `EN.ticket.write-verification-...`, `EN.14.D`. None
