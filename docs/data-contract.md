@@ -504,12 +504,27 @@ obligation ends at leaving this canonical document correct and naming what the c
 engine-rs may not edit either consumer file directly (different repos, different lanes — see
 `out_of_scope` on this block's record).
 
-As of this 1.8.0 bump, both pinning consumers still declare 1.7.0 and must re-pin:
+As of this 1.8.0 bump, both pinning consumers were recorded as still declaring 1.7.0 and
+needing to re-pin. **DISCHARGED 2026-09-02 by `EN.14.D`** — both now declare `1.10.0`. The
+original reading was also wrong in both rows, which is worth keeping rather than deleting:
 
-| Consumer file | Must move to | Authority |
-|---|---|---|
-| `core/orchestrator/docs/data-contract.md` (`**Contract Version: 1.7.0**` observed 2026-08-21) | `1.8.0` | [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md) |
-| `core/bastion/docs/data-contract.md` (`**Pinned Contract Version: 1.7.0**` observed 2026-08-21) | `1.8.0` | [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md) |
+| Consumer file | Recorded here 2026-08-21 | Actually declared | Now at | Authority |
+|---|---|---|---|---|
+| `core/synapse/docs/data-contract.md` (was `core/orchestrator/`, renamed per D52) | `1.7.0` | **`1.9.0`** — a different lineage's 1.9.0 (`GET /recall`) | `1.10.0` (`df61b41`) | [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md) |
+| `core/bastion/docs/data-contract.md` | `1.7.0` | **`1.8.0`** — but the SYNAPSE lineage's 1.8.0 (`OR.3.A`, `/ingest/artifact`), not this document's | `1.10.0` (`9fe802f`) | [D78](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D78-engine-rs-owns-the-data-contract.md) |
+
+**Why the 2026-08-21 reading was wrong, and why that matters more than the stale numbers.** This
+document and `core/synapse/docs/data-contract.md` had forked into two independent content histories
+sharing one version counter: this file's `1.8.0` is `EN.11.E` campaign identity, while the synapse
+lineage's `1.8.0` is `/ingest/artifact`'s optional fields and its `1.9.0` is `GET /recall`. So
+`1.8.0` named two different contracts depending on which file you opened, and `bastion` was pinned to
+the lineage D78 says is *not* canonical. The collision was recorded from both directions and neither
+document noticed: this row asserted both consumers were at 1.7.0, while bastion's own changelog said
+plainly that it re-pinned *synapse's* 1.8.0. `EN.14.D` jumped to `1.10.0` — skipping `1.9.0`
+precisely because the synapse lineage had already spent that number — and each consumer's changelog
+row now names the lineage it was on. Reconciling the two content histories is separate, unscoped
+work, tracked as carryover
+`data-contract-has-forked-into-two-lineages-sharing-one-version-counter`.
 
 Each re-pin must also absorb the campaign-identity addition documented above (§ Campaign identity)
 into that consumer's own field-mapping tables. The obligation is carried to the other lanes as one
