@@ -264,14 +264,14 @@ engine-rs/
     read with no DB query, byte-identical durable EventsRow mapping for a fixture 2-node workflow,
     and 422 for an unregistered workflow_type;
     crates/engine-core/tests/it/fan_out_aggregate.rs (module of the single `tests/it/main.rs`
-    binary, per CLAUDE.md rule 8) — `EN.6.G` task 3: a real `Workflow::new_validated` + `.run()`
+    binary, per CLAUDE.md rule 9) — `EN.6.G` task 3: a real `Workflow::new_validated` + `.run()`
     graph (FanOut -> Aggregate -> a persist stub node) proving no last-write-wins collision across
     same-type fan-out branches;
     crates/engine-serve/tests/schedule.rs — `EN.6.G` task 3: a `ScheduleRegistry.tick()` fire
     dispatching one persist-shaped payload and one outbound-action-shaped record through the
     non-blocking `spawn_run` path, over a real tempdir-backed `FileCronStore`;
     crates/engine-core/tests/it/evals_slice.rs (module of the single `tests/it/main.rs` binary,
-    per CLAUDE.md rule 8) — `EN.5.B` task 3: proves `run_slice` against a fixture
+    per CLAUDE.md rule 9) — `EN.5.B` task 3: proves `run_slice` against a fixture
     `tests/fixtures/eval_coding_state.json` SDLC-flow state file, scoring `coding_slice()`
     through the real `aggregate_state_files` path end-to-end)
 ```
