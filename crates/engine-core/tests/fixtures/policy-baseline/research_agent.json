@@ -1,0 +1,26 @@
+{
+  "contact_enrichment": {
+    "max_fetches": 4,
+    "prospect": "standard",
+    "research": "standard"
+  },
+  "grounding": {
+    "prospect": "standard",
+    "research": "standard"
+  },
+  "ingress_dispatch": {
+    "enabled": false,
+    "target_workflow_type": "CONTENT_PIPELINE"
+  },
+  "local": {
+    "constrained_json": false,
+    "endpoint": "http://localhost:11434",
+    "model": "qwen2.5-coder:7b"
+  },
+  "model_tiers": {
+    "prospect": "sonnet",
+    "research": "sonnet"
+  },
+  "output_verbosity": "normal",
+  "prompt_cache": false
+}

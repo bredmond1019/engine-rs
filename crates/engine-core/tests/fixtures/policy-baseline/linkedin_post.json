@@ -1,0 +1,15 @@
+{
+  "candidate_count": 3,
+  "local": {
+    "constrained_json": false,
+    "endpoint": "http://localhost:11434",
+    "model": "qwen2.5-coder:7b"
+  },
+  "max_critic_iterations": 3,
+  "model_tiers": {
+    "critic": "sonnet",
+    "draft": "sonnet",
+    "translate": "sonnet"
+  },
+  "translate_enabled": true
+}
