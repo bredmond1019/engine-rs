@@ -9329,4 +9329,223 @@ mod tests {
              interrupted — behavior must match today exactly"
         );
     }
+
+    // --- EN.14.A task 3: COST_BEARING_STAGES carry-forward regression -----
+    //
+    // One table, driven end-to-end through each cost-bearing wrapper's
+    // `process`, asserting the billing channels `carry_forward_billing`
+    // (EN.14.A task 1) is supposed to preserve across `put_result` actually
+    // survive it. The table's stage set is asserted equal to
+    // `COST_BEARING_STAGES` itself, so a fifth stage added to that constant
+    // later has no driver here and fails loudly instead of going untested
+    // silently (per the block's AC and carryover
+    // `gate-scope-must-be-shown-capable-of-failing`).
+
+    /// A fake model reply carrying known, non-default billing figures —
+    /// `cost_usd`, both cache channels, and a `session_id` the wrapper is
+    /// NOT meant to re-emit (used by the negative assertion below).
+    fn billing_outcome(text: &str) -> Outcome {
+        Outcome {
+            cost_usd: 1.25,
+            usage: claude_code_rs::parse::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: 77,
+                cache_read_input_tokens: 500,
+            },
+            model_usage: std::collections::BTreeMap::new(),
+            text: text.to_string(),
+            is_error: false,
+            api_error_status: None,
+            session_id: Some("sess-billing-test".to_string()),
+            structured_output: None,
+        }
+    }
+
+    async fn drive_implement_task_node_for_billing() -> TaskContext {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { Ok(billing_outcome(&json!({ "summary": "done" }).to_string())) })
+        });
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx)
+            .await
+            .expect("ImplementTaskNode should succeed")
+    }
+
+    async fn drive_triage_task_node_for_billing() -> TaskContext {
+        let task = SDLCTask::new(1, "One", "d1");
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async {
+                Ok(billing_outcome(
+                    &json!({ "verdict": "RETRYABLE", "reason": "try again" }).to_string(),
+                ))
+            })
+        });
+        let node = TriageTaskNode::new().with_transport(transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+        node.process(ctx)
+            .await
+            .expect("TriageTaskNode should succeed")
+    }
+
+    async fn drive_consolidated_review_node_for_billing() -> TaskContext {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async {
+                Ok(billing_outcome(
+                    &json!({ "verdict": "PASS", "summary": "looks good", "issues": [] })
+                        .to_string(),
+                ))
+            })
+        });
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        node.process(ctx)
+            .await
+            .expect("ConsolidatedReviewNode should succeed")
+    }
+
+    /// Counter for a unique scratch worktree per call — `GenerateTasksNode`
+    /// writes real `tasks.json`/`tasks.md` files under it.
+    static TASK3_BILLING_TMP_COUNTER: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+
+    async fn drive_generate_tasks_node_for_billing() -> TaskContext {
+        use crate::workflows::sdlc_flow::setup::GenerateTasksNode;
+
+        let n = TASK3_BILLING_TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let worktree = std::env::temp_dir().join(format!(
+            "engine-core-en-14-a-task3-billing-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&worktree).ok();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec"))
+            .expect("create spec dir");
+
+        let mut ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let canned = json!({
+            "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc" }],
+            "tasks_markdown": "# Tasks\n\n1. Do it",
+        })
+        .to_string();
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let canned = canned.clone();
+            Box::pin(async move { Ok(billing_outcome(&canned)) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("GenerateTasksNode should succeed");
+        std::fs::remove_dir_all(&worktree).ok();
+        out
+    }
+
+    /// The headline regression: every `COST_BEARING_STAGES` entry retains
+    /// `cost_usd` and both cache channels after its wrapper's `put_result`
+    /// (positive), and the carry-forward is proven selective rather than a
+    /// blanket copy by asserting two keys it must NOT re-emit (negative).
+    #[tokio::test]
+    async fn cost_bearing_stages_carry_forward_billing_channels() {
+        use crate::workflows::sdlc_flow::wrap_up::COST_BEARING_STAGES;
+
+        let table: Vec<(&'static str, TaskContext)> = vec![
+            (
+                "ImplementTaskNode",
+                drive_implement_task_node_for_billing().await,
+            ),
+            ("TriageTaskNode", drive_triage_task_node_for_billing().await),
+            (
+                "ConsolidatedReviewNode",
+                drive_consolidated_review_node_for_billing().await,
+            ),
+            (
+                "GenerateTasksNode",
+                drive_generate_tasks_node_for_billing().await,
+            ),
+        ];
+
+        // The table IS the contract: its stage set must equal
+        // `COST_BEARING_STAGES` exactly, sorted, so a fifth stage added to
+        // the constant later has no driver here and fails this assertion
+        // rather than silently going untested.
+        let mut table_names: Vec<&str> = table.iter().map(|(name, _)| *name).collect();
+        table_names.sort_unstable();
+        let mut declared: Vec<&str> = COST_BEARING_STAGES.to_vec();
+        declared.sort_unstable();
+        assert_eq!(
+            table_names, declared,
+            "the driver table must cover exactly COST_BEARING_STAGES"
+        );
+
+        for (stage, ctx) in &table {
+            let entry = ctx
+                .nodes
+                .get(*stage)
+                .unwrap_or_else(|| panic!("{stage}: missing ctx.nodes entry after process()"));
+
+            // Positive: the billing channels survived put_result.
+            assert_eq!(
+                entry["cost_usd"], 1.25,
+                "{stage}: cost_usd must survive put_result"
+            );
+            assert_eq!(
+                entry["cache_creation_input_tokens"], 77,
+                "{stage}: cache_creation_input_tokens must survive put_result"
+            );
+            assert_eq!(
+                entry["cache_read_input_tokens"], 500,
+                "{stage}: cache_read_input_tokens must survive put_result"
+            );
+            assert!(
+                !entry["transport"].is_null(),
+                "{stage}: transport must survive put_result"
+            );
+
+            // Negative: a carry-forward that copied everything indiscriminately
+            // would also pass every assertion above, so this proves the
+            // wrapper's carry-forward is selective — session_id and the raw
+            // model content are stamped by `ClaudeCodeStep::process` onto the
+            // same identity but are deliberately not among the four billing
+            // keys `carry_forward_billing` copies.
+            assert!(
+                entry.get("session_id").is_none(),
+                "{stage}: session_id must NOT be carried forward"
+            );
+            assert!(
+                entry.get("content").is_none(),
+                "{stage}: the raw model content must NOT be carried forward"
+            );
+        }
+    }
 }
