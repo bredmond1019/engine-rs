@@ -42,10 +42,7 @@ const NODE_NAME: &str = "ProspectingResearchNode";
 /// `sdlc_flow::task_loop::STABLE_SYSTEM_PROMPT`'s rationale: keeping this
 /// byte-identical across calls gives the underlying `claude` CLI a stable
 /// prefix to cache against.
-const STABLE_SYSTEM_PROMPT: &str =
-    "You are running inside the engine-rs RESEARCH_AGENT workflow, prospecting \
-     mode. This system prompt is held constant across calls so its tokens can be \
-     cached.";
+const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/prospecting.md");
 
 /// The verdict-bearing model-judgment stages this node's telemetry snapshot
 /// inspects. `ProspectingResearchNode` has no downstream review stage — the
