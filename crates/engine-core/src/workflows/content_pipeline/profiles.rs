@@ -28,7 +28,7 @@ use crate::policy::PolicyConfigSource;
 use super::policy::{
     self, validate_bounds, ContentPipelinePolicy, HarvestMode, ModelTier, OutputVerbosity,
     PartialContentPipelinePolicy, PartialHarvestConfig, PartialLocalConfig,
-    PartialMaterializeConfig, PartialModelTiers,
+    PartialMaterializeConfig, PartialModelTiers, MAX_CRITIC_ITERATIONS_CEILING,
 };
 use super::schema::ContentPipelineInput;
 
@@ -149,6 +149,73 @@ pub fn fast_summarize() -> PartialContentPipelinePolicy {
     }
 }
 
+/// Cost/latency-floor profile (EN.14.J): all four Local-eligible stages
+/// (`{summarize, critic, revise, translate}`) rewire to `ModelTier::Haiku`,
+/// terse output, prompt caching on, the critic loop cut to a single pass at
+/// a looser confidence bar, and harvest left `off` (the cheapest run should
+/// not add an extra ingest hop). Mirrors the shape of `research_agent`'s
+/// `cheap_fast` — every existing knob stated, no new knob introduced.
+#[must_use]
+pub fn cheap_fast() -> PartialContentPipelinePolicy {
+    PartialContentPipelinePolicy {
+        output_verbosity: Some(OutputVerbosity::Terse),
+        prompt_cache: Some(true),
+        model_tiers: Some(PartialModelTiers {
+            summarize: Some(ModelTier::Haiku),
+            critic: Some(ModelTier::Haiku),
+            revise: Some(ModelTier::Haiku),
+            translate: Some(ModelTier::Haiku),
+        }),
+        local: None,
+        max_critic_iterations: Some(1),
+        critic_confidence_threshold: Some(0.6),
+        dispatch_verbosity: Some(OutputVerbosity::Terse),
+        // Still materializes — a cheaper tier is a model-tier trade, not a
+        // durability one (same reasoning as `local_drafting`/`fast_summarize`).
+        materialize: Some(PartialMaterializeConfig {
+            enabled: Some(true),
+            corpus_root: Some(None),
+            write: Some(true),
+        }),
+        harvest: Some(PartialHarvestConfig {
+            mode: Some(HarvestMode::Off),
+        }),
+    }
+}
+
+/// Quality-ceiling profile (EN.14.J): all four Local-eligible stages
+/// rewire to `ModelTier::Opus`, verbose output, the critic loop opened to
+/// its full ceiling (`MAX_CRITIC_ITERATIONS_CEILING`) at a strict
+/// confidence bar, and harvest opted into `in_process` so the highest-
+/// quality run also gets instant/curated indexing. Mirrors the shape of
+/// `research_agent`'s `thorough` — every existing knob stated, no new knob
+/// introduced.
+#[must_use]
+pub fn thorough() -> PartialContentPipelinePolicy {
+    PartialContentPipelinePolicy {
+        output_verbosity: Some(OutputVerbosity::Verbose),
+        prompt_cache: Some(false),
+        model_tiers: Some(PartialModelTiers {
+            summarize: Some(ModelTier::Opus),
+            critic: Some(ModelTier::Opus),
+            revise: Some(ModelTier::Opus),
+            translate: Some(ModelTier::Opus),
+        }),
+        local: None,
+        max_critic_iterations: Some(MAX_CRITIC_ITERATIONS_CEILING),
+        critic_confidence_threshold: Some(0.95),
+        dispatch_verbosity: Some(OutputVerbosity::Verbose),
+        materialize: Some(PartialMaterializeConfig {
+            enabled: Some(true),
+            corpus_root: Some(None),
+            write: Some(true),
+        }),
+        harvest: Some(PartialHarvestConfig {
+            mode: Some(HarvestMode::InProcess),
+        }),
+    }
+}
+
 /// Curated-harvest profile: the one built-in bundle that opts into an
 /// explicit, in-process Synapse ingest POST (`HarvestMode::InProcess`)
 /// rather than relying on the existing manifest/`index_brain` freshness
@@ -174,11 +241,13 @@ pub fn curated_harvest() -> PartialContentPipelinePolicy {
 }
 
 /// Resolve a built-in profile bundle by its kebab-case name. Returns `None`
-/// for any name that isn't one of the four canonical profiles.
+/// for any name that isn't one of the six canonical profiles.
 #[must_use]
 pub fn profile_by_name(name: &str) -> Option<PartialContentPipelinePolicy> {
     match name {
         "baseline" => Some(baseline()),
+        "cheap-fast" => Some(cheap_fast()),
+        "thorough" => Some(thorough()),
         "local-drafting" => Some(local_drafting()),
         "fast-summarize" => Some(fast_summarize()),
         "curated-harvest" => Some(curated_harvest()),
@@ -329,11 +398,75 @@ mod tests {
     }
 
     #[test]
-    fn profile_by_name_resolves_all_four_canonical_names() {
+    fn profile_by_name_resolves_all_six_canonical_names() {
         assert_eq!(profile_by_name("baseline"), Some(baseline()));
+        assert_eq!(profile_by_name("cheap-fast"), Some(cheap_fast()));
+        assert_eq!(profile_by_name("thorough"), Some(thorough()));
         assert_eq!(profile_by_name("local-drafting"), Some(local_drafting()));
         assert_eq!(profile_by_name("fast-summarize"), Some(fast_summarize()));
         assert_eq!(profile_by_name("curated-harvest"), Some(curated_harvest()));
+    }
+
+    #[test]
+    fn cheap_fast_resolves_all_four_stages_to_haiku() {
+        let resolved = policy::resolve(
+            ContentPipelinePolicy::default(),
+            None,
+            Some(&cheap_fast()),
+            None,
+        );
+        assert_eq!(resolved.model_tiers.summarize, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.critic, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.revise, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.translate, ModelTier::Haiku);
+        assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
+        assert!(resolved.prompt_cache);
+        assert_eq!(resolved.max_critic_iterations, 1);
+        assert_eq!(resolved.harvest.mode, HarvestMode::Off);
+        // cheap-fast must still validate (positive control on validate_bounds).
+        assert!(validate_bounds(&resolved).is_ok());
+    }
+
+    #[test]
+    fn thorough_resolves_all_four_stages_to_opus() {
+        let resolved = policy::resolve(
+            ContentPipelinePolicy::default(),
+            None,
+            Some(&thorough()),
+            None,
+        );
+        assert_eq!(resolved.model_tiers.summarize, ModelTier::Opus);
+        assert_eq!(resolved.model_tiers.critic, ModelTier::Opus);
+        assert_eq!(resolved.model_tiers.revise, ModelTier::Opus);
+        assert_eq!(resolved.model_tiers.translate, ModelTier::Opus);
+        assert_eq!(resolved.output_verbosity, OutputVerbosity::Verbose);
+        assert_eq!(
+            resolved.max_critic_iterations,
+            MAX_CRITIC_ITERATIONS_CEILING
+        );
+        assert_eq!(resolved.harvest.mode, HarvestMode::InProcess);
+        // thorough must still validate (positive control on validate_bounds).
+        assert!(validate_bounds(&resolved).is_ok());
+    }
+
+    #[test]
+    fn resolve_policy_for_run_applies_named_cheap_fast_profile() {
+        let worktree = temp_dir();
+        let mut event = minimal_web_article_event();
+        event["profile"] = serde_json::json!("cheap-fast");
+        let ctx = base_ctx(event);
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved.model_tiers.summarize, ModelTier::Haiku);
+    }
+
+    #[test]
+    fn resolve_policy_for_run_applies_named_thorough_profile() {
+        let worktree = temp_dir();
+        let mut event = minimal_web_article_event();
+        event["profile"] = serde_json::json!("thorough");
+        let ctx = base_ctx(event);
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved.model_tiers.summarize, ModelTier::Opus);
     }
 
     #[test]
@@ -593,6 +726,8 @@ mod tests {
     fn every_named_profile_sets_materialize_explicitly() {
         for (name, bundle) in [
             ("baseline", baseline()),
+            ("cheap-fast", cheap_fast()),
+            ("thorough", thorough()),
             ("local-drafting", local_drafting()),
             ("fast-summarize", fast_summarize()),
         ] {
@@ -618,6 +753,8 @@ mod tests {
     fn every_named_profile_sets_harvest_explicitly() {
         for (name, bundle) in [
             ("baseline", baseline()),
+            ("cheap-fast", cheap_fast()),
+            ("thorough", thorough()),
             ("local-drafting", local_drafting()),
             ("fast-summarize", fast_summarize()),
             ("curated-harvest", curated_harvest()),
