@@ -1,5 +1,5 @@
 {
-  "version": "172c230e09e82353ec8c83050768aaab54df03ab",
+  "version": "b936e38bcc3767a42808d389d69ef3e97c2e7292",
   "generated": "2026-09-02",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -62,7 +62,7 @@
     ".claude/workflows/block-registration.md": "87e23520c10a562eaf769354bc44f63dbcdb12ec2e0dda01cea7e2d9fec96ecd",
     ".claude/workflows/templates/spec-template.md": "e35fa94c1ed104c27bfce0a362ae234c72c165de2e5989f82eb323d2a2ecf039",
     ".claude/workflows/prompts/shared.js": "0e0e7248268f139ab202cea6b4e4213ef0bbe46a0d1f608b2ffe5668debcbd05",
-    ".claude/skills/write-carryover-entry/SKILL.md": "bacec0d0ebba36727a01efea31823db866f2d071a1021c67c9468470538a716c",
+    ".claude/skills/write-carryover-entry/SKILL.md": "bb710888d5a31097bab71327a3e891f7774472835486cefd3fffe9089a56ee88",
     ".claude/skills/record-a-bail/SKILL.md": "c4448720ced1b1f554c9704556e4bb99a80bf54e43b9ef1689bdb00300e41108",
     ".claude/skills/report-to-the-operator/SKILL.md": "e614feaea13fe4256c473ad061b7d77e3ecee295e4bface588dbf006691abe2b",
     ".claude/skills/write-okf-markdown/SKILL.md": "4351d746da220e56483a0721afba54a827c9465c20270c8f57a640a8ae7e1e58",
@@ -79,7 +79,7 @@
     ".claude/skills/pick-the-next-block/SKILL.md": "ad953b99f80a4c9648a95b2904e95a067fc4c4943d291538194b42a01082b358",
     ".claude/skills/stamp-workflow-run-id/SKILL.md": "53de128ade77ba3e200ddcfe94a07e3cb601feff838b73369d49f45f8258ec0b",
     "scripts/check_block_records.py": "cfeff56da1a9410cd0b246e153d80f1236d9aac4cf3b5250d2ec300f6043e560",
-    ".agents/skills/write-carryover-entry/SKILL.md": "bdf3b1d36bfa3659015164ee191c0de810c04e830e5636a5df2a4a67aa5c3871",
+    ".agents/skills/write-carryover-entry/SKILL.md": "36bbdccdcd4d011662c5de96adb3d8d2306e1f5abce8f1e5cf66a196039d23b3",
     ".agents/skills/record-a-bail/SKILL.md": "bd5d51ec7a1722f72700972c6393c314c47d26c8335b557747657e4d3d63d17a",
     ".agents/skills/sdlc-task/SKILL.md": "9f526f815472123a098c42ca6f795a5962d0312ac22480148947774d379d045a",
     ".agents/skills/sdlc-flow/SKILL.md": "98e852d6842f431743bf20c857f83452609da25f407f3449673fa2e9510d27f9",

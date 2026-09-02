@@ -1,6 +1,6 @@
 ---
 name: write-carryover-entry
-description: How to write a carryover[] entry that can actually die — whether the finding belongs in carryover[] at all rather than an operator edge, a block, or reference[], how to author a clears_when predicate that will still fire in six weeks, how to write text that survives its author being wrong, and the finding_id discipline that makes one finding one fix. Use BEFORE adding any carryover[] entry, at every /handoff, /wrap-up, /log-work and lane close, before filing a finding an orchestration run turned up, and when a sweep reports an entry CLEARED that is plainly still live.
+description: How to write a carryover[] entry that can actually die — whether the finding belongs in carryover[] at all rather than an operator edge, a block, or reference[], the `needs` value that says what kind of work closes it, how to author a clears_when predicate that will still fire in six weeks, the eight measured ways a predicate silently never fires, how to write text that survives its author being wrong, and the finding_id discipline that makes one finding one fix. Use BEFORE adding any carryover[] entry, at every /handoff, /wrap-up, /log-work and lane close, before filing a finding an orchestration run turned up, and when a sweep reports an entry CLEARED that is plainly still live.
 allowed-tools: Bash(mev:*) Bash(bastion:*) Bash(python3:*) Bash(git:*) Bash(grep:*) Bash(rg:*) Bash(ls:*) Bash(test:*)
 ---
 
@@ -15,14 +15,22 @@ then to go away on its own. Judge every field by that: does this make the entry 
 machine, or does it commit some future human to reading 400 words to find out the work landed a
 month ago?
 
-That is not the current state. **Measured across the fleet on 2026-09-01, over two audit rounds
-covering 489 of 497 entries: 159 — 32% — were already dead.** Not deferred, not blocked. Done,
-or void, sometimes for weeks, and still on the board. Both rounds hit ~32% independently, so that
-is the steady-state rot rate, not an artifact of looking at the oldest ones first.
+That is not the current state. **Three audit rounds on 2026-09-01/02 measured 32%, 32% and 26% of
+their slices already dead** — not deferred, not blocked; done or void, sometimes for weeks, and still
+on the board. Three independent measurements make ~30% the container's steady state, not an artifact
+of sampling.
 
-The cause is not neglect. It is that **only 30% of entries can be checked by a machine at all**
-(136 of 409: 221 prose, 85 with no predicate), and a meaningful share of the rest carry a predicate
-that *could never have fired*. Everything below is the difference between those two outcomes.
+The cause is not neglect. It is that **only about a third of entries can be checked by a machine at
+all** (measured after round 3: 161 prose, 39 with no predicate), and a share of the rest carry a
+predicate that *could never have fired*. Retiring dead entries does not move that ratio, which is
+exactly why ~30% is always dead. **The ratio is the disease; the dead entries are the symptom.**
+Everything below is about authoring an entry that lands on the right side of it.
+
+> **Some of this is now enforced.** As of 2026-09-02 `mev` warns on several of the failures below —
+> `W_STATE_CARRYOVER_BROKEN_PREDICATE_UNREADABLE` / `_PATTERN`, `W_STATE_CARRYOVER_ALREADY_SATISFIED`,
+> `W_STATE_FINDING_ID_ORPHAN`, `W_CARRYOVER_MISFILED`, `W_STATE_CARRYOVER_UNKNOWN_NEEDS`. Treat those
+> as a safety net, not as the standard: three of the eight predicate failures below are still invisible
+> to every gate, and the misfiling warning is blind unless you set `needs`.
 
 ---
 
@@ -35,7 +43,7 @@ critical path and blocks no work, so an item misfiled here is never forced — i
 | Ask | If yes | Why not carryover |
 |---|---|---|
 | **Can only a human do this?** A decision, a credential, an approval, a physical act. | `{"type":"operator", slug, exit, start}` edge in `depends_on` on the block it gates | An operator edge inherits the effective priority of everything it gates and *blocks that work*. Drive it with `/begin-session <slug>`. |
-| **Is it a unit of work an agent could be told to do?** | a block: `tracks[].blocks[]` + `planning/blocks/<ID>.json` | Carryover is a finding, not a task. A block is schedulable, startable, and closeable. |
+| **Is it a unit of work an agent could be told to do?** | a block — use **`mev create-block`**, which refuses bad input rather than guessing | Carryover is a finding, not a task. A block is schedulable, startable, and closeable. Until 2026-09-02 nothing could create one and every record in the fleet was hand-written; there is no longer an excuse to file work as a finding. |
 | **Will it be true forever?** No `clears_when` is possible because nothing will ever make it stop being true. | `reference[]`, with a `class` of `trap` · `invariant` · `lesson` · `deliberate` | Per D72 a reference carries no `clears_when`, no `priority` and no `blocks[]` — nothing can gate on a permanent fact resolving. |
 | **Is it an idea, not yet committed work?** | `backlog[]` + a `/capture` note | |
 | Otherwise | `carryover[]`, `kind` ∈ `defect` · `deferred` · `drift` · `env` | |
@@ -55,6 +63,28 @@ on every board while being impossible for `/generate-tasks` to touch. If you are
 `constraint` and `known_issue` are **retired** kinds (D72). They still deserialize through
 `CarryoverKind::Unknown(String)` so legacy entries round-trip, and they warn as
 `W_STATE_LEGACY_KIND`. Never mint a new one.
+
+---
+
+## Step 1b — Set `needs`: what kind of work closes it
+
+`kind` says *why the entry exists* (`defect`/`deferred`/`drift`/`env`). **`needs` says what closes
+it** — `code` · `docs` · `state` · `operator` · `dedupe`. It is optional in the schema and you should
+set it anyway, for two reasons.
+
+**It routes.** The 2026-09-01 triage had to hand-sort 55 findings into those exact five buckets before
+it could parallelize them — three doc agents running concurrently while one agent held `state.json`.
+Without the field that sort is redone by hand every round, and "how much of this backlog is actually
+engineering?" needs a ten-agent audit to answer.
+
+**And `needs: operator` is a self-report of a misfiling.** `W_CARRYOVER_MISFILED` fires on exactly
+that value: if only a human can do it, it belongs on the block it gates as an `operator` edge, where
+it blocks something. **That warning is blind until the field is populated** — measured 2026-09-02,
+8 of 275 entries carried a `needs` value, so a lint built for the fleet's most common misfiling was
+firing zero times. Setting it is what turns the check on.
+
+So: if you are about to write `needs: operator`, stop and re-read Step 1's first row. You have just
+told yourself this is not a carryover entry.
 
 ---
 
@@ -81,9 +111,10 @@ own name — that is the most common authoring error and it fails the whole file
 `note` is optional on all four. A `command_exits_zero` runs with **cwd = the entry's `scope.repo`
 root**, and is never executed unless the sweep is invoked with `--allow-exec`.
 
-### The six ways a predicate silently never fires
+### The eight ways a predicate silently never fires
 
-Each of these was found live on 2026-09-01. All six produce an entry that outlives its own fix.
+Each was found live during the 2026-09-01/02 audits. All eight produce an entry that outlives its own
+fix. **`mev` now warns on 1, 2, 4 and 5. It cannot see 3, 6, 7 or 8** — those are yours to avoid.
 
 **1. It names a path that later moves.** This was the *dominant* failure of the whole audit — most
 of the 65 round-2 RESOLVEDs were fixed weeks earlier and could not retire themselves because the
@@ -124,6 +155,30 @@ done at the same time.
 > work — 15 live entries are legitimately waiting for an artifact to appear. The failure is only
 > when the artifact arrives under another name. Say in `note` what the artifact is, so a reader can
 > tell the two apart.
+
+**7. `block_closed` on a block that gets CUT.** The skill recommends `block_closed` over a path, and
+that advice is right — but a block can stop being work without ever becoming `closed`.
+`unmet_carryover_block_keys`' contract treats a `wontfix` target as **unmet by design**, so an entry
+anchored to a cut block is permanently open and permanently undoable at once. Live case:
+`bastion-web:docs-graph-and-related-chips-blocked-upstream` on `BW.8.N`, which is `wontfix`. **When you
+author a `block_closed`, and whenever you audit one, check the target's status is `closed` — not
+`wontfix`, not absent.**
+
+**8. The predicate becomes satisfied AFTER authoring, by unrelated work, while the finding stays
+live.** This is the nastiest, because the predicate is typed, well-formed, and genuinely passing —
+none of the other seven classes flags it, and no gate catches it. Trap 2 is checkable at authoring
+time; this one arrives later by a route authoring-time checking cannot see. Found in three repos
+independently: a bella render bug whose scene check went green from a *different* fix while the
+original keystroke finding stayed unexplained (its own text warned "do not assume the tape fix closed
+the keystroke one" — and the predicate then assumed exactly that); a mev prototype-retirement entry
+whose block closed while the prototype it exists to retire is still on disk; and a bastiel entry whose
+`file_contains "npm install"` matched a *comment* explaining why `npm ci` is used instead — the right
+verdict reached by luck.
+
+> **The defence is in the text, not the predicate.** Write the predicate so it names the observable
+> the finding is *about*, and write the text so a reader re-checking a CLEARED entry can tell whether
+> the finding actually went away. This is why the CLEARED lane is a candidate list and never a delete
+> list.
 
 ### Anchor the predicate to the thing that actually changes
 
@@ -202,18 +257,26 @@ close it. A bastion change *triggered* by another repo's release is still `repo:
 
 - [ ] Ran Step 1's routing questions — it is not operator work, a block, a permanent fact, or an idea
 - [ ] `kind` is one of `defect` · `deferred` · `drift` · `env` — no retired value minted
+- [ ] **`needs` is set** (`code`/`docs`/`state`/`operator`/`dedupe`) — and if it is `operator`, you
+      went back to Step 1 instead of filing it here
 - [ ] `clears_when` is **typed**, not prose, unless you genuinely cannot express the observable
 - [ ] The predicate anchors to a block or a command where possible, not to a path that can move
 - [ ] It is **not already satisfied** — confirmed with `mev carryover --repo <slug>`, not assumed
 - [ ] A `file_contains` pattern is a literal substring, not a regex, and its file exists
 - [ ] A `file_exists` on a missing path is deliberate, and `note` says what the artifact is
+- [ ] A `block_closed` target's status is `closed` — **not `wontfix`, not absent** (trap 7)
+- [ ] The text would let a future reader re-checking a CLEARED entry tell whether the finding
+      actually went away, not just whether the predicate passes (trap 8)
 - [ ] Text leads with the observable, cites `file:line`, dates the measurement, and flags any
       untested cause
 - [ ] `finding_id` set if this finding is true in another repo — and set on the sibling too
 - [ ] `scope` has exactly one non-null key; `cross_repo` is a boolean
 - [ ] Round-tripped byte-for-byte: `json.dump(data, f, indent=2, ensure_ascii=False)` + trailing
       newline, and `git diff --stat` shows the size of your edit
-- [ ] `mev validate-state <path>` clean, then `bastion validate-brain --state` clean
+- [ ] `mev validate-state <path>` clean, then `bastion validate-brain --state` clean — and read the
+      new `W_STATE_CARRYOVER_*` / `W_CARRYOVER_*` warnings on your own entry before moving on
+- [ ] If the change touched docs or `related:` edges, `--graph` **and** `--links` were both run.
+      They check different things; a dangling `related:` has shipped behind a green `--links`
 
 ## Related
 
