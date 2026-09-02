@@ -56,6 +56,7 @@ mod sdlc_flow_check_selection;
 mod sdlc_flow_e2e;
 mod sdlc_flow_end_review_e2e;
 mod sdlc_flow_experiment;
+mod sdlc_flow_ledger_resume;
 mod sdlc_flow_live;
 mod sdlc_flow_profiles;
 mod sdlc_flow_repo_resolution;
