@@ -38,10 +38,7 @@ pub const NODE_NAME: &str = "ProposalCompanyResearchNode";
 /// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
 /// anchor when `policy.prompt_cache` is true — mirrors
 /// `research_agent::company_research::STABLE_SYSTEM_PROMPT`'s rationale.
-const STABLE_SYSTEM_PROMPT: &str =
-    "You are running inside the engine-rs PROPOSAL_GENERATOR workflow, \
-     research stage. This system prompt is held constant across calls so \
-     its tokens can be cached.";
+const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/company_research.md");
 
 /// Deserialize the inbound `PROPOSAL_GENERATOR` event from `ctx.event`.
 fn parse_event(ctx: &TaskContext) -> Result<ProposalGeneratorEventSchema, NodeError> {

@@ -46,11 +46,7 @@ const NODE_NAME: &str = "IntakeExtractNode";
 /// `research_agent::company_research::STABLE_SYSTEM_PROMPT`'s rationale:
 /// keeping this byte-identical across calls gives the underlying `claude`
 /// CLI (or local OpenAI-compat transport) a stable prefix to cache against.
-const STABLE_SYSTEM_PROMPT: &str =
-    "You are running inside the engine-rs DIAGNOSTIC_INTAKE workflow, the \
-     IntakeExtractNode stage. This system prompt is held constant across \
-     calls so its tokens can be cached. You perform pure structured \
-     extraction only — no web search, no tool use.";
+const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/extract.md");
 
 /// The verdict-bearing model-judgment stages this node's telemetry snapshot
 /// inspects. `IntakeExtractNode` has no downstream review stage — it is the
