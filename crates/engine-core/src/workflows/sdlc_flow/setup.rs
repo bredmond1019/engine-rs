@@ -30,7 +30,10 @@ use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::task_loop::{apply_policy, resolved_policy, worktree_path, Stage};
-use super::{get_result, parse_structured_or_fenced, put_result, DEFAULT_STATE_FILENAME};
+use super::{
+    carry_forward_billing, get_result, parse_structured_or_fenced, put_result,
+    DEFAULT_STATE_FILENAME,
+};
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
 /// downstream node reads one resolved value rather than re-deriving it.
@@ -1420,20 +1423,23 @@ impl Node for GenerateTasksNode {
             ))
         })?;
 
-        put_result(
-            &mut ctx,
-            "GenerateTasksNode",
-            json!({
-                "tasks_json": tasks_json_path.to_string_lossy(),
-                "tasks_md": tasks_md_path.to_string_lossy(),
-                "task_count": tasks.len(),
-                // Stamp the resolved knob values so `RunTelemetry` /
-                // `PolicyAggregate` can attribute this stage's observed cost
-                // to the settings that caused it (standing rule 6).
-                "model_tier": policy.model_tiers.generate,
-                "call_timeout_secs": policy.timeouts.generate,
-            }),
-        );
+        let mut result = json!({
+            "tasks_json": tasks_json_path.to_string_lossy(),
+            "tasks_md": tasks_md_path.to_string_lossy(),
+            "task_count": tasks.len(),
+            // Stamp the resolved knob values so `RunTelemetry` /
+            // `PolicyAggregate` can attribute this stage's observed cost
+            // to the settings that caused it (standing rule 6).
+            "model_tier": policy.model_tiers.generate,
+            "call_timeout_secs": policy.timeouts.generate,
+        });
+        // This site previously carried forward nothing — `put_result` below
+        // replaces this node's whole `ctx.nodes` entry, which would
+        // otherwise silently drop what `ClaudeCodeStep::process` just wrote
+        // onto this same identity: the `"transport"` tier stamp,
+        // `cost_usd`, and both cache channels (`EN.14.A`).
+        carry_forward_billing(&ctx, "GenerateTasksNode", &mut result);
+        put_result(&mut ctx, "GenerateTasksNode", result);
 
         Ok(ctx)
     }

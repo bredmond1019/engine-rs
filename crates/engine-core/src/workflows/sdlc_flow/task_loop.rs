@@ -33,8 +33,8 @@ use super::policy::OutputVerbosity;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::{
-    get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
-    ModelTransport, TransportSlot,
+    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, CommandOutput,
+    CommandRunner, ModelTransport, TransportSlot,
 };
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
@@ -1294,6 +1294,10 @@ impl Node for ImplementTaskNode {
         // this identity (see [`STATE_NESTED_IDENTITIES`]).
         result["state"] = serde_json::to_value(&counted_state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        // Preserve billing/telemetry from the inner ClaudeCodeStep's just-stamped
+        // entry before this wrapper overwrites it — this site previously carried
+        // forward nothing at all (EN.14.A).
+        carry_forward_billing(&ctx, "ImplementTaskNode", &mut result);
         put_result(&mut ctx, "ImplementTaskNode", result);
 
         Ok(ctx)
@@ -2406,17 +2410,6 @@ impl Node for TriageTaskNode {
             .and_then(|value| value.as_str())
             .ok_or_else(|| NodeError::new("TriageTaskNode: model returned no content"))?
             .to_string();
-        // Carried forward below: `put_result` replaces this node's whole
-        // `ctx.nodes` entry, which would otherwise silently drop the
-        // `"transport"` stamp `ClaudeCodeStep::process` just wrote — the
-        // exact tier-telemetry `RunTelemetry`/`observed_model_tiers`
-        // (`policy/telemetry.rs`) reads back out by this same node name.
-        let transport_stamp = ctx
-            .nodes
-            .get("TriageTaskNode")
-            .and_then(|value| value.get("transport"))
-            .cloned();
-
         let parsed: TriageOutput = parse_structured_or_fenced(&ctx, "TriageTaskNode", &content)
             .map_err(|err| {
                 NodeError::new(format!(
@@ -2448,9 +2441,15 @@ impl Node for TriageTaskNode {
         ) {
             result["unrecognized_verdict"] = json!(normalized_verdict);
         }
-        if let Some(transport) = transport_stamp {
-            result["transport"] = transport;
-        }
+        // Carried forward below: `put_result` replaces this node's whole
+        // `ctx.nodes` entry, which would otherwise silently drop what
+        // `ClaudeCodeStep::process` just wrote onto this same identity —
+        // the `"transport"` tier stamp the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name, plus `cost_usd` and both
+        // cache channels so `BudgetLedger`/`total_cost_usd` see them too
+        // (`EN.14.A`).
+        carry_forward_billing(&ctx, "TriageTaskNode", &mut result);
         put_result(&mut ctx, "TriageTaskNode", result);
 
         Ok(ctx)
@@ -2803,17 +2802,6 @@ impl Node for ConsolidatedReviewNode {
             .and_then(|value| value.as_str())
             .ok_or_else(|| NodeError::new("ConsolidatedReviewNode: model returned no content"))?
             .to_string();
-        // Carried forward below: `put_result` replaces this node's whole
-        // `ctx.nodes` entry, which would otherwise silently drop the
-        // `"transport"` stamp `ClaudeCodeStep::process` just wrote — the
-        // exact tier-telemetry `RunTelemetry`/`observed_model_tiers`
-        // (`policy/telemetry.rs`) reads back out by this same node name.
-        let transport_stamp = ctx
-            .nodes
-            .get("ConsolidatedReviewNode")
-            .and_then(|value| value.get("transport"))
-            .cloned();
-
         let parsed: ReviewOutput =
             parse_structured_or_fenced(&ctx, "ConsolidatedReviewNode", &content).map_err(
                 |err| {
@@ -2869,9 +2857,6 @@ impl Node for ConsolidatedReviewNode {
         // `wrap_up::derive_terminal_signal` read the same number this pass
         // produced rather than each re-deriving it.
         result["task_review_attempts"] = json!(task_review_attempts);
-        if let Some(transport) = transport_stamp {
-            result["transport"] = transport;
-        }
         // Nested under `"state"` rather than replacing this result outright
         // — the object above IS the review verdict `ReviewRouterNode` reads
         // via `get_result(ctx, "ConsolidatedReviewNode")`, so the durable
@@ -2880,6 +2865,15 @@ impl Node for ConsolidatedReviewNode {
         // knows to unwrap this key for this one node identity.
         result["state"] = serde_json::to_value(&counted_state)
             .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        // Carried forward below: `put_result` replaces this node's whole
+        // `ctx.nodes` entry, which would otherwise silently drop what
+        // `ClaudeCodeStep::process` just wrote onto this same identity —
+        // the `"transport"` tier stamp the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name, plus `cost_usd` and both
+        // cache channels so `BudgetLedger`/`total_cost_usd` see them too
+        // (`EN.14.A`).
+        carry_forward_billing(&ctx, "ConsolidatedReviewNode", &mut result);
         put_result(&mut ctx, "ConsolidatedReviewNode", result);
 
         Ok(ctx)

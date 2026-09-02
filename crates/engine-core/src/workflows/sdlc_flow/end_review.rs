@@ -52,8 +52,8 @@ use super::task_loop::{
     stage_untracked_intent, worktree_path, ReviewOutput, Stage, REVIEW_STABLE_PROMPT,
 };
 use super::{
-    get_result, parse_structured_or_fenced, put_result, CommandRunner, ModelTransport,
-    TransportSlot,
+    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, CommandRunner,
+    ModelTransport, TransportSlot,
 };
 
 /// The result-node name [`EndReviewNode`] stamps under, and the name
@@ -224,16 +224,6 @@ impl Node for EndReviewNode {
             .and_then(|value| value.as_str())
             .ok_or_else(|| NodeError::new(format!("{NODE_NAME}: model returned no content")))?
             .to_string();
-        // Carry the transport stamp forward the same way
-        // `ConsolidatedReviewNode` does — `put_result` below replaces this
-        // node's whole `ctx.nodes` entry, which would otherwise silently
-        // drop the `"transport"` stamp `ClaudeCodeStep::process` just wrote.
-        let transport_stamp = ctx
-            .nodes
-            .get(NODE_NAME)
-            .and_then(|value| value.get("transport"))
-            .cloned();
-
         let parsed: ReviewOutput =
             parse_structured_or_fenced(&ctx, NODE_NAME, &content).map_err(|err| {
                 NodeError::new(format!(
@@ -256,9 +246,15 @@ impl Node for EndReviewNode {
         if !matches!(normalized_verdict.as_str(), "PASS" | "FAIL" | "PARTIAL") {
             result["unrecognized_verdict"] = json!(normalized_verdict);
         }
-        if let Some(transport) = transport_stamp {
-            result["transport"] = transport;
-        }
+        // Carry billing/telemetry forward the same way `ConsolidatedReviewNode`
+        // does — `put_result` below replaces this node's whole `ctx.nodes`
+        // entry, which would otherwise silently drop what
+        // `ClaudeCodeStep::process` just wrote onto this same identity: the
+        // `"transport"` tier stamp, `cost_usd`, and both cache channels
+        // (`EN.14.A`). `EndReviewNode` is deliberately NOT a member of
+        // `COST_BEARING_STAGES` — this repairs the carry-forward without
+        // changing what `total_cost_usd`/`model_tier_used` report.
+        carry_forward_billing(&ctx, NODE_NAME, &mut result);
         put_result(&mut ctx, NODE_NAME, result);
 
         Ok(ctx)
