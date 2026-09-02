@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-01T10:13:33Z"
+timestamp: "2026-09-02T10:30:15Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,47 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [run: 2026-09-02]
+
+### Lane close — context-handling-between-nodes, six blocks, five cost-reporting leaks
+- **What:** Drove the `engine` lane of the `context-handling-between-nodes` roadmap end to end:
+  `EN.14.A`, `EN.14.B`, `EN.14.C`, `EN.14.J`, `EN.ticket.write-verification-...`, `EN.14.D`. None
+  bailed. Per-block detail is in the entries below; this entry records what only the lane can see.
+  **The five leaks were one story:** the engine could not tell you what a run cost. `put_result`
+  dropped the billed cost at four wrapper sites (so a live $5 `Budget::max_cost_usd` cap was
+  structurally incapable of firing, and `total_cost_usd` reported $0.00 on runs that spent money);
+  a resumed run started with an empty ledger; a wrapper that failed after a successful model call
+  threw the billed session away; ledger entries had no model or timestamp to attribute spend by; and
+  two of nine policy surfaces silently lacked the profiles they were documented as having.
+  `EN.14.D` additionally wrote across repo boundaries — `core/synapse` (`df61b41`) and
+  `core/bastion` (`9fe802f`) — under an exclusive lease, per the root Update Protocol.
+- **Why:** `sequence.md`'s rule that nothing is measured until the numbers are true. Every consumer
+  built on the old numbers would have been pinned against figures already known to be wrong.
+- **Reading the source contradicted five of six block records, and the amendments are the durable
+  part.** `EN.14.C`'s specified mechanism was **not implementable** — `Node::process` takes `ctx` by
+  value, so on `Err` there is nothing left to diff — while the channel it wanted
+  (`NodeError::with_sessions` + `node_context`'s replay loop) already existed and was already in use.
+  `EN.14.J` listed `crates/engine-core/src/policy/` as a new directory; it had existed since EN.4.0
+  with eleven modules. `EN.14.D`'s "pre-existing drift" was a **fork**: `1.8.0` named two different
+  contracts and `bastion` was pinned to the lineage D78 says is not canonical — hence the jump to
+  `1.10.0`, skipping a `1.9.0` the other lineage had already spent. The write-verification ticket was
+  blocked on `SDLCTask` having no `files` field at all. Each amended in place per D18 rather than
+  written around.
+- **The write-verification guard's first catch was this lane's own next block, within the hour.**
+  `EN.14.D`'s cross-tree task declared only files outside the worktree, which `git status` never
+  reports — it would have failed condition (1). Merged the doc bump into that task, which is what the
+  Update Protocol required anyway.
+- **Findings, not fixes:** 9 carryover entries filed, two of them P1 — that the SDLC engines pass no
+  `--agent` and so a lane may be **quiescing its own `emit-state`** (filed unverified, with the
+  decisive test named and the reason it was not run: it only informs by succeeding, which means a
+  corpus-wide emit from a red-toolchain binary while four lanes were live), and that `emitStateRan`
+  is declared in the engine and never persisted, so no emit can be attributed from disk.
+- **Method, and it cost real time three times:** a negative result needs a control known to contain
+  the thing. Three "positive controls" this lane ran were themselves invalid and all three ran clean
+  — grepping files that never held the string, a too-precise literal (`"emit-state"` where the label
+  is `"emit-state --write"`), and a control key absent from the file it was checking.
+- **Refs:** [`orchestration-run/context-handling-between-nodes/review.md`](planning/orchestration-run/context-handling-between-nodes/review.md) ·
+  [`notes.md`](planning/orchestration-run/context-handling-between-nodes/notes.md) ·
+  [`handoff.md`](planning/handoff.md) · roadmap `context-handling-between-nodes`
 
 ### EN.14.J — shared policy core extracted, six `ModelTiers` collapsed to one — PASS
 - **What:** Ran `EN.14.J` through `/sdlc-flow` (tasks 1-5), closing the policy initiative's parallel track. Task 1 added a golden-fixture test (`policy_baseline.rs`) that resolves each of the nine workflow surfaces' baseline profile with no event override and no `harness.json`, asserting byte-identity against nine committed pre-change fixtures — the guard against silent default drift this block exists to enforce. Task 2 collapsed the six duplicate `pub struct ModelTiers` definitions to one, renaming five surface-prefixed variants (`ContentPipelineModelTiers`, `LinkedinPostModelTiers`, `ProposalGeneratorModelTiers`, `DiagnosticIntakeModelTiers`, `ResearchAgentModelTiers`) and leaving `sdlc_flow::policy::ModelTiers` as the sole survivor — a pure identifier rename, zero risk to serialized defaults. Task 3 gave `content_pipeline` and `proposal_generator` — the two surfaces that previously errored on `cheap-fast`/`thorough` — working profiles (critic-iteration and harvest-mode knobs on `content_pipeline`; `review_mode: Skip`/`Full` on `proposal_generator`), no new knobs introduced. Task 4 added a nine-surface x three-profile resolution matrix test and manually demonstrated both failure gates (a perturbed baseline reddens task 1's fixture test by name; a removed profile arm reddens the matrix test by name), reverting both before commit. Task 5 validated the full harness: fmt, clippy `-D warnings`, `nextest --workspace` (3494 passed), release build, hang-terminate script, micro-spec runner — all green, `rg -c 'pub struct ModelTiers'` returns 1. PASS review. Closes `EN.14.J`.
