@@ -38,10 +38,7 @@ pub const NODE_NAME: &str = "SummarizeNode";
 
 /// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
 /// anchor when `policy.prompt_cache` is true.
-const STABLE_SYSTEM_PROMPT: &str =
-    "You are running inside the engine-rs CONTENT_PIPELINE workflow, \
-     summarize stage. This system prompt is held constant across calls so \
-     its tokens can be cached.";
+const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/summarize.md");
 
 /// What `SummarizeNode` (and, on the back-edge, `ReviseNode`) stores under
 /// its own identity — the shape `SelfCriticNode`/`DigestRenderNode` read.
