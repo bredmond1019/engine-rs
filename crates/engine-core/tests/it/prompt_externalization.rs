@@ -110,7 +110,7 @@ fn all_stable_prompt_consts_are_include_str() {
     assert!(
         violations.is_empty(),
         "found {} inline PROMPT const literal(s) under {} — every stable-prompt const must be \
-         an include_str! definition (D24, CLAUDE.md standing rule 12):\n{}",
+         an include_str! definition (D24, CLAUDE.md standing rule 7):\n{}",
         violations.len(),
         root.display(),
         violations
