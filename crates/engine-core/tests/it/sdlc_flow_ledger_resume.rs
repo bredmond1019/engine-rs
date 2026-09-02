@@ -57,6 +57,8 @@ fn session(node: &str, id: &str, cost: f64) -> ClaudeSession {
         output_tokens: 10,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        model: String::new(),
+        started_at: None,
     }
 }
 

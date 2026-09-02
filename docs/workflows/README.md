@@ -104,6 +104,32 @@ table is a reader's copy.
 | `APPROVE_AND_RUN` | Takes an approved decision and actually executes the thing it authorized, recording one ledger row. | [approve-and-run.md](approve-and-run.md) |
 | `TERMINAL_PROBE` | Opens (or reattaches to) a tmux session and reads its pane back. A diagnostic for the terminal stack, not business work. | [terminal-probe.md](terminal-probe.md) |
 
+## Where a workflow's prompts live
+
+Every node's stable prompt text is a `.md` file, not a Rust string literal — colocated with the
+workflow that sends it, per [D24](../../planning/decisions/D24-node-prompts-live-in-colocated-files.md):
+
+```
+crates/engine-core/src/workflows/<workflow>/prompts/<node>.md
+```
+
+pulled back in with `include_str!("prompts/<node>.md")` so the `const` — and the cache breakpoint
+`policy::apply_prompt_cache` relies on — never moves. `ls` one of these directories to see every
+stable prompt a workflow sends, without grepping Rust for string literals:
+
+| Workflow | Prompts directory |
+|---|---|
+| `SDLC_FLOW` | `crates/engine-core/src/workflows/sdlc_flow/prompts/` |
+| `CONTENT_PIPELINE` | `crates/engine-core/src/workflows/content_pipeline/prompts/` |
+| `PROPOSAL_GENERATOR` | `crates/engine-core/src/workflows/proposal_generator/prompts/` |
+| `RESEARCH_AGENT` | `crates/engine-core/src/workflows/research_agent/prompts/` |
+| `DIAGNOSTIC_INTAKE` | `crates/engine-core/src/workflows/diagnostic_intake/prompts/` |
+
+Only the stable prefix lives in the file — per-run body construction (`build_prompt(...)`,
+interpolating `format!`s) stays in Rust, per CLAUDE.md standing rule 6. A regression guard,
+`crates/engine-core/tests/it/prompt_externalization.rs`, fails the suite if a new stable-prompt
+`const` is ever written as an inline literal instead of `include_str!`.
+
 ## Tuning a workflow: profiles and local models
 
 Most workflows expose a **policy** — the knobs that trade cost, speed and quality (which model tier

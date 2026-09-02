@@ -161,6 +161,30 @@ pub struct SDLCTask {
     /// declared.
     #[serde(default = "default_expects_writes")]
     pub expects_writes: bool,
+    /// Authored spec data naming the files this task is expected to touch —
+    /// `tasks.json`'s `files[]` array, which every task has carried for as
+    /// long as `/generate-tasks` has existed even though this struct never
+    /// deserialized it until now.
+    ///
+    /// Used by `TestTaskNode::verify_claimed_writes`'s condition (2): when
+    /// non-empty, at least one path in the task's actual diff must appear
+    /// here, or the task fails write-verification.
+    ///
+    /// **This is NOT the model's self-reported `modified_files`.** That
+    /// self-report is unreliable — a model can under- or over-claim what it
+    /// touched — which is exactly why the existing write-verification guard
+    /// does not compare paths against it. `files[]` is different in kind:
+    /// it is authored into the spec by `/generate-tasks` *before* the task
+    /// ever runs, so it cannot be shaped by the run it is being used to
+    /// check. That authorship is the entire reason condition (2) is
+    /// trustworthy where a `modified_files` comparison would not be.
+    ///
+    /// `#[serde(default)]` so every `tasks.json` and committed
+    /// `sdlc-*state.json` written before this field existed still
+    /// deserializes — to an empty vec, not an error — on both a fresh load
+    /// and a resume.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 impl SDLCTask {
@@ -178,6 +202,7 @@ impl SDLCTask {
             max_attempts: default_max_attempts(),
             review_attempt_count: 0,
             expects_writes: default_expects_writes(),
+            files: Vec::new(),
         }
     }
 }
@@ -1229,6 +1254,30 @@ mod tests {
         assert_eq!(task.validation_commands, Vec::<String>::new());
         assert_eq!(task.attempt_count, 0);
         assert_eq!(task.max_attempts, 3);
+        assert_eq!(task.files, Vec::<String>::new());
+    }
+
+    #[test]
+    fn sdlc_task_files_round_trips_when_present() {
+        let json = serde_json::json!({
+            "task_id": 1,
+            "title": "Do the thing",
+            "description": "Full description",
+            "files": ["crates/engine-core/src/lib.rs", "crates/engine-core/src/main.rs"],
+        });
+        let task: SDLCTask = serde_json::from_value(json).expect("deserializes with files");
+        assert_eq!(
+            task.files,
+            vec![
+                "crates/engine-core/src/lib.rs".to_string(),
+                "crates/engine-core/src/main.rs".to_string(),
+            ]
+        );
+
+        let round_tripped: SDLCTask =
+            serde_json::from_value(serde_json::to_value(&task).expect("serializes"))
+                .expect("re-deserializes");
+        assert_eq!(round_tripped.files, task.files);
     }
 
     #[test]
@@ -1522,6 +1571,19 @@ mod tests {
     /// The ledger is the whole point of the field: an engine-rs run spans one
     /// Claude session per LLM stage per attempt, so every entry must survive
     /// the committed-state write, in order, failures included.
+    ///
+    /// Also covers EN.14.D-task2: `model` and `started_at` must survive the
+    /// same round trip as every other ledger field. This assertion is SHOWN
+    /// CAPABLE OF FAILING (carryover `gate-scope-must-be-shown-capable-of-failing`):
+    /// temporarily removing either field from `ClaudeSession`'s `Serialize`
+    /// impl (e.g. commenting out the `model`/`started_at` fields so
+    /// `serde_json::json!(session)` omits them) turns the `model`/`started_at`
+    /// assertions below red — `assert_eq!` reports the actual value
+    /// (`""`/`None`) against the expected literal, naming exactly which field
+    /// regressed — while every other assertion in this test keeps passing.
+    /// Restoring the fields turns it green again. Both outputs are recorded in
+    /// the task-2 completion note; the test itself is left in its normal,
+    /// passing shape.
     #[test]
     fn claude_sessions_round_trip_through_committed_json_in_order() {
         let mut state = SDLCState::new("EN.4.1-fixture");
@@ -1532,18 +1594,24 @@ mod tests {
                 node: "ImplementNode".to_string(),
                 session_id: Some("sess-1".to_string()),
                 ok: true,
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                started_at: Some("2026-09-01T12:00:00Z".to_string()),
                 ..Default::default()
             },
             ClaudeSession {
                 node: "TestNode".to_string(),
                 session_id: Some("sess-2".to_string()),
                 ok: false,
+                model: "claude-opus-4-1-20250805".to_string(),
+                started_at: Some("2026-09-01T12:05:00Z".to_string()),
                 ..Default::default()
             },
             ClaudeSession {
                 node: "TestNode".to_string(),
                 session_id: Some("sess-3".to_string()),
                 ok: true,
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                started_at: Some("2026-09-01T12:10:00Z".to_string()),
                 ..Default::default()
             },
         ];
@@ -1551,6 +1619,14 @@ mod tests {
         let json = state.to_committed_state_json(&meta, None, None, None, None, None);
         assert_eq!(json["claude_sessions"][0]["session_id"], "sess-1");
         assert_eq!(json["claude_sessions"][1]["ok"], false);
+        assert_eq!(
+            json["claude_sessions"][0]["model"],
+            "claude-sonnet-4-5-20250929"
+        );
+        assert_eq!(
+            json["claude_sessions"][1]["started_at"],
+            "2026-09-01T12:05:00Z"
+        );
 
         let round_tripped =
             SDLCState::from_committed_state_json(&json).expect("round-trip should parse");
@@ -1566,6 +1642,59 @@ mod tests {
         );
         assert!(!round_tripped.claude_sessions[1].ok);
         assert_eq!(round_tripped.claude_sessions[1].node, "TestNode");
+        assert_eq!(
+            round_tripped
+                .claude_sessions
+                .iter()
+                .map(|s| s.model.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "claude-sonnet-4-5-20250929",
+                "claude-opus-4-1-20250805",
+                "claude-sonnet-4-5-20250929",
+            ],
+            "model must survive the round trip alongside the rest of the ledger"
+        );
+        assert_eq!(
+            round_tripped.claude_sessions[2].started_at.as_deref(),
+            Some("2026-09-01T12:10:00Z"),
+            "started_at must survive the round trip alongside the rest of the ledger"
+        );
+    }
+
+    /// Backward compatibility direction (EN.14.D-task2): a ledger entry JSON
+    /// written before `model`/`started_at` existed — neither key present at
+    /// all — must still deserialize, yielding an empty `model` and `None`
+    /// `started_at` rather than an error. This is the shape of every
+    /// `ClaudeSession` artifact on disk today.
+    #[test]
+    fn claude_sessions_entry_without_model_or_started_at_deserializes_to_empty_and_none() {
+        let value = serde_json::json!({
+            "spec_slug": "fixture",
+            "branch": "b",
+            "worktree_path": "w",
+            "started_at": "2026-07-25T00:00:00Z",
+            "updated_at": "2026-07-25T00:10:00Z",
+            "status": "running",
+            "tasks": {},
+            "claude_sessions": [
+                {
+                    "node": "ImplementNode",
+                    "session_id": "sess-1",
+                    "ok": true,
+                    "cost_usd": 0.5,
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                },
+            ],
+        });
+
+        let state = SDLCState::from_committed_state_json(&value).expect("must parse");
+        assert_eq!(state.claude_sessions.len(), 1);
+        assert_eq!(state.claude_sessions[0].model, "");
+        assert_eq!(state.claude_sessions[0].started_at, None);
     }
 
     /// `claude_sessions` must never be confused with, or overwrite, `run_id` —

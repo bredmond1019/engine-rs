@@ -372,9 +372,11 @@ end/reconcile. Before starting a heavy repo, determine this by reading the targe
 (the JSON `category` field is `"browser-automation"` or `"native-build"`), then register it with
 that category:
 `python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <name> --category <category> --agent <this lane's agent identity>`.
-Exit code `3` (or `"allowed": false` in the JSON output) means that category's pool is already at
-capacity (`MAX_LANES_BY_CATEGORY`: 2 browser-automation, 4 native-build) — put this repo on a
-cheap-gate block instead, or wait.
+Exit code `3` (or `"allowed": false` in the JSON output) means either that category's pool is already at
+capacity (`MAX_LANES_BY_CATEGORY`: 2 browser-automation, 4 native-build) **or** that a held exclusive lease
+is blocking this registration — the two are distinguishable from the JSON output's now-populated
+`exclusive_leases` array (non-empty means a lease, not capacity, is the cause) versus `active`. Either
+way: put this repo on a cheap-gate block instead, or wait.
 
 **Do not pass `--pid`.** The process running `register` is the short-lived Claude Code command
 invocation itself — it exits as soon as this step returns, so its own pid is never a valid

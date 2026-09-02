@@ -53,10 +53,7 @@ const RESEARCH_NODE_NAME: &str = "ProposalCompanyResearchNode";
 
 /// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
 /// anchor when `policy.prompt_cache` is true.
-const STABLE_SYSTEM_PROMPT: &str =
-    "You are running inside the engine-rs PROPOSAL_GENERATOR workflow, \
-     opportunity stage. This system prompt is held constant across calls so \
-     its tokens can be cached.";
+const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/opportunity_identifier.md");
 
 /// The model's raw per-candidate scoring output, before the node overwrites
 /// `composite`/`tier` deterministically.

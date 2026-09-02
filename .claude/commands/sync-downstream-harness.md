@@ -32,6 +32,13 @@ $ARGUMENTS — optional flags, space-separated:
 - `--commit` — after applying, commit each repo's own half and make one brain commit for all the
   `planning/.template-version` stamps. **Requires `--apply`** (a dry run writes nothing to commit;
   passing `--commit` alone is a usage error and exits 2). See step 6.
+- `--commit-pending` — widen `--commit`'s pathspec to every base-template-**owned** path the repo
+  has dirty, not only what this run wrote. **Requires `--commit`.** The catch-up case: an earlier
+  `--apply` that was never committed leaves files that are current on disk and unrecorded in git,
+  and they never appear in a dry run because their content already matches. Ownership is computed
+  from the same source sets `--apply` writes from, so a repo's own file is never swept in; an owned
+  path whose content *differs* from base-template is **withheld and reported**, never staged under a
+  "sync base-template" subject. Measured 2026-09-02: 103 such paths across 18 repos.
 
 ## Instructions
 
@@ -98,7 +105,9 @@ $ARGUMENTS — optional flags, space-separated:
    pathspec is explicit and derived from what that run actually wrote — the script never runs
    `git add -A` (there is a test asserting that against its source). A repo whose harness tree
    lives in the brain's own index (the `engines_only` brain root) is folded into the brain commit
-   rather than committed twice. Per repo it prints the short sha, `nothing to commit`, or
+   rather than committed twice. **If a repo is already in limbo, add `--commit-pending`** — a repo carrying owned files from an earlier uncommitted `--apply` will otherwise stay in limbo, one file deeper each run, because `--commit` only ever stages its own output.
+
+   Per repo it prints the short sha, `nothing to commit`, or
    `COMMIT FAILED: <reason>`; any failure makes the whole run exit 1, so a red run is visible
    rather than buried in the middle of a 19-repo report.
 

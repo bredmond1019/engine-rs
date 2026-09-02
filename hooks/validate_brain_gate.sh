@@ -86,16 +86,36 @@ find_brain_root() {
   return 1
 }
 
-# classify_new_errors <brain_root> <this_repo_toplevel>
-# Reads newline-separated `error [CODE] <path> — <message>` diagnostics on stdin. For each
-# line, resolves the git repo that OWNS the named file (its own `git -C <dir>
-# rev-parse --show-toplevel`, walking up from that file's directory — works whether or not
-# the file itself exists, as long as some ancestor directory does) and compares it against
-# <this_repo_toplevel>. Writes blocking lines (owned by this repo) and advisory lines (owned
-# by any other repo, or unresolvable) to two temp files and prints their paths as
+# classify_new_errors <brain_root> <this_repo_toplevel> <staged_files>
+# Reads newline-separated `error [CODE] <path> — <message>` diagnostics on stdin.
+#
+# LANE, not just repo: a file's "lane" is (a) the toplevel of the separate git repo that
+# owns it, if any (e.g. core/bastion-ui, its own .git) — same as before; otherwise (b), if
+# the path matches `[<tier>/]_planning/<slug>/...` (a sub-repo's planning vault, physically
+# tracked by THIS repo's own git per CLAUDE.md standing rule 10 — `core/mev/planning` is a
+# symlink into `core/_planning/mev/`), the lane is that specific `_planning/<slug>` vault,
+# NOT the whole brain repo; otherwise (c) the brain root itself (genuinely shared top-level
+# content: docs/, hooks/, scripts/, HQ's own top-level planning/). (b) is why gate 2 needed
+# a second pass 2026-09-01: a commit scoped to core/_planning/mev/ was blocked by an
+# untracked file in core/_planning/bella/ — different lanes, same physical git repo, so the
+# original repo-toplevel-only check (a) alone couldn't tell them apart.
+#
+# <staged_files> is a newline-separated list of the paths THIS operation is actually
+# touching, brain-root-relative — normally `git diff --cached --name-only` for a commit,
+# converted to brain-root-relative if this repo isn't the brain root itself. Empty for
+# `pre-push` (nothing is staged post-commit, pre-push), which deliberately falls back to
+# the exact old whole-repo behavior: committing lane = {this_repo_toplevel} alone, matching
+# pre-push stage 1 before this lane split existed and keeping it unaffected by design.
+#
+# When staged files ARE given, the committing lane set is every lane touched by them (a
+# commit spanning two lanes is blocked by either); a new error blocks iff its own lane is
+# in that set — never merely "owned by the physical repo."
+#
+# Writes blocking lines (this operation's own lane(s)) and advisory lines (every other
+# lane, or unresolvable) to two temp files and prints their paths as
 # "<blocking-file>\t<advisory-file>". Caller is responsible for removing both.
 classify_new_errors() {
-  local brain_root="$1" this_repo="$2"
+  local brain_root="$1" this_repo="$2" staged_files="$3"
   local blocking_file advisory_file
   blocking_file="$(mktemp)"
   advisory_file="$(mktemp)"
@@ -104,18 +124,11 @@ import os
 import subprocess
 import sys
 
-brain_root, this_repo, blocking_path, advisory_path = sys.argv[1:5]
+brain_root, this_repo, staged_raw, blocking_path, advisory_path = sys.argv[1:6]
 lines = [ln for ln in sys.stdin.read().splitlines() if ln.strip()]
-blocking = []
-advisory = []
-for ln in lines:
-    # "error [CODE] <path> -- <message>" -- path never contains " -- " itself.
-    try:
-        rest = ln.split("] ", 1)[1]
-        path = rest.split(" — ", 1)[0]
-    except IndexError:
-        advisory.append(ln)
-        continue
+staged_files = [p for p in staged_raw.splitlines() if p.strip()]
+
+def lane_of(path):
     fdir = os.path.dirname(os.path.join(brain_root, path))
     owner = ""
     try:
@@ -127,7 +140,43 @@ for ln in lines:
             owner = r.stdout.strip()
     except Exception:
         owner = ""
-    if this_repo and owner == this_repo:
+    if owner and owner != brain_root:
+        return owner
+    # A sub-repo planning vault shows up under TWO different path shapes that must map
+    # to the SAME lane token: the real vault path `[<tier>/]_planning/<slug>/...` (how a
+    # commit stages it, e.g. via `git add core/_planning/mev/...`) and the symlinked face
+    # `<tier>/<slug>/planning/...` (how `bastion validate-brain` actually REPORTS it, e.g.
+    # `core/bella/planning/...` -- validate-brain resolves through the symlink). Missing
+    # this equivalence was the exact bug that shipped 2026-09-01: staging the real vault
+    # path for the offending file itself still read as advisory, because its lane token
+    # never matched the symlink-face token in the validate-brain diagnostic line.
+    parts = path.split("/")
+    for i, part in enumerate(parts):
+        if part == "_planning":
+            prefix = "/".join(parts[:i])
+            slug = parts[i + 1] if i + 1 < len(parts) else ""
+            return "planning:" + (prefix + "/" + slug if prefix else slug)
+        if part == "planning":
+            prefix = "/".join(parts[:i])
+            return "planning:" + (prefix if prefix else "_root")
+    return brain_root
+
+if staged_files:
+    committing_lanes = {lane_of(p) for p in staged_files}
+else:
+    committing_lanes = {this_repo} if this_repo else set()
+
+blocking = []
+advisory = []
+for ln in lines:
+    # "error [CODE] <path> -- <message>" -- path never contains " -- " itself.
+    try:
+        rest = ln.split("] ", 1)[1]
+        path = rest.split(" — ", 1)[0]
+    except IndexError:
+        advisory.append(ln)
+        continue
+    if lane_of(path) in committing_lanes:
         blocking.append(ln)
     else:
         advisory.append(ln)
@@ -135,7 +184,7 @@ with open(blocking_path, "w") as f:
     f.write("\n".join(blocking))
 with open(advisory_path, "w") as f:
     f.write("\n".join(advisory))
-' "$brain_root" "$this_repo" "$blocking_file" "$advisory_file" 2>/dev/null
+' "$brain_root" "$this_repo" "$staged_files" "$blocking_file" "$advisory_file" 2>/dev/null
   printf '%s\t%s\n' "$blocking_file" "$advisory_file"
 }
 
@@ -157,6 +206,13 @@ run_validate_brain_gate() {
     echo "$label: no brain.toml found walking up from $start_dir — skipping validate-brain gate (standalone checkout)" >&2
     return 0
   fi
+  # Normalize to the PHYSICAL path: find_brain_root is a pure dirname walk (never resolves
+  # symlinks), but `git rev-parse --show-toplevel` always does (e.g. macOS's /var/folders/...
+  # resolves to /private/var/folders/...). Left unnormalized, brain_root and
+  # this_repo_toplevel below can name the SAME directory as two different strings, silently
+  # breaking both the "am I at brain root" check and the staged-file relative-path
+  # conversion that feeds classify_new_errors' lane scoping.
+  brain_root="$(cd "$brain_root" && pwd -P)"
 
   if ! command -v bastion >/dev/null 2>&1; then
     echo "$label: warning: 'bastion' not found on PATH — skipping validate-brain gate. Install bastion to enable it." >&2
@@ -226,6 +282,22 @@ except Exception:
   local this_repo_toplevel
   this_repo_toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 
+  # staged_files: what THIS operation actually touches, brain-root-relative — used by
+  # classify_new_errors to scope blocking by LANE, not just by physical repo (see its
+  # header). Empty at push time (nothing staged post-commit), so pre-push falls back to its
+  # original whole-repo behavior automatically — this is deliberate, not a gap.
+  local staged_files=""
+  local raw_staged
+  raw_staged="$(git diff --cached --name-only 2>/dev/null || true)"
+  if [ -n "$raw_staged" ]; then
+    if [ "$this_repo_toplevel" = "$brain_root" ]; then
+      staged_files="$raw_staged"
+    else
+      local repo_prefix="${this_repo_toplevel#"$brain_root"/}"
+      staged_files="$(printf '%s\n' "$raw_staged" | sed "s#^#$repo_prefix/#")"
+    fi
+  fi
+
   local strict="${VALIDATE_BRAIN_STRICT:-${PREPUSH_STRICT:-0}}"
 
   if [ "$strict" = "1" ]; then
@@ -270,7 +342,7 @@ for ln in dict.fromkeys(current):
       fi
     elif [ -n "$introduced" ]; then
       local files blocking_file advisory_file blocking_new advisory_new
-      files="$(classify_new_errors "$brain_root" "$this_repo_toplevel" <<< "$introduced")"
+      files="$(classify_new_errors "$brain_root" "$this_repo_toplevel" "$staged_files" <<< "$introduced")"
       blocking_file="${files%%$'\t'*}"
       advisory_file="${files#*$'\t'}"
       blocking_new="$(cat "$blocking_file" 2>/dev/null)"
@@ -309,7 +381,7 @@ for ln in dict.fromkeys(current):
     # block a repo that introduced nothing of its own.
     if [ "$total" -gt "$baseline" ] && [ -n "$diagnostics" ] && command -v python3 >/dev/null 2>&1; then
       local files blocking_file advisory_file blocking_new advisory_new
-      files="$(classify_new_errors "$brain_root" "$this_repo_toplevel" <<< "$diagnostics")"
+      files="$(classify_new_errors "$brain_root" "$this_repo_toplevel" "$staged_files" <<< "$diagnostics")"
       blocking_file="${files%%$'\t'*}"
       advisory_file="${files#*$'\t'}"
       blocking_new="$(cat "$blocking_file" 2>/dev/null)"

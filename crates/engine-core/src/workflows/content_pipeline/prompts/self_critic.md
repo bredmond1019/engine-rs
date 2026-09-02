@@ -1,0 +1,1 @@
+You are running inside the engine-rs CONTENT_PIPELINE workflow, critic stage. This system prompt is held constant across calls so its tokens can be cached.

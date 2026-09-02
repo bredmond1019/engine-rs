@@ -40,6 +40,16 @@ Empty `$ARGUMENTS` → print usage and stop.
 
 ---
 
+## Not this: several roadmaps at once
+
+This command is **one roadmap**, and its output is proposed `carryover[]` entries for it. To mine
+several runs together for the mechanisms behind them — engine defects, orchestration friction,
+carryover shapes that recur across repos — use [`/consolidate-fleet`](consolidate-fleet.md), which
+invokes this command per roadmap and adds a cross-run pass on top. It also carries the
+`lane-log.jsonl` watermark (`scripts/lane_log_watermark.py`), which is what lets a later run resume
+from where the last one stopped reading. This command's own resume mechanism is the
+`lifecycle: consolidated` stamp of Step 6 and is unchanged.
+
 ## Step 1 — Resolve scope
 
 Walk up from cwd for `brain.toml` to find `BRAIN_ROOT`. Resolve `<roadmap-slug>` to `roadmap_dir` via

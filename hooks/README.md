@@ -163,41 +163,47 @@ Note the hook is still only *live* where `core.hooksPath` is set (HQ is; `pre-pu
 `chmod -x`'d fleet-wide), so enabling this is a change to author-time behaviour in HQ and in
 every repo that opts in, not a fleet-wide flag day.
 
-### Gate 2 (corpus graph/structure) is OFF by default as of 2026-09-01
+### Gate 2 (corpus graph/structure): off-and-back-on, 2026-09-01 → 2026-09-02
 
-The frontmatter gate above stays on. The corpus graph/structure gate that shipped alongside it
-(`982c63bc0`) is now opt-in behind **`BRAIN_GRAPH_GATE=1`**, at the operator's request, until
-corpus graph validation has a better home than author time.
+The frontmatter gate above (gate 1) stays on throughout; only gate 2 (the corpus
+graph/structure delta check) went through this cycle.
 
-**Why.** The gate scores the WHOLE corpus, by design — that is what lets it catch the break class
-a path-scoped gate misses, where deleting a doc surfaces the error on a different file. But the
-corpus is one shared vault written by several concurrent sessions, so it also blocks your commit
-on a file you did not touch and cannot safely fix. Measured 2026-09-01: a commit scoped to
-`core/_planning/mev/` was blocked by `core/bella/planning/ide-layout/sequence.md`, an **untracked**
-file another session had written 40 minutes earlier and had not yet given an `index.md` row. The
-only moves available were to race that session's index edit or pass `--no-verify`, and a gate that
-is routinely bypassed is worse than one that is off, because the bypass becomes reflex.
+**Shipped 2026-09-01, broke same day.** The gate scores the WHOLE corpus by design — that is
+what lets it catch the break class a path-scoped gate misses, where deleting a doc surfaces the
+error on a different file. But the corpus is one shared vault written by several concurrent
+sessions, and the FIRST version of the gate attributed a new error to "the repo currently
+committing" using only the physical git repo boundary. That is too coarse: a commit scoped to
+`core/_planning/mev/` was blocked by `core/bella/planning/ide-layout/sequence.md`, an
+**untracked** file another session had written 40 minutes earlier — different sub-repos'
+planning vaults, but the SAME physical HQ git repo (every `planning/` is a symlink into
+`core/_planning/<slug>/`, CLAUDE.md standing rule 10), so the repo-boundary check could not
+tell them apart. Switched off behind `BRAIN_GRAPH_GATE=1` (opt-in) the same day.
 
-**What is unchanged.** `hooks/validate_brain_gate.sh`, its delta-attribution logic, and every one
-of its test cases stay live — the suite sets `BRAIN_GRAPH_GATE=1` so the contract is still
-exercised, and one case pins the default-off behaviour. `hooks/pre-push` stage 1 uses the same
-shared gate script and is unaffected by this switch. Re-enabling is one environment variable.
+**Re-enabled 2026-09-02** after the real fix: `hooks/validate_brain_gate.sh`'s
+`classify_new_errors` now scopes blocking by **lane**, not merely by physical repo — a
+`core/<slug>/planning/...` or `core/_planning/<slug>/...` path (both shapes a file can appear
+under are unified to the same lane token) is its own lane, distinct from the rest of the repo.
+A commit in `core/_planning/mev/` no longer blocks on a break in `core/_planning/bella/`; it
+still blocks on a break inside its own vault, or in genuinely shared top-level content
+(`docs/`, `hooks/`, `scripts/`). Verified live against the exact reported scenario, both
+directions, before re-enabling. Gate 2 is **ON by default** again; `BRAIN_GRAPH_GATE=0` is
+kept as an opt-out escape hatch (inverted from the 2026-09-01 default) in case a lane-scoping
+edge case surfaces before this has been proven at scale.
 
 ```bash
-BRAIN_GRAPH_GATE=1 git commit -m "..."   # run gate 2 for one commit
+BRAIN_GRAPH_GATE=0 git commit -m "..."   # skip gate 2 for one commit
 ```
 
-**What is now uncovered.** Corpus graph and structure errors reach `main` unannounced at commit
-time. `./scripts/sync/validate_brain.sh` still runs nightly, and `bastion validate-brain --graph`
-/ `--structure` are still the authoritative checks to run by hand before a push. The better home
-this is waiting on is a check that attributes an error to the session that caused it rather than
-to whoever commits next.
+`hooks/pre-push` stage 1 uses the same shared gate script throughout this whole cycle and was
+never affected by either the break or the fix — see `hooks/validate_brain_gate.sh`'s header for
+why (pre-push has nothing staged post-commit, so it always used the whole-repo fallback, which
+this lane fix leaves untouched).
 
 ```bash
 bash hooks/test_pre-commit.sh   # exit 0 = all pass
 ```
 
-34 cases — clean frontmatter passes, an unquoted colon blocks (and names the file:line),
+47 checks across ~30 scenarios — clean frontmatter passes, an unquoted colon blocks (and names the file:line),
 the same value quoted passes, no-frontmatter passes, a non-`.md` staged file with
 YAML-shaped content is ignored, an unstaged broken file is ignored, re-staging a broken
 edit over a clean one blocks (proves it checks the staged blob, not the first `git add`),
@@ -213,16 +219,20 @@ impossible date, and both fields absent. The env var passes through `git commit`
 hook and on into the checker, so they exercise the real path rather than calling the
 function directly.
 
-Gate 2's 8 cases (`new_gated_repo()`, a `bastion` shim over `--graph`/`--structure` only)
-prove: the gate visibly runs rather than silently skipping when `brain.toml` + `bastion` are
-both present; a fresh fixture with no `.git/validate-last-good.json` yet blocks on a newly
-introduced error, falling back to the (absent, so zero) tracked baseline; the SAME error
-pre-recorded in `.git/validate-last-good.json` does **not** block — the fairness property
-gate 2 exists for, proving a commit is never blocked for an error a different, earlier commit
-already let through; and `bastion` missing from PATH degrades gracefully, same non-fatal
-contract as gate 1's missing-tool cases. Every other existing case's fixture has no
-`brain.toml` at all, so gate 2 always skips gracefully for them ("no brain.toml found") —
-proving the new gate is additive and does not change gate 1's existing behavior.
+Gate 2's own cases (`new_gated_repo()`, a `bastion` shim over `--graph`/`--structure` only)
+prove: the gate is ON with no env var at all, and `BRAIN_GRAPH_GATE=0` opts back out; the gate
+visibly runs rather than silently skipping when `brain.toml` + `bastion` are both present; a
+fresh fixture with no `.git/validate-last-good.json` yet blocks on a newly introduced error,
+falling back to the (absent, so zero) tracked baseline; the SAME error pre-recorded in
+`.git/validate-last-good.json` does **not** block — the fairness property gate 2 exists for;
+`bastion` missing from PATH degrades gracefully; a nested git repo's error is advisory-only for
+the outer repo's commit while the outer repo's own error still blocks (`new_nested_repo()`);
+and — the 2026-09-01→02 fix's own regression test — two DIFFERENT sub-repo planning vaults
+inside the SAME physical git repo are correctly kept apart (`new_planning_vaults_repo()`),
+including proving the real-vault-path and symlinked-face path SHAPES for the same vault map to
+the identical lane. Every other existing case's fixture has no `brain.toml` at all, so gate 2
+always skips gracefully for them ("no brain.toml found") — proving the gate is additive and
+does not change gate 1's existing behavior.
 
 #### `pre-commit` gate 2 — corpus graph/structure delta gate (added 2026-09-01)
 
@@ -240,6 +250,13 @@ only when a push is blocked with no clue which commit is at fault.
   `.git/validate-last-good.json`'s known set, so a commit is blocked only for an error it
   itself introduces, never for a pre-existing one another session already left unresolved
   (unless that session bypassed the gate with `--no-verify`).
+- **Scoped by LANE, not merely by physical repo** (the 2026-09-02 fix). A new error blocks
+  only if it is owned by the SAME lane as what this commit is staging — a separate git
+  repo's own lane (unchanged since 2026-09-01), OR a specific `core/<slug>/planning/...` /
+  `core/_planning/<slug>/...` sub-repo vault (both path shapes unified), OR genuinely shared
+  top-level content (`docs/`, `hooks/`, `scripts/`) as its own catch-all lane. A commit
+  scoped to one sub-repo's vault is never blocked by a break in a different sub-repo's
+  vault, even though both are tracked by the SAME physical HQ git repo.
 - **Only `--graph` and `--structure`** (~1s each, corpus-wide). `--links` (~11s) and
   `--state`/`--sync` stay at push time — too slow to pay on every commit.
 - **Unconditional** — unlike gate 1, this does NOT skip when no `.md` file is staged. A
@@ -248,16 +265,18 @@ only when a push is blocked with no clue which commit is at fault.
   CLAUDE.md standing rule 10) still pays for it: `validate-brain` always scores the whole
   corpus regardless of what the commit touched, because the errors worth catching are
   relational — an edit to one file can dangle a `related:` edge or `index.md` row in a
-  completely different, untouched file.
-- **Degrades gracefully**: no `brain.toml` walking up → skip, notice only (most repos —
-  the errors this gate finds today all live in HQ's own `docs/decisions/`); `bastion` not on
+  completely different, untouched file. The LANE check above only narrows which of those
+  errors can *block*, never what is *checked*.
+- **Degrades gracefully**: no `brain.toml` walking up → skip, notice only; `bastion` not on
   PATH → skip, warning only; `hooks/validate_brain_gate.sh` missing → skip, warning only.
-- **`.git/validate-last-good.json` is per-clone and untracked**, shared by every concurrent
-  session working in this one physical HQ checkout — it only ever advances past a commit
-  that did NOT block, so the fairness property holds as long as nobody routes around the
-  gate with `--no-verify`.
-- **`VALIDATE_BRAIN_STRICT=1`** (or the older `PREPUSH_STRICT=1`, kept as an alias) forces
-  the whole-corpus test instead of the delta, same escape hatch `pre-push` stage 1 has.
+- **`.git/validate-last-good.json` is per-clone, per-PHYSICAL-repo, and untracked** — HQ's
+  is a different file from `core/mev`'s own, even once every repo carries this gate; it only
+  ever advances past a commit that did NOT block, so the fairness property holds within one
+  repo as long as nobody routes around the gate with `--no-verify`.
+- **`BRAIN_GRAPH_GATE=0`** turns gate 2 off for one commit (it is ON by default). Separately,
+  **`VALIDATE_BRAIN_STRICT=1`** (or the older `PREPUSH_STRICT=1`, kept as an alias) forces
+  the whole-corpus, every-lane test instead of the delta/lane scoping, same escape hatch
+  `pre-push` stage 1 has.
 
 ### `post-commit` — Brain RAG delete/rename freshness
 

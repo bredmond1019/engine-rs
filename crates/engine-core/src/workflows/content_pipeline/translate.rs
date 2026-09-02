@@ -84,10 +84,7 @@ const DIGEST_RENDER_NODE_NAME: &str = "DigestRenderNode";
 
 /// A stable, run-invariant system-prompt prefix used as the cache-breakpoint
 /// anchor when `policy.prompt_cache` is true.
-const STABLE_SYSTEM_PROMPT: &str =
-    "You are running inside the engine-rs CONTENT_PIPELINE workflow, \
-     translate stage. This system prompt is held constant across calls so \
-     its tokens can be cached.";
+const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/translate.md");
 
 /// What `TranslateNode` stores under its own identity — the shape
 /// `DigestRenderNode` reads to populate `ContentPipelineOutput
