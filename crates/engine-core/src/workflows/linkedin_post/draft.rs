@@ -451,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn applies_draft_stage_model_tier() {
         let policy = LinkedInPostPolicy {
-            model_tiers: super::super::policy::ModelTiers {
+            model_tiers: super::super::policy::LinkedinPostModelTiers {
                 draft: super::super::policy::ModelTier::Opus,
                 ..LinkedInPostPolicy::default().model_tiers
             },

@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn registry_for_policy_with_local_tier_keeps_same_node_identity() {
         let policy = DiagnosticIntakePolicy {
-            model_tiers: super::super::policy::ModelTiers {
+            model_tiers: super::super::policy::DiagnosticIntakeModelTiers {
                 extract: ModelTier::Local,
             },
             ..DiagnosticIntakePolicy::default()

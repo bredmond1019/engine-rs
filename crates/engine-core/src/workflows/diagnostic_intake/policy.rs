@@ -23,11 +23,11 @@ use crate::policy::{merge_opt, Overlay};
 /// Per-stage model tier assignment. `DIAGNOSTIC_INTAKE` has exactly one
 /// stage: the terminal `IntakeExtractNode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelTiers {
+pub struct DiagnosticIntakeModelTiers {
     pub extract: ModelTier,
 }
 
-impl Default for ModelTiers {
+impl Default for DiagnosticIntakeModelTiers {
     /// Sonnet — the behavior-stable baseline. `extract` may still be
     /// resolved to `ModelTier::Local` via an override layer.
     fn default() -> Self {
@@ -45,7 +45,7 @@ impl Default for ModelTiers {
 pub struct DiagnosticIntakePolicy {
     pub output_verbosity: OutputVerbosity,
     pub prompt_cache: bool,
-    pub model_tiers: ModelTiers,
+    pub model_tiers: DiagnosticIntakeModelTiers,
     /// Configuration for the `local` model tier — consumed by
     /// `graph::registry_for_policy` when `model_tiers.extract ==
     /// ModelTier::Local`.
@@ -59,13 +59,13 @@ impl Default for DiagnosticIntakePolicy {
         Self {
             output_verbosity: OutputVerbosity::Normal,
             prompt_cache: false,
-            model_tiers: ModelTiers::default(),
+            model_tiers: DiagnosticIntakeModelTiers::default(),
             local: LocalConfig::default(),
         }
     }
 }
 
-/// All-optional mirror of [`ModelTiers`] for the `extract` stage override.
+/// All-optional mirror of [`DiagnosticIntakeModelTiers`] for the `extract` stage override.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialModelTiers {
@@ -85,7 +85,10 @@ pub struct PartialDiagnosticIntakePolicy {
     pub local: Option<PartialLocalConfig>,
 }
 
-fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
+fn merge_model_tiers(
+    mut base: DiagnosticIntakeModelTiers,
+    over: &PartialModelTiers,
+) -> DiagnosticIntakeModelTiers {
     if let Some(v) = over.extract {
         base.extract = v;
     }

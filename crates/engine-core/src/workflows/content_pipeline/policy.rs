@@ -15,7 +15,7 @@
 //! render/persist stages have no `ModelTier` field and never rewire to
 //! Local. `EN.6.A` adds a fifth, non-model `dispatch` stage
 //! (`ActionDispatchNode`): `dispatch_verbosity` is telemetry/verbosity
-//! config only — there is no `dispatch` entry in `ModelTiers`, no rewire
+//! config only — there is no `dispatch` entry in `ContentPipelineModelTiers`, no rewire
 //! branch in `graph::registry_for_policy`, and it is never Local-eligible.
 //!
 //! `EN.7.C` adds a `harvest` knob on the same non-model `persist` stage — it
@@ -152,14 +152,14 @@ pub const MAX_CRITIC_ITERATIONS_CEILING: u32 = 10;
 
 /// Per-stage model tier assignment for the four Local-eligible nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelTiers {
+pub struct ContentPipelineModelTiers {
     pub summarize: ModelTier,
     pub critic: ModelTier,
     pub revise: ModelTier,
     pub translate: ModelTier,
 }
 
-impl Default for ModelTiers {
+impl Default for ContentPipelineModelTiers {
     /// All-Sonnet — the behavior-stable baseline.
     fn default() -> Self {
         Self {
@@ -179,7 +179,7 @@ impl Default for ModelTiers {
 pub struct ContentPipelinePolicy {
     pub output_verbosity: OutputVerbosity,
     pub prompt_cache: bool,
-    pub model_tiers: ModelTiers,
+    pub model_tiers: ContentPipelineModelTiers,
     /// Configuration for the `local` model tier — used by whichever of
     /// `{summarize, critic, revise, translate}` resolves to
     /// `ModelTier::Local`.
@@ -216,7 +216,7 @@ impl Default for ContentPipelinePolicy {
         Self {
             output_verbosity: OutputVerbosity::Normal,
             prompt_cache: false,
-            model_tiers: ModelTiers::default(),
+            model_tiers: ContentPipelineModelTiers::default(),
             local: LocalConfig::default(),
             max_critic_iterations: 3,
             critic_confidence_threshold: 0.8,
@@ -227,7 +227,7 @@ impl Default for ContentPipelinePolicy {
     }
 }
 
-/// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
+/// All-optional mirror of [`ContentPipelineModelTiers`] for per-stage partial overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialModelTiers {
@@ -255,7 +255,10 @@ pub struct PartialContentPipelinePolicy {
     pub harvest: Option<PartialHarvestConfig>,
 }
 
-fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
+fn merge_model_tiers(
+    mut base: ContentPipelineModelTiers,
+    over: &PartialModelTiers,
+) -> ContentPipelineModelTiers {
     if let Some(v) = over.summarize {
         base.summarize = v;
     }

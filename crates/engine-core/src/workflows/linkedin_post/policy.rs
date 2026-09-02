@@ -36,13 +36,13 @@ pub const MAX_CANDIDATE_COUNT_CEILING: u32 = 20;
 /// `draft` (`PostDraftNode`), `critic` (`BrandCriticNode`), `translate`
 /// (`TranslateNode`, reused from `content_pipeline`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelTiers {
+pub struct LinkedinPostModelTiers {
     pub draft: ModelTier,
     pub critic: ModelTier,
     pub translate: ModelTier,
 }
 
-impl Default for ModelTiers {
+impl Default for LinkedinPostModelTiers {
     /// All-Sonnet — the behavior-stable baseline.
     fn default() -> Self {
         Self {
@@ -59,7 +59,7 @@ impl Default for ModelTiers {
 /// in that order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkedInPostPolicy {
-    pub model_tiers: ModelTiers,
+    pub model_tiers: LinkedinPostModelTiers,
     /// Configuration for the `local` model tier — used by whichever of
     /// `{draft, critic, translate}` resolves to `ModelTier::Local`.
     pub local: LocalConfig,
@@ -85,7 +85,7 @@ impl Default for LinkedInPostPolicy {
     /// candidates, translate on.
     fn default() -> Self {
         Self {
-            model_tiers: ModelTiers::default(),
+            model_tiers: LinkedinPostModelTiers::default(),
             local: LocalConfig::default(),
             max_critic_iterations: 3,
             candidate_count: 3,
@@ -94,7 +94,7 @@ impl Default for LinkedInPostPolicy {
     }
 }
 
-/// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
+/// All-optional mirror of [`LinkedinPostModelTiers`] for per-stage partial overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialModelTiers {
@@ -117,7 +117,10 @@ pub struct PartialLinkedInPostPolicy {
     pub translate_enabled: Option<bool>,
 }
 
-fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
+fn merge_model_tiers(
+    mut base: LinkedinPostModelTiers,
+    over: &PartialModelTiers,
+) -> LinkedinPostModelTiers {
     if let Some(v) = over.draft {
         base.draft = v;
     }

@@ -36,7 +36,7 @@ pub enum ReviewMode {
 
 /// Per-stage model tier assignment for the five nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelTiers {
+pub struct ProposalGeneratorModelTiers {
     pub research: ModelTier,
     pub opportunity: ModelTier,
     pub writer: ModelTier,
@@ -44,7 +44,7 @@ pub struct ModelTiers {
     pub revise: ModelTier,
 }
 
-impl Default for ModelTiers {
+impl Default for ProposalGeneratorModelTiers {
     /// All-Sonnet — the behavior-stable baseline.
     fn default() -> Self {
         Self {
@@ -65,7 +65,7 @@ impl Default for ModelTiers {
 pub struct ProposalGeneratorPolicy {
     pub output_verbosity: OutputVerbosity,
     pub prompt_cache: bool,
-    pub model_tiers: ModelTiers,
+    pub model_tiers: ProposalGeneratorModelTiers,
     /// Configuration for the `local` model tier — used by whichever of
     /// `{opportunity, review, revise}` resolves to `ModelTier::Local`;
     /// `research` never rewires to it.
@@ -81,14 +81,14 @@ impl Default for ProposalGeneratorPolicy {
         Self {
             output_verbosity: OutputVerbosity::Normal,
             prompt_cache: false,
-            model_tiers: ModelTiers::default(),
+            model_tiers: ProposalGeneratorModelTiers::default(),
             local: LocalConfig::default(),
             review_mode: ReviewMode::default(),
         }
     }
 }
 
-/// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
+/// All-optional mirror of [`ProposalGeneratorModelTiers`] for per-stage partial overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialModelTiers {
@@ -113,7 +113,10 @@ pub struct PartialProposalGeneratorPolicy {
     pub review_mode: Option<ReviewMode>,
 }
 
-fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
+fn merge_model_tiers(
+    mut base: ProposalGeneratorModelTiers,
+    over: &PartialModelTiers,
+) -> ProposalGeneratorModelTiers {
     if let Some(v) = over.research {
         base.research = v;
     }

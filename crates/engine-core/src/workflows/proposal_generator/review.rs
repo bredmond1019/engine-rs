@@ -400,7 +400,7 @@ mod tests {
         let policy = ProposalGeneratorPolicy {
             output_verbosity: super::super::policy::OutputVerbosity::Terse,
             prompt_cache: true,
-            model_tiers: super::super::policy::ModelTiers {
+            model_tiers: super::super::policy::ProposalGeneratorModelTiers {
                 review: ModelTier::Local,
                 ..ProposalGeneratorPolicy::default().model_tiers
             },

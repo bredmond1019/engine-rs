@@ -262,7 +262,7 @@ mod tests {
     use claude_code_rs::Outcome;
     use futures::FutureExt;
 
-    use super::super::policy::{ModelTier, ModelTiers};
+    use super::super::policy::{LinkedinPostModelTiers, ModelTier};
     use super::super::schema::WorkSourceKind;
     use super::*;
 
@@ -488,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn process_applies_draft_stage_model_tier() {
         let policy = LinkedInPostPolicy {
-            model_tiers: ModelTiers {
+            model_tiers: LinkedinPostModelTiers {
                 draft: ModelTier::Opus,
                 ..LinkedInPostPolicy::default().model_tiers
             },
