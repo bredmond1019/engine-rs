@@ -9424,6 +9424,54 @@ pub(crate) mod tests {
             .expect("TriageTaskNode should succeed")
     }
 
+    /// EN.14.C task 3 — REALISM requirement: drive the actual
+    /// `TriageTaskNode` (not a synthetic stand-in) with a fake transport that
+    /// bills the API (`billing_outcome`, a real `cost_usd`/`session_id`) and
+    /// then returns content `TriageOutput` cannot parse, so the wrapper
+    /// fails AFTER the billed call — exactly the measured case named in the
+    /// block's `why`. Asserts on the returned `NodeError` directly (this
+    /// module has no access to the private `node_context`; the generic
+    /// `node_context`-level tests in `workflow.rs` cover that once a
+    /// `NodeError` carries a session via `.with_sessions(..)`, `node_context`
+    /// retains it across the discard — this test proves the real wrapper
+    /// populates that field in the first place).
+    #[tokio::test]
+    async fn triage_task_node_preserves_billed_session_on_post_billed_call_parse_failure() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            // Billed (real cost + a session id), but the text is neither
+            // valid `TriageOutput` JSON nor a parseable fenced block — the
+            // parse-failure branch this block targets.
+            Box::pin(async { Ok(billing_outcome("not parseable as TriageOutput at all")) })
+        });
+        let node = TriageTaskNode::new().with_transport(transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("unparseable model output must fail the wrapper");
+
+        assert!(
+            err.message.contains("failed to parse model output"),
+            "err: {}",
+            err.message
+        );
+        assert_eq!(
+            err.sessions.len(),
+            1,
+            "the billed call's session must be carried on the wrapper's \
+             failure, not dropped: {:?}",
+            err.sessions
+        );
+        assert_eq!(
+            err.sessions[0].session_id.as_deref(),
+            Some("sess-billing-test")
+        );
+        assert_eq!(err.sessions[0].cost_usd, 1.25);
+    }
+
     pub(crate) async fn drive_consolidated_review_node_for_billing() -> TaskContext {
         let task = SDLCTask::new(1, "One", "d1");
         let state = state_with_tasks(vec![task.clone()]);
