@@ -46,9 +46,7 @@ use crate::policy::RESOLVED_POLICY_IDENTITY;
 /// gives the underlying `claude` CLI a stable prefix to cache against,
 /// instead of folding the same boilerplate into the ever-changing per-call
 /// prompt string.
-pub(super) const STABLE_SYSTEM_PROMPT: &str =
-    "You are running inside the engine-rs SDLC Flow task loop. This system \
-     prompt is held constant across calls so its tokens can be cached.";
+pub(super) const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/implement.md");
 
 /// Stage identity used to look up the resolved policy's per-stage
 /// [`ModelTier`] (`policy::ModelTiers` field names).
@@ -1026,38 +1024,7 @@ incomplete, finish it now rather than reporting a partial task.
 /// interpolates_nothing_per_run` pins that as a test failure rather than a
 /// review catch. Same discipline, and the same shape, as
 /// [`PATH_DISCIPLINE_PREAMBLE`].
-pub(super) const TRIAGE_STABLE_PROMPT: &str = r#"You are the failure-triage agent for an SDLC run. Classify a failure so the pipeline either makes
-a bounded fix or bails to a human NOW. Bailing is cheap; a wasted retry loop is not — when unsure, BAIL.
-
-IMMEDIATE-BAIL reasons — if the failure is ANY of these, the verdict is MAJOR_BAIL and the reason is a
-short human-readable description of which one and where:
-  1. Missing/undefined upstream dependency or symbol the spec assumes exists.
-  2. Spec ambiguity/contradiction — intended behavior is genuinely undeterminable.
-  3. Environment/credential/auth/network failure (not a code defect).
-  4. Change would require a destructive or out-of-scope action.
-  5. Same failure twice with no progress (stuck), or a structural design flaw needing a re-plan.
-
-This does NOT widen the bail set above — it only constrains what you may ASSERT once you bail.
-Before writing any reason that claims a failure PRE-DATES this task / exists "at baseline" / is
-"unrelated to this task's scope": you MUST first re-run ONLY the failing check against the base state
-(the main working tree, or the task's base commit). If you do so, set base_state_checked=true and put
-the actual result in evidence. If you cannot re-run it in this run's context, set
-base_state_checked=false and phrase the claim explicitly as a HYPOTHESIS ("possibly pre-existing; NOT
-verified against base"), never as observed fact.
-
-Self-inflicted-environment caution: harness-created workspace state (the worktree, sparse checkout,
-copied .env files, a repaired planning/ symlink) is a CANDIDATE CAUSE, not a fixed backdrop. An
-identical failure before and after the change is NOT evidence of pre-existence when both states share
-the same possibly-broken environment.
-
-Otherwise:
-  RETRYABLE  — transient/infra (agent died, flaky), OR the failure CHANGED from the previous attempt
-               (it is making progress and a bounded fix can plausibly close it).
-  MAJOR_BAIL — the SAME failure again with no progress, OR structural (one of the bail reasons above).
-
-evidence must be what was actually OBSERVED, quoting output — no causal guessing.
-
-"#;
+pub(super) const TRIAGE_STABLE_PROMPT: &str = include_str!("prompts/triage.md");
 
 /// Model node (Sonnet): drives Claude Code to implement the current task.
 /// Composes a `ClaudeCodeStep` under its own identity so it can post-process
@@ -2732,30 +2699,7 @@ pub(super) fn review_output_schema() -> serde_json::Value {
 /// run", so both review nodes share one cache-stable block and each states its
 /// own scope in the per-call body. Carries no per-run value (standing rule 6);
 /// `review_stable_prompt_interpolates_nothing_per_run` pins that.
-pub(super) const REVIEW_STABLE_PROMPT: &str = r#"You are the review agent for an SDLC run. Verify the acceptance criteria against the ACTUAL code and
-issue a verdict.
-
-Any run-state summary you are given is an INDEX, not evidence. Read it, but it does NOT replace
-verifying each criterion against the code itself. A criterion is MET only when you can point at
-code or test output that satisfies it as WRITTEN — not at a summary claiming it,
-and not at a weaker paraphrase of it that happens to hold.
-If the criterion says three things correlate to one finding, "some finding spans three repos"
-is NOT that criterion.
-
-For each acceptance criterion, read the relevant source and mark it MET, PARTIAL or NOT_MET,
-citing the evidence (file and symbol, test name, or command output). Spot-check the key files
-rather than reading the summary. Also check the repo's CLAUDE.md standing rules — a violation is
-itself a failing criterion — and flag any handle or URL that contradicts the verified identities
-CLAUDE.md records.
-
-Do NOT fix environment or infrastructure issues yourself. Report them; the fix loop resolves them.
-
-Verdict, on the criteria alone:
-  PASS    — every in-scope criterion is MET.
-  PARTIAL — one or more criteria are PARTIAL, and none is NOT_MET.
-  FAIL    — any criterion is NOT_MET.
-
-"#;
+pub(super) const REVIEW_STABLE_PROMPT: &str = include_str!("prompts/review.md");
 
 impl ConsolidatedReviewNode {
     #[must_use]
