@@ -64,22 +64,12 @@ table; this restates only what an agent needs inline while appending:
 `constraint` and `known_issue` are **retired** (HQ D72) — okf-core preserves them only through its
 `Unknown(String)` fallback so legacy entries still round-trip. Do not mint new entries with either.
 
-**Route at write time — three destinations, not two.** Ask both questions before appending:
+**Route at write time — load the `edit-state-json` skill's Step 1 before appending.** It covers
+the operator-edge vs. `reference[]` vs. `carryover[]` question in full, including the measured
+30-of-202 fleet-wide misfiling rate for operator work parked in `carryover[]` by mistake — do not
+re-derive the routing rule here.
 
-1. **Can only a human do this?** A decision only the operator can make, a credential only they
-   hold, a judgement call, a thing they must look at — that is **not** a `carryover[]` entry. File
-   it as a `{"type":"operator", slug, exit, start, what?}` edge on the block it gates, per the
-   operator-work rule below. **Why it matters here and not only there:** a carryover entry gates
-   nothing, so operator work parked in it is never forced; an operator edge blocks the work standing
-   behind it, which is what gets it done. Measured 2026-08-19 — **30 of the fleet's 202 `carryover[]`
-   entries are operator work misfiled this way**, filed as `defect` or `deferred` because the table
-   above offers no row meaning "not an agent's to do."
-2. **Is it permanently true?** A gotcha still true next month, a deliberate non-fix nobody intends to
-   reverse, a load-bearing measured number someone will need again — that belongs in `reference[]`.
-   A fact with no `clears_when` because nothing will ever make it stop being true is the signal.
-   See `docs/state/reference-container-schema.md` for its field table and kind vocabulary.
-
-Only what survives both questions is a `carryover[]` entry: work-class findings that eventually
+Only what survives both of its questions is a `carryover[]` entry: work-class findings that eventually
 clear — an unticketed defect, a deferred follow-on, a drifted surface, a transient env caveat.
 
 - `priority` (int, `0..=3`) — value if resolved, on the same rubric as `tracks[].blocks[]`.

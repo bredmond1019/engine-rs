@@ -194,7 +194,11 @@
             "required": ["type", "slug", "exit", "start"],
             "properties": {
               "type": { "const": "operator" },
-              "slug": { "type": "string", "pattern": "^operator-[a-z0-9][a-z0-9-]*$" },
+              "slug": {
+                "type": "string",
+                "pattern": "^(operator-)?[a-z0-9][a-z0-9-]*$",
+                "description": "Bare kebab-case is CANONICAL. The edge is cited as OP.<slug> (D76), so an `operator-` prefix stutters into OP.operator-foo and mev raises W_STATE_OP_SLUG_STUTTER; `mev normalize-op-slugs --write` strips it. This pattern used to REQUIRE the prefix, which contradicted D76, docs/state/state-schema.md, block-registration.md and check_block_records.py all at once -- measured 2026-09-02, live data was 30 bare against 7 prefixed. The optional group is tolerance for those 7 legacy slugs, not permission to write new ones. Not to be confused with lane.schema.json's `held_until`, where the prefix IS required: there it is what distinguishes an operator-gate slug from a block ID in one string field."
+              },
               "exit": { "type": "string", "minLength": 1, "description": "The artifact whose existence ends the gate — never a description of the work." },
               "start": { "type": "string", "minLength": 1, "description": "A paste-ready command." },
               "what": { "type": "string" }
@@ -221,14 +225,14 @@
       "items": { "type": "string" }
     },
     "origin": {
-      "description": "Where this block came from, when it was promoted rather than authored fresh.",
+      "description": "Where this block came from, when it was promoted rather than authored fresh. `mechanism` means a consolidation analysis produced it: `slug` is that mechanism's finding_id, so a block can be traced back to the analysis that filed it and forward to the carryover entries sharing the id. A block does NOT carry `finding_id` or `needs` of its own -- clustering is a carryover concern (the entries already have the field), and `needs` is a routing key consumed when a finding becomes work, which `sdlc_workflow`/`files`/`what` then answer.",
       "oneOf": [
         {
           "type": "object",
           "additionalProperties": false,
           "required": ["type", "slug"],
           "properties": {
-            "type": { "enum": ["backlog", "carryover", "capture"] },
+            "type": { "enum": ["backlog", "carryover", "capture", "mechanism"] },
             "slug": { "type": "string" }
           }
         }

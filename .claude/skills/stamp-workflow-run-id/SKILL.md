@@ -34,9 +34,15 @@ that call already has the run id, full Bash/Write access, and knows the spec slu
 
 1. Call `Workflow({name: 'sdlc-task', args: '<spec-slug> ...'})` (or `sdlc-flow`) as normal.
 2. Note the run id from the tool result (the `wf_...`-shaped id).
-3. Wait until `planning/<spec-slug>/sdlc/sdlc-task-state.json` (or `sdlc-flow-state.json`) exists —
-   it's written at the end of the engine's first state-write stage, not at launch. Don't create it
-   yourself if it's missing; that means the engine hasn't reached its first write yet.
+3. **Stamp after the completion notification, not on first appearance of the file.** The state
+   file is written at the end of the engine's *first* state-write stage, and the engine **rewrites
+   the whole file on every subsequent write** — so an id patched in at first appearance is silently
+   overwritten and the run finishes reporting `workflow_run_id: null` (measured 2026-09-01 on a real
+   `sdlc-task` run). Wait for the run's completion notification, which lands after the engine's
+   terminal write, then patch `planning/<spec-slug>/sdlc/sdlc-task-state.json` (or
+   `sdlc-flow-state.json`). Don't create the file yourself if it's missing. Stamping *additionally*
+   at first appearance is fine and worth doing — a run that bails before its terminal write still
+   has a transcript worth joining — but the stamp after the terminal write is the one that survives.
 4. Patch the field in with a small, idempotent JSON rewrite — do **not** hand-edit the file with a
    text editor, and do not touch any other key:
 

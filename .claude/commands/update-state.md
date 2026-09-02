@@ -26,17 +26,10 @@ is the *workflow*; `state-schema.md` is the *ground truth*.
 
 ## The one rule that matters most: Authored vs Derived
 
-`state-schema.md`'s "Authored vs derived" table is the load-bearing distinction. Before touching any
-field, know which bucket it's in:
-
-| Bucket | Fields | You may hand-edit these |
-|---|---|---|
-| **Authored** (source of truth) | `tracks[].blocks[]` (`id`, `title`, `status`, `depends_on`, `wave`, `note?`, `origin?`, `tasks?`), `backlog[]` (HQ only), `carryover[]`, HQ `tiers[]`, `epics[]` (HQ only — `plan` field points at a roadmap's `roadmap.md` per `/generate-roadmap`'s registration step), `note` (portfolio kind) | **Yes** |
-| **Derived** (a regenerated cache) | `focus`, brain `repos[]`, brain `cross_repo[]`, master-plan wave tables | **No — never hand-edit.** Run `mev emit-state --write` instead |
-
-If you find yourself about to type a value into `focus.now[]`, `repos[]`, or `cross_repo[]` directly,
-stop — edit the authored `tracks[].blocks[]` (or the child repo's own state.json) instead, then
-regenerate (see Step 4 below).
+**Load the `edit-state-json` skill before any non-trivial edit** — its Step 2 owns the
+authored-vs-derived field split, the four `depends_on` edge shapes, the `status` authored-values
+trap, and the `scope` exactly-one-of rule (the fleet's single most-repeated `state.json` error).
+This command does not restate that content; it covers what the skill doesn't (below).
 
 An `epics[]` entry's `plan` is a path, not a slug — resolve a roadmap's directory via
 `/begin-orchestration`'s Step 1C rule (`planning/roadmaps/<slug>/`, else legacy `planning/<slug>/`)
@@ -73,48 +66,28 @@ error-prone part of editing `state.json` by hand:
 - The matching heading in `planning/master-plan.md` (`### <id> — <name>`) and any prose reference to
   it there.
 - `planning/status.md`'s Progress Table row and Current focus line, if present.
-- A brain's cached `repos[]` rollup, if this repo feeds one (regenerate, don't hand-edit — Step 4).
+- A brain's cached `repos[]` rollup, if this repo feeds one (regenerate, don't hand-edit — Procedure step 3).
 
 ## Procedure
 
-1. **Read `state-schema.md`** for the exact field shape you're about to touch (`tracks[].blocks[]`
-   shape, `carryover[]` shape, `backlog[]` shape, `depends_on` entry forms) — don't reconstruct it
+1. **Read `state-schema.md`** for the exact field shape you're about to touch — don't reconstruct it
    from memory or from another file's example; shapes have changed across schema versions (currently
    v2, D36).
-2. **Make the authored edit only.** Never hand-set `status: "blocked"` — it's derived from unmet
-   `depends_on`, not an authored value (`open` / `in_progress` / `closed` are the only authored
-   statuses). Never invent a block ID prefix — resolve it from `brain.toml`.
-3. **Validate the JSON is well-formed** before doing anything else:
-   `python3 -c "import json;json.load(open('planning/state.json'))"`.
-   This is a **parse-only** sanity check, not schema validation — it cannot catch a shape mismatch
-   (e.g. a struct-typed field like `origin` written as a scalar), which parses fine as JSON and
-   only fails `mev`'s typed deserialization. For real schema confidence, run
-   `mev validate-brain --state`.
-4. **Regenerate derived views** — run `mev emit-state --write` (from anywhere under the brain root; it
-   walks up to find `brain.toml`). This recomputes `focus`, brain `repos[]`/`cross_repo[]`, and any
-   `master-plan.md` wave tables with `wave-table` sentinels. Never hand-patch these fields to "match" —
-   let the derivation do it, then diff the result to sanity-check it.
-5. **Run `mev validate-brain --state`** and confirm no new `E_STATE_*` errors and no unexpected new
-   `W_STATE_*` warnings. A `W_STATE_ROLLUP_DRIFT` after step 4 means step 4 didn't actually run against
-   the file you just edited (check you're pointing `emit-state` at the right root).
-6. **Check for concurrent in-flight work before committing.** If this repo has an active `/sdlc-flow`
-   or `/orchestrate` running (look for `planning/<slug>/trees/*` worktrees, or a fresh unexpected commit
-   on `main` since you started), your uncommitted edit can be silently discarded by that process's own
-   git operations. Commit your `state.json` edit **promptly** once it's correct, or coordinate with
-   whatever is running before editing further.
+2. **Make the authored edit**, following `edit-state-json`'s Step 2 rules (edge shapes, `status`
+   values, `origin`/`clears_when`/`scope` shapes). Never invent a block ID prefix — resolve it from
+   `brain.toml`; see the rename checklist above if you're renaming one.
+3. **Round-trip, validate, and regenerate exactly as `edit-state-json`'s Steps 5–7 describe** — JSON
+   well-formedness, `mev validate-brain --state`, `mev emit-state --write`, and the concurrent-lane
+   commit-promptly rule. Not restated here.
 
-## Common footguns (from real incidents)
+## Common footguns
 
-- Editing `focus`/`repos[]`/`cross_repo[]` by hand instead of running `emit-state --write` — the next
-  regeneration will silently overwrite your manual fix, and in the meantime nothing else agrees with
-  it.
-- Renaming a block id in `master-plan.md` but not in `state.json` (or vice versa) — `mev
-  validate-brain --state` will flag the resulting `W_STATE_ROLLUP_DRIFT` / dangling reference, but only
-  *after* something reads the mismatch.
+See `edit-state-json`'s own "Before you commit" checklist for the general list (scope exactly-one-of,
+`origin` shape, `clears_when` already-satisfied trap, etc.). Specific to this command:
+
 - Treating a `portfolio`-kind repo as `project` (or vice versa) — see the `kind` table above.
-- Leaving an edit uncommitted in a repo with a concurrent SDLC pipeline running — see Step 6.
-- Hand-authoring `status: "blocked"` — always derived, never authored (`state-schema.md`'s
-  "Derivation rules" section).
+- Renaming a block id in `master-plan.md` but not in `state.json` (or vice versa), or skipping any
+  step of the rename checklist above.
 
 ## Report
 
