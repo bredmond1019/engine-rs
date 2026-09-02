@@ -363,7 +363,7 @@ pub(crate) fn resolve_harness_path(ctx: &TaskContext, worktree: &Path) -> PathBu
 /// immediately before every diff this module takes against `HEAD`.
 ///
 /// Git's `diff` ignores untracked files entirely. Because implementer agents
-/// routinely create brand-new files (see `TestTaskNode::changed_files`, which
+/// routinely create brand-new files (see `TestTaskNode::changed_files_with_status`, which
 /// already parses untracked paths out of `git status --porcelain` as expected
 /// output), a plain `git diff HEAD` would show the reviewer and the
 /// trivial-skip classifier a diff with those files' content missing. Intent-to-add
@@ -1693,13 +1693,22 @@ impl TestTaskNode {
 
     /// List every path `git status --porcelain` reports as changed
     /// (modified, added, deleted, renamed, or untracked) in `worktree`, via
-    /// the injectable [`CommandRunner`] seam. Each porcelain line is either
-    /// `XY path` or, for a rename, `XY orig -> new` — this returns the
-    /// right-hand path in the rename case (the file's current location) and
-    /// the single path otherwise. Returns an empty list (never errors) when
-    /// the runner invocation itself fails, so a spawn failure here degrades
-    /// to "nothing looks changed" rather than aborting the node.
-    fn changed_files(&self, worktree: &Path) -> Vec<String> {
+    /// the injectable [`CommandRunner`] seam, together with each entry's
+    /// two-letter porcelain status column (`line[0..2]`, e.g. `"M "`,
+    /// `" D"`, `"R "`, `"??"`). Each porcelain line is either `XY path` or,
+    /// for a rename, `XY orig -> new` — this returns the right-hand path in
+    /// the rename case (the file's current location) and the single path
+    /// otherwise; a rename's status is always `R`, never `D`, so it is
+    /// never mistaken for a deletion by a caller inspecting the status.
+    /// Returns an empty list (never errors) when the runner invocation
+    /// itself fails, so a spawn failure here degrades to "nothing looks
+    /// changed" rather than aborting the node.
+    ///
+    /// Condition (1) reads only the path half (via `.map(|(_, path)|
+    /// path)`); conditions (2) and (3) need the status column too — this is
+    /// why the status is returned alongside the path rather than
+    /// discarded, as an earlier, path-only version of this method did.
+    fn changed_files_with_status(&self, worktree: &Path) -> Vec<(String, String)> {
         let output =
             (self.runner)("git", &["status", "--porcelain"], worktree).unwrap_or(CommandOutput {
                 status: -1,
@@ -1714,64 +1723,93 @@ impl TestTaskNode {
                 if line.len() <= 3 {
                     return None;
                 }
+                let status = line[0..2].to_string();
                 let rest = line[3..].trim();
                 if rest.is_empty() {
                     return None;
                 }
                 // Rename/copy lines look like `orig -> new`; keep the
-                // destination path.
+                // destination path. A rename's status is `R `/` R`, never
+                // `D`, so it is never mistaken for a deletion below.
                 let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
                 if path.is_empty() {
                     None
                 } else {
-                    Some(path.trim_matches('"').to_string())
+                    Some((status, path.trim_matches('"').to_string()))
                 }
             })
             .collect()
     }
 
-    /// Write-verification guard: asks [`Self::changed_files`] whether the
-    /// worktree shows ANY change at all, and fails the task when it does
-    /// not.
+    /// Write-verification guard: three conditions, checked in order, any one
+    /// of which fails the task.
     ///
-    /// **The question is asked unconditionally, and the answer does not
-    /// depend on `ImplementTaskNode`'s self-reported `modified_files`.**
-    /// That self-report is documented-unreliable in both directions: a real
-    /// (non-stubbed) `claude` call was observed live leaving it EMPTY on a
-    /// genuinely successful write (see `sdlc_flow_live.rs`'s
-    /// `live_full_workflow_real_implement_and_review`), and a run whose
-    /// implement work landed in the WRONG TREE also reported it empty while
-    /// the worktree was untouched. So the claim is not evidence of a write,
-    /// and its absence is not evidence of a no-op — only the worktree is
-    /// evidence. Note what this does NOT do: it never compares claimed
-    /// paths against changed paths. The self-report is unreliable about
-    /// WHICH files; "did anything change" is the robust question.
+    /// 1. **Nothing changed at all** — asks [`Self::changed_files_with_status`] whether
+    ///    the worktree shows ANY change. This is the original, and only
+    ///    unconditionally-run, check.
+    /// 2. **The diff misses `task.files` entirely** — when the task
+    ///    declares a non-empty `files[]`, at least one changed path must be
+    ///    in it. Skipped outright when `files[]` is empty: a task that
+    ///    declared nothing is judged by condition (1) alone, exactly as
+    ///    before this existed. This is an INTERSECTION test, not subset —
+    ///    touching files outside `files[]` (tests, fixtures, formatter
+    ///    siblings) never fails it.
+    /// 3. **A deletion of a path never declared** — any changed entry whose
+    ///    porcelain status marks it deleted, and whose path is not in
+    ///    `task.files`, fails independently of condition (2). A deletion of
+    ///    a path that IS in `task.files` is fine — a task may legitimately
+    ///    delete a file it declared.
+    ///
+    /// **Condition (1)'s question is asked unconditionally, and its answer
+    /// does not depend on `ImplementTaskNode`'s self-reported
+    /// `modified_files`.** That self-report is documented-unreliable in
+    /// both directions: a real (non-stubbed) `claude` call was observed
+    /// live leaving it EMPTY on a genuinely successful write (see
+    /// `sdlc_flow_live.rs`'s `live_full_workflow_real_implement_and_review`),
+    /// and a run whose implement work landed in the WRONG TREE also
+    /// reported it empty while the worktree was untouched. So the claim is
+    /// not evidence of a write, and its absence is not evidence of a no-op
+    /// — only the worktree is evidence.
+    ///
+    /// **Conditions (2) and (3) ARE path comparisons, and that is safe for
+    /// a reason condition (1) explicitly is not.** They compare the
+    /// worktree's changed paths against `task.files` — the AUTHORED spec
+    /// data a human (or `/generate-tasks`) wrote into `tasks.json` before
+    /// the task ran — never against `modified_files`, the model's
+    /// self-report of what it thinks it touched. The unreliability above is
+    /// a property of the self-report, not of path comparison in general;
+    /// `task.files` was fixed before the attempt started and cannot drift
+    /// with what the model claims. This is also why the guard could not
+    /// implement condition (2) any earlier: `SDLCTask` did not deserialize
+    /// `files[]` until [`SDLCTask::files`] existed to hold it.
     ///
     /// This guard is the only check that can distinguish "task done" from
-    /// "task never ran". Measured on a pristine worktree with zero task
-    /// work, `cargo nextest run --workspace --all-features` reported
-    /// `187 tests run: 187 passed`; a real run's `check_results` showed
-    /// `fmt`, `clippy`, `test` and `build` ALL PASSED beside a failing
-    /// `write-verification`. A green check on a tree nobody wrote to
+    /// "task never ran", and now also "task touched the wrong files" or
+    /// "task destroyed another task's undeclared file". Measured on a
+    /// pristine worktree with zero task work, `cargo nextest run
+    /// --workspace --all-features` reported `187 tests run: 187 passed`; a
+    /// real run's `check_results` showed `fmt`, `clippy`, `test` and
+    /// `build` ALL PASSED beside a failing `write-verification`. A green
+    /// check on a tree nobody wrote to (or wrote the wrong thing to)
     /// carries no information about the task, so the harness suite cannot
     /// be allowed to stand in for this.
     ///
     /// The legitimately no-op task (investigation-only) is handled by an
     /// EXPLICIT task-level signal — [`SDLCTask::expects_writes`] — rather
     /// than by inferring consent from an empty claim. A task that says
-    /// nothing defaults to `expects_writes: true` and is therefore guarded;
-    /// only an explicit `"expects_writes": false` in `tasks.json` disarms
-    /// it.
+    /// nothing defaults to `expects_writes: true` and is therefore guarded
+    /// by all three conditions; only an explicit `"expects_writes": false`
+    /// in `tasks.json` disarms all of them.
     ///
-    /// Still catches the guard's original target
+    /// Condition (1) still catches the guard's original target
     /// (`planning/decisions/D8-autonomous-node-write-permission.md`): a
-    /// claimed, narrated write that never touched disk. That case is now a
+    /// claimed, narrated write that never touched disk. That case is a
     /// strict subset of "nothing changed", and the emitted message names
     /// the claim when there was one so triage keeps the same evidence.
     ///
-    /// Trips as a failed [`CheckResult`], routed through the normal
-    /// triage/retry machinery exactly like a harness-check failure — never
-    /// a `NodeError` and never a hard bail.
+    /// Every condition trips as a failed [`CheckResult`], routed through
+    /// the normal triage/retry machinery exactly like a harness-check
+    /// failure — never a `NodeError` and never a hard bail.
     fn verify_claimed_writes(
         &self,
         ctx: &TaskContext,
@@ -1785,43 +1823,91 @@ impl TestTaskNode {
             return None;
         }
 
-        let changed = self.changed_files(worktree);
-        if !changed.is_empty() {
-            return None;
+        let changed_with_status = self.changed_files_with_status(worktree);
+        let changed: Vec<String> = changed_with_status
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect();
+
+        // Condition (1), unchanged: nothing changed at all.
+        if changed.is_empty() {
+            let modified_files: Vec<String> = get_result(ctx, "ImplementTaskNode")
+                .and_then(|value| value.get("modified_files"))
+                .and_then(|value| value.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let claim = if modified_files.is_empty() {
+                "ImplementTaskNode claimed no modified_files".to_string()
+            } else {
+                format!("ImplementTaskNode claimed modified_files {modified_files:?}")
+            };
+
+            return Some(CheckResult {
+                name: "write-verification".to_string(),
+                kind: "write-verification".to_string(),
+                passed: false,
+                output: String::new(),
+                message: format!(
+                    "{claim} and the worktree shows no changes at all (git status \
+                     --porcelain reported nothing) — task {} is expected to write, so an \
+                     unchanged worktree means the implement work never reached this tree. \
+                     Harness checks passing against an untouched checkout say nothing about \
+                     this task. If this task is genuinely investigation-only, declare \
+                     \"expects_writes\": false on it in tasks.json.",
+                    task.task_id
+                ),
+            });
         }
 
-        let modified_files: Vec<String> = get_result(ctx, "ImplementTaskNode")
-            .and_then(|value| value.get("modified_files"))
-            .and_then(|value| value.as_array())
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Condition (3): a deletion of a path the task never declared. A
+        // deletion is any entry whose status column carries `D` in either
+        // the index or worktree slot; renames carry `R`, never `D`, so they
+        // are never misread here.
+        if let Some((_, deleted_path)) = changed_with_status
+            .iter()
+            .find(|(status, path)| status.contains('D') && !task.files.contains(path))
+        {
+            return Some(CheckResult {
+                name: "write-verification".to_string(),
+                kind: "write-verification".to_string(),
+                passed: false,
+                output: String::new(),
+                message: format!(
+                    "task {} deleted '{deleted_path}', a path it never declared in \
+                     tasks.json's files[] ({:?}) — a task deleting a file it did not declare \
+                     is the shape of one task destroying another's work. If this deletion is \
+                     intentional, add '{deleted_path}' to this task's files[].",
+                    task.task_id, task.files
+                ),
+            });
+        }
 
-        let claim = if modified_files.is_empty() {
-            "ImplementTaskNode claimed no modified_files".to_string()
-        } else {
-            format!("ImplementTaskNode claimed modified_files {modified_files:?}")
-        };
+        // Condition (2): the task declared files[] and the diff misses all
+        // of them. Skipped entirely when files[] is empty — a task that
+        // declared nothing is judged by condition (1) alone, exactly as
+        // before this existed. Intersection, not subset.
+        if !task.files.is_empty() && !changed.iter().any(|path| task.files.contains(path)) {
+            return Some(CheckResult {
+                name: "write-verification".to_string(),
+                kind: "write-verification".to_string(),
+                passed: false,
+                output: String::new(),
+                message: format!(
+                    "task {} declared files[] {:?} but the worktree's changed paths are \
+                     {changed:?} — none of the declared files were touched. A non-empty diff \
+                     is not enough; the diff must intersect what this task said it would do.",
+                    task.task_id, task.files
+                ),
+            });
+        }
 
-        Some(CheckResult {
-            name: "write-verification".to_string(),
-            kind: "write-verification".to_string(),
-            passed: false,
-            output: String::new(),
-            message: format!(
-                "{claim} and the worktree shows no changes at all (git status --porcelain \
-                 reported nothing) — task {} is expected to write, so an unchanged worktree \
-                 means the implement work never reached this tree. Harness checks passing \
-                 against an untouched checkout say nothing about this task. If this task is \
-                 genuinely investigation-only, declare \"expects_writes\": false on it in \
-                 tasks.json.",
-                task.task_id
-            ),
-        })
+        None
     }
 
     /// `pub(crate)` so [`super::final_validation::FinalValidationNode`] can
