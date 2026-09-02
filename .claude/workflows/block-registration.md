@@ -65,6 +65,10 @@ Find this repo's `prefix` in `brain.toml` at the brain root (e.g. `MV`). Then:
 `status.md`, or any other narrative file. Narrative files lag, and that lag is how one repo came
 to carry two unrelated "Phase 4"s. Take the highest existing phase for this repo and go up.
 
+**`state.json` alone under-counts** — a lane file can claim a phase for a block that was never
+registered, so also sweep the corpus for the prefix before allocating and take the max of both:
+`rg --follow -o '\b<PFX>\.[0-9]+\.[A-Z]\b' planning core/_planning | sort -u`.
+
 **The spec directory equals the block ID exactly** — `planning/MV.3.A/`,
 `planning/MV.ticket.fix-null-deref/`. No title suffix, ever. `/plan` does not create it;
 `/generate-tasks` does, later. `/ticket` and `/chore` create it at author time because they

@@ -163,6 +163,36 @@ Note the hook is still only *live* where `core.hooksPath` is set (HQ is; `pre-pu
 `chmod -x`'d fleet-wide), so enabling this is a change to author-time behaviour in HQ and in
 every repo that opts in, not a fleet-wide flag day.
 
+### Gate 2 (corpus graph/structure) is OFF by default as of 2026-09-01
+
+The frontmatter gate above stays on. The corpus graph/structure gate that shipped alongside it
+(`982c63bc0`) is now opt-in behind **`BRAIN_GRAPH_GATE=1`**, at the operator's request, until
+corpus graph validation has a better home than author time.
+
+**Why.** The gate scores the WHOLE corpus, by design — that is what lets it catch the break class
+a path-scoped gate misses, where deleting a doc surfaces the error on a different file. But the
+corpus is one shared vault written by several concurrent sessions, so it also blocks your commit
+on a file you did not touch and cannot safely fix. Measured 2026-09-01: a commit scoped to
+`core/_planning/mev/` was blocked by `core/bella/planning/ide-layout/sequence.md`, an **untracked**
+file another session had written 40 minutes earlier and had not yet given an `index.md` row. The
+only moves available were to race that session's index edit or pass `--no-verify`, and a gate that
+is routinely bypassed is worse than one that is off, because the bypass becomes reflex.
+
+**What is unchanged.** `hooks/validate_brain_gate.sh`, its delta-attribution logic, and every one
+of its test cases stay live — the suite sets `BRAIN_GRAPH_GATE=1` so the contract is still
+exercised, and one case pins the default-off behaviour. `hooks/pre-push` stage 1 uses the same
+shared gate script and is unaffected by this switch. Re-enabling is one environment variable.
+
+```bash
+BRAIN_GRAPH_GATE=1 git commit -m "..."   # run gate 2 for one commit
+```
+
+**What is now uncovered.** Corpus graph and structure errors reach `main` unannounced at commit
+time. `./scripts/sync/validate_brain.sh` still runs nightly, and `bastion validate-brain --graph`
+/ `--structure` are still the authoritative checks to run by hand before a push. The better home
+this is waiting on is a check that attributes an error to the session that caused it rather than
+to whoever commits next.
+
 ```bash
 bash hooks/test_pre-commit.sh   # exit 0 = all pass
 ```

@@ -90,8 +90,24 @@ if [ -n "$staged" ]; then
 fi
 
 # --- Gate 2: corpus graph/structure delta gate ------------------------------------------
+# DISABLED BY DEFAULT since 2026-09-01, at the operator's request, until corpus graph
+# validation has a better home than author time. Set BRAIN_GRAPH_GATE=1 to re-enable.
+#
+# Why it was switched off rather than deleted: the gate scores the WHOLE corpus, and the
+# corpus is one shared vault written by several concurrent sessions. So it blocks your
+# commit on a file you did not touch and cannot safely fix -- measured 2026-09-01, a
+# commit scoped to core/_planning/mev/ was blocked by an untracked sequence.md another
+# session had written 40 minutes earlier and had not yet given an index.md row. The only
+# available moves were to race that session's index edit or to pass --no-verify, and the
+# gate's value does not survive being routinely bypassed.
+#
+# The machinery below, hooks/validate_brain_gate.sh, and its test cases all stay live and
+# tested (the suite sets BRAIN_GRAPH_GATE=1) so re-enabling is one env var, not a rewrite.
+# The delta-attribution logic it depends on is unchanged and still used by hooks/pre-push.
 gate_script="$repo_root/hooks/validate_brain_gate.sh"
-if [ -f "$gate_script" ]; then
+if [ "${BRAIN_GRAPH_GATE:-0}" != "1" ]; then
+  : # gate 2 off by default; see the note above
+elif [ -f "$gate_script" ]; then
   # shellcheck source=hooks/validate_brain_gate.sh
   source "$gate_script"
   if ! run_validate_brain_gate "pre-commit" --graph --structure; then

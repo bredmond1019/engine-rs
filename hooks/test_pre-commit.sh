@@ -430,9 +430,29 @@ new_gated_repo() { # new_gated_repo <dir> -- new_repo() plus a brain.toml, so ga
 
 commit_ok_gated() { # commit_ok_gated <dir> [env-assignment ...] -> sets RC, OUT; bastion shim on PATH
   local d="$1"; shift
-  OUT="$(cd "$d" && env "$@" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"
+  # BRAIN_GRAPH_GATE=1: gate 2 is opt-in as of 2026-09-01 (see hooks/pre-commit's note).
+  # The suite sets it so every case below still exercises the real gate contract; case 19b
+  # pins the default-off behaviour.
+  OUT="$(cd "$d" && env BRAIN_GRAPH_GATE=1 "$@" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"
   RC=$?
 }
+
+# --- Case 19b: gate 2 is OFF unless BRAIN_GRAPH_GATE=1 (default changed 2026-09-01) ---
+# Same fixture as case 21, which IS blocked when the gate runs. With no BRAIN_GRAPH_GATE in
+# the environment the commit must succeed and the gate must not announce itself at all.
+R19B="$WORK/r19b"; new_gated_repo "$R19B"
+cat > "$R19B/clean.md" <<'EOF'
+---
+type: Note
+title: Clean
+description: fine
+---
+# Clean
+EOF
+( cd "$R19B" && git add clean.md )
+OUT="$(cd "$R19B" && env BASTION_SHIM_ERRORS="1 0" PATH="$GATE_BIN:$PATH" git commit -q -m test 2>&1)"; RC=$?
+check "gate 2: OFF by default, an error that would block does not" "$([ "$RC" -eq 0 ]; echo $?)"
+check "gate 2: OFF by default, gate does not announce itself" "$(if printf '%s' "$OUT" | grep -q "running validate-brain gate"; then echo 1; else echo 0; fi)"
 
 # --- Case 20: gate 2, brain.toml present, bastion shim reports 0 errors -> commit succeeds,
 # and the gate visibly ran (not silently skipped) ---
@@ -500,7 +520,7 @@ description: fine
 # Clean
 EOF
 ( cd "$R23" && git add clean.md )
-OUT="$(cd "$R23" && PATH="/usr/bin:/bin" git commit -q -m test 2>&1)"; RC=$?
+OUT="$(cd "$R23" && env BRAIN_GRAPH_GATE=1 PATH="/usr/bin:/bin" git commit -q -m test 2>&1)"; RC=$?
 check "gate 2: bastion absent: non-fatal, commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
 check "gate 2: bastion absent: warning printed" "$(printf '%s' "$OUT" | grep -q "'bastion' not found on PATH" ; echo $?)"
 

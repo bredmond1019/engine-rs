@@ -567,6 +567,19 @@ Target:
 
 3. Execute methodically with Read/Edit/Write/Bash (all paths resolve from the ${runRootLabel}).
 
+3a. STAY INSIDE THIS TASK'S OWN FILES — and NEVER revert a path you did not author. You may read
+   anything in the repo. You may create/edit/delete only the paths in this task's "files" (plus what
+   those changes directly require, e.g. a new test's fixture). You may NEVER restore, revert,
+   discard, or overwrite a path outside that set: no \`${GIT} checkout -- <path>\`, no
+   \`${GIT} restore <path>\`, no \`${GIT} reset\`, no \`${GIT} stash\`, no \`${GIT} clean\`, and no
+   reverting a file to an earlier revision to "undo" an unrelated change you noticed. This is
+   absolute, not tidiness: several agent lanes run concurrently in this fleet, some against the same
+   working tree, and every repo's planning/ directory is tracked by one shared git repo — so a stray
+   \`${GIT} checkout -- <path>\` silently and IRRECOVERABLY destroys another live session's
+   uncommitted work, with no reflog entry to recover from because those bytes were never committed.
+   If a file outside your files[] looks wrong, is uncommitted, or appears to block this task, STOP:
+   leave it exactly as it is and say so in notes. Do not fix it, do not revert it, do not stage it.
+
 4. Follow every CLAUDE.md standing rule; add/update tests for new code/logic; verify any model ids /
    package names via the claude-api skill — never from memory.
 
