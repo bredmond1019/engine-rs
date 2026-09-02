@@ -194,9 +194,12 @@ per task. Determine whether this repo is heavy, and which category, mechanically
 **This is enforced, not prose-only.** If this repo is heavy, register before starting, passing the
 category from the `is-heavy` output:
 `python3 <path-to-base-template>/scripts/fleet_concurrency_check.py register --repo <this-repo-name> --category <category> --agent <this lane's agent identity>`.
-Exit code `3` (`"allowed": false`) means that category's pool is already at capacity (2
-browser-automation lanes, or 4 native-build lanes) — stop and report rather than starting another;
-wait or swap in a cheap-gate block instead.
+Exit code `3` (`"allowed": false`) means either that category's pool is already at capacity (2
+browser-automation lanes, or 4 native-build lanes) **or** that a held exclusive lease is blocking
+this registration — the two are distinguishable from the JSON output's now-populated
+`exclusive_leases` array (non-empty means a lease, not capacity, is the cause) versus `active`.
+Either way: stop and report rather than starting another; wait or swap in a cheap-gate block
+instead.
 
 **Do not pass `--pid`.** The process running `register` is this short-lived command invocation —
 it exits as soon as this step returns, so its own pid is never a valid liveness signal for a later

@@ -34,6 +34,7 @@ predictably-named reports alongside it.
     - [`/begin-orchestration --roadmap <path> (--lane <name|path> | --blocks <id ...>)`](#begin-orchestration---roadmap-path---lane-namepath----blocks-id-)
     - [`/begin-session <session-slug> [--roadmap <path>] [--dry-run]`](#begin-session-session-slug---roadmap-path---dry-run)
     - [`/consolidate-run <roadmap-slug> [--repo <slug>]`](#consolidate-run-roadmap-slug---repo-slug)
+    - [`/consolidate-fleet [<roadmap-slug>...] [--since-watermark]`](#consolidate-fleet-roadmap-slug---since-watermark)
     - [`/roadmap-status --roadmap <slug>`](#roadmap-status---roadmap-slug)
   - [Session Orientation](#session-orientation)
     - [`/wrap-up [note]`](#wrap-up-note)
@@ -114,7 +115,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | Planning | `/generate-roadmap`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` (`/generate-master-plan` is superseded by `/plan --founding`, D65) |
 | SDLC | `/patch`, `/update-docs`, `/update-task`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block` |
-| Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/roadmap-status` |
+| Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/consolidate-fleet`, `/roadmap-status` |
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
 | Backlog | `/backlog-ticket`, `/initial-research` |
 | Distribution | `/sync-downstream-harness`, `/sync-all`, `/sync-global-commands`, `/sync-global-skills`, `/sync-brain-skills` |
@@ -395,6 +396,18 @@ entry per finding, each carrying a `finding_id` for mev's cross-repo correlation
 dedup, similarity, ranking, or staleness logic of its own (that's mev's — `mev carryover`); it never
 auto-merges, and it writes no `state.json` anywhere. `/generate-roadmap --from <consolidated-review.md>`
 is the disposal path for what it proposes.
+
+### `/consolidate-fleet [<roadmap-slug>...] [--since-watermark] [--all]`
+The cross-run half of `/consolidate-run`. Where that command asks "what did this roadmap turn up?",
+this asks "across every run since we last looked, what is wrong with the orchestration system, the
+engines, and the way we file findings?" Reads unconsolidated `lane-log.jsonl` lines and run records
+across several roadmaps at once, plus the commander's retros and the fleet carryover triage, and
+emits one `pattern-analysis-<date>.md` of named **mechanisms** — each with a severity, a breadth
+count, and a minted `finding_id` so `mev`'s `cluster_by_finding_id` finally has something to group
+on. Extraction fans out to Sonnet subagents; the mechanism synthesis does not. Resume is a
+per-roadmap watermark into `lane-log.jsonl` (`scripts/lane_log_watermark.py`), which refuses to
+advance over a rewritten log rather than silently re-basing. Invokes `/consolidate-run` per roadmap
+unless `--no-per-roadmap`. Writes no `state.json`. **HQ-only** — never synced downstream.
 
 ### `/roadmap-status --roadmap <slug>`
 Read-only, mid-run view of one roadmap's live lanes across every repo — joins the roadmap's
