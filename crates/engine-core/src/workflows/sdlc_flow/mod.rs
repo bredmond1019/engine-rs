@@ -84,3 +84,53 @@ pub use super::{default_command_runner, CommandOutput, CommandRunner};
 /// (converting them to carry their own field is `EN.11.N`'s, per the scope
 /// call recorded in this block's amendments).
 pub const DEFAULT_STATE_FILENAME: &str = "sdlc-flow-state.json";
+
+/// Carry billing/telemetry fields forward across a wrapper's `put_result`.
+///
+/// `put_result` (`workflows::mod::put_result`) is a blind
+/// `ctx.nodes.insert` — it replaces the whole `ctx.nodes[identity]` entry
+/// rather than merging into it. A `COST_BEARING_STAGES` wrapper node that
+/// builds a fresh `result` object (its own verdict/content JSON) and then
+/// calls `put_result` therefore silently drops everything the inner
+/// `ClaudeCodeStep::process` already stamped onto that same identity —
+/// `cost_usd`, both cache channels, and the `"transport"` tier stamp
+/// (`crates/engine-core/src/nodes/claude_code_step.rs:485-510`). That loss
+/// is why `BudgetLedger::node_cost_usd` folds in `None` for every SDLC
+/// stage and `Budget::max_cost_usd` can never fire, and why
+/// `policy::telemetry::total_cost_usd`'s fallback reports zero for
+/// SDLC_FLOW runs that in fact cost money (`EN.14.A`).
+///
+/// This helper is called BEFORE a wrapper overwrites `result` into
+/// `ctx.nodes[identity]`, reading the *prior* `ctx.nodes[identity]` (the
+/// inner step's just-stamped entry) and copying exactly four keys —
+/// `"transport"`, `"cost_usd"`, `"cache_creation_input_tokens"`,
+/// `"cache_read_input_tokens"` — onto the wrapper's `result`, skipping any
+/// key that is absent or JSON `null`. It copies nothing else: not
+/// `content`, not `structured`, not `model`, not `session_id`.
+///
+/// Unused as of this task (`EN.14.A` task 1) — the five wrapper call sites
+/// are wired in the tasks that follow it in this spec.
+#[allow(dead_code)]
+pub(crate) fn carry_forward_billing(
+    ctx: &engine_contract::TaskContext,
+    identity: &str,
+    result: &mut serde_json::Value,
+) {
+    const BILLING_KEYS: [&str; 4] = [
+        "transport",
+        "cost_usd",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ];
+    let Some(prior) = ctx.nodes.get(identity) else {
+        return;
+    };
+    for key in BILLING_KEYS {
+        match prior.get(key) {
+            Some(value) if !value.is_null() => {
+                result[key] = value.clone();
+            }
+            _ => {}
+        }
+    }
+}
