@@ -161,6 +161,30 @@ pub struct SDLCTask {
     /// declared.
     #[serde(default = "default_expects_writes")]
     pub expects_writes: bool,
+    /// Authored spec data naming the files this task is expected to touch —
+    /// `tasks.json`'s `files[]` array, which every task has carried for as
+    /// long as `/generate-tasks` has existed even though this struct never
+    /// deserialized it until now.
+    ///
+    /// Used by `TestTaskNode::verify_claimed_writes`'s condition (2): when
+    /// non-empty, at least one path in the task's actual diff must appear
+    /// here, or the task fails write-verification.
+    ///
+    /// **This is NOT the model's self-reported `modified_files`.** That
+    /// self-report is unreliable — a model can under- or over-claim what it
+    /// touched — which is exactly why the existing write-verification guard
+    /// does not compare paths against it. `files[]` is different in kind:
+    /// it is authored into the spec by `/generate-tasks` *before* the task
+    /// ever runs, so it cannot be shaped by the run it is being used to
+    /// check. That authorship is the entire reason condition (2) is
+    /// trustworthy where a `modified_files` comparison would not be.
+    ///
+    /// `#[serde(default)]` so every `tasks.json` and committed
+    /// `sdlc-*state.json` written before this field existed still
+    /// deserializes — to an empty vec, not an error — on both a fresh load
+    /// and a resume.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 impl SDLCTask {
@@ -178,6 +202,7 @@ impl SDLCTask {
             max_attempts: default_max_attempts(),
             review_attempt_count: 0,
             expects_writes: default_expects_writes(),
+            files: Vec::new(),
         }
     }
 }
@@ -1229,6 +1254,30 @@ mod tests {
         assert_eq!(task.validation_commands, Vec::<String>::new());
         assert_eq!(task.attempt_count, 0);
         assert_eq!(task.max_attempts, 3);
+        assert_eq!(task.files, Vec::<String>::new());
+    }
+
+    #[test]
+    fn sdlc_task_files_round_trips_when_present() {
+        let json = serde_json::json!({
+            "task_id": 1,
+            "title": "Do the thing",
+            "description": "Full description",
+            "files": ["crates/engine-core/src/lib.rs", "crates/engine-core/src/main.rs"],
+        });
+        let task: SDLCTask = serde_json::from_value(json).expect("deserializes with files");
+        assert_eq!(
+            task.files,
+            vec![
+                "crates/engine-core/src/lib.rs".to_string(),
+                "crates/engine-core/src/main.rs".to_string(),
+            ]
+        );
+
+        let round_tripped: SDLCTask =
+            serde_json::from_value(serde_json::to_value(&task).expect("serializes"))
+                .expect("re-deserializes");
+        assert_eq!(round_tripped.files, task.files);
     }
 
     #[test]
