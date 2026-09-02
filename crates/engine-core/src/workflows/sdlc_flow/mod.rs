@@ -108,9 +108,14 @@ pub const DEFAULT_STATE_FILENAME: &str = "sdlc-flow-state.json";
 /// key that is absent or JSON `null`. It copies nothing else: not
 /// `content`, not `structured`, not `model`, not `session_id`.
 ///
-/// Unused as of this task (`EN.14.A` task 1) — the five wrapper call sites
-/// are wired in the tasks that follow it in this spec.
-#[allow(dead_code)]
+/// Called at five wrapper sites: `ImplementTaskNode`, `TriageTaskNode` and
+/// `ConsolidatedReviewNode` (`task_loop.rs`), `GenerateTasksNode`
+/// (`setup.rs`), and `EndReviewNode` (`end_review.rs`). The first four are
+/// exactly [`super::wrap_up::COST_BEARING_STAGES`]; `EndReviewNode` is a
+/// billed call that is deliberately NOT a member of that constant — see the
+/// carryover `end-review-node-is-billed-but-absent-from-cost-bearing-stages`,
+/// which is why repairing its carry-forward here does not by itself make its
+/// spend visible to `total_cost_usd`.
 pub(crate) fn carry_forward_billing(
     ctx: &engine_contract::TaskContext,
     identity: &str,
