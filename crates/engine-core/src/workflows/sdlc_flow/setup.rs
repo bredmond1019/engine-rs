@@ -1100,6 +1100,12 @@ impl Node for LoadTaskStateNode {
                 ))
             })?;
             let mut state = SDLCState::from_committed_state_json(value)?;
+            // `retry_task` is itself a resume (it loads the existing
+            // committed state and continues the run), and it early-returns
+            // before the main resume path below — so it needs the same
+            // ledger rehydration or a `--resume --retry-task` run would
+            // under-report cost exactly like an ordinary resume would.
+            crate::sessions::seed_sessions(&mut ctx.metadata, state.claude_sessions.clone());
             let known_ids: Vec<u32> = state.tasks.iter().map(|task| task.task_id).collect();
             let task = state
                 .tasks
@@ -1143,7 +1149,16 @@ impl Node for LoadTaskStateNode {
         let resumed_state = if restarting { None } else { existing_state };
 
         let mut state: SDLCState = if let Some(value) = resumed_state {
-            SDLCState::from_committed_state_json(&value)?
+            let state = SDLCState::from_committed_state_json(&value)?;
+            // Without this, a resumed run's `ctx.metadata` ledger starts
+            // empty, so `total_cost_usd` under-reports by every segment
+            // before the resume — after EN.14.A makes those numbers real,
+            // that under-reporting is a new way to lie about money. Seed
+            // (not append) the committed ledger into `ctx.metadata` here,
+            // before any node in this run has appended an invocation of its
+            // own, so later invocations extend it rather than restart it.
+            crate::sessions::seed_sessions(&mut ctx.metadata, state.claude_sessions.clone());
+            state
         } else if tasks_path.exists() {
             let raw = std::fs::read_to_string(&tasks_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", tasks_path.display()))
