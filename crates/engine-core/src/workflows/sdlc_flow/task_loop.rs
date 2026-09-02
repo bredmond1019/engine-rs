@@ -6283,6 +6283,222 @@ pub(crate) mod tests {
         assert_eq!(results[1]["name"], "always_fail");
     }
 
+    // --- verify_claimed_writes conditions (2) and (3) -----------------------
+    // (EN.ticket.write-verification-must-check-the-changed-paths-not-just-
+    // that-something-changed)
+
+    /// Builds a ctx around a task that declares `files` and whose worktree
+    /// (via the stubbed `git status --porcelain`) shows `modified_files` as
+    /// changed. Mirrors [`ctx_with_implement_claim`] but lets the task's
+    /// declared `files[]` be set explicitly, which conditions (2) and (3)
+    /// read.
+    fn ctx_with_task_files_and_claim(
+        worktree: &Path,
+        files: &[&str],
+        modified_files: &[&str],
+    ) -> TaskContext {
+        let mut task = SDLCTask::new(1, "t", "d");
+        task.files = files.iter().map(|s| s.to_string()).collect();
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task_and_worktree(&state, &task, worktree);
+        ctx.nodes.insert(
+            "ImplementTaskNode".to_string(),
+            json!({
+                "summary": "did the thing",
+                "modified_files": modified_files,
+                "tests_added": [],
+            }),
+        );
+        ctx
+    }
+
+    /// THE RETRO-FIXTURE. Reconstructs the JX.3.A shape that motivated this
+    /// ticket: task 3 declared `files: ["a.rs", "b.rs"]`, and its diff — a
+    /// legitimately non-empty one, re-creating tasks 1 and 2's work in a
+    /// thinner shape — touched only `c.rs`, intersecting neither declared
+    /// file. Condition (1) alone (the guard as it existed before this
+    /// ticket) waved this through because SOMETHING changed; condition (2)
+    /// must fail it.
+    #[tokio::test]
+    async fn write_verification_fails_retro_fixture_jx_3_a_thinner_shape() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_task_files_and_claim(&worktree, &["a.rs", "b.rs"], &["c.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" M c.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert_eq!(results[0]["passed"], false);
+        let message = results[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("a.rs") && message.contains("b.rs"),
+            "condition (2)'s message must print the declared files[]: {message}"
+        );
+        assert!(
+            message.contains("c.rs"),
+            "condition (2)'s message must print the changed paths too: {message}"
+        );
+    }
+
+    /// Condition (2) is an INTERSECTION test, not a subset test: touching an
+    /// undeclared file alongside a declared one still passes.
+    #[tokio::test]
+    async fn write_verification_passes_intersection_with_extra_files() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_task_files_and_claim(&worktree, &["a.rs"], &["a.rs", "z.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" M a.rs\n M z.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// An empty `files[]` with a non-empty diff behaves exactly as before
+    /// this ticket: condition (2) is skipped outright, so an unrelated
+    /// changed path still passes.
+    #[tokio::test]
+    async fn write_verification_passes_empty_files_with_nonempty_diff() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_task_files_and_claim(&worktree, &[], &["a.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" M unrelated.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+    }
+
+    /// An empty `files[]` with an empty diff still fails via condition (1)
+    /// alone, with today's exact message — condition (2)/(3) never engage
+    /// when there is nothing to compare against, but condition (1) is
+    /// unconditional.
+    #[tokio::test]
+    async fn write_verification_empty_files_and_empty_diff_fails_via_condition_one() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_task_files_and_claim(&worktree, &[], &[]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(""));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        assert!(results[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("worktree shows no changes at all"));
+    }
+
+    /// `expects_writes: false` exempts a task from conditions (2) and (3)
+    /// too, not only condition (1) — a non-intersecting diff on an
+    /// explicitly no-op task still returns `None`.
+    #[tokio::test]
+    async fn write_verification_expects_writes_false_exempt_from_condition_two() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let mut task = SDLCTask::new(1, "investigate", "read only");
+        task.expects_writes = false;
+        task.files = vec!["a.rs".to_string()];
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task_and_worktree(&state, &task, &worktree);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" M z.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// Condition (3): deleting a path the task never declared fails,
+    /// distinctly from condition (2)'s message.
+    #[tokio::test]
+    async fn write_verification_fails_on_deletion_of_undeclared_path() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_task_files_and_claim(&worktree, &["a.rs"], &["c.rs"]);
+
+        // Staged deletion of `c.rs`, an undeclared path; `a.rs` is also
+        // touched so condition (2)'s intersection would otherwise pass —
+        // isolating this assertion to condition (3) alone.
+        let node = TestTaskNode::new().with_runner(porcelain_runner("D  c.rs\nM  a.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], false);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results[0]["kind"], "write-verification");
+        let message = results[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("c.rs") && message.contains("deleted"),
+            "condition (3)'s message must name the deleted path: {message}"
+        );
+        assert!(
+            message
+                != "task 1 declared files[] [\"a.rs\"] but the worktree's changed \
+                         paths are [\"c.rs\", \"a.rs\"] — none of the declared files were \
+                         touched. A non-empty diff is not enough; the diff must intersect \
+                         what this task said it would do.",
+            "condition (3)'s message must be distinct from condition (2)'s"
+        );
+    }
+
+    /// Condition (3): deleting a path the task DID declare is fine — a task
+    /// may legitimately delete a file it declared.
+    #[tokio::test]
+    async fn write_verification_passes_deletion_of_declared_path() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_task_files_and_claim(&worktree, &["a.rs"], &["a.rs"]);
+
+        // Unstaged deletion of the declared file `a.rs`.
+        let node = TestTaskNode::new().with_runner(porcelain_runner(" D a.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// A rename line (`orig -> new`) must never be misread as a deletion —
+    /// its porcelain status is `R `, never `D`, so condition (3) does not
+    /// engage even when the destination path is undeclared. `files[]` is
+    /// left empty here so condition (2) is also out of the picture, keeping
+    /// this test isolated to the rename-vs-deletion distinction.
+    #[tokio::test]
+    async fn write_verification_rename_not_misread_as_deletion() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        let ctx = ctx_with_task_files_and_claim(&worktree, &[], &["old.rs"]);
+
+        let node = TestTaskNode::new().with_runner(porcelain_runner("R  old.rs -> new.rs\n"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["TestTaskNode"]["all_passed"], true);
+        let results = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
     #[tokio::test]
     async fn forbidden_pattern_scan_fails_on_unallowlisted_match() {
         let worktree = temp_worktree();
