@@ -175,4 +175,4 @@ configuration: `BASTION_ENGINE_HARNESS_PATH` is unset and `schedule.entries` is 
   alarms.
 
 No new integration-test binary was added to any crate — all new tests are unit tests in-module or
-cases appended to the existing `#[ignore]`d binary (CLAUDE.md standing rule 8).
+cases appended to the existing `#[ignore]`d binary (CLAUDE.md standing rule 9).

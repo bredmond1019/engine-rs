@@ -105,20 +105,32 @@ housekeeping. There is no global scheduler.
    - *Where feasible* is a real qualifier: a value fixed by an external contract (a wire format, a
      required header, an interface another repo pins) is not a knob. Say so in a comment rather than
      leaving the next reader to wonder.
-7. **Use `cargo nextest run`, never plain `cargo test`, for any test run you invoke yourself
+7. **A node's stable prompt is a file, not a string literal.** Per **D24**
+   (`planning/decisions/D24-node-prompts-live-in-colocated-files.md`), every stable-prompt `const`
+   lives at `crates/engine-core/src/workflows/<workflow>/prompts/<node>.md` and is pulled in with
+   `include_str!("prompts/<node>.md")` — colocated per workflow, never a global prompt tree, and
+   never a runtime file read (`include_str!` resolves at compile time, so a deployed `bastion
+   serve` never depends on finding the file on disk). This keeps the const's type, name, and
+   visibility unchanged, so `policy::apply_prompt_cache`'s cache breakpoint stays run-invariant —
+   the same discipline rule 6 requires for policy-varying text. Only the STABLE prefix moves:
+   per-run body construction (`build_prompt(...)`, interpolating `format!`s) stays in Rust. A
+   guard test at `crates/engine-core/tests/it/prompt_externalization.rs` (module of the shared
+   integration binary, per rule 9) fails on any newly-introduced inline prompt literal — see
+   [`docs/workflows/README.md`](docs/workflows/README.md) for where each workflow's prompts live.
+8. **Use `cargo nextest run`, never plain `cargo test`, for any test run you invoke yourself
    during a task** (scoped to a module: `cargo nextest run -p <crate> <module::path>`; workspace-
    wide fast check: `cargo nextest run --lib --workspace`). A `PreToolUse` hook in
    `.claude/settings.json` enforces this. Beyond the parallelism, nextest's process-per-test model
-   is what makes the single-integration-test-binary layout (rule 8) safe — the two go together.
+   is what makes the single-integration-test-binary layout (rule 9) safe — the two go together.
    The one exception is the task explicitly designated to own full-suite validation for a spec —
    that task runs `planning/harness.json`'s authoritative `command` (`cargo nextest run
    --workspace` + `cargo build --release`), not `fastCommand`.
-8. **One integration-test binary per crate.** New integration suites go in
+9. **One integration-test binary per crate.** New integration suites go in
    `crates/engine-core/tests/it/<name>.rs` with a `mod <name>;` line in `tests/it/main.rs` — never
    a new `crates/engine-core/tests/*.rs` file, which cargo builds as a separate binary that
    statically re-links the whole ~345-crate graph. See [`docs/testing.md`](docs/testing.md) and
    "Build / test / run" below.
-9. **Never `git push` this repo directly from inside it.** This repo sits in the fleet's Cargo
+10. **Never `git push` this repo directly from inside it.** This repo sits in the fleet's Cargo
    path-dependency graph (`engine-rs` -> `claude-code-rs`, `mev`, `okf-core`; and `bastion` ->
    `engine-rs`), and every Rust repo's CI clones its sibling path-deps at their unpinned default
    branch — pushing out of order breaks a sibling's CI on code that was actually fine (the
