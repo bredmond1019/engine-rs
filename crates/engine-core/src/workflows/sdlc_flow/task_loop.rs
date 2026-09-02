@@ -3388,7 +3388,7 @@ impl Node for SaveStateNode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::workflows::sdlc_flow::policy::{ModelTiers, TransportRetry};
     use claude_code_rs::Outcome;
@@ -9362,7 +9362,7 @@ mod tests {
         }
     }
 
-    async fn drive_implement_task_node_for_billing() -> TaskContext {
+    pub(crate) async fn drive_implement_task_node_for_billing() -> TaskContext {
         let task = SDLCTask::new(1, "One", "d1");
         let state = state_with_tasks(vec![task.clone()]);
         let ctx = ctx_with_current_task(&state, &task);
@@ -9376,7 +9376,7 @@ mod tests {
             .expect("ImplementTaskNode should succeed")
     }
 
-    async fn drive_triage_task_node_for_billing() -> TaskContext {
+    pub(crate) async fn drive_triage_task_node_for_billing() -> TaskContext {
         let task = SDLCTask::new(1, "One", "d1");
         let transport: ModelTransport = Arc::new(|_config, _prompt| {
             Box::pin(async {
@@ -9393,7 +9393,7 @@ mod tests {
             .expect("TriageTaskNode should succeed")
     }
 
-    async fn drive_consolidated_review_node_for_billing() -> TaskContext {
+    pub(crate) async fn drive_consolidated_review_node_for_billing() -> TaskContext {
         let task = SDLCTask::new(1, "One", "d1");
         let state = state_with_tasks(vec![task.clone()]);
         let mut ctx = ctx_with_current_task(&state, &task);
@@ -9430,7 +9430,7 @@ mod tests {
     static TASK3_BILLING_TMP_COUNTER: std::sync::atomic::AtomicU32 =
         std::sync::atomic::AtomicU32::new(0);
 
-    async fn drive_generate_tasks_node_for_billing() -> TaskContext {
+    pub(crate) async fn drive_generate_tasks_node_for_billing() -> TaskContext {
         use crate::workflows::sdlc_flow::setup::GenerateTasksNode;
 
         let n = TASK3_BILLING_TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
