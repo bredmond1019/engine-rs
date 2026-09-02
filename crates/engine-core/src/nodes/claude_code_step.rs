@@ -12,6 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRun, NodeRunStatus, TaskContext, Usage};
 use futures::future::BoxFuture;
@@ -66,7 +67,12 @@ fn record_sessions(ctx: &mut TaskContext, sessions: Vec<ClaudeSession>) {
 /// `usage` exactly as a success does. `Spawn`/`BinaryNotFound`/`Timeout`/`Parse` never got an
 /// envelope, so nothing about their cost is known; they return `None` and are recorded nowhere,
 /// because a zero-cost entry would assert a measurement that was never made.
-fn billed_failure(err: &claude_code_rs::Error, node: &str) -> Option<ClaudeSession> {
+fn billed_failure(
+    err: &claude_code_rs::Error,
+    node: &str,
+    model: &str,
+    started_at: &str,
+) -> Option<ClaudeSession> {
     match err {
         claude_code_rs::Error::Api {
             session_id,
@@ -82,6 +88,8 @@ fn billed_failure(err: &claude_code_rs::Error, node: &str) -> Option<ClaudeSessi
             output_tokens: usage.output_tokens,
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            model: model.to_string(),
+            started_at: Some(started_at.to_string()),
         }),
         _ => None,
     }
@@ -141,7 +149,9 @@ async fn call_with_retry<T, F>(
     retry: TransportRetry,
     token: Option<&CancellationToken>,
     node: &str,
+    model: &str,
     failed_sessions: &mut Vec<ClaudeSession>,
+    last_attempt_started_at: &mut String,
 ) -> RetriedCall<T>
 where
     F: FnMut() -> BoxFuture<'static, claude_code_rs::Result<T>>,
@@ -151,6 +161,12 @@ where
     let mut attempt = 1u32;
 
     loop {
+        // Captured before this attempt's transport call — not after it returns — so a reader
+        // can derive a duration rather than only ever seeing an end-stamp. Left in
+        // `last_attempt_started_at` on return so a caller whose attempt succeeded can stamp the
+        // ledger entry with the start of the attempt that actually won, not the first one tried.
+        let attempt_started_at = Utc::now().to_rfc3339();
+        *last_attempt_started_at = attempt_started_at.clone();
         match race_one_attempt(make_attempt(), token).await {
             None => return RetriedCall::Cancelled,
             Some(Ok(value)) => return RetriedCall::Ok(value),
@@ -161,7 +177,7 @@ where
                 // (`Spawn`/`Timeout`/`Parse`) reports no billing and is not recorded: we know
                 // nothing about it, and a zero-cost entry would assert something we did not
                 // measure.
-                if let Some(session) = billed_failure(&err, node) {
+                if let Some(session) = billed_failure(&err, node, model, &attempt_started_at) {
                     failed_sessions.push(session);
                 }
                 let budget_exhausted = attempt >= total_attempts;
@@ -410,6 +426,18 @@ impl Node for ClaudeCodeStep {
         // because `process` may return `Err` below, and `workflow::node_context` discards the
         // context on `Err` — they ride out on the `NodeError` instead (see `NodeError::sessions`).
         let mut failed_sessions: Vec<ClaudeSession> = Vec::new();
+        // The requested model, from the same source `ClaudeCodeStep::config` uses for every
+        // attempt in a retry loop (no per-attempt model info exists on the transport error
+        // envelope, so a failed attempt is attributed to what was asked for).
+        let requested_model = self
+            .config
+            .model
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+        // Overwritten on each attempt inside `call_with_retry`; on return it holds the start of
+        // whichever attempt the `RetriedCall` describes (the winning one on `Ok`, the last-tried
+        // one on `Err`/`Cancelled`).
+        let mut last_attempt_started_at = String::new();
 
         let (outcome, transport_info) = match &self.meta_transport {
             Some(meta_transport) => {
@@ -420,7 +448,9 @@ impl Node for ClaudeCodeStep {
                     self.retry,
                     self.cancellation_token.as_ref(),
                     &self.name,
+                    &requested_model,
                     &mut failed_sessions,
+                    &mut last_attempt_started_at,
                 )
                 .await;
 
@@ -445,7 +475,9 @@ impl Node for ClaudeCodeStep {
                     self.retry,
                     self.cancellation_token.as_ref(),
                     &self.name,
+                    &requested_model,
                     &mut failed_sessions,
+                    &mut last_attempt_started_at,
                 )
                 .await;
 
@@ -527,6 +559,10 @@ impl Node for ClaudeCodeStep {
                 output_tokens: outcome.usage.output_tokens,
                 cache_read_input_tokens: outcome.usage.cache_read_input_tokens,
                 cache_creation_input_tokens: outcome.usage.cache_creation_input_tokens,
+                // Same expression stamped into `ctx.nodes["model"]` above — the ledger entry and
+                // the node entry can never disagree.
+                model: model.clone(),
+                started_at: Some(last_attempt_started_at.clone()),
             },
         );
 

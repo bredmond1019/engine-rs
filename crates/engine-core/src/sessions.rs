@@ -75,6 +75,18 @@ pub struct ClaudeSession {
     /// Tokens written to the prompt cache. Bills at ~125% of an uncached input token.
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
+    /// The model tier this invocation ran under, taken from the same expression
+    /// `ClaudeCodeStep` stamps into `ctx.nodes` (`outcome.primary_model().unwrap_or(UNKNOWN_MODEL)`)
+    /// so the ledger entry and the node entry can never disagree. Empty string when unknown, not
+    /// absent — an entry written before this field existed deserializes to `""` via
+    /// `#[serde(default)]`, same tolerance as every other field here.
+    #[serde(default)]
+    pub model: String,
+    /// ISO-8601 timestamp of when THIS invocation started, captured before the transport call —
+    /// not after it returns, so a reader can derive a duration. `None` for an entry written
+    /// before this field existed.
+    #[serde(default)]
+    pub started_at: Option<String>,
 }
 
 /// Append one invocation to `metadata`'s ledger, creating it if absent. Order-preserving.
@@ -196,6 +208,8 @@ mod tests {
             output_tokens: 10,
             cache_read_input_tokens: 5,
             cache_creation_input_tokens: 1,
+            model: String::new(),
+            started_at: None,
         }
     }
 
