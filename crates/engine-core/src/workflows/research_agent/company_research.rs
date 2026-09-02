@@ -27,7 +27,10 @@ use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
 use crate::nodes::ClaudeCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
-use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
+use crate::workflows::{
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport,
+};
 
 use super::policy::{ContactDepth, GroundingDepth, ModelTier, ResearchAgentPolicy};
 use super::schema::{company_brief_json_schema, CompanyBrief, ResearchAgentEventSchema};
@@ -341,6 +344,11 @@ impl Node for CompanyResearchNode {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below carries whatever the inner
+        // `ClaudeCodeStep` appended to the ledger, so this research wrapper's
+        // billed session survives a post-billed-call failure.
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -356,6 +364,7 @@ impl Node for CompanyResearchNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse a CompanyBrief from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         // Deterministic stamp: an explicitly-supplied trigger `company_url`
@@ -365,8 +374,10 @@ impl Node for CompanyResearchNode {
             brief.company_url = Some(company_url.clone());
         }
 
-        let mut brief_value = serde_json::to_value(&brief)
-            .map_err(|err| NodeError::new(format!("failed to serialize CompanyBrief: {err}")))?;
+        let mut brief_value = serde_json::to_value(&brief).map_err(|err| {
+            NodeError::new(format!("failed to serialize CompanyBrief: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
         // Stamp the resolved contact-enrichment depth alongside the brief so
         // EN.4.0 telemetry can attribute cost to the setting that caused it.
         // `CompanyBrief` ignores unknown fields on deserialize, so this is a
@@ -417,7 +428,8 @@ impl Node for CompanyResearchNode {
             model_stages: &COST_BEARING_STAGES,
         };
         let telemetry = crate::policy::harvest_telemetry(&ctx, chrono::Utc::now(), inputs);
-        persist_state(&worktree, "company", &policy, &telemetry)?;
+        persist_state(&worktree, "company", &policy, &telemetry)
+            .map_err(|err| err.with_sessions(sessions_since(&ctx, baseline)))?;
 
         Ok(ctx)
     }

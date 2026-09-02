@@ -33,8 +33,8 @@ use super::policy::OutputVerbosity;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::{
-    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, CommandOutput,
-    CommandRunner, ModelTransport, TransportSlot,
+    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, session_baseline,
+    sessions_since, CommandOutput, CommandRunner, ModelTransport, TransportSlot,
 };
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
@@ -1264,6 +1264,11 @@ impl Node for ImplementTaskNode {
             step = step.with_cancellation_token(token);
         }
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below this line carries whatever the
+        // inner `ClaudeCodeStep` appended to the ledger, so a billed session
+        // never dies with the discarded `ctx` on the by-value `Err` path.
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -1292,8 +1297,10 @@ impl Node for ImplementTaskNode {
         // result is also what the write-verification guard reads
         // `modified_files` from. `latest_state` knows to unwrap this key for
         // this identity (see [`STATE_NESTED_IDENTITIES`]).
-        result["state"] = serde_json::to_value(&counted_state)
-            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        result["state"] = serde_json::to_value(&counted_state).map_err(|err| {
+            NodeError::new(format!("failed to serialize SDLCState: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
         // Preserve billing/telemetry from the inner ClaudeCodeStep's just-stamped
         // entry before this wrapper overwrites it — this site previously carried
         // forward nothing at all (EN.14.A).
@@ -2402,19 +2409,29 @@ impl Node for TriageTaskNode {
             step = step.with_cancellation_token(token);
         }
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below carries whatever the inner
+        // `ClaudeCodeStep` appended to the ledger, so this triage wrapper's
+        // billed session survives a post-billed-call parse/content failure
+        // (the measured case this block exists for).
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
         let content = ctx
             .nodes
             .get("TriageTaskNode")
             .and_then(|value| value.get("content"))
             .and_then(|value| value.as_str())
-            .ok_or_else(|| NodeError::new("TriageTaskNode: model returned no content"))?
+            .ok_or_else(|| {
+                NodeError::new("TriageTaskNode: model returned no content")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?
             .to_string();
         let parsed: TriageOutput = parse_structured_or_fenced(&ctx, "TriageTaskNode", &content)
             .map_err(|err| {
                 NodeError::new(format!(
                     "TriageTaskNode: failed to parse model output as JSON: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         let normalized_verdict = parsed.verdict.trim().to_uppercase();
@@ -2794,13 +2811,21 @@ impl Node for ConsolidatedReviewNode {
             step = step.with_cancellation_token(token);
         }
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below carries whatever the inner
+        // `ClaudeCodeStep` appended to the ledger, so this review wrapper's
+        // billed session survives a post-billed-call failure.
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
         let content = ctx
             .nodes
             .get("ConsolidatedReviewNode")
             .and_then(|value| value.get("content"))
             .and_then(|value| value.as_str())
-            .ok_or_else(|| NodeError::new("ConsolidatedReviewNode: model returned no content"))?
+            .ok_or_else(|| {
+                NodeError::new("ConsolidatedReviewNode: model returned no content")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?
             .to_string();
         let parsed: ReviewOutput =
             parse_structured_or_fenced(&ctx, "ConsolidatedReviewNode", &content).map_err(
@@ -2808,6 +2833,7 @@ impl Node for ConsolidatedReviewNode {
                     NodeError::new(format!(
                         "ConsolidatedReviewNode: failed to parse model output as JSON: {err}"
                     ))
+                    .with_sessions(sessions_since(&ctx, baseline))
                 },
             )?;
 
@@ -2845,12 +2871,15 @@ impl Node for ConsolidatedReviewNode {
         let current_task_id = current_task_fields(&ctx)?
             .get("current_task_id")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
-            as u32;
+            .ok_or_else(|| {
+                NodeError::new("TaskQueueRouterNode output missing current_task_id")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })? as u32;
         let task_review_attempts = if normalized_verdict == "PASS" {
             task_review_attempts(&counted_state, current_task_id)
         } else {
-            bump_task_review_attempt(&mut counted_state, current_task_id)?
+            bump_task_review_attempt(&mut counted_state, current_task_id)
+                .map_err(|err| err.with_sessions(sessions_since(&ctx, baseline)))?
         };
         // Standing rule 6: stamp the counter the bound is measured against
         // right next to the verdict that moved it, so `ReviewRouterNode` and
@@ -2863,8 +2892,10 @@ impl Node for ConsolidatedReviewNode {
         // `SDLCState` (carrying the just-bumped `review_attempts`) has to
         // ride alongside it, not instead of it. `latest_state` (this file)
         // knows to unwrap this key for this one node identity.
-        result["state"] = serde_json::to_value(&counted_state)
-            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        result["state"] = serde_json::to_value(&counted_state).map_err(|err| {
+            NodeError::new(format!("failed to serialize SDLCState: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
         // Carried forward below: `put_result` replaces this node's whole
         // `ctx.nodes` entry, which would otherwise silently drop what
         // `ClaudeCodeStep::process` just wrote onto this same identity —
