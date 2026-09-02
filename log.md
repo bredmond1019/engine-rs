@@ -14,6 +14,20 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-02]
+
+### EN.14.J — shared policy core extracted, six `ModelTiers` collapsed to one — PASS
+- **What:** Ran `EN.14.J` through `/sdlc-flow` (tasks 1-5), closing the policy initiative's parallel track. Task 1 added a golden-fixture test (`policy_baseline.rs`) that resolves each of the nine workflow surfaces' baseline profile with no event override and no `harness.json`, asserting byte-identity against nine committed pre-change fixtures — the guard against silent default drift this block exists to enforce. Task 2 collapsed the six duplicate `pub struct ModelTiers` definitions to one, renaming five surface-prefixed variants (`ContentPipelineModelTiers`, `LinkedinPostModelTiers`, `ProposalGeneratorModelTiers`, `DiagnosticIntakeModelTiers`, `ResearchAgentModelTiers`) and leaving `sdlc_flow::policy::ModelTiers` as the sole survivor — a pure identifier rename, zero risk to serialized defaults. Task 3 gave `content_pipeline` and `proposal_generator` — the two surfaces that previously errored on `cheap-fast`/`thorough` — working profiles (critic-iteration and harvest-mode knobs on `content_pipeline`; `review_mode: Skip`/`Full` on `proposal_generator`), no new knobs introduced. Task 4 added a nine-surface x three-profile resolution matrix test and manually demonstrated both failure gates (a perturbed baseline reddens task 1's fixture test by name; a removed profile arm reddens the matrix test by name), reverting both before commit. Task 5 validated the full harness: fmt, clippy `-D warnings`, `nextest --workspace` (3494 passed), release build, hang-terminate script, micro-spec runner — all green, `rg -c 'pub struct ModelTiers'` returns 1. PASS review. Closes `EN.14.J`.
+- **Next:** `EN.14.D` — add `model`/`started_at` to `ClaudeSession` and re-pin the three data-contract documents.
+
+```
+4a03d47 docs: update docs for EN.14.J
+ccdf501 feat: implement EN.14.J-task4
+6202ce0 feat: implement EN.14.J-task3
+3c3f701 feat: implement EN.14.J-task2
+c9d1458 feat: implement EN.14.J-task1
+```
+
 ## [run: 2026-09-01]
 
 ### Micro-spec fixture built and run live — PARTIAL, two structural defects found
