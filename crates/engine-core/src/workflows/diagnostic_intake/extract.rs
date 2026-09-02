@@ -510,7 +510,7 @@ mod tests {
         let policy = DiagnosticIntakePolicy {
             output_verbosity: super::super::policy::OutputVerbosity::Terse,
             prompt_cache: true,
-            model_tiers: super::super::policy::ModelTiers {
+            model_tiers: super::super::policy::DiagnosticIntakeModelTiers {
                 extract: ModelTier::Opus,
             },
             ..DiagnosticIntakePolicy::default()

@@ -16,7 +16,7 @@
 //! `policy` override). Everything else here — the routers, `TestTaskNode`,
 //! `UpdateTaskStatusNode`, `SaveStateNode` — is pure Rust.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use claude_code_rs::Config;
 use engine_contract::TaskContext;
@@ -33,8 +33,8 @@ use super::policy::OutputVerbosity;
 use super::policy::{ModelTier, RetryFeedback, ReviewMode, SdlcPolicy, TestDepth};
 use super::schema::{RunMeta, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::{
-    get_result, parse_structured_or_fenced, put_result, CommandOutput, CommandRunner,
-    ModelTransport, TransportSlot,
+    carry_forward_billing, get_result, parse_structured_or_fenced, put_result, session_baseline,
+    sessions_since, CommandOutput, CommandRunner, ModelTransport, TransportSlot,
 };
 #[cfg(test)]
 use crate::policy::RESOLVED_POLICY_IDENTITY;
@@ -328,6 +328,35 @@ pub(crate) fn worktree_path(ctx: &TaskContext) -> Result<String, NodeError> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .ok_or_else(|| NodeError::new("SetupWorktreeNode output missing worktree_path"))
+}
+
+/// Resolve which `harness.json` a run gates on (`EN.ticket.per-spec-harness-override`).
+///
+/// Resolution order:
+/// 1. `worktree/planning/<spec_slug>/harness.json` — when `ctx.event` carries
+///    a `spec_slug` (read the same way `emit_state.rs::spec_slug` does) AND
+///    that file exists.
+/// 2. `worktree/planning/harness.json` — otherwise.
+///
+/// Behavior-stable by construction: a spec with no per-spec harness of its
+/// own (no `spec_slug` on the event, or a `spec_slug` whose directory
+/// carries no `harness.json`) resolves to exactly the path every existing
+/// run used before this knob existed. A malformed per-spec harness is
+/// **not** this function's concern — it returns the per-spec path as long
+/// as the file exists, and the caller's existing read/parse error path
+/// (which already names `harness_path` in its message) surfaces the
+/// failure without any silent fallback to the repo harness.
+pub(crate) fn resolve_harness_path(ctx: &TaskContext, worktree: &Path) -> PathBuf {
+    if let Some(spec_slug) = ctx.event.get("spec_slug").and_then(|v| v.as_str()) {
+        let per_spec_path = worktree
+            .join("planning")
+            .join(spec_slug)
+            .join("harness.json");
+        if per_spec_path.exists() {
+            return per_spec_path;
+        }
+    }
+    worktree.join("planning").join("harness.json")
 }
 
 /// Best-effort `git add -N -A` ("intent to add") in `worktree`, run
@@ -1235,6 +1264,11 @@ impl Node for ImplementTaskNode {
             step = step.with_cancellation_token(token);
         }
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below this line carries whatever the
+        // inner `ClaudeCodeStep` appended to the ledger, so a billed session
+        // never dies with the discarded `ctx` on the by-value `Err` path.
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -1263,8 +1297,14 @@ impl Node for ImplementTaskNode {
         // result is also what the write-verification guard reads
         // `modified_files` from. `latest_state` knows to unwrap this key for
         // this identity (see [`STATE_NESTED_IDENTITIES`]).
-        result["state"] = serde_json::to_value(&counted_state)
-            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        result["state"] = serde_json::to_value(&counted_state).map_err(|err| {
+            NodeError::new(format!("failed to serialize SDLCState: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
+        // Preserve billing/telemetry from the inner ClaudeCodeStep's just-stamped
+        // entry before this wrapper overwrites it — this site previously carried
+        // forward nothing at all (EN.14.A).
+        carry_forward_billing(&ctx, "ImplementTaskNode", &mut result);
         put_result(&mut ctx, "ImplementTaskNode", result);
 
         Ok(ctx)
@@ -1998,7 +2038,7 @@ impl Node for TestTaskNode {
         // that happen to already be green (e.g. no `harness.json`).
         let write_verification = self.verify_claimed_writes(&ctx, &task, worktree);
 
-        let harness_path = worktree.join("planning").join("harness.json");
+        let harness_path = resolve_harness_path(&ctx, worktree);
         let harness_exists = harness_path.exists();
         let harness_checks: Vec<serde_json::Value> = if harness_exists {
             let raw = std::fs::read_to_string(&harness_path).map_err(|err| {
@@ -2369,30 +2409,29 @@ impl Node for TriageTaskNode {
             step = step.with_cancellation_token(token);
         }
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below carries whatever the inner
+        // `ClaudeCodeStep` appended to the ledger, so this triage wrapper's
+        // billed session survives a post-billed-call parse/content failure
+        // (the measured case this block exists for).
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
         let content = ctx
             .nodes
             .get("TriageTaskNode")
             .and_then(|value| value.get("content"))
             .and_then(|value| value.as_str())
-            .ok_or_else(|| NodeError::new("TriageTaskNode: model returned no content"))?
+            .ok_or_else(|| {
+                NodeError::new("TriageTaskNode: model returned no content")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?
             .to_string();
-        // Carried forward below: `put_result` replaces this node's whole
-        // `ctx.nodes` entry, which would otherwise silently drop the
-        // `"transport"` stamp `ClaudeCodeStep::process` just wrote — the
-        // exact tier-telemetry `RunTelemetry`/`observed_model_tiers`
-        // (`policy/telemetry.rs`) reads back out by this same node name.
-        let transport_stamp = ctx
-            .nodes
-            .get("TriageTaskNode")
-            .and_then(|value| value.get("transport"))
-            .cloned();
-
         let parsed: TriageOutput = parse_structured_or_fenced(&ctx, "TriageTaskNode", &content)
             .map_err(|err| {
                 NodeError::new(format!(
                     "TriageTaskNode: failed to parse model output as JSON: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         let normalized_verdict = parsed.verdict.trim().to_uppercase();
@@ -2419,9 +2458,15 @@ impl Node for TriageTaskNode {
         ) {
             result["unrecognized_verdict"] = json!(normalized_verdict);
         }
-        if let Some(transport) = transport_stamp {
-            result["transport"] = transport;
-        }
+        // Carried forward below: `put_result` replaces this node's whole
+        // `ctx.nodes` entry, which would otherwise silently drop what
+        // `ClaudeCodeStep::process` just wrote onto this same identity —
+        // the `"transport"` tier stamp the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name, plus `cost_usd` and both
+        // cache channels so `BudgetLedger`/`total_cost_usd` see them too
+        // (`EN.14.A`).
+        carry_forward_billing(&ctx, "TriageTaskNode", &mut result);
         put_result(&mut ctx, "TriageTaskNode", result);
 
         Ok(ctx)
@@ -2766,31 +2811,29 @@ impl Node for ConsolidatedReviewNode {
             step = step.with_cancellation_token(token);
         }
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below carries whatever the inner
+        // `ClaudeCodeStep` appended to the ledger, so this review wrapper's
+        // billed session survives a post-billed-call failure.
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
         let content = ctx
             .nodes
             .get("ConsolidatedReviewNode")
             .and_then(|value| value.get("content"))
             .and_then(|value| value.as_str())
-            .ok_or_else(|| NodeError::new("ConsolidatedReviewNode: model returned no content"))?
+            .ok_or_else(|| {
+                NodeError::new("ConsolidatedReviewNode: model returned no content")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })?
             .to_string();
-        // Carried forward below: `put_result` replaces this node's whole
-        // `ctx.nodes` entry, which would otherwise silently drop the
-        // `"transport"` stamp `ClaudeCodeStep::process` just wrote — the
-        // exact tier-telemetry `RunTelemetry`/`observed_model_tiers`
-        // (`policy/telemetry.rs`) reads back out by this same node name.
-        let transport_stamp = ctx
-            .nodes
-            .get("ConsolidatedReviewNode")
-            .and_then(|value| value.get("transport"))
-            .cloned();
-
         let parsed: ReviewOutput =
             parse_structured_or_fenced(&ctx, "ConsolidatedReviewNode", &content).map_err(
                 |err| {
                     NodeError::new(format!(
                         "ConsolidatedReviewNode: failed to parse model output as JSON: {err}"
                     ))
+                    .with_sessions(sessions_since(&ctx, baseline))
                 },
             )?;
 
@@ -2828,29 +2871,40 @@ impl Node for ConsolidatedReviewNode {
         let current_task_id = current_task_fields(&ctx)?
             .get("current_task_id")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| NodeError::new("TaskQueueRouterNode output missing current_task_id"))?
-            as u32;
+            .ok_or_else(|| {
+                NodeError::new("TaskQueueRouterNode output missing current_task_id")
+                    .with_sessions(sessions_since(&ctx, baseline))
+            })? as u32;
         let task_review_attempts = if normalized_verdict == "PASS" {
             task_review_attempts(&counted_state, current_task_id)
         } else {
-            bump_task_review_attempt(&mut counted_state, current_task_id)?
+            bump_task_review_attempt(&mut counted_state, current_task_id)
+                .map_err(|err| err.with_sessions(sessions_since(&ctx, baseline)))?
         };
         // Standing rule 6: stamp the counter the bound is measured against
         // right next to the verdict that moved it, so `ReviewRouterNode` and
         // `wrap_up::derive_terminal_signal` read the same number this pass
         // produced rather than each re-deriving it.
         result["task_review_attempts"] = json!(task_review_attempts);
-        if let Some(transport) = transport_stamp {
-            result["transport"] = transport;
-        }
         // Nested under `"state"` rather than replacing this result outright
         // — the object above IS the review verdict `ReviewRouterNode` reads
         // via `get_result(ctx, "ConsolidatedReviewNode")`, so the durable
         // `SDLCState` (carrying the just-bumped `review_attempts`) has to
         // ride alongside it, not instead of it. `latest_state` (this file)
         // knows to unwrap this key for this one node identity.
-        result["state"] = serde_json::to_value(&counted_state)
-            .map_err(|err| NodeError::new(format!("failed to serialize SDLCState: {err}")))?;
+        result["state"] = serde_json::to_value(&counted_state).map_err(|err| {
+            NodeError::new(format!("failed to serialize SDLCState: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
+        })?;
+        // Carried forward below: `put_result` replaces this node's whole
+        // `ctx.nodes` entry, which would otherwise silently drop what
+        // `ClaudeCodeStep::process` just wrote onto this same identity —
+        // the `"transport"` tier stamp the exact tier-telemetry
+        // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
+        // reads back out by this same node name, plus `cost_usd` and both
+        // cache channels so `BudgetLedger`/`total_cost_usd` see them too
+        // (`EN.14.A`).
+        carry_forward_billing(&ctx, "ConsolidatedReviewNode", &mut result);
         put_result(&mut ctx, "ConsolidatedReviewNode", result);
 
         Ok(ctx)
@@ -3365,7 +3419,7 @@ impl Node for SaveStateNode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::workflows::sdlc_flow::policy::{ModelTiers, TransportRetry};
     use claude_code_rs::Outcome;
@@ -5595,6 +5649,131 @@ mod tests {
             serde_json::to_string(&harness).unwrap(),
         )
         .unwrap();
+    }
+
+    fn write_per_spec_harness(dir: &Path, spec_slug: &str, checks: serde_json::Value) {
+        let spec_dir = dir.join("planning").join(spec_slug);
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let harness = json!({ "validation": { "checks": checks } });
+        std::fs::write(
+            spec_dir.join("harness.json"),
+            serde_json::to_string(&harness).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // ---- resolve_harness_path (EN.ticket.per-spec-harness-override) ----
+
+    #[test]
+    fn resolve_harness_path_prefers_per_spec_override_when_it_exists() {
+        let worktree = temp_worktree();
+        write_per_spec_harness(&worktree, "my-spec", json!([]));
+        // The repo-level harness also exists, to prove the override wins
+        // rather than merely being the only file present.
+        write_harness(&worktree, json!([]));
+
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let resolved = resolve_harness_path(&ctx, &worktree);
+
+        assert_eq!(
+            resolved,
+            worktree
+                .join("planning")
+                .join("my-spec")
+                .join("harness.json")
+        );
+    }
+
+    #[test]
+    fn resolve_harness_path_falls_back_to_repo_harness_when_override_absent() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+
+        let ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        let resolved = resolve_harness_path(&ctx, &worktree);
+
+        // The exact-path assertion IS the behavior-stability claim this
+        // knob rests on: with no per-spec harness.json present, resolution
+        // must land on the same path every run used before this knob
+        // existed.
+        assert_eq!(resolved, worktree.join("planning").join("harness.json"));
+    }
+
+    #[test]
+    fn resolve_harness_path_falls_back_to_repo_harness_when_no_spec_slug_on_event() {
+        let worktree = temp_worktree();
+        write_harness(&worktree, json!([]));
+        // Even a per-spec harness for SOME slug existing on disk must not
+        // matter when the event carries no spec_slug at all.
+        write_per_spec_harness(&worktree, "my-spec", json!([]));
+
+        let ctx = empty_context(json!({}));
+        let resolved = resolve_harness_path(&ctx, &worktree);
+
+        assert_eq!(resolved, worktree.join("planning").join("harness.json"));
+    }
+
+    #[tokio::test]
+    async fn test_task_malformed_per_spec_harness_errors_with_its_own_path_no_fallback() {
+        let worktree = temp_worktree();
+        // A valid repo harness exists too, to prove a malformed override
+        // does NOT silently fall back to it.
+        write_harness(
+            &worktree,
+            json!([{ "name": "repo_check", "command": "exit 0", "gates": true }]),
+        );
+        let spec_dir = worktree.join("planning").join("my-spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(spec_dir.join("harness.json"), "{ not valid json").unwrap();
+
+        let ctx = ctx_for_worktree(&worktree);
+        let node = TestTaskNode::new();
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("malformed per-spec harness must error");
+        let expected_path = spec_dir.join("harness.json");
+        assert!(
+            err.message.contains(&expected_path.display().to_string()),
+            "error must name the per-spec path, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_runs_checks_from_per_spec_harness_not_repo_harness() {
+        let worktree = temp_worktree();
+        // The repo harness declares a DIFFERENT check name than the
+        // per-spec override — a resolver wired correctly must run only the
+        // override's checks.
+        write_harness(
+            &worktree,
+            json!([{ "name": "repo_only_check", "command": "exit 0", "gates": true }]),
+        );
+        write_per_spec_harness(
+            &worktree,
+            "my-spec",
+            json!([{ "name": "per_spec_only_check", "command": "exit 0", "gates": true }]),
+        );
+
+        let ctx = ctx_for_worktree(&worktree);
+        let node = TestTaskNode::new();
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        let check_names: Vec<&str> = out.nodes["TestTaskNode"]["check_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            check_names.contains(&"per_spec_only_check"),
+            "expected the per-spec check to run: {check_names:?}"
+        );
+        assert!(
+            !check_names.contains(&"repo_only_check"),
+            "the repo harness's check must NOT run when a per-spec override exists: {check_names:?}"
+        );
     }
 
     #[tokio::test]
@@ -9180,5 +9359,272 @@ mod tests {
             "with no token attached, an in-flight call must NOT be \
              interrupted — behavior must match today exactly"
         );
+    }
+
+    // --- EN.14.A task 3: COST_BEARING_STAGES carry-forward regression -----
+    //
+    // One table, driven end-to-end through each cost-bearing wrapper's
+    // `process`, asserting the billing channels `carry_forward_billing`
+    // (EN.14.A task 1) is supposed to preserve across `put_result` actually
+    // survive it. The table's stage set is asserted equal to
+    // `COST_BEARING_STAGES` itself, so a fifth stage added to that constant
+    // later has no driver here and fails loudly instead of going untested
+    // silently (per the block's AC and carryover
+    // `gate-scope-must-be-shown-capable-of-failing`).
+
+    /// A fake model reply carrying known, non-default billing figures —
+    /// `cost_usd`, both cache channels, and a `session_id` the wrapper is
+    /// NOT meant to re-emit (used by the negative assertion below).
+    fn billing_outcome(text: &str) -> Outcome {
+        Outcome {
+            cost_usd: 1.25,
+            usage: claude_code_rs::parse::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: 77,
+                cache_read_input_tokens: 500,
+            },
+            model_usage: std::collections::BTreeMap::new(),
+            text: text.to_string(),
+            is_error: false,
+            api_error_status: None,
+            session_id: Some("sess-billing-test".to_string()),
+            structured_output: None,
+        }
+    }
+
+    pub(crate) async fn drive_implement_task_node_for_billing() -> TaskContext {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let ctx = ctx_with_current_task(&state, &task);
+
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async { Ok(billing_outcome(&json!({ "summary": "done" }).to_string())) })
+        });
+        let node = ImplementTaskNode::new().with_transport(transport);
+        node.process(ctx)
+            .await
+            .expect("ImplementTaskNode should succeed")
+    }
+
+    pub(crate) async fn drive_triage_task_node_for_billing() -> TaskContext {
+        let task = SDLCTask::new(1, "One", "d1");
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async {
+                Ok(billing_outcome(
+                    &json!({ "verdict": "RETRYABLE", "reason": "try again" }).to_string(),
+                ))
+            })
+        });
+        let node = TriageTaskNode::new().with_transport(transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+        node.process(ctx)
+            .await
+            .expect("TriageTaskNode should succeed")
+    }
+
+    /// EN.14.C task 3 — REALISM requirement: drive the actual
+    /// `TriageTaskNode` (not a synthetic stand-in) with a fake transport that
+    /// bills the API (`billing_outcome`, a real `cost_usd`/`session_id`) and
+    /// then returns content `TriageOutput` cannot parse, so the wrapper
+    /// fails AFTER the billed call — exactly the measured case named in the
+    /// block's `why`. Asserts on the returned `NodeError` directly (this
+    /// module has no access to the private `node_context`; the generic
+    /// `node_context`-level tests in `workflow.rs` cover that once a
+    /// `NodeError` carries a session via `.with_sessions(..)`, `node_context`
+    /// retains it across the discard — this test proves the real wrapper
+    /// populates that field in the first place).
+    #[tokio::test]
+    async fn triage_task_node_preserves_billed_session_on_post_billed_call_parse_failure() {
+        let task = SDLCTask::new(1, "One", "d1");
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            // Billed (real cost + a session id), but the text is neither
+            // valid `TriageOutput` JSON nor a parseable fenced block — the
+            // parse-failure branch this block targets.
+            Box::pin(async { Ok(billing_outcome("not parseable as TriageOutput at all")) })
+        });
+        let node = TriageTaskNode::new().with_transport(transport);
+        let mut ctx = ctx_with_test_result(false, &task);
+        ctx.event = json!({ "spec_slug": "my-spec", "llm_triage": true });
+
+        let err = node
+            .process(ctx)
+            .await
+            .expect_err("unparseable model output must fail the wrapper");
+
+        assert!(
+            err.message.contains("failed to parse model output"),
+            "err: {}",
+            err.message
+        );
+        assert_eq!(
+            err.sessions.len(),
+            1,
+            "the billed call's session must be carried on the wrapper's \
+             failure, not dropped: {:?}",
+            err.sessions
+        );
+        assert_eq!(
+            err.sessions[0].session_id.as_deref(),
+            Some("sess-billing-test")
+        );
+        assert_eq!(err.sessions[0].cost_usd, 1.25);
+    }
+
+    pub(crate) async fn drive_consolidated_review_node_for_billing() -> TaskContext {
+        let task = SDLCTask::new(1, "One", "d1");
+        let state = state_with_tasks(vec![task.clone()]);
+        let mut ctx = ctx_with_current_task(&state, &task);
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": "." }),
+        );
+
+        let runner: CommandRunner = Arc::new(|_program, _args, _cwd| {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: "diff --git a b".to_string(),
+                stderr: String::new(),
+            })
+        });
+        let transport: ModelTransport = Arc::new(|_config, _prompt| {
+            Box::pin(async {
+                Ok(billing_outcome(
+                    &json!({ "verdict": "PASS", "summary": "looks good", "issues": [] })
+                        .to_string(),
+                ))
+            })
+        });
+        let node = ConsolidatedReviewNode::new()
+            .with_runner(runner)
+            .with_transport(transport);
+        node.process(ctx)
+            .await
+            .expect("ConsolidatedReviewNode should succeed")
+    }
+
+    /// Counter for a unique scratch worktree per call — `GenerateTasksNode`
+    /// writes real `tasks.json`/`tasks.md` files under it.
+    static TASK3_BILLING_TMP_COUNTER: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+
+    pub(crate) async fn drive_generate_tasks_node_for_billing() -> TaskContext {
+        use crate::workflows::sdlc_flow::setup::GenerateTasksNode;
+
+        let n = TASK3_BILLING_TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let worktree = std::env::temp_dir().join(format!(
+            "engine-core-en-14-a-task3-billing-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&worktree).ok();
+        std::fs::create_dir_all(worktree.join("planning").join("my-spec"))
+            .expect("create spec dir");
+
+        let mut ctx = empty_context(json!({ "spec_slug": "my-spec" }));
+        ctx.nodes.insert(
+            "SetupWorktreeNode".to_string(),
+            json!({ "worktree_path": worktree.to_string_lossy() }),
+        );
+        ctx.nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::to_value(SdlcPolicy::default()).expect("SdlcPolicy serializes"),
+        );
+
+        let canned = json!({
+            "tasks": [{ "task_id": 1, "title": "Do it", "description": "desc" }],
+            "tasks_markdown": "# Tasks\n\n1. Do it",
+        })
+        .to_string();
+        let transport: ModelTransport = Arc::new(move |_config, _prompt| {
+            let canned = canned.clone();
+            Box::pin(async move { Ok(billing_outcome(&canned)) })
+        });
+
+        let node = GenerateTasksNode::new().with_transport(transport);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("GenerateTasksNode should succeed");
+        std::fs::remove_dir_all(&worktree).ok();
+        out
+    }
+
+    /// The headline regression: every `COST_BEARING_STAGES` entry retains
+    /// `cost_usd` and both cache channels after its wrapper's `put_result`
+    /// (positive), and the carry-forward is proven selective rather than a
+    /// blanket copy by asserting two keys it must NOT re-emit (negative).
+    #[tokio::test]
+    async fn cost_bearing_stages_carry_forward_billing_channels() {
+        use crate::workflows::sdlc_flow::wrap_up::COST_BEARING_STAGES;
+
+        let table: Vec<(&'static str, TaskContext)> = vec![
+            (
+                "ImplementTaskNode",
+                drive_implement_task_node_for_billing().await,
+            ),
+            ("TriageTaskNode", drive_triage_task_node_for_billing().await),
+            (
+                "ConsolidatedReviewNode",
+                drive_consolidated_review_node_for_billing().await,
+            ),
+            (
+                "GenerateTasksNode",
+                drive_generate_tasks_node_for_billing().await,
+            ),
+        ];
+
+        // The table IS the contract: its stage set must equal
+        // `COST_BEARING_STAGES` exactly, sorted, so a fifth stage added to
+        // the constant later has no driver here and fails this assertion
+        // rather than silently going untested.
+        let mut table_names: Vec<&str> = table.iter().map(|(name, _)| *name).collect();
+        table_names.sort_unstable();
+        let mut declared: Vec<&str> = COST_BEARING_STAGES.to_vec();
+        declared.sort_unstable();
+        assert_eq!(
+            table_names, declared,
+            "the driver table must cover exactly COST_BEARING_STAGES"
+        );
+
+        for (stage, ctx) in &table {
+            let entry = ctx
+                .nodes
+                .get(*stage)
+                .unwrap_or_else(|| panic!("{stage}: missing ctx.nodes entry after process()"));
+
+            // Positive: the billing channels survived put_result.
+            assert_eq!(
+                entry["cost_usd"], 1.25,
+                "{stage}: cost_usd must survive put_result"
+            );
+            assert_eq!(
+                entry["cache_creation_input_tokens"], 77,
+                "{stage}: cache_creation_input_tokens must survive put_result"
+            );
+            assert_eq!(
+                entry["cache_read_input_tokens"], 500,
+                "{stage}: cache_read_input_tokens must survive put_result"
+            );
+            assert!(
+                !entry["transport"].is_null(),
+                "{stage}: transport must survive put_result"
+            );
+
+            // Negative: a carry-forward that copied everything indiscriminately
+            // would also pass every assertion above, so this proves the
+            // wrapper's carry-forward is selective — session_id and the raw
+            // model content are stamped by `ClaudeCodeStep::process` onto the
+            // same identity but are deliberately not among the four billing
+            // keys `carry_forward_billing` copies.
+            assert!(
+                entry.get("session_id").is_none(),
+                "{stage}: session_id must NOT be carried forward"
+            );
+            assert!(
+                entry.get("content").is_none(),
+                "{stage}: the raw model content must NOT be carried forward"
+            );
+        }
     }
 }

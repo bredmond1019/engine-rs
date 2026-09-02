@@ -808,4 +808,73 @@ mod tests {
         let round_tripped: RunTelemetry = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped, telemetry);
     }
+
+    // --- EN.14.A task 4: the two readers this block exists for -----------
+    //
+    // The carry-forward (tasks 1-3) is only worth anything if the readers
+    // downstream of it actually see a real number. Both assertions here run
+    // over a `TaskContext` produced by task 3's own wrapper drivers
+    // (`task_loop::tests::drive_*_for_billing`), not a hand-built
+    // `ctx.nodes` — so a regression in the wrappers' `carry_forward_billing`
+    // call breaks this test too, rather than this test independently
+    // re-asserting the same fact task 3 already covers.
+    //
+    // Grounding, verified in source this session (name the symbols, not the
+    // line numbers, in any assertion): `DEFAULT_MAX_COST_USD` is defined at
+    // `engine-serve/src/http.rs:352` and applied at `:674`; `Workflow::walk`
+    // folds `crate::workflow::node_cost_usd` into the `BudgetLedger` and
+    // checks `Budget::max_cost_usd` before dispatch.
+    #[tokio::test]
+    async fn total_cost_usd_and_node_cost_usd_see_a_real_number_from_wrapper_produced_context() {
+        use crate::workflows::sdlc_flow::task_loop::tests::{
+            drive_consolidated_review_node_for_billing, drive_generate_tasks_node_for_billing,
+            drive_implement_task_node_for_billing, drive_triage_task_node_for_billing,
+        };
+        use crate::workflows::sdlc_flow::wrap_up::COST_BEARING_STAGES;
+
+        // Drive each cost-bearing wrapper for real (fake transport, no
+        // network, no live model call, no installed binary) and fold each
+        // one's own `ctx.nodes[stage]` entry into a single combined context,
+        // the way a real SDLC run's `ctx.nodes` would accumulate one entry
+        // per stage across the walk.
+        let mut nodes: HashMap<String, serde_json::Value> = HashMap::new();
+        for (stage, ctx) in [
+            (
+                "ImplementTaskNode",
+                drive_implement_task_node_for_billing().await,
+            ),
+            ("TriageTaskNode", drive_triage_task_node_for_billing().await),
+            (
+                "ConsolidatedReviewNode",
+                drive_consolidated_review_node_for_billing().await,
+            ),
+            (
+                "GenerateTasksNode",
+                drive_generate_tasks_node_for_billing().await,
+            ),
+        ] {
+            let entry = ctx
+                .nodes
+                .get(stage)
+                .unwrap_or_else(|| panic!("{stage}: missing ctx.nodes entry after process()"))
+                .clone();
+            nodes.insert(stage.to_string(), entry);
+        }
+        let combined = ctx_with(nodes, HashMap::new());
+
+        let total = total_cost_usd(&combined, &COST_BEARING_STAGES);
+        assert!(
+            total > 0.0,
+            "total_cost_usd must be non-zero over a context produced by the wrappers \
+             themselves, got {total}"
+        );
+
+        for stage in COST_BEARING_STAGES {
+            assert!(
+                crate::workflow::node_cost_usd(&combined, stage).is_some(),
+                "{stage}: node_cost_usd must yield Some(_) so BudgetLedger::record receives \
+                 a cost and Budget::max_cost_usd is reachable"
+            );
+        }
+    }
 }

@@ -874,6 +874,204 @@ mod tests {
         assert_eq!(run.error.as_deref(), Some("boom"));
     }
 
+    // --- EN.14.C task 3: billed-session-survives-wrapper-failure, at the
+    // `node_context` dispatch choke point itself -------------------------
+    //
+    // These fixtures mimic the real wrapper shape EN.14.C task 2 wired up
+    // (`crate::sessions::append_session` from an "inner step", then a
+    // post-billed-call `Err` carrying the delta via `NodeError::with_sessions`
+    // / `crate::workflows::sessions_since`) without depending on any
+    // `sdlc_flow` types — proving the fix lives at the `node_context` site
+    // itself, not merely in one wrapper's plumbing.
+
+    /// Appends one known [`crate::sessions::ClaudeSession`] to `ctx.metadata`
+    /// (standing in for a billed inner `ClaudeCodeStep` call), then fails —
+    /// carrying exactly the delta since its own baseline, the same pattern
+    /// `TriageTaskNode` etc. use post-EN.14.C.
+    struct AppendsSessionThenFailsNode {
+        session: crate::sessions::ClaudeSession,
+    }
+
+    #[async_trait::async_trait]
+    impl Node for AppendsSessionThenFailsNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            let baseline = crate::workflows::session_baseline(&ctx);
+            crate::sessions::append_session(&mut ctx.metadata, self.session.clone());
+            Err(NodeError::new("wrapper failed after billed call")
+                .with_sessions(crate::workflows::sessions_since(&ctx, baseline)))
+        }
+
+        fn name(&self) -> &str {
+            "AppendsSessionThenFailsNode"
+        }
+    }
+
+    /// Fails without ever calling an inner step — no session appended, no
+    /// session carried. The negative-direction twin of
+    /// [`AppendsSessionThenFailsNode`].
+    struct FailsWithoutBillingNode;
+
+    #[async_trait::async_trait]
+    impl Node for FailsWithoutBillingNode {
+        async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            Err(NodeError::new("failed before any billed call"))
+        }
+
+        fn name(&self) -> &str {
+            "FailsWithoutBillingNode"
+        }
+    }
+
+    fn sample_session(node: &str, session_id: &str) -> crate::sessions::ClaudeSession {
+        crate::sessions::ClaudeSession {
+            node: node.to_string(),
+            session_id: Some(session_id.to_string()),
+            ok: true,
+            cost_usd: 1.25,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+
+    /// POSITIVE: a billed session appended by an "inner step" survives a
+    /// wrapper-level `Err`, driven through `node_context` itself — not
+    /// asserted on the bare `NodeError`, which is the point of the block
+    /// (the entry must survive the context discard `node_context` performs
+    /// on its `Err` branch).
+    #[tokio::test]
+    async fn node_context_retains_a_billed_session_across_a_wrapper_failure() {
+        let node = AppendsSessionThenFailsNode {
+            session: sample_session("AppendsSessionThenFailsNode", "sess-survives"),
+        };
+        let ctx = empty_context();
+        let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
+
+        assert!(failed);
+        let ledger = crate::sessions::read_sessions(&out.metadata);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].session_id.as_deref(), Some("sess-survives"));
+    }
+
+    /// NEGATIVE (required alongside the positive — a test that only asserts
+    /// presence would still pass a fix that unconditionally invents an
+    /// entry): a dispatch that appends nothing and fails leaves the ledger
+    /// byte-identical (empty) to the pre-call ledger.
+    #[tokio::test]
+    async fn node_context_leaves_ledger_untouched_when_a_failure_billed_nothing() {
+        let node = FailsWithoutBillingNode;
+        let ctx = empty_context();
+        assert!(crate::sessions::read_sessions(&ctx.metadata).is_empty());
+        let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
+
+        assert!(failed);
+        assert!(crate::sessions::read_sessions(&out.metadata).is_empty());
+    }
+
+    /// DUPLICATION GUARD: a ledger that already carries a prior entry, plus
+    /// one new billed-then-failed entry, must end at exactly two — the prior
+    /// entry replayed once (by `node_context`'s pre-call snapshot, which
+    /// already contains it) and the new delta appended once. A fix that
+    /// attached the whole ledger (instead of the delta since baseline) would
+    /// double the prior entry here, inflating reported spend — the exact
+    /// hazard `sessions_since`'s doc comment names.
+    #[tokio::test]
+    async fn node_context_appends_exactly_one_delta_entry_not_the_whole_ledger() {
+        let node = AppendsSessionThenFailsNode {
+            session: sample_session("AppendsSessionThenFailsNode", "sess-new"),
+        };
+        let mut ctx = empty_context();
+        crate::sessions::append_session(
+            &mut ctx.metadata,
+            sample_session("EarlierNode", "sess-earlier"),
+        );
+        let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
+
+        assert!(failed);
+        let ledger = crate::sessions::read_sessions(&out.metadata);
+        assert_eq!(ledger.len(), 2, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].session_id.as_deref(), Some("sess-earlier"));
+        assert_eq!(ledger[1].session_id.as_deref(), Some("sess-new"));
+    }
+
+    /// SUCCESS-PATH STABILITY: a passing dispatch produces the same ledger
+    /// it did before this block — `node_context`'s `Ok` branch is untouched
+    /// by EN.14.C, so a session appended on the success path (by
+    /// `SuccessNode` itself here, standing in for an inner `ClaudeCodeStep`)
+    /// is exactly what comes back, with no replay/delta logic in play at
+    /// all.
+    #[tokio::test]
+    async fn node_context_success_path_ledger_is_unchanged_by_this_block() {
+        let node = SuccessNode;
+        let mut ctx = empty_context();
+        crate::sessions::append_session(
+            &mut ctx.metadata,
+            sample_session("SuccessNode", "sess-ok"),
+        );
+        let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
+
+        assert!(!failed);
+        let ledger = crate::sessions::read_sessions(&out.metadata);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].session_id.as_deref(), Some("sess-ok"));
+    }
+
+    /// SHOWN CAPABLE OF FAILING (carryover `gate-scope-must-be-shown-capable-
+    /// of-failing`): asserted here structurally rather than by literally
+    /// reverting source, since this is the framework site itself — a node
+    /// that fails WITHOUT ever calling `.with_sessions(..)` (the exact shape
+    /// a reverted wrapper site would produce) must NOT retain the session it
+    /// billed, proving `node_context`'s replay is driven by `err.sessions`
+    /// and not by some blanket carry-forward that would mask a wrapper
+    /// regressing back to a bare `NodeError::new`.
+    struct AppendsSessionThenFailsWithoutCarryingItNode {
+        session: crate::sessions::ClaudeSession,
+    }
+
+    #[async_trait::async_trait]
+    impl Node for AppendsSessionThenFailsWithoutCarryingItNode {
+        async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            crate::sessions::append_session(&mut ctx.metadata, self.session.clone());
+            // Deliberately a bare `NodeError::new` — the pre-EN.14.C shape —
+            // to prove the ledger is lost without `.with_sessions(..)`.
+            Err(NodeError::new(
+                "wrapper failed and forgot to carry sessions",
+            ))
+        }
+
+        fn name(&self) -> &str {
+            "AppendsSessionThenFailsWithoutCarryingItNode"
+        }
+    }
+
+    #[tokio::test]
+    async fn node_context_drops_a_billed_session_when_the_wrapper_never_carries_it() {
+        let node = AppendsSessionThenFailsWithoutCarryingItNode {
+            session: sample_session("X", "sess-lost"),
+        };
+        let ctx = empty_context();
+        let mut on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+        let (out, failed) = node_context(&node, ctx, &mut on_progress).await;
+
+        assert!(failed);
+        assert!(
+            crate::sessions::read_sessions(&out.metadata).is_empty(),
+            "a bare NodeError::new with no .with_sessions(..) must NOT retain \
+             the billed session — this is what task 2's fix at the real \
+             wrapper sites prevents by attaching sessions_since(..) instead"
+        );
+    }
+
     #[tokio::test]
     async fn run_seeds_all_nodes_pending_before_first_run() {
         let mut registry = NodeRegistry::new();

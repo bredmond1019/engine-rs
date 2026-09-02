@@ -206,13 +206,57 @@ def check_date_fields(path: str, data) -> int:
     return fail
 
 
+def _in_code_fence_mask(lines):
+    """True for every line inside (or marking) a ``` fenced code block.
+
+    A `---` inside a fence is an ILLUSTRATIVE EXAMPLE — e.g. the OKF sample in standing
+    rule 6 of the brain root's own CLAUDE.md — never a real frontmatter fence. Mirrors
+    base-template/scripts/check_frontmatter_presence.py's mask of the same name so this
+    parse gate and the presence gate it delegates to agree on what a fence is.
+    """
+    mask = [False] * len(lines)
+    in_fence = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            mask[i] = True
+            in_fence = not in_fence
+            continue
+        mask[i] = in_fence
+    return mask
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("check_frontmatter.py: missing <path> argument", file=sys.stderr)
         return 0  # non-fatal: never block a commit on a checker misuse
 
     path = sys.argv[1]
+    if sys.stdin.isatty():
+        print(
+            f"check_frontmatter.py: {path}: no content on stdin (stdin is a terminal)",
+            file=sys.stderr,
+        )
+        print(
+            "  fix: this checker reads the file's content on STDIN — "
+            f"`git show :{path} | python3 hooks/check_frontmatter.py {path}`. "
+            "Passing the path alone checks nothing and used to exit 0 (a vacuous pass).",
+            file=sys.stderr,
+        )
+        return 1
     content = sys.stdin.read()
+    if not content.strip():
+        print(
+            f"check_frontmatter.py: {path}: empty content on stdin — nothing to check",
+            file=sys.stderr,
+        )
+        print(
+            "  fix: pipe the content in — "
+            f"`git show :{path} | python3 hooks/check_frontmatter.py {path}`. "
+            "If the file really is empty, it carries no OKF frontmatter and should not "
+            "be committed into the corpus.",
+            file=sys.stderr,
+        )
+        return 1
     lines = content.splitlines()
 
     if not lines or lines[0].strip() != "---":
@@ -221,9 +265,13 @@ def main() -> int:
         # parse gate's; delegate instead of punting to a check that doesn't exist.
         return _presence_check(path, content)
 
+    # Skip ``` fenced regions when hunting for the CLOSING fence: an unterminated
+    # frontmatter block whose file later contains a fenced OKF example would otherwise
+    # take the example's `---` as its terminator and parse prose as YAML.
+    in_code = _in_code_fence_mask(lines)
     end = None
     for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
+        if not in_code[i] and lines[i].strip() == "---":
             end = i
             break
     if end is None:

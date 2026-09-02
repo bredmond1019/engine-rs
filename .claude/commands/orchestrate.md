@@ -388,6 +388,12 @@ runs longer than that, re-register periodically as a heartbeat (`... register --
 SAME agent refreshes `started_at` on the existing entry in place rather than consuming a second
 slot.
 
+**The old release → register → re-take workaround is superseded by this heartbeat.** Before the entry
+was keyed on `--agent`, refreshing a long-running heavy lane's slot meant `release` followed by a
+fresh `register` — which really did give the slot up and let another lane claim it mid-chain. Do
+not do that any more: repeat the `register` in place. (The *repo lease* release/drain/re-take at
+the block boundary in rule 10 and step 10 is a different mechanism and is still required.)
+
 **The lane MUST release its slot on exit** — success, failure, or abandonment — with
 `... release --repo <name> --agent <this lane's agent identity>` when the heavy repo's chain
 finishes. A stale entry (one past the TTL,
@@ -416,7 +422,12 @@ Invoke the workflow **in this session**:
 - `sdlc-flow <spec-slug> --auto-merge [--worktree]` — prefer `--auto-merge` in a chain so an open
   PR does not block the next block. Drop it when the change deserves a look first.
 
-It returns a task ID immediately. **Now go back to step 4 for the next un-specced blocks** and keep
+It returns a task ID immediately. **Check the script path in the launch result before going on** —
+the `Workflow` tool inherits the session cwd, so an engine launched from the wrong tree silently
+runs against another repo's `.claude/workflows/`. The path must name the repo you intend to drive;
+if it does not, stop the launch rather than letting the engine proceed.
+
+**Now go back to step 4 for the next un-specced blocks** and keep
 generating specs until either the notification arrives or you are out of blocks to prepare.
 
 ### 7. On the completion notification

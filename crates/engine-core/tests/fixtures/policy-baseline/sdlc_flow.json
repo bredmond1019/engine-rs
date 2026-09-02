@@ -1,0 +1,40 @@
+{
+  "llm_triage": false,
+  "local": {
+    "constrained_json": false,
+    "endpoint": "http://localhost:11434",
+    "model": "qwen2.5-coder:7b"
+  },
+  "max_attempts": 3,
+  "max_review_attempts": 3,
+  "model_tiers": {
+    "docs": "sonnet",
+    "generate": "opus",
+    "implement": "sonnet",
+    "implement_simple": "sonnet",
+    "review": "sonnet",
+    "triage": "sonnet"
+  },
+  "output_verbosity": "normal",
+  "prompt_cache": false,
+  "retry_feedback": {
+    "enabled": true,
+    "max_chars": 4000
+  },
+  "review_diff_max_chars": 120000,
+  "review_mode": "per_task",
+  "review_skip_max_diff_lines": 40,
+  "review_skip_max_files": 2,
+  "test_depth": "full",
+  "timeouts": {
+    "docs": null,
+    "generate": null,
+    "implement": null,
+    "review": null,
+    "triage": null
+  },
+  "transport_retry": {
+    "initial_backoff_ms": 200,
+    "max_attempts": 3
+  }
+}

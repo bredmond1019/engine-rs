@@ -81,9 +81,10 @@ pub struct ClaudeSession {
 ///
 /// # No de-duplication, deliberately
 ///
-/// Called exactly once per invocation, at the point the CLI call returns. Nothing replays it: a
-/// resumed run rehydrates the ledger array as data and carries it forward — it does not re-append
-/// the entries already in it. So there is no duplicate to suppress.
+/// Called exactly once per invocation, at the point the CLI call returns. Nothing replays it: on
+/// the resume path, [`seed_sessions`] rehydrates the committed ledger as data before any new
+/// invocation appends to it — it does not re-append the entries already in it. So there is no
+/// duplicate to suppress.
 ///
 /// An earlier revision deduped, first by `session_id` and then by whole-entry equality. Both are
 /// wrong now that entries carry money. Two invocations can legitimately be identical in every
@@ -102,6 +103,24 @@ pub fn append_session(metadata: &mut Value, session: ClaudeSession) {
         Some(Value::Array(entries)) => entries.push(serde_json::json!(session)),
         _ => metadata[SESSIONS_METADATA_KEY] = serde_json::json!([session]),
     }
+}
+
+/// Seed `metadata`'s ledger from a committed set of entries, replacing whatever is there.
+///
+/// # Replace, not extend
+///
+/// The only caller is the resume path, which runs exactly once, before any invocation of this
+/// run has appended anything. An extend would be a silent double-count if that assumption ever
+/// broke — replaying the committed entries on top of themselves; a replace is idempotent no
+/// matter how many times it is called. Creates the metadata object if it is not one, the same
+/// defensive shape [`append_session`] already uses. A no-op for an empty vec is fine and expected
+/// (a fresh run's state file has no ledger, or an empty one).
+pub fn seed_sessions(metadata: &mut Value, sessions: Vec<ClaudeSession>) {
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+
+    metadata[SESSIONS_METADATA_KEY] = serde_json::json!(sessions);
 }
 
 /// Read back the ledger in order. Returns an empty vec for absent, non-array, or non-object
@@ -236,6 +255,42 @@ mod tests {
         assert!(read_session_ids(&meta).is_empty());
         assert_eq!(ledger_totals(&meta).invocations, 1);
         assert!((ledger_totals(&meta).cost_usd - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn seed_sessions_round_trips_through_read_sessions() {
+        let mut meta = serde_json::json!({});
+        let seeded = vec![
+            session("Implement", Some("s1"), true, 1.0),
+            session("Test", Some("s2"), false, 2.0),
+        ];
+        seed_sessions(&mut meta, seeded.clone());
+
+        assert_eq!(read_sessions(&meta), seeded);
+    }
+
+    #[test]
+    fn seed_sessions_replaces_rather_than_extends() {
+        let mut meta = serde_json::json!({});
+        append_session(&mut meta, session("Implement", Some("old"), true, 9.0));
+
+        seed_sessions(&mut meta, vec![session("Implement", Some("s1"), true, 1.0)]);
+
+        assert_eq!(read_session_ids(&meta), vec!["s1"]);
+    }
+
+    #[test]
+    fn seed_sessions_creates_metadata_object_when_absent_or_non_object() {
+        let mut meta = serde_json::json!("not an object");
+        seed_sessions(&mut meta, vec![session("Implement", Some("s1"), true, 0.1)]);
+        assert_eq!(read_session_ids(&meta), vec!["s1"]);
+    }
+
+    #[test]
+    fn seed_sessions_with_empty_vec_is_a_noop_shaped_write() {
+        let mut meta = serde_json::json!({});
+        seed_sessions(&mut meta, vec![]);
+        assert!(read_sessions(&meta).is_empty());
     }
 
     #[test]

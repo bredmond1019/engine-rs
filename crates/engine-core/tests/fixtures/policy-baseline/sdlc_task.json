@@ -1,0 +1,30 @@
+{
+  "llm_triage": false,
+  "local": {
+    "constrained_json": false,
+    "endpoint": "http://localhost:11434",
+    "model": "qwen2.5-coder:7b"
+  },
+  "max_attempts": 3,
+  "model_tiers": {
+    "generate": "opus",
+    "implement": "sonnet",
+    "triage": "sonnet"
+  },
+  "output_verbosity": "normal",
+  "prompt_cache": false,
+  "retry_feedback": {
+    "enabled": true,
+    "max_chars": 4000
+  },
+  "test_depth": "full",
+  "timeouts": {
+    "generate": null,
+    "implement": null,
+    "triage": null
+  },
+  "transport_retry": {
+    "initial_backoff_ms": 200,
+    "max_attempts": 3
+  }
+}

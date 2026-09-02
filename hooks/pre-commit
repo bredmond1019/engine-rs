@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# pre-commit — author-time OKF frontmatter YAML gate.
+# pre-commit — two independent author-time gates, run back to back:
+#   Gate 1: OKF frontmatter YAML parse gate (staged .md files only).
+#   Gate 2: corpus graph/structure delta gate (whole corpus, every commit).
+#
+# --- Gate 1: OKF frontmatter YAML parse gate -------------------------------------------
 #
 # Why this exists: a `: ` (colon-space), unquoted `#`, or an em-dash clause inside an
 # unquoted plain scalar in OKF frontmatter (typically `description:`/`title:`) breaks
@@ -12,56 +16,108 @@
 # planning/state.json carryover `okf-frontmatter-unquoted-colon-trap`) after already
 # being fixed once and re-filed as a systemic gate a day earlier
 # (core/_planning/orchestrator/state.json carryover
-# `frontmatter-colon-parse-failures-recur-fleet-wide`). This hook is that gate: catch it
-# at commit time, before it ever reaches validate-brain.
+# `frontmatter-colon-parse-failures-recur-fleet-wide`). This gate catches it at commit
+# time, before it ever reaches validate-brain.
 #
 # Scope: staged .md files only, checked against their STAGED content (`git show :<path>`),
 # not the working tree — so this reflects exactly what is about to be committed, and is
 # immune to unrelated unstaged edits sitting in the same file.
 #
 # Degrades gracefully, same spirit as hooks/post-commit and hooks/pre-push:
-#   - no staged .md files                    -> exit 0, silent
-#   - python3 not on PATH                    -> exit 0, warning only
-#   - PyYAML not importable                  -> exit 0, warning only
-#   - hooks/check_frontmatter.py missing     -> exit 0, warning only
+#   - no staged .md files                    -> gate 1 skipped, silent
+#   - python3 not on PATH                    -> gate 1 skipped, warning only
+#   - PyYAML not importable                  -> gate 1 skipped, warning only
+#   - hooks/check_frontmatter.py missing     -> gate 1 skipped, warning only
 # The checker itself never blocks a commit by failing to run — only a real YAML parse
 # error in a staged file's frontmatter does.
+#
+# --- Gate 2: corpus graph/structure delta gate ------------------------------------------
+#
+# Why this exists: a wrong doc_id or a missing cross-repo prefix in a `related:` list, or
+# an index.md row pointing at a file that no longer exists, was previously caught only at
+# PUSH time (hooks/pre-push stage 1, or preflight.sh) — often a whole session later than
+# the edit that caused it, discovered only when a push is blocked. This gate runs the same
+# two cheap `bastion validate-brain` flags (--graph ~1s, --structure ~1s; --links/--state
+# are deliberately left at push time — --links alone costs ~11s, too slow to pay on every
+# commit) at commit time instead, via the shared hooks/validate_brain_gate.sh (see its
+# header for the full new-errors-only attribution rule this reuses from pre-push's stage 1
+# — it blocks only the commit that actually introduces a new corpus error, never a commit
+# for a pre-existing problem someone else left unresolved).
+#
+# Unconditional — unlike gate 1, this does NOT skip when no .md file is staged. A commit
+# that only touches planning/state.json (the common case for `emit_state_write.sh`, since
+# every sub-repo's planning/ is a symlink into this HQ git — CLAUDE.md standing rule 10)
+# still deserves the check: validate-brain always scores the WHOLE corpus regardless of
+# what this commit touched, because the errors worth catching are relational (a change in
+# one file can dangle a `related:` edge or index.md row in another, untouched file).
+#
+# Degrades gracefully, same spirit as gate 1 and hooks/pre-push:
+#   - no brain.toml found walking up          -> gate 2 skipped, notice only
+#   - `bastion` not on PATH                   -> gate 2 skipped, warning only
+#   - hooks/validate_brain_gate.sh missing    -> gate 2 skipped, warning only
 #
 set -uo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-
-staged="$(git diff --cached --name-only --diff-filter=ACM -- '*.md')"
-[ -z "$staged" ] && exit 0
-
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "pre-commit: warning: 'python3' not found on PATH — skipping frontmatter YAML gate." >&2
-  exit 0
-fi
-
-if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  echo "pre-commit: warning: PyYAML not importable — skipping frontmatter YAML gate." >&2
-  exit 0
-fi
-
-checker="$repo_root/hooks/check_frontmatter.py"
-if [ ! -f "$checker" ]; then
-  echo "pre-commit: warning: $checker not found — skipping frontmatter YAML gate." >&2
-  exit 0
-fi
-
 fail=0
-while IFS= read -r f; do
-  [ -z "$f" ] && continue
-  # Staged blob content, not the working tree — reflects exactly what will be committed.
-  if ! git show ":$f" 2>/dev/null | python3 "$checker" "$f"; then
+
+# --- Gate 1: OKF frontmatter YAML parse gate --------------------------------------------
+staged="$(git diff --cached --name-only --diff-filter=ACM -- '*.md')"
+if [ -n "$staged" ]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-commit: warning: 'python3' not found on PATH — skipping frontmatter YAML gate." >&2
+  elif ! python3 -c "import yaml" >/dev/null 2>&1; then
+    echo "pre-commit: warning: PyYAML not importable — skipping frontmatter YAML gate." >&2
+  else
+    checker="$repo_root/hooks/check_frontmatter.py"
+    if [ ! -f "$checker" ]; then
+      echo "pre-commit: warning: $checker not found — skipping frontmatter YAML gate." >&2
+    else
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        # Staged blob content, not the working tree — reflects exactly what will be committed.
+        if ! git show ":$f" 2>/dev/null | python3 "$checker" "$f"; then
+          fail=1
+        fi
+      done <<< "$staged"
+      if [ "$fail" -ne 0 ]; then
+        echo "" >&2
+        echo "pre-commit: BLOCKED (gate 1) — malformed YAML frontmatter (see above)." >&2
+        echo "" >&2
+      fi
+    fi
+  fi
+fi
+
+# --- Gate 2: corpus graph/structure delta gate ------------------------------------------
+# DISABLED BY DEFAULT since 2026-09-01, at the operator's request, until corpus graph
+# validation has a better home than author time. Set BRAIN_GRAPH_GATE=1 to re-enable.
+#
+# Why it was switched off rather than deleted: the gate scores the WHOLE corpus, and the
+# corpus is one shared vault written by several concurrent sessions. So it blocks your
+# commit on a file you did not touch and cannot safely fix -- measured 2026-09-01, a
+# commit scoped to core/_planning/mev/ was blocked by an untracked sequence.md another
+# session had written 40 minutes earlier and had not yet given an index.md row. The only
+# available moves were to race that session's index edit or to pass --no-verify, and the
+# gate's value does not survive being routinely bypassed.
+#
+# The machinery below, hooks/validate_brain_gate.sh, and its test cases all stay live and
+# tested (the suite sets BRAIN_GRAPH_GATE=1) so re-enabling is one env var, not a rewrite.
+# The delta-attribution logic it depends on is unchanged and still used by hooks/pre-push.
+gate_script="$repo_root/hooks/validate_brain_gate.sh"
+if [ "${BRAIN_GRAPH_GATE:-0}" != "1" ]; then
+  : # gate 2 off by default; see the note above
+elif [ -f "$gate_script" ]; then
+  # shellcheck source=hooks/validate_brain_gate.sh
+  source "$gate_script"
+  if ! run_validate_brain_gate "pre-commit" --graph --structure; then
     fail=1
   fi
-done <<< "$staged"
+else
+  echo "pre-commit: warning: $gate_script not found — skipping corpus graph/structure gate." >&2
+fi
 
 if [ "$fail" -ne 0 ]; then
-  echo "" >&2
-  echo "pre-commit: BLOCKED — malformed YAML frontmatter (see above)." >&2
   echo "pre-commit: bypass with 'git commit --no-verify' if you must." >&2
   echo "" >&2
   exit 1

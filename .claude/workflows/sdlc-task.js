@@ -661,6 +661,19 @@ Target:
 
 3. Execute methodically with Read/Edit/Write/Bash (all paths resolve from the ${runRootLabel}).
 
+3a. STAY INSIDE THIS TASK'S OWN FILES — and NEVER revert a path you did not author. You may read
+   anything in the repo. You may create/edit/delete only the paths in this task's "files" (plus what
+   those changes directly require, e.g. a new test's fixture). You may NEVER restore, revert,
+   discard, or overwrite a path outside that set: no \`${GIT} checkout -- <path>\`, no
+   \`${GIT} restore <path>\`, no \`${GIT} reset\`, no \`${GIT} stash\`, no \`${GIT} clean\`, and no
+   reverting a file to an earlier revision to "undo" an unrelated change you noticed. This is
+   absolute, not tidiness: several agent lanes run concurrently in this fleet, some against the same
+   working tree, and every repo's planning/ directory is tracked by one shared git repo — so a stray
+   \`${GIT} checkout -- <path>\` silently and IRRECOVERABLY destroys another live session's
+   uncommitted work, with no reflog entry to recover from because those bytes were never committed.
+   If a file outside your files[] looks wrong, is uncommitted, or appears to block this task, STOP:
+   leave it exactly as it is and say so in notes. Do not fix it, do not revert it, do not stage it.
+
 4. Follow every CLAUDE.md standing rule; add/update tests for new code/logic; verify any model ids /
    package names via the claude-api skill — never from memory.
 
@@ -2568,6 +2581,14 @@ Target:
      This run's own tally — ${passedTasks.length} of ${taskList.length} selected this run — is only a
      SLICE. Never use that slice alone as "how many tasks are done" anywhere you write a count; use the
      cumulative count you just derived from the file.
+   - Update the spec's provenance stub, if it has one. Many specs open with "**Status:**" /
+     "**Last run:**" lines near the top. Those are AUTHORED markers, not derived — nothing else in
+     the pipeline ever refreshes them, so a run that skips this leaves a fully-executed spec still
+     reading "**Status:** Not started" (measured on \`micro-spec-large\`, which ran to completion with
+     its stub untouched). Set "**Status:**" to ${blockDone ? '"Done"' : '"In progress"'} and
+     "**Last run:**" to today's date (cd ${runDir} && date +%Y-%m-%d) plus this run's outcome
+     (e.g. "2026-01-01 — tasks ${taskList.join(', ')} passed"). If the spec carries no such stub,
+     do nothing — never invent one.
 
 3. Update planning/status.md (Edit tool, surgical). "Current focus" is APPEND-ONLY narrative — never
    delete or rewrite any existing line under it; a prior block's narrative must survive this edit

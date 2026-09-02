@@ -65,6 +65,10 @@ Find this repo's `prefix` in `brain.toml` at the brain root (e.g. `MV`). Then:
 `status.md`, or any other narrative file. Narrative files lag, and that lag is how one repo came
 to carry two unrelated "Phase 4"s. Take the highest existing phase for this repo and go up.
 
+**`state.json` alone under-counts** — a lane file can claim a phase for a block that was never
+registered, so also sweep the corpus for the prefix before allocating and take the max of both:
+`rg --follow -o '\b<PFX>\.[0-9]+\.[A-Z]\b' planning core/_planning | sort -u`.
+
 **The spec directory equals the block ID exactly** — `planning/MV.3.A/`,
 `planning/MV.ticket.fix-null-deref/`. No title suffix, ever. `/plan` does not create it;
 `/generate-tasks` does, later. `/ticket` and `/chore` create it at author time because they
@@ -81,8 +85,19 @@ a block ends up blocked for days with nothing saying why.
 review only they can give. If yes, add to `depends_on`:
 
 ```json
-{"type": "operator", "slug": "operator-<kebab>", "exit": "<the artifact whose existence ends the gate>", "start": "<paste-ready command>"}
+{"type": "operator", "slug": "<kebab>", "exit": "<the artifact whose existence ends the gate>", "start": "<paste-ready command>"}
 ```
+
+**The slug is BARE kebab-case — no `operator-` prefix.** `mev` renders the edge as `OP.<slug>`
+(D76, `docs/state/state-schema.md`), so `operator-mac-mini-visit` stutters into
+`OP.operator-mac-mini-visit` and raises `W_STATE_OP_SLUG_STUTTER`; fix an existing one with
+`mev normalize-op-slugs --write`. This example used to carry the prefix and contradicted the
+schema doc — measured 2026-09-01, 9 of the fleet's 13 operator/approval slugs still carry it.
+
+**Do not confuse this with `held_until`.** `lane.schema.json`'s `held_until` field *does* take an
+`operator-`-prefixed token (`"held_until": "operator-mac-mini-visit"`) — that prefix is what
+distinguishes an operator-gate slug from a block ID in a single string field. Two fields, two
+conventions, both correct: bare in a `depends_on` slug, prefixed in `held_until`.
 
 `exit` names an **artifact**, never a description of the work — "the signed cert is at
 `certs/prod.pem`", not "operator decides on certs". An operator edge inherits the effective
@@ -139,6 +154,21 @@ reintroduced by the next piece of work.
 If this block is being filed **to resolve** a carryover, set
 `"origin": {"type": "carryover", "slug": "<carryover-slug>"}` on the block record so the loop
 visibly closes.
+
+**Then re-check that carryover's `clears_when` against the state you just wrote.** A predicate that
+observes *registration* rather than *completion* is satisfied by the act of filing the block, while
+none of the work has been done — the entry retires itself on its first `mev carryover` sweep and
+the finding goes dark. Measured 2026-09-01: the carryover
+`ctx-nodes-work-is-sequenced-into-en-14-a-through-j` was predicated on `file_contains "EN.14.A"` in
+`state.json`. Filing the twelve blocks satisfied it immediately and
+`W_STATE_CARRYOVER_ALREADY_SATISFIED` fired on the spot.
+
+The tell is that the predicate names a block ID, a spec path, or anything else the registration
+itself creates. **Re-predicate it — typically to `block_closed` on the LAST block of the chain the
+carryover was sequenced into — never delete it.** Deleting loses the finding; the entry exists
+because something is still true. This is the same rule as "never author a typed `clears_when` that
+is already satisfied" (standing rule 8), reached from the other direction: there, the predicate was
+born satisfied; here, your own registration satisfies it a second later.
 
 ---
 
@@ -242,10 +272,30 @@ ticket, `"Chores"` for a chore — and add an entry to its `blocks[]` if one doe
   pre-existing blocks already missing the value are reported, not blocking — do not go backfilling
   them because you saw the error on an unrelated registration.
 - `model` — the block's choice.
-- `wave` — for a roadmap block, `10 * <phase>`. For a ticket or chore, the next multiple of ten
-  past this repo's highest existing wave, so one-offs queue behind roadmap work and stay on the
-  same lattice. Ask before assigning an earlier wave. **Do not use `max + 1`** — that lands
-  inside the lattice and silently interleaves chores with roadmap phases.
+- `wave` — **read the owning repo's own observed convention out of its `state.json`; do not
+  compute it.** Find the phase track nearest yours and continue its run. Then **assert the waves
+  you chose are unused in that repo before writing them.**
+
+  ```bash
+  python3 - <<'PYEOF'
+  import json
+  st = json.load(open("planning/state.json"))
+  used = sorted({b.get("wave") for t in st.get("tracks", []) for b in t.get("blocks", [])
+                 if b.get("wave") is not None})
+  print("waves in use:", used)
+  PYEOF
+  ```
+
+  `10 * <phase>` is the **fallback for a repo with no established pattern**, not the rule. It was
+  stated here as the rule and caused two real collisions on 2026-09-01: it holds for bastion
+  (phase 23 -> 230) and the brain (phase 9 -> 90), but engine-rs's phase 12 sits at waves
+  **186–198**, and its `10 * 14 = 140` is already occupied by an unrelated track. Following the
+  stated rule collided at 200 (engine-rs) and 240 (bastion).
+
+  For a ticket or chore, the next multiple of ten past this repo's highest existing wave, so
+  one-offs queue behind roadmap work and stay on the same lattice. Ask before assigning an earlier
+  wave. **Do not use `max + 1`** — that lands inside the lattice and silently interleaves chores
+  with roadmap phases.
 - `depends_on` — the edges from Step 2. Omit or `[]` when there are none. Never encode the
   implicit phase-sequential default as an edge; `wave` already expresses it.
 - `created` — today, `YYYY-MM-DD`.
@@ -369,6 +419,22 @@ edge blocks it for the length of the run.
 **Re-derive each half's edges from what that half actually needs**, rather than copying the
 original row's. Two blocks tracing to the same source row with identical `depends_on` sets is the
 signature — treat it as unverified until both have been re-derived.
+
+**State the control before you act on the signature, or it flags mostly false positives.** Two
+blocks with identical `depends_on` are only suspicious when **both halves trace back to ONE source
+row**. Identical edge sets across blocks that were always separate mean a genuinely shared
+prerequisite, which is normal and correct. And a split row is **confirmed re-derived** when the two
+halves' edge sets **differ** — that difference is the evidence the re-derivation happened.
+
+Measured 2026-09-01: the raw signature flagged three groups on a 12-block initiative and **all three
+were false positives** — shared prerequisites, not inherited edges. The genuinely split row passed,
+visibly: `HQ.10.A` depends on `EN.14.E` and `HQ.10.B` on `EN.14.I`. So:
+
+| What you see | Verdict |
+|---|---|
+| Two halves of one source row, edge sets **differ** | Re-derived. Done. |
+| Two halves of one source row, edge sets **identical** | Unverified — re-derive both, or state why the shared edge is right for each |
+| Two blocks from **different** source rows, identical edge sets | Not a finding. A shared prerequisite |
 
 ### C4 — A sizing flag is a decision owed, not a note
 

@@ -353,7 +353,7 @@ mod tests {
     use futures::FutureExt;
     use serde_json::json;
 
-    use super::super::policy::{ModelTier, ModelTiers, OutputVerbosity};
+    use super::super::policy::{ContentPipelineModelTiers, ModelTier, OutputVerbosity};
     use super::*;
 
     fn translated_json() -> serde_json::Value {
@@ -591,7 +591,7 @@ mod tests {
         let policy = ContentPipelinePolicy {
             output_verbosity: OutputVerbosity::Terse,
             prompt_cache: true,
-            model_tiers: ModelTiers {
+            model_tiers: ContentPipelineModelTiers {
                 translate: ModelTier::Opus,
                 ..ContentPipelinePolicy::default().model_tiers
             },

@@ -32,7 +32,16 @@ ID_RE = re.compile(r"^[A-Z]{2,4}\.(?:\d+[A-Z]?|ticket|chore)\.[A-Za-z0-9][A-Za-z
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 DIGEST_RE = re.compile(r"^[a-z0-9]+:[0-9a-f]+$")
-OPERATOR_SLUG_RE = re.compile(r"^operator-[a-z0-9][a-z0-9-]*$")
+# An operator/approval edge is cited in prose as `OP.<slug>` (D76, docs/state/state-schema.md
+# ~line 89), so the slug is authored BARE kebab-case. A redundant `operator-` prefix stutters into
+# `OP.operator-foo` and mev raises W_STATE_OP_SLUG_STUTTER on it (fix: `mev normalize-op-slugs
+# --write`). This checker used to REQUIRE the prefix, i.e. it enforced the stutter -- measured
+# 2026-09-01, 9 of the fleet's 13 operator/approval slugs carry it, which is why the severity here
+# mirrors mev's exactly: a WARNING, never an error. Do not confuse this with lane.schema.json's
+# `held_until`, which DOES take an `operator-`-prefixed token -- different field, different
+# convention, both correct.
+OPERATOR_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+OPERATOR_STUTTER_RE = re.compile(r"^operator-")
 
 REQUIRED = ["id", "repo", "kind", "title", "description", "what", "why",
             "sdlc_workflow", "model", "out_of_scope",
@@ -48,6 +57,56 @@ WARN_IF_MISSING = ["files", "validation_commands"]
 KINDS = {"block", "ticket", "chore"}
 WORKFLOWS = {"none", "patch", "task", "run", "flow"}
 MODELS = {"sonnet", "gemini-pro", "gemini-flash", "either"}
+
+
+# --- brain.toml prefix resolution ---------------------------------------------------------
+# A block ID's prefix declares which repo's NAMESPACE it lives in; the `repo` field declares which
+# repo OWNS the work. When they disagree, the block is filed into another repo's namespace and
+# nothing downstream notices: check_block_naming.py reads the same [[repos]] prefixes but validates
+# SPEC DIRECTORY NAMES, so a record's repo field is out of its scope by construction. Measured
+# 2026-09-01 on the context-handling-between-nodes run: `sequence.md` filed the unattended-migration
+# -runner block as `EN.14.H` with repo `agentic-portfolio` ("filed under HQ because the files are
+# HQ's"). EN is engine-rs's prefix. An agent copying that row registers it into HQ's graph under
+# engine-rs's namespace.
+
+_PREFIX_CACHE = {}
+
+
+def load_repo_prefixes(start):
+    """prefix -> repo slug, from brain.toml's [[repos]] table, walking up from `start`.
+
+    Returns {} when no brain.toml is reachable or it cannot be read -- a standalone repo
+    scaffolded from this template has no brain, and the check simply does not apply there.
+    """
+    current = os.path.abspath(start)
+    if os.path.isfile(current):
+        current = os.path.dirname(current)
+    root = None
+    while True:
+        if os.path.exists(os.path.join(current, "brain.toml")):
+            root = current
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    if root is None:
+        return {}
+    if root in _PREFIX_CACHE:
+        return _PREFIX_CACHE[root]
+    out = {}
+    try:
+        import tomllib
+        with open(os.path.join(root, "brain.toml"), "rb") as fh:
+            data = tomllib.load(fh)
+        for entry in data.get("repos", []):
+            prefix, slug = entry.get("prefix"), entry.get("slug")
+            if prefix and slug:
+                out[prefix] = slug
+    except Exception:                              # noqa: BLE001 - report nothing, never raise
+        out = {}
+    _PREFIX_CACHE[root] = out
+    return out
 
 
 def check(path, planning_root="planning"):
@@ -83,6 +142,17 @@ def check(path, planning_root="planning"):
     bid = b.get("id", "")
     if bid and not ID_RE.match(bid):
         bad(f"id `{bid}` does not match <PFX>.<phase|ticket|chore>.<name>")
+
+    prefixes = load_repo_prefixes(planning_root)
+    if bid and prefixes:
+        pfx = bid.split(".")[0]
+        owner = prefixes.get(pfx)
+        if owner is None:
+            warn(f"id prefix `{pfx}` is not registered in brain.toml's [[repos]] table")
+        elif b.get("repo") and b["repo"] != owner:
+            bad(f"id prefix `{pfx}` is {owner}'s namespace but `repo` is `{b['repo']}` — a block "
+                f"filed under another repo's prefix registers into that repo's namespace. Renumber "
+                f"it under {b['repo']}'s own prefix, or correct `repo` to `{owner}`")
 
     stem = os.path.splitext(os.path.basename(path))[0]
     if bid and stem != bid:
@@ -172,15 +242,25 @@ def check(path, planning_root="planning"):
             for k in ("slug", "exit", "start"):
                 if not e.get(k):
                     bad(f"depends_on[{i}] operator edge needs `{k}`")
-            if e.get("slug") and not OPERATOR_SLUG_RE.match(e["slug"]):
-                bad(f"depends_on[{i}] operator slug `{e['slug']}` must be kebab-case, "
-                    f"prefixed `operator-`")
+            slug = e.get("slug")
+            if slug and OPERATOR_STUTTER_RE.match(slug):
+                warn(f"depends_on[{i}] operator slug `{slug}` carries a redundant `operator-` "
+                     f"prefix — it is cited as OP.{slug}, which stutters "
+                     f"(W_STATE_OP_SLUG_STUTTER). Fix with `mev normalize-op-slugs --write`")
+            elif slug and not OPERATOR_SLUG_RE.match(slug):
+                bad(f"depends_on[{i}] operator slug `{slug}` must be bare kebab-case "
+                    f"(no `operator-` prefix — it is rendered as OP.<slug>)")
         elif t == "approval":
             for k in ("slug", "what", "digest"):
                 if not e.get(k):
                     bad(f"depends_on[{i}] approval edge needs `{k}`")
             if e.get("digest") and not DIGEST_RE.match(e["digest"]):
                 bad(f"depends_on[{i}] digest `{e['digest']}` must be <algo>:<hex>")
+            # An approval edge is cited as OP.<slug> too, so it stutters identically.
+            if e.get("slug") and OPERATOR_STUTTER_RE.match(e["slug"]):
+                warn(f"depends_on[{i}] approval slug `{e['slug']}` carries a redundant "
+                     f"`operator-` prefix — cited as OP.{e['slug']}, which stutters "
+                     f"(W_STATE_OP_SLUG_STUTTER). Fix with `mev normalize-op-slugs --write`")
         else:
             bad(f"depends_on[{i}] unknown type `{t}`")
 

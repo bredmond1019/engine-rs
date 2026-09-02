@@ -596,6 +596,19 @@ Target:
 
 3. Execute methodically with Read/Edit/Write/Bash (all paths resolve from the ${runRootLabel}).
 
+3a. STAY INSIDE THIS TASK'S OWN FILES — and NEVER revert a path you did not author. You may read
+   anything in the repo. You may create/edit/delete only the paths in this task's "files" (plus what
+   those changes directly require, e.g. a new test's fixture). You may NEVER restore, revert,
+   discard, or overwrite a path outside that set: no \`${GIT} checkout -- <path>\`, no
+   \`${GIT} restore <path>\`, no \`${GIT} reset\`, no \`${GIT} stash\`, no \`${GIT} clean\`, and no
+   reverting a file to an earlier revision to "undo" an unrelated change you noticed. This is
+   absolute, not tidiness: several agent lanes run concurrently in this fleet, some against the same
+   working tree, and every repo's planning/ directory is tracked by one shared git repo — so a stray
+   \`${GIT} checkout -- <path>\` silently and IRRECOVERABLY destroys another live session's
+   uncommitted work, with no reflog entry to recover from because those bytes were never committed.
+   If a file outside your files[] looks wrong, is uncommitted, or appears to block this task, STOP:
+   leave it exactly as it is and say so in notes. Do not fix it, do not revert it, do not stage it.
+
 4. Follow every CLAUDE.md standing rule; add/update tests for new code/logic; verify any model ids /
    package names via the claude-api skill — never from memory.
 
@@ -3272,6 +3285,9 @@ Return via StructuredOutput: exitCode, url, number, state, isDraft.
 let mergeInfo = null
 if (autoMerge && !bailed && finalVerdict === 'PASS' && prOutcome === 'created' && !isDraft) {
   log(`--auto-merge — merging the PR and cleaning up (${useWorktree ? 'worktree' : 'branch'} mode)...`)
+  // This run's own title. On --resume the PR on the remote was opened by the earlier (bailed) run
+  // and still carries its "[BLOCKED] ..." title; the merge would otherwise land under it.
+  const mergeTitle = `${blockId}: ${passedTasks.length} task(s), review ${finalVerdict}`
   mergeInfo = await tracedAgent(`
 You complete an --auto-merge for an /sdlc-flow run. Merge the PR, ${useWorktree
     ? 'then remove the worktree and delete the branch'
@@ -3283,8 +3299,7 @@ ${useWorktree ? `Worktree: ${worktreePath}\n` : ''}PR:       ${state.pr?.number 
 Base:     ${prBase}
 Verified remote draft state at pr-verify time: ${state.pr?.draft ? 'draft' : 'not draft'}
 
-0. GitHub enforces two prerequisites the merge itself needs — wait for both BEFORE attempting the
-   merge, in this order:
+0. Three things must be settled BEFORE attempting the merge — do them in this order:
 
    a. Poll required checks until none is pending:
       gh pr checks ${state.pr?.number || state.pr?.url}; echo "EXIT:$?"
@@ -3300,6 +3315,17 @@ Verified remote draft state at pr-verify time: ${state.pr?.draft ? 'draft' : 'no
       \`gh pr view ${state.pr?.number || state.pr?.url} --json isDraft\`), mark it ready before
       merging:
       gh pr ready ${state.pr?.number || state.pr?.url}
+
+   c. Correct the PR title. The remote PR may have been opened by an earlier, bailed run of this
+      same spec (the --resume path), in which case it still carries that run's "[BLOCKED] ..."
+      title and the merge commit would land under it. Set it to THIS run's final title
+      unconditionally — the call is idempotent when the title is already correct:
+      gh pr edit ${state.pr?.number || state.pr?.url} --title "$(cat <<'EOF'
+${mergeTitle}
+EOF
+)"
+      If this errors, do NOT stop — the title is cosmetic and the merge is not. Continue to step 1
+      and record the actual error text in notes, prefixed "pr-title-fix-failed: ".
 
 1. Merge the PR via gh (delete the remote branch as part of the merge):
    gh pr merge ${state.pr?.number || state.pr?.url} --merge --delete-branch

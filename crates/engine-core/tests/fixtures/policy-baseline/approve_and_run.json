@@ -1,0 +1,5 @@
+{
+  "drain_batch_max": 60,
+  "harvest_item_priority": 0,
+  "session_fallback_slug": "harvest-review"
+}

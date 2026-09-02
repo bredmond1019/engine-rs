@@ -22,12 +22,12 @@ use crate::policy::{merge_opt, Overlay};
 
 /// Per-stage cloud model tier assignment for the two terminal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelTiers {
+pub struct ResearchAgentModelTiers {
     pub research: ModelTier,
     pub prospect: ModelTier,
 }
 
-impl Default for ModelTiers {
+impl Default for ResearchAgentModelTiers {
     /// All-Sonnet — the behavior-stable baseline.
     fn default() -> Self {
         Self {
@@ -54,7 +54,7 @@ pub enum ContactDepth {
     Deep,
 }
 
-/// Per-stage contact-acquisition policy — mirrors [`ModelTiers`]'s per-stage
+/// Per-stage contact-acquisition policy — mirrors [`ResearchAgentModelTiers`]'s per-stage
 /// shape, plus `max_fetches`, the cap on the EXTRA page loads spent on
 /// contact acquisition per run (contact acquisition costs real fetches and
 /// real latency, so it is a policy knob per `CLAUDE.md` standing rule 6, not
@@ -101,7 +101,7 @@ pub enum GroundingDepth {
     Strict,
 }
 
-/// Per-stage grounding-check depth — mirrors [`ModelTiers`]'s per-stage
+/// Per-stage grounding-check depth — mirrors [`ResearchAgentModelTiers`]'s per-stage
 /// shape. The cheapest run still flags (`cheap-fast` resolves to
 /// `standard`/`standard`, the floor, never below it); `thorough` resolves to
 /// `strict`/`strict`, the quality ceiling.
@@ -153,7 +153,7 @@ impl Default for IngressDispatch {
 pub struct ResearchAgentPolicy {
     pub output_verbosity: OutputVerbosity,
     pub prompt_cache: bool,
-    pub model_tiers: ModelTiers,
+    pub model_tiers: ResearchAgentModelTiers,
     /// Configuration for the `local` model tier — carried for API-shape
     /// parity only; neither `research` nor `prospect` ever resolves to it.
     pub local: LocalConfig,
@@ -174,7 +174,7 @@ impl Default for ResearchAgentPolicy {
         Self {
             output_verbosity: OutputVerbosity::Normal,
             prompt_cache: false,
-            model_tiers: ModelTiers::default(),
+            model_tiers: ResearchAgentModelTiers::default(),
             local: LocalConfig::default(),
             contact_enrichment: ContactEnrichment::default(),
             grounding: Grounding::default(),
@@ -183,7 +183,7 @@ impl Default for ResearchAgentPolicy {
     }
 }
 
-/// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
+/// All-optional mirror of [`ResearchAgentModelTiers`] for per-stage partial overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PartialModelTiers {
@@ -207,7 +207,10 @@ pub struct PartialResearchAgentPolicy {
     pub ingress_dispatch: Option<PartialIngressDispatch>,
 }
 
-fn merge_model_tiers(mut base: ModelTiers, over: &PartialModelTiers) -> ModelTiers {
+fn merge_model_tiers(
+    mut base: ResearchAgentModelTiers,
+    over: &PartialModelTiers,
+) -> ResearchAgentModelTiers {
     if let Some(v) = over.research {
         base.research = v;
     }

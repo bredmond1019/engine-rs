@@ -83,9 +83,9 @@ everywhere, because it does not. The full set, read from each workflow's `profil
 | `SDLC_TASK` | `baseline` · `cheap-fast` · `thorough` |
 | `RESEARCH_AGENT` | `baseline` · `cheap-fast` · `thorough` |
 | `DIAGNOSTIC_INTAKE` | `baseline` · `cheap-fast` · `thorough` · **`local-extract`** |
-| `PROPOSAL_GENERATOR` | `baseline` · **`local-judgment`** · `skip-review` |
+| `PROPOSAL_GENERATOR` | `baseline` · `cheap-fast` · `thorough` · **`local-judgment`** · `skip-review` |
 | `DELIVERABLE_RENDER` | `baseline` · `cheap-fast` · `thorough` |
-| `CONTENT_PIPELINE` | `baseline` · `fast-summarize` · **`local-drafting`** · `curated-harvest` |
+| `CONTENT_PIPELINE` | `baseline` · `cheap-fast` · `thorough` · `fast-summarize` · **`local-drafting`** · `curated-harvest` |
 | `LINKEDIN_POST` | `baseline` · `cheap-fast` · `thorough` |
 | `APPROVE_AND_RUN` | `baseline` · `cheap-fast` · `thorough` |
 

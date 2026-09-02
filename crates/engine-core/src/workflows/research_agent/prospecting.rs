@@ -605,7 +605,7 @@ mod tests {
         let policy = ResearchAgentPolicy {
             output_verbosity: super::super::policy::OutputVerbosity::Terse,
             prompt_cache: true,
-            model_tiers: super::super::policy::ModelTiers {
+            model_tiers: super::super::policy::ResearchAgentModelTiers {
                 prospect: ModelTier::Opus,
                 ..ResearchAgentPolicy::default().model_tiers
             },

@@ -70,205 +70,26 @@ set -uo pipefail
 # Consume stdin sent by git push (local_ref local_sha remote_ref remote_sha) to prevent SIGPIPE in caller
 cat >/dev/null
 
-# --- Resolve the brain root by walking up for brain.toml (stage 1 only). ----------------
-find_brain_root() {
-  local d="$1"
-  while [ "$d" != "/" ] && [ -n "$d" ]; do
-    if [ -f "$d/brain.toml" ]; then
-      printf '%s\n' "$d"
-      return 0
-    fi
-    d="$(dirname "$d")"
-  done
-  return 1
-}
-
 start_dir="$(pwd)"
 
 # =========================================================================================
-# Stage 1 — validate-brain drift gate.
+# Stage 1 — validate-brain drift gate. The delta-attribution logic (block on what THIS push
+# introduced, never the whole pre-existing backlog) lives in validate_brain_gate.sh, shared
+# with hooks/pre-commit's own (cheaper, --graph/--structure-only) use of the same mechanism.
+# See that file's header for the full attribution rationale.
 # =========================================================================================
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=hooks/validate_brain_gate.sh
+if [ -f "$hook_dir/validate_brain_gate.sh" ]; then
+  source "$hook_dir/validate_brain_gate.sh"
+fi
+
 stage1_validate_brain() {
-  local brain_root
-  brain_root="$(find_brain_root "$start_dir")"
-  if [ -z "$brain_root" ]; then
-    echo "pre-push: no brain.toml found walking up from $start_dir — skipping validate-brain gate (standalone checkout)" >&2
+  if ! command -v run_validate_brain_gate >/dev/null 2>&1; then
+    echo "pre-push: warning: $hook_dir/validate_brain_gate.sh not found — skipping validate-brain gate." >&2
     return 0
   fi
-
-  if ! command -v bastion >/dev/null 2>&1; then
-    echo "pre-push: warning: 'bastion' not found on PATH — skipping validate-brain gate. Install bastion to enable it." >&2
-    return 0
-  fi
-
-  local FLAGS=(--sync --graph --state --links --structure)
-  local total=0
-  local diagnostics=""
-
-  echo "pre-push: [stage 1/2] running validate-brain gate (${#FLAGS[@]} checks, corpus root: $brain_root)..." >&2
-
-  local flag out start_ts end_ts elapsed summary_line n
-  for flag in "${FLAGS[@]}"; do
-    printf 'pre-push:   %s ... ' "$flag" >&2
-    start_ts=$(date +%s 2>/dev/null || echo 0)
-    out="$(bastion validate-brain "$flag" </dev/null 2>&1)"
-    end_ts=$(date +%s 2>/dev/null || echo 0)
-    elapsed=$((end_ts - start_ts))
-    summary_line="$(printf '%s\n' "$out" | grep -E '^validated .*: [0-9]+ error\(s\), [0-9]+ warning\(s\)$' | tail -1)"
-    if [ -z "$summary_line" ]; then
-      echo "warning: unparseable output (${elapsed}s) — treating as 0 errors" >&2
-      continue
-    fi
-    n="$(printf '%s\n' "$summary_line" | sed -E 's/^validated .*: ([0-9]+) error\(s\).*/\1/')"
-    case "$n" in
-      ''|*[!0-9]*)
-        echo "warning: unparseable error count (${elapsed}s) — treating as 0 errors" >&2
-        continue
-        ;;
-    esac
-    echo "$summary_line (${elapsed}s)" >&2
-    total=$((total + n))
-    if [ "$n" -gt 0 ]; then
-      local flag_diagnostics
-      flag_diagnostics="$(printf '%s\n' "$out" | grep -E '^error \[' || true)"
-      [ -n "$flag_diagnostics" ] && diagnostics="${diagnostics}${flag_diagnostics}
-"
-    fi
-  done
-
-  echo "pre-push: [stage 1/2] validate-brain gate finished — $total total error(s) (baseline check next)" >&2
-
-  local baseline_file="$brain_root/hooks/validate-baseline.json"
-  local baseline=0
-  if [ -f "$baseline_file" ]; then
-    local parsed
-    parsed="$(python3 -c '
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        d = json.load(f)
-    print(int(d.get("errors", 0)))
-except Exception:
-    print(0)
-' "$baseline_file" 2>/dev/null)"
-    case "$parsed" in
-      ''|*[!0-9]*) baseline=0 ;;
-      *) baseline="$parsed" ;;
-    esac
-  fi
-
-  # --- Attribution: block on what THIS push introduced, not on the global total. -----------
-  #
-  # The baseline is corpus-wide and singular, so a bare `total > baseline` test blocks every
-  # hooked repo whenever any file anywhere is bad — including files this repo never touched,
-  # written by another session or an unattended routine. That is how a gate gets muted with
-  # --no-verify forever. Attribution fixes the fairness without narrowing what is CHECKED:
-  # the whole corpus is still validated, because the errors worth catching are relational
-  # (delete a doc in one repo, dangle a `related:` edge in another). Only the BLOCKING
-  # decision narrows, and it narrows by delta rather than by path — deleting docs/foo.md
-  # surfaces the error on bar.md, a file the push never touched, and must still block.
-  #
-  # last-good lives under .git/ deliberately: untracked, per-clone, never committed, so it
-  # cannot drift into the corpus or be shared. Absent (fresh clone) -> fall back to the
-  # tracked baseline, i.e. exactly the old behaviour.
-  #
-  # PREPUSH_STRICT=1 forces the whole-corpus test — for a deploy, a big merge, or before
-  # propagating hooks fleet-wide, when "all of it correct" is the actual question.
-  local last_good=""
-  local git_dir
-  git_dir="$(git rev-parse --git-dir 2>/dev/null || true)"
-  [ -n "$git_dir" ] && last_good="$git_dir/validate-last-good.json"
-
-  local strict="${PREPUSH_STRICT:-0}"
-
-  if [ "$strict" = "1" ]; then
-    if [ "$total" -gt "$baseline" ]; then
-      echo "" >&2
-      echo "pre-push: BLOCKED (stage 1, STRICT) — the corpus carries $total error(s) against a baseline of $baseline." >&2
-      echo "" >&2
-      [ -n "$diagnostics" ] && printf '%s' "$diagnostics" >&2
-      echo "" >&2
-      echo "pre-push: strict mode blocks on the whole-corpus total, not just what this push introduced." >&2
-      echo "pre-push: fix the error(s) above, re-run without PREPUSH_STRICT, or bypass with 'git push --no-verify'." >&2
-      echo "" >&2
-      return 1
-    fi
-    echo "pre-push: [stage 1/2] STRICT: whole corpus clean ($total error(s) vs baseline $baseline)." >&2
-  elif [ -n "$last_good" ] && [ -f "$last_good" ] && command -v python3 >/dev/null 2>&1; then
-    local introduced
-    introduced="$(printf '%s' "$diagnostics" | python3 -c '
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        known = set(json.load(f).get("errors", []))
-except Exception:
-    known = None
-current = [ln for ln in sys.stdin.read().splitlines() if ln.strip()]
-if known is None:          # unreadable last-good: say nothing, caller falls back
-    sys.exit(3)
-# dict.fromkeys dedupes while preserving order: the same diagnostic is reported once per
-# validate-brain flag that surfaces it, and printing it five times helps nobody.
-for ln in dict.fromkeys(current):
-    if ln not in known:
-        print(ln)
-' "$last_good" 2>/dev/null)"
-    local rc=$?
-    if [ "$rc" -eq 3 ]; then
-      echo "pre-push: warning: could not read $last_good — falling back to the tracked baseline." >&2
-      if [ "$total" -gt "$baseline" ]; then
-        echo "pre-push: BLOCKED (stage 1) — $total error(s) against baseline $baseline." >&2
-        [ -n "$diagnostics" ] && printf '%s' "$diagnostics" >&2
-        return 1
-      fi
-    elif [ -n "$introduced" ]; then
-      echo "" >&2
-      echo "pre-push: BLOCKED (stage 1) — this push introduces new corpus error(s):" >&2
-      echo "" >&2
-      printf '%s\n' "$introduced" >&2
-      echo "" >&2
-      echo "pre-push: these are new since this clone's last successful push. The corpus carries" >&2
-      echo "pre-push: $total error(s) in total; the rest pre-date your work and are not blocking you." >&2
-      echo "pre-push: fix the new error(s) above, or bypass this check with 'git push --no-verify'." >&2
-      echo "" >&2
-      return 1
-    else
-      if [ "$total" -gt 0 ]; then
-        echo "pre-push: [stage 1/2] no NEW errors from this push; $total pre-existing error(s) reported, not blocking." >&2
-        echo "pre-push:   (run 'PREPUSH_STRICT=1 git push' to gate on the whole corpus, or scripts/sync/validate_brain.sh to see them all)" >&2
-      fi
-    fi
-  else
-    # No last-good yet (fresh clone) or no python3: the original whole-corpus behaviour.
-    if [ "$total" -gt "$baseline" ]; then
-      echo "" >&2
-      echo "pre-push: BLOCKED (stage 1) — validate-brain error count increased." >&2
-      echo "" >&2
-      [ -n "$diagnostics" ] && printf '%s' "$diagnostics" >&2
-      echo "" >&2
-      echo "pre-push: baseline is $baseline error(s); this push would leave the corpus at $total error(s)." >&2
-      echo "pre-push: fix the new error(s) above, or bypass this check with 'git push --no-verify'." >&2
-      echo "" >&2
-      return 1
-    fi
-  fi
-
-  # Passed. Record the current error set as this clone's new high-water mark, so the next
-  # push is judged against what the corpus looked like when we last let one through.
-  if [ -n "$last_good" ] && command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$diagnostics" | python3 -c '
-import json, sys
-path = sys.argv[1]
-errors = sorted({ln for ln in sys.stdin.read().splitlines() if ln.strip()})
-try:
-    with open(path, "w") as f:
-        json.dump({"errors": errors}, f, indent=2)
-        f.write("\n")
-except OSError:
-    pass
-' "$last_good" 2>/dev/null || true
-  fi
-
-  return 0
+  run_validate_brain_gate "pre-push: [stage 1/2]" --sync --graph --state --links --structure
 }
 
 # =========================================================================================

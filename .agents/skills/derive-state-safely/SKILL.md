@@ -34,10 +34,19 @@ The hazard is the write, not the command name you typed:
 | `mev close-operator-gate <slug> --exit-verified` | verified-or-refused, **no dry-run** | yes |
 | `mev approve <slug> --digest <d>` · `mev reject <slug>` | digest-bound | yes |
 | `./scripts/sync/emit_state_write.sh` · `sync/validate_brain.sh` · `sync/routine.sh` | wrappers | yes |
+| `mev normalize-op-slugs --write` | dry-run by default | **no** (takes the emit lock only) |
 
 So `mev set-block-status mev:MV.10.A closed --write` against a stale binary regresses boards
 fleet-wide exactly as a bare `emit-state --write` would. **There is no "small" writer** — the
 one-block verb and the whole-corpus command have the same blast radius on derived surfaces.
+
+**`normalize-op-slugs --write` writes the corpus but commits nothing.** It is the one writer in the
+table that does *not* re-run `emit-state --write`, so it never goes through
+`emit_state_write.sh` and never reaches `commit_routine_updates.sh` — the script that actually
+stages and commits. It leaves its edits dirty in the working tree. After running it, commit them
+yourself (explicit pathspec, per standing rule 10) or let the next
+`./scripts/sync/emit_state_write.sh` run pick them up; otherwise they sit uncommitted until some
+other lane's unattended routine sweeps or trips over them.
 
 `mev carryover`, `frontier`, `lanes`, `conformance` and every `validate-*` verb are read-only and
 exempt. `mev carryover --dispose` (`MV.ticket.carryover-dispose`) is **not** — add it to the table

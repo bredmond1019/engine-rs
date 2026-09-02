@@ -23,6 +23,7 @@ use engine_contract::TaskContext;
 use futures::future::BoxFuture;
 
 use crate::policy::command_floor::{self, CommandDecision};
+use crate::sessions::{self, ClaudeSession};
 
 pub mod approve_and_run;
 pub mod content_pipeline;
@@ -62,6 +63,123 @@ pub(crate) fn get_result<'a>(
     identity: &str,
 ) -> Option<&'a serde_json::Value> {
     ctx.nodes.get(identity)
+}
+
+/// Snapshot the current length of `ctx`'s session ledger, to be paired with [`sessions_since`]
+/// after a wrapper's inner `ClaudeCodeStep` call returns.
+///
+/// # Why a length, not a clone
+///
+/// A wrapper that bills the API via an inner step and then fails at parse/validation time
+/// currently constructs a bare `NodeError::new(..)`, whose `sessions` is empty — the billed entry
+/// dies with the discarded `ctx` when `node_context`'s `Node::process(ctx)` (by-value) call
+/// returns `Err`. `node_context` already has a carry-on-error channel (`NodeError::sessions` /
+/// `NodeError::with_sessions`, replayed onto the pre-call ledger on the `Err` branch) — the gap is
+/// only that these wrappers never populate it for a post-billed-call failure.
+///
+/// Pairing a cheap `usize` baseline with [`sessions_since`] — rather than diffing two full ledger
+/// clones — keeps this a per-invocation delta, not a per-dispatch whole-context clone. Attaching
+/// the *whole* ledger onto `NodeError` would double-count every entry already present in the
+/// pre-call snapshot `node_context` replays onto (it prepends `err.sessions`, it does not merge
+/// them), inflating the run's reported spend — the opposite of what this exists to fix.
+pub(crate) fn session_baseline(ctx: &TaskContext) -> usize {
+    sessions::read_sessions(&ctx.metadata).len()
+}
+
+/// The ledger entries appended to `ctx` after `baseline`, in order.
+///
+/// Returns an empty vec when nothing was appended, and also when the ledger is shorter than
+/// `baseline` (should not happen — the ledger is append-only — but a telemetry helper must never
+/// panic or slice out of bounds over a malformed/shrunk ledger; [`sessions::read_sessions`]
+/// follows the same never-panic contract for the same reason).
+pub(crate) fn sessions_since(ctx: &TaskContext, baseline: usize) -> Vec<ClaudeSession> {
+    let all = sessions::read_sessions(&ctx.metadata);
+    if all.len() <= baseline {
+        return Vec::new();
+    }
+    all[baseline..].to_vec()
+}
+
+#[cfg(test)]
+mod session_delta_tests {
+    use super::{session_baseline, sessions_since};
+    use crate::sessions::{append_session, ClaudeSession};
+    use engine_contract::TaskContext;
+
+    fn make_session(node: &str) -> ClaudeSession {
+        ClaudeSession {
+            node: node.to_string(),
+            session_id: Some(format!("sess-{node}")),
+            ok: true,
+            cost_usd: 0.01,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+
+    fn ctx_with_metadata(metadata: serde_json::Value) -> TaskContext {
+        TaskContext {
+            event: serde_json::json!({}),
+            nodes: Default::default(),
+            metadata,
+            node_runs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn baseline_on_empty_ledger_is_zero() {
+        let ctx = ctx_with_metadata(serde_json::json!({}));
+        assert_eq!(session_baseline(&ctx), 0);
+    }
+
+    #[test]
+    fn sessions_since_returns_only_appended_entries_in_order() {
+        let mut metadata = serde_json::json!({});
+        append_session(&mut metadata, make_session("a"));
+        let mut ctx = ctx_with_metadata(metadata);
+        let baseline = session_baseline(&ctx);
+        assert_eq!(baseline, 1);
+
+        append_session(&mut ctx.metadata, make_session("b"));
+        append_session(&mut ctx.metadata, make_session("c"));
+
+        let delta = sessions_since(&ctx, baseline);
+        assert_eq!(delta.len(), 2);
+        assert_eq!(delta[0].node, "b");
+        assert_eq!(delta[1].node, "c");
+    }
+
+    #[test]
+    fn sessions_since_empty_when_nothing_appended() {
+        let mut metadata = serde_json::json!({});
+        append_session(&mut metadata, make_session("a"));
+        let ctx = ctx_with_metadata(metadata);
+        let baseline = session_baseline(&ctx);
+
+        let delta = sessions_since(&ctx, baseline);
+        assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn sessions_since_never_panics_on_shrunk_ledger() {
+        let mut metadata = serde_json::json!({});
+        append_session(&mut metadata, make_session("a"));
+        append_session(&mut metadata, make_session("b"));
+        let ctx = ctx_with_metadata(metadata);
+
+        // Baseline claims a length longer than the ledger actually has.
+        let delta = sessions_since(&ctx, 99);
+        assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn sessions_since_on_absent_metadata_is_empty() {
+        let ctx = ctx_with_metadata(serde_json::json!(null));
+        assert_eq!(session_baseline(&ctx), 0);
+        assert!(sessions_since(&ctx, 0).is_empty());
+    }
 }
 
 /// Strip a Markdown code fence (` ```json ... ``` ` or plain ` ``` ... ``` `)

@@ -137,6 +137,7 @@ still bears on the *why*:
 | `base-template` | **`--no-worktree`** (default) | The Workflow harness executes a launch-time **copy** of the engine, so a chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it, in either isolation mode — a worktree never protected a running chain. The residual exposure is narrower and *between* blocks, not within one: a block's engine edit lands in the working tree before the *next* block's launch snapshots it. Mitigate by sequencing engine edits to a chain boundary, not with `--worktree`. |
 | the brain root (HQ) | **`--no-worktree`, always** | `validate-brain` inside a worktree resolves the gitignored sub-repos against the worktree's own `brain.toml` and they are absent from any checkout. Measured: 64 structure / 601 state errors versus 0/0 in the main tree. Worktree creation is clean — it is the corpus gates that cannot pass. |
 | anything else | `--no-worktree` | Cheaper. Use `--worktree` when a change deserves quarantine — available again fleet-wide since the D81 lift. |
+| any repo that already has another session live in it | **`--worktree`** | The first three rows assume one session per repo. Two chains sharing a working tree share one git index, so each sees the other's uncommitted files: a tree-wide `validation_command` bails on a sibling's edits, `git status` reads as dirty for reasons you did not cause, and a `git checkout`/branch switch by either one moves the other's tree underneath it. Cheap detection before Step 4: `git -C <repo> status --short` showing edits you did not make, a branch you did not create (`git -C <repo> branch --show-current`), or the roadmap's lane records naming another live lane in this repo. When in doubt, take the worktree — except for the two rows above, where a worktree cannot pass the gates at all; there, do not start a second concurrent chain. |
 
 An explicit `--isolation` that contradicts either of the first two rows → **stop and report.** Do
 not run a chain whose gates cannot pass.
@@ -207,6 +208,12 @@ that registered actually free the slot. If this chain runs longer than that, re-
 periodically as a heartbeat (repeat the same `register --repo <this-repo-name> --category
 <category> --agent <this lane's agent identity>` call): a repeat register for the SAME agent
 refreshes `started_at` on the existing entry in place rather than consuming a second slot.
+
+**The old release → register → re-take workaround is superseded by this heartbeat.** Before the entry
+was keyed on `--agent`, the only way to refresh a long-running heavy lane's slot was to `release`
+it and `register` again — which genuinely gave the slot up and let another lane claim it
+mid-chain. Do not do that any more: repeat the `register` in place. (The *repo lease*
+release/drain/re-take at the block boundary is a different mechanism and is still required.)
 
 **Release the slot when this repo's chain finishes — this is required, not optional:**
 `... release --repo <this-repo-name> --agent <this lane's agent identity>`, on success, failure,
@@ -481,8 +488,18 @@ work that has to be redone.
 - A leading `_` excludes a file from the corpus, so `_zz_*.md` debug probes are invisible to
   `validate-brain`.
 - `timeout` does not exist on this macOS shell.
+- **Check `git status --short <file>` before acting on a corpus error.** A validation error on a
+  file that is *uncommitted or untracked* belongs to whoever is editing it right now — very likely a
+  concurrent lane, not you — and "fixing" it overwrites work in flight; leave it, and say in the
+  report which lane's file it was. A committed error belongs to nobody in particular and is yours to
+  fix if it blocks the gate. The two cases look identical in `validate-brain` output, so the git
+  check is the only thing separating them. Positive control: run the same `git status --short` on a
+  file you know you just edited, and confirm it prints a line.
 - Invoke `/sdlc-flow` and `/sdlc-task` from the **main session** — the `Workflow` runtime behind
   `.claude/workflows/` is unavailable to delegated subagents.
+- The `Workflow` tool **inherits the session cwd**, so an engine launched from the wrong tree runs
+  against another repo's `.claude/workflows/` without complaining. The tell is the script path in
+  the launch result — check it names the repo you meant to drive before letting the engine proceed.
 
 ## Before finishing
 

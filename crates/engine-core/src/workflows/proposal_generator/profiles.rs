@@ -86,12 +86,59 @@ pub fn skip_review() -> PartialProposalGeneratorPolicy {
     }
 }
 
+/// Cost/latency-floor profile (EN.14.J): all five stages rewire to
+/// `ModelTier::Haiku`, terse output, prompt caching on, and the review loop
+/// dropped to `Skip` — `ProposalReviewNode` short-circuits straight to
+/// `pass`, no revise branch ever taken. Mirrors the shape of
+/// `research_agent`'s `cheap_fast` — every existing knob stated, no new
+/// knob introduced.
+#[must_use]
+pub fn cheap_fast() -> PartialProposalGeneratorPolicy {
+    PartialProposalGeneratorPolicy {
+        output_verbosity: Some(OutputVerbosity::Terse),
+        prompt_cache: Some(true),
+        model_tiers: Some(PartialModelTiers {
+            research: Some(ModelTier::Haiku),
+            opportunity: Some(ModelTier::Haiku),
+            writer: Some(ModelTier::Haiku),
+            review: Some(ModelTier::Haiku),
+            revise: Some(ModelTier::Haiku),
+        }),
+        local: None,
+        review_mode: Some(ReviewMode::Skip),
+    }
+}
+
+/// Quality-ceiling profile (EN.14.J): all five stages rewire to
+/// `ModelTier::Opus`, verbose output, prompt caching off, and the full
+/// review loop (`ReviewMode::Full`) so every proposal is critiqued and
+/// revised. Mirrors the shape of `research_agent`'s `thorough` — every
+/// existing knob stated, no new knob introduced.
+#[must_use]
+pub fn thorough() -> PartialProposalGeneratorPolicy {
+    PartialProposalGeneratorPolicy {
+        output_verbosity: Some(OutputVerbosity::Verbose),
+        prompt_cache: Some(false),
+        model_tiers: Some(PartialModelTiers {
+            research: Some(ModelTier::Opus),
+            opportunity: Some(ModelTier::Opus),
+            writer: Some(ModelTier::Opus),
+            review: Some(ModelTier::Opus),
+            revise: Some(ModelTier::Opus),
+        }),
+        local: None,
+        review_mode: Some(ReviewMode::Full),
+    }
+}
+
 /// Resolve a built-in profile bundle by its kebab-case name. Returns `None`
-/// for any name that isn't one of the three canonical profiles.
+/// for any name that isn't one of the five canonical profiles.
 #[must_use]
 pub fn profile_by_name(name: &str) -> Option<PartialProposalGeneratorPolicy> {
     match name {
         "baseline" => Some(baseline()),
+        "cheap-fast" => Some(cheap_fast()),
+        "thorough" => Some(thorough()),
         "local-judgment" => Some(local_judgment()),
         "skip-review" => Some(skip_review()),
         _ => None,
@@ -235,10 +282,69 @@ mod tests {
     }
 
     #[test]
-    fn profile_by_name_resolves_all_three_canonical_names() {
+    fn profile_by_name_resolves_all_five_canonical_names() {
         assert_eq!(profile_by_name("baseline"), Some(baseline()));
+        assert_eq!(profile_by_name("cheap-fast"), Some(cheap_fast()));
+        assert_eq!(profile_by_name("thorough"), Some(thorough()));
         assert_eq!(profile_by_name("local-judgment"), Some(local_judgment()));
         assert_eq!(profile_by_name("skip-review"), Some(skip_review()));
+    }
+
+    #[test]
+    fn cheap_fast_resolves_all_five_stages_to_haiku_and_skips_review() {
+        let resolved = policy::resolve(
+            ProposalGeneratorPolicy::default(),
+            None,
+            Some(&cheap_fast()),
+            None,
+        );
+        assert_eq!(resolved.model_tiers.research, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.opportunity, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.writer, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.review, ModelTier::Haiku);
+        assert_eq!(resolved.model_tiers.revise, ModelTier::Haiku);
+        assert_eq!(resolved.output_verbosity, OutputVerbosity::Terse);
+        assert!(resolved.prompt_cache);
+        assert_eq!(resolved.review_mode, ReviewMode::Skip);
+    }
+
+    #[test]
+    fn thorough_resolves_all_five_stages_to_opus_and_keeps_full_review() {
+        let resolved = policy::resolve(
+            ProposalGeneratorPolicy::default(),
+            None,
+            Some(&thorough()),
+            None,
+        );
+        assert_eq!(resolved.model_tiers.research, ModelTier::Opus);
+        assert_eq!(resolved.model_tiers.opportunity, ModelTier::Opus);
+        assert_eq!(resolved.model_tiers.writer, ModelTier::Opus);
+        assert_eq!(resolved.model_tiers.review, ModelTier::Opus);
+        assert_eq!(resolved.model_tiers.revise, ModelTier::Opus);
+        assert_eq!(resolved.output_verbosity, OutputVerbosity::Verbose);
+        assert_eq!(resolved.review_mode, ReviewMode::Full);
+    }
+
+    #[test]
+    fn resolve_policy_for_run_applies_named_cheap_fast_profile() {
+        let worktree = temp_dir();
+        let mut event = base_event();
+        event.profile = Some("cheap-fast".to_string());
+        let ctx = base_ctx(event);
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved.model_tiers.research, ModelTier::Haiku);
+        assert_eq!(resolved.review_mode, ReviewMode::Skip);
+    }
+
+    #[test]
+    fn resolve_policy_for_run_applies_named_thorough_profile() {
+        let worktree = temp_dir();
+        let mut event = base_event();
+        event.profile = Some("thorough".to_string());
+        let ctx = base_ctx(event);
+        let resolved = resolve_policy_for_run(&ctx, &worktree).expect("resolve should succeed");
+        assert_eq!(resolved.model_tiers.research, ModelTier::Opus);
+        assert_eq!(resolved.review_mode, ReviewMode::Full);
     }
 
     #[test]

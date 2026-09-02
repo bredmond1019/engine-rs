@@ -593,7 +593,7 @@ const VERDICT_STAGES: [&str; 2] = ["TriageTaskNode", "ConsolidatedReviewNode"];
 /// `"cost_usd"` field (`ClaudeCodeStep`'s output shape). Passed to the
 /// generic `crate::policy::telemetry::harvest` as
 /// `RunTelemetryInputs::cost_bearing_stages` (EN.4.0).
-const COST_BEARING_STAGES: [&str; 4] = [
+pub(crate) const COST_BEARING_STAGES: [&str; 4] = [
     "ImplementTaskNode",
     "TriageTaskNode",
     "ConsolidatedReviewNode",

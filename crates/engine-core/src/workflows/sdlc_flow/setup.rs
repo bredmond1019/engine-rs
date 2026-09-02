@@ -30,7 +30,10 @@ use super::policy::{self, PartialPolicy, SdlcPolicy};
 use super::profiles;
 use super::schema::{parse_task_range, SDLCFlowEventSchema, SDLCState, SDLCTask, SDLCTaskStatus};
 use super::task_loop::{apply_policy, resolved_policy, worktree_path, Stage};
-use super::{get_result, parse_structured_or_fenced, put_result, DEFAULT_STATE_FILENAME};
+use super::{
+    carry_forward_billing, get_result, parse_structured_or_fenced, put_result,
+    DEFAULT_STATE_FILENAME,
+};
 
 /// The `ctx.nodes` identity the resolved policy is stamped under, so every
 /// downstream node reads one resolved value rather than re-deriving it.
@@ -1097,6 +1100,12 @@ impl Node for LoadTaskStateNode {
                 ))
             })?;
             let mut state = SDLCState::from_committed_state_json(value)?;
+            // `retry_task` is itself a resume (it loads the existing
+            // committed state and continues the run), and it early-returns
+            // before the main resume path below — so it needs the same
+            // ledger rehydration or a `--resume --retry-task` run would
+            // under-report cost exactly like an ordinary resume would.
+            crate::sessions::seed_sessions(&mut ctx.metadata, state.claude_sessions.clone());
             let known_ids: Vec<u32> = state.tasks.iter().map(|task| task.task_id).collect();
             let task = state
                 .tasks
@@ -1140,7 +1149,16 @@ impl Node for LoadTaskStateNode {
         let resumed_state = if restarting { None } else { existing_state };
 
         let mut state: SDLCState = if let Some(value) = resumed_state {
-            SDLCState::from_committed_state_json(&value)?
+            let state = SDLCState::from_committed_state_json(&value)?;
+            // Without this, a resumed run's `ctx.metadata` ledger starts
+            // empty, so `total_cost_usd` under-reports by every segment
+            // before the resume — after EN.14.A makes those numbers real,
+            // that under-reporting is a new way to lie about money. Seed
+            // (not append) the committed ledger into `ctx.metadata` here,
+            // before any node in this run has appended an invocation of its
+            // own, so later invocations extend it rather than restart it.
+            crate::sessions::seed_sessions(&mut ctx.metadata, state.claude_sessions.clone());
+            state
         } else if tasks_path.exists() {
             let raw = std::fs::read_to_string(&tasks_path).map_err(|err| {
                 NodeError::new(format!("failed to read {}: {err}", tasks_path.display()))
@@ -1420,20 +1438,23 @@ impl Node for GenerateTasksNode {
             ))
         })?;
 
-        put_result(
-            &mut ctx,
-            "GenerateTasksNode",
-            json!({
-                "tasks_json": tasks_json_path.to_string_lossy(),
-                "tasks_md": tasks_md_path.to_string_lossy(),
-                "task_count": tasks.len(),
-                // Stamp the resolved knob values so `RunTelemetry` /
-                // `PolicyAggregate` can attribute this stage's observed cost
-                // to the settings that caused it (standing rule 6).
-                "model_tier": policy.model_tiers.generate,
-                "call_timeout_secs": policy.timeouts.generate,
-            }),
-        );
+        let mut result = json!({
+            "tasks_json": tasks_json_path.to_string_lossy(),
+            "tasks_md": tasks_md_path.to_string_lossy(),
+            "task_count": tasks.len(),
+            // Stamp the resolved knob values so `RunTelemetry` /
+            // `PolicyAggregate` can attribute this stage's observed cost
+            // to the settings that caused it (standing rule 6).
+            "model_tier": policy.model_tiers.generate,
+            "call_timeout_secs": policy.timeouts.generate,
+        });
+        // This site previously carried forward nothing — `put_result` below
+        // replaces this node's whole `ctx.nodes` entry, which would
+        // otherwise silently drop what `ClaudeCodeStep::process` just wrote
+        // onto this same identity: the `"transport"` tier stamp,
+        // `cost_usd`, and both cache channels (`EN.14.A`).
+        carry_forward_billing(&ctx, "GenerateTasksNode", &mut result);
+        put_result(&mut ctx, "GenerateTasksNode", result);
 
         Ok(ctx)
     }

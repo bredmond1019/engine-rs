@@ -205,17 +205,24 @@ $ARGUMENTS — one of two input modes:
    - **`tasks.json` parses as valid JSON** and is a non-empty array (not wrapped in an object —
      orchestrator's `LoadTaskStateNode` expects a bare array).
    - **Every task except the final Validate task names ≥1 file** in its `files[]` (so the dependency
-     analysis and the compilable-boundary review below can see boundaries). This does **not** imply
-     the named files must be disjoint *across* tasks — two tasks are free to touch the same file
-     under the sequential engines, since there is no inter-task merge to collide. This property and
-     the compilable-boundary check below do not contradict each other: naming files is about
+     analysis and the gate-passing boundary review below can see boundaries). This does **not**
+     imply the named files must be disjoint *across* tasks — two tasks are free to touch the same
+     file under the sequential engines, since there is no inter-task merge to collide. This property
+     and the gate-passing boundary check below do not contradict each other: naming files is about
      visibility, not ownership.
-   - **Compilable task boundaries — can fail.** Check whether any single breaking public-surface
-     change (a renamed public type, a struct's changed fields, an altered trait/interface signature)
-     is split across two or more tasks such that an intermediate task would leave the repository
-     non-compiling. If it is, this check **fails**: merge those tasks into one before proceeding, per
-     the compilable task boundaries rule in step 6, then re-run this self-check — a task that cannot
-     compile on its own is never valid, under either engine.
+   - **Gate-passing task boundaries — can fail.** The bar is **the project's gating suite passing**
+     (`planning/harness.json` → `validation.checks[]` with `gates: true`) at every task boundary —
+     not merely "it compiles". Compiling is one stack's instance of that bar and never the whole of
+     it: a task can compile fine and still leave `fmt`, `clippy -D warnings`, a lint, a type-check,
+     a schema check or the test suite red, and both engines run the full gating suite after every
+     single task, so such a task fails its gate and burns a fix loop. Check whether any single
+     change is split across two or more tasks such that an intermediate task would leave any gated
+     check failing — a renamed public type, a struct's changed fields, an altered trait/interface
+     signature and every call site each one touches; a lint that only passes once the old code path
+     is deleted; a test updated in one task for behaviour that lands in the next. If so, this check
+     **fails**: merge those tasks into one before proceeding, per the compilable task boundaries
+     rule in step 6, then re-run this self-check — a task that cannot pass the gate on its own is
+     never valid, under either engine.
    - **`dependsOn` ids are all valid** — every id referenced exists as some task's `task_id` in the
      same array, and the final Validate task depends on every other task's id.
    - **Acceptance Criteria are non-empty and observable** — each criterion can be judged true/false.
@@ -428,6 +435,28 @@ heading's bullets used to hold (bulleted lines in one string are fine). `accepta
 the spec-level markdown sections stay authoritative for those. **Set it for a task that CANNOT break
 the build** — docs-only, config-only, fixture-only — with the cheap commands that actually verify
 that task (file exists, frontmatter present, index updated).
+
+**A task that writes or edits OKF frontmatter must be told what a legal `related:` target is.** An
+engine executing the spec has no independent way to know, and the failure mode is that it invents
+one — a carryover slug, a block id, a filename, a plausible-looking id for a doc that does not
+exist — which red-gates the **whole corpus** for every concurrent lane the next time `--graph`
+gates, not just the authoring repo. So spell the constraint out in the task's `description`, and
+back it with a check in that task's `validation_commands`:
+
+- A `related:` entry is a **`doc_id`**, not a filename, a slug, a title, or a block id. The
+  `doc_id` is the `doc_id:` field in the target document's own frontmatter (defaulting to its
+  filename stem when that field is absent).
+- The target must be a **real, existing, crawled document**. Verify it before writing the edge —
+  `rg -L -n "^doc_id: <id>$" <repo>` , or confirm the file whose stem is `<id>` exists in the
+  corpus. A leading `_` in a filename excludes it from the corpus, so such a target is unresolved
+  even though the file is on disk.
+- A **cross-repo** target must be qualified `<repo>:<doc_id>` (e.g.
+  `base-template:D48-downstream-harness-sync-script`). A bare `doc_id` resolves only inside the
+  authoring repo and is treated as unresolved everywhere else.
+- When no real target exists, **omit `related:` entirely**. An empty or absent edge list is always
+  correct; an invented edge never is.
+
+See `docs/okf-frontmatter.md` for the full schema.
 
 **The two engines run an override differently ([D63](../../planning/decisions/D63-per-task-validation-commands-augment-gating.md)) — know which one the spec is targeting:**
 - **`/sdlc-flow`** still runs the override commands INSTEAD of the project-wide gating checks for

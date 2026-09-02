@@ -1,0 +1,17 @@
+{
+  "local": {
+    "constrained_json": false,
+    "endpoint": "http://localhost:11434",
+    "model": "qwen2.5-coder:7b"
+  },
+  "model_tiers": {
+    "opportunity": "sonnet",
+    "research": "sonnet",
+    "review": "sonnet",
+    "revise": "sonnet",
+    "writer": "sonnet"
+  },
+  "output_verbosity": "normal",
+  "prompt_cache": false,
+  "review_mode": "full"
+}

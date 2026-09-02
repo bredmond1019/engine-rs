@@ -31,7 +31,8 @@ use serde_json::json;
 use crate::node::{InputBinding, Node, NodeError};
 use crate::nodes::{ClaudeCodeStep, MetaTransport};
 use crate::workflows::{
-    get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
+    get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
+    ModelTransport, TransportSlot,
 };
 
 use super::policy::ContentPipelinePolicy;
@@ -258,6 +259,11 @@ impl Node for SelfCriticNode {
             .transport
             .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
 
+        // Baseline taken immediately before the billed call, per EN.14.C —
+        // any wrapper `Err` returned below carries whatever the inner
+        // `ClaudeCodeStep` appended to the ledger, so this critic wrapper's
+        // billed session survives a post-billed-call parse/serialize failure.
+        let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
 
         let content = ctx
@@ -283,6 +289,7 @@ impl Node for SelfCriticNode {
                 NodeError::new(format!(
                     "{NODE_NAME}: failed to parse a CriticEvaluation from the model's reply: {err}"
                 ))
+                .with_sessions(sessions_since(&ctx, baseline))
             })?;
 
         let verdict = verdict_from_model_text(&parsed.verdict);
@@ -296,6 +303,7 @@ impl Node for SelfCriticNode {
 
         let mut result = serde_json::to_value(&evaluation).map_err(|err| {
             NodeError::new(format!("failed to serialize CriticEvaluation: {err}"))
+                .with_sessions(sessions_since(&ctx, baseline))
         })?;
         if let Some(transport) = transport_stamp {
             result["transport"] = transport;
@@ -319,7 +327,7 @@ mod tests {
     use futures::FutureExt;
     use serde_json::json;
 
-    use super::super::policy::{ModelTier, ModelTiers, OutputVerbosity};
+    use super::super::policy::{ContentPipelineModelTiers, ModelTier, OutputVerbosity};
     use super::*;
 
     fn stub_critic_json(verdict: &str, confidence: f64, issues: Vec<&str>) -> serde_json::Value {
@@ -511,7 +519,7 @@ mod tests {
         let policy = ContentPipelinePolicy {
             output_verbosity: OutputVerbosity::Terse,
             prompt_cache: true,
-            model_tiers: ModelTiers {
+            model_tiers: ContentPipelineModelTiers {
                 critic: ModelTier::Opus,
                 ..ContentPipelinePolicy::default().model_tiers
             },
