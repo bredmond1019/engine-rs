@@ -143,8 +143,25 @@ pub struct OrchestrationPolicy {
     /// repo that is neither `base-template` (always `true`) nor the brain
     /// root (always `false`) — those two rows are external contracts and
     /// are NOT reachable through this knob, whatever it is set to. Defaults
-    /// to `false`: today every orchestrated run is in-place, and standing
-    /// rule 6 requires a new knob to be behavior-stable.
+    /// to `true`.
+    ///
+    /// **Deliberate exception to CLAUDE.md standing rule 6's
+    /// behavior-stability clause.** Rule 6 governs *adding* a knob: a new
+    /// knob must not change what an existing run does. This is not that —
+    /// it is an existing knob's default changed on purpose, because
+    /// in-place execution was never a cost/quality trade to begin with; it
+    /// was a correctness hazard whose cheapness depended on an assumption
+    /// (nothing else is using this checkout) that this environment
+    /// routinely violates. Measured 2026-09-02: an `ORCHESTRATION` dispatch
+    /// with no `policy` override ran in-place while a concurrent session
+    /// checked out a different branch in the same tree mid-run, silently
+    /// stealing `HEAD` and landing three of the orchestrated run's commits
+    /// on the other lane's branch. Do not "restore" this to `false` as a
+    /// rule-6 fix — see `planning/blocks/EN.ticket.orchestration-worktree-by-default.json`.
+    /// An operator who knowingly owns the checkout exclusively can still
+    /// pass `"policy": {"default_use_worktree": false}` to opt back into
+    /// in-place execution — the knob itself is unchanged, only which way
+    /// the unstated case falls.
     pub default_use_worktree: bool,
     /// EN.11.L Task 3: the TOTAL budget [`integrate::wait_for_clearance`]
     /// allows a single operator hold to consume before it fails the chain
@@ -156,13 +173,14 @@ pub struct OrchestrationPolicy {
 }
 
 impl Default for OrchestrationPolicy {
-    /// The behavior-stable baseline: poll every 2s while held, run every
-    /// ordinary repo in-place, and never time out a hold (`hold_deadline_ms:
-    /// None`) — exactly the pre-Task-2 behavior.
+    /// Poll every 2s while held, isolate every ordinary repo into its own
+    /// worktree by default (see the doc comment on `default_use_worktree`
+    /// for why this is a correctness precondition, not the pre-Task-2
+    /// behavior), and never time out a hold (`hold_deadline_ms: None`).
     fn default() -> Self {
         Self {
             hold_poll_interval_ms: 2_000,
-            default_use_worktree: false,
+            default_use_worktree: true,
             hold_deadline_ms: None,
         }
     }
@@ -214,7 +232,11 @@ impl crate::policy::Policy for OrchestrationPolicy {
 pub fn baseline() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(2_000),
-        default_use_worktree: Some(false),
+        // Restates the built-in default verbatim, per its own contract —
+        // isolated by default. See `default_use_worktree`'s doc comment
+        // for why this is a deliberate exception to CLAUDE.md standing
+        // rule 6's behavior-stability clause.
+        default_use_worktree: Some(true),
         // Restates the built-in default verbatim (no deadline) — baseline's
         // no-op contract, per EN.11.L Task 3.
         hold_deadline_ms: Some(None),
@@ -222,9 +244,15 @@ pub fn baseline() -> PartialOrchestrationPolicy {
 }
 
 /// Cheapest/fastest profile: poll far less often — fewer wake-ups, at the
-/// cost of noticing an operator clearance later. Also runs in-place: a
-/// worktree is a fresh checkout plus a second target dir, the expensive
-/// option, not the cheap one.
+/// cost of noticing an operator clearance later.
+///
+/// Still isolates by default. Cheapness on this profile applies to poll
+/// intervals and hold deadlines — the axes where getting it wrong costs a
+/// slightly later reaction — never to sharing a working tree with other
+/// processes, where getting it wrong costs someone else's commits. See
+/// `default_use_worktree`'s doc comment: this is a deliberate exception to
+/// CLAUDE.md standing rule 6's behavior-stability clause, not a knob this
+/// profile is free to relax back to the pre-fix default.
 ///
 /// EN.11.L Task 3: a bounded 15-minute hold deadline — the cost floor this
 /// profile is already tuned for extends to holds too: a lane parked on an
@@ -235,7 +263,7 @@ pub fn baseline() -> PartialOrchestrationPolicy {
 pub fn cheap_fast() -> PartialOrchestrationPolicy {
     PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(10_000),
-        default_use_worktree: Some(false),
+        default_use_worktree: Some(true),
         hold_deadline_ms: Some(Some(15 * 60 * 1_000)),
     }
 }
@@ -1006,7 +1034,10 @@ mod tests {
     #[test]
     fn builtin_default_is_behavior_stable_baseline() {
         assert_eq!(OrchestrationPolicy::default().hold_poll_interval_ms, 2_000);
-        assert!(!OrchestrationPolicy::default().default_use_worktree);
+        // Isolated by default (deliberate exception to standing rule 6 —
+        // see the doc comment on `default_use_worktree`): the "behavior
+        // stable" name refers to hold_poll_interval_ms and hold_deadline_ms.
+        assert!(OrchestrationPolicy::default().default_use_worktree);
         // EN.11.L Task 3: the built-in default must preserve the
         // pre-Task-2 unbounded wait exactly — adding this knob must not
         // change what an existing run does (CLAUDE.md standing rule 6).
@@ -1015,8 +1046,8 @@ mod tests {
 
     #[test]
     fn all_three_profiles_set_default_use_worktree_explicitly() {
-        assert_eq!(baseline().default_use_worktree, Some(false));
-        assert_eq!(cheap_fast().default_use_worktree, Some(false));
+        assert_eq!(baseline().default_use_worktree, Some(true));
+        assert_eq!(cheap_fast().default_use_worktree, Some(true));
         assert_eq!(thorough().default_use_worktree, Some(true));
     }
 
