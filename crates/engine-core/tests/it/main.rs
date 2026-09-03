@@ -21,6 +21,7 @@ mod blocked_bridge;
 mod brain_client;
 mod budget;
 mod cancellation;
+mod claim_reaffirm;
 mod claude_code_step;
 mod close_block_commit_manifest;
 mod command_runner_spec;
