@@ -51,7 +51,7 @@ use engine_core::workflows::content_pipeline::summarize::SummarizeNode;
 use engine_core::workflows::content_pipeline::translate::{TranslateNode, TranslateSkipRouterNode};
 use engine_core::workflows::ModelTransport;
 use futures::FutureExt;
-use okf_core::{parse_nested_frontmatter, LearningArtifact};
+use okf_core::{parse_nested_frontmatter, BrainDocModel, LearningArtifact};
 use serde_json::{json, Value};
 
 use engine_core::nodes::channel_transport::StubChannelTransport;
@@ -99,12 +99,30 @@ fn critic_json() -> Value {
     json!({ "verdict": "pass", "confidence": 0.95, "issues": [] })
 }
 
-/// The learning corpus directory `okf_core::LearningArtifact`'s
-/// `index_intent` registers into — pre-created so the first write has a
+/// The corpus directory `okf_core::LearningArtifact`'s `index_intent`
+/// registers into, **derived from the model rather than hardcoded**.
+///
+/// `mev`'s materializer resolves its write target as
+/// `root/dirname(index_path)/link_target`, so this directory is decided
+/// entirely by okf-core's `LEARNING_CORPUS_INDEX`. Hardcoding the literal
+/// here is what let a one-line const repoint in another repo break this
+/// suite in four places at once, with a failure ("0 documents on disk")
+/// that reads like a writer bug rather than a moved target — it cost a
+/// misdiagnosis against `mev::write_atomic`. Derive it, and the suite
+/// follows the model wherever it points.
+fn learning_corpus_rel_dir() -> std::path::PathBuf {
+    let artifact = okf_core::LearningArtifact::from_payload(&serde_json::json!({}));
+    Path::new(&artifact.index_intent().index_path)
+        .parent()
+        .expect("index_path must have a parent directory component")
+        .to_path_buf()
+}
+
+/// The same directory under `root`, pre-created so the first write has a
 /// directory to land in (mirrors `opportunity_loop_e2e.rs`'s
 /// `opportunities_dir`).
 fn learning_corpus_dir(root: &Path) -> std::path::PathBuf {
-    let dir = root.join("docs/content/learning-corpus");
+    let dir = root.join(learning_corpus_rel_dir());
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -448,7 +466,7 @@ async fn materialization_runs_before_the_synapse_push() {
     );
 
     // The document survives the failed push.
-    let docs: Vec<_> = std::fs::read_dir(tmp.path().join("docs/content/learning-corpus"))
+    let docs: Vec<_> = std::fs::read_dir(tmp.path().join(learning_corpus_rel_dir()))
         .expect("corpus readable")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().to_string())
@@ -465,7 +483,7 @@ async fn materialization_runs_before_the_synapse_push() {
 async fn a_first_ever_write_creates_the_missing_corpus_subtree() {
     // Regression: `mev::brain::emit::apply_plan` calls `std::fs::write`
     // directly and never creates directories, so a first-ever write into a
-    // brain root with no `docs/content/learning-corpus/` used to fail with
+    // brain root with no learning-artifact corpus subtree used to fail with
     // `E_EMIT_WRITE_FAILED` and halt the run. The real corpus does NOT have
     // that directory yet, so this is the production path, not an edge case.
     //
@@ -474,7 +492,7 @@ async fn a_first_ever_write_creates_the_missing_corpus_subtree() {
     // it (mirroring `opportunity_loop_e2e.rs`), which is exactly what
     // masked this.
     let tmp = tempfile::tempdir().expect("tempdir");
-    assert!(!tmp.path().join("docs/content/learning-corpus").exists());
+    assert!(!tmp.path().join(learning_corpus_rel_dir()).exists());
 
     let ctx = run_at(
         tmp.path(),
