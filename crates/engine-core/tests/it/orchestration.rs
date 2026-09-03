@@ -1405,8 +1405,10 @@ async fn isolation_invariance_matrix_across_all_fifteen_cells() {
 
     // Ordinary-repo's expected resolution per setting, in the same order as
     // `settings` above — this is the ONE row allowed to vary across the
-    // settings axis.
-    let ordinary_expected = [false, true, false, true, true];
+    // settings axis. `cheap-fast` now resolves true: EN.ticket.orchestration-worktree-by-default
+    // flipped isolation from a cost knob to a correctness precondition (deliberate exception to
+    // CLAUDE.md standing rule 6), so cheap-fast no longer economises on this axis.
+    let ordinary_expected = [false, true, true, true, true];
 
     for (i, setting) in settings.iter().enumerate() {
         setting.write_harness_default(dir.path());
@@ -1450,11 +1452,16 @@ async fn isolation_invariance_matrix_across_all_fifteen_cells() {
     }
 }
 
-/// Behavior-stability pin (CLAUDE.md standing rule 6): a chain wired with no isolation
-/// overrides at all — no `harness.json` `orchestration.policy` entry, no `profile`, no
-/// event `policy` override — seeds exactly what today's runs seed: in-place
-/// (`use_worktree: false`) for an ordinary repo. Adding the `default_use_worktree` knob
-/// must not have changed an existing, override-free run's behavior.
+/// Isolation-by-default pin (EN.ticket.orchestration-worktree-by-default): a chain wired
+/// with no isolation overrides at all — no `harness.json` `orchestration.policy` entry,
+/// no `profile`, no event `policy` override — now seeds `use_worktree: true` for an
+/// ordinary repo. This is a DELIBERATE exception to CLAUDE.md standing rule 6's
+/// behavior-stability clause: isolation was reclassified from a cost/quality knob to a
+/// correctness precondition after an unstated-policy ORCHESTRATION dispatch ran in-place
+/// in a shared checkout a concurrent session was also using, silently landing that run's
+/// commits on the other session's branch. A safe default costs a worktree; an unsafe one
+/// costs a cherry-pick recovery and a dead PR. This test previously pinned the OLD
+/// (in-place) behavior — it now pins the new one, on purpose.
 #[tokio::test]
 async fn a_run_with_no_isolation_overrides_seeds_in_place_unchanged_from_today() {
     let dir = isolation_matrix_brain_root();
@@ -1468,9 +1475,10 @@ async fn a_run_with_no_isolation_overrides_seeds_in_place_unchanged_from_today()
     .await;
 
     assert!(
-        !use_worktree,
-        "an override-free run against an ordinary repo must stay in-place, matching \
-         behavior before default_use_worktree existed"
+        use_worktree,
+        "an override-free run against an ordinary repo must isolate by default: \
+         default_use_worktree is a correctness precondition, not a cost knob \
+         (EN.ticket.orchestration-worktree-by-default)"
     );
 }
 
