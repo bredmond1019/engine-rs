@@ -6,17 +6,28 @@
 //! candidate set the conductor may draw from — it is a planner, never a backlog
 //! drain, because it can only pick and justify from a set that already exists.
 //!
-//! **Task 1 lands the two inputs alone**: reading the objective file
+//! **Task 1** lands the two inputs: reading the objective file
 //! ([`read_objective`]) and obtaining mev's computed slate via `mev frontier
 //! --json` ([`fetch_frontier_slate`]), shelled out through the SAME
 //! `CommandRunner` convention [`crate::policy::emit_state::EmitStateNode`]
 //! already uses for `mev emit-state --write` — the injectable
 //! [`crate::policy::emit_state::Runner`] seam, so no test in this module (or
-//! anywhere downstream of it) ever shells out to a real `mev` binary. Later
-//! tasks turn these two inputs into a slate-constrained, justified chain
-//! proposal (with the `git log -S` pre-flight and the invented-block /
-//! missing-`tasks.json` refusals) and the journal write; this module does not
-//! yet propose or journal anything.
+//! anywhere downstream of it) ever shells out to a real `mev` binary.
+//!
+//! **Task 2** adds [`propose_chain`]: the subset-only constraint and its two
+//! refusal cases (a candidate outside the slate, and a slate candidate with
+//! no `tasks.json`).
+//!
+//! **Task 3** adds the `git log -S` pre-flight ([`git_log_dash_s_preflight`]),
+//! wired into [`propose_chain`] as the last step before the chain is
+//! finalised. Unlike the two refusals above, a pre-flight match does not
+//! reject the whole proposal — it DROPS just that candidate and records why
+//! on [`DroppedCandidate`] (surfaced via [`ProposalOutcome::dropped`]) for a
+//! later task to write to the EN.12.D journal; a pre-flight that cannot even
+//! run (spawn failure, non-zero exit) IS a hard refusal
+//! ([`ConductorProposalError::GitPreflightFailed`]), since an inconclusive
+//! check must never be treated as "history is clean". The actual journal
+//! write is a later task's job — this module only produces the record.
 //!
 //! # `--agent` quiesce hazard (carry forward)
 //!
@@ -110,6 +121,7 @@ impl std::error::Error for ConductorInputError {}
 pub struct ConductorConfig {
     objective_path: PathBuf,
     mev_cwd: PathBuf,
+    git_cwd: Option<PathBuf>,
 }
 
 impl Default for ConductorConfig {
@@ -117,6 +129,7 @@ impl Default for ConductorConfig {
         Self {
             objective_path: PathBuf::from(DEFAULT_OBJECTIVE_PATH),
             mev_cwd: PathBuf::from("."),
+            git_cwd: None,
         }
     }
 }
@@ -143,6 +156,15 @@ impl ConductorConfig {
         self
     }
 
+    /// Override the working directory the `git log -S` pre-flight runs in.
+    /// Defaults to the same directory as `mev_cwd` (the brain/HQ root) — see
+    /// [`Self::git_cwd`].
+    #[must_use]
+    pub fn with_git_cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.git_cwd = Some(path.into());
+        self
+    }
+
     #[must_use]
     pub fn objective_path(&self) -> &Path {
         &self.objective_path
@@ -151,6 +173,14 @@ impl ConductorConfig {
     #[must_use]
     pub fn mev_cwd(&self) -> &Path {
         &self.mev_cwd
+    }
+
+    /// The working directory the `git log -S` pre-flight runs in — the
+    /// explicit override if one was given via [`Self::with_git_cwd`],
+    /// otherwise the same directory as [`Self::mev_cwd`].
+    #[must_use]
+    pub fn git_cwd(&self) -> &Path {
+        self.git_cwd.as_deref().unwrap_or(&self.mev_cwd)
     }
 }
 
@@ -254,6 +284,17 @@ pub enum ConductorProposalError {
     /// `repo:block_id` is in the slate but has no `tasks.json` yet, so
     /// dispatching it would only fail. Refused rather than dispatched.
     MissingTasksJson { repo: String, block_id: String },
+    /// The `git log -S` pre-flight for `repo:block_id` failed to spawn or
+    /// exited non-zero. Unlike a matched pre-flight (which drops the
+    /// candidate and journals why — see [`DroppedCandidate`]), a pre-flight
+    /// that cannot even run is treated as a hard refusal of the whole
+    /// proposal: the conductor must not silently proceed as if the
+    /// candidate's history were clean when it never actually checked.
+    GitPreflightFailed {
+        repo: String,
+        block_id: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConductorProposalError {
@@ -272,11 +313,131 @@ impl std::fmt::Display for ConductorProposalError {
                 "conductor: proposed block '{repo}:{block_id}' has no `tasks.json` \
                  yet — run `/generate-tasks` for it before it can be dispatched"
             ),
+            ConductorProposalError::GitPreflightFailed {
+                repo,
+                block_id,
+                reason,
+            } => write!(
+                f,
+                "conductor: `git log -S` pre-flight for '{repo}:{block_id}' \
+                 could not run: {reason} — refusing rather than proceeding \
+                 as if history were clean"
+            ),
         }
     }
 }
 
 impl std::error::Error for ConductorProposalError {}
+
+// ── Task 3: the `git log -S` pre-flight ─────────────────────────────────────
+//
+// The corpus graph lags reality by days — the block record's own evidence:
+// two blocks were fully implemented and merged while `state.json` still read
+// `open`, because their bookkeeping emits were silently refused by the
+// lane's own quiesce lease. A conductor that trusted the graph (via the
+// slate) alone could propose work that is already done. The `git log -S`
+// pre-flight runs BEFORE the proposal is finalised (inside [`propose_chain`],
+// after the subset/tasks.json checks but before the chain is built) and
+// drops any candidate whose work is already present in git history, with the
+// reason recorded on [`DroppedCandidate`] for [`propose_chain`]'s caller to
+// journal (the actual EN.12.D journal write is a later task's job — this one
+// only produces the record to write).
+
+/// A candidate the `git log -S` pre-flight dropped from a proposal, and why —
+/// the record [`propose_chain`]'s caller journals to EN.12.D so a dropped
+/// candidate is auditable, not silently vanished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedCandidate {
+    pub repo: String,
+    pub block_id: String,
+    pub reason: String,
+}
+
+/// `(survivors, dropped)` — [`git_log_dash_s_preflight`]'s success shape.
+/// Named to keep the function signature under clippy's type-complexity
+/// threshold, not because it means anything beyond the tuple it wraps.
+pub type PreflightOutcome = (Vec<(String, String)>, Vec<DroppedCandidate>);
+
+/// Run `git log -S<block_id> --oneline` for each of `candidates` in
+/// `config.git_cwd()`, via the SAME injected [`Runner`] convention as
+/// [`fetch_frontier_slate`] — no test here ever shells out to real `git`.
+///
+/// `-S<block_id>` (git's "pickaxe" search) finds commits that changed the
+/// number of occurrences of the literal string `block_id` in the tracked
+/// tree — i.e. commits that added or removed code/docs referencing this
+/// block id, which is what a completed implementation looks like. A
+/// candidate with at least one such commit is dropped as already-done; a
+/// candidate with none survives untouched, in its original order.
+///
+/// Returns `(survivors, dropped)` on success. A spawn failure or non-zero
+/// exit for any candidate is a hard refusal
+/// ([`ConductorProposalError::GitPreflightFailed`]) — an inconclusive
+/// pre-flight must never be treated as "history is clean".
+pub fn git_log_dash_s_preflight<O: CommandOutputLike>(
+    runner: &Runner<O>,
+    config: &ConductorConfig,
+    candidates: &[(String, String)],
+) -> Result<PreflightOutcome, ConductorProposalError> {
+    let mut survivors = Vec::with_capacity(candidates.len());
+    let mut dropped = Vec::new();
+
+    for (repo, block_id) in candidates {
+        let pickaxe_arg = format!("-S{block_id}");
+        let output = runner(
+            "git",
+            &["log", pickaxe_arg.as_str(), "--oneline"],
+            config.git_cwd(),
+        )
+        .map_err(|err| ConductorProposalError::GitPreflightFailed {
+            repo: repo.clone(),
+            block_id: block_id.clone(),
+            reason: err.to_string(),
+        })?;
+
+        if output.status() != 0 {
+            return Err(ConductorProposalError::GitPreflightFailed {
+                repo: repo.clone(),
+                block_id: block_id.clone(),
+                reason: format!(
+                    "`git log -S` exited {}: {}",
+                    output.status(),
+                    output.stderr()
+                ),
+            });
+        }
+
+        let matched_commits = output
+            .stdout()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if matched_commits > 0 {
+            dropped.push(DroppedCandidate {
+                repo: repo.clone(),
+                block_id: block_id.clone(),
+                reason: format!(
+                    "conductor: '{repo}:{block_id}' dropped by the `git log -S` \
+                     pre-flight — {matched_commits} commit(s) already touch this \
+                     block id in git history, so the corpus graph is stale for it"
+                ),
+            });
+        } else {
+            survivors.push((repo.clone(), block_id.clone()));
+        }
+    }
+
+    Ok((survivors, dropped))
+}
+
+/// The outcome of a successful [`propose_chain`] call: the finalised chain
+/// (already subset-checked, tasks.json-checked, and `git log -S`-checked),
+/// plus every candidate the `git log -S` pre-flight dropped along the way,
+/// for the caller to journal to EN.12.D.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalOutcome {
+    pub chain: Vec<crate::workflows::orchestration::chain::ChainStep>,
+    pub dropped: Vec<DroppedCandidate>,
+}
 
 /// Validate `proposed` (an ordered, caller-supplied `(repo, block_id)` list —
 /// the conductor's candidate picks, in the order it wants them run) against
@@ -294,16 +455,22 @@ impl std::error::Error for ConductorProposalError {}
 /// 3. Any proposed block with no `tasks.json` — see
 ///    [`ConductorProposalError::MissingTasksJson`].
 ///
+/// 4. The `git log -S` pre-flight ([`git_log_dash_s_preflight`]) — a
+///    candidate already present in git history is DROPPED (not refused —
+///    the rest of the proposal still goes ahead) with the reason recorded on
+///    [`ProposalOutcome::dropped`] for the caller to journal.
+///
 /// `slate` is an independent input (typically [`fetch_frontier_slate`]'s
 /// result), never derived from `proposed` — per carryover
 /// `gate-scope-must-be-shown-capable-of-failing`, a subset check whose slate
 /// is derived from the proposal itself can never fail.
-pub fn propose_chain(
+pub fn propose_chain<O: CommandOutputLike>(
     config: &ConductorConfig,
     proposed: &[(String, String)],
     slate: &FrontierArtifact,
     tasks_json_exists: &TasksJsonChecker,
-) -> Result<Vec<crate::workflows::orchestration::chain::ChainStep>, ConductorProposalError> {
+    git_runner: &Runner<O>,
+) -> Result<ProposalOutcome, ConductorProposalError> {
     read_objective(config).map_err(ConductorProposalError::Objective)?;
 
     let slate_keys: std::collections::HashSet<&str> = slate
@@ -331,7 +498,14 @@ pub fn propose_chain(
         }
     }
 
-    Ok(crate::workflows::orchestration::chain::resolve_explicit_chain(proposed.to_vec()))
+    // The pre-flight runs BEFORE the proposal is finalised (this is the
+    // last step, right before the chain is built from whatever survives it).
+    let (survivors, dropped) = git_log_dash_s_preflight(git_runner, config, proposed)?;
+
+    Ok(ProposalOutcome {
+        chain: crate::workflows::orchestration::chain::resolve_explicit_chain(survivors),
+        dropped,
+    })
 }
 
 #[cfg(test)]
@@ -564,19 +738,49 @@ mod tests {
         })
     }
 
+    /// A `git` runner stub that reports NO matching commits for any pickaxe
+    /// search — i.e. every candidate survives the `git log -S` pre-flight.
+    /// The default double for tests that exercise the earlier refusal
+    /// stages (subset / tasks.json / objective) and don't care about the
+    /// pre-flight itself.
+    fn no_history_git_runner() -> Runner<TestOutput> {
+        Arc::new(|_program, _args, _cwd| {
+            Ok(TestOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        })
+    }
+
+    /// A `git` runner stub that reports a matching commit for every pickaxe
+    /// search — i.e. every candidate is dropped by the `git log -S`
+    /// pre-flight.
+    fn all_history_git_runner() -> Runner<TestOutput> {
+        Arc::new(|_program, _args, _cwd| {
+            Ok(TestOutput {
+                status: 0,
+                stdout: "abc1234 feat: implement already done\n".to_string(),
+                stderr: String::new(),
+            })
+        })
+    }
+
     #[test]
     fn a_slate_subset_proposal_with_tasks_json_succeeds() {
         let config = config_with_objective("subset-ok");
         let slate = slate_from(INDEPENDENT_SLATE);
         let proposed = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
         let tasks_json_exists = checker(&[("engine-rs", "EN.12.F")]);
+        let git_runner = no_history_git_runner();
 
-        let chain = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+        let outcome = propose_chain(&config, &proposed, &slate, &tasks_json_exists, &git_runner)
             .expect("proposal is a subset of the slate and has tasks.json");
 
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].repo, "engine-rs");
-        assert_eq!(chain[0].block_id, "EN.12.F");
+        assert_eq!(outcome.chain.len(), 1);
+        assert_eq!(outcome.chain[0].repo, "engine-rs");
+        assert_eq!(outcome.chain[0].block_id, "EN.12.F");
+        assert!(outcome.dropped.is_empty());
     }
 
     #[test]
@@ -591,8 +795,9 @@ mod tests {
             ("engine-rs".to_string(), "EN.99.Z".to_string()),
         ];
         let tasks_json_exists = checker(&[("engine-rs", "EN.12.F"), ("engine-rs", "EN.99.Z")]);
+        let git_runner = no_history_git_runner();
 
-        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists, &git_runner)
             .expect_err("EN.99.Z is not in the slate");
 
         assert_eq!(
@@ -612,8 +817,9 @@ mod tests {
         // Even a "yes it has tasks.json" checker must not rescue an invented
         // id — the slate check runs first and rejects it regardless.
         let tasks_json_exists = checker(&[("engine-rs", "EN.NOT.REAL")]);
+        let git_runner = no_history_git_runner();
 
-        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists, &git_runner)
             .expect_err("EN.NOT.REAL does not exist in the slate/corpus");
 
         match &err {
@@ -633,8 +839,9 @@ mod tests {
         let proposed = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
         // In the slate, but the checker reports no tasks.json.
         let tasks_json_exists = checker(&[]);
+        let git_runner = no_history_git_runner();
 
-        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists, &git_runner)
             .expect_err("EN.12.F has no tasks.json per the checker");
 
         assert_eq!(
@@ -664,8 +871,9 @@ mod tests {
         // check runs first and blocks it regardless.
         let proposed = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
         let tasks_json_exists = checker(&[("engine-rs", "EN.12.F")]);
+        let git_runner = no_history_git_runner();
 
-        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists, &git_runner)
             .expect_err("no objective file present");
 
         match err {
@@ -674,5 +882,203 @@ mod tests {
             }
             other => panic!("expected Objective(ObjectiveMissing), got {other:?}"),
         }
+    }
+
+    // ── git_log_dash_s_preflight / propose_chain integration ───────────────
+
+    /// A two-entry slate so pre-flight tests can prove one candidate is
+    /// dropped while its neighbour — the positive control — survives.
+    const TWO_ENTRY_SLATE: &str = r#"{
+        "derived_at": "2026-09-03T00:00:00-07:00",
+        "entries": [
+            {
+                "roadmap": "orchestration-extensions",
+                "lane": "engine-rs",
+                "segment": 0,
+                "repo": "engine-rs",
+                "key": "engine-rs:EN.12.F",
+                "id": "EN.12.F",
+                "title": "CONDUCTOR",
+                "status": "open",
+                "unmet_blocks": [],
+                "unmet_gates": [],
+                "startable": true
+            },
+            {
+                "roadmap": "orchestration-extensions",
+                "lane": "engine-rs",
+                "segment": 1,
+                "repo": "engine-rs",
+                "key": "engine-rs:EN.12.G",
+                "id": "EN.12.G",
+                "title": "DEBRIEF",
+                "status": "open",
+                "unmet_blocks": [],
+                "unmet_gates": [],
+                "startable": true
+            }
+        ],
+        "gate_ranks": []
+    }"#;
+
+    /// A `git` runner stub that reports a matching commit ONLY for
+    /// `-SEN.12.F` and nothing for any other pickaxe search — so a test can
+    /// prove one candidate is dropped while a second, untouched candidate
+    /// (the positive control) survives.
+    fn selective_history_git_runner() -> Runner<TestOutput> {
+        Arc::new(|_program, args, _cwd| {
+            let matched_en_12_f = args.iter().any(|a| *a == "-SEN.12.F");
+            Ok(TestOutput {
+                status: 0,
+                stdout: if matched_en_12_f {
+                    "abc1234 feat: implement EN.12.F already\n".to_string()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        })
+    }
+
+    #[test]
+    fn git_log_dash_s_preflight_drops_a_candidate_already_in_history() {
+        let config = ConductorConfig::new();
+        let candidates = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
+        let git_runner = all_history_git_runner();
+
+        let (survivors, dropped) =
+            git_log_dash_s_preflight(&git_runner, &config, &candidates).expect("git ran cleanly");
+
+        assert!(survivors.is_empty());
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].repo, "engine-rs");
+        assert_eq!(dropped[0].block_id, "EN.12.F");
+        assert!(dropped[0].reason.contains("already"));
+    }
+
+    #[test]
+    fn git_log_dash_s_preflight_lets_a_not_yet_done_candidate_survive() {
+        // The positive control: proves the filter isn't simply dropping
+        // everything it's given.
+        let config = ConductorConfig::new();
+        let candidates = vec![("engine-rs".to_string(), "EN.12.G".to_string())];
+        let git_runner = no_history_git_runner();
+
+        let (survivors, dropped) =
+            git_log_dash_s_preflight(&git_runner, &config, &candidates).expect("git ran cleanly");
+
+        assert_eq!(survivors, candidates);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn git_log_dash_s_preflight_invokes_git_log_dash_s_through_the_injected_runner() {
+        let calls: Arc<Mutex<Vec<(String, Vec<String>, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: Runner<TestOutput> = Arc::new(move |program, args, cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+                cwd.to_string_lossy().into_owned(),
+            ));
+            Ok(TestOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let config = ConductorConfig::new().with_git_cwd("hq-root");
+        let candidates = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
+        git_log_dash_s_preflight(&runner, &config, &candidates).expect("git ran cleanly");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "git");
+        assert_eq!(recorded[0].1, vec!["log", "-SEN.12.F", "--oneline"]);
+        assert_eq!(recorded[0].2, "hq-root");
+    }
+
+    #[test]
+    fn git_log_dash_s_preflight_defaults_git_cwd_to_mev_cwd() {
+        let config = ConductorConfig::new().with_mev_cwd("hq-root");
+        assert_eq!(config.git_cwd(), Path::new("hq-root"));
+
+        let overridden = config.clone().with_git_cwd("elsewhere");
+        assert_eq!(overridden.git_cwd(), Path::new("elsewhere"));
+        // Overriding git_cwd must not disturb mev_cwd.
+        assert_eq!(overridden.mev_cwd(), Path::new("hq-root"));
+    }
+
+    #[test]
+    fn git_log_dash_s_preflight_reports_a_spawn_failure_as_a_hard_refusal() {
+        let config = ConductorConfig::new();
+        let candidates = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
+        let runner: Runner<TestOutput> = Arc::new(|_p, _a, _c| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "git not on PATH",
+            ))
+        });
+
+        let err = git_log_dash_s_preflight(&runner, &config, &candidates)
+            .expect_err("git failed to spawn");
+
+        match err {
+            ConductorProposalError::GitPreflightFailed { repo, block_id, .. } => {
+                assert_eq!(repo, "engine-rs");
+                assert_eq!(block_id, "EN.12.F");
+            }
+            other => panic!("expected GitPreflightFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_log_dash_s_preflight_reports_a_nonzero_exit_as_a_hard_refusal() {
+        let config = ConductorConfig::new();
+        let candidates = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
+        let runner: Runner<TestOutput> = Arc::new(|_p, _a, _c| {
+            Ok(TestOutput {
+                status: 128,
+                stdout: String::new(),
+                stderr: "fatal: not a git repository".to_string(),
+            })
+        });
+
+        let err = git_log_dash_s_preflight(&runner, &config, &candidates)
+            .expect_err("git exited non-zero");
+
+        assert!(matches!(
+            err,
+            ConductorProposalError::GitPreflightFailed { .. }
+        ));
+        assert!(err.to_string().contains("could not run"));
+    }
+
+    #[test]
+    fn propose_chain_runs_the_preflight_before_finalising_and_journals_the_drop() {
+        let config = config_with_objective("preflight-drop");
+        let slate = slate_from(TWO_ENTRY_SLATE);
+        // EN.12.F is already done (per the selective runner); EN.12.G is
+        // the not-yet-done positive control.
+        let proposed = vec![
+            ("engine-rs".to_string(), "EN.12.F".to_string()),
+            ("engine-rs".to_string(), "EN.12.G".to_string()),
+        ];
+        let tasks_json_exists = checker(&[("engine-rs", "EN.12.F"), ("engine-rs", "EN.12.G")]);
+        let git_runner = selective_history_git_runner();
+
+        let outcome = propose_chain(&config, &proposed, &slate, &tasks_json_exists, &git_runner)
+            .expect("subset + tasks.json checks pass; the pre-flight only drops, never refuses");
+
+        // EN.12.F was dropped by the pre-flight, not proposed downstream —
+        // proving the pre-flight ran BEFORE the chain was finalised.
+        assert_eq!(outcome.chain.len(), 1);
+        assert_eq!(outcome.chain[0].block_id, "EN.12.G");
+
+        assert_eq!(outcome.dropped.len(), 1);
+        assert_eq!(outcome.dropped[0].block_id, "EN.12.F");
+        assert!(outcome.dropped[0].reason.contains("EN.12.F"));
     }
 }
