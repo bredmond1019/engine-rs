@@ -32,11 +32,10 @@ git config --get core.hooksPath   # → hooks
 > has no active hooks there, so nothing is lost. To revert: `git config --unset core.hooksPath`.
 
 **Enabled per repo (as of 2026-08-06): all 15 eligible repos.** The first five were switched on
-2026-08-04 under `HQ.chore.pre-push-gate-hook` — HQ (this repo), `learn-ai/`, `business/bastiel/`,
-`client/brazilianportugui/`, `client/wild-trail-photo/`. The remaining ten were switched on
-2026-08-06 during a quiet-fleet window: `core/orchestrator`, `core/mev`, `core/bastion`,
-`core/bastion-ui`, `core/bella`, `core/engine-rs`, `core/claude-code-rs`, `core/bastion-web`,
-`side/amistad`, `side/price-scout`.
+2026-08-04 under `HQ.chore.pre-push-gate-hook`; the remaining ten on 2026-08-06 during a
+quiet-fleet window. The repos are deliberately not enumerated here: this file ships inside
+public repositories, and the fleet's repo list includes client work. Read the live list from
+`brain.toml`'s `[[repos]]` table instead, which is where it is authoritative anyway.
 
 > **`base-template` is not eligible and never was.** It has no `hooks/` directory because
 > `discover_targets()` in `base-template/scripts/sync_downstream_harness.py` explicitly skips
@@ -422,9 +421,10 @@ config format — this is the existing checks manifest, re-run at a new trigger 
     `harness.json` committed ahead of `create-next-app`/`cargo new` is not a real failure.
   - an individual gated check's command isn't on PATH (e.g. a tool nobody installed on this
     machine) → that one check is skipped, warning only; the rest still run
-- **Cost is whatever the repo's own gates cost** — measured on the four repos this shipped with:
-  bastiel ~16s (lint+types+test+build), brazilianportugui ~12s, learn-ai ~40s (6 checks incl. a
-  full `next build`), wild-trail-photo currently a no-op (unscaffolded, no `package.json` yet).
+- **Cost is whatever the repo's own gates cost** — measured on the four repos this shipped
+  with: roughly 12-16s for a small Next.js app (lint+types+test+build), ~40s for a larger one
+  (6 checks including a full `next build`), and a no-op for a repo not yet scaffolded (no
+  `package.json`, so nothing to run).
   Same rationale as stage 1 for living at pre-push and not pre-commit.
 - **`--no-verify` skips both stages.** There is no way to skip stage 2 alone short of temporarily
   removing/editing `planning/harness.json`'s `gates` flags — that's intentional; if a check is
