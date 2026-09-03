@@ -1,5 +1,5 @@
 {
-  "version": "b647770edebb0166205a8e1e75b938af4f8785c7",
+  "version": "c3e9fe7c5ff4345c00b9b39fb0323e2371cc0e45",
   "generated": "2026-09-03",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -21,7 +21,7 @@
     ".claude/commands/log-work.md": "b818e53c04840b3368128e6f9ae177fb7c5e034f5bc3e2bdaf669accaee3dc74",
     ".claude/commands/sync-all.md": "57a11500b8c765d32864f544bad19fdef37de93f70beb047aa8f60180f42b8f3",
     ".claude/commands/next.md": "3ad5b77bb22f9edf43821a2aa98c876e11ddd159740f6e8c2bf6933cd13765f4",
-    ".claude/commands/sync-global-skills.md": "c20a7c572bbafd6ee602bbb41562c84d7c4a3d6b92ce1a5ba774b5e0a3d1fd80",
+    ".claude/commands/sync-global-skills.md": "e0f0e5374fd8e413ba98a5b4b56aa97f3640eff0d45211b3c5225c4c02e62b59",
     ".claude/commands/generate-master-plan.md": "28c96669f9601840d94f9d4943e0b0837cbee46f82cad57592f0c25a1240b0e7",
     ".claude/commands/define-design-system.md": "d06d842a0ff4e00f0ef3462f31033c43db21c3de940a0b228173c028bf372ba7",
     ".claude/commands/orchestration-commander.md": "be1fa465c72dcb6b0af2df6cb41b5a181323e5b5adca5b31c5ac344bf528b3fc",
@@ -80,6 +80,8 @@
     ".agents/skills/notify-operator/SKILL.md": "f03c1c71ed913af454ff2085ad56edddb5c5c6824fe837880a42d70dc1c9cd43",
     ".agents/skills/check-blast-radius/SKILL.md": "75f94560df69a84f97ff7b272a1e5538e331f7cc11c950860a38736fc1bb35e9",
     ".agents/skills/pick-the-next-block/SKILL.md": "9654dde6a74942dde60a56f0ac082b14bb66db4cc0ca929ee30e4a437dbcaf09",
+    ".agents/skills/fleet-push-discipline/SKILL.md": "58327c1303bd4aa68c8c17ee3c9f6784c441a056513dc240872971a92530cf44",
+    ".agents/skills/stamp-workflow-run-id/SKILL.md": "6937d301449fa243e803557366252b9672c4f4bcb8966455404cc0a66276e1f3",
     "hooks/pre-push": "cfa9992dcd433d2bb5851d3ede8af83c2d4193c28b2544c26e0a1e4f89b0efe6",
     "hooks/test_pre_push.sh": "1609949cc90574cdbbfc56839dec391bf40ec21037fe44f25aad43b52113d7d1",
     "hooks/README.md": "5c6038e8a225241300c6e0625d1290d18e0f87eb6b417ade8fa6534aca80fe9a",
