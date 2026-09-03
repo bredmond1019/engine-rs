@@ -238,6 +238,10 @@ fn patch_close_block_into_state(ctx: &TaskContext, runner: &CommandRunner, state
 pub struct EmitStateNode {
     runner: CommandRunner,
     state_filename: &'static str,
+    /// Lane identity passed as `--agent <id>` so the node self-exempts an
+    /// exclusive lease it owns (`EN.ticket.emit-state-node-must-self-exempt-its-own-lease`).
+    /// `None` (the default) keeps the argv byte-identical to today.
+    agent: Option<String>,
 }
 
 impl EmitStateNode {
@@ -246,6 +250,7 @@ impl EmitStateNode {
         Self {
             runner: default_command_runner(),
             state_filename: DEFAULT_STATE_FILENAME,
+            agent: None,
         }
     }
 
@@ -266,6 +271,16 @@ impl EmitStateNode {
         self.state_filename = filename;
         self
     }
+
+    /// Set the lane identity to pass as `--agent <id>` so this node's own
+    /// terminal emit self-exempts an exclusive lease the running chain
+    /// holds on its own repo. Leaving this unset keeps the invocation
+    /// exactly as it was before this knob existed.
+    #[must_use]
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
+        self
+    }
 }
 
 impl Default for EmitStateNode {
@@ -280,9 +295,11 @@ impl Node for EmitStateNode {
         // `CommandRunner` (`sdlc_flow`) and `crate::policy::emit_state::Runner<CommandOutput>`
         // (the generic seam) are the same underlying `Arc<dyn Fn(...) -> io::Result<CommandOutput>>`
         // type, so `self.runner` is directly usable here.
-        let ctx = GenericEmitStateNode::new(self.runner.clone())
-            .process(ctx)
-            .await?;
+        let mut generic = GenericEmitStateNode::new(self.runner.clone());
+        if let Some(agent) = self.agent.clone() {
+            generic = generic.with_agent(agent);
+        }
+        let ctx = generic.process(ctx).await?;
 
         // EN.ticket.wrap-up-closes-the-block task 5: patch CloseBlockNode's
         // outcome into the already-committed state file's
@@ -360,6 +377,62 @@ mod tests {
         assert_eq!(recorded[0].0, "mev");
         assert_eq!(recorded[0].1, vec!["emit-state", "--write"]);
         assert_eq!(recorded[0].2, "trees/sdlc/EN.3.B");
+    }
+
+    #[tokio::test]
+    async fn with_agent_appends_the_agent_flag_to_argv() {
+        let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+                cwd.to_string_lossy().into_owned(),
+            ));
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let ctx = ctx_with("trees/sdlc/EN.3.B");
+        let node = EmitStateNode::new()
+            .with_runner(runner)
+            .with_agent("lane-engine-rs-d5");
+        node.process(ctx).await.expect("process should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].1,
+            vec!["emit-state", "--write", "--agent", "lane-engine-rs-d5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_agent_configured_leaves_argv_byte_identical_to_today() {
+        let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: CommandRunner = Arc::new(move |program, args, cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+                cwd.to_string_lossy().into_owned(),
+            ));
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let ctx = ctx_with("trees/sdlc/EN.3.B");
+        let node = EmitStateNode::new().with_runner(runner);
+        node.process(ctx).await.expect("process should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded[0].1, vec!["emit-state", "--write"]);
     }
 
     #[tokio::test]

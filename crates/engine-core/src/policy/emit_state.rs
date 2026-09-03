@@ -50,6 +50,13 @@ fn worktree_path(ctx: &TaskContext) -> String {
 /// produces so this module carries no `sdlc_flow` dependency.
 pub struct EmitStateNode<O: CommandOutputLike> {
     runner: Runner<O>,
+    /// Lane identity passed as `--agent <id>` so the node self-exempts an
+    /// exclusive lease it owns, while a lease held by a DIFFERENT agent
+    /// still refuses it (mev's `refuse_if_quiesced` gate,
+    /// `EN.ticket.emit-state-node-must-self-exempt-its-own-lease`).
+    /// `None` (the default) keeps the argv byte-identical to today —
+    /// behavior-stable per standing rule 6.
+    agent: Option<String>,
 }
 
 impl<O: CommandOutputLike> EmitStateNode<O> {
@@ -59,13 +66,26 @@ impl<O: CommandOutputLike> EmitStateNode<O> {
     /// subprocess runner to default to (that lives in `sdlc_flow`).
     #[must_use]
     pub fn new(runner: Runner<O>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            agent: None,
+        }
     }
 
     /// Override the command runner used for the `mev` invocation.
     #[must_use]
     pub fn with_runner(mut self, runner: Runner<O>) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Set the lane identity to pass as `--agent <id>` so this node's own
+    /// terminal emit self-exempts an exclusive lease the running chain
+    /// holds on its own repo. Leaving this unset keeps the invocation
+    /// exactly as it was before this knob existed.
+    #[must_use]
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
         self
     }
 }
@@ -76,7 +96,13 @@ impl<O: CommandOutputLike + 'static> Node for EmitStateNode<O> {
         let cwd_string = worktree_path(&ctx);
         let cwd = Path::new(&cwd_string);
 
-        let output = (self.runner)("mev", &["emit-state", "--write"], cwd)
+        let mut args: Vec<&str> = vec!["emit-state", "--write"];
+        if let Some(agent) = self.agent.as_deref() {
+            args.push("--agent");
+            args.push(agent);
+        }
+
+        let output = (self.runner)("mev", &args, cwd)
             .map_err(|err| NodeError::new(format!("mev emit-state failed to spawn: {err}")))?;
 
         let emitted = output.status() == 0;
@@ -192,6 +218,60 @@ mod tests {
         assert_eq!(recorded[0].0, "mev");
         assert_eq!(recorded[0].1, vec!["emit-state", "--write"]);
         assert_eq!(recorded[0].2, "trees/sdlc/EN.4.0");
+    }
+
+    #[tokio::test]
+    async fn with_agent_appends_the_agent_flag_to_argv() {
+        let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: Runner<TestOutput> = Arc::new(move |program, args, cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+                cwd.to_string_lossy().into_owned(),
+            ));
+            Ok(TestOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let ctx = ctx_with("trees/sdlc/EN.4.0");
+        let node = EmitStateNode::new(runner).with_agent("lane-engine-rs-d5");
+        node.process(ctx).await.expect("process should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].1,
+            vec!["emit-state", "--write", "--agent", "lane-engine-rs-d5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_agent_configured_leaves_argv_byte_identical_to_today() {
+        let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let runner: Runner<TestOutput> = Arc::new(move |program, args, cwd| {
+            calls_clone.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+                cwd.to_string_lossy().into_owned(),
+            ));
+            Ok(TestOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let ctx = ctx_with("trees/sdlc/EN.4.0");
+        let node = EmitStateNode::new(runner);
+        node.process(ctx).await.expect("process should succeed");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded[0].1, vec!["emit-state", "--write"]);
     }
 
     #[tokio::test]
