@@ -18,6 +18,15 @@ Turn `seams.md` into **the cut**: an ordered set of candidate blocks, each with 
 each shipping something the operator can use on its own, sequenced by dependency and by what
 makes later work verifiable.
 
+**Which successor consumes this is a COUNT, not a judgement call** — state it in the closing
+report so the caller does not have to re-derive it, and so this stage can be a deterministic node in
+a sequential workflow: count the distinct values in the block table's **Repo** column.
+`== 1` -> `/plan <slug>`, which authors `plan.md` into `planning/<slug>/` alongside this file.
+`> 1` -> `/generate-roadmap <slug> --from planning/<slug>/sequence.md`, which writes
+`planning/roadmaps/<slug>/` and, in its Step 7b, MOVES this folder to
+`planning/roadmaps/<slug>/pre-plan/`. The invariant both paths maintain is that
+`planning/<slug>/` and `planning/roadmaps/<slug>/` are never both populated.
+
 Output: `planning/<slug>/sequence.md`. It is the **only** input `/plan` (one repo) or
 `/generate-roadmap` (multiple repos) needs.
 

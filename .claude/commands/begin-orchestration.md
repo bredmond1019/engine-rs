@@ -74,8 +74,20 @@ rather than a `roadmap.md` file, resolve it in this fixed order:
 
 1. `planning/roadmaps/<slug>/` — if it exists, that is `roadmap_dir`.
 2. Otherwise, legacy `planning/<slug>/` — if it exists, that is `roadmap_dir`.
-3. A slug present in **both** locations is an **error**, not a silent preference — stop and report
-   both paths. An ambiguous roadmap is how a lane appends to the wrong lane log.
+3. A slug present in **both** locations is an **error only when the legacy path is itself a
+   roadmap** — that is, when `planning/<slug>/` holds `lane-log.jsonl` or `roadmap.md`. Then stop
+   and report both paths; an ambiguous roadmap is how a lane appends to the wrong lane log.
+   **Otherwise prefer `planning/roadmaps/<slug>/` silently and say nothing.** A `planning/<slug>/`
+   holding `assessment.md` / `seams.md` / `sequence.md` / `evidence/` is PRE-PLAN RESIDUE, not a
+   rival roadmap: `/assess`, `/seams` and `/sequence` all write there, and which successor consumes
+   them is unknown until `/sequence` counts the repos in its cut — one repo goes to `/plan`, which
+   stays in that same directory, several go to `/generate-roadmap`, which writes
+   `planning/roadmaps/<slug>/`. So the same slug in both places is the NORMAL end state of the
+   multi-repo path. Measured 2026-09-03: 0 of 31 roadmap directories and 0 directories under
+   `planning/` carried a `lane-log.jsonl` or `roadmap.md`, so the unnarrowed rule's true-positive
+   population was empty and it fired only on pre-plan residue — wedging every consolidation in the
+   fleet (`lane_log_watermark.py` hard-exits) on a directory nobody was confused about. The
+   mechanical form is `is_roadmap_dir()` in `scripts/lane_log_watermark.py`; keep the two in step.
 
 An explicit path argument (one that already names a file or a full directory, e.g.
 `planning/roadmaps/close-the-loop/roadmap.md` or `planning/demand-ready/`) is always **honoured as

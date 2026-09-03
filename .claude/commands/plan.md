@@ -15,6 +15,13 @@ $ARGUMENTS — free-text description of the feature, experiment, or body of work
 ## Purpose
 
 Author **one initiative**: a coherent body of work in **one repo**, spanning one or more blocks.
+**This command writes IN PLACE, into `planning/<slug>/`** — `plan.md` lands beside the
+`sequence.md` it was authored from, and any pre-plan artifacts (`assessment.md`, `seams.md`,
+`evidence/`) stay exactly where `/assess` left them. That is deliberate and is one half of an
+invariant: `planning/<slug>/` and `planning/roadmaps/<slug>/` are never both populated. This command
+satisfies it by staying put; `/generate-roadmap` satisfies it by relocating the pre-plan into
+`planning/roadmaps/<slug>/pre-plan/` (its Step 7b). Do not move anything here.
+
 Output is two things, plus a third when `--lane` is passed:
 
 - `planning/<slug>/plan.md` — the authored **narrative**: the goal, the sequencing rationale, the
