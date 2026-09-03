@@ -107,6 +107,15 @@ pub struct FlowInvocation {
     /// construction site): an invocation with an unstated isolation is the
     /// defect this field exists to make unrepresentable.
     pub use_worktree: bool,
+    /// Whether this step's `SDLC_FLOW` run is permitted to open a real PR
+    /// (`true`) or must short-circuit `PullRequestNode` without shelling
+    /// out to `gh` (`false`) — resolved by [`execute_step`] from the
+    /// caller's `default_auto_pr` argument (itself the resolved
+    /// `OrchestrationPolicy::default_auto_pr` knob). Deliberately no
+    /// `Default` and no builder on this struct, same reasoning as
+    /// `use_worktree`: an invocation with an unstated PR policy is the
+    /// defect this field exists to make unrepresentable.
+    pub auto_pr: bool,
     /// The campaign this step belongs to — the parent id that spans the N
     /// runs of one chain (`EN.11.E`). Deliberately no `Default` and no
     /// builder on this struct, same reasoning as `use_worktree`: an
@@ -485,6 +494,10 @@ pub struct ExecutionOutcome {
     /// attribute observed cost/behavior to the setting that produced it,
     /// per CLAUDE.md standing rule 6.
     pub use_worktree: bool,
+    /// The PR policy this step actually resolved to, per CLAUDE.md
+    /// standing rule 6 ("stamp the resolved value") — same reasoning as
+    /// `use_worktree` above.
+    pub auto_pr: bool,
     /// The campaign this step ran under — stamped here for the same reason
     /// as `use_worktree` (CLAUDE.md standing rule 6): a finished step must
     /// be attributable to its campaign without re-reading the child ctx.
@@ -561,6 +574,11 @@ fn step_spend(ctx: &TaskContext) -> (Option<f64>, u64) {
 /// read policy itself, it only consults `registry.brain_root()` (row 2) and
 /// `step.repo` (row 1) alongside whatever the caller passed in for row 3.
 ///
+/// `default_auto_pr` is the resolved `OrchestrationPolicy::default_auto_pr`
+/// knob, carried straight through onto the resolved [`FlowInvocation`] and
+/// seeded into the child event by [`sdlc_flow_event`] — this function does
+/// not itself resolve policy, it only threads the caller-supplied value.
+///
 /// `cancellation_token`/`budget` (`EN.11.F` task 3) are threaded straight
 /// into the resolved [`FlowInvocation`] for [`default_flow_runner`] to hand
 /// to the child's `RunOptions` — this function does not itself check
@@ -580,6 +598,7 @@ pub async fn execute_step(
     registry: &RepoRegistry,
     run_flow: &FlowRunner,
     default_use_worktree: bool,
+    default_auto_pr: bool,
     campaign_id: Uuid,
     cancellation_token: Option<CancellationToken>,
     budget: Option<Budget>,
@@ -639,6 +658,7 @@ pub async fn execute_step(
         repo_path: repo_path.clone(),
         block_id: step.block_id.clone(),
         use_worktree,
+        auto_pr: default_auto_pr,
         campaign_id,
         engine,
         cancellation_token,
@@ -683,6 +703,7 @@ pub async fn execute_step(
         engine,
         ctx,
         use_worktree,
+        auto_pr: default_auto_pr,
         campaign_id,
         cost_usd,
         total_tokens,
@@ -705,6 +726,7 @@ fn sdlc_flow_event(invocation: &FlowInvocation) -> serde_json::Value {
         "repo": invocation.repo,
         "spec_slug": invocation.block_id,
         "use_worktree": invocation.use_worktree,
+        "auto_pr": invocation.auto_pr,
         "campaign_id": invocation.campaign_id,
         "permission_profile": invocation.permission_profile,
     })
@@ -890,6 +912,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -904,6 +927,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -944,6 +968,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -980,6 +1005,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1044,6 +1070,7 @@ mod tests {
             &registry,
             &failing_runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1081,6 +1108,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1119,6 +1147,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1170,6 +1199,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1232,6 +1262,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1280,6 +1311,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1347,6 +1379,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1377,6 +1410,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1492,6 +1526,7 @@ mod tests {
             repo_path: PathBuf::from("/tmp/repo-a"),
             block_id: "A.1".to_string(),
             use_worktree: true,
+            auto_pr: true,
             campaign_id: Uuid::new_v4(),
             engine: EngineKind::Flow,
             cancellation_token: None,
@@ -1505,6 +1540,7 @@ mod tests {
 
         let invocation_false = FlowInvocation {
             use_worktree: false,
+            auto_pr: true,
             ..invocation_true
         };
         assert_eq!(
@@ -1523,6 +1559,7 @@ mod tests {
             repo_path: PathBuf::from("/tmp/repo-a"),
             block_id: "A.1".to_string(),
             use_worktree: true,
+            auto_pr: true,
             campaign_id,
             engine: EngineKind::Flow,
             cancellation_token: None,
@@ -1572,6 +1609,7 @@ mod tests {
             &registry,
             &runner,
             true,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1586,6 +1624,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1669,6 +1708,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1699,6 +1739,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1731,6 +1772,7 @@ mod tests {
             &registry,
             &runner,
             false,
+            true,
             Uuid::new_v4(),
             None,
             None,
@@ -1823,6 +1865,7 @@ mod tests {
             repo_path: PathBuf::from("/tmp/repo-a"),
             block_id: "A.1".to_string(),
             use_worktree: false,
+            auto_pr: true,
             campaign_id: Uuid::new_v4(),
             engine: EngineKind::Flow,
             cancellation_token: None,
@@ -1842,6 +1885,7 @@ mod tests {
             repo_path: PathBuf::from("/tmp/repo-a"),
             block_id: "A.1".to_string(),
             use_worktree: false,
+            auto_pr: true,
             campaign_id: Uuid::new_v4(),
             engine: EngineKind::Task,
             cancellation_token: None,
@@ -1851,5 +1895,112 @@ mod tests {
 
         let event = sdlc_task_event(&invocation);
         assert_eq!(event["permission_profile"], json!("unrestricted"));
+    }
+
+    // ── FlowInvocation.auto_pr threading (EN.ticket.orchestration-auto-pr-knob) ──
+
+    /// The decisive test for this block: `sdlc_flow_event` must seed an
+    /// `"auto_pr"` key equal to the invocation's value, in both
+    /// directions. This test could not pass — could not even compile —
+    /// before `FlowInvocation::auto_pr` and the `sdlc_flow_event` seeding
+    /// line existed; that pre-field compile failure is this block's
+    /// reproduction.
+    #[test]
+    fn sdlc_flow_event_seeds_auto_pr_with_the_invocations_value() {
+        let invocation_true = FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: true,
+            auto_pr: true,
+            campaign_id: Uuid::new_v4(),
+            engine: EngineKind::Flow,
+            cancellation_token: None,
+            budget: None,
+            permission_profile: PermissionProfile::Standard,
+        };
+        assert_eq!(sdlc_flow_event(&invocation_true)["auto_pr"], json!(true));
+
+        let invocation_false = FlowInvocation {
+            auto_pr: false,
+            ..invocation_true
+        };
+        assert_eq!(sdlc_flow_event(&invocation_false)["auto_pr"], json!(false));
+    }
+
+    /// `SDLC_TASK` ships no PR ceremony — `sdlc_task_event` must keep
+    /// emitting exactly its five existing keys and never an `auto_pr` key,
+    /// regardless of the invocation's own `auto_pr` value.
+    #[test]
+    fn sdlc_task_event_never_seeds_auto_pr() {
+        let invocation = FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: false,
+            auto_pr: false,
+            campaign_id: Uuid::new_v4(),
+            engine: EngineKind::Task,
+            cancellation_token: None,
+            budget: None,
+            permission_profile: PermissionProfile::Standard,
+        };
+
+        let event = sdlc_task_event(&invocation);
+        assert!(
+            event.get("auto_pr").is_none(),
+            "sdlc_task_event must never emit an auto_pr key, got: {event}"
+        );
+        let keys: std::collections::BTreeSet<&str> = event
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "repo",
+                "spec_slug",
+                "use_worktree",
+                "campaign_id",
+                "permission_profile",
+            ]),
+            "sdlc_task_event must emit exactly its five existing keys"
+        );
+    }
+
+    /// `execute_step` populates `FlowInvocation::auto_pr` from the
+    /// caller-supplied `default_auto_pr` argument (the resolved
+    /// `OrchestrationPolicy::default_auto_pr` value), and stamps the same
+    /// resolved value into `ExecutionOutcome::auto_pr` per CLAUDE.md
+    /// standing rule 6.
+    #[tokio::test]
+    async fn execute_step_populates_auto_pr_from_the_resolved_policy_and_stamps_it() {
+        let (_dir, registry) = registry_with_base_template();
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let s = step("repo-a", "A.1");
+
+        let outcome = execute_step(
+            &s,
+            &resolve_engine,
+            &registry,
+            &runner,
+            false,
+            false,
+            Uuid::new_v4(),
+            None,
+            None,
+            PermissionProfile::Standard,
+            None,
+        )
+        .await
+        .expect("execute_step should succeed");
+
+        assert!(
+            !outcome.auto_pr,
+            "ExecutionOutcome::auto_pr must equal the resolved default_auto_pr passed in"
+        );
     }
 }

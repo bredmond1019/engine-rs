@@ -1863,12 +1863,19 @@ async fn integrate_chain_impl(
             crate::policy::permission::resolve_permission_profile(
                 &registry.brain_root().join("brain.toml"),
             );
+        // `default_auto_pr` is hardcoded `true` here — behavior-stable
+        // with today's implicit default (the SDLC_FLOW schema's own serde
+        // default) — until a future task threads the real
+        // `OrchestrationPolicy::default_auto_pr` knob through
+        // `integrate_chain` from `OrchestrationRunNode::process`, the same
+        // shape `default_use_worktree` followed above it.
         let outcome = match execute_step(
             step,
             resolve_engine,
             registry,
             run_flow,
             default_use_worktree,
+            true,
             campaign_id,
             None,
             None,
@@ -2142,6 +2149,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2215,6 +2223,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2238,6 +2247,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2264,6 +2274,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2348,6 +2359,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2463,6 +2475,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2496,6 +2509,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2590,6 +2604,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2617,6 +2632,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,
@@ -2633,6 +2649,7 @@ mod tests {
                 node_runs: std::collections::HashMap::new(),
             },
             use_worktree: false,
+            auto_pr: true,
             campaign_id: uuid::Uuid::new_v4(),
             cost_usd: None,
             total_tokens: 0,

@@ -2599,6 +2599,7 @@ async fn path_d_a_locked_parent_cannot_produce_an_unrestricted_child() {
         &registry,
         &flow_runner,
         false,
+        true,
         Uuid::new_v4(),
         None,
         None,
