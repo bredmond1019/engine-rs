@@ -29,5 +29,8 @@
 //! - Registration lives in `crates/engine-serve/src/workflows.rs` (task 3),
 //!   the same one-fn-per-type pattern as the other workflow types.
 
+pub mod judge;
 pub mod load_claims;
+pub mod queue_router;
+pub mod save_verdict;
 pub mod schema;
