@@ -1186,31 +1186,43 @@ pub fn register_orchestration_with_registry(
 /// opportunity/harvest/lead workflows: `DebriefNode` calls no model and
 /// reads no `harness.json` policy section, so this factory resolves no
 /// policy and seeds no policy stamp. Wires the live
-/// [`crate::journal::journal_reader_live`] (task 1) — with no pool, since a
-/// `Dispatcher` factory closure runs at process start-up, before
-/// `engine-serve`'s `AppState`/`DurableHandle` (and the Postgres pool it
-/// carries) exist for any served request (see `register_orchestration`'s
-/// own `StepFanoutContext` doc for the identical gap on `ORCHESTRATION`);
-/// `journal_reader_live(None)` self-skips to an empty campaign rather than
-/// erroring, per that constructor's own doc — wiring a real pool through
-/// this seam is a separate concern from this task. `transport` is
-/// `channel_transport_live` pointed at [`events_url_from_env`], mirroring
-/// [`register_research_agent`]'s / [`register_content_pipeline`]'s own
-/// transport wiring. No journal sink is wired here either, for the same
-/// no-pool-yet reason — [`engine_core::workflows::orchestration::graph::debrief_registry`]'s
-/// `journal_sink` parameter exists precisely so a caller that DOES have a
-/// live sink (a hermetic test, or a future wiring of this gap) can pass
-/// one without this function's signature changing.
+/// [`crate::journal::journal_reader_live`] (task 1), with the process-global
+/// `DurableHandle` [`crate::journal::journal_durable_handle`] currently has
+/// installed (EN.14.E task 4) — resolved *inside* the boxed factory closure,
+/// which `engine_core::dispatch::Dispatcher::dispatch_with_event` re-invokes
+/// on every dispatched `DEBRIEF` event, not once at registration time. That
+/// distinction is what makes this seam work at all: `register_debrief`
+/// itself (the call that registers the factory) does run at process
+/// start-up, before `engine-serve`'s `AppState`/`DurableHandle` (and the
+/// Postgres pool it carries) exist for any served request (see
+/// `register_orchestration`'s own `StepFanoutContext` doc for the identical
+/// gap on `ORCHESTRATION`) — but the *closure body* below runs fresh per
+/// event, by which point a handle may well have been installed via
+/// `crate::journal::set_journal_durable_handle`. With none installed (no
+/// `DATABASE_URL`, or nothing has called the setter — e.g. `bastion`'s
+/// `serve/mod.rs`, out of this repo, the same boundary `AppState`'s own doc
+/// comment names), `journal_reader_live(None)` self-skips to an empty
+/// campaign and the sink drops every row, exactly as both did before this
+/// task — never an error. `transport` is `channel_transport_live` pointed at
+/// [`events_url_from_env`], mirroring [`register_research_agent`]'s /
+/// [`register_content_pipeline`]'s own transport wiring.
+/// `crate::journal::journal_sink_live()` is the live
+/// [`engine_core::workflows::orchestration::graph::debrief_registry`]'s
+/// `journal_sink` parameter this factory now passes — the seam that doc
+/// comment always said a live sink would use, without changing this
+/// function's own signature.
 pub fn register_debrief(dispatcher: &mut Dispatcher) {
     dispatcher.register(
         engine_core::workflows::orchestration::graph::debrief_schema(),
         Box::new(|_event: &serde_json::Value| {
+            let pool = crate::journal::journal_durable_handle()
+                .and_then(|handle| handle.pool().cloned());
             let registry = engine_core::workflows::orchestration::graph::debrief_registry(
-                crate::journal::journal_reader_live(None),
+                crate::journal::journal_reader_live(pool),
                 engine_core::nodes::channel_transport::channel_transport_live(
                     events_url_from_env(),
                 ),
-                None,
+                Some(crate::journal::journal_sink_live()),
             );
             Ok(Workflow::new(
                 registry,
@@ -2925,6 +2937,30 @@ mod tests {
             .expect("DEBRIEF should dispatch to a runnable Workflow");
 
         let _ = workflow;
+    }
+
+    /// EN.14.E task 4: with a process-global `DurableHandle` installed
+    /// (`crate::journal::set_journal_durable_handle`), the same dispatch
+    /// still builds a runnable `Workflow` — `register_debrief`'s closure
+    /// now resolves the reader's pool and the sink from that handle at
+    /// dispatch time rather than always passing `None`/no sink, and this
+    /// must not change dispatch's own success/failure shape.
+    #[test]
+    fn register_debrief_dispatches_with_a_journal_durable_handle_installed() {
+        let (handle, _receiver) = crate::durable::test_handle();
+        crate::journal::set_journal_durable_handle(handle);
+
+        let mut dispatcher = Dispatcher::new();
+        register_debrief(&mut dispatcher);
+
+        let result = dispatcher.dispatch_with_event(
+            "DEBRIEF",
+            &serde_json::json!("00000000-0000-0000-0000-000000000000"),
+        );
+
+        crate::journal::clear_journal_durable_handle();
+
+        result.expect("DEBRIEF should still dispatch with a journal durable handle installed");
     }
 
     #[test]

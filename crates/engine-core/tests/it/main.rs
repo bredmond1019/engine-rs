@@ -35,6 +35,7 @@ mod fan_out_aggregate;
 mod gate_timeout_fixture;
 mod harvest_gate_e2e;
 mod held_session;
+mod journal_wiring;
 mod linkedin_post_e2e;
 mod locale_rate_card;
 mod materialize_doc;

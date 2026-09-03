@@ -19,14 +19,17 @@
 //! clean `404`, never a `500`. This mirrors `crate::resume::rehydrate_from_store`,
 //! which returns `None` on a missing pool so its caller 404s uniformly.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use async_trait::async_trait;
 use engine_contract::{JournalDecisionKind, JournalRow};
 use engine_core::workflows::orchestration::debrief::JournalReader;
+use engine_core::workflows::orchestration::integrate::JournalSinkFn;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::durable::DurableHandle;
 
 use crate::http::{check_api_key, AppState};
 
@@ -345,6 +348,86 @@ pub fn journal_reader_live(pool: Option<PgPool>) -> Arc<dyn JournalReader> {
     Arc::new(LiveJournalReader::new(pool))
 }
 
+// ---------------------------------------------------------------------------
+// EN.14.E task 4 — the process-global journal `DurableHandle` seam.
+//
+// `register_debrief`'s (`workflows.rs`) `WorkflowFactory` closure has the
+// same shape problem `workflows.rs`'s `repo_registry_cell`/`set_repo_registry`
+// pattern already solves for `RepoRegistry`: `engine_core::dispatch::Dispatcher`
+// registers a bare `Fn(&serde_json::Value) -> Result<Workflow, String>` per
+// `workflow_type`, with no way to thread `AppState`/`DurableHandle` through
+// the call — the factory is registered once (`register_builtin_workflows`,
+// called at process start-up before `AppState`/its Postgres pool exist) but
+// invoked fresh on every `dispatch_with_event` call thereafter, by which
+// point a real handle (and its pool) may well exist. This cell is the same
+// fix, specialized to the one `DurableHandle` `register_debrief` needs: its
+// reader (`journal_reader_live`) and its sink (`journal_sink_live`) both
+// resolve it at *dispatch* time, not at registration time, exactly mirroring
+// `repo_registry()`'s own resolution point.
+//
+// Nothing in this crate installs the handle yet — the real handle (wrapping
+// a live Postgres pool) is built by whichever binary constructs `AppState`
+// (`bastion`'s `serve/mod.rs`, out of this repo, the same boundary
+// `AppState`'s own doc comment names for `campaigns`/`runs`), via
+// `set_journal_durable_handle`. With none installed, both the reader and the
+// sink self-skip exactly as they did before this task: an absent pool reads
+// back an empty `Vec` ([`LiveJournalReader::rows_for_campaign`]) and a
+// dropped journal row is simply never written, matching
+// `DurableHandle::send_journal`'s own swallowed-error contract for a `None`
+// writer_pool.
+fn journal_durable_cell() -> &'static RwLock<Option<DurableHandle>> {
+    static JOURNAL_DURABLE: OnceLock<RwLock<Option<DurableHandle>>> = OnceLock::new();
+    JOURNAL_DURABLE.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the process-global `DurableHandle` [`register_debrief`]'s reader
+/// and sink resolve at dispatch time. Overwrites any previously installed
+/// handle — a test that installs one for the duration of a case should
+/// restore the previous value (typically `None`) on the way out, mirroring
+/// `workflows::set_repo_registry`'s own contract.
+pub fn set_journal_durable_handle(handle: DurableHandle) {
+    if let Ok(mut guard) = journal_durable_cell().write() {
+        *guard = Some(handle);
+    }
+}
+
+/// Clear the process-global journal `DurableHandle`, restoring the
+/// "no handle installed" self-skip default.
+pub fn clear_journal_durable_handle() {
+    if let Ok(mut guard) = journal_durable_cell().write() {
+        *guard = None;
+    }
+}
+
+/// Read the currently installed process-global journal `DurableHandle`, if
+/// any. `DurableHandle` is cheaply `Clone` (an `mpsc::UnboundedSender` plus
+/// an `Option<PgPool>`), matching `repo_registry`'s own clone-out-of-the-lock
+/// shape.
+pub fn journal_durable_handle() -> Option<DurableHandle> {
+    journal_durable_cell()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// The live journal sink `register_debrief` wires into
+/// [`engine_core::workflows::orchestration::graph::debrief_registry`]: every
+/// [`JournalRow`] `DebriefNode` decides to write is forwarded to
+/// [`DurableHandle::send_journal`] on whichever handle is currently
+/// installed (see [`journal_durable_handle`]). With none installed the row
+/// is simply dropped — the same "no `DATABASE_URL`, no durable write"
+/// self-skip every other seam in this module already applies, never an
+/// error or a panic. This is `send_journal`'s first production caller
+/// (previously `#[cfg(test)]`-only).
+#[must_use]
+pub fn journal_sink_live() -> Arc<JournalSinkFn> {
+    Arc::new(|row: JournalRow| {
+        if let Some(handle) = journal_durable_handle() {
+            handle.send_journal(row);
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -379,6 +462,100 @@ mod tests {
             .expect("self-skip returns Ok, not Err");
 
         assert!(rows.is_empty());
+    }
+
+    /// EN.14.E task 4: with no process-global `DurableHandle` installed
+    /// (the default, and the state every other test in this binary leaves
+    /// it in — `nextest` forks a process per test, so there is no
+    /// cross-test contention on this static), [`super::journal_durable_handle`]
+    /// reads back `None`.
+    #[::core::prelude::v1::test]
+    fn journal_durable_handle_defaults_to_none() {
+        assert!(super::journal_durable_handle().is_none());
+    }
+
+    /// Round-trips [`super::set_journal_durable_handle`] /
+    /// [`super::journal_durable_handle`] / [`super::clear_journal_durable_handle`]
+    /// against a channel-backed test handle (`crate::durable::test_handle`,
+    /// no live pool) — the same seam `register_debrief`'s dispatch-time
+    /// resolution (`workflows.rs`) reads through.
+    #[::core::prelude::v1::test]
+    fn journal_durable_handle_round_trips_through_set_and_clear() {
+        let (handle, _receiver) = crate::durable::test_handle();
+
+        super::set_journal_durable_handle(handle);
+        assert!(
+            super::journal_durable_handle().is_some(),
+            "installed handle should read back Some"
+        );
+
+        super::clear_journal_durable_handle();
+        assert!(
+            super::journal_durable_handle().is_none(),
+            "cleared handle should read back None again"
+        );
+    }
+
+    /// EN.14.E task 4 — `send_journal`'s first production caller
+    /// (previously `#[cfg(test)]`-only, per the block's own acceptance
+    /// criteria): with a `DurableHandle` installed, [`super::journal_sink_live`]'s
+    /// closure forwards a [`JournalRow`] through `DurableHandle::send_journal`
+    /// onto that handle's channel — asserted here by reading it straight
+    /// back off the test-handle receiver, with no live Postgres involved.
+    #[tokio::test]
+    async fn journal_sink_live_forwards_a_row_to_the_installed_handle() {
+        let (handle, mut receiver) = crate::durable::test_handle();
+        super::set_journal_durable_handle(handle);
+
+        let sink = super::journal_sink_live();
+        let row = super::JournalRow {
+            id: Uuid::new_v4(),
+            campaign_id: "campaign-task4".to_string(),
+            run_id: Uuid::new_v4(),
+            step: "debrief".to_string(),
+            kind: engine_contract::JournalDecisionKind::RecallConsulted,
+            reason: "task 4 sink wiring test".to_string(),
+            detail: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        sink(row.clone());
+
+        super::clear_journal_durable_handle();
+
+        let received = receiver
+            .try_recv()
+            .expect("sink should have sent the row onto the installed handle's channel");
+        match received {
+            crate::durable::DurableItem::Journal(received_row) => {
+                assert_eq!(received_row.id, row.id);
+                assert_eq!(received_row.campaign_id, row.campaign_id);
+            }
+            other => panic!("expected DurableItem::Journal, got {other:?}"),
+        }
+    }
+
+    /// With no `DurableHandle` installed (the default self-skip), the sink
+    /// silently drops the row instead of panicking — mirroring
+    /// `DurableHandle::send_journal`'s own dropped-write contract for a
+    /// `None` `writer_pool` at the other end of the channel.
+    #[::core::prelude::v1::test]
+    fn journal_sink_live_drops_the_row_with_no_handle_installed() {
+        assert!(super::journal_durable_handle().is_none());
+
+        let sink = super::journal_sink_live();
+        let row = super::JournalRow {
+            id: Uuid::new_v4(),
+            campaign_id: "campaign-task4-no-handle".to_string(),
+            run_id: Uuid::new_v4(),
+            step: "debrief".to_string(),
+            kind: engine_contract::JournalDecisionKind::RecallConsulted,
+            reason: "no handle installed".to_string(),
+            detail: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Must not panic.
+        sink(row);
     }
 
     /// `RecallConsulted` renders `DONE` (an observation, not an open item

@@ -80,11 +80,17 @@ flowchart LR
    this node itself produced, not whatever the fire-and-forget `CONTENT_PIPELINE` run does with it.
 
 The production wiring (`register_debrief`, `crates/engine-serve/src/workflows.rs`) uses the live
-`JournalReader` (`journal::journal_reader_live`) and the live `ChannelTransport`. Its journal-sink
-is unset at dispatch time — a `Dispatcher` factory closure runs before the serving process's
-Postgres pool exists (the same gap `ORCHESTRATION`'s own `StepFanoutContext` documents) — so a
-production run's brief is dispatched and rendered, but the synchronous write-back needs a live
-sink wired in; see [`../architecture.md`](../architecture.md) for the current state of that gap.
+`JournalReader` (`journal::journal_reader_live`) and journal-sink (`journal::journal_sink_live`),
+plus the live `ChannelTransport`. `register_debrief` itself — the call that registers the
+`Dispatcher` factory — still runs before the serving process's Postgres pool exists (the same gap
+`ORCHESTRATION`'s own `StepFanoutContext` documents), but the *closure body* resolves the reader's
+pool and the sink fresh on every dispatch, from a process-global `DurableHandle` cell
+(`journal::set_journal_durable_handle`/`journal_durable_handle`) rather than at registration time —
+so once something has installed a handle (e.g. `bastion`'s `serve/mod.rs`, out of this repo), both
+the read and the synchronous write-back are live for that and every later dispatch. With no handle
+installed, the reader self-skips to an empty campaign and the sink drops the row, exactly as before
+this wiring — never an error. See [`../architecture.md`](../architecture.md) for the seam's full
+detail.
 
 ## No policy, no profiles
 

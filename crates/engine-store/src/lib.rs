@@ -7,7 +7,8 @@ pub mod postgres;
 
 pub use postgres::{
     connect, get_event, get_task_context, insert_event, insert_journal_row,
-    list_journal_rows_for_campaign, list_orphan_candidates, touch, update_event, upsert_event,
+    list_journal_rows_for_campaign, list_orphan_candidates, run_migrations, touch, update_event,
+    upsert_event,
 };
 
 /// Placeholder identifying this crate; exists so the workspace has at least one
