@@ -55,9 +55,16 @@
 //!   comment) that renders a publishable post draft from the same journal
 //!   rows the ops digest already reads, refusing to produce one when the
 //!   run has no measured number and no evidence path to show for itself.
+//! - [`conductor`] (`EN.12.F` Task 1) — `CONDUCTOR`'s two inputs: the
+//!   operator-written weekly objective file and mev's computed candidate
+//!   slate (`mev frontier --json`), the latter shelled out through the same
+//!   `CommandRunner` convention `policy::emit_state::EmitStateNode` already
+//!   uses. Later tasks turn these into a slate-constrained, justified chain
+//!   proposal and journal write.
 
 pub mod chain;
 pub mod checkpoint;
+pub mod conductor;
 pub mod corpus_gates;
 pub mod debrief;
 pub mod dispatch;
