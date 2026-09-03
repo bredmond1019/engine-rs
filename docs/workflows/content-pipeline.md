@@ -239,10 +239,16 @@ opportunity instance and this one is the model string and the source node. `EN.7
 `the_same_node_and_seam_serve_both_doc_kinds` test pins that claim.
 
 Where the document lands: `okf_core::LearningArtifact`'s `index_intent` targets
-`docs/content/learning-corpus/`, with the filename derived from the `artifact_id` slug. That path is
-sketch-level and expected to move — **where externally-harvested knowledge lives, and how it is
-organized, is a separate future decision** deliberately not made here. `materialize.corpus_root`
-exists so that decision stays open.
+`docs/content/drafts/`, with the filename derived from the `artifact_id` slug. **The directory is
+decided by okf-core, not by this repo and not by `mev`** — `mev`'s materializer resolves its write
+target as `root/dirname(index_path)/link_target`, so whatever `LEARNING_CORPUS_INDEX`
+(`okf-core/src/doc/learning_artifact.rs`) points at is where documents land. Derive it from
+`index_intent()` rather than restating the literal; a test that hardcodes the path keeps passing
+while covering nothing once the model moves.
+
+It was repointed on 2026-09-03 from the sketch-level `docs/content/learning-corpus/` placeholder to
+the draft queue `EN.12.M` feeds. `materialize.corpus_root` still exists, so the decision about where
+externally-harvested knowledge ultimately lives stays open.
 
 **Idempotency** comes from two layers stacked: `artifact_id` is UUID-v5-derived from `envelope_id`
 (so a retried webhook mints the same id, hence the same slug and path), and the materializer plans

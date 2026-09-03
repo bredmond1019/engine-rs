@@ -126,9 +126,15 @@ The e2e suites in `tests/it/` follow rules worth preserving:
   *next* run passed. Measured 2026-08-22 — 492 leaked sessions dating back four days, a green local
   suite, and the same tests red on CI, which has no pre-existing server. Green that depends on what
   the previous run left behind is not green.
-- **Don't pre-create directories the writer should create.** Pre-creating
-  `docs/content/learning-corpus/` in every test masked a real production bug where `apply_plan`
-  never created parents (`EN.7.D`, fixed in `d1a8787`).
+- **Don't pre-create directories the writer should create, and never hardcode the path.**
+  Pre-creating the learning-artifact corpus directory in every test masked a real production bug
+  where `apply_plan` never created parents (`EN.7.D`, fixed in `d1a8787`). It went wrong a second
+  way on 2026-09-03: the fixtures hardcoded `docs/content/learning-corpus/`, so when okf-core
+  repointed `LEARNING_CORPUS_INDEX` to `docs/content/drafts/` the fixtures silently kept creating
+  the retired directory — one suite went red with "0 documents on disk" (which reads like a writer
+  bug and was twice misdiagnosed as one), and two others stayed green while covering nothing.
+  **Derive the directory from `LearningArtifact::index_intent()`**, as
+  `content_pipeline_materialize_e2e.rs` and `harvest_gate_e2e.rs` now do.
 - **A migration test never runs against `orchestration_dev`.** `crates/engine-store/tests/
   migrations_apply_cleanly.rs` (`EN.14.E`) `CREATE DATABASE`s a uniquely-named scratch database,
   applies `crates/engine-store/migrations/` to it twice (idempotency), asserts the resulting schema,
