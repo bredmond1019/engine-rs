@@ -23,6 +23,7 @@ mod budget;
 mod cancellation;
 mod claude_code_step;
 mod close_block_commit_manifest;
+mod command_runner_spec;
 mod composition;
 mod content_pipeline_e2e;
 mod content_pipeline_materialize_e2e;
