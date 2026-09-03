@@ -850,11 +850,17 @@ block.
   the injected `JournalSinkFn` — so what `GET /campaigns/{id}/journal` returns is exactly the text
   this node produced, not whatever the fire-and-forget `CONTENT_PIPELINE` run does with it.
   `register_debrief`
-  (`crates/engine-serve/src/workflows.rs`) wires the live `JournalReader` (`journal_reader_live`,
-  called with `None` — a `Dispatcher` factory closure runs before `AppState`'s Postgres pool
-  exists, so it self-skips to an empty campaign, same gap `ORCHESTRATION` documents) and the live
-  `ChannelTransport`, so `DEBRIEF` is directly dispatchable via `POST /events/` with
-  `workflow_type: "DEBRIEF"` and no conductor, chain, roadmap, or lane involved.
+  (`crates/engine-serve/src/workflows.rs`) wires the live `JournalReader` (`journal_reader_live`)
+  and journal-sink (`journal_sink_live`) plus the live `ChannelTransport`, so `DEBRIEF` is directly
+  dispatchable via `POST /events/` with `workflow_type: "DEBRIEF"` and no conductor, chain,
+  roadmap, or lane involved. `register_debrief` itself (the call that registers the `Dispatcher`
+  factory) still runs before `AppState`'s Postgres pool exists — the same gap `ORCHESTRATION`
+  documents — but the closure body resolves both the reader's pool and the sink fresh per dispatch
+  from a process-global `DurableHandle` cell (`journal::set_journal_durable_handle`/
+  `journal_durable_handle`, `EN.14.E`), so once something installs a handle (e.g. `bastion`'s
+  `serve/mod.rs`, out of this repo) a live run's journal read and its synchronous
+  `DebriefRendered` write-back are both live. With no handle installed, the reader self-skips to
+  an empty campaign and the sink drops the row, exactly as both did before this wiring.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,
