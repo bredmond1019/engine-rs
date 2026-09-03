@@ -314,6 +314,10 @@ mod tests {
                 ],
             ),
             ("mod.rs", &[]),
+            // `build_post_draft_payload`'s `language: &str` is the `"en"`/`"pt-BR"`
+            // (D77 §2) field a draft was authored in — a config value, not a
+            // runner-name escape hatch (`EN.12.M` task 1).
+            ("post_draft.rs", &["build_post_draft_payload"]),
         ];
 
         let dir =

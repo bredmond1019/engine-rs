@@ -186,6 +186,63 @@ campaign — every block in the chain, not just the block currently running. A c
 `integrate.rs`'s per-boundary check (above) observes. See `docs/architecture.md`'s "Campaign abort
 endpoint" entry for the route contract.
 
+## `DEBRIEF`'s two outputs: the ops digest and `POST_DRAFT` (`EN.12.M`)
+
+`DebriefNode` (see [`debrief.md`](debrief.md) for its full mechanics) renders **two** separately-
+shaped outputs from a completed campaign's journal rows, both produced by one node — no second node
+was added; standing rule 6 forbids a policy knob or an optional output changing a declared graph's
+node set, and the draft needs no input the ops digest hasn't already fetched:
+
+- **The ops digest** (`render_brief`, unchanged by this block) — every step in order, every bail
+  named with its reason. Written back as a `DebriefRendered` journal row with `step: "DebriefNode"`.
+- **`POST_DRAFT`** (`render_post_draft` / `build_post_draft_payload`,
+  `crates/engine-core/src/workflows/orchestration/post_draft.rs`) — a publishable draft: a thesis
+  line, the measured numbers the run actually produced, and the evidence paths behind them. Written
+  back as its own `DebriefRendered` row with `step: "PostDraft"`, and dispatched as a
+  `LearningArtifact` payload whose `channel_type` is the literal `"post_draft"` — distinguishing it
+  from any other `LearningArtifact` shape without parsing `digest_markdown` prose.
+
+Both outputs are dispatched to `CONTENT_PIPELINE` over the same fire-and-forget `ChannelTransport`
+seam the ops digest already used, and both are written back **synchronously**, byte-identical to
+what was dispatched — the same "nothing lost to an unawaited child run" guarantee `debrief.md`
+documents for the ops digest, now covering the draft too.
+
+**The bar a draft must clear (D79).** A draft is only produced when the campaign's journal rows
+collectively carry **at least one measured number AND at least one evidence path** — a numeric JSON
+leaf under some row's `detail`, and a path-shaped token (something containing `/`, e.g.
+`planning/harness.json` or `debrief.rs:208`) in some row's `reason` or `detail`. This is the same
+bar `docs/content/queue.md` (D79) holds every hand-written entry to: a measured fact or a named
+failure, checkable from an evidence path — never a claim with nothing behind it.
+
+**No draft, rather than an empty one, when the bar isn't cleared.** A campaign whose journal has
+zero rows, whose `JournalReader` fails, or whose rows carry neither a number nor a path produces
+**no** `POST_DRAFT` output at all — never an empty or stub draft. This is deliberate and the
+opposite of the ops digest's own rule (which always renders *something*, even "No steps ran for
+this campaign"): a queue that fills up regardless of whether a run had anything worth writing up
+trains the operator to stop reading it, which is the exact failure this block exists to end. Each
+refusal is journaled with a named reason (zero rows / reader failure / missing number / missing
+path / missing both) rather than silently dropped, so a refusal is always distinguishable from a
+run nobody debriefed.
+
+**Where a draft lands, and who decides it.** A cleared draft's `LearningArtifact` payload
+materializes into `docs/content/drafts/` — but that directory is **not** a literal engine-rs (or
+mev) chose. It falls out of `okf_core::BrainDocModel::index_intent()` on the payload: the same
+`index_path`/`link_target` resolution `mev doc materialize --model learning-artifact` uses
+internally. **okf-core owns the target directory, not mev and not engine-rs** — if the drafts
+directory ever needs to change, that's an okf-core change, not a materializer flag or an engine-rs
+constant.
+
+**engine-rs writes no markdown on this path.** `DebriefNode` builds the payload, dispatches it, and
+writes the journal row — it never calls `mev` and never performs an `fs::write` to a `.md` path (a
+module-scoped test in `post_draft.rs` asserts this by construction). `mev doc materialize --model
+learning-artifact [--write]` is the only writer, and dry-run is its default. Because there is no
+synchronous path back from the dispatch, `DebriefNode` cannot observe what `mev` actually did with
+the draft — so it reports what `mev` **would** write instead, before anything is applied:
+`post_draft.materialize_intent.would_write` on the node's own result carries the resolved
+`docs/content/drafts/<file>` path, computed the identical way (`would_write_path`, mirroring
+`index_intent()`) without invoking `mev`. That is this block's dry-run observability requirement —
+proposing, not writing.
+
 ## Policy
 
 Resolved through the standard four layers (per-run event override > named profile >

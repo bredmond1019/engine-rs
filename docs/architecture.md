@@ -778,12 +778,17 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `JournalReader` seam (`engine-core` cannot call `engine_store` directly — same reasoning as
   `HttpGet`/`HttpPost` — so `engine-serve::journal::journal_reader_live` is the only production
   implementation), renders one deterministic text digest naming every bail's reason (`render_brief`
-  / `brief_names_every_bail`), dispatches that digest to `CONTENT_PIPELINE` over the existing
+  / `brief_names_every_bail`), and — separately, from the same rows — attempts a second,
+  publishable `POST_DRAFT` output (`render_post_draft`, `post_draft.rs`, `EN.12.M`) that is
+  produced only when the rows clear a measured-number-plus-evidence-path bar and refused (never
+  emptied) otherwise; see [`workflows/orchestration.md`](workflows/orchestration.md) § `DEBRIEF`'s
+  two outputs. Each produced output is dispatched to `CONTENT_PIPELINE` over the existing
   `ChannelTransport` seam (fire-and-forget, like every other `OutboundBody::TriggerWorkflow`
-  caller), and **separately, synchronously** writes the same digest back as a
-  `JournalDecisionKind::DebriefRendered` row via the injected `JournalSinkFn` — so what
-  `GET /campaigns/{id}/journal` returns is exactly the text this node produced, not whatever the
-  fire-and-forget `CONTENT_PIPELINE` run does with it. `register_debrief`
+  caller), and **separately, synchronously** written back as its own
+  `JournalDecisionKind::DebriefRendered` row (`step: "DebriefNode"` vs. `step: "PostDraft"`) via
+  the injected `JournalSinkFn` — so what `GET /campaigns/{id}/journal` returns is exactly the text
+  this node produced, not whatever the fire-and-forget `CONTENT_PIPELINE` run does with it.
+  `register_debrief`
   (`crates/engine-serve/src/workflows.rs`) wires the live `JournalReader` (`journal_reader_live`,
   called with `None` — a `Dispatcher` factory closure runs before `AppState`'s Postgres pool
   exists, so it self-skips to an empty campaign, same gap `ORCHESTRATION` documents) and the live

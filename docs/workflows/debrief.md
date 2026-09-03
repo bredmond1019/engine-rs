@@ -6,7 +6,7 @@ doc_id: debrief-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [debrief, journal, brief, campaign, morning brief, DEBRIEF]
+keywords: [debrief, journal, brief, campaign, morning brief, DEBRIEF, POST_DRAFT]
 related: [workflows-readme, orchestration-workflow, architecture]
 ---
 
@@ -42,15 +42,18 @@ Read the rendered brief back the same way you'd read any journal entry:
 curl $ENGINE/campaigns/<campaign-uuid>/journal -H "X-API-Key: $ENGINE_EVENTS_API_KEY"
 ```
 
-Look for the row with `kind: "DebriefRendered"` — its detail payload holds the text.
+Look for rows with `kind: "DebriefRendered"` — their detail payload holds the text. A completed
+run writes **up to two** such rows (see step 3 below): one always, one only when the campaign's
+rows clear a quality bar — filter on `detail.step` (`"DebriefNode"` for the ops digest,
+`"PostDraft"` for the publishable draft) to tell them apart.
 
 ## How it works
 
-One node, both start and terminal:
+One node, both start and terminal, producing up to two outputs:
 
 ```mermaid
 flowchart LR
-    A["DebriefNode<br/>read journal rows<br/>render brief<br/>dispatch + write back"]
+    A["DebriefNode<br/>read journal rows<br/>render brief + draft<br/>dispatch + write back"]
 ```
 
 1. Resolve the campaign id out of `ctx.event`.
@@ -61,16 +64,20 @@ flowchart LR
 3. Render one deterministic text digest, steps in `created_at` order, every `StepBailed` /
    `GateRefused` / `StateWriteVerificationFailed` / `BudgetHalted` row naming its reason in the
    text — this is enforced in code (`brief_names_every_bail`), not left to a summarizing model.
-4. Dispatch that digest to `CONTENT_PIPELINE` over the existing `ChannelTransport` seam, for
-   downstream delivery. This leg is **fire-and-forget** — every `OutboundBody::TriggerWorkflow`
-   dispatch in this codebase is (see [`../architecture.md`](../architecture.md) § Injectable Seams
-   for `ChannelTransport`) — so `DebriefNode` never waits on it and never reads a result back from
-   it.
-5. **Separately, synchronously**, write the same digest back as a
-   `JournalDecisionKind::DebriefRendered` journal row through the injected journal-sink seam. This
-   is why the digest reads back through `GET /campaigns/{id}/journal` reliably: the text a reader
-   gets is the text this node itself produced, not whatever the fire-and-forget
-   `CONTENT_PIPELINE` run does with it.
+   **Separately**, attempt a second, publishable output — a `POST_DRAFT` — from the same rows; it
+   is produced only when the rows clear a quality bar, and is refused (not emptied) otherwise. See
+   [orchestration.md, § "`DEBRIEF`'s two outputs"](orchestration.md) for the bar, the refusal
+   rule, and where a cleared draft lands.
+4. Dispatch each produced output (the ops digest always; the draft only when produced) to
+   `CONTENT_PIPELINE` over the existing `ChannelTransport` seam, for downstream delivery. This leg
+   is **fire-and-forget** — every `OutboundBody::TriggerWorkflow` dispatch in this codebase is (see
+   [`../architecture.md`](../architecture.md) § Injectable Seams for `ChannelTransport`) — so
+   `DebriefNode` never waits on it and never reads a result back from it.
+5. **Separately, synchronously**, write each produced output back as its own
+   `JournalDecisionKind::DebriefRendered` journal row (`step: "DebriefNode"` for the ops digest,
+   `step: "PostDraft"` for the draft) through the injected journal-sink seam. This is why each
+   reads back through `GET /campaigns/{id}/journal` reliably: the text a reader gets is the text
+   this node itself produced, not whatever the fire-and-forget `CONTENT_PIPELINE` run does with it.
 
 The production wiring (`register_debrief`, `crates/engine-serve/src/workflows.rs`) uses the live
 `JournalReader` (`journal::journal_reader_live`) and the live `ChannelTransport`. Its journal-sink
