@@ -27,7 +27,74 @@
 use std::str::FromStr;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, PgPool, Row};
+
+/// Assert task 3's `journal` table migration produced exactly the schema
+/// stated at `postgres.rs:198-207`: `created_at` is `timestamp` WITHOUT time
+/// zone (not `timestamptz`), `detail` is `json` (not `jsonb`), and the
+/// `(campaign_id, created_at)` composite index exists so
+/// `list_journal_rows_for_campaign`'s query never falls back to a full table
+/// scan.
+async fn assert_journal_table_and_index_exist(pool: &PgPool) -> Result<(), String> {
+    let columns = sqlx::query(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_name = 'journal'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("failed to read information_schema.columns for journal: {e}"))?;
+
+    if columns.is_empty() {
+        return Err("journal table does not exist after migrating".to_string());
+    }
+
+    let mut by_name = std::collections::HashMap::new();
+    for row in &columns {
+        let name: String = row.try_get("column_name").map_err(|e| e.to_string())?;
+        let data_type: String = row.try_get("data_type").map_err(|e| e.to_string())?;
+        by_name.insert(name, data_type);
+    }
+
+    let expect_type = |col: &str, expected: &str| -> Result<(), String> {
+        match by_name.get(col) {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(format!(
+                "journal.{col} has type \"{actual}\", expected \"{expected}\""
+            )),
+            None => Err(format!("journal is missing column \"{col}\"")),
+        }
+    };
+
+    expect_type("id", "uuid")?;
+    expect_type("campaign_id", "text")?;
+    expect_type("run_id", "uuid")?;
+    expect_type("step", "text")?;
+    expect_type("kind", "text")?;
+    expect_type("reason", "text")?;
+    expect_type("detail", "json")?;
+    // The trap this whole block warns about: WITHOUT time zone, not "timestamp
+    // with time zone" — matches alembic's sa.DateTime() and the reader's
+    // try_get::<NaiveDateTime>.
+    expect_type("created_at", "timestamp without time zone")?;
+
+    let index_count: i64 = sqlx::query(
+        "SELECT count(*) AS count FROM pg_indexes \
+         WHERE tablename = 'journal' AND indexname = 'journal_campaign_created_at_idx'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("failed to query pg_indexes for journal: {e}"))?
+    .try_get("count")
+    .map_err(|e| e.to_string())?;
+
+    if index_count != 1 {
+        return Err(format!(
+            "expected exactly one journal_campaign_created_at_idx index, found {index_count}"
+        ));
+    }
+
+    Ok(())
+}
 
 /// Build the admin connection string this test was configured with (must be able
 /// to `CREATE DATABASE`/`DROP DATABASE`), and read back the maintenance database's
@@ -83,6 +150,8 @@ async fn migrations_apply_cleanly_to_a_scratch_database_created_from_empty() {
         engine_store::run_migrations(&scratch_pool)
             .await
             .map_err(|e| format!("second (idempotent) migration run failed: {e}"))?;
+
+        assert_journal_table_and_index_exist(&scratch_pool).await?;
 
         scratch_pool.close().await;
         Ok(())

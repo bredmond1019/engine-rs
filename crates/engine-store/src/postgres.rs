@@ -213,10 +213,14 @@ fn journal_kind_from_text(text: &str) -> Result<JournalDecisionKind, sqlx::Error
 /// so [`list_journal_rows_for_campaign`]'s `WHERE campaign_id = $1 ORDER BY
 /// created_at ASC` reads back in decision order without a full table scan —
 /// e.g. `CREATE INDEX journal_campaign_created_at_idx ON journal
-/// (campaign_id, created_at);`. This repo carries no `.sql` migrations (the
-/// `events` table above is likewise schema-documented in comments, not in a
-/// tracked migration file); provisioning this index is a deployment-side
-/// step, mirroring how `events`' schema is provisioned.
+/// (campaign_id, created_at);`. As of EN.14.E task 3 this DDL (columns and
+/// index alike) is a real, tracked migration —
+/// `crates/engine-store/migrations/0001_create_journal.sql`, applied via
+/// [`run_migrations`] — not merely documented in this comment. The `events`
+/// table above predates migration tooling and is still schema-documented in
+/// comments only, provisioned as a deployment-side step; `journal` is the
+/// first table in this crate for which the doc comment and the tracked
+/// schema cannot drift apart.
 ///
 /// Insert one durable journal row (EN.12.D). Follows `insert_event`'s shape:
 /// a plain `INSERT`, no upsert semantics — journal rows are append-only
