@@ -6,7 +6,7 @@ doc_id: orchestration-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, sdlc flow, sdlc task, dispatch step]
+keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, worktree isolation, permission profiles]
 related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, terminal-crates, orphan-recovery]
 ---
 
@@ -188,22 +188,83 @@ endpoint" entry for the route contract.
 
 ## Policy
 
-One knob today, resolved through the standard four layers
-(per-run event override > named profile > `planning/harness.json` > built-in default):
+Resolved through the standard four layers (per-run event override > named profile >
+`planning/harness.json` > built-in default):
 
 | Knob | Default | What it trades |
 |---|---|---|
 | `hold_poll_interval_ms` | `2000` | How often a paused run checks whether an operator hold has cleared. Lower notices a clearance sooner at the cost of more wake-ups. |
+| `default_use_worktree` | `true` | Whether a block with no per-run policy override runs in its own worktree (isolated) or directly in the repo's shared checkout (in-place). **This is a correctness precondition, not a cost/quality knob** — see below. |
+| `hold_deadline_ms` | `None` (unbounded) | The total time a single operator hold may consume before the chain fails loudly with `IntegrateError::HoldDeadlineExceeded`, instead of waiting forever. |
 
 Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 
-- **`baseline`** — `2000ms`. Spelled out explicitly rather than left empty, so selecting it is a
-  legible, self-documenting no-op against the built-in default.
-- **`cheap-fast`** — `10000ms`. Fewer wake-ups; a cleared hold is noticed later.
-- **`thorough`** — `500ms`. A cleared hold is noticed almost immediately; more wake-ups.
+- **`baseline`** — `2000ms` poll, `default_use_worktree: true`, no hold deadline. Spelled out
+  explicitly rather than left empty, so selecting it is a legible, self-documenting no-op against
+  the built-in default.
+- **`cheap-fast`** — `10000ms` poll (fewer wake-ups; a cleared hold is noticed later),
+  `default_use_worktree: true`, a bounded 15-minute hold deadline. Cheapness on this profile
+  applies to poll intervals and hold deadlines — the axes where getting it wrong costs a slightly
+  later reaction — never to sharing a working tree with other processes, where getting it wrong
+  costs someone else's commits.
+- **`thorough`** — `500ms` poll (a cleared hold is noticed almost immediately; more wake-ups),
+  `default_use_worktree: true`, no hold deadline.
 
-Defaults are also written into `planning/harness.json` under `orchestration`, so the knob is
+Defaults are also written into `planning/harness.json` under `orchestration`, so the knobs are
 discoverable without reading the Rust.
+
+### `ORCHESTRATION` isolates by default
+
+`OrchestrationPolicy::default_use_worktree` is `true`: a dispatch that carries no `policy` field —
+and every named profile — runs each block in its own worktree, not in the repo's shared checkout.
+
+This changed 2026-09-02 (`EN.ticket.orchestration-worktree-by-default`) after an incident where an
+`ORCHESTRATION` dispatch with no `policy` override ran in-place while a concurrent Claude Code
+session ran `git checkout` in the same tree mid-run, silently stealing `HEAD` and landing three of
+the orchestrated run's commits on the other lane's branch — recovered only by a seven-commit
+cherry-pick and a dead PR. It is a deliberate, named exception to this repo's standing rule 6
+(a new knob must not change existing behavior): the *knob* is unchanged, only which way the
+*unstated* case falls, because in this environment's routine 10+ concurrent sessions a hazard that
+requires every caller to remember a policy field is a hazard that will recur.
+
+**To opt back into in-place execution** — for example the fleet sandbox at
+`/Users/brandon/Dev/engine-rs-sandbox/`, which an operator owns exclusively — pass an explicit
+override on the dispatch event:
+
+```json
+{"workflow_type": "ORCHESTRATION", "policy": {"default_use_worktree": false}, ...}
+```
+
+Two contract rows sit ahead of this knob and are unreachable through it whatever it is set to
+(`resolve_isolation`, `crates/engine-core/src/workflows/orchestration/execute.rs:315-334`):
+`base-template` is always isolated, and the brain root is never isolated, regardless of
+`default_use_worktree`.
+
+**What this does not fix.** Even with isolation on, `merge_step_branch`
+(`crates/engine-core/src/workflows/orchestration/integrate.rs:341-370`) still runs
+`git checkout main`, `git merge --no-ff <branch>` and `git push origin main` against the repo's
+**shared** checkout at integration time. Isolation narrows the collision window to the merge step;
+it does not close it. Real mutual exclusion around that window is separate, still-open work — see
+the carryover `orchestration-default-use-worktree-false-collides-with-concurrent-lanes`, which
+stays open (`clears_when: null`) until it lands.
+
+**Verifying the installed binary, not just the source tree.** The repo's gated checks (`cargo fmt`,
+`cargo clippy`, `cargo nextest`, `cargo build --release`) compile and test the **source tree**; they
+cannot observe what the fleet's already-running `bastion serve` actually does, because that process
+is an installed binary built at some earlier commit. A green suite here is not evidence the deployed
+default flipped. The standing verification recipe:
+
+1. Rebuild the installed binaries: `agentic-portfolio/scripts/sync/rebuild_binaries.sh`.
+2. Restart the sandbox instance (port 4318).
+3. Dispatch an `ORCHESTRATION` event with **no** `policy` field.
+4. Confirm the step result reports `use_worktree: true`, and that `main`'s `HEAD` did not move
+   during the block (it should have moved only via the post-integration merge, not mid-run).
+
+This is the standing evidence for the acceptance criterion "the deployed `bastion serve` actually
+exhibits the new default" — marked `gateable: false` in the block record precisely because no
+automated suite here can observe an installed binary. Run this recipe and record the outcome
+(step result and `HEAD` observation) whenever the installed default needs re-confirming, rather
+than inferring it from a green source-tree suite.
 
 ## Permission profiles (`EN.12.C`)
 
