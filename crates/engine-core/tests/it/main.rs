@@ -47,6 +47,7 @@ mod policy_baseline;
 mod policy_dispatch_e2e;
 mod policy_framework;
 mod policy_profile_matrix;
+mod post_draft;
 mod prompt_externalization;
 mod proposal_generator_e2e;
 mod research_agent_contacts_e2e;
