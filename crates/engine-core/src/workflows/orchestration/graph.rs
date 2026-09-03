@@ -112,7 +112,7 @@ use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
-use super::conductor::{ConductorProposalError, ProposalOutcome};
+use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome};
 use super::execute::{default_flow_runner, EngineKind, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
 use super::integrate::{
@@ -184,6 +184,42 @@ pub struct OrchestrationPolicy {
     /// `auto_pr_false_short_circuits_without_calling_runner`) without
     /// shelling out to `gh` at all.
     pub default_auto_pr: bool,
+    /// `CONDUCTOR`-only (`EN.12.F` Task 5): the campaign-scoped cost
+    /// ceiling for the FIRST autonomous (conductor-proposed) runs, in USD
+    /// cents rather than `f64` so [`OrchestrationPolicy`] can still derive
+    /// `Eq`. Wired straight into [`integrate::integrate_chain`]'s existing
+    /// `campaign_budget: Option<&crate::budget::Budget>` parameter — task 4
+    /// of `EN.11.F` already checks it at every block boundary and halts the
+    /// chain with the `budget_halted` terminal state; until this task that
+    /// call site always passed `None`. `Some(5_000)` ($50.00) is the
+    /// built-in default: a **deliberate exception** to CLAUDE.md standing
+    /// rule 6's behavior-stability clause, the same exception
+    /// `default_use_worktree` already documents, because the operator's
+    /// weekly objective names this ceiling as a constraint on the first
+    /// unattended nights, not a cost/quality trade a new knob may leave
+    /// unset. Scoped to a conductor-proposed run only — an explicit
+    /// `blocks` chain or a `roadmap`+`lane` chain is operator-directed, not
+    /// autonomous, and is unaffected.
+    pub campaign_max_cost_usd_cents: Option<u64>,
+    /// `CONDUCTOR`-only (`EN.12.F` Task 5): the same ceiling expressed as a
+    /// total token count instead of cost. `None` (the built-in default)
+    /// leaves this axis unchecked — `campaign_max_cost_usd_cents` above is
+    /// the primary guardrail for the first unattended nights.
+    pub campaign_max_total_tokens: Option<u64>,
+    /// `CONDUCTOR`-only (`EN.12.F` Task 5): the most blocks a
+    /// conductor-proposed chain may dispatch in one run, applied by
+    /// [`apply_conductor_caps`] before the chain is finalised. `Some(3)` is
+    /// the built-in default — the operator's weekly objective caps the
+    /// first autonomous chains at "two or three blocks"; this is the upper
+    /// end of that range. Never consulted for an explicit `blocks` chain or
+    /// a `roadmap`+`lane` chain, both of which are operator-directed.
+    pub conductor_max_chain_blocks: Option<usize>,
+    /// `CONDUCTOR`-only (`EN.12.F` Task 5): whether a conductor-proposed
+    /// chain is trimmed to its first proposed block's repo before dispatch
+    /// (also [`apply_conductor_caps`]). `true` is the built-in default,
+    /// matching the objective's "single repo" cap for the first autonomous
+    /// chains. Never consulted for an explicit or `roadmap`+`lane` chain.
+    pub conductor_single_repo_only: bool,
 }
 
 impl Default for OrchestrationPolicy {
@@ -200,6 +236,10 @@ impl Default for OrchestrationPolicy {
             default_use_worktree: true,
             hold_deadline_ms: None,
             default_auto_pr: true,
+            campaign_max_cost_usd_cents: Some(5_000),
+            campaign_max_total_tokens: None,
+            conductor_max_chain_blocks: Some(3),
+            conductor_single_repo_only: true,
         }
     }
 }
@@ -220,6 +260,10 @@ pub struct PartialOrchestrationPolicy {
     pub default_use_worktree: Option<bool>,
     pub hold_deadline_ms: Option<Option<u64>>,
     pub default_auto_pr: Option<bool>,
+    pub campaign_max_cost_usd_cents: Option<Option<u64>>,
+    pub campaign_max_total_tokens: Option<Option<u64>>,
+    pub conductor_max_chain_blocks: Option<Option<usize>>,
+    pub conductor_single_repo_only: Option<bool>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -240,6 +284,22 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 over.hold_deadline_ms,
             ),
             default_auto_pr: crate::policy::merge_opt(self.default_auto_pr, over.default_auto_pr),
+            campaign_max_cost_usd_cents: crate::policy::merge_opt(
+                self.campaign_max_cost_usd_cents,
+                over.campaign_max_cost_usd_cents,
+            ),
+            campaign_max_total_tokens: crate::policy::merge_opt(
+                self.campaign_max_total_tokens,
+                over.campaign_max_total_tokens,
+            ),
+            conductor_max_chain_blocks: crate::policy::merge_opt(
+                self.conductor_max_chain_blocks,
+                over.conductor_max_chain_blocks,
+            ),
+            conductor_single_repo_only: crate::policy::merge_opt(
+                self.conductor_single_repo_only,
+                over.conductor_single_repo_only,
+            ),
         }
     }
 }
@@ -263,6 +323,12 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         // Restates the built-in default verbatim — every dispatched block
         // opens its PR, baseline's no-op contract.
         default_auto_pr: Some(true),
+        // EN.12.F Task 5: restate the built-in defaults verbatim —
+        // baseline's no-op contract extends to the conductor's caps too.
+        campaign_max_cost_usd_cents: Some(Some(5_000)),
+        campaign_max_total_tokens: Some(None),
+        conductor_max_chain_blocks: Some(Some(3)),
+        conductor_single_repo_only: Some(true),
     }
 }
 
@@ -293,6 +359,16 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
         // profile's longer poll interval and bounded hold deadline. A cost
         // floor has no business paying for either.
         default_auto_pr: Some(false),
+        // EN.12.F Task 5: the cost floor extends to the conductor's caps —
+        // a tighter $25 ceiling and a 2-block chain, the low end of the
+        // objective's "two or three" range. `conductor_single_repo_only`
+        // stays `true` regardless of profile: it is a safety invariant, not
+        // a cost/quality trade a cheaper profile is free to relax, mirroring
+        // `default_use_worktree` never varying with profile either.
+        campaign_max_cost_usd_cents: Some(Some(2_500)),
+        campaign_max_total_tokens: Some(None),
+        conductor_max_chain_blocks: Some(Some(2)),
+        conductor_single_repo_only: Some(true),
     }
 }
 
@@ -312,6 +388,18 @@ pub fn thorough() -> PartialOrchestrationPolicy {
         default_use_worktree: Some(true),
         hold_deadline_ms: Some(Some(24 * 60 * 60 * 1_000)),
         default_auto_pr: Some(true),
+        // EN.12.F Task 5: a more generous $100 ceiling and the full
+        // 3-block end of the objective's "two or three" range, matching
+        // this profile's higher quality ceiling elsewhere.
+        // `conductor_single_repo_only` still stays `true` — see
+        // `cheap_fast`'s comment: it is a safety invariant, never widened
+        // by a more permissive profile, the same discipline
+        // `resolve_child_permission_profile` already enforces for
+        // `PermissionProfile` (narrow-only, never widen).
+        campaign_max_cost_usd_cents: Some(Some(10_000)),
+        campaign_max_total_tokens: Some(None),
+        conductor_max_chain_blocks: Some(Some(3)),
+        conductor_single_repo_only: Some(true),
     }
 }
 
@@ -446,6 +534,57 @@ fn conductor_justification(outcome: &ProposalOutcome) -> String {
             outcome.chain.len(),
             outcome.dropped.len()
         )
+    }
+}
+
+/// `CONDUCTOR`-only (`EN.12.F` Task 5): trim `outcome` to the operator's
+/// weekly-objective caps for the first autonomous runs — `policy`'s
+/// `conductor_single_repo_only` first (keep only the first proposed block's
+/// repo), then `conductor_max_chain_blocks` (keep at most that many
+/// remaining steps). Every block dropped this way is appended to
+/// `outcome.dropped` with a named reason, exactly like a `git log -S`
+/// pre-flight drop, so [`conductor_justification`] and the EN.12.D journal
+/// entry it renders already reflect what was actually dispatched, not the
+/// conductor's unbounded proposal. Never called for an explicit `blocks`
+/// chain or a `roadmap`+`lane` chain — only [`OrchestrationRunNode::process`]'s
+/// conductor branch calls this.
+fn apply_conductor_caps(outcome: &mut ProposalOutcome, policy: &OrchestrationPolicy) {
+    if policy.conductor_single_repo_only {
+        if let Some(first_repo) = outcome.chain.first().map(|step| step.repo.clone()) {
+            let mut kept = Vec::with_capacity(outcome.chain.len());
+            for step in outcome.chain.drain(..) {
+                if step.repo == first_repo {
+                    kept.push(step);
+                } else {
+                    outcome.dropped.push(DroppedCandidate {
+                        repo: step.repo.clone(),
+                        block_id: step.block_id.clone(),
+                        reason: format!(
+                            "conductor: '{}:{}' dropped — the first autonomous runs' \
+                             single-repo cap keeps only '{first_repo}' this run",
+                            step.repo, step.block_id
+                        ),
+                    });
+                }
+            }
+            outcome.chain = kept;
+        }
+    }
+
+    if let Some(max_blocks) = policy.conductor_max_chain_blocks {
+        if outcome.chain.len() > max_blocks {
+            for step in outcome.chain.split_off(max_blocks) {
+                outcome.dropped.push(DroppedCandidate {
+                    repo: step.repo.clone(),
+                    block_id: step.block_id.clone(),
+                    reason: format!(
+                        "conductor: '{}:{}' dropped — the first autonomous runs' \
+                         chain cap keeps at most {max_blocks} block(s) tonight",
+                        step.repo, step.block_id
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -720,7 +859,12 @@ impl Node for OrchestrationRunNode {
             // chain from the objective + frontier slate instead.
             match &self.conductor {
                 Some(conductor) => {
-                    let outcome = conductor().map_err(|err| NodeError::new(err.to_string()))?;
+                    let mut outcome = conductor().map_err(|err| NodeError::new(err.to_string()))?;
+                    // EN.12.F Task 5: cap the proposal to the operator's
+                    // weekly-objective constraints for the first autonomous
+                    // runs BEFORE it is finalised — see
+                    // `apply_conductor_caps`.
+                    apply_conductor_caps(&mut outcome, &policy);
                     let chain = outcome.chain.clone();
                     conductor_outcome = Some(outcome);
                     chain
@@ -826,6 +970,25 @@ impl Node for OrchestrationRunNode {
         // `Copy`, so this is captured into the `spawn_blocking` closure by
         // value like `poll_interval` above — no `Arc`/clone needed.
         let default_use_worktree = policy.default_use_worktree;
+        // `EN.12.F` Task 5: a conductor-proposed ("autonomous") run gets a
+        // real campaign budget ceiling — `integrate::integrate_chain`'s
+        // `campaign_budget` parameter has checked this at every block
+        // boundary and halted with `budget_halted` (`EN.11.F` task 4) since
+        // it existed, but every call site before this task passed `None`.
+        // An explicit `blocks` chain or a `roadmap`+`lane` chain is
+        // operator-directed, not autonomous, so it stays unbounded here —
+        // unchanged from before this knob existed.
+        let campaign_budget: Option<crate::budget::Budget> = if conductor_outcome.is_some() {
+            let budget = crate::budget::Budget {
+                max_total_tokens: policy.campaign_max_total_tokens,
+                max_cost_usd: policy
+                    .campaign_max_cost_usd_cents
+                    .map(|cents| cents as f64 / 100.0),
+            };
+            (budget.max_total_tokens.is_some() || budget.max_cost_usd.is_some()).then_some(budget)
+        } else {
+            None
+        };
 
         let resolve_depends_on = self.resolve_depends_on.clone();
         let is_edge_met = self.is_edge_met.clone();
@@ -896,12 +1059,14 @@ impl Node for OrchestrationRunNode {
                     poll_interval,
                     hold_deadline,
                     cancellation_token.as_ref(),
-                    // `EN.11.F` task 4 adds the campaign-boundary ceiling
-                    // check to `integrate_chain`; wiring a real cap through
-                    // `OrchestrationRunNode`'s own policy surface is not
-                    // this task's job — `None` here is behavior-identical
-                    // to before this parameter existed (no ceiling).
-                    None,
+                    // `EN.11.F` task 4 added the campaign-boundary ceiling
+                    // check to `integrate_chain`; `EN.12.F` Task 5 is what
+                    // finally supplies a real cap through this node's own
+                    // policy surface — see `campaign_budget` above. `None`
+                    // for a non-conductor (operator-directed) chain is
+                    // still behavior-identical to before this parameter
+                    // existed.
+                    campaign_budget.as_ref(),
                     &move |repo, block_id| resolve_engine(repo, block_id),
                     &repo_registry,
                     &run_flow,
@@ -981,6 +1146,19 @@ impl Node for OrchestrationRunNode {
                     "hold_poll_interval_ms": policy.hold_poll_interval_ms,
                     "default_use_worktree": policy.default_use_worktree,
                     "hold_deadline_ms": policy.hold_deadline_ms,
+                    // EN.12.F Task 5: stamp the resolved value so
+                    // `RunTelemetry`/`PolicyAggregate` can attribute
+                    // observed cost/chain-shape to the setting that caused
+                    // it, per CLAUDE.md standing rule 6. `campaign_budget`
+                    // (not `policy.campaign_max_*` directly) is what was
+                    // actually consulted — `None` for a non-conductor run
+                    // regardless of the resolved policy's own values.
+                    "campaign_budget": campaign_budget.map(|b| json!({
+                        "max_total_tokens": b.max_total_tokens,
+                        "max_cost_usd": b.max_cost_usd,
+                    })),
+                    "conductor_max_chain_blocks": policy.conductor_max_chain_blocks,
+                    "conductor_single_repo_only": policy.conductor_single_repo_only,
                 },
                 "cancellation": cancellation,
                 // The addressable subject `GET /campaigns/{id}` (task 5)
@@ -1227,6 +1405,30 @@ mod tests {
         assert_eq!(baseline().default_auto_pr, Some(true));
         assert_eq!(cheap_fast().default_auto_pr, Some(false));
         assert_eq!(thorough().default_auto_pr, Some(true));
+    }
+
+    /// Every named profile sets all four `EN.12.F` Task 5 knobs explicitly
+    /// — a knob absent from the profile bundles is a knob nobody will find
+    /// (CLAUDE.md standing rule 6). `conductor_single_repo_only` stays
+    /// `true` across every profile: a safety invariant, never relaxed by a
+    /// cheaper or more thorough profile.
+    #[test]
+    fn all_three_profiles_set_the_conductor_and_budget_caps_explicitly() {
+        assert_eq!(baseline().campaign_max_cost_usd_cents, Some(Some(5_000)));
+        assert_eq!(cheap_fast().campaign_max_cost_usd_cents, Some(Some(2_500)));
+        assert_eq!(thorough().campaign_max_cost_usd_cents, Some(Some(10_000)));
+
+        assert_eq!(baseline().campaign_max_total_tokens, Some(None));
+        assert_eq!(cheap_fast().campaign_max_total_tokens, Some(None));
+        assert_eq!(thorough().campaign_max_total_tokens, Some(None));
+
+        assert_eq!(baseline().conductor_max_chain_blocks, Some(Some(3)));
+        assert_eq!(cheap_fast().conductor_max_chain_blocks, Some(Some(2)));
+        assert_eq!(thorough().conductor_max_chain_blocks, Some(Some(3)));
+
+        assert_eq!(baseline().conductor_single_repo_only, Some(true));
+        assert_eq!(cheap_fast().conductor_single_repo_only, Some(true));
+        assert_eq!(thorough().conductor_single_repo_only, Some(true));
     }
 
     #[test]
@@ -1992,6 +2194,207 @@ mod tests {
         assert_eq!(node.name(), NODE_NAME);
         assert_eq!(registry().len(), 1);
         assert!(registry().contains(NODE_NAME));
+    }
+
+    // ── `CONDUCTOR` caps: chain length, single repo, campaign budget
+    //    (`EN.12.F` Task 5) ─────────────────────────────────────────────
+
+    #[test]
+    fn apply_conductor_caps_trims_to_the_first_repo_and_records_why() {
+        let mut outcome = ProposalOutcome {
+            chain: resolve_explicit_chain(vec![
+                ("repo-a".to_string(), "A.1".to_string()),
+                ("repo-b".to_string(), "B.1".to_string()),
+                ("repo-a".to_string(), "A.2".to_string()),
+            ]),
+            dropped: Vec::new(),
+        };
+        let policy = OrchestrationPolicy {
+            conductor_single_repo_only: true,
+            conductor_max_chain_blocks: None,
+            ..OrchestrationPolicy::default()
+        };
+
+        apply_conductor_caps(&mut outcome, &policy);
+
+        assert_eq!(outcome.chain.len(), 2, "only the repo-a steps survive");
+        assert!(outcome.chain.iter().all(|s| s.repo == "repo-a"));
+        assert_eq!(outcome.dropped.len(), 1);
+        assert_eq!(outcome.dropped[0].repo, "repo-b");
+        assert_eq!(outcome.dropped[0].block_id, "B.1");
+        assert!(
+            outcome.dropped[0].reason.contains("single-repo"),
+            "the drop reason should name the cap that dropped it: {}",
+            outcome.dropped[0].reason
+        );
+    }
+
+    #[test]
+    fn apply_conductor_caps_trims_an_oversized_chain_and_records_why() {
+        let mut outcome = ProposalOutcome {
+            chain: resolve_explicit_chain(vec![
+                ("repo-a".to_string(), "A.1".to_string()),
+                ("repo-a".to_string(), "A.2".to_string()),
+                ("repo-a".to_string(), "A.3".to_string()),
+                ("repo-a".to_string(), "A.4".to_string()),
+            ]),
+            dropped: Vec::new(),
+        };
+        let policy = OrchestrationPolicy {
+            conductor_single_repo_only: false,
+            conductor_max_chain_blocks: Some(2),
+            ..OrchestrationPolicy::default()
+        };
+
+        apply_conductor_caps(&mut outcome, &policy);
+
+        assert_eq!(outcome.chain.len(), 2, "only the first 2 blocks survive");
+        assert_eq!(outcome.chain[0].block_id, "A.1");
+        assert_eq!(outcome.chain[1].block_id, "A.2");
+        assert_eq!(outcome.dropped.len(), 2);
+        assert_eq!(outcome.dropped[0].block_id, "A.3");
+        assert_eq!(outcome.dropped[1].block_id, "A.4");
+        for dropped in &outcome.dropped {
+            assert!(
+                dropped.reason.contains("chain cap"),
+                "the drop reason should name the cap that dropped it: {}",
+                dropped.reason
+            );
+        }
+    }
+
+    #[test]
+    fn apply_conductor_caps_with_both_knobs_none_or_false_is_a_no_op() {
+        let mut outcome = sample_outcome("repo-a", "A.1");
+        let untouched = outcome.clone();
+        let policy = OrchestrationPolicy {
+            conductor_single_repo_only: false,
+            conductor_max_chain_blocks: None,
+            ..OrchestrationPolicy::default()
+        };
+
+        apply_conductor_caps(&mut outcome, &policy);
+
+        assert_eq!(outcome, untouched, "neither cap is active — nothing drops");
+    }
+
+    #[tokio::test]
+    async fn the_built_in_default_caps_trim_a_conductor_proposal_to_one_repo_and_three_blocks() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+        write_done_state(&dir.path().join("repo-a"), "A.3");
+        write_done_state(&dir.path().join("repo-a"), "A.4");
+
+        // Five candidates, two repos — a proposal larger than either
+        // built-in default cap (`conductor_max_chain_blocks: Some(3)`,
+        // `conductor_single_repo_only: true`) would allow through
+        // unconstrained.
+        let conductor: ConductorSeamFn = Arc::new(|| {
+            Ok(ProposalOutcome {
+                chain: resolve_explicit_chain(vec![
+                    ("repo-a".to_string(), "A.1".to_string()),
+                    ("repo-b".to_string(), "B.1".to_string()),
+                    ("repo-a".to_string(), "A.2".to_string()),
+                    ("repo-a".to_string(), "A.3".to_string()),
+                    ("repo-a".to_string(), "A.4".to_string()),
+                ]),
+                dropped: Vec::new(),
+            })
+        });
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let written: Arc<std::sync::Mutex<Vec<engine_contract::JournalRow>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let written_clone = written.clone();
+        let sink: Arc<JournalSinkFn> = Arc::new(move |row| written_clone.lock().unwrap().push(row));
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_conductor(conductor)
+            .with_journal_sink(sink);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("conductor should resolve a capped chain");
+
+        // The single-repo cap drops `B.1` first (a different repo than the
+        // first-proposed block), leaving the four `repo-a` candidates; the
+        // chain-length cap then drops the 4th of those (`A.4`), so exactly
+        // 3 steps — `A.1`, `A.2`, `A.3` — are integrated.
+        assert_eq!(out.nodes[NODE_NAME]["steps_integrated"], 3);
+        for step in out.nodes[NODE_NAME]["blocks"].as_array().unwrap() {
+            assert_eq!(step["repo"], "repo-a");
+        }
+
+        let rows = written.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        let dropped = rows[0].detail["dropped"].as_array().unwrap();
+        assert_eq!(dropped.len(), 2, "B.1 (single-repo) and A.4 (chain cap)");
+        assert!(
+            dropped
+                .iter()
+                .any(|d| d["reason"].as_str().unwrap().contains("single-repo")),
+            "at least one drop should name the single-repo cap: {dropped:?}"
+        );
+        assert!(
+            dropped
+                .iter()
+                .any(|d| d["reason"].as_str().unwrap().contains("chain cap")),
+            "at least one drop should name the chain cap: {dropped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_budget_is_none_for_a_non_conductor_chain_even_with_a_default_ceiling() {
+        // An explicit `blocks` chain is operator-directed, not autonomous —
+        // the campaign budget ceiling `OrchestrationPolicy::default` now
+        // carries (`Some(5_000)` cents) must never apply to it.
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_run_flow(run_flow);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [{ "repo": "repo-a", "block_id": "A.1" }],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("an explicit chain should run to completion");
+        assert_eq!(
+            out.nodes[NODE_NAME]["policy"]["campaign_budget"],
+            serde_json::Value::Null,
+            "a non-conductor chain must never see a campaign budget ceiling"
+        );
     }
 
     // ── Node::process — campaign id resolution and stamping (Task 3) ────
