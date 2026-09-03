@@ -52,14 +52,13 @@ none of the pieces below exist, so an operator still chooses the work and reads 
 
 | Capability | Block | State | What it will do |
 |---|---|---|---|
-| Run journal | `EN.12.D` | **Ready** | Durable decision rows, a D57 renderer, and a read route — the substrate the two below render from. |
-| `WORKFLOW_DISPATCH` | `EN.12.E` | Waiting on `EN.12.D` | Lets a chain step run any registered workflow, not just an SDLC engine. |
-| `CONDUCTOR` | `EN.12.F` | Waiting on `mev:MV.14.B`, `EN.12.D`, `EN.12.E`, `OP.first-weekly-objective` | The run picks tonight's chain itself from a weekly objective, instead of being handed a block list. |
-| Research → action items | `EN.12.H` | Waiting on `EN.12.E`, `bastion:BA.21.D` | A scheduled research chain files into the operator queue. |
-| Research → demo | `EN.12.I` | Waiting on `EN.12.E`, `EN.12.F` | An overnight branded demo generated from a company name. |
+| `CONDUCTOR` | `EN.12.F` | Waiting on `OP.first-weekly-objective` | The run picks tonight's chain itself from a weekly objective, instead of being handed a block list. |
+| Research → action items | `EN.12.H` | **Ready** | A scheduled research chain files into the operator queue. |
+| Research → demo | `EN.12.I` | Waiting on `EN.12.F` | An overnight branded demo generated from a company name. |
 
-Two of these wait on `OP.first-weekly-objective` — an operator gate. The engine cannot pick a
-chain from an objective that nobody has written yet, and it may not invent one.
+`CONDUCTOR` waits directly on `OP.first-weekly-objective` — an operator gate — and `Research →
+demo` waits on `CONDUCTOR`, so it is gated on the same objective transitively. The engine cannot
+pick a chain from an objective that nobody has written yet, and it may not invent one.
 
 ## Brain integration
 
@@ -68,10 +67,7 @@ The engine writes to the Brain today ([`materialize-doc-node.md`](materialize-do
 
 | Capability | Block | State | What it will do |
 |---|---|---|---|
-| Brain read client | `EN.6.K` | **Ready** | `HttpGet` seam, `BrainConfig`, a `RecallNode` over `GET /recall`, plus ingest-client hardening. |
-| Recall consumer | `EN.12.L` | **Ready** | The engine half of the read seam: a dispatchable `RECALL` workflow over `RecallNode`, chain-branching on an empty result (`integrate_chain_inner`), and a `JournalDecisionKind::RecallConsulted` row. See [`architecture.md`](architecture.md). |
-| `CLAIM_REAFFIRM` | `EN.6.L` | Waiting on `EN.6.K`, `mev:MV.ticket.distill-freshness-lane` | Distilled-claim reaffirmation via queue-drain. |
-| Content-pipeline ingest fix | `EN.12.K` | Waiting on `orchestrator:OR.3.A` | Real route, auth header, and the chosen payload mapping. |
+| `CLAIM_REAFFIRM` | `EN.6.L` | **Ready** | Distilled-claim reaffirmation via queue-drain. |
 
 The read direction was gated on an operator ruling until 2026-08-23; it is now settled by
 `planning/decisions/D23-brain-read-seam.md` — the engine **may** read back from Synapse as a typed
@@ -81,32 +77,26 @@ consumer that never re-ranks. The blocks above are the implementation of that ru
 
 | Capability | Block | State | What it will do |
 |---|---|---|---|
-| `CONTENT_DRAFT` | `EN.5.G` | **Ready** | Draft posts from shipped work, review-gated. |
-| `EXTERNAL_INTEL` | `EN.5.C` | Waiting on `orchestrator:OR.Q` | Ecosystem sweep and ranked digest — the engine half of a Synapse pairing. |
-| Regression history + blind judge | `EN.5.B2` | **Ready** | Keep-if-better / revert-if-worse change gate. |
+| `EXTERNAL_INTEL` | `EN.5.C` | **Deferred** (dependency-clear — parked, not blocked) | Ecosystem sweep and ranked digest — the engine half of a Synapse pairing. |
+| Regression history + blind judge | `EN.5.B2` | **Deferred** (dependency-clear — parked, not blocked) | Keep-if-better / revert-if-worse change gate. |
 
 ## Run integrity and identity
 
 | Capability | Block | State | What it will do |
 |---|---|---|---|
-| Artifact identity | `EN.11.A` | Waiting on `brain:HQ.5.A` | Stamp build, writer, `run_id` and host onto produced artifacts. |
-| Chains compose | `EN.11.C` | **Ready** | Guarantee block N+1's tree contains block N's work. |
-| Permission-profile enforcement | `EN.12.C` | Waiting on `bastion:BA.21.C`, `brain:HQ.5.B` | Stamp the profile in force into every run record and gate graded actions on it. |
-| `GuardedSender` adoption | `EN.12.B` | **Ready** | Adopt it at both terminal send call sites. |
-| `routine.sh` behind an approval gate | `EN.9.H` | Waiting on `brain:HQ.ticket.restart-services-drain-guard` | Excluding its self-restart. |
+| `routine.sh` behind an approval gate | `EN.9.H` | **Ready** | Excluding its self-restart. |
 
 ## Known defects, filed and not yet fixed
 
 These are shortcomings in shipped code rather than absent features. Listed here because a reader
 hitting one should find it named rather than assume they are holding it wrong.
 
-| Defect | Block | What is wrong today |
-|---|---|---|
-| The test gate can wedge | `EN.ticket.test-gate-must-terminate-a-hang-not-wedge` | No `nextest.toml` exists, so the default profile never terminates a hung test — a genuine hang blocks the gate forever with no verdict. |
-| `CloseBlockNode` leaves derived output uncommitted | `EN.ticket.close-block-node-leaves-derived-output-uncommitted` | It must stage and commit the derived fallout of its own state write. |
-| Vault-dependent tests fail instead of skipping | `EN.ticket.vault-dependent-tests-must-skip-not-fail` | A test needing the brain vault hard-fails on any checkout without one, including CI. |
-| The test suite mutates a tracked fixture | `EN.ticket.diagnostic-intake-fixture-tempdir` | `diagnostic-intake-state.json` is rewritten in place by running the suite. |
-| No env-var policy source | `EN.ticket.local-policy-harness-file` | `PolicyConfigSource::HarnessFile` for the three API-shaped workflows. Interim — superseded by `EN.3.K`. |
+**None currently filed.** The five defects previously listed here (`EN.ticket.test-gate-must-
+terminate-a-hang-not-wedge`, `EN.ticket.close-block-node-leaves-derived-output-uncommitted`,
+`EN.ticket.vault-dependent-tests-must-skip-not-fail`, `EN.ticket.diagnostic-intake-fixture-
+tempdir`, `EN.ticket.local-policy-harness-file`) are resolved — the first four `closed`, the last
+`wontfix` and superseded by `EN.3.K` (also `closed`) — and their rows have been removed per the
+rule below.
 
 ## Keeping this page honest
 

@@ -322,12 +322,33 @@ in the module and fails if a string-typed runner is reintroduced anywhere in it.
 > a per-file allowlist of legitimate string-taking entry points. The lesson generalises: a gate must
 > be shown failing *for the surface its criterion names*, not merely shown failing.
 
-## Status: not yet exercised on a real chain
+## Status: first real-repo chain has run; cross-repo remains unexercised
 
 Every acceptance criterion is covered by integration tests against **tempdir fixture repos**. As of
-2026-08-18 `ORCHESTRATION` has never sequenced a real block in a real repo.
+2026-08-18 `ORCHESTRATION` had never sequenced a real block in a real repo. That has since changed,
+but only partially — read the scope carefully before citing this as more than it is.
 
-Treat the first real run as a test, not as routine — the same posture the brain root's `CLAUDE.md`
-prescribes for the first `/orchestrate` run in HQ, and with more force here because this one drives
-other engines. A short **two-block, single-repo** chain where a failure is cheap to unwind is the
-right first target; a cross-repo lane is not.
+On 2026-09-02, `ORCHESTRATION` sequenced two fixture specs single-repo, inside engine-rs, from
+block `EN.ticket.micro-spec-fixture-for-engine-seam-comparison`. The run is recorded in
+`planning/roadmaps/jynx-orchestration-smoke/lane-log.jsonl` (`"writer": "engine-rs"`, the only
+Rust-written lane-log in the corpus):
+
+- `2026-09-02T18:57:11Z` — block `micro-spec-small`, `bailed` — `node 'PullRequestNode' did not
+  succeed` (build_sha `2aebc8ebb9e4e7898ffb807677c5a89c8f25b2a0`).
+- `2026-09-02T19:20:08Z` — block `micro-spec-small`, `closed` via `SDLC_FLOW` (run_id
+  `96e6826b-a0d4-4142-b9e8-b22dd3a27cb0`, build_sha `74375e76e49f4df3f2bd43a9fa778b75dad87f67`,
+  profile `standard`).
+- `2026-09-02T19:28:03Z` — block `micro-spec-large`, `closed` via `SDLC_FLOW` (run_id
+  `f0dd2d18-5813-4290-bd57-6867dcf459a5`, same build_sha, profile `standard`).
+
+**What this does and does not establish.** These were fixture specs, not corpus blocks, and the
+chain ran against a single repo — it is evidence that `ORCHESTRATION` can sequence a real
+`SDLC_FLOW` run end to end (including a real bail-and-recover), not evidence about a cross-repo
+lane. **A cross-repo chain over real corpus blocks remains unexercised.** The posture below still
+applies in full to that case.
+
+Treat the first real cross-repo run as a test, not as routine — the same posture the brain root's
+`CLAUDE.md` prescribes for the first `/orchestrate` run in HQ, and with more force here because this
+one drives other engines. A short **two-block, single-repo** chain where a failure is cheap to
+unwind was, and remains, the right first target before a cross-repo lane; the run above is that
+first target, exercised.
