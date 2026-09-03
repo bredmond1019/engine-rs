@@ -95,12 +95,14 @@ use engine_contract::{JournalDecisionKind, JournalRow, NodeRun, NodeRunStatus};
 use engine_core::budget::Budget;
 use engine_core::cancellation::CancellationToken;
 use engine_core::nodes::{RecallNode, StubHttpGet, RECALL_NODE_NAME};
+use engine_core::policy::PolicyConfigSource;
 use engine_core::repo_registry::RepoRegistry;
 use engine_core::workflows::orchestration::chain::{resolve_explicit_chain, ChainStep, StepKind};
 use engine_core::workflows::orchestration::execute::{
     execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowInvocation, FlowRunner,
 };
 use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::graph::resolve_policy_for_run_from;
 use engine_core::workflows::orchestration::integrate::{
     integrate_chain, integrate_chain_with_dispatch, verify_state_write, IntegrateError,
     LaneLogStatus, NeverHeld, StepProgress,
@@ -278,6 +280,13 @@ struct RecordingRunner {
     // reports NO cost figure at all (empty `ctx.nodes`, matching every
     // earlier task's fixture exactly), never a silent `$0`.
     cost_overrides: Arc<Mutex<HashMap<String, f64>>>,
+    // `EN.ticket.orchestration-worktree-by-default` task 3: the RESOLVED
+    // `FlowInvocation::use_worktree` this runner was actually invoked
+    // with, per block — captured from the invocation itself, never
+    // re-derived from `OrchestrationPolicy`, so a test reading this proves
+    // the value reached the child rather than merely that the policy
+    // struct was right.
+    use_worktree_calls: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
 impl RecordingRunner {
@@ -286,7 +295,20 @@ impl RecordingRunner {
             calls: Arc::new(Mutex::new(Vec::new())),
             status_overrides: Arc::new(Mutex::new(HashMap::new())),
             cost_overrides: Arc::new(Mutex::new(HashMap::new())),
+            use_worktree_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The `use_worktree` the captured [`FlowInvocation`] for `block_id`
+    /// actually carried, or `None` if this runner was never invoked for
+    /// that block.
+    fn use_worktree_for(&self, block_id: &str) -> Option<bool> {
+        self.use_worktree_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| id == block_id)
+            .map(|(_, use_worktree)| *use_worktree)
     }
 
     /// Force `block_id`'s state-file status to `status` instead of the
@@ -345,6 +367,10 @@ impl RecordingRunner {
                     invocation.block_id.clone(),
                     invocation.repo_path.clone(),
                 ));
+                this.use_worktree_calls
+                    .lock()
+                    .unwrap()
+                    .push((invocation.block_id.clone(), invocation.use_worktree));
 
                 // Real `SDLC_FLOW` branch discipline: cut fresh from
                 // `origin/main`, never from a sibling block's branch tip.
@@ -1768,5 +1794,136 @@ async fn a_failing_recall_step_bails_the_chain_via_the_real_recall_node() {
     assert!(
         matches!(err, IntegrateError::Dispatch(_)),
         "a failing RECALL step must surface as a dispatch error: {err:?}"
+    );
+}
+
+// ── EN.ticket.orchestration-worktree-by-default task 3 ───────────────────
+//
+// Proves the resolved `default_use_worktree` value actually reaches the
+// child `FlowInvocation`, end to end through the real chain driver: an
+// ORCHESTRATION event is resolved via the SAME `resolve_policy_for_run_from`
+// production entry point `OrchestrationRunNode::process` calls, and the
+// resulting `OrchestrationPolicy::default_use_worktree` is threaded into
+// `integrate_chain` exactly as `graph.rs` does. The assertion reads
+// `RecordingRunner`'s captured `FlowInvocation::use_worktree` — never the
+// `OrchestrationPolicy` struct — because a correct policy whose value fails
+// to reach the child is exactly the bug class this block exists to prevent
+// the consequences of.
+
+/// An ORCHESTRATION event with NO `policy` field resolves through the real
+/// four-layer policy resolution (`resolve_policy_for_run_from`) to
+/// `OrchestrationPolicy::default().default_use_worktree` (`true`, per this
+/// block), and that value reaches the captured child `FlowInvocation`.
+#[tokio::test]
+async fn unstated_policy_event_resolves_to_use_worktree_true_on_the_invocation() {
+    let (_brain_root, _bare_root, registry, _repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-worktree-default-unstated");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    // No `policy` key at all — the exact shape of the real-world dispatch
+    // that caused the incident this block's `why` describes.
+    let event_ctx = engine_contract::TaskContext {
+        event: serde_json::json!({}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+    let policy = resolve_policy_for_run_from(&event_ctx, &PolicyConfigSource::Builtin)
+        .expect("an event with no policy field must still resolve via built-in default");
+    assert!(
+        policy.default_use_worktree,
+        "OrchestrationPolicy::default().default_use_worktree must be true"
+    );
+
+    let chain = resolve_explicit_chain(vec![("smoke-repo".to_string(), "WT.1".to_string())]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        policy.default_use_worktree,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("single-block chain should integrate cleanly");
+    assert_eq!(outcomes.len(), 1);
+
+    assert_eq!(
+        runner.use_worktree_for("WT.1"),
+        Some(true),
+        "an unstated-policy event must reach the child FlowInvocation with \
+         use_worktree == true"
+    );
+}
+
+/// An ORCHESTRATION event carrying an explicit
+/// `"policy": {"default_use_worktree": false}` still resolves to `false`
+/// end to end on the captured child `FlowInvocation` — the knob is
+/// preserved, not removed, by this block's default flip.
+#[tokio::test]
+async fn explicit_false_policy_event_resolves_to_use_worktree_false_on_the_invocation() {
+    let (_brain_root, _bare_root, registry, _repo_path) = single_repo_fixture("smoke-repo");
+    let (_planning_root, roadmap_dir) = fixture_roadmap_dir("en-worktree-default-explicit-false");
+    let runner = RecordingRunner::new();
+    let flow_runner = runner.clone().into_runner();
+    let admission = AdmissionGate::with_default_policy();
+
+    let event_ctx = engine_contract::TaskContext {
+        event: serde_json::json!({"policy": {"default_use_worktree": false}}),
+        nodes: HashMap::new(),
+        metadata: serde_json::json!({}),
+        node_runs: HashMap::new(),
+    };
+    let policy = resolve_policy_for_run_from(&event_ctx, &PolicyConfigSource::Builtin)
+        .expect("an event with an explicit policy override must resolve");
+    assert!(
+        !policy.default_use_worktree,
+        "an explicit policy.default_use_worktree: false must override the built-in default"
+    );
+
+    let chain = resolve_explicit_chain(vec![("smoke-repo".to_string(), "WT.2".to_string())]);
+
+    let outcomes = integrate_chain(
+        &chain,
+        &no_deps,
+        &always_met,
+        &admission,
+        &NeverHeld,
+        Duration::from_millis(5),
+        None,
+        None,
+        None,
+        &always_flow,
+        &registry,
+        &flow_runner,
+        &roadmap_dir,
+        None,
+        &|_: &StepProgress| {},
+        policy.default_use_worktree,
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("single-block chain should integrate cleanly");
+    assert_eq!(outcomes.len(), 1);
+
+    assert_eq!(
+        runner.use_worktree_for("WT.2"),
+        Some(false),
+        "an explicit default_use_worktree: false override must still reach \
+         the child FlowInvocation as false — the knob is preserved"
     );
 }
