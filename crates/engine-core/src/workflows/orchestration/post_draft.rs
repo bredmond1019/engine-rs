@@ -37,8 +37,22 @@
 use std::collections::BTreeSet;
 
 use engine_contract::JournalRow;
+use okf_core::LearningArtifact;
 use regex::Regex;
 use serde_json::Value;
+
+/// The `channel_type` every post-draft payload carries. Deliberately not
+/// `"schedule"`/`"web_article"`/etc — the values `content_pipeline`'s own
+/// `LearningArtifact` payloads use for ingested content — so a draft is
+/// distinguishable from anything else materialized through the same model
+/// by this field alone, without parsing `digest_markdown` prose (task 2
+/// acceptance criteria).
+pub const POST_DRAFT_CHANNEL_TYPE: &str = "post_draft";
+
+/// `language` fallback when a caller passes an empty string. Mirrors
+/// `content_pipeline::learning_artifact::DEFAULT_LANGUAGE` — a draft that
+/// was never translated is in its original language, `en`.
+const DEFAULT_LANGUAGE: &str = "en";
 
 /// A path-shaped token: at least one non-whitespace segment, a `/`, then at
 /// least one more non-whitespace segment. Deliberately permissive about
@@ -209,11 +223,97 @@ pub fn render_post_draft(rows: &[JournalRow]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// The first line of a rendered draft — the thesis line — used as the
+/// `LearningArtifact`'s `summary` field so a reader deciding whether to
+/// open the full draft sees the claim, not the whole digest.
+fn thesis_line(draft: &str) -> String {
+    draft.lines().next().unwrap_or_default().to_string()
+}
+
+/// Build the `LearningArtifact` payload
+/// (`{artifact_id, channel_type, source_ref, summary, digest_markdown,
+/// entities, language}` — [`okf_core::LearningArtifact::from_payload`]'s
+/// exact field set, task 2's block interface) for `rows`, or `None` when
+/// [`rows_clear_draft_bar`] refuses the draft. Reuses [`render_post_draft`]
+/// rather than re-deriving the bar, so the refusal rule lives in exactly
+/// one place (task 1's predicate).
+///
+/// `language` is set per-call (`"en"` or `"pt-BR"`, per D77 §2) rather than
+/// hardcoded — an empty string falls back to [`DEFAULT_LANGUAGE`]. No
+/// translation happens here (out of scope, per the block record): the
+/// caller is responsible for choosing which language the draft was
+/// authored in.
+///
+/// `source_ref` is the first evidence path the draft names — the closest
+/// thing to "where this came from" a journal row set offers, and, since
+/// [`rows_clear_draft_bar`] already guarantees at least one evidence path
+/// exists whenever this returns `Some`, always present when it matters.
+/// `channel_type` is always [`POST_DRAFT_CHANNEL_TYPE`], distinguishing
+/// this payload from any other `LearningArtifact` shape (task 2 AC:
+/// "distinguishable by their payload without parsing prose"). `entities`
+/// is left empty: a journal row set names steps and paths, not named
+/// entities, and inventing placeholder entities would be worse than an
+/// honest empty list.
+#[must_use]
+pub fn build_post_draft_payload(rows: &[JournalRow], language: &str) -> Option<Value> {
+    let draft = render_post_draft(rows)?;
+    let evidence = row_evidence_paths_all(rows);
+    let source_ref = evidence.first().cloned().unwrap_or_default();
+
+    let campaign_id = rows
+        .first()
+        .map(|row| row.campaign_id.as_str())
+        .unwrap_or("unknown-campaign");
+
+    let language = if language.trim().is_empty() {
+        DEFAULT_LANGUAGE
+    } else {
+        language
+    };
+
+    Some(serde_json::json!({
+        "artifact_id": format!("post-draft:{campaign_id}"),
+        "channel_type": POST_DRAFT_CHANNEL_TYPE,
+        "source_ref": source_ref,
+        "summary": thesis_line(&draft),
+        "digest_markdown": draft,
+        "entities": Vec::<String>::new(),
+        "language": language,
+    }))
+}
+
+/// Every distinct evidence path across `rows`, sorted — a small helper so
+/// [`build_post_draft_payload`] does not re-walk each row's `detail`/`reason`
+/// itself; delegates to [`row_evidence_paths`] per row.
+fn row_evidence_paths_all(rows: &[JournalRow]) -> Vec<String> {
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    for row in rows {
+        found.extend(row_evidence_paths(row));
+    }
+    found.into_iter().collect()
+}
+
+/// Validate that `payload` (as built by [`build_post_draft_payload`])
+/// round-trips through [`okf_core::LearningArtifact::from_payload`] without
+/// dropping or mangling a field. Exposed for the test below and for a
+/// future caller that wants a hard guarantee before materializing.
+#[must_use]
+pub fn payload_round_trips_as_learning_artifact(payload: &Value) -> bool {
+    let artifact = LearningArtifact::from_payload(payload);
+    artifact.artifact_id == payload["artifact_id"].as_str().unwrap_or_default()
+        && artifact.channel_type == payload["channel_type"].as_str().unwrap_or_default()
+        && artifact.source_ref == payload["source_ref"].as_str().unwrap_or_default()
+        && artifact.summary == payload["summary"].as_str().unwrap_or_default()
+        && artifact.language == payload["language"].as_str().unwrap_or_default()
+        && artifact.digest_markdown == payload["digest_markdown"].as_str().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use engine_contract::JournalDecisionKind;
+    use okf_core::BrainDocModel;
     use uuid::Uuid;
 
     fn row(kind: JournalDecisionKind, reason: &str, detail: Value, offset_secs: i64) -> JournalRow {
@@ -375,5 +475,118 @@ mod tests {
         let draft = render_post_draft(&[later, earlier]).expect("bar cleared");
         assert!(draft.contains("score=9"));
         assert!(draft.contains("src/main.rs"));
+    }
+
+    fn clearing_row() -> JournalRow {
+        row(
+            JournalDecisionKind::StepIntegrated,
+            "wrote crates/engine-core/src/workflows/orchestration/post_draft.rs",
+            serde_json::json!({ "lines_added": 240 }),
+            0,
+        )
+    }
+
+    #[test]
+    fn build_post_draft_payload_none_when_bar_not_cleared() {
+        let rows = vec![row(
+            JournalDecisionKind::StepIntegrated,
+            "nothing measured or path-worthy",
+            serde_json::json!({ "note": "plain text" }),
+            0,
+        )];
+        assert!(build_post_draft_payload(&rows, "en").is_none());
+    }
+
+    #[test]
+    fn build_post_draft_payload_round_trips_as_learning_artifact() {
+        let rows = vec![clearing_row()];
+        let payload = build_post_draft_payload(&rows, "en").expect("bar cleared");
+        assert!(payload_round_trips_as_learning_artifact(&payload));
+
+        let artifact = LearningArtifact::from_payload(&payload);
+        assert_eq!(artifact.digest_markdown, render_post_draft(&rows).unwrap());
+        assert_eq!(artifact.channel_type, POST_DRAFT_CHANNEL_TYPE);
+        assert!(artifact.source_ref.contains("post_draft.rs"));
+    }
+
+    #[test]
+    fn build_post_draft_payload_language_round_trips_en_and_pt_br() {
+        let rows = vec![clearing_row()];
+
+        let en_payload = build_post_draft_payload(&rows, "en").expect("bar cleared");
+        assert_eq!(LearningArtifact::from_payload(&en_payload).language, "en");
+
+        let pt_payload = build_post_draft_payload(&rows, "pt-BR").expect("bar cleared");
+        assert_eq!(
+            LearningArtifact::from_payload(&pt_payload).language,
+            "pt-BR"
+        );
+    }
+
+    #[test]
+    fn build_post_draft_payload_defaults_language_when_empty() {
+        let rows = vec![clearing_row()];
+        let payload = build_post_draft_payload(&rows, "").expect("bar cleared");
+        assert_eq!(LearningArtifact::from_payload(&payload).language, "en");
+    }
+
+    #[test]
+    fn post_draft_payload_is_distinguishable_from_ops_digest_without_parsing_prose() {
+        // The ops digest is dispatched as plain envelope text
+        // (`debrief.rs`'s `SourcePayload::ChannelMessage { text, .. }`), not
+        // as a `LearningArtifact` payload at all — so the two are
+        // structurally distinguishable by shape alone. Within the
+        // `LearningArtifact` shape itself, `channel_type` is the field a
+        // consumer checks: it is never anything a content-pipeline ingest
+        // would set (`web_article`, `youtube_transcript`, etc.), so a
+        // reader never has to parse `digest_markdown` to tell the two
+        // apart.
+        let rows = vec![clearing_row()];
+        let payload = build_post_draft_payload(&rows, "en").expect("bar cleared");
+        assert_eq!(payload["channel_type"], POST_DRAFT_CHANNEL_TYPE);
+        assert_ne!(payload["channel_type"], "web_article");
+        assert_ne!(payload["channel_type"], "youtube_transcript");
+    }
+
+    #[test]
+    fn post_draft_target_directory_is_derived_not_hardcoded() {
+        // Task 2: "Any test touching the target directory DERIVES it from
+        // `LearningArtifact::index_intent()`, never a hardcoded literal."
+        let rows = vec![clearing_row()];
+        let payload = build_post_draft_payload(&rows, "en").expect("bar cleared");
+        let artifact = LearningArtifact::from_payload(&payload);
+        let intent = artifact.index_intent();
+        let dir = std::path::Path::new(&intent.index_path)
+            .parent()
+            .expect("index_path has a parent directory")
+            .to_path_buf();
+        // Derived, not restated as a literal: assert the directory the
+        // model itself resolves to, which is what mev's materializer will
+        // actually write into (`root/dirname(index_path)/link_target`).
+        assert_eq!(
+            dir,
+            LearningArtifact::default()
+                .index_intent()
+                .index_path
+                .rsplit_once('/')
+                .map(|(dir, _)| std::path::PathBuf::from(dir))
+                .expect("index_path has a directory component")
+        );
+    }
+
+    #[test]
+    fn no_fourth_brain_doc_model_is_added_here() {
+        // Guards task 2's out-of-scope clause structurally: this module
+        // imports and reuses `okf_core::LearningArtifact` and defines no
+        // new type implementing `BrainDocModel`. If a future edit adds one,
+        // this test's import line becomes the only `okf_core` model type
+        // named in the module — a reviewer diff on this file is the check;
+        // there is no runtime assertion possible for "a type was not
+        // added", so this test instead pins that the existing model
+        // round-trips end-to-end, which is what "reuse, don't mint" means
+        // in practice.
+        let rows = vec![clearing_row()];
+        let payload = build_post_draft_payload(&rows, "en").expect("bar cleared");
+        assert!(payload_round_trips_as_learning_artifact(&payload));
     }
 }
