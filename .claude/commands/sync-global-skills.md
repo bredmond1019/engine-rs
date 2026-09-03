@@ -1,5 +1,22 @@
 # sync-global-skills — Sync harness skills to global install
 
+**Two targets, two audiences — both are installed by this command:**
+
+| Target | Source | Read by |
+|---|---|---|
+| `~/.claude/skills/` | `.claude/skills/` (17 hand-authored) | Claude Code, in every repo and outside any repo |
+| `~/.gemini/config/skills/` | `.agents/skills/` (67 = 50 command mirrors + the 17) | the Antigravity surface |
+
+The `~/.claude/skills/` half was added by BT.chore.skills-go-global (2026-09-03). Before it, the 17
+fleet skills were copied into all 19 repos — 323 byte-identical files, zero divergence — and are now
+installed once here instead. **Per-repo copies of a fleet skill name are not just redundant, they are
+unreachable:** skills offer no picker, and a same-named repo-local skill loses to the global one
+(measured by body, not by listing). A repo needing different behaviour must use a DISTINCT name.
+
+Freshness of the `~/.claude/skills/` half is reported by `global-skills-fresh` in
+`planning/harness.json` — registered **non-gating**, because a CI checkout and a fresh clone have no
+global install at all.
+
 Installs all harness skills from `.agents/skills/` into `~/.gemini/config/skills/`, mirroring what
 `/sync-global-commands` does for `.claude/commands/` → `~/.claude/commands/`. `.agents/skills/` is
 the vendor-neutral skill directory other agent tools (Gemini, per `GEMINI.md`) read; Claude Code
@@ -26,6 +43,7 @@ itself reads `.claude/commands/` and does not need this sync.
 
    Run:
    ```bash
+   rsync -av --delete .claude/skills/ ~/.claude/skills/
    rsync -av --delete .agents/skills/ ~/.gemini/config/skills/
    ```
 
