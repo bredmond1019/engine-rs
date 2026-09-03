@@ -235,14 +235,18 @@ this fleet-concurrency slot release** — delete `<lock_dir>/leases/lease-<repo>
 failure, or abandonment, so a reader looking for "what does this lane give back on exit" finds it
 in one place.
 
+**Taking any exclusive lease quiesces this repo's `mev` write verbs for the length of the chain.** While a `kind: exclusive` lease is held — whether the ordinary per-lane lease Step 4 takes for every real lane, or an additional lease taken here for a repo named in `exclusive_repos` — every `mev` write verb for that leased repo (`set-block-status --write`, `emit-state --write`, and the other write verbs) is refused with `E_QUIESCE_LEASE_HELD`. This is a declared quiet window, distinct from `E_EMIT_LOCK_HELD` contention: do NOT retry — either wait for the lease to be released, or, if this lane is the holder, pass `--agent <this lane's agent identity>` as the self-exemption on the write verb, exactly as `register`/`release` already require it above. The lease Step 4 makes this lane take is one of the leases this section's own `register` check consults — `--agent` is what lets the holder's own `register`/`release`/write calls through without being refused by its own lease. (The holder's own re-register is never refused: both `fleet_concurrency_check.py` and `mev` skip a lease whose `agent` matches the requester.)
+
 **Fleet-exclusive lanes (`exclusive_repos`).** If the lane record's `exclusive_repos` array is
 non-empty, before the first block starts, write an additional `kind: exclusive` lease at
 `<lock_dir>/leases/lease-<repo>.json` for **each** repo named in `exclusive_repos` — same shape as
 any other lease record (`repo`, `lane`, `agent`, `acquired_at`, `kind: exclusive`; no new field).
-While any such lease is held, every other agent's `fleet_concurrency_check.py register` call is
-refused with exit `3` regardless of category or heaviness, so a lane that must run with the fleet
-quiesced can actually hold it — this is admission control only, never pre-emption of a lane
-already running. Remove every lease written this way at lane close — success, failure, or
+`scope` absent defaults to `repo`: a repo-scoped exclusive lease refuses `register` (and the
+`mev` write verbs above) only for a requester whose own repo the lease names — not every other
+agent. Only `scope: fleet` quiesces the whole fleet; the leases this paragraph writes for each
+`exclusive_repos` entry are repo-scoped, one per named repo, so together they close
+registration on exactly those repos. This is admission control only, never pre-emption of a
+lane already running. Remove every lease written this way at lane close — success, failure, or
 abandonment — alongside the ordinary lease and registry releases. `exclusive_repos` is read only
 here; no new field is added to `.claude/workflows/lane.schema.json` or to the lease record.
 
