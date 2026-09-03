@@ -196,22 +196,35 @@ Resolved through the standard four layers (per-run event override > named profil
 | `hold_poll_interval_ms` | `2000` | How often a paused run checks whether an operator hold has cleared. Lower notices a clearance sooner at the cost of more wake-ups. |
 | `default_use_worktree` | `true` | Whether a block with no per-run policy override runs in its own worktree (isolated) or directly in the repo's shared checkout (in-place). **This is a correctness precondition, not a cost/quality knob** — see below. |
 | `hold_deadline_ms` | `None` (unbounded) | The total time a single operator hold may consume before the chain fails loudly with `IntegrateError::HoldDeadlineExceeded`, instead of waiting forever. |
+| `default_auto_pr` | `true` | Whether a `flow` step's `SDLC_FLOW` child event opens a real PR through `PullRequestNode`. `false` seeds `auto_pr: false` on the child event, which `PullRequestNode` short-circuits on — stamping `{"pr_url": null, "skipped": true, "branch_name": ...}` without ever shelling out to `gh`. **`SDLC_TASK` steps are unaffected**: `SdlcTaskEventSchema` drops the field entirely because `SDLC_TASK` ships no PR ceremony, so there is nothing to seed. |
 
 Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 
-- **`baseline`** — `2000ms` poll, `default_use_worktree: true`, no hold deadline. Spelled out
-  explicitly rather than left empty, so selecting it is a legible, self-documenting no-op against
-  the built-in default.
+- **`baseline`** — `2000ms` poll, `default_use_worktree: true`, no hold deadline,
+  `default_auto_pr: true`. Spelled out explicitly rather than left empty, so selecting it is a
+  legible, self-documenting no-op against the built-in default.
 - **`cheap-fast`** — `10000ms` poll (fewer wake-ups; a cleared hold is noticed later),
-  `default_use_worktree: true`, a bounded 15-minute hold deadline. Cheapness on this profile
-  applies to poll intervals and hold deadlines — the axes where getting it wrong costs a slightly
-  later reaction — never to sharing a working tree with other processes, where getting it wrong
-  costs someone else's commits.
+  `default_use_worktree: true`, a bounded 15-minute hold deadline, `default_auto_pr: false`.
+  Cheapness on this profile applies to poll intervals, hold deadlines, and now PR creation — the
+  axes where getting it wrong costs a slightly later reaction or a review ceremony nobody asked
+  for — never to sharing a working tree with other processes, where getting it wrong costs
+  someone else's commits.
 - **`thorough`** — `500ms` poll (a cleared hold is noticed almost immediately; more wake-ups),
-  `default_use_worktree: true`, no hold deadline.
+  `default_use_worktree: true`, no hold deadline, `default_auto_pr: true`.
 
 Defaults are also written into `planning/harness.json` under `orchestration`, so the knobs are
 discoverable without reading the Rust.
+
+**Why `default_auto_pr` exists.** The fleet sandbox at `/Users/brandon/Dev/engine-rs-sandbox/`
+exists so `ORCHESTRATION` can be exercised without risking the live, concurrently-used checkouts.
+Its `origin` is a local bare repo — enough for `merge_step_branch`'s `git push origin main` at
+integration time, but not for `gh`, so a chain run there used to die at the PR step with
+`gh pr create failed: none of the git remotes configured for this repository point to a known
+GitHub host`. Passing `"policy": {"default_auto_pr": false}` (or the `cheap-fast` profile) lets a
+`flow` step run to completion without ever calling `gh`. The knob is complementary to, not a
+substitute for, giving the sandbox a real GitHub remote: with `auto_pr: false`,
+`PullRequestNode` is never exercised, so a run that must actually test the PR path still needs a
+real GitHub-hosted remote.
 
 ### `ORCHESTRATION` isolates by default
 
