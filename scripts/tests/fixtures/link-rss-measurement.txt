@@ -1,0 +1,410 @@
+# link-rss-measurement.txt
+#
+# Purpose: the raw measurement backing scripts/fleet_build.py's
+# FLEET_BUILD_MIN_FREE_MB default (EN.ticket.fleet-build-permit-wrapper, task 1).
+#
+# The admission question the wrapper answers is "is there room for one more
+# linker", i.e. the PEAK resident set size of a single build invocation --
+# not the aggregate RSS of many concurrent rustc jobs. So the number below is
+# the "maximum resident set size" field from `/usr/bin/time -l`, taken across
+# TWO runs of the full `cargo build --release` for this workspace (25 crates
+# in this workspace's own dependency graph, ~345 with third-party deps):
+#
+#   1. warm tree (only a few crates needed recompiling)
+#   2. `cargo clean`ed tree (full workspace rebuild)
+#
+# Both runs report closely matching peak RSS (~1.35 GiB / ~1.41 GiB), which
+# is expected: `/usr/bin/time -l`'s reported "maximum resident set size" for
+# the `cargo build --release` invocation is the max RSS seen across cargo
+# itself and every rustc/linker child process cargo spawned and reaped
+# (kernel-accumulated RUSAGE_CHILDREN, folded into the parent's own reported
+# rusage on exit) -- so a warm build that still has to link the changed
+# crates' final binaries sees essentially the same link-step peak as a full
+# rebuild, even though it compiles far less.
+#
+# ============================================================
+# RUN 1 -- warm tree (target/ already built; 3 crates recompiled)
+# ============================================================
+   Compiling mev v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/mev)
+   Compiling engine-core v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/engine-core)
+   Compiling engine-serve v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/engine-serve)
+    Finished `release` profile [optimized] target(s) in 20.38s
+       20.44 real       110.38 user         1.90 sys
+          1441366016  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              373227  page reclaims
+               15860  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   7  signals received
+                3631  voluntary context switches
+               61014  involuntary context switches
+          2694336321  instructions retired
+           959399623  cycles elapsed
+            65504320  peak memory footprint
+
+# ============================================================
+# RUN 2 -- `cargo clean`ed tree (full workspace rebuild, 1m08s)
+# ============================================================
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling parking_lot_core v0.9.12
+   Compiling pin-project-lite v0.2.17
+   Compiling memchr v2.8.2
+   Compiling log v0.4.33
+   Compiling bytes v1.12.0
+   Compiling futures-core v0.3.32
+   Compiling itoa v1.0.18
+   Compiling version_check v0.9.5
+   Compiling scopeguard v1.2.0
+   Compiling once_cell v1.21.4
+   Compiling lock_api v0.4.14
+   Compiling pkg-config v0.3.33
+   Compiling icu_properties_data v2.2.0
+   Compiling icu_normalizer_data v2.2.0
+   Compiling zmij v1.0.21
+   Compiling generic-array v0.14.7
+   Compiling serde_json v1.0.150
+   Compiling autocfg v1.5.1
+   Compiling typenum v1.20.1
+   Compiling futures-sink v0.3.32
+   Compiling syn v2.0.118
+   Compiling stable_deref_trait v1.2.1
+   Compiling getrandom v0.4.3
+   Compiling num-traits v0.2.19
+   Compiling futures-channel v0.3.32
+   Compiling tracing-core v0.1.36
+   Compiling bitflags v2.13.0
+   Compiling futures-task v0.3.32
+   Compiling jobserver v0.1.34
+   Compiling slab v0.4.12
+   Compiling dunce v1.0.5
+   Compiling equivalent v1.0.2
+   Compiling futures-io v0.3.32
+   Compiling fs_extra v1.3.0
+   Compiling cc v1.2.65
+   Compiling core-foundation-sys v0.8.7
+   Compiling litemap v0.8.2
+   Compiling writeable v0.6.3
+   Compiling rand_core v0.10.1
+   Compiling hashbrown v0.17.1
+   Compiling errno v0.3.14
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling percent-encoding v2.3.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling cmake v0.1.58
+   Compiling crossbeam-utils v0.8.21
+   Compiling zeroize v1.9.0
+   Compiling indexmap v2.14.0
+   Compiling aws-lc-rs v1.17.3
+   Compiling utf8_iter v1.0.4
+   Compiling hybrid-array v0.4.13
+   Compiling ring v0.17.14
+   Compiling aws-lc-sys v0.43.0
+   Compiling rustls-pki-types v1.15.0
+   Compiling getrandom v0.2.17
+   Compiling untrusted v0.9.0
+   Compiling cmov v0.5.4
+   Compiling synstructure v0.13.2
+   Compiling ctutils v0.4.2
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling const-oid v0.10.2
+   Compiling rustls v0.23.41
+   Compiling thiserror v2.0.18
+   Compiling digest v0.11.3
+   Compiling serde_derive v1.0.228
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.6
+   Compiling tokio-macros v2.7.0
+   Compiling tracing-attributes v0.1.31
+   Compiling futures-macro v0.3.32
+   Compiling thiserror-impl v2.0.18
+   Compiling zerofrom v0.1.8
+   Compiling form_urlencoded v1.2.2
+   Compiling yoke v0.8.3
+   Compiling iana-time-zone v0.1.65
+   Compiling aho-corasick v1.1.4
+   Compiling futures-util v0.3.32
+   Compiling zerovec v0.11.6
+   Compiling tracing v0.1.44
+   Compiling zerotrie v0.2.4
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling smallvec v1.15.2
+   Compiling icu_provider v2.2.0
+   Compiling parking_lot v0.12.5
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling tokio v1.52.3
+   Compiling base64 v0.22.1
+   Compiling idna_adapter v1.2.2
+   Compiling regex-syntax v0.8.11
+   Compiling subtle v2.6.1
+   Compiling idna v1.1.0
+   Compiling chrono v0.4.45
+   Compiling httparse v1.10.1
+   Compiling url v2.5.8
+   Compiling regex-automata v0.4.14
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling http v1.4.2
+   Compiling allocator-api2 v0.2.21
+   Compiling heck v0.5.0
+   Compiling foldhash v0.2.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.11.0
+   Compiling hashbrown v0.16.1
+   Compiling http-body v1.1.0
+   Compiling digest v0.10.7
+   Compiling rustls-webpki v0.103.13
+   Compiling either v1.16.0
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling cpufeatures v0.2.17
+   Compiling cpufeatures v0.3.0
+   Compiling sha1_smol v1.0.1
+   Compiling parking v2.2.1
+   Compiling crc-catalog v2.5.0
+   Compiling event-listener v5.4.2
+   Compiling crc v3.4.0
+   Compiling uuid v1.23.4
+   Compiling sha2 v0.10.9
+   Compiling futures-intrusive v0.5.0
+   Compiling crossbeam-queue v0.3.12
+   Compiling regex v1.12.4
+   Compiling hashlink v0.11.1
+   Compiling tokio-stream v0.1.18
+   Compiling unicode-normalization v0.1.25
+   Compiling chacha20 v0.10.1
+   Compiling hmac v0.13.0
+   Compiling webpki-roots v1.0.8
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling winnow v0.7.15
+   Compiling ryu v1.0.23
+   Compiling try-lock v0.2.5
+   Compiling toml_write v0.1.2
+   Compiling unicode-properties v0.1.4
+   Compiling rustix v1.1.4
+   Compiling tower-service v0.3.3
+   Compiling utf8parse v0.2.2
+   Compiling unicode-bidi v0.3.18
+   Compiling stringprep v0.1.5
+   Compiling sqlx-core v0.9.0
+   Compiling anstyle-parse v1.0.0
+   Compiling want v0.3.1
+   Compiling rand v0.10.2
+   Compiling sha2 v0.11.0
+   Compiling toml_edit v0.22.27
+   Compiling hkdf v0.13.0
+   Compiling atoi v2.0.0
+   Compiling md-5 v0.11.0
+   Compiling unicode-segmentation v1.13.3
+   Compiling rustix v0.38.44
+   Compiling hex v0.4.3
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling dotenvy v0.15.7
+   Compiling byteorder v1.5.0
+   Compiling zstd-safe v7.2.4
+   Compiling colorchoice v1.0.5
+   Compiling alloc-no-stdlib v2.0.4
+   Compiling anstyle-query v1.1.5
+   Compiling local-waker v0.1.4
+   Compiling whoami v2.1.2
+   Compiling crc32fast v1.5.0
+   Compiling lazy_static v1.5.0
+   Compiling fnv v1.0.7
+   Compiling atomic-waker v1.1.2
+   Compiling anstyle v1.0.14
+   Compiling http v0.2.12
+   Compiling hyper v1.10.1
+   Compiling alloc-stdlib v0.2.4
+   Compiling anstream v1.0.0
+   Compiling sqlx-postgres v0.9.0
+   Compiling convert_case v0.10.0
+   Compiling toml v0.8.23
+   Compiling tokio-util v0.7.18
+   Compiling core-foundation v0.10.1
+   Compiling security-framework-sys v2.17.0
+   Compiling syn v3.0.3
+   Compiling sync_wrapper v1.0.2
+   Compiling ipnet v2.12.0
+   Compiling adler2 v2.0.1
+   Compiling clap_lex v1.1.0
+   Compiling simd-adler32 v0.3.9
+   Compiling unicode-xid v0.2.6
+   Compiling siphasher v1.0.3
+   Compiling strsim v0.11.1
+   Compiling tower-layer v0.3.3
+   Compiling time-core v0.1.9
+   Compiling num-conv v0.2.2
+   Compiling anyhow v1.0.104
+   Compiling fastrand v2.4.1
+   Compiling thiserror v1.0.69
+   Compiling tempfile v3.27.0
+   Compiling time-macros v0.2.31
+   Compiling tower v0.5.3
+   Compiling clap_builder v4.6.2
+   Compiling sqlx-macros-core v0.9.0
+   Compiling phf_shared v0.12.1
+   Compiling derive_more-impl v2.1.1
+   Compiling miniz_oxide v0.8.9
+   Compiling clap_derive v4.6.4
+   Compiling hyper-util v0.1.20
+   Compiling security-framework v3.7.0
+   Compiling brotli-decompressor v5.0.3
+   Compiling actix-utils v3.0.1
+   Compiling serde_urlencoded v0.7.1
+   Compiling actix-rt v2.11.0
+   Compiling async-trait v0.1.89
+   Compiling thiserror-impl v1.0.69
+   Compiling bytestring v1.5.1
+   Compiling cookie v0.16.2
+   Compiling actix-service v2.0.3
+   Compiling regex-lite v0.1.9
+   Compiling same-file v1.0.6
+   Compiling home v0.5.12
+   Compiling powerfmt v0.2.0
+   Compiling mev v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/mev)
+   Compiling unsafe-libyaml v0.2.11
+   Compiling deranged v0.5.8
+   Compiling minimal-lexical v0.2.1
+   Compiling chrono-tz v0.10.4
+   Compiling nom v7.1.3
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling actix-router v0.5.4
+   Compiling time v0.3.53
+   Compiling which v6.0.3
+   Compiling walkdir v2.5.0
+   Compiling term-core v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/term-core)
+   Compiling derive_more v2.1.1
+   Compiling brotli v8.0.4
+   Compiling clap v4.6.4
+   Compiling flate2 v1.1.9
+   Compiling sqlx-macros v0.9.0
+   Compiling phf v0.12.1
+   Compiling tower-http v0.6.11
+   Compiling h2 v0.3.27
+   Compiling actix-codec v0.5.2
+   Compiling colored v2.2.0
+   Compiling local-channel v0.1.5
+   Compiling engine-contract v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/engine-contract)
+   Compiling sha1 v0.11.0
+   Compiling http-body-util v0.1.4
+   Compiling okf-core v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/okf-core)
+   Compiling futures-executor v0.3.32
+   Compiling socket2 v0.5.10
+   Compiling encoding_rs v0.8.35
+   Compiling httpdate v1.0.3
+   Compiling mime v0.3.17
+   Compiling engine-core v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/engine-core)
+   Compiling language-tags v0.3.2
+   Compiling actix-server v2.6.0
+   Compiling futures v0.3.32
+   Compiling cron v0.12.1
+   Compiling claude-sdk-rs v2.0.0 (/Users/brandon/Dev/agentic-portfolio/core/claude-code-rs)
+   Compiling actix-web-codegen v4.3.0
+   Compiling sharded-slab v0.1.7
+   Compiling matchers v0.2.0
+   Compiling tracing-serde v0.2.0
+   Compiling actix-macros v0.2.4
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.10
+   Compiling nu-ansi-term v0.50.3
+   Compiling impl-more v0.3.1
+   Compiling term-attach v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/term-attach)
+   Compiling tracing-subscriber v0.3.23
+   Compiling zstd v0.13.3
+   Compiling actix-http v3.13.1
+   Compiling actix-web v4.14.0
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling sqlx v0.9.0
+   Compiling engine-store v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/engine-store)
+   Compiling engine-serve v0.1.0 (/Users/brandon/Dev/agentic-portfolio/core/engine-rs/crates/engine-serve)
+    Finished `release` profile [optimized] target(s) in 1m 08s
+       68.42 real       436.75 user        33.63 sys
+          1408909312  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             8689268  page reclaims
+              210007  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                 710  signals received
+               19144  voluntary context switches
+              446581  involuntary context switches
+          8063196253  instructions retired
+          6789889228  cycles elapsed
+            81266048  peak memory footprint
+
+# ============================================================
+# CHOSEN CONSTANT: FLEET_BUILD_MIN_FREE_MB = 2048
+# ============================================================
+#
+# Arithmetic, from peak RSS to threshold:
+#
+#   peak "maximum resident set size" observed  = 1441366016 bytes  (run 1, the higher of the two)
+#   in MiB (bytes / 1048576)                    = 1374.65 MiB
+#   safety margin (measurement variance + other = x1.5
+#     concurrent processes on the box; this is
+#     a peak-of-two-runs number on an otherwise
+#     idle machine, not a worst case)
+#   1374.65 MiB * 1.5                           = 2061.97 MiB
+#   rounded down to a clean value                = 2048 MiB (2 GiB)
+#
+# FLEET_BUILD_MIN_FREE_MB = 2048
+#
+# This is the "room for one more linker" threshold: the wrapper's memory gate
+# requires at least this many MB free before admitting a build, re-checked at
+# every dequeue attempt (task 3), not once at enqueue.
+#
+# ============================================================
+# WHY macOS "free pages" ALONE IS MISLEADING (and what the wrapper reads instead)
+# ============================================================
+#
+# The operator's 2026-09-01 23:38 measurement showed 2.7G free WITH a 6G
+# compressor and large swap counters -- i.e. "free" pages alone read low even
+# though several more GB were readily reclaimable. This machine's own
+# `vm_stat` right now shows the same shape:
+#
+#   Pages free:        135406   (x 16384-byte pages = ~2.07 GiB)
+#   Pages inactive:     727163   (x 16384-byte pages = ~11.10 GiB, reclaimable
+#                                 without swapping -- these are clean/backed
+#                                 pages the kernel drops under pressure before
+#                                 ever touching swap or the compressor)
+#   Pages purgeable:      1401   (negligible here, but also reclaimable on demand)
+#
+# Reading ONLY "Pages free" would report ~2.07 GiB free on a machine that
+# actually has far more readily available -- exactly the operator's 2.7G
+# reading, which was itself misleading. So `fleet_build.py`'s memory reader
+# (task 3) sums `vm_stat`'s "Pages free" + "Pages inactive" (both reclaimable
+# without swap activity) as its "available memory" estimate, rather than
+# "Pages free" alone. "Pages purgeable" and swap-compressor internals are
+# left out deliberately: they are a much smaller share on this machine and
+# folding in compressor accounting risks *overstating* headroom right before
+# a page-out event, which is the opposite of the failure this gate exists to
+# prevent.
