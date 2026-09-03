@@ -51,6 +51,7 @@ use chrono::Utc;
 use engine_contract::{
     ChannelType, IngressEnvelope, JournalDecisionKind, JournalRow, SourcePayload, TaskContext,
 };
+use okf_core::{BrainDocModel, LearningArtifact};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -60,6 +61,9 @@ use crate::nodes::channel_transport::{
 };
 use crate::workflow::read_run_id;
 use crate::workflows::orchestration::integrate::JournalSinkFn;
+use crate::workflows::orchestration::post_draft::{
+    build_post_draft_payload, row_has_evidence_path, row_has_measured_number,
+};
 use crate::workflows::put_result;
 
 /// The injectable journal-read seam: `rows_for_campaign(campaign_id)` -> the
@@ -133,6 +137,66 @@ const CAMPAIGN_ID_FIELD: &str = "campaign_id";
 /// [`DebriefNode::with_dispatch_workflow_type`] so a test never needs a
 /// literal `CONTENT_PIPELINE` registration to exercise the dispatch path.
 const DEFAULT_DISPATCH_WORKFLOW_TYPE: &str = "CONTENT_PIPELINE";
+
+/// The `step` label the post-draft's own journal row carries — distinct
+/// from [`DEBRIEF_NODE_NAME`] (the ops-digest row's `step`) so a reader
+/// can tell a campaign's two `DebriefRendered` rows apart without
+/// inspecting `detail` (`EN.12.M` task 3 AC1: "both outputs, distinguishable").
+pub const POST_DRAFT_STEP_NAME: &str = "PostDraft";
+
+/// A short, named reason [`DebriefNode::process`] stamps (and, when a
+/// journal sink is present, does NOT write a row for — refusal means no
+/// row, per `EN.12.M` task 1's "the refusal is the point") when
+/// [`build_post_draft_payload`] returns `None`. Distinguishes the two ways
+/// a run can have nothing draft-worthy to say: no rows at all, versus rows
+/// that carry neither a measured number nor an evidence path. Its own named
+/// function so a test can assert on the exact reason string rather than
+/// merely on `Option::is_none()`.
+#[must_use]
+fn no_draft_reason(rows: &[JournalRow]) -> String {
+    if rows.is_empty() {
+        return "no post draft: campaign journal has zero rows".to_string();
+    }
+
+    let has_number = rows.iter().any(row_has_measured_number);
+    let has_path = rows.iter().any(row_has_evidence_path);
+    match (has_number, has_path) {
+        (false, false) => {
+            "no post draft: no journal row carries a measured number or an evidence path"
+                .to_string()
+        }
+        (false, true) => "no post draft: no journal row carries a measured number".to_string(),
+        (true, false) => "no post draft: no journal row carries an evidence path".to_string(),
+        (true, true) => unreachable!(
+            "no_draft_reason called when both bar predicates hold - build_post_draft_payload \
+             would have returned Some"
+        ),
+    }
+}
+
+/// The directory + filename a `LearningArtifact` payload would materialize
+/// to, derived from [`okf_core::BrainDocModel::index_intent`]
+/// exactly as `mev`'s materializer derives it
+/// (`root/dirname(index_path)/link_target`) — never a hardcoded literal
+/// (`EN.12.M` task 2's rule, restated here for the dry-run report task 3
+/// adds). Relative to the brain root; this function performs no I/O and
+/// engine-rs never resolves the root itself on this path (out of scope,
+/// per the block record: "engine-rs proposes, mev writes").
+#[must_use]
+fn would_write_path(payload: &Value) -> String {
+    let artifact = LearningArtifact::from_payload(payload);
+    let intent = artifact.index_intent();
+    let dir = intent
+        .index_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
+    if dir.is_empty() {
+        intent.link_target
+    } else {
+        format!("{dir}/{}", intent.link_target)
+    }
+}
 
 /// Pull a campaign id out of a `ctx.event` JSON value: a bare JSON string
 /// is parsed directly; a JSON object is read via its `"campaign_id"` field
@@ -269,6 +333,7 @@ pub struct DebriefNode {
     transport: Arc<dyn ChannelTransport>,
     journal_sink: Option<Arc<JournalSinkFn>>,
     dispatch_workflow_type: String,
+    draft_language: String,
 }
 
 impl DebriefNode {
@@ -288,6 +353,7 @@ impl DebriefNode {
             transport,
             journal_sink: None,
             dispatch_workflow_type: DEFAULT_DISPATCH_WORKFLOW_TYPE.to_string(),
+            draft_language: String::new(),
         }
     }
 
@@ -306,6 +372,18 @@ impl DebriefNode {
     #[must_use]
     pub fn with_dispatch_workflow_type(mut self, workflow_type: impl Into<String>) -> Self {
         self.dispatch_workflow_type = workflow_type.into();
+        self
+    }
+
+    /// Set the `language` (`"en"` or `"pt-BR"`, per D77 §2) the post-draft
+    /// payload is built with. Defaults to empty, which
+    /// [`build_post_draft_payload`] falls back to `"en"` for — no
+    /// translation happens on this path (out of scope, per the block
+    /// record); this only labels the language the caller asserts the
+    /// campaign's rows were already produced in.
+    #[must_use]
+    pub fn with_draft_language(mut self, language: impl Into<String>) -> Self {
+        self.draft_language = language.into();
         self
     }
 }
@@ -375,10 +453,11 @@ impl Node for DebriefNode {
             .map(|row| json!({ "step": row.step, "reason": row.reason }))
             .collect();
 
+        let run_id = read_run_id(&ctx.metadata)
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .unwrap_or_else(Uuid::new_v4);
+
         if let Some(sink) = &self.journal_sink {
-            let run_id = read_run_id(&ctx.metadata)
-                .and_then(|s| Uuid::parse_str(&s).ok())
-                .unwrap_or_else(Uuid::new_v4);
             sink(JournalRow {
                 id: Uuid::new_v4(),
                 campaign_id: campaign_id.to_string(),
@@ -395,6 +474,98 @@ impl Node for DebriefNode {
             });
         }
 
+        // THE POST DRAFT — a second, separately-shaped output on the same
+        // path (`EN.12.M` task 3). Reuses the exact rows already fetched
+        // above; `brief`/`brief_names_every_bail` above are untouched by
+        // any of what follows, so the ops-digest gate this node enforces
+        // stays exactly as strict as it was before this block landed.
+        let draft_payload = build_post_draft_payload(&rows, &self.draft_language);
+        let post_draft_result = match &draft_payload {
+            Some(payload) => {
+                let draft_text = payload["digest_markdown"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+
+                // Dispatched over the same fire-and-forget seam as the ops
+                // digest (see the module doc: there is no synchronous path
+                // back from a dispatched CONTENT_PIPELINE run), carrying
+                // the draft text as its envelope body and the full
+                // `LearningArtifact` payload as `raw_payload` so a future
+                // consumer can read the structured shape without a second
+                // dispatch.
+                let draft_envelope = IngressEnvelope {
+                    envelope_id: format!("debrief-draft:{campaign_id}"),
+                    channel_type: ChannelType::Schedule,
+                    sender_id: None,
+                    reply_context: None,
+                    timestamp: Utc::now().to_rfc3339(),
+                    source: SourcePayload::ChannelMessage {
+                        text: draft_text.clone(),
+                        attachments: vec![],
+                    },
+                    raw_payload: payload.clone(),
+                };
+                let draft_event = json!({ "envelope": draft_envelope, "chain_depth": 0u64 });
+                let draft_action = OutboundAction::new(
+                    ChannelType::WorkflowTrigger,
+                    None,
+                    OutboundBody::TriggerWorkflow {
+                        workflow_type: self.dispatch_workflow_type.clone(),
+                        event: draft_event,
+                    },
+                );
+                let draft_receipt =
+                    receipt_from_send_result(self.transport.send(&draft_action).await);
+
+                // Written back synchronously, byte-identical to what was
+                // just dispatched — matching EN.12.G's existing guarantee
+                // for the ops digest (module doc: "nothing is lost to an
+                // unawaited child run").
+                if let Some(sink) = &self.journal_sink {
+                    sink(JournalRow {
+                        id: Uuid::new_v4(),
+                        campaign_id: campaign_id.to_string(),
+                        run_id,
+                        step: POST_DRAFT_STEP_NAME.to_string(),
+                        kind: JournalDecisionKind::DebriefRendered,
+                        reason: "post draft rendered".to_string(),
+                        detail: json!({
+                            "draft": draft_text,
+                            "payload": payload,
+                            "row_count": row_count,
+                        }),
+                        created_at: Utc::now(),
+                    });
+                }
+
+                // Dry-run report: mev is never called from this path
+                // (out of scope, per the block record — "engine-rs
+                // proposes, mev writes"), so what mev WOULD write is
+                // reported here, before anything is applied.
+                json!({
+                    "rendered": true,
+                    "reason": Value::Null,
+                    "payload": payload,
+                    "dispatch_receipt": draft_receipt,
+                    "materialize_intent": {
+                        "would_write": would_write_path(payload),
+                        "written": false,
+                    },
+                })
+            }
+            None => {
+                let reason = no_draft_reason(&rows);
+                json!({
+                    "rendered": false,
+                    "reason": reason,
+                    "payload": Value::Null,
+                    "dispatch_receipt": Value::Null,
+                    "materialize_intent": Value::Null,
+                })
+            }
+        };
+
         let mut ctx = ctx;
         put_result(
             &mut ctx,
@@ -404,6 +575,7 @@ impl Node for DebriefNode {
                 "row_count": row_count,
                 "brief": brief,
                 "dispatch_receipt": receipt,
+                "post_draft": post_draft_result,
             }),
         );
 
@@ -912,5 +1084,252 @@ mod tests {
     #[test]
     fn debrief_node_name_is_stable() {
         assert_eq!(DEBRIEF_NODE_NAME, "DebriefNode");
+    }
+
+    // ── POST_DRAFT (`EN.12.M` task 3) ────────────────────────────────────
+
+    fn row_with_detail(
+        campaign_id: &str,
+        step: &str,
+        kind: JournalDecisionKind,
+        reason: &str,
+        detail: Value,
+        offset_secs: i64,
+    ) -> JournalRow {
+        JournalRow {
+            id: Uuid::new_v4(),
+            campaign_id: campaign_id.to_string(),
+            run_id: Uuid::new_v4(),
+            step: step.to_string(),
+            kind,
+            reason: reason.to_string(),
+            detail,
+            created_at: Utc::now() + chrono::Duration::seconds(offset_secs),
+        }
+    }
+
+    /// A row that clears the draft bar alone: a numeric `detail` leaf and a
+    /// path-shaped token in `reason`.
+    fn draft_worthy_row(campaign_id: &str) -> JournalRow {
+        row_with_detail(
+            campaign_id,
+            "build",
+            JournalDecisionKind::StepIntegrated,
+            "wrote crates/engine-core/src/workflows/orchestration/debrief.rs",
+            json!({ "lines_added": 42 }),
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn process_produces_both_ops_digest_and_post_draft_when_bar_is_cleared() {
+        let campaign_id = Uuid::new_v4();
+        let rows = vec![draft_worthy_row(&campaign_id.to_string())];
+        let reader = Arc::new(StubJournalReader::succeeding(rows));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let written: Arc<Mutex<Vec<JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_written = written.clone();
+        let sink: Arc<JournalSinkFn> = Arc::new(move |row| sink_written.lock().unwrap().push(row));
+
+        let node = DebriefNode::new(reader, transport.clone()).with_journal_sink(sink);
+        let ctx = base_ctx(Value::String(campaign_id.to_string()));
+
+        let result_ctx = node
+            .process(ctx)
+            .await
+            .expect("a draft-worthy campaign must not fail");
+
+        let node_result = result_ctx.nodes.get(DEBRIEF_NODE_NAME).unwrap();
+        let brief = node_result["brief"].as_str().unwrap();
+        let post_draft = &node_result["post_draft"];
+        assert_eq!(post_draft["rendered"], json!(true));
+        let draft_text = post_draft["payload"]["digest_markdown"].as_str().unwrap();
+
+        // Distinguishable by payload, not by parsing prose (block AC1).
+        assert_ne!(brief, draft_text);
+        assert_eq!(post_draft["payload"]["channel_type"], "post_draft");
+
+        // Both dispatched: the ops digest, and the draft.
+        assert_eq!(transport.calls().len(), 2);
+
+        // Both written back to the journal.
+        let written_rows = written.lock().unwrap();
+        assert_eq!(written_rows.len(), 2);
+        assert_eq!(written_rows[0].step, DEBRIEF_NODE_NAME);
+        assert_eq!(written_rows[1].step, POST_DRAFT_STEP_NAME);
+        assert_eq!(
+            written_rows[1].detail["draft"].as_str().unwrap(),
+            draft_text
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_text_written_to_journal_is_byte_identical_to_text_dispatched() {
+        let campaign_id = Uuid::new_v4();
+        let rows = vec![draft_worthy_row(&campaign_id.to_string())];
+        let reader = Arc::new(StubJournalReader::succeeding(rows));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let written: Arc<Mutex<Vec<JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_written = written.clone();
+        let sink: Arc<JournalSinkFn> = Arc::new(move |row| sink_written.lock().unwrap().push(row));
+
+        let node = DebriefNode::new(reader, transport.clone()).with_journal_sink(sink);
+        let ctx = base_ctx(Value::String(campaign_id.to_string()));
+
+        node.process(ctx).await.expect("must succeed");
+
+        let dispatched_text = match &transport.calls()[1].body {
+            OutboundBody::TriggerWorkflow { event, .. } => event["envelope"]["source"]["text"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            other => panic!("expected TriggerWorkflow, got {other:?}"),
+        };
+
+        let written_rows = written.lock().unwrap();
+        let journalled_text = written_rows[1].detail["draft"].as_str().unwrap();
+
+        assert_eq!(dispatched_text, journalled_text);
+    }
+
+    #[tokio::test]
+    async fn brief_names_every_bail_still_holds_when_a_draft_is_also_produced() {
+        // The second output must not weaken the first (block AC7): a
+        // bailed step's reason must still be named in the ops digest even
+        // when the same rows also clear the draft bar.
+        let campaign_id = Uuid::new_v4();
+        let rows = vec![
+            draft_worthy_row(&campaign_id.to_string()),
+            row_at(
+                &campaign_id.to_string(),
+                "publish",
+                JournalDecisionKind::StepBailed,
+                "publish target unreachable: connection refused",
+                5,
+            ),
+        ];
+        let reader = Arc::new(StubJournalReader::succeeding(rows.clone()));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let node = DebriefNode::new(reader, transport);
+        let ctx = base_ctx(Value::String(campaign_id.to_string()));
+
+        let result_ctx = node
+            .process(ctx)
+            .await
+            .expect("a correctly rendered bail must still succeed");
+
+        let brief = result_ctx.nodes.get(DEBRIEF_NODE_NAME).unwrap()["brief"]
+            .as_str()
+            .unwrap();
+        assert!(brief_names_every_bail(brief, &rows));
+        assert!(brief.contains("publish target unreachable: connection refused"));
+    }
+
+    #[tokio::test]
+    async fn zero_rows_produces_no_draft_with_a_named_reason() {
+        let campaign_id = Uuid::new_v4();
+        let reader = Arc::new(StubJournalReader::succeeding(vec![]));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let node = DebriefNode::new(reader, transport.clone());
+        let ctx = base_ctx(Value::String(campaign_id.to_string()));
+
+        let result_ctx = node
+            .process(ctx)
+            .await
+            .expect("empty campaign must not fail");
+
+        let post_draft = &result_ctx.nodes.get(DEBRIEF_NODE_NAME).unwrap()["post_draft"];
+        assert_eq!(post_draft["rendered"], json!(false));
+        assert!(post_draft["reason"].as_str().unwrap().contains("zero rows"));
+        assert!(post_draft["payload"].is_null());
+
+        // No second dispatch call for a refused draft.
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rows_with_no_measured_number_or_evidence_path_produce_no_draft_with_a_named_reason() {
+        let campaign_id = Uuid::new_v4();
+        let rows = vec![row_at(
+            &campaign_id.to_string(),
+            "build",
+            JournalDecisionKind::StepIntegrated,
+            "ok",
+            0,
+        )];
+        let reader = Arc::new(StubJournalReader::succeeding(rows));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let node = DebriefNode::new(reader, transport);
+        let ctx = base_ctx(Value::String(campaign_id.to_string()));
+
+        let result_ctx = node.process(ctx).await.expect("must not fail");
+
+        let post_draft = &result_ctx.nodes.get(DEBRIEF_NODE_NAME).unwrap()["post_draft"];
+        assert_eq!(post_draft["rendered"], json!(false));
+        assert!(post_draft["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no post draft"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_journal_reader_yields_no_draft_and_no_silent_pass() {
+        // The whole node fails before any draft logic runs — never a
+        // silent pass, and never an empty draft.
+        let reader = Arc::new(StubJournalReader::failing("journal unreachable"));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let node = DebriefNode::new(reader, transport.clone());
+        let ctx = base_ctx(Value::String(Uuid::new_v4().to_string()));
+
+        let result = node.process(ctx).await;
+
+        match result {
+            Err(err) => assert!(err.message.contains("journal unreachable")),
+            Ok(_) => panic!("a journal read failure must fail the node, not silently pass"),
+        }
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_what_mev_would_write_before_anything_is_applied() {
+        let campaign_id = Uuid::new_v4();
+        let rows = vec![draft_worthy_row(&campaign_id.to_string())];
+        let reader = Arc::new(StubJournalReader::succeeding(rows));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let node = DebriefNode::new(reader, transport);
+        let ctx = base_ctx(Value::String(campaign_id.to_string()));
+
+        let result_ctx = node.process(ctx).await.expect("must succeed");
+
+        let post_draft = &result_ctx.nodes.get(DEBRIEF_NODE_NAME).unwrap()["post_draft"];
+        let intent = &post_draft["materialize_intent"];
+        assert_eq!(intent["written"], json!(false));
+        let would_write = intent["would_write"].as_str().unwrap();
+        assert!(would_write.starts_with("docs/content/drafts/"));
+        assert!(would_write.ends_with(".md"));
+    }
+
+    #[tokio::test]
+    async fn draft_language_round_trips_through_the_dispatched_and_journalled_payload() {
+        let campaign_id = Uuid::new_v4();
+        let rows = vec![draft_worthy_row(&campaign_id.to_string())];
+        let reader = Arc::new(StubJournalReader::succeeding(rows));
+        let transport = Arc::new(StubChannelTransport::succeeding());
+        let written: Arc<Mutex<Vec<JournalRow>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_written = written.clone();
+        let sink: Arc<JournalSinkFn> = Arc::new(move |row| sink_written.lock().unwrap().push(row));
+
+        let node = DebriefNode::new(reader, transport)
+            .with_draft_language("pt-BR")
+            .with_journal_sink(sink);
+        let ctx = base_ctx(Value::String(campaign_id.to_string()));
+
+        let result_ctx = node.process(ctx).await.expect("must succeed");
+
+        let post_draft = &result_ctx.nodes.get(DEBRIEF_NODE_NAME).unwrap()["post_draft"];
+        assert_eq!(post_draft["payload"]["language"], "pt-BR");
+
+        let written_rows = written.lock().unwrap();
+        assert_eq!(written_rows[1].detail["payload"]["language"], "pt-BR");
     }
 }
