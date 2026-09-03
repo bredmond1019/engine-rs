@@ -8,3 +8,11 @@ state.json
 /planning
 node_modules/
 target/
+
+# Nested planning/ directories. The rule above is anchored (`/planning`), so it
+# only ever covered the repo-root symlink into the brain vault — a REAL planning
+# directory created anywhere below the root slipped straight past it and was
+# tracked and pushed. That happened: engine-rs shipped
+# crates/engine-core/planning/ (knowledge.md, memory.md, archived SDLC worklogs)
+# to its public GitHub remote for weeks. Anchored-rule gap, not a one-off.
+**/planning/
