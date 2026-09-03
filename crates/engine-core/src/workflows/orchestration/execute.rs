@@ -2003,4 +2003,127 @@ mod tests {
             "ExecutionOutcome::auto_pr must equal the resolved default_auto_pr passed in"
         );
     }
+
+    // ── Composed seam: sdlc_flow_event -> PullRequestNode ────────────────
+    //
+    // `sdlc_flow/pr.rs`'s own `auto_pr_false_short_circuits_without_calling_runner`
+    // already proves the RECEIVER honours `auto_pr: false` when told. What
+    // that test cannot prove is that the VALUE actually gets there through
+    // this module's own event-building — so this test drives a real
+    // `PullRequestNode` with the exact `serde_json::Value` `sdlc_flow_event`
+    // builds, never a hand-written fixture, closing the one seam this
+    // block exists to fix.
+
+    /// Builds a real `SDLC_FLOW` event through [`sdlc_flow_event`] from an
+    /// invocation with `auto_pr: false`, hands that exact event to a real
+    /// `PullRequestNode`, and asserts the node short-circuits — stamping
+    /// `skipped: true` — without ever invoking the command runner. The
+    /// runner stub panics if called at all, so a regression that lets
+    /// `auto_pr` silently default back to `true` on the wire fails this
+    /// test loudly rather than shelling out to `gh`.
+    #[tokio::test]
+    async fn seeded_auto_pr_false_reaches_a_real_pull_request_node_and_suppresses_the_pr() {
+        use crate::node::Node;
+        use crate::workflows::sdlc_flow::pr::PullRequestNode;
+        use crate::workflows::sdlc_flow::CommandOutput;
+
+        let invocation = FlowInvocation {
+            repo: "repo-a".to_string(),
+            repo_path: PathBuf::from("/tmp/repo-a"),
+            block_id: "A.1".to_string(),
+            use_worktree: true,
+            auto_pr: false,
+            campaign_id: Uuid::new_v4(),
+            engine: EngineKind::Flow,
+            cancellation_token: None,
+            budget: None,
+            permission_profile: PermissionProfile::Standard,
+        };
+
+        let event = sdlc_flow_event(&invocation);
+
+        let runner: sdlc_flow::CommandRunner = Arc::new(|program, args, _cwd| {
+            panic!(
+                "PullRequestNode must never invoke the command runner when the \
+                 seeded event carries auto_pr: false — got {program} {args:?}"
+            );
+            #[allow(unreachable_code)]
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let ctx = TaskContext {
+            event,
+            nodes: std::collections::HashMap::new(),
+            metadata: json!({}),
+            node_runs: std::collections::HashMap::new(),
+        };
+
+        let node = PullRequestNode::new().with_runner(runner);
+        let out = node
+            .process(ctx)
+            .await
+            .expect("PullRequestNode should short-circuit cleanly, not error");
+
+        let result = &out.nodes["PullRequestNode"];
+        assert_eq!(
+            result["skipped"],
+            json!(true),
+            "seeded auto_pr: false must reach PullRequestNode as skipped: true, got {result}"
+        );
+        assert!(
+            result["pr_url"].is_null(),
+            "a skipped PR must stamp a null pr_url, got {result}"
+        );
+    }
+
+    /// Mirror of the above: an `ORCHESTRATION` event with no `policy` field
+    /// at all resolves to `auto_pr == true` (existing chains are
+    /// unchanged), and one with `"policy": {"default_auto_pr": false}`
+    /// resolves to `auto_pr == false` — both through the real
+    /// `resolve_policy_for_run_from` this module's `execute_step` caller
+    /// consults, never a hand-rolled default.
+    #[test]
+    fn orchestration_event_policy_resolves_default_auto_pr_both_ways() {
+        use super::super::graph::resolve_policy_for_run_from;
+        use crate::policy::PolicyConfigSource;
+
+        let ctx_no_policy = TaskContext {
+            event: json!({
+                "brain_root": "/tmp/brain",
+                "blocks": [{"repo": "repo-a", "block_id": "A.1"}],
+            }),
+            nodes: std::collections::HashMap::new(),
+            metadata: json!({}),
+            node_runs: std::collections::HashMap::new(),
+        };
+        let policy_default =
+            resolve_policy_for_run_from(&ctx_no_policy, &PolicyConfigSource::Builtin)
+                .expect("event with no policy field should resolve");
+        assert!(
+            policy_default.default_auto_pr,
+            "an ORCHESTRATION event with no policy field must resolve default_auto_pr == true"
+        );
+
+        let ctx_override = TaskContext {
+            event: json!({
+                "brain_root": "/tmp/brain",
+                "blocks": [{"repo": "repo-a", "block_id": "A.1"}],
+                "policy": {"default_auto_pr": false},
+            }),
+            nodes: std::collections::HashMap::new(),
+            metadata: json!({}),
+            node_runs: std::collections::HashMap::new(),
+        };
+        let policy_override =
+            resolve_policy_for_run_from(&ctx_override, &PolicyConfigSource::Builtin)
+                .expect("event with a default_auto_pr override should resolve");
+        assert!(
+            !policy_override.default_auto_pr,
+            "\"policy\": {{\"default_auto_pr\": false}} must resolve default_auto_pr == false"
+        );
+    }
 }
