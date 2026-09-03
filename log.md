@@ -14,6 +14,22 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-03]
+
+### EN.12.M — `POST_DRAFT`: a finished run drafts the post about itself
+- **What:** Ran `/sdlc-flow` end to end on branch `EN.12.M-flow`, all 6 tasks passed, PASS review. `DebriefNode` now renders a second output alongside its existing ops digest: a post draft, produced by a new deterministic, I/O-free `render_post_draft` over `JournalRow` (task 1). The draft only fires when `rows_clear_draft_bar` is satisfied — at least one row carries a measured number (any numeric JSON leaf in a row's detail) and at least one row carries an evidence path (a path-shaped token in a row's reason or detail); otherwise DebriefNode refuses with a named reason and produces no draft. The draft is built into an `okf_core::LearningArtifact` payload (`channel_type="post_draft"`, en/pt-BR language, `source_ref` from the first sorted evidence path — task 2), then dispatched and journaled through the same `ChannelTransport`/`JournalDecisionKind::DebriefRendered` seams the ops digest already uses (a second `OutboundAction` and journal row, distinguished by `step: "PostDraft"`), plus a dry-run `materialize_intent` report computed purely from `okf_core::LearningArtifact::index_intent()` — engine-rs never touches disk or calls mev on this path (task 3). Two by-construction guard tests pin the invariants: a source scan proving no `.md` write anywhere on the POST_DRAFT path, and a DebriefNode-level integration test proving an unworthy campaign yields no draft and no second dispatch — both watched failing before the fix, then green (task 4). Along the way, fixed a pre-existing gap in `engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` guard test that the new `post_draft.rs` module tripped. `docs/workflows/orchestration.md` documents the two-output shape, the D79 measured-number+evidence-path bar, and the no-markdown-writer guarantee (task 5). Task 6 (validation-only) ran the full gate over the integrated tree: `cargo fmt --check`, `clippy --all-features -D warnings`, `cargo nextest run --workspace --all-features` (3550/3550 passed), `cargo build --release` — all green.
+- **Decisions:** draft is a second *output* of `DebriefNode`, not a new graph node (graph.rs node-count assertion untouched); `channel_type="post_draft"` is a new constant distinguishing this payload from other `LearningArtifact` uses; `entities` left empty (journal rows name steps/paths, not entities); reused the existing `okf_core::LearningArtifact` model rather than adding a fourth `BrainDocModel`.
+- Next: pick up the next item in `planning/status.md`'s `next:` queue — `EN.6.L` (CLAIM_REAFFIRM), `EN.12.F` (CONDUCTOR), `EN.12.H` (Research → action items), `EN.14.E` (journal table migration tooling), or `EN.ticket.emit-state-node-must-self-exempt-its-own-lease`.
+
+```
+26bf466 docs: update docs for EN.12.M
+4c447c2 feat: implement EN.12.M-task5
+fa7ba43 feat: implement EN.12.M-task4
+87b7318 feat: implement EN.12.M-task3
+7ef25eb feat: implement EN.12.M-task2
+7ddbd27 feat: implement EN.12.M-task1
+```
+
 ## [run: 2026-09-02]
 
 ### EN.ticket.externalize-node-prompts — Node prompts move out of the .rs files
