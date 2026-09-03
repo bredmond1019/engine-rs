@@ -129,6 +129,13 @@ The e2e suites in `tests/it/` follow rules worth preserving:
 - **Don't pre-create directories the writer should create.** Pre-creating
   `docs/content/learning-corpus/` in every test masked a real production bug where `apply_plan`
   never created parents (`EN.7.D`, fixed in `d1a8787`).
+- **A migration test never runs against `orchestration_dev`.** `crates/engine-store/tests/
+  migrations_apply_cleanly.rs` (`EN.14.E`) `CREATE DATABASE`s a uniquely-named scratch database,
+  applies `crates/engine-store/migrations/` to it twice (idempotency), asserts the resulting schema,
+  then drops it in a cleanup path that always runs. It is `#[ignore]`d — CI has no Postgres service
+  — so run it explicitly with a `CREATEDB`-capable `DATABASE_URL`; see
+  [architecture.md § Migrations](architecture.md#migrations-en14e) for the full command and the
+  CI-Postgres consequence.
 
 ## The nextest terminate-after bound
 

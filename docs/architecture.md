@@ -428,6 +428,65 @@ CI (`.github/workflows/ci.yml`) runs on every push (all branches) and on pull re
 the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
 `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release`.
 
+### Migrations (`EN.14.E`)
+
+`crates/engine-store/migrations/` is engine-rs's first tracked migration directory, applied with
+plain `sqlx::migrate!` — the `migrate` feature of the workspace's existing `sqlx` dependency, not a
+second database stack or a second connection pool. A `diesel-async` spike ran ahead of this choice
+(`planning/EN.14.E/spike-fork-9.md`) and found it workable against this workspace's tokio/actix
+runtime, but adding it would mean a second Postgres driver stack alongside sqlx's for no compile-time
+safety gain: `engine-store` has zero `query!`/`query_as!` macro calls today, so there is no `.sqlx`
+offline-query cache to lose by staying on sqlx and no compile-time-checked-query benefit to gain by
+adopting diesel here either. `OP.fork-9-orm-choice` is the operator gate that ratifies an ORM choice
+for the crates downstream of this block (`EN.14.F`, `EN.14.I`); this block's own choice is `sqlx`.
+
+Files under `crates/engine-store/migrations/` follow sqlx's `<VERSION>_<description>.sql` naming
+convention (leading integer version, underscore, description, `.sql`); a file that does not match
+that shape — this section's own `README.md` included — is ignored by the migration resolver.
+`0001_create_journal.sql` is the initial revision: the `journal` table plus its
+`(campaign_id, created_at)` composite index (see "Journal" below), derived from the live DDL stated
+in `crates/engine-store/src/postgres.rs`'s `insert_journal_row`/`list_journal_rows_for_campaign`
+doc comment, not from `docs/data-contract.md`.
+
+Apply pending migrations programmatically with `engine_store::run_migrations(&pool)`, or from the
+command line with `sqlx-cli`:
+
+```sh
+sqlx migrate run --source crates/engine-store/migrations --database-url "$DATABASE_URL"
+```
+
+**Tests that apply migrations always run against a scratch database created and dropped by the
+test itself — never `orchestration_dev`, and never `orchestration_sandbox` unless the test can
+guarantee it only touches what it created.** `crates/engine-store/tests/migrations_apply_cleanly.rs`
+is the pattern: it `CREATE DATABASE`s a uniquely-named scratch database, runs the migrations against
+it twice (proving the second run is a no-op, not an error), asserts the `journal` table's columns
+and index match the live schema exactly, then drops the scratch database in a cleanup path that
+always runs, migration failure or not.
+
+**CI-Postgres consequence: none, so far.** engine-rs's CI (`.github/workflows/ci.yml`) still runs no
+Postgres service — `migrations_apply_cleanly.rs`'s scratch-database test is `#[ignore]`d for the same
+reason `crates/engine-store/tests/postgres_round_trip.rs` already was (see above): it needs a live
+Postgres role with `CREATEDB`, which CI does not provide. `sqlx::migrate!`/`embed_migrations!`-style
+tooling only reads `.sql` files from disk at compile time — no live database is needed to *build*,
+only to *run* the ignored test, so choosing sqlx over diesel-async changed nothing about CI's shape.
+Run it explicitly:
+
+```sh
+DATABASE_URL=postgres://<superuser>@localhost:5432/postgres \
+  cargo nextest run -p engine-store --run-ignored ignored-only
+```
+
+`DATABASE_URL`'s username must be given explicitly — nextest runs each test in its own process with
+a scrubbed environment, so sqlx's no-username fallback (`$USER`/`whoami`) resolves to a role that
+does not exist rather than the invoking shell's user.
+
+**Synapse's alembic setup is untouched.** Per brain
+[D84 Amendment 1](file:///Users/brandon/Dev/agentic-portfolio/docs/decisions/D84-engine-rs-owns-the-engine-tables.md#amendment-1-same-day-2026-09-01--events-is-a-shared-dispatch-table-not-an-engine-table),
+the Engine and Brain databases are separate — this migration only ever touches engine-rs's own
+Postgres database (the one `engine-store` connects to), never Synapse's corpus/embeddings database
+or its alembic revision history. Nothing in Synapse's code or migrations changes as a result of this
+block.
+
 ## Core Types
 
 - `Node` (trait, `engine-core::node`, `#[async_trait::async_trait]`) — `async fn process(&self, ctx:
