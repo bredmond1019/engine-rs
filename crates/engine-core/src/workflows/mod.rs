@@ -17,6 +17,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use claude_code_rs::{Config, Outcome};
 use engine_contract::TaskContext;
@@ -246,19 +247,108 @@ pub struct CommandOutput {
 pub type CommandRunner =
     Arc<dyn Fn(&str, &[&str], &Path) -> std::io::Result<CommandOutput> + Send + Sync>;
 
-/// The default [`CommandRunner`]: shells out to the real subprocess via
-/// `std::process::Command` — gated by the non-overridable
-/// [`command_floor::evaluate_command`] org-floor denylist. Every consumer of
-/// this seam (git/gh argv from `setup.rs`/`pr.rs`, `sh -c` harness-check
-/// strings from `task_loop.rs`) funnels through here, so gating it here
-/// covers all of them with no per-call-site changes (see
-/// `planning/ticket-sdlc-command-policy-floor/tasks.md`). A denied command
-/// never reaches `std::process::Command`.
+/// The default [`CommandRunner`]: a thin delegation onto
+/// [`default_spec_runner`] with an empty `env` (inherit-only) and
+/// `timeout: None` (wait forever) — today's exact behavior. This keeps
+/// [`CommandRunner`]'s signature and every one of its 28 call sites
+/// untouched (`EN.ticket.command-runner-timeout-and-env`); the org-floor
+/// denylist evaluation and the crate's one `std::process::Command` spawn
+/// both live in [`default_spec_runner`] now, not here.
 #[must_use]
 pub fn default_command_runner() -> CommandRunner {
-    Arc::new(|program, args, cwd| {
-        let joined = std::iter::once(program)
-            .chain(args.iter().copied())
+    let spec_runner = default_spec_runner();
+    Arc::new(move |program, args, cwd| {
+        let spec = CommandSpec {
+            program,
+            args,
+            cwd,
+            env: &[],
+            timeout: None,
+        };
+        spec_runner(&spec)
+    })
+}
+
+/// Superset description of a subprocess invocation for [`SpecCommandRunner`]
+/// — additive to the plain `(program, args, cwd)` triple [`CommandRunner`]
+/// takes, carrying per-call environment variables and an optional hard
+/// timeout. An empty `env` and `timeout: None` reproduce
+/// [`default_command_runner`]'s exact behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandSpec<'a> {
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    pub cwd: &'a Path,
+    /// Extra environment variables the child sees on top of whatever it
+    /// would otherwise inherit from this process. Empty means "inherit
+    /// only" — today's behavior. These never mutate this process's own
+    /// environment; they are passed straight to `std::process::Command`.
+    pub env: &'a [(&'a str, &'a str)],
+    /// Hard wall-clock budget for the child. `None` waits forever (today's
+    /// behavior). `Some(d)` kills and reaps the child if it has not exited
+    /// within `d`, returning a [`CommandTimeout`] error rather than a
+    /// success or an empty result.
+    pub timeout: Option<Duration>,
+}
+
+/// The injectable command-runner signature for callers that need per-call
+/// environment variables and/or a hard timeout — the superset seam new
+/// subprocess callers (`typst`, `yt-dlp`, `uv run`, Playwright drivers,
+/// ...) should reach for instead of a raw `std::process::Command`. Defaults
+/// to the real subprocess via [`default_spec_runner`]; tests substitute a
+/// stub exactly as they do for [`CommandRunner`].
+pub type SpecCommandRunner =
+    Arc<dyn Fn(&CommandSpec) -> std::io::Result<CommandOutput> + Send + Sync>;
+
+/// Typed error returned when a [`SpecCommandRunner`] child exceeds its
+/// [`CommandSpec::timeout`]. Carried as the source of an
+/// `io::Error(ErrorKind::TimedOut, ..)` so the seam's return type stays
+/// `std::io::Result<CommandOutput>` — downcast via
+/// `err.get_ref().and_then(|e| e.downcast_ref::<CommandTimeout>())` to
+/// recover the typed detail. Never a zero-status success and never a
+/// silent empty result: whatever stdout/stderr the child had produced
+/// before the kill is preserved here.
+#[derive(Debug)]
+pub struct CommandTimeout {
+    pub program: String,
+    pub elapsed: Duration,
+    pub stdout: String,
+    pub stderr: String,
+    /// The killed child's pid, for diagnostics/tests that want to confirm
+    /// the process is actually gone (not left as a zombie).
+    pub pid: u32,
+}
+
+impl std::fmt::Display for CommandTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "command `{}` (pid {}) timed out after {:?}",
+            self.program, self.pid, self.elapsed
+        )
+    }
+}
+
+impl std::error::Error for CommandTimeout {}
+
+/// The default [`SpecCommandRunner`]: shells out to the real subprocess via
+/// `std::process::Command` — gated by the non-overridable
+/// [`command_floor::evaluate_command`] org-floor denylist, exactly as
+/// [`default_command_runner`] used to do directly. This is now the ONLY
+/// place in the crate that evaluates the floor and spawns a child; a
+/// denied command never reaches `std::process::Command`.
+///
+/// Timeout semantics: the child's stdout/stderr are drained on background
+/// threads (so a chatty child can't deadlock on a full pipe buffer while
+/// this polls), and `try_wait` is polled against a deadline. On expiry the
+/// child is `kill()`-ed and then `wait()`-ed to reap it — never left as a
+/// zombie — and the call returns a [`CommandTimeout`] naming the program,
+/// pid, elapsed duration, and whatever output had been captured so far.
+#[must_use]
+pub fn default_spec_runner() -> SpecCommandRunner {
+    Arc::new(|spec: &CommandSpec| {
+        let joined = std::iter::once(spec.program)
+            .chain(spec.args.iter().copied())
             .collect::<Vec<_>>()
             .join(" ");
         if let CommandDecision::Deny { reason, matched } = command_floor::evaluate_command(&joined)
@@ -269,15 +359,77 @@ pub fn default_command_runner() -> CommandRunner {
                 stderr: format!("command-policy: blocked ({reason}): {matched}"),
             });
         }
-        let output = std::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .output()?;
-        Ok(CommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+
+        let mut child = std::process::Command::new(spec.program)
+            .args(spec.args)
+            .current_dir(spec.cwd)
+            .envs(spec.env.iter().map(|(k, v)| (*k, *v)))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+
+        // Drain stdout/stderr concurrently so a child that writes more
+        // than a pipe buffer's worth of output can't deadlock the poll
+        // loop below (which never reads the pipes itself).
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            buf
+        });
+
+        let start = std::time::Instant::now();
+        let exit_status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if let Some(timeout) = spec.timeout {
+                if start.elapsed() >= timeout {
+                    break None;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let collect = |handle: std::thread::JoinHandle<Vec<u8>>| -> String {
+            String::from_utf8_lossy(&handle.join().unwrap_or_default()).into_owned()
+        };
+
+        match exit_status {
+            Some(status) => Ok(CommandOutput {
+                status: status.code().unwrap_or(-1),
+                stdout: collect(stdout_handle),
+                stderr: collect(stderr_handle),
+            }),
+            None => {
+                // Deadline hit: kill then wait() to reap — a kill() alone
+                // leaves a zombie until someone waits on the pid.
+                let _ = child.kill();
+                let _ = child.wait();
+                let elapsed = start.elapsed();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    CommandTimeout {
+                        program: spec.program.to_string(),
+                        elapsed,
+                        stdout: collect(stdout_handle),
+                        stderr: collect(stderr_handle),
+                        pid,
+                    },
+                ))
+            }
+        }
     })
 }
 
@@ -459,8 +611,8 @@ fn log_noop_commit(label: &str, output: &CommandOutput) {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_all, default_command_runner, is_noop_commit, strip_json_fence, CommandOutput,
-        CommandRunner, CommitOutcome,
+        commit_all, default_command_runner, default_spec_runner, is_noop_commit, strip_json_fence,
+        CommandOutput, CommandRunner, CommandSpec, CommitOutcome,
     };
     use std::sync::Arc;
 
@@ -582,6 +734,80 @@ mod tests {
         assert_eq!(output.status, 0);
         assert!(output.stdout.contains("hi"));
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn command_spec_with_empty_env_and_no_timeout_matches_default_command_runner() {
+        let tmp = std::env::temp_dir();
+        let spec_runner = default_spec_runner();
+        let spec = CommandSpec {
+            program: "echo",
+            args: &["hi"],
+            cwd: &tmp,
+            env: &[],
+            timeout: None,
+        };
+        let spec_output = spec_runner(&spec).expect("echo via CommandSpec should run normally");
+
+        let plain_runner = default_command_runner();
+        let plain_output = plain_runner("echo", &["hi"], &tmp)
+            .expect("echo via CommandRunner should run normally");
+
+        assert_eq!(spec_output.status, plain_output.status);
+        assert_eq!(spec_output.stdout, plain_output.stdout);
+        assert_eq!(spec_output.stderr, plain_output.stderr);
+    }
+
+    #[test]
+    fn default_spec_runner_blocks_a_denied_command_without_spawning() {
+        let runner = default_spec_runner();
+        let bogus_cwd = std::path::Path::new("/no/such/directory/for/this/test");
+        let spec = CommandSpec {
+            program: "git",
+            args: &["push", "--force"],
+            cwd: bogus_cwd,
+            env: &[],
+            timeout: None,
+        };
+        let output =
+            runner(&spec).expect("denied command must short-circuit before spawning, not error");
+        assert_eq!(output.status, 126);
+        assert!(
+            output.stderr.contains("force push"),
+            "stderr should name the deny reason: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("git push --force"),
+            "stderr should include the matched text: {}",
+            output.stderr
+        );
+        assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn default_spec_runner_passes_env_to_the_child_without_mutating_the_parent() {
+        let tmp = std::env::temp_dir();
+        let runner = default_spec_runner();
+
+        // The parent process must never see this var, before or after.
+        assert!(std::env::var("ENGINE_RS_SPEC_ENV_TEST_VAR").is_err());
+
+        let spec = CommandSpec {
+            program: "sh",
+            args: &["-c", "echo $ENGINE_RS_SPEC_ENV_TEST_VAR"],
+            cwd: &tmp,
+            env: &[("ENGINE_RS_SPEC_ENV_TEST_VAR", "spec-env-value")],
+            timeout: None,
+        };
+        let output = runner(&spec).expect("sh -c echo should run normally");
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.trim(), "spec-env-value");
+
+        assert!(
+            std::env::var("ENGINE_RS_SPEC_ENV_TEST_VAR").is_err(),
+            "CommandSpec::env must be scoped to the child, never the parent process"
+        );
     }
 
     #[test]
