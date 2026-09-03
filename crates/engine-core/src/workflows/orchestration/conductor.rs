@@ -205,6 +205,135 @@ pub fn fetch_frontier_slate<O: CommandOutputLike>(
     })
 }
 
+// ── Task 2: subset-only proposals, and the refusal cases ───────────────────
+//
+// The conductor proposes an ordered chain that is a SUBSET of the slate `mev
+// frontier --json` returned for this run. It can never invent a block: a
+// candidate id that is not in the slate is refused wholesale (never silently
+// trimmed) via [`ConductorProposalError::NotInSlate`] — this single check
+// covers BOTH the "proposed a real corpus block that just isn't in tonight's
+// slate" case and the "proposed a block id that does not exist in the corpus
+// at all" (invented) case, because the slate is the only view of the corpus
+// this module is allowed to hold (per the block's `out_of_scope`: filing or
+// re-deriving corpus membership is `MV.14.B`'s and `mev frontier`'s job, not
+// this module's). A separately-invented id is, from here, indistinguishable
+// from a real id that simply isn't in tonight's slate, and both are refused
+// identically.
+//
+// A candidate that IS in the slate but has no `tasks.json` yet is refused
+// for dispatch (never silently dispatched into a run that can only fail)
+// via [`ConductorProposalError::MissingTasksJson`], naming `/generate-tasks`
+// in its diagnostic. Per carryover `gate-scope-must-be-shown-capable-of-
+// failing`, [`propose_chain`]'s subset check takes the slate as an
+// independent input — never one derived from the proposal itself — so the
+// check can actually fail on a real input instead of only ever passing.
+
+/// Whether `tasks.json` exists for `(repo, block_id)`. Injected exactly like
+/// [`Runner`] (`crate::policy::emit_state`'s `CommandRunner` convention) so no
+/// test in this module touches a real filesystem or another repo's
+/// `planning/` tree — a fake in a test can assert "these ids have a
+/// `tasks.json`, these do not" without caring how a real implementation would
+/// locate one across repos.
+pub type TasksJsonChecker = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// Everything that refuses a conductor proposal outright. Every variant names
+/// what was refused and why — mirrors [`ConductorInputError`]'s own
+/// discipline of never failing silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConductorProposalError {
+    /// No objective, so the conductor refuses to propose anything at all —
+    /// it never falls back to an inferred goal. Wraps [`ConductorInputError`]
+    /// so the underlying reason (missing vs. unreadable) is preserved.
+    Objective(ConductorInputError),
+    /// `repo:block_id` is not present in the slate this run's `mev frontier
+    /// --json` returned. Covers both a real corpus block that just isn't in
+    /// tonight's slate and an outright invented id — see the module note
+    /// above for why the two are indistinguishable from here. The WHOLE
+    /// proposal is rejected; nothing is silently trimmed.
+    NotInSlate { repo: String, block_id: String },
+    /// `repo:block_id` is in the slate but has no `tasks.json` yet, so
+    /// dispatching it would only fail. Refused rather than dispatched.
+    MissingTasksJson { repo: String, block_id: String },
+}
+
+impl std::fmt::Display for ConductorProposalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConductorProposalError::Objective(err) => write!(f, "{err}"),
+            ConductorProposalError::NotInSlate { repo, block_id } => write!(
+                f,
+                "conductor: proposed block '{repo}:{block_id}' is not in tonight's \
+                 `mev frontier --json` slate — the conductor never proposes a block \
+                 outside the computed slate, whether that block exists elsewhere in \
+                 the corpus or was invented outright; the whole proposal is rejected"
+            ),
+            ConductorProposalError::MissingTasksJson { repo, block_id } => write!(
+                f,
+                "conductor: proposed block '{repo}:{block_id}' has no `tasks.json` \
+                 yet — run `/generate-tasks` for it before it can be dispatched"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConductorProposalError {}
+
+/// Validate `proposed` (an ordered, caller-supplied `(repo, block_id)` list —
+/// the conductor's candidate picks, in the order it wants them run) against
+/// `slate` and `tasks_json_exists`, and turn it into a real chain the same
+/// shape [`super::chain::resolve_explicit_chain`] produces, so nothing
+/// downstream of this function can tell a conductor-produced chain from an
+/// authored one.
+///
+/// Refuses, in order:
+/// 1. No objective file at `config.objective_path()` — see
+///    [`ConductorProposalError::Objective`].
+/// 2. Any proposed block outside `slate` — see
+///    [`ConductorProposalError::NotInSlate`]. The WHOLE proposal is rejected
+///    on the first offending entry; nothing is silently trimmed.
+/// 3. Any proposed block with no `tasks.json` — see
+///    [`ConductorProposalError::MissingTasksJson`].
+///
+/// `slate` is an independent input (typically [`fetch_frontier_slate`]'s
+/// result), never derived from `proposed` — per carryover
+/// `gate-scope-must-be-shown-capable-of-failing`, a subset check whose slate
+/// is derived from the proposal itself can never fail.
+pub fn propose_chain(
+    config: &ConductorConfig,
+    proposed: &[(String, String)],
+    slate: &FrontierArtifact,
+    tasks_json_exists: &TasksJsonChecker,
+) -> Result<Vec<crate::workflows::orchestration::chain::ChainStep>, ConductorProposalError> {
+    read_objective(config).map_err(ConductorProposalError::Objective)?;
+
+    let slate_keys: std::collections::HashSet<&str> = slate
+        .entries
+        .iter()
+        .map(|entry| entry.key.as_str())
+        .collect();
+
+    for (repo, block_id) in proposed {
+        let key = format!("{repo}:{block_id}");
+        if !slate_keys.contains(key.as_str()) {
+            return Err(ConductorProposalError::NotInSlate {
+                repo: repo.clone(),
+                block_id: block_id.clone(),
+            });
+        }
+    }
+
+    for (repo, block_id) in proposed {
+        if !tasks_json_exists(repo, block_id) {
+            return Err(ConductorProposalError::MissingTasksJson {
+                repo: repo.clone(),
+                block_id: block_id.clone(),
+            });
+        }
+    }
+
+    Ok(crate::workflows::orchestration::chain::resolve_explicit_chain(proposed.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +522,157 @@ mod tests {
             err,
             ConductorInputError::FrontierSpawnFailed { .. }
         ));
+    }
+
+    // ── propose_chain ────────────────────────────────────────────────────
+
+    /// Writes `content` to a fresh temp file and returns its path — mirrors
+    /// `chain.rs`'s own fixture-writing convention rather than pulling in a
+    /// tempdir crate for one string.
+    fn write_objective_fixture(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "engine-rs-conductor-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("objective.md");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn config_with_objective(name: &str) -> ConductorConfig {
+        let path = write_objective_fixture(name, "Ship EN.12.F.\n");
+        ConductorConfig::new().with_objective_path(path)
+    }
+
+    fn slate_from(json: &str) -> FrontierArtifact {
+        serde_json::from_str(json).expect("well-formed frontier fixture")
+    }
+
+    /// A slate fixture built independently of any proposal below — per
+    /// carryover `gate-scope-must-be-shown-capable-of-failing`, the subset
+    /// check's two inputs must never derive one from the other.
+    const INDEPENDENT_SLATE: &str = SAMPLE_FRONTIER;
+
+    fn checker(known: &'static [(&'static str, &'static str)]) -> TasksJsonChecker {
+        std::sync::Arc::new(move |repo: &str, block_id: &str| {
+            known.iter().any(|(r, b)| *r == repo && *b == block_id)
+        })
+    }
+
+    #[test]
+    fn a_slate_subset_proposal_with_tasks_json_succeeds() {
+        let config = config_with_objective("subset-ok");
+        let slate = slate_from(INDEPENDENT_SLATE);
+        let proposed = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
+        let tasks_json_exists = checker(&[("engine-rs", "EN.12.F")]);
+
+        let chain = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+            .expect("proposal is a subset of the slate and has tasks.json");
+
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].repo, "engine-rs");
+        assert_eq!(chain[0].block_id, "EN.12.F");
+    }
+
+    #[test]
+    fn a_proposal_containing_a_non_slate_block_is_rejected_wholesale_not_trimmed() {
+        let config = config_with_objective("non-slate");
+        let slate = slate_from(INDEPENDENT_SLATE);
+        // Two entries: one IS in the slate, one is not. A trimming
+        // implementation would drop only the second and succeed with one
+        // step; the subset rule instead rejects the WHOLE proposal.
+        let proposed = vec![
+            ("engine-rs".to_string(), "EN.12.F".to_string()),
+            ("engine-rs".to_string(), "EN.99.Z".to_string()),
+        ];
+        let tasks_json_exists = checker(&[("engine-rs", "EN.12.F"), ("engine-rs", "EN.99.Z")]);
+
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+            .expect_err("EN.99.Z is not in the slate");
+
+        assert_eq!(
+            err,
+            ConductorProposalError::NotInSlate {
+                repo: "engine-rs".to_string(),
+                block_id: "EN.99.Z".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_invented_block_id_is_refused_with_a_named_diagnostic() {
+        let config = config_with_objective("invented");
+        let slate = slate_from(INDEPENDENT_SLATE);
+        let proposed = vec![("engine-rs".to_string(), "EN.NOT.REAL".to_string())];
+        // Even a "yes it has tasks.json" checker must not rescue an invented
+        // id — the slate check runs first and rejects it regardless.
+        let tasks_json_exists = checker(&[("engine-rs", "EN.NOT.REAL")]);
+
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+            .expect_err("EN.NOT.REAL does not exist in the slate/corpus");
+
+        match &err {
+            ConductorProposalError::NotInSlate { repo, block_id } => {
+                assert_eq!(repo, "engine-rs");
+                assert_eq!(block_id, "EN.NOT.REAL");
+            }
+            other => panic!("expected NotInSlate, got {other:?}"),
+        }
+        assert!(err.to_string().contains("EN.NOT.REAL"));
+    }
+
+    #[test]
+    fn a_candidate_with_no_tasks_json_is_refused_naming_generate_tasks() {
+        let config = config_with_objective("no-tasks-json");
+        let slate = slate_from(INDEPENDENT_SLATE);
+        let proposed = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
+        // In the slate, but the checker reports no tasks.json.
+        let tasks_json_exists = checker(&[]);
+
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+            .expect_err("EN.12.F has no tasks.json per the checker");
+
+        assert_eq!(
+            err,
+            ConductorProposalError::MissingTasksJson {
+                repo: "engine-rs".to_string(),
+                block_id: "EN.12.F".to_string(),
+            }
+        );
+        assert!(err.to_string().contains("/generate-tasks"));
+    }
+
+    #[test]
+    fn with_no_objective_file_the_conductor_refuses_to_propose_anything() {
+        let dir = std::env::temp_dir().join(format!(
+            "engine-rs-conductor-test-no-objective-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let missing_path = dir.join("does-not-exist.md");
+        let config = ConductorConfig::new().with_objective_path(&missing_path);
+        let slate = slate_from(INDEPENDENT_SLATE);
+        // A proposal that WOULD otherwise succeed, to prove the objective
+        // check runs first and blocks it regardless.
+        let proposed = vec![("engine-rs".to_string(), "EN.12.F".to_string())];
+        let tasks_json_exists = checker(&[("engine-rs", "EN.12.F")]);
+
+        let err = propose_chain(&config, &proposed, &slate, &tasks_json_exists)
+            .expect_err("no objective file present");
+
+        match err {
+            ConductorProposalError::Objective(ConductorInputError::ObjectiveMissing { path }) => {
+                assert_eq!(path, missing_path);
+            }
+            other => panic!("expected Objective(ObjectiveMissing), got {other:?}"),
+        }
     }
 }
