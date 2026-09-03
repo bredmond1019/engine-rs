@@ -48,6 +48,13 @@ pub enum JournalDecisionKind {
     /// AC4 requires it retrievable over the same `GET /campaigns/{id}/journal`
     /// route family as the raw rows, with no second derivation.
     DebriefRendered,
+    /// `CONDUCTOR` (`EN.12.F` Task 4) proposed tonight's chain from the
+    /// operator's weekly objective and mev's computed frontier slate.
+    /// `detail` carries `{ proposed: [{repo, block_id}], dropped: [{repo,
+    /// block_id, reason}] }` — every candidate the proposal finalised with,
+    /// and every one the `git log -S` pre-flight dropped and why, so the
+    /// choice is auditable the next morning without re-deriving it.
+    ConductorProposed,
 }
 
 /// One row of the durable run journal.
@@ -112,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_decision_kinds_round_trip() {
+    fn all_nine_decision_kinds_round_trip() {
         let kinds = [
             JournalDecisionKind::StepIntegrated,
             JournalDecisionKind::StepBailed,
@@ -122,6 +129,7 @@ mod tests {
             JournalDecisionKind::ResolvedPolicy,
             JournalDecisionKind::RecallConsulted,
             JournalDecisionKind::DebriefRendered,
+            JournalDecisionKind::ConductorProposed,
         ];
         for kind in kinds {
             let row = sample_row(kind);
@@ -153,6 +161,14 @@ mod tests {
         assert_eq!(kind_json, "\"debrief_rendered\"");
         let round_tripped: JournalDecisionKind = serde_json::from_str(&kind_json).unwrap();
         assert_eq!(round_tripped, JournalDecisionKind::DebriefRendered);
+    }
+
+    #[test]
+    fn conductor_proposed_serializes_to_snake_case_wire_string() {
+        let kind_json = serde_json::to_string(&JournalDecisionKind::ConductorProposed).unwrap();
+        assert_eq!(kind_json, "\"conductor_proposed\"");
+        let round_tripped: JournalDecisionKind = serde_json::from_str(&kind_json).unwrap();
+        assert_eq!(round_tripped, JournalDecisionKind::ConductorProposed);
     }
 
     #[test]

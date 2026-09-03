@@ -6,7 +6,7 @@ doc_id: orchestration-workflow
 layer: [engine]
 project: engine-rs
 status: active
-keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, worktree isolation, permission profiles]
+keywords: [orchestration, lane chain, admission control, operator hold, sanctioned engines, worktree isolation, permission profiles, conductor, autonomous run, campaign budget]
 related: [architecture, sdlc-flow-workflow, sdlc-flow-policy, terminal-crates, orphan-recovery]
 ---
 
@@ -243,6 +243,104 @@ the draft — so it reports what `mev` **would** write instead, before anything 
 `index_intent()`) without invoking `mev`. That is this block's dry-run observability requirement —
 proposing, not writing.
 
+## `CONDUCTOR`: picking tonight's chain (`EN.12.F`)
+
+Every chain documented above still needs a human to name it — an explicit `blocks` list, or a
+`roadmap`+`lane` pair. `CONDUCTOR` is the seam that fills in the one case that used to be a hard
+refusal: **no `blocks` and no `roadmap`/`lane` at all.** With no conductor wired
+(`OrchestrationRunNode::new()`'s default), that event shape still refuses exactly as before, with the
+same "needs either `blocks` or `roadmap`+`lane`" diagnostic. With one wired
+(`OrchestrationRunNode::with_conductor`), it proposes tonight's chain itself — and the proposal flows
+through the SAME `ChainStep` shape `resolve_explicit_chain` produces, so nothing downstream of it can
+tell a conductor-proposed chain from an authored one.
+
+**Two inputs, never a third.** `conductor.rs`:
+
+- **The operator-written weekly objective** — `read_objective`, plain prose at
+  `ConductorConfig::objective_path()` (default `planning/objective.md` at the HQ/brain root, **not**
+  this repo's own vaulted `planning/`). The conductor reads it; it never writes it. **With no
+  objective file present, the conductor refuses to propose anything** — it never falls back to an
+  inferred goal.
+- **mev's computed candidate slate** — `fetch_frontier_slate`, `mev frontier --json`, shelled out
+  through the SAME `CommandRunner` convention `policy::emit_state::EmitStateNode` already uses for
+  `mev emit-state --write`. `frontier` is a READ verb and is exempt from the `--agent` quiesce rule a
+  write verb must pass (see `conductor.rs`'s module doc); a future write call from this module would
+  not be.
+
+**Subset-only, never invented.** `propose_chain` validates a caller-supplied, ordered
+`(repo, block_id)` pick list against the slate and refuses, in order: (1) any proposed block absent
+from the slate — the WHOLE proposal is rejected, never silently trimmed — with
+`ConductorProposalError::NotInSlate`; (2) a block id that does not exist in the corpus at all, same
+refusal shape; (3) a slate candidate with no `tasks.json` yet —
+`ConductorProposalError::MissingTasksJson`, naming `/generate-tasks` rather than dispatching into a
+run that has nothing to execute.
+
+**The `git log -S` pre-flight.** The corpus graph lags reality by days — measured directly against
+this fleet: two blocks were fully implemented and merged while `state.json` still read `open`, because
+their bookkeeping emits were silently refused by the lane's own quiesce lease. Before the proposal is
+finalised, `git_log_dash_s_preflight` runs `git log -S<block_id> --oneline` (through the same injected
+`Runner` convention, never a real shell-out in a test) for every surviving candidate; one with at least
+one matching commit is DROPPED — not refused, the rest of the proposal still goes ahead — with the
+reason recorded on `DroppedCandidate` and journalled (see below). A candidate the pre-flight cannot
+even check (spawn failure, non-zero exit) is a hard refusal
+(`ConductorProposalError::GitPreflightFailed`): an inconclusive check must never read as "history is
+clean".
+
+**Journalled to `EN.12.D`, retrievable per campaign.** `OrchestrationRunNode::process` writes one
+`JournalRow` (`kind: JournalDecisionKind::ConductorProposed`, `step: "CONDUCTOR"`) once the run's
+`campaign_id` is resolved — a human-scannable `reason` (how many blocks proposed, how many the
+pre-flight or the caps below dropped) plus the full per-block detail (`proposed[]`/`dropped[]`, each
+drop naming why) on `detail`. `OrchestrationRunNode::with_journal_sink` wires the sink; with none
+attached (the default) a conductor-resolved chain still runs, it simply journals nothing —
+`DebriefNode`'s own no-op convention.
+
+### Constraints on the first autonomous runs (Task 5)
+
+The operator's weekly objective (`agentic-portfolio/planning/objective.md`) bounds the *first*
+`CONDUCTOR`-proposed runs so a wrong call is cheap to unwind. All three constraints are
+`OrchestrationPolicy` knobs — resolved through the same four layers as every other knob in this
+workflow — and, unlike most of this repo's knobs, their **built-in defaults are the caps
+themselves**, not a behavior-stable no-op: a deliberate exception to CLAUDE.md standing rule 6, the
+same exception `default_use_worktree` already documents, because an unbounded first unattended run was
+never a cost/quality trade to begin with. All three apply **only** to a chain `CONDUCTOR` itself
+proposed — an explicit `blocks` chain or a `roadmap`+`lane` chain is operator-directed, not
+autonomous, and is unaffected by any of them.
+
+| Knob | Built-in default | What it enforces |
+|---|---|---|
+| `conductor_max_chain_blocks` | `Some(3)` | The most blocks a conductor proposal may dispatch in one run — the upper end of the objective's "two or three blocks" cap. |
+| `conductor_single_repo_only` | `true` | Trims a proposal to its first proposed block's repo before dispatch — the objective's "single repo, not a cross-repo lane" cap. A safety invariant: it stays `true` on every named profile, never relaxed by a cheaper or more thorough one, mirroring how `default_use_worktree` is never relaxed by profile either. |
+| `campaign_max_cost_usd_cents` | `Some(5_000)` ($50.00) | Wired straight into `integrate::integrate_chain`'s existing `campaign_budget: Option<&budget::Budget>` parameter — `EN.11.F` task 4 already checks it at every block boundary and halts the chain with the `budget_halted` terminal state; until this task the call site always passed `None`. Kept as integer cents, not `f64`, so `OrchestrationPolicy` can still derive `Eq`. |
+| `campaign_max_total_tokens` | `None` | The same ceiling expressed as a token count. Left unset on every profile — cost is the primary guardrail for the first unattended nights. |
+
+`apply_conductor_caps` (`graph.rs`) applies the first two, in order — single-repo trim, then
+chain-length trim — to the conductor's `ProposalOutcome` BEFORE the chain is finalised, appending a
+`DroppedCandidate` (same shape and journalling path as a `git log -S` drop) for every block either cap
+removes, so the journalled proposal always reflects what was actually dispatched.
+
+**The permission profile is not widened by any of this.** `resolve_child_permission_profile`
+(`execute.rs`, see "Permission profiles" below) already narrows-but-never-widens a per-step request
+against its parent, and `permission::decide` already denies `ClearOperatorGate` for every profile via
+an early return no profile row can flip — both pre-date `CONDUCTOR` and needed no new code here.
+`CONDUCTOR` requests no `permission_profile` of its own, so a conductor-proposed chain runs at
+whatever profile the dispatching event already carries, at most `standard`, with `ClearOperatorGate`
+staying denied exactly as it is for every other chain.
+
+**Why the caution is specific, not general.** `CONDUCTOR` selects work by reading two verdicts this
+fleet has measured reliability problems in: 17 committed `gates: true` checks across 7 repos that
+cannot go red (M1), and 12 forms across 6 repos of an engine writing a terminal state it has no
+evidence for (M2). Autonomy layered on top of unreliable verdicts compounds overnight instead of
+stalling, so the caps above stay in force — revisited only once M2's remediation closes, not by
+default. Evidence: `agentic-portfolio/planning/open-work/orchestration-runs/retros/pattern-analysis-2026-09-02.md`.
+
+Named profiles carry all four knobs explicitly (CLAUDE.md standing rule 6):
+
+- **`baseline`** — restates the built-in defaults verbatim: `$50.00` ceiling, no token ceiling,
+  3-block cap, single-repo.
+- **`cheap-fast`** — a tighter `$25.00` ceiling and a 2-block cap, the low end of the objective's
+  "two or three" range; still single-repo.
+- **`thorough`** — a more generous `$100.00` ceiling and the full 3-block cap; still single-repo.
+
 ## Policy
 
 Resolved through the standard four layers (per-run event override > named profile >
@@ -254,6 +352,10 @@ Resolved through the standard four layers (per-run event override > named profil
 | `default_use_worktree` | `true` | Whether a block with no per-run policy override runs in its own worktree (isolated) or directly in the repo's shared checkout (in-place). **This is a correctness precondition, not a cost/quality knob** — see below. |
 | `hold_deadline_ms` | `None` (unbounded) | The total time a single operator hold may consume before the chain fails loudly with `IntegrateError::HoldDeadlineExceeded`, instead of waiting forever. |
 | `default_auto_pr` | `true` | Whether a `flow` step's `SDLC_FLOW` child event opens a real PR through `PullRequestNode`. `false` seeds `auto_pr: false` on the child event, which `PullRequestNode` short-circuits on — stamping `{"pr_url": null, "skipped": true, "branch_name": ...}` without ever shelling out to `gh`. **`SDLC_TASK` steps are unaffected**: `SdlcTaskEventSchema` drops the field entirely because `SDLC_TASK` ships no PR ceremony, so there is nothing to seed. |
+| `conductor_max_chain_blocks` | `Some(3)` | `CONDUCTOR`-only (`EN.12.F` Task 5) — the most blocks a conductor proposal may dispatch. See "Constraints on the first autonomous runs" above. |
+| `conductor_single_repo_only` | `true` | `CONDUCTOR`-only — trims a proposal to its first block's repo. Never varies by profile. |
+| `campaign_max_cost_usd_cents` | `Some(5_000)` | `CONDUCTOR`-only — the campaign cost ceiling in USD cents, wired into `integrate_chain`'s `campaign_budget` and enforced via the `budget_halted` terminal state (`EN.11.F`). |
+| `campaign_max_total_tokens` | `None` | `CONDUCTOR`-only — the same ceiling by token count. Unset on every named profile. |
 
 Named profiles (`crates/engine-core/src/workflows/orchestration/graph.rs`):
 

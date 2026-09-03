@@ -740,7 +740,9 @@ the same four gate commands as `planning/harness.json`: `cargo fmt --check`,
   `JournalDecisionKind` (`StepIntegrated`, `StepBailed`, `GateRefused`,
   `StateWriteVerificationFailed`, `BudgetHalted`, `ResolvedPolicy`, `RecallConsulted` — `EN.12.L`,
   added when a `RECALL` dispatch step's result branches the chain, see below —, `DebriefRendered` —
-  `EN.12.G`, written by the `DEBRIEF` workflow once it renders a campaign's brief, see below) plus a kind-specific
+  `EN.12.G`, written by the `DEBRIEF` workflow once it renders a campaign's brief, see below —,
+  `ConductorProposed` — `EN.12.F`, written once per `CONDUCTOR`-proposed chain (`step: "CONDUCTOR"`),
+  see [`workflows/orchestration.md`](workflows/orchestration.md) § `CONDUCTOR`) plus a kind-specific
   `serde_json::Value` detail payload, written via `engine_store::insert_journal_row` and read back
   ordered by `(campaign_id, created_at ASC)` via `list_journal_rows_for_campaign`.
   `integrate_chain_with_journal` (`engine-core::workflows::orchestration::integrate`) is the new

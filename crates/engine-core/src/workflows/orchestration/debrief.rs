@@ -253,6 +253,7 @@ fn kind_label(kind: JournalDecisionKind) -> &'static str {
         JournalDecisionKind::ResolvedPolicy => "resolved policy",
         JournalDecisionKind::RecallConsulted => "recall consulted",
         JournalDecisionKind::DebriefRendered => "debrief rendered",
+        JournalDecisionKind::ConductorProposed => "conductor proposed",
     }
 }
 

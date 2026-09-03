@@ -144,7 +144,8 @@ fn ledger_label(kind: JournalDecisionKind) -> &'static str {
         JournalDecisionKind::StepIntegrated
         | JournalDecisionKind::ResolvedPolicy
         | JournalDecisionKind::RecallConsulted
-        | JournalDecisionKind::DebriefRendered => "DONE",
+        | JournalDecisionKind::DebriefRendered
+        | JournalDecisionKind::ConductorProposed => "DONE",
     }
 }
 
@@ -158,6 +159,7 @@ fn kind_title(kind: JournalDecisionKind) -> &'static str {
         JournalDecisionKind::ResolvedPolicy => "resolved policy",
         JournalDecisionKind::RecallConsulted => "recall consulted",
         JournalDecisionKind::DebriefRendered => "debrief rendered",
+        JournalDecisionKind::ConductorProposed => "conductor proposed",
     }
 }
 
