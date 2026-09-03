@@ -94,11 +94,26 @@ fn critic_json() -> Value {
     json!({ "verdict": "pass", "confidence": 0.95, "issues": [] })
 }
 
-/// The learning corpus directory `okf_core::LearningArtifact`'s
-/// `index_intent` registers into — pre-created so the first write has a
-/// directory to land in (mirrors `content_pipeline_materialize_e2e.rs`).
+/// The corpus directory `okf_core::LearningArtifact`'s `index_intent`
+/// registers into, **derived from the model rather than hardcoded** —
+/// pre-created so the first write has a directory to land in (mirrors
+/// `content_pipeline_materialize_e2e.rs`).
+///
+/// Hardcoding the literal here is a latent trap, not a style nit: this
+/// fixture pre-creates whatever path it names, so if the model moves the
+/// fixture silently keeps creating the OLD directory and the test keeps
+/// passing while covering nothing. That is exactly how okf-core `85c9db1`'s
+/// repoint stayed hidden here (this suite went green) while breaking
+/// `content_pipeline_materialize_e2e` and, separately, a fixture in mev's
+/// own suite. Derive it, and the fixture follows the model.
 fn learning_corpus_dir(root: &Path) -> std::path::PathBuf {
-    let dir = root.join("docs/content/learning-corpus");
+    use okf_core::BrainDocModel;
+    let artifact = okf_core::LearningArtifact::from_payload(&serde_json::json!({}));
+    let rel = Path::new(&artifact.index_intent().index_path)
+        .parent()
+        .expect("index_path must have a parent directory component")
+        .to_path_buf();
+    let dir = root.join(rel);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
