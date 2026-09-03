@@ -354,6 +354,47 @@ in every harvest mode (`off`/`in_process`/`approval`). The gate only changes wha
 freshness reindex), or defer to a `pending` record for `HARVEST_APPROVE`. A failed harvest push
 therefore never costs the run its already-written source document (D53).
 
+## `EmitStateNode` lease self-exemption (`EN.ticket.emit-state-node-must-self-exempt-its-own-lease`)
+
+`EmitStateNode` (`crates/engine-core/src/policy/emit_state.rs`, and the `sdlc_flow`-specific copy
+in `crates/engine-core/src/workflows/sdlc_flow/emit_state.rs`) shells out to
+`mev emit-state --write` through the injected `Runner`/`CommandRunner` seam. mev's
+`refuse_if_quiesced` gate (`mev/src/main.rs`) refuses that verb under any live exclusive lease
+whose holder does not match the caller's `--agent` value — and a caller that passes no `--agent`
+at all can never match, by design (`mev/src/brain/lease.rs`), so it is refused by *any* live
+exclusive lease, including one the running chain itself holds. Every real lane takes a
+`/begin-orchestration` Step 4 exclusive lease on its own repo before running a chain, so the
+unmodified node was failing at its own terminal node on every such run.
+
+**The fix is a knob, not a bypass.** `EmitStateNode` now carries an optional `agent: Option<String>`
+field, set via the builder method `with_agent(impl Into<String>)`. When set, the node appends
+`--agent <id>` to the `mev emit-state --write` argv; when unset (the default), the argv is
+byte-identical to before this change — behavior-stable per standing rule 6. Passing the *wrong*
+identity (a lease held by a different agent) still gets refused by mev exactly as before — this
+change teaches the node to identify itself correctly, it does not touch mev's lease semantics or
+weaken the gate. See the argv-level tests in `policy/emit_state.rs`
+(`with_agent_appends_the_agent_flag_to_argv`, and the load-bearing
+`with_agent_uses_the_configured_identity_and_nothing_else`, which is written so that widening the
+exemption to a hardcoded or wildcard agent — rather than genuinely threading the configured
+identity through — turns it red).
+
+**Why this went unnoticed: the gate's refusal is CWD-dependent.** `refuse_if_quiesced` resolves
+"which repo is this?" from the current working directory. Run from the brain root, no repo
+resolves, no lease matches, and the call fails OPEN (exits 0, writes normally) — which is exactly
+what ad hoc testing from the brain root shows, hiding the defect. Run from a repo root (e.g.
+`core/engine-rs`, which is what a real chain's `cd ${runDir}` lands in), the repo resolves, the
+held lease is found, and an agent-less caller is refused. The two callers that matter here both run
+from a repo root, so both hit the refusing case.
+
+**Out of scope — a different, still-open surface.** This block only threads `--agent` through the
+Rust `EmitStateNode`. The SDLC **JS engines'** own bookkeeping emit
+(`sdlc-task.js:2656` — `cd ${runDir} && mev emit-state --write .`, and the equivalent call in
+`sdlc-flow.js`) still passes no `--agent` and is refused by the same mechanism under the same
+conditions. That is tracked separately by carryover
+`sdlc-engines-pass-no-agent-so-a-lane-may-be-quiescing-its-own-emit` (confirmed live by execution
+during this block's investigation) — closing this block does **not** retire that carryover; it is a
+distinct call site in a distinct language, not covered here.
+
 ## Schedule Source (`EN.6.G`)
 
 `crates/engine-serve/src/schedule.rs` turns a durable cron fire (`engine_core::cron`, `EN.6.M`)
