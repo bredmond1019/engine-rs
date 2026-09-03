@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-03T05:52:20Z"
+timestamp: "2026-09-03T06:25:27Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -15,6 +15,24 @@ related: [status, context]
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
 ## [run: 2026-09-03]
+
+### EN.12.F — `CONDUCTOR`: the run picks tonight's chain from the weekly objective and says why (PASS)
+- **What:** Resumed `/sdlc-flow` on branch `EN.12.F-flow` and ran tasks 4-6 to completion (tasks 1-3 already passed from the prior BAILED attempt below). Task 4 fixed the scoping gap that caused the earlier bail — added `conductor.rs`'s entry to `engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` allowlist — and confirmed the rest of task 4 (journal write via a new `JournalDecisionKind::ConductorProposed`, `OrchestrationRunNode` wiring as an internal seam so the declared graph node set stays unchanged, `ChainStep`-shape parity in `chain.rs`) was already present from a prior interrupted attempt on this branch. Task 5 added three named policy profiles (baseline/cheap-fast/thorough) enforcing `conductor_max_chain_blocks`, `conductor_single_repo_only`, and a real `campaign_max_cost_usd_cents` budget wired into `integrate_chain`, scoped to conductor-proposed ("autonomous") runs only, plus `docs/workflows/orchestration.md` documenting the whole CONDUCTOR mechanism. Task 6 (validation-only) ran the full harness gate over the integrated tree: `cargo fmt --check`, `cargo clippy --all-features -D warnings`, `cargo nextest run --workspace --all-features` (3585 passed), `cargo build --release` — all green. End review verdict PASS.
+- **Decisions:** Placed the `conductor.rs` allowlist entry between `checkpoint.rs` and `debrief.rs`, matching the module's existing ordering, with a comment naming every `conductor.rs` pub fn and why none takes a bare `&str`/`String`. Scoped all four Task 5 caps to conductor-proposed chains only (never explicit-block or roadmap+lane chains) since the objective frames them as constraints on autonomous runs specifically. Chose `campaign_max_cost_usd_cents: Option<u64>` (integer cents, not `f64` dollars) so the policy structs can still derive `Eq`. Declared the four new knobs' built-in defaults as the real caps themselves ($50/$25/$100 cents and 3/2/3 blocks for baseline/cheap-fast/thorough) rather than behavior-stable no-ops — a deliberate rule-6 exception mirroring `default_use_worktree`'s precedent, since the operator's weekly objective demands these as real defaults for the first unattended nights.
+- **Commits this run:** `653f944` (task 4), `f349f77` (task 5), `e6469e9` (docs). Task 6 was validation-only with no code changes (files: []).
+
+Next: EN.6.L (`CLAIM_REAFFIRM`), EN.12.H (Research → action items), or EN.14.E (migration tooling + `journal` table).
+
+```
+e6469e9 docs: update docs for EN.12.F
+f349f77 feat: implement EN.12.F-task5
+653f944 feat: implement EN.12.F-task4
+7bb8c70 chore: wrap up EN.12.F
+19f6389 feat: implement EN.12.F-task4
+1e12463 feat: implement EN.12.F-task3
+cfb6330 feat: implement EN.12.F-task2
+141723d feat: implement EN.12.F-task1
+```
 
 ### EN.12.F — `CONDUCTOR`: the run picks tonight's chain from the weekly objective and says why (BAILED)
 - **What:** Ran `/sdlc-flow` on branch `EN.12.F-flow`; tasks 1-3 passed, task 4 failed, run BAILED before tasks 5-6 executed. Task 1 added `conductor.rs` (`ConductorConfig`/`read_objective`/`fetch_frontier_slate`) reading the weekly objective file and `mev frontier --json` via the injectable `Runner` seam reused from `policy::emit_state`, parsing into the existing `gates::FrontierArtifact` shape. Task 2 added slate-subset validation, refusing any proposed chain step not in tonight's frontier slate or missing a `tasks.json`. Task 3 added a `git log -S` pre-flight that drops (not refuses) any candidate already present in git history, returning `ProposalOutcome{chain, dropped}`. Task 4 wired `OrchestrationRunNode` with optional conductor/journal_sink seams so a "no blocks, no roadmap/lane" event resolves via CONDUCTOR and journals its justification, adding `JournalDecisionKind::ConductorProposed` to `engine-contract` — but this run bailed at task 4's validation: `engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` guard list was never updated for `conductor.rs` (added in task 1), and `engine_kind.rs` sits outside every task's declared `files[]` in this spec, so no task was authorized to fix the guard list. Re-ran the exact failing test against the task-3 base commit (`1e12463`, before any task-4 change) in an isolated worktree — it fails identically there, confirming the failure pre-dates task 4 and is a spec-scoping gap, not a task-4 defect. Tasks 5 (docs) and 6 (final validation) never ran.
