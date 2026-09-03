@@ -249,6 +249,55 @@ mod tests {
         );
     }
 
+    /// Load-bearing: proves the emitted `--agent` value is the one that was
+    /// CONFIGURED, not a hardcoded or wildcard string — a "fix" that
+    /// disables the quiesce gate by always passing a fixed identity would
+    /// pass a single-identity test but fails this one, since two
+    /// differently-configured nodes must produce two different argvs.
+    /// `EN.ticket.emit-state-node-must-self-exempt-its-own-lease` task 2.
+    #[tokio::test]
+    async fn with_agent_uses_the_configured_identity_and_nothing_else() {
+        async fn argv_for(agent: &str) -> Vec<String> {
+            let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
+            let calls_clone = calls.clone();
+            let runner: Runner<TestOutput> = Arc::new(move |program, args, cwd| {
+                calls_clone.lock().unwrap().push((
+                    program.to_string(),
+                    args.iter().map(|s| s.to_string()).collect(),
+                    cwd.to_string_lossy().into_owned(),
+                ));
+                Ok(TestOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+
+            let ctx = ctx_with("trees/sdlc/EN.4.0");
+            let node = EmitStateNode::new(runner).with_agent(agent);
+            node.process(ctx).await.expect("process should succeed");
+
+            let recorded = calls.lock().unwrap();
+            recorded[0].1.clone()
+        }
+
+        let argv_x = argv_for("lane-engine-rs-d5").await;
+        let argv_y = argv_for("some-other-lane").await;
+
+        assert_eq!(
+            argv_x,
+            vec!["emit-state", "--write", "--agent", "lane-engine-rs-d5"]
+        );
+        assert_eq!(
+            argv_y,
+            vec!["emit-state", "--write", "--agent", "some-other-lane"]
+        );
+        // The decisive assertion: different configured identities MUST
+        // produce different argvs. A hardcoded or wildcard `--agent` value
+        // would make these equal and this line would catch it.
+        assert_ne!(argv_x, argv_y);
+    }
+
     #[tokio::test]
     async fn no_agent_configured_leaves_argv_byte_identical_to_today() {
         let calls: Arc<Mutex<Vec<RecordedCall>>> = Arc::new(Mutex::new(Vec::new()));
