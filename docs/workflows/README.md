@@ -64,7 +64,7 @@ curl -X POST $ENGINE/events/$RUN_ID/abort -H "X-API-Key: $ENGINE_EVENTS_API_KEY"
 
 ## The workflows
 
-Seventeen registered types, grouped by what you'd use them for. The registration list in
+Eighteen registered types, grouped by what you'd use them for. The registration list in
 `crates/engine-serve/src/workflows.rs` (`register_builtin_workflows`) is the source of truth; this
 table is a reader's copy.
 
@@ -104,6 +104,12 @@ table is a reader's copy.
 | `APPROVE_AND_RUN` | Takes an approved decision and actually executes the thing it authorized, recording one ledger row. | [approve-and-run.md](approve-and-run.md) |
 | `TERMINAL_PROBE` | Opens (or reattaches to) a tmux session and reads its pane back. A diagnostic for the terminal stack, not business work. | [terminal-probe.md](terminal-probe.md) |
 
+### Maintaining the Brain
+
+| Workflow | What it does | Detail |
+|---|---|---|
+| `CLAIM_REAFFIRM` | Re-checks every stale distilled D35 claim (`knowledge.md`/`memory.md`) against fresh corpus evidence via a queue-drain loop, and writes one reviewable markdown proposal report — never a write-back. | [claim-reaffirm.md](claim-reaffirm.md) |
+
 ## Where a workflow's prompts live
 
 Every node's stable prompt text is a `.md` file, not a Rust string literal — colocated with the
@@ -124,6 +130,7 @@ stable prompt a workflow sends, without grepping Rust for string literals:
 | `PROPOSAL_GENERATOR` | `crates/engine-core/src/workflows/proposal_generator/prompts/` |
 | `RESEARCH_AGENT` | `crates/engine-core/src/workflows/research_agent/prompts/` |
 | `DIAGNOSTIC_INTAKE` | `crates/engine-core/src/workflows/diagnostic_intake/prompts/` |
+| `CLAIM_REAFFIRM` | `crates/engine-core/src/workflows/claim_reaffirm/prompts/` |
 
 Only the stable prefix lives in the file — per-run body construction (`build_prompt(...)`,
 interpolating `format!`s) stays in Rust, per CLAUDE.md standing rule 6. A regression guard,
