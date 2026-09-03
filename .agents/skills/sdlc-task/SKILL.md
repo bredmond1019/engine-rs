@@ -18,7 +18,7 @@ description: >
  state.json block status) and — in place, on main — runs `mev emit-state --write`; it
  does NOT write a log.md narrative, a D18 amendment log, or run review/docs/PR. Run
  /log-work for the narrative. When you need a consolidated review + docs + a PR, use
- /sdlc-flow; for a whole spec in place, /sdlc-run; for a roadmap, /sdlc-block.
+ /sdlc-flow; for a roadmap, /orchestrate.
 
  TERMINAL AUTHORITATIVE RECONCILE (D56) — this engine's per-task tripwire runs
  `fastCommand` in place of `command` (testDepth=fast, the default) and never runs a
@@ -38,22 +38,17 @@ description: >
  renderCheckList) or on a partial task-subset run (the existing fullRun guard).
 
  ISOLATION
-   Default: IN PLACE on the current branch (no worktree) — cheapest, like /sdlc-run.
-   --worktree: creates an isolated trees/<branch>/ checkout for true isolation. Was
-   suspended fleet-wide 2026-08-23 to 2026-08-28 (D81, worktree-moratorium) after three
-   whole-repo-deletion incidents behind a green PASS; lifted after
-   BT.ticket.worktree-smoke-fixture verified a real --worktree run end to end and
-   confirmed the guards added during the suspension hold (binding/brain-root/population
-   guards, the commit-safety guard, the post-commit work assertion). Replicating this
-   pipeline by hand: create the worktree only when --worktree was explicitly passed.
+   Default: IN PLACE on the current branch (no worktree) — cheapest.
+   --worktree: run in an isolated git worktree on its own branch (you integrate the
+   branch yourself when ready). Opt-in only.
 
  USAGE
    /sdlc-task <spec-slug>                 run every task in the spec, in place
    /sdlc-task <spec-slug> 2               run only task 2
    /sdlc-task <spec-slug> 1-3             run a task range (1-3, 1,3,5, 5)
+   /sdlc-task <spec-slug> 2 --worktree    run task 2 in an isolated worktree/branch
    /sdlc-task <spec-slug> --resume        resume from the committed state file
    /sdlc-task <spec-slug> --test-depth full  full gating suite per task (default: fast)
-   /sdlc-task <spec-slug> --worktree      run in an isolated trees/<branch>/ checkout
 
  PIPELINE
    setup (locate repo / create worktree) → enumerate (D16 lint) → [resume load]
@@ -85,62 +80,6 @@ description: >
    feat: implement <stem>         implement agent (per task)
    fix:  fix pass P for <stem>    fix agent (per pass)
    chore: sdlc-task bookkeep — <…>  bookkeep close-out (on a passing run)
-
- COMMIT-SAFETY GUARD (BT.ticket.worktree-run-can-commit-an-empty-tree) — run before EVERY `git commit`
- in this pipeline, joined with `&&` in the SAME shell call as the commit (a separate preceding call
- runs in a different process whose inherited git environment may differ, which is the whole failure
- mode this guards against). The one exception is the worktree-init `--allow-empty` commit — its index
- is legitimately populated right after checkout, so the guard cannot fire there. Run the identical
- check against the vault repo (`git -C <vault planning path>` in place of `git`) before any vault
- commit too:
-   if git rev-parse --verify -q HEAD >/dev/null; then TRACKED=$(git ls-tree -r HEAD --name-only | wc -l | tr -d ' '); STAGED=$(git ls-files -s | wc -l | tr -d ' '); if [ "$TRACKED" -gt 0 ] && [ "$STAGED" -eq 0 ]; then echo "COMMIT_GUARD_ABORT: index holds 0 entries but HEAD tracks $TRACKED files - refusing to commit a tree that deletes everything (BT.ticket.worktree-run-can-commit-an-empty-tree)"; exit 1; fi; fi
- If this prints COMMIT_GUARD_ABORT, STOP — do not run the commit; the index is empty against a
- non-empty HEAD, which is exactly the shape that deletes every tracked file.
-
- POST-COMMIT WORK ASSERTION (D81 lift condition 2 —
- BT.ticket.a-run-must-prove-its-commits-contain-the-work) — the COMMIT-SAFETY GUARD above only
- catches a TOTALLY empty index; it does NOT catch a commit whose index is non-empty but whose
- content is still wrong — e.g. many undeclared deletions with one surviving file (measured live:
- EN.11.O, 443 files changed, 177,867 deletions, zero insertions, and it PASSED the guard above).
- Run this immediately AFTER every PER-TASK work commit in step 7 (never before — it reads the
- commit it is checking), chained with `&&` onto the commit itself, substituting the real task id
- for `<task-id>` and the real tasks.json path for `<tasks-json-path>`:
-   NAME_STATUS=$(git diff --name-status HEAD~1 HEAD); if [ -z "$NAME_STATUS" ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit diff is EMPTY (condition 1) - no work was committed"; exit 1; fi; WA_DECLARED=$(python3 -c "
-import json
-d = json.load(open('<tasks-json-path>'))
-t = [x for x in d if x.get('task_id') == <task-id>]
-print(chr(10).join(t[0].get('files', []) if t else []))
-"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task <task-id> commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi
- It aborts (WORK_ASSERTION_ABORT, nonzero exit) when: (1) the commit's diff is empty; (2) no
- changed path matches the task's declared `files[]`; (3) the commit DELETES a path that is NOT in
- `files[]` (the EN.11.O shape — undeclared/collateral deletion). Deleting a file the task DID
-
- VAULT-ONLY TASKS (D46): if EVERY path in the task's declared files[] begins with `planning/`,
- the work landed in the VAULT repo, not this one, and this repo's history structurally cannot
- contain it — the assertion aborts on condition 1 (empty diff) forever and no retry clears it.
- That is a false negative, not missing work. In that case only, run the same diff against the
- vault repo (`git -C <vault.planningPath> diff --name-status HEAD~1 HEAD`) and confirm the
- changed paths correspond to the declared files[] with the leading `planning/` replaced by this
- repo's subdirectory name in the vault; set workAssertionPassed=true only if that vault-side
- diff is non-empty AND corresponds. A task with a MIX of vaulted and non-vaulted files is NOT
- this case and must still pass the ordinary assertion.
-
- declare is fine and passes. If this prints WORK_ASSERTION_ABORT, treat the task as FAILED —
- investigate, fix, and re-commit; do not report success. EXEMPT (never run this check at these
- sites): the worktree-init commit, the two D16 `chore: derive tasks.json ...` fallback commits, and
- the vault commit (step 7b) — the vault commits into a different repo whose own HEAD~1 and
- `planning/`-prefixed paths this check does not attempt to reconcile, and which other concurrent
- lanes also write to.
-
- GIT ENVIRONMENT STRIP (BT.ticket.worktree-run-can-commit-an-empty-tree, half (a)) — git exports
- nine repository-scoping variables to the hooks it runs, and a hook-spawned process inherits them;
- they OVERRIDE `-C` and cwd, so a later `git commit` can silently build its tree from a stale/foreign
- index instead of the one you just staged. Run EVERY git command in this guide — including inside
- `$(...)` substitutions — through this prefix instead of a bare `git`:
-   env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git
- e.g. `git status` becomes `env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE -u GIT_PREFIX -u GIT_CEILING_DIRECTORIES git status`.
- Below, commands are written as plain `git ...` for readability — always run them through this
- prefix; only the prose mentions of git (descriptions, prohibitions) stay bare.
 
  MODEL TIERING (the token lever — see the MODEL map below)
    haiku : setup, enumerate, state-load, test, state-writer, bookkeep
@@ -890,6 +829,8 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
     the commits already landed on the current branch.
   - Either way, remind the user to run **`/log-work`** afterward for the narrative `log.md` entry —
     the lean bookkeep close-out above only flips status markers, it never writes prose.
+
+
 
 
 

@@ -11,6 +11,14 @@ delegated, or who else is running right now. This command supplies that, then ha
 
 **One `/begin-orchestration` session drives one repo.** Run several at once — that is the lane model.
 
+
+**Before writing down anything that is wrong, follow
+[`.claude/workflows/finding-discipline.md`](../workflows/finding-discipline.md).** Evidence travels
+with the finding or the finding does not exist; one occurrence is an instance, not a pattern; and an
+odd-but-unexplained thing is recorded as an **observation** rather than inflated into a defect. The
+cut list is part of the report — a pass that files everything it noticed has not filtered. Measured:
+three independent audits found 32%/32%/26% of filed carryover already dead.
+
 ## Variables
 
 `$ARGUMENTS` — flags, any order. **`--roadmap` is required, plus one of `--lane` or `--blocks`.**

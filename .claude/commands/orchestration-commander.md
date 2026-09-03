@@ -5,6 +5,14 @@ routes this repo's message queue, re-derives the fleet's surfaces the only safe 
 derivation, never guessing which dirty files are derived), and reports whatever is left over that
 a human or a lane needs to see. It never implements a block and never edits another lane's chain.
 
+
+**Before writing down anything that is wrong, follow
+[`.claude/workflows/finding-discipline.md`](../workflows/finding-discipline.md).** Evidence travels
+with the finding or the finding does not exist; one occurrence is an instance, not a pattern; and an
+odd-but-unexplained thing is recorded as an **observation** rather than inflated into a defect. The
+cut list is part of the report — a pass that files everything it noticed has not filtered. Measured:
+three independent audits found 32%/32%/26% of filed carryover already dead.
+
 ## Variables
 
 None. A drain takes no arguments — everything it needs is already on disk: the queue, the lease

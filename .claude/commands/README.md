@@ -35,6 +35,7 @@ predictably-named reports alongside it.
     - [`/begin-session <session-slug> [--roadmap <path>] [--dry-run]`](#begin-session-session-slug---roadmap-path---dry-run)
     - [`/consolidate-run <roadmap-slug> [--repo <slug>]`](#consolidate-run-roadmap-slug---repo-slug)
     - [`/consolidate-fleet [<roadmap-slug>...] [--since-watermark]`](#consolidate-fleet-roadmap-slug---since-watermark)
+    - [`/dispose-run <analysis-path>`](#dispose-run-analysis-path)
     - [`/roadmap-status --roadmap <slug>`](#roadmap-status---roadmap-slug)
   - [Session Orientation](#session-orientation)
     - [`/wrap-up [note]`](#wrap-up-note)
@@ -115,7 +116,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | Planning | `/generate-roadmap`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` (`/generate-master-plan` is superseded by `/plan --founding`, D65) |
 | SDLC | `/patch`, `/update-docs`, `/update-task`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block` |
-| Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/consolidate-fleet`, `/roadmap-status` |
+| Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/consolidate-fleet`, `/dispose-run`, `/roadmap-status` |
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
 | Backlog | `/backlog-ticket`, `/initial-research` |
 | Distribution | `/sync-downstream-harness`, `/sync-all`, `/sync-global-commands`, `/sync-global-skills`, `/sync-brain-skills` |
@@ -408,6 +409,18 @@ on. Extraction fans out to Sonnet subagents; the mechanism synthesis does not. R
 per-roadmap watermark into `lane-log.jsonl` (`scripts/lane_log_watermark.py`), which refuses to
 advance over a rewritten log rather than silently re-basing. Invokes `/consolidate-run` per roadmap
 unless `--no-per-roadmap`. Writes no `state.json`. **HQ-only** — never synced downstream.
+
+### `/dispose-run <analysis-path> [--rows M1,M2] [--dry-run]`
+The disposal half of `/consolidate-fleet`. Reads that run's `disposal.json` and files each mechanism
+as a block (`mev create-block --from`), a `carryover[]` entry (per `write-carryover-entry`), an
+operator edge, or explicitly nothing — then stops. It does **not** author a roadmap; that is
+`/generate-roadmap --from`, and running both gives you two schedulers over one body of findings.
+Its actual output is the **withheld** list: every row whose `ungrounded[]` names a required field
+the evidence cannot support, asked about rather than invented. Refuses to put `finding_id`/`needs`
+on a block (the schema drops them silently — provenance goes in `origin.type: mechanism`), refuses
+an operator edge that gates nothing, and requires a `carryover[]` predicate proven unmet before
+commit. Checks `toolchain-freshness` immediately before writing, because `create-block --write`
+chains `emit-state --write` unconditionally. **HQ-only.**
 
 ### `/roadmap-status --roadmap <slug>`
 Read-only, mid-run view of one roadmap's live lanes across every repo — joins the roadmap's
