@@ -61,6 +61,14 @@ Plan one maintenance or housekeeping task — no behavior change, tests incident
      what 3a's baseline establishes. At least one criterion must be something that is *different*
      after this chore and observable: a command whose output changed, a file that no longer
      exists, a count that dropped. Otherwise the chore has no evidence it did anything.
+   - **Never name a `files[]` path under `planning/` (same shape of problem as an un-gateable
+     criterion).** `planning/` is a symlink into the private HQ vault, excluded from this repo's
+     git by `base-template/.gitignore:20` (the bare rule `/planning`). Code that references such a
+     path — an `include_str!`, a fixture path, a test data file — compiles on every developer
+     machine, because the vault checkout is present locally.
+     A CI checkout cannot see the private vault: every local gate passes and the build fails only
+     in CI, where nothing reachable from the developer's machine could have caught it. Put
+     fixtures and test data under `tests/` instead.
    - **Escalation trigger.** If the chore turns out to change behaviour — even behaviour nobody
      relies on — stop: it is a `/ticket`, and it needs tests and real Acceptance Criteria.
      Likewise, if 3b's blast radius comes back wide, or the "no remaining caller" check is

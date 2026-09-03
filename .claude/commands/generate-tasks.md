@@ -261,6 +261,14 @@ $ARGUMENTS — one of two input modes:
      spec error, revise it in place — and confirm no entry names one of
      `planning/harness.json` → `validation.checks[]`'s `gates: true` commands; `expect_red` may only
      invert a command the task itself declared, never a harness gate shared by every concurrent lane.
+   - **No task's `files[]` names a path under `planning/` — can fail.** `planning/` is a symlink
+     into the private HQ vault, excluded from this repo's git by `base-template/.gitignore:20` (the
+     bare rule `/planning`). Code that references such a path — an `include_str!`, a fixture path,
+     a test data file — compiles on every developer machine, because the vault checkout is present
+     locally, and on no CI runner, because a **CI checkout cannot see the private vault**: every
+     local gate passes and the build fails only in CI, where nothing reachable from the developer's
+     machine could have caught it. If a task's `files[]` names such a path, revise the spec in
+     place — put the fixture or test data under `tests/` instead — then re-run this self-check.
    - **No leftover template sentinels** — no `{{TOKEN}}`, no literal seed strings the Output Format
      ships (`<placeholder>`-style angle stubs left unfilled, empty AC/Validation bullets, or a
      `tasks.json` task still reading `<Foundational step>`). Do **not** treat legitimate `<...>` in

@@ -110,6 +110,14 @@ downstream block waiting on its code, so there is nothing to defer (D65).
    `bastion`, or similar): state explicitly whether it checks **source** or **installed**
    behaviour. The two diverge, and the divergence is invisible unless named.
 
+5b. **Never name a `files[]` path under `planning/` (same shape of problem as 5).** `planning/` is
+   a symlink into the private HQ vault, excluded from this repo's git by
+   `base-template/.gitignore:20` (the bare rule `/planning`). Code that references such a path — an
+   `include_str!`, a fixture path, a test data file — compiles on every developer machine, because
+   the vault checkout is present locally. **A CI checkout cannot see the private vault**, so the
+   build fails only in CI: every local gate passes and nothing reachable from the developer's
+   machine could have caught it. Put fixtures and test data under `tests/` instead.
+
 6. Choose a short descriptive slug (e.g. `fix-null-deref`, `add-rate-limit`). The Block ID is
    `<Prefix>.ticket.<slug>`, and the spec directory equals it exactly.
 

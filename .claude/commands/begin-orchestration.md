@@ -123,6 +123,45 @@ the lane file itself:
 Print what you resolved. A lane driven against the wrong roadmap is worse than one driven against
 none.
 
+## Step 1B — Premise re-derivation
+
+**Before task generation, re-derive every quantitative claim and every named live artifact in each
+block about to run — never trust the record's own numbers.** A block record's premises rot faster
+than the block runs: a count, a line number, an "N of M", a named file/symbol/command/registered
+check, or a "three sites" claim in the block's `description`, `what`, `why`, or
+`acceptance_criteria` can be stale the day the block executes, and a wrong premise ships working
+code doing the wrong thing (M4, `pattern-analysis-2026-09-02`).
+
+For each block in the resolved chain:
+
+1. **Extract** every quantitative claim and every named live artifact from that block's record —
+   `description`, `what`, `why`, `acceptance_criteria`. A "quantitative claim" is a count, a line
+   number, an "N of M", or any number a reader could check against the live system. A "named live
+   artifact" is a file, a symbol, a command, or a registered check the record names as existing or
+   behaving a specific way right now.
+2. **Run one command per claim.** Re-reading the record is not re-derivation — the record is the
+   thing under test, so reading it again only confirms what it already says. Run the actual check
+   (`grep`, `wc -l`, the named script, `bastion validate-brain`, whatever answers that specific
+   claim) against the live corpus.
+3. **Amend the record in place** with the re-measured value plus the date, per D18 — never leave
+   the stale number sitting next to the fresh one. A block record cannot carry a separate
+   `amendments` array (`.claude/workflows/block.schema.json` sets `additionalProperties: false` and
+   defines no such field), so the amendment goes in the record's existing `notes` field, with the
+   evidence (the command run and its output) captured in the orchestration-run notes.
+4. **Rewrite a moved criterion to measure at run time**, not to compare against a newly-frozen
+   number — an acceptance criterion re-pinned to today's count just rots again on the same clock
+   that broke it the first time.
+5. **A premise that survives re-derivation unchanged is still a result, not a no-op.** Record that
+   it was checked and held — a lane that finds nothing on every block should not conclude the step
+   is ceremony and stop running it; the control case (a record checked the same way that held on
+   every premise) is what proves the step isn't a formality that always finds something.
+
+**Do not fold this into the isolation policy step's re-verification below** — that step re-verifies
+the *isolation* caveat (worktree exposure, a carried-forward isolation override); this step
+re-derives *block record* premises. They are different questions in different steps, and
+`BT.ticket.begin-orchestration-step2-reverify-rules` (closed) already owns the isolation one —
+do not re-litigate it here.
+
 ## Step 2 — Isolation policy
 
 `--isolation auto` resolves as:

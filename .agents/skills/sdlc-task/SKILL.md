@@ -114,6 +114,17 @@ print(chr(10).join(t[0].get('files', []) if t else []))
  It aborts (WORK_ASSERTION_ABORT, nonzero exit) when: (1) the commit's diff is empty; (2) no
  changed path matches the task's declared `files[]`; (3) the commit DELETES a path that is NOT in
  `files[]` (the EN.11.O shape — undeclared/collateral deletion). Deleting a file the task DID
+
+ VAULT-ONLY TASKS (D46): if EVERY path in the task's declared files[] begins with `planning/`,
+ the work landed in the VAULT repo, not this one, and this repo's history structurally cannot
+ contain it — the assertion aborts on condition 1 (empty diff) forever and no retry clears it.
+ That is a false negative, not missing work. In that case only, run the same diff against the
+ vault repo (`git -C <vault.planningPath> diff --name-status HEAD~1 HEAD`) and confirm the
+ changed paths correspond to the declared files[] with the leading `planning/` replaced by this
+ repo's subdirectory name in the vault; set workAssertionPassed=true only if that vault-side
+ diff is non-empty AND corresponds. A task with a MIX of vaulted and non-vaulted files is NOT
+ this case and must still pass the ordinary assertion.
+
  declare is fine and passes. If this prints WORK_ASSERTION_ABORT, treat the task as FAILED —
  investigate, fix, and re-commit; do not report success. EXEMPT (never run this check at these
  sites): the worktree-init commit, the two D16 `chore: derive tasks.json ...` fallback commits, and

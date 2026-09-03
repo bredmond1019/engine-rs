@@ -701,6 +701,21 @@ EOF
    Run: cd ${runRoot} && ${renderWorkAssertion('git', taskNum, tasksJsonFile)}
    If this prints WORK_ASSERTION_ABORT, the commit failed the check — treat this as a task failure
    (investigate, fix, and re-commit) before proceeding; do NOT report success with a failing assertion.
+   Capture the outcome as a STRUCTURED field, not only prose: this command's FINAL run this attempt
+   (after any fix + re-commit) must print no WORK_ASSERTION_ABORT line and exit 0 for
+   workAssertionPassed to be true. The terminal write recipe refuses to record this task done/passed
+   without a positive workAssertionPassed — never omit or fabricate this field.
+   VAULT-ONLY TASKS (D46): if EVERY path in this task's declared files[] begins with "planning/",
+   the work landed in the vault repo by step 7b and this repo's own history structurally CANNOT
+   contain it — the assertion above will abort on condition 1 (empty diff) forever, and no retry
+   can clear it. That is a false negative, not missing work. In that case ONLY, satisfy the
+   assertion against the repo the work actually went to: run the same
+   \`diff --name-status HEAD~1 HEAD\` with \`-C\` pointed at the vault's planning path, and confirm
+   the changed paths correspond to this task's declared files[] with the leading "planning/"
+   replaced by this repo's subdirectory name in the vault. Set workAssertionPassed=true only if
+   that vault-side diff is non-empty AND corresponds; otherwise false. Say in notes that the
+   assertion was satisfied vault-side and name the vault commit. A task with a MIX of vaulted and
+   non-vaulted files is NOT this case — it must still pass the ordinary assertion above.
 ${vault.vaulted ? `
 7b. planning/ is a vaulted symlink (D46) — its bytes live at ${vault.planningPath}, a DIFFERENT git
     repo, invisible to the commit you just made in step 7. If this attempt created or edited ANY file
@@ -732,6 +747,8 @@ Return via StructuredOutput:${extraReturnFields}
   decisions: any non-obvious choices (empty array if none)
   filesReadKb: telemetry — before returning, sum the byte size of every file you cat/Read this attempt
     (cd ${runRoot} && wc -c <each file>), divide the total by 1024, and report the number.
+  workAssertionPassed: true only if step 7a's FINAL run this attempt printed no WORK_ASSERTION_ABORT
+    and exited 0; false otherwise. Never omit this field.
   notes: one-line status${vault.vaulted ? ' — mention explicitly whether a vault commit (step 7b) happened and, if so, its outcome' : ''}`
 }
 // <</shared:renderImplementPrompt>>
@@ -870,13 +887,19 @@ const STAGE_SCHEMA = {
   type: 'object',
   required: ['success'],
   properties: {
-    success:       { type: 'boolean' },
-    filesModified: { type: 'array', items: { type: 'string' } },
-    commitHash:    { type: 'string', description: 'Short hash of the commit this agent made, or empty string' },
-    summary:       { type: 'string', description: 'One-line summary of what was implemented/fixed (folded into state.tasks[N].summary)' },
-    decisions:     { type: 'array', items: { type: 'string' }, description: 'Non-obvious choices made (folded into state)' },
-    filesReadKb:   { type: 'number', description: 'Telemetry (optional): sum of bytes of all files this stage cat/Read, divided by 1024.' },
-    notes:         { type: 'string' }
+    success:             { type: 'boolean' },
+    filesModified:       { type: 'array', items: { type: 'string' } },
+    commitHash:          { type: 'string', description: 'Short hash of the commit this agent made, or empty string' },
+    summary:             { type: 'string', description: 'One-line summary of what was implemented/fixed (folded into state.tasks[N].summary)' },
+    decisions:           { type: 'array', items: { type: 'string' }, description: 'Non-obvious choices made (folded into state)' },
+    filesReadKb:         { type: 'number', description: 'Telemetry (optional): sum of bytes of all files this stage cat/Read, divided by 1024.' },
+    // BT.ticket.engine-terminal-state-needs-evidence (task 3, Gap 1): step 7a's renderWorkAssertion
+    // check previously lived only as prose the agent could skip or misreport. This is that check's
+    // outcome as a STRUCTURED field: true only if step 7a's FINAL run (after any fix + re-commit
+    // this attempt) printed no WORK_ASSERTION_ABORT and exited 0. Absent/false is treated as a
+    // failed assertion by the terminal write recipe below — never a silent pass.
+    workAssertionPassed: { type: 'boolean', description: 'true only if step 7a\'s renderWorkAssertion check printed no WORK_ASSERTION_ABORT and exited 0 on its final run this attempt; false/absent means the terminal write must refuse to record this task done/passed' },
+    notes:               { type: 'string' }
   }
 }
 
@@ -1332,6 +1355,13 @@ const state = {
   worktree_path: '',
   status: 'running',
   current_task: null,
+  // Resolved by BT.ticket.engine-terminal-state-needs-evidence task 2: emitStateRan was declared,
+  // instructed, gated and logged in six sites but never persisted to disk (a key in 0 of 150
+  // corpus state files). Written here, once, from bookkeepResult.emitStateRan just before the
+  // final writeTaskState() call below — null until the bookkeep stage runs or is skipped
+  // (bailed/reconcile_failed), matching every other field this object carries only from the
+  // point its stage actually resolves it.
+  emitStateRan: null,
   // DELIBERATE (ticket-sdlc-task-resume-truncates-run-state): tasks_run stays PER-INVOCATION
   // telemetry — "what did THIS invocation run" — and is never unioned across a resume, because
   // doing so would erase the record of which run did what. `tasks` below is the opposite: it is
@@ -2297,6 +2327,39 @@ ${renderImplementPrompt({ roleIntro, runRootLabel: 'run root', runRoot: runDir, 
     if (Array.isArray(stageResult.filesModified)) t.files_changed = [...new Set([...(t.files_changed || []), ...stageResult.filesModified])]
     if (Array.isArray(stageResult.decisions) && stageResult.decisions.length) t.decisions = [...(t.decisions || []), ...stageResult.decisions]
 
+    // Work-assertion evidence gate (BT.ticket.engine-terminal-state-needs-evidence, task 3, Gap 1).
+    // renderWorkAssertion's files[]-vs-diff check (BT.ticket.a-run-must-prove-its-commits-contain-
+    // the-work) previously lived only as prose in step 7a — an agent that skipped or misreported it
+    // still yielded a task the engine could record as done. workAssertionPassed is that check's
+    // outcome as a structured field; absent/false is treated as a failed assertion, never a silent
+    // pass, exactly like the vault-commit check below.
+    t.workAssertionPassed = stageResult.workAssertionPassed === true
+    if (!t.workAssertionPassed) {
+      log(`Task ${taskNum} attempt ${attempt}: work assertion not confirmed (workAssertionPassed=${stageResult.workAssertionPassed === false ? 'false' : 'absent'}) — refusing to record this task done/passed without that evidence.`)
+      const waFailBlob = `WORK_ASSERTION_NOT_CONFIRMED — step 7a's renderWorkAssertion outcome was ${stageResult.workAssertionPassed === false ? 'reported false (WORK_ASSERTION_ABORT fired)' : 'not reported at all'} for task ${taskNum}. The terminal write recipe refuses done/passed without a positive workAssertionPassed field.`
+      t.issues = [...(t.issues || []), 'work assertion not confirmed']
+      const waBailPayload = buildBailPayload(taskNum, t, `Task ${taskNum}: work assertion not confirmed`)
+      const tr = await triage(`task ${taskNum} work-assertion`, attempt, MAX_TASK_ATTEMPTS, waFailBlob, prevFailBlob, waBailPayload)
+      prevFailBlob = waFailBlob
+      if (tr && tr.class === 'MAJOR') {
+        bailed = true
+        bailReason = tr.bailReason || tr.reason || waFailBlob
+        if (tr.stateWritten) taskStateWritten = true
+        log(`Task ${taskNum}: triage → MAJOR on unconfirmed work assertion — bailing immediately.`)
+        break
+      }
+      if (attempt === MAX_TASK_ATTEMPTS) {
+        bailed = true
+        bailReason = `Task ${taskNum} still lacking a positive workAssertionPassed outcome after ${MAX_TASK_ATTEMPTS} attempts.`
+        if (tr && tr.stateWritten) taskStateWritten = true
+        log(`Task ${taskNum}: exhausted ${MAX_TASK_ATTEMPTS} attempts without a confirmed work assertion — bailing.`)
+        break
+      }
+      if (tr) t.fixes = [...(t.fixes || []), tr.reason]
+      log(`Task ${taskNum}: triage → RETRYABLE on unconfirmed work assertion — fix pass ${attempt}/${MAX_TASK_ATTEMPTS - 1}. ${tr?.reason || ''}`)
+      continue
+    }
+
     // Vault-commit verification — independent of the stage's self-report. A non-empty commitHash
     // proves nothing about the vault half (observed live: one run's commitHash was valid and covered
     // only the source half, with the vault edit silently uncommitted — see this ticket's amendment
@@ -2564,7 +2627,7 @@ Target:
   Tasks run:   ${taskList.join(', ')}  (passed: ${passedTasks.join(', ') || 'none'})
   Full spec run: ${fullRun ? 'yes (every task in the spec)' : 'no (a task subset — do NOT close the block)'}
   Spec-wide:   ${passedAll.length}/${allTasks.length} tasks passed across all runs${outstandingTasks.length ? ` | outstanding: ${outstandingTasks.join(', ')}` : ''}
-  Block done:  ${blockDone ? 'yes — every task in the spec has passed' : `no — keep the block open/in-progress (outstanding: ${outstandingTasks.join(', ') || 'none, but bailed/reconcile_failed this run'})`}
+  Block done:  ${blockDone ? 'yes — every task in the spec has passed, each with a confirmed workAssertionPassed outcome from its own implement/fix stage (the per-task loop refuses to mark a task passed without one)' : `no — keep the block open/in-progress (outstanding: ${outstandingTasks.join(', ') || 'none, but bailed/reconcile_failed this run'})`}
 
 1. Read the surfaces:
    cd ${runDir} && cat ${specFile}
@@ -2712,6 +2775,12 @@ Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emi
       : `postEmitCommitCommand ran (planning/harness.json).`)
   }
 }
+
+// Fold bookkeep's emitStateRan into the in-memory state so the final write below persists it —
+// the first site in this file where the field actually reaches disk (see the `state` declaration
+// above). `false` (not left null) when bookkeep ran but the agent omitted the field; stays null
+// only when bookkeep itself was skipped (bailed / reconcile_failed).
+if (bookkeepResult) state.emitStateRan = bookkeepResult.emitStateRan ?? false
 
 // Final run-state write — disk-only, never committed (see writeTaskState). Captures the final
 // token roll-up after the bookkeep close-out ran.
