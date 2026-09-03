@@ -269,6 +269,13 @@ mod tests {
             // `read_checkpoint` take `&Path`/`Uuid`/`&Checkpoint`, never a
             // bare `&str` runner name.
             ("checkpoint.rs", &[]),
+            // No string-typed pub fn: `read_objective`/`fetch_frontier_slate`/
+            // `git_log_dash_s_preflight`/`propose_chain` take a `&ConductorConfig`,
+            // `&[(String, String)]`, `&FrontierArtifact`, a `&TasksJsonChecker`, and
+            // a `&Runner<O>` — never a bare runner-name `&str`. The `with_*` builder
+            // methods take `impl Into<PathBuf>`, not `&str`/`String` either
+            // (`EN.12.F` task 4).
+            ("conductor.rs", &[]),
             // No string-typed pub fn: `JournalReader::rows_for_campaign` takes
             // a `&Uuid`, and `StubJournalReader`'s constructors take owned
             // `Vec<JournalRow>` / `impl Into<String>` test-double config, not
