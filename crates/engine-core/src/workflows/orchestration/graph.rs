@@ -170,18 +170,33 @@ pub struct OrchestrationPolicy {
     /// exactly — an unbounded wait — so adding this knob does not change
     /// what an existing run does, per CLAUDE.md standing rule 6.
     pub hold_deadline_ms: Option<u64>,
+    /// Whether a `SDLC_FLOW` invocation this chain dispatches should open a
+    /// real PR (`SdlcFlowEventSchema::auto_pr`, which
+    /// [`super::execute::sdlc_flow_event`] seeds from this resolved value).
+    /// Defaults to `true` — behavior-stable per CLAUDE.md standing rule 6:
+    /// this is a brand-new knob, so adding it must not change what any
+    /// existing run does. `false` is exactly what a rehearsal, a fixture
+    /// run, or a sandboxed chain without a real GitHub remote wants —
+    /// `PullRequestNode` short-circuits cleanly (`pr.rs`'s
+    /// `auto_pr_false_short_circuits_without_calling_runner`) without
+    /// shelling out to `gh` at all.
+    pub default_auto_pr: bool,
 }
 
 impl Default for OrchestrationPolicy {
     /// Poll every 2s while held, isolate every ordinary repo into its own
     /// worktree by default (see the doc comment on `default_use_worktree`
     /// for why this is a correctness precondition, not the pre-Task-2
-    /// behavior), and never time out a hold (`hold_deadline_ms: None`).
+    /// behavior), never time out a hold (`hold_deadline_ms: None`), and let
+    /// every dispatched block open its PR (`default_auto_pr: true`) — the
+    /// pre-existing, unchanged behavior of every run before this knob
+    /// existed.
     fn default() -> Self {
         Self {
             hold_poll_interval_ms: 2_000,
             default_use_worktree: true,
             hold_deadline_ms: None,
+            default_auto_pr: true,
         }
     }
 }
@@ -201,6 +216,7 @@ pub struct PartialOrchestrationPolicy {
     pub hold_poll_interval_ms: Option<u64>,
     pub default_use_worktree: Option<bool>,
     pub hold_deadline_ms: Option<Option<u64>>,
+    pub default_auto_pr: Option<bool>,
 }
 
 impl crate::policy::Policy for OrchestrationPolicy {
@@ -220,6 +236,7 @@ impl crate::policy::Policy for OrchestrationPolicy {
                 self.hold_deadline_ms,
                 over.hold_deadline_ms,
             ),
+            default_auto_pr: crate::policy::merge_opt(self.default_auto_pr, over.default_auto_pr),
         }
     }
 }
@@ -240,6 +257,9 @@ pub fn baseline() -> PartialOrchestrationPolicy {
         // Restates the built-in default verbatim (no deadline) — baseline's
         // no-op contract, per EN.11.L Task 3.
         hold_deadline_ms: Some(None),
+        // Restates the built-in default verbatim — every dispatched block
+        // opens its PR, baseline's no-op contract.
+        default_auto_pr: Some(true),
     }
 }
 
@@ -265,6 +285,11 @@ pub fn cheap_fast() -> PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(10_000),
         default_use_worktree: Some(true),
         hold_deadline_ms: Some(Some(15 * 60 * 1_000)),
+        // `gh pr create` is a real external process call plus a review
+        // ceremony — the same reasoning that already justifies this
+        // profile's longer poll interval and bounded hold deadline. A cost
+        // floor has no business paying for either.
+        default_auto_pr: Some(false),
     }
 }
 
@@ -283,6 +308,7 @@ pub fn thorough() -> PartialOrchestrationPolicy {
         hold_poll_interval_ms: Some(500),
         default_use_worktree: Some(true),
         hold_deadline_ms: Some(Some(24 * 60 * 60 * 1_000)),
+        default_auto_pr: Some(true),
     }
 }
 
@@ -1042,6 +1068,11 @@ mod tests {
         // pre-Task-2 unbounded wait exactly — adding this knob must not
         // change what an existing run does (CLAUDE.md standing rule 6).
         assert_eq!(OrchestrationPolicy::default().hold_deadline_ms, None);
+        // This is a brand-new knob (unlike default_use_worktree above):
+        // adding it must not change what any existing run does, so the
+        // built-in default matches the pre-existing, unconditional-PR
+        // behavior.
+        assert!(OrchestrationPolicy::default().default_auto_pr);
     }
 
     #[test]
@@ -1049,6 +1080,46 @@ mod tests {
         assert_eq!(baseline().default_use_worktree, Some(true));
         assert_eq!(cheap_fast().default_use_worktree, Some(true));
         assert_eq!(thorough().default_use_worktree, Some(true));
+    }
+
+    /// Every named profile sets `default_auto_pr` explicitly — a knob
+    /// absent from the profile bundles is a knob nobody will find
+    /// (CLAUDE.md standing rule 6).
+    #[test]
+    fn all_three_profiles_set_default_auto_pr_explicitly() {
+        assert_eq!(baseline().default_auto_pr, Some(true));
+        assert_eq!(cheap_fast().default_auto_pr, Some(false));
+        assert_eq!(thorough().default_auto_pr, Some(true));
+    }
+
+    #[test]
+    fn default_auto_pr_resolves_through_the_policy_layers() {
+        let event_override = PartialOrchestrationPolicy {
+            default_auto_pr: Some(false),
+            ..Default::default()
+        };
+        // Event override beats the profile.
+        let resolved = crate::policy::resolve(
+            OrchestrationPolicy::default(),
+            None,
+            Some(&thorough()),
+            Some(&event_override),
+        );
+        assert!(!resolved.default_auto_pr);
+
+        // With no event override, the profile's value wins.
+        let resolved = crate::policy::resolve(
+            OrchestrationPolicy::default(),
+            None,
+            Some(&cheap_fast()),
+            None,
+        );
+        assert!(!resolved.default_auto_pr);
+
+        // With nothing set at all, the behavior-stable built-in default
+        // (every block opens its PR) is what resolves.
+        let resolved = crate::policy::resolve(OrchestrationPolicy::default(), None, None, None);
+        assert!(resolved.default_auto_pr);
     }
 
     /// EN.11.L Task 3: every named profile explicitly sets
