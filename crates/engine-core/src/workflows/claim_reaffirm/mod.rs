@@ -3,9 +3,13 @@
 //! `freshness:` threshold) into a reviewed verdict per claim
 //! (`bump-freshness` / `supersede` / `archive` / `needs-human`, each with
 //! corpus-evidence citations), delivered as one reviewable proposal report
-//! through the mev/materializer seam. The engine proposes; mev writes; a
-//! human approves (inherited from Synapse `OR.K3`, load-bearing — see
-//! `planning/en-6l-claim-reaffirm/tasks.md`).
+//! written to a single fixed path via an injectable filesystem seam (the
+//! spec's explicitly-allowed simpler alternative to a new okf-core doc
+//! model + `doc_materializer` arm — see `render_report`'s module doc for
+//! the full reasoning). The engine only ever proposes here; a human reads
+//! the report and acts on it — this workflow never writes
+//! `knowledge.md`/`memory.md` itself (inherited from Synapse `OR.K3`,
+//! load-bearing — see `planning/en-6l-claim-reaffirm/tasks.md`).
 //!
 //! Module layout (each leaf file owned by the task in
 //! `planning/en-6l-claim-reaffirm/tasks.json` that introduces it):
@@ -24,13 +28,16 @@
 //! - `queue_router` / `judge` / `save_verdict` (task 2) — the queue-drain
 //!   loop: per-claim recall evidence, one `ClaudeCodeStep` judgment, and
 //!   the read-modify-write verdict accumulator.
-//! - `render_report` / `graph` (task 3) — the reviewable markdown report
-//!   through the mev/materializer seam, and the declared workflow graph.
+//! - `render_report` / `graph` (task 3) — the reviewable markdown report,
+//!   written through an injectable `ReportFs` seam to one fixed path, and
+//!   the declared workflow graph.
 //! - Registration lives in `crates/engine-serve/src/workflows.rs` (task 3),
 //!   the same one-fn-per-type pattern as the other workflow types.
 
+pub mod graph;
 pub mod judge;
 pub mod load_claims;
 pub mod queue_router;
+pub mod render_report;
 pub mod save_verdict;
 pub mod schema;
