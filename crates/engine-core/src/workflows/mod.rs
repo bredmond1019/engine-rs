@@ -27,6 +27,7 @@ use crate::policy::command_floor::{self, CommandDecision};
 use crate::sessions::{self, ClaudeSession};
 
 pub mod approve_and_run;
+pub mod claim_reaffirm;
 pub mod content_pipeline;
 pub mod deliverable_render;
 pub mod diagnostic_intake;

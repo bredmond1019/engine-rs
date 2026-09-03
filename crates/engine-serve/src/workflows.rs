@@ -1232,12 +1232,57 @@ pub fn register_debrief(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `CLAIM_REAFFIRM` workflow
+/// (`engine_core::workflows::claim_reaffirm::graph`, `EN.6.L` task 3) with
+/// `dispatcher`, populating both the `workflow_registry` and the
+/// `schema_registry`.
+///
+/// A **model-free-at-dispatch** registration, mirroring [`register_recall`]
+/// exactly: `ClaimQueueRouterNode` (not this factory) resolves
+/// `claim_reaffirm.policy`/`claim_reaffirm.profiles` itself, once per pass,
+/// from `PolicyConfigSource::Builtin` — this workflow, like `RECALL`, is
+/// triggered `POST /events/` with no worktree to derive a `harness.json`
+/// path from — so there is no `resolve_policy_for_run_from` call and no
+/// `seed_resolved_policy` call here. Only `ClaimRecallNode`'s underlying
+/// `RecallNode` (`EN.6.K`'s Brain seam) needs a [`BrainConfig`], resolved
+/// fresh per event from the environment
+/// (`engine_core::nodes::brain_client::BrainConfig::from_env`) — a
+/// construction-time error (missing `BRAIN_API_URL`) surfaces as
+/// `DispatchError::PolicyResolutionFailed`, not a panic.
+///
+/// **Trigger discipline (this spec's Context Pointers, load-bearing):**
+/// this workflow is triggered **by hand** via `POST /events/` — never cron.
+/// A hundreds-of-claims lane will halt against the default `$5`/run ceiling
+/// (`ENGINE_RUN_MAX_COST_USD`, `crates/engine-serve/src/http.rs`) before
+/// draining; an operator triggering a large lane should expect a partial
+/// drain and re-trigger with `lane_source_override` narrowed to the
+/// remainder, or budget accordingly. `SaveVerdictNode`'s read-modify-write
+/// accumulator means a re-trigger against the same
+/// `ClaimReaffirmState`/lane always skips already-`Judged` claims (task 4's
+/// abort/resume-skip guarantee) — but note the lossy resume-budget caveat
+/// for loop-heavy runs generally (`crates/engine-core/src/budget.rs`): a
+/// resumed run's cost accounting does not necessarily carry the aborted
+/// run's spend forward byte-for-byte.
+pub fn register_claim_reaffirm(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::claim_reaffirm::graph::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            let config = engine_core::nodes::brain_client::BrainConfig::from_env()
+                .map_err(|err| err.to_string())?;
+            Ok(Workflow::new(
+                engine_core::workflows::claim_reaffirm::graph::registry(config),
+                engine_core::workflows::claim_reaffirm::graph::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `SDLC_TASK`, `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `LINKEDIN_POST`, `OPPORTUNITY_SET_STAGE`,
 /// `OPPORTUNITY_ADD_ACTION`, `HARVEST_APPROVE`, `LEAD_INGEST`,
-/// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, `RECALL`, `ORCHESTRATION`, and
-/// `DEBRIEF`; future
+/// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, `RECALL`, `ORCHESTRATION`,
+/// `DEBRIEF`, and `CLAIM_REAFFIRM`; future
 /// builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
@@ -1285,6 +1330,7 @@ pub fn register_builtin_workflows_with_registry(
     register_recall(dispatcher);
     register_orchestration(dispatcher);
     register_debrief(dispatcher);
+    register_claim_reaffirm(dispatcher);
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@ English, and how to trigger one. This page is just the file listing.
 | [orchestration.md](orchestration.md) | The `ORCHESTRATION` workflow — chaining `SDLC_FLOW`/`SDLC_TASK` runs across repos, the dependency and admission gates, and the `lane-log.jsonl` contract |
 | [debrief.md](debrief.md) | The `DEBRIEF` workflow — rendering a morning brief from one campaign's journal, the bail-naming guarantee, and the dispatch/write-back split |
 | [recall.md](recall.md) | The `RECALL` workflow — querying Synapse's `GET /recall` mid-run over the injectable `HttpGet` seam, the dispatch-step shape, and the skip-next branch it drives |
+| [claim-reaffirm.md](claim-reaffirm.md) | The `CLAIM_REAFFIRM` workflow — re-checking every stale distilled D35 claim against corpus evidence via the queue-drain loop, the OR.K3 empty-evidence guard, and the one-file proposal report it writes |
 | [research-agent.md](research-agent.md) | The `RESEARCH_AGENT` graph — company brief vs. prospecting, the anti-fabrication contract, and the self-feeding trigger into `CONTENT_PIPELINE` |
 | [diagnostic-intake.md](diagnostic-intake.md) | The `DIAGNOSTIC_INTAKE` graph — single-node structured extraction from call notes, with a Local-tier rewire |
 | [proposal-generator.md](proposal-generator.md) | The `PROPOSAL_GENERATOR` graph — the seven-node research-to-persist pipeline and the locale-firewalled rate card |

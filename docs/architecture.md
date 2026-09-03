@@ -703,15 +703,17 @@ block.
   (`hold_poll_interval_ms`) never rewires which node runs, so there is no `registry_for_policy`
   variant to choose between at dispatch time — `engine_core::workflows::orchestration::graph::registry`
   is the only registry the workflow ever runs under — and `register_builtin_workflows` now
-  populates seventeen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
+  populates eighteen workflow types in total (`EN.11.P` added `SDLC_TASK`'s own
   `register_sdlc_task`/`register_sdlc_task_with_registry`, mirroring `SDLC_FLOW`'s;
   `register_deliverable_render` (`DELIVERABLE_RENDER`, `EN.4.D` task 5) and
   `register_linkedin_post` (`LINKEDIN_POST`, `EN.5.G` task 6) both follow the same
   `PolicyConfigSource::Builtin` shape as the other channel/API-triggered workflows — see
   [deliverable-render-workflow.md](workflows/deliverable-render.md) and
   [linkedin-post-workflow.md](workflows/linkedin-post.md); `register_recall` (`RECALL`, `EN.12.L`)
-  and `register_debrief` (`DEBRIEF`, `EN.12.G`) are the two most recent additions, both
-  no-policy single-node micro-workflows — see the Journal section below).
+  and `register_debrief` (`DEBRIEF`, `EN.12.G`) are two of the most recent additions, both
+  no-policy single-node micro-workflows — see the Journal section below; `register_claim_reaffirm`
+  (`CLAIM_REAFFIRM`, `EN.6.L`) is the newest, a model-free-at-dispatch queue-drain workflow that
+  mirrors `register_recall`'s shape — see [claim-reaffirm.md](workflows/claim-reaffirm.md)).
 - `LiveStateStore` (`engine-serve::live_state`) — in-memory `Arc<RwLock<HashMap<RunId, TaskContext>>>`
   (`RunId = uuid::Uuid`, matching `EventsRow.id`) with `record`/`get`/`list_active`/`remove`; the
   local Console's no-DB-poll read path for live run state. `mark_terminal` (EN.5.F) moves a
