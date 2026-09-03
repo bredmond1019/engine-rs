@@ -50,6 +50,11 @@
 //!   seam (`engine-core` cannot depend on `engine-store`) plus the
 //!   hermetic `StubJournalReader` test double every debrief test runs
 //!   against. `DebriefNode` itself lands in task 3.
+//! - [`post_draft`] (`EN.12.M` Task 1) — `POST_DRAFT`: a second output of
+//!   `DebriefNode` (not a new node — see the module's shape-decision doc
+//!   comment) that renders a publishable post draft from the same journal
+//!   rows the ops digest already reads, refusing to produce one when the
+//!   run has no measured number and no evidence path to show for itself.
 
 pub mod chain;
 pub mod checkpoint;
@@ -61,3 +66,4 @@ pub mod execute;
 pub mod gates;
 pub mod graph;
 pub mod integrate;
+pub mod post_draft;
