@@ -112,9 +112,12 @@ use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
 
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
+use super::conductor::{ConductorProposalError, ProposalOutcome};
 use super::execute::{default_flow_runner, EngineKind, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
-use super::integrate::{integrate_chain, resolve_roadmap_dir, HoldSource, NeverHeld, StepProgress};
+use super::integrate::{
+    integrate_chain, resolve_roadmap_dir, HoldSource, JournalSinkFn, NeverHeld, StepProgress,
+};
 
 /// The registered workflow type string, used both to register the workflow
 /// (`engine-serve`, this task) and as `WorkflowSchema::workflow_type`.
@@ -424,6 +427,28 @@ pub fn resolve_campaign_id(raw: Option<&str>) -> Result<Uuid, NodeError> {
     }
 }
 
+/// Render a [`ProposalOutcome`] into the plain-text `reason` its journal row
+/// carries — a human-scannable one-liner naming how many blocks the
+/// conductor proposed from the frontier slate and how many the `git log -S`
+/// pre-flight dropped as already done. The full per-block detail (which
+/// blocks, and why each drop happened) lives on the row's `detail` field,
+/// not here — this is the summary a reader scans first.
+fn conductor_justification(outcome: &ProposalOutcome) -> String {
+    if outcome.dropped.is_empty() {
+        format!(
+            "conductor proposed {} block(s) from tonight's frontier slate",
+            outcome.chain.len()
+        )
+    } else {
+        format!(
+            "conductor proposed {} block(s) from tonight's frontier slate; {} \
+             dropped by the `git log -S` pre-flight as already done",
+            outcome.chain.len(),
+            outcome.dropped.len()
+        )
+    }
+}
+
 // ── The node ─────────────────────────────────────────────────────────────
 
 type DependsOnFn = Arc<dyn Fn(&str, &str) -> Vec<DependencyEdge> + Send + Sync>;
@@ -434,6 +459,16 @@ type BlockOpenFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// [`OrchestrationRunNode::with_step_observer`] and
 /// [`integrate::StepProgress`].
 type StepObserverArc = Arc<dyn Fn(&StepProgress) + Send + Sync>;
+
+/// `CONDUCTOR` (`EN.12.F` Task 4): the injected seam that turns "no `blocks`,
+/// no `roadmap`/`lane`" into a real chain by reading the operator's weekly
+/// objective and mev's computed frontier slate, then proposing a chain drawn
+/// only from it — [`super::conductor::propose_chain`]'s full input set
+/// (config, candidate picks, slate, `tasks.json` checker, git runner) baked
+/// into one production closure, so this node only needs to call it and
+/// handle the result. See [`OrchestrationRunNode::with_conductor`].
+pub type ConductorSeamFn =
+    Arc<dyn Fn() -> Result<ProposalOutcome, ConductorProposalError> + Send + Sync>;
 
 /// The sole node in the `ORCHESTRATION` graph: resolves a lane chain, then
 /// drives it end to end via [`integrate::integrate_chain`] — dependency
@@ -473,6 +508,24 @@ pub struct OrchestrationRunNode {
     /// the id from the event exactly as it did before this field existed.
     /// See [`Self::with_campaign_id`].
     campaign_id: Option<Uuid>,
+    /// `CONDUCTOR` (`EN.12.F` Task 4): consulted ONLY when the event carries
+    /// neither an explicit `blocks` list nor a `roadmap`+`lane` pair — every
+    /// other event shape is resolved exactly as before this field existed,
+    /// so an explicit chain (or a lane chain) always bypasses the conductor
+    /// entirely (standing rule 6: a knob may change a bound, never a
+    /// declared node set — this seam changes what fills in for a case that
+    /// used to be a hard refusal, not which node runs). `None` (the
+    /// default, [`Self::new`]) is fully behavior-stable: that event shape
+    /// still refuses with the same "needs either `blocks` or
+    /// `roadmap`+`lane`" diagnostic it always has. See [`Self::with_conductor`].
+    conductor: Option<ConductorSeamFn>,
+    /// The `EN.12.D` journal sink a conductor proposal's justification is
+    /// written through — see [`Self::with_journal_sink`]. `None` (the
+    /// default) is a true no-op, mirroring
+    /// [`super::debrief::DebriefNode`]'s own `journal_sink` field: no row is
+    /// even constructed. Reached ONLY by the conductor branch above; an
+    /// explicit or lane chain never touches it.
+    journal_sink: Option<Arc<JournalSinkFn>>,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -501,6 +554,8 @@ impl OrchestrationRunNode {
             cancellation_token: None,
             step_observer: Arc::new(|_progress: &StepProgress| {}),
             campaign_id: None,
+            conductor: None,
+            journal_sink: None,
         }
     }
 
@@ -588,6 +643,27 @@ impl OrchestrationRunNode {
         self.campaign_id = Some(campaign_id);
         self
     }
+
+    /// Wire the `CONDUCTOR` seam: consulted only when the inbound event
+    /// carries neither `blocks` nor `roadmap`/`lane` — see the field's own
+    /// doc for the exact bypass rule. With no seam wired (the default), that
+    /// event shape refuses exactly as it always has.
+    #[must_use]
+    pub fn with_conductor(mut self, conductor: ConductorSeamFn) -> Self {
+        self.conductor = Some(conductor);
+        self
+    }
+
+    /// Attach the `EN.12.D` journal sink a conductor proposal's
+    /// justification is written through. With none attached (the default),
+    /// a conductor-resolved chain still runs; it simply journals nothing —
+    /// mirroring [`super::debrief::DebriefNode::with_journal_sink`]'s own
+    /// no-op default.
+    #[must_use]
+    pub fn with_journal_sink(mut self, journal_sink: Arc<JournalSinkFn>) -> Self {
+        self.journal_sink = Some(journal_sink);
+        self
+    }
 }
 
 impl Default for OrchestrationRunNode {
@@ -618,13 +694,43 @@ impl Node for OrchestrationRunNode {
         // single-repo lines where `lane == repo`.
         let mut resolved_lane: Option<String> = None;
 
+        // `CONDUCTOR` (`EN.12.F` Task 4): a `ProposalOutcome` captured here
+        // only when this run's chain came from the conductor, so its
+        // justification can be journalled once `campaign_id` is resolved
+        // below (chain resolution runs BEFORE campaign-id resolution in
+        // this function, so the journal write cannot happen inline with
+        // the branch that produces it).
+        let mut conductor_outcome: Option<ProposalOutcome> = None;
+
         let chain: Vec<ChainStep> = if let Some(blocks) = &event.blocks {
+            // An explicit chain always bypasses the conductor entirely —
+            // this branch is byte-identical to before `conductor` existed,
+            // whether or not a seam is wired.
             resolve_explicit_chain(
                 blocks
                     .iter()
                     .map(|b| (b.repo.clone(), b.block_id.clone()))
                     .collect(),
             )
+        } else if event.roadmap.is_none() && event.lane.is_none() {
+            // Neither an explicit chain nor a lane chain was named — the
+            // case that used to be a hard refusal unconditionally. With no
+            // conductor wired, it still is (identical diagnostic, identical
+            // `NodeError`); with one wired, the conductor proposes tonight's
+            // chain from the objective + frontier slate instead.
+            match &self.conductor {
+                Some(conductor) => {
+                    let outcome = conductor().map_err(|err| NodeError::new(err.to_string()))?;
+                    let chain = outcome.chain.clone();
+                    conductor_outcome = Some(outcome);
+                    chain
+                }
+                None => {
+                    return Err(NodeError::new(
+                        "ORCHESTRATION event needs either `blocks` or `roadmap`+`lane`",
+                    ));
+                }
+            }
         } else {
             let roadmap = event.roadmap.clone().ok_or_else(|| {
                 NodeError::new("ORCHESTRATION event needs either `blocks` or `roadmap`+`lane`")
@@ -658,6 +764,37 @@ impl Node for OrchestrationRunNode {
             Some(id) => id,
             None => resolve_campaign_id(event.campaign_id.as_deref())?,
         };
+
+        // `CONDUCTOR` (`EN.12.F` Task 4): journal the proposal's
+        // justification — retrievable for this campaign over the same
+        // `GET /campaigns/{id}/journal` route family every other decision
+        // kind already uses — now that `campaign_id` is known. A `None`
+        // `journal_sink` (the default) is a true no-op, matching
+        // `DebriefNode`'s own convention: nothing is even constructed.
+        if let Some(outcome) = &conductor_outcome {
+            if let Some(sink) = &self.journal_sink {
+                sink(engine_contract::JournalRow {
+                    id: Uuid::new_v4(),
+                    campaign_id: campaign_id.to_string(),
+                    run_id: Uuid::new_v4(),
+                    step: "CONDUCTOR".to_string(),
+                    kind: engine_contract::JournalDecisionKind::ConductorProposed,
+                    reason: conductor_justification(outcome),
+                    detail: json!({
+                        "proposed": outcome.chain.iter().map(|s| json!({
+                            "repo": s.repo,
+                            "block_id": s.block_id,
+                        })).collect::<Vec<_>>(),
+                        "dropped": outcome.dropped.iter().map(|d| json!({
+                            "repo": d.repo,
+                            "block_id": d.block_id,
+                            "reason": d.reason,
+                        })).collect::<Vec<_>>(),
+                    }),
+                    created_at: chrono::Utc::now(),
+                });
+            }
+        }
 
         let roadmap_slug = event
             .roadmap_slug
@@ -1618,6 +1755,243 @@ mod tests {
             "error should explain what was missing: {}",
             err.message
         );
+    }
+
+    // ── `CONDUCTOR` wiring (`EN.12.F` Task 4) ───────────────────────────
+
+    /// A one-block, no-drops [`ProposalOutcome`] for `(repo, block_id)` — the
+    /// canned "successful proposal" a conductor seam stub returns.
+    fn sample_outcome(repo: &str, block_id: &str) -> ProposalOutcome {
+        ProposalOutcome {
+            chain: resolve_explicit_chain(vec![(repo.to_string(), block_id.to_string())]),
+            dropped: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_blocks_chain_bypasses_the_conductor_even_when_one_is_wired() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+
+        let conductor_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let conductor_called_clone = conductor_called.clone();
+        let conductor: ConductorSeamFn = Arc::new(move || {
+            conductor_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!("the conductor must never be consulted when `blocks` is present");
+        });
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_conductor(conductor);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" },
+                { "repo": "repo-b", "block_id": "B.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        // Behavior-identical to `process_drives_an_explicit_two_repo_chain_end_to_end`
+        // (no conductor wired there): the same event produces the same
+        // outcome regardless of whether a conductor seam is attached.
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes[NODE_NAME]["steps_integrated"], 2);
+        assert!(
+            !conductor_called.load(std::sync::atomic::Ordering::SeqCst),
+            "an explicit `blocks` chain must never consult the conductor"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_blocks_and_no_roadmap_lane_the_conductor_resolves_the_chain() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let conductor: ConductorSeamFn = Arc::new(|| Ok(sample_outcome("repo-a", "A.1")));
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_conductor(conductor);
+        // No `blocks`, no `roadmap`, no `lane` — the case that used to be a
+        // hard refusal unconditionally.
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("conductor should resolve a chain");
+        assert_eq!(out.nodes[NODE_NAME]["steps_integrated"], 1);
+        assert_eq!(out.nodes[NODE_NAME]["blocks"][0]["block_id"], "A.1");
+    }
+
+    #[tokio::test]
+    async fn a_conductor_proposal_error_is_surfaced_as_a_node_error() {
+        let dir = two_repo_brain_root();
+        let conductor: ConductorSeamFn = Arc::new(|| {
+            Err(ConductorProposalError::NotInSlate {
+                repo: "repo-a".to_string(),
+                block_id: "EN.99.Z".to_string(),
+            })
+        });
+
+        let node = OrchestrationRunNode::new().with_conductor(conductor);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let err = node.process(ctx).await.unwrap_err();
+        assert!(
+            err.message.contains("EN.99.Z"),
+            "a refused proposal should name the offending block: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn the_conductor_proposal_is_journalled_and_retrievable_for_the_campaign() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let conductor: ConductorSeamFn = Arc::new(|| {
+            Ok(ProposalOutcome {
+                chain: resolve_explicit_chain(vec![("repo-a".to_string(), "A.1".to_string())]),
+                dropped: vec![
+                    crate::workflows::orchestration::conductor::DroppedCandidate {
+                        repo: "repo-b".to_string(),
+                        block_id: "B.1".to_string(),
+                        reason: "already done per git history".to_string(),
+                    },
+                ],
+            })
+        });
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let written: Arc<std::sync::Mutex<Vec<engine_contract::JournalRow>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let written_clone = written.clone();
+        let sink: Arc<JournalSinkFn> = Arc::new(move |row| written_clone.lock().unwrap().push(row));
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_conductor(conductor)
+            .with_journal_sink(sink);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node
+            .process(ctx)
+            .await
+            .expect("conductor should resolve a chain");
+        let campaign_id = out.nodes[NODE_NAME]["campaign_id"]
+            .as_str()
+            .expect("campaign_id stamped")
+            .to_string();
+
+        let rows = written.lock().unwrap();
+        assert_eq!(rows.len(), 1, "exactly one CONDUCTOR journal row");
+        let row = &rows[0];
+        assert_eq!(row.step, "CONDUCTOR");
+        assert_eq!(
+            row.kind,
+            engine_contract::JournalDecisionKind::ConductorProposed
+        );
+        // Retrievable for THIS campaign — the row's `campaign_id` matches
+        // the id this very run stamped into `ctx.nodes`.
+        assert_eq!(row.campaign_id, campaign_id);
+        assert!(
+            row.reason.contains("proposed") && row.reason.contains('1'),
+            "reason should summarise the proposal: {}",
+            row.reason
+        );
+        assert_eq!(row.detail["proposed"].as_array().unwrap().len(), 1);
+        assert_eq!(row.detail["dropped"].as_array().unwrap().len(), 1);
+        assert_eq!(row.detail["dropped"][0]["block_id"], "B.1");
+    }
+
+    #[tokio::test]
+    async fn with_no_journal_sink_a_conductor_run_still_succeeds_true_no_op() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let conductor: ConductorSeamFn = Arc::new(|| Ok(sample_outcome("repo-a", "A.1")));
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        // No `.with_journal_sink(..)` at all.
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_conductor(conductor);
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        node.process(ctx)
+            .await
+            .expect("no journal sink wired must still be a no-op success");
+    }
+
+    #[test]
+    fn wiring_a_conductor_does_not_change_the_declared_node_identity() {
+        // The conductor is an internal seam on `OrchestrationRunNode`, not a
+        // second registered node — the declared graph shape (one node, both
+        // start and terminal) is fixed at `schema()`/`registry()` time and
+        // is never toggled by which seams a particular instance carries
+        // (CLAUDE.md standing rule 6: a knob must not change a declared
+        // node set).
+        let conductor: ConductorSeamFn = Arc::new(|| Ok(sample_outcome("repo-a", "A.1")));
+        let node = OrchestrationRunNode::new().with_conductor(conductor);
+        assert_eq!(node.name(), NODE_NAME);
+        assert_eq!(registry().len(), 1);
+        assert!(registry().contains(NODE_NAME));
     }
 
     // ── Node::process — campaign id resolution and stamping (Task 3) ────

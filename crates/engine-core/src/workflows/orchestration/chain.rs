@@ -303,6 +303,16 @@ pub fn resolve_lane_chain(
 /// preserved exactly as given; every produced [`ChainStep`] carries `directives: None` and
 /// `roadmap`/`lane`/`segment: None` — an explicit list names no lane segment, so it cannot
 /// be matched against a `lane-frontier.json` entry either.
+///
+/// This is also the exact function `CONDUCTOR`'s
+/// [`super::conductor::propose_chain`] (`EN.12.F` Task 4) calls to turn its
+/// finalised, `git log -S`-surviving candidate list into a chain — a
+/// conductor-produced chain is therefore never a parallel shape, only ever
+/// this function's own output, so nothing downstream of chain resolution can
+/// tell a proposed chain from an authored one. See
+/// `conductor_produced_chain_step_shape_matches_resolve_explicit_chain`
+/// below for a test proving the two calls converge byte-for-byte on the
+/// same input.
 #[must_use]
 pub fn resolve_explicit_chain(blocks: Vec<(String, String)>) -> Vec<ChainStep> {
     blocks
@@ -550,6 +560,79 @@ mod tests {
             let deserialized: StepKind = serde_json::from_str(wire).unwrap();
             assert_eq!(deserialized, kind, "round-trip mismatch for {wire}");
         }
+    }
+
+    // ── `CONDUCTOR` chain-shape equivalence (`EN.12.F` Task 4) ──────────
+
+    /// A `git`/`mev` [`crate::policy::emit_state::Runner`] stub that reports
+    /// no matching commits for any `git log -S` pickaxe search — every
+    /// candidate survives the pre-flight untouched.
+    struct NoHistoryOutput {
+        stdout: String,
+    }
+
+    impl crate::policy::emit_state::CommandOutputLike for NoHistoryOutput {
+        fn status(&self) -> i32 {
+            0
+        }
+        fn stdout(&self) -> &str {
+            &self.stdout
+        }
+        fn stderr(&self) -> &str {
+            ""
+        }
+    }
+
+    #[test]
+    fn conductor_produced_chain_step_shape_matches_resolve_explicit_chain() {
+        use super::super::conductor::{propose_chain, ConductorConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let objective_path = dir.path().join("objective.md");
+        fs::write(&objective_path, "Ship EN.12.F.\n").unwrap();
+        let config = ConductorConfig::new().with_objective_path(&objective_path);
+
+        let slate_json = r#"{
+            "derived_at": "2026-09-03T00:00:00-07:00",
+            "entries": [
+                {
+                    "roadmap": "r", "lane": "l", "segment": 0, "repo": "repo-a",
+                    "key": "repo-a:A.1", "id": "A.1", "title": "t", "status": "open",
+                    "unmet_blocks": [], "unmet_gates": [], "startable": true
+                },
+                {
+                    "roadmap": "r", "lane": "l", "segment": 0, "repo": "repo-b",
+                    "key": "repo-b:B.2", "id": "B.2", "title": "t", "status": "open",
+                    "unmet_blocks": [], "unmet_gates": [], "startable": true
+                }
+            ],
+            "gate_ranks": []
+        }"#;
+        let slate: crate::workflows::orchestration::gates::FrontierArtifact =
+            serde_json::from_str(slate_json).expect("well-formed frontier fixture");
+
+        let proposed = vec![
+            ("repo-a".to_string(), "A.1".to_string()),
+            ("repo-b".to_string(), "B.2".to_string()),
+        ];
+        let tasks_json_exists: super::super::conductor::TasksJsonChecker =
+            std::sync::Arc::new(|_repo: &str, _block_id: &str| true);
+        let git_runner: crate::policy::emit_state::Runner<NoHistoryOutput> =
+            std::sync::Arc::new(|_program, _args, _cwd| {
+                Ok(NoHistoryOutput {
+                    stdout: String::new(),
+                })
+            });
+
+        let outcome = propose_chain(&config, &proposed, &slate, &tasks_json_exists, &git_runner)
+            .expect("subset + tasks.json + pre-flight all pass");
+
+        let directly_resolved = resolve_explicit_chain(proposed);
+        assert_eq!(
+            outcome.chain, directly_resolved,
+            "a conductor-produced chain must be byte-identical to \
+             `resolve_explicit_chain`'s own output for the same survivors"
+        );
     }
 
     #[test]
