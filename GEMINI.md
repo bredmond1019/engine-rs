@@ -204,12 +204,23 @@ cargo run
 > touched and defer the broad run.
 >
 > **A task that cannot break the build should not pay for one.** `tasks.json`'s
-> `validation_commands` is now honoured by `/sdlc-flow` and `/sdlc-task`: a task declaring a
-> non-empty array runs exactly those commands as its per-task tripwire instead of the
-> project-wide gating checks. Use it for docs-only and config-only tasks — a markdown edit does
-> not need a Rust compile. The end review still runs the full harness suite over the integrated
-> tree, so nothing escapes validation; this changes only what the *tripwire* costs. Leave the
-> field `[]` for any task that touches `.rs` files.
+> `validation_commands` is honoured by `/sdlc-flow` and `/sdlc-task`: a task declaring a
+> non-empty array runs those commands **in addition to** this project's `gates: true` harness
+> checks (in their `fastCommand` form) — they **AUGMENT** the harness list, they do **not**
+> replace it. See `base-template/planning/decisions/D63-per-task-validation-commands-augment-gating.md`
+> (note: this is base-template's D63, not the brain's D63, which is an unrelated decision), and
+> the engine's own log line at `.claude/workflows/sdlc-task.js:2000`.
+>
+> **The consequence, which is the opposite of what this section said until 2026-09-04:** scoping a
+> task's `validation_commands` narrowly does **not** buy it a cheaper run — the project's gating
+> checks still run on top. The only thing that removes a project check from per-task runs is
+> **`perTask: false` on that check in `planning/harness.json`**; a task's own `validation_commands`
+> can never suppress one. Two corollaries: a docs-only task still pays for whatever the harness
+> gates unless those rows are `perTask: false`, and `expect_red` can never invert a `gates: true`
+> harness check — so in a repo whose suite-wide runner gates, a task whose deliverable is a test
+> observed failing must use a runtime inversion or be merged into its fix task. The end review
+> still runs the full harness suite over the integrated tree, so nothing escapes validation. Leave
+> the field `[]` for any task that touches `.rs` files.
 >
 > The SDLC pipeline reads its validation suite from `planning/harness.json` (not from this
 > block). Keep the commands here in sync with that file's `validation.checks[]` so humans and
