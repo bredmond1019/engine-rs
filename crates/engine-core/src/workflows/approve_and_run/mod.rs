@@ -78,6 +78,54 @@ use crate::operator::ledger::ApprovalLedger;
 use crate::operator::queue::OperatorQueue;
 use crate::operator::{validate, OperatorPayloadLimits, ValidatedOperatorPayload};
 
+/// The `ctx.nodes` key `crate::workflows::content_pipeline::persist_to_brain`
+/// stamps its result under (its own `NODE_NAME` const) — the key
+/// [`pending_harvest_records_from_content_pipeline_run`] reads to find a
+/// deferred harvest's pending record.
+const CONTENT_PIPELINE_PERSIST_TO_BRAIN_NODE_NAME: &str = "PersistToBrainNode";
+
+/// Extract the pending-harvest record(s), if any, out of a finished
+/// `CONTENT_PIPELINE` run's `ctx.nodes` map.
+///
+/// `persist_to_brain.rs`'s `Defer` arm (harvest mode `approval`) stamps a
+/// pending-harvest-record-shaped JSON value under
+/// `ctx.nodes["PersistToBrainNode"]["pending"]` — the exact shape
+/// [`approval_mode_makes_zero_posts_and_stamps_a_pending_record`] fixtures
+/// (`crate::workflows::content_pipeline::persist_to_brain`) and that
+/// [`PendingHarvestRecord::from_value`] parses. When the run posted
+/// in-process instead of deferring (harvest mode `off`, or a matched
+/// `Approved` decision), that key is `null` and this returns an empty
+/// `Vec` — there is nothing pending to drain.
+///
+/// This function is pure: no I/O, no clock read, no queue or ledger
+/// mutation. It only locates and parses the record(s); it does not enqueue
+/// them. **The real caller that holds a live [`ApproveAndRunSeams`]
+/// instance and passes these records to [`ApproveAndRunSeams::drain`] lives
+/// in `core/bastion`** (where a served `CONTENT_PIPELINE` dispatch actually
+/// runs and where the live `ApproveAndRunSeams` is constructed) — this
+/// crate has no dependency on `core/bastion` and cannot call `.drain()`
+/// from inside a `CONTENT_PIPELINE` run itself.
+///
+/// # Errors
+///
+/// Returns the underlying [`serde_json::Error`] if the stamped `pending`
+/// value does not parse as a [`PendingHarvestRecord`].
+pub fn pending_harvest_records_from_content_pipeline_run(
+    nodes: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<PendingHarvestRecord>, serde_json::Error> {
+    let Some(result) = nodes.get(CONTENT_PIPELINE_PERSIST_TO_BRAIN_NODE_NAME) else {
+        return Ok(Vec::new());
+    };
+    let pending = result
+        .get("pending")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if pending.is_null() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![PendingHarvestRecord::from_value(&pending)?])
+}
+
 /// The engine-side shape of one resolved operator verdict — the fields a
 /// resolved Telegram response carries, without naming bastion's
 /// `telegram::ResponseVerdict` (this crate has no dependency on
@@ -439,5 +487,66 @@ mod seams_tests {
     fn seams_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ApproveAndRunSeams>();
+    }
+
+    #[test]
+    fn pending_harvest_records_from_content_pipeline_run_round_trips_through_drain() {
+        // Build a `ctx.nodes`-shaped fixture matching what persist_to_brain.rs's
+        // `Defer` arm stamps under `PersistToBrainNode`'s result — the same
+        // shape `approval_mode_makes_zero_posts_and_stamps_a_pending_record`
+        // (`crate::workflows::content_pipeline::persist_to_brain`) fixtures.
+        let pending = pending_harvest_record(
+            "artifact-1",
+            "https://brain.example/ingest/artifact",
+            json!({"title": "some artifact", "body": "content"}),
+            vec!["brain/content/learning/artifact-1.md".to_string()],
+        );
+        let mut nodes: HashMap<String, serde_json::Value> = HashMap::new();
+        nodes.insert(
+            CONTENT_PIPELINE_PERSIST_TO_BRAIN_NODE_NAME.to_string(),
+            json!({
+                "posted": false,
+                "skipped": true,
+                "harvest_mode": "approval",
+                "pending": pending,
+            }),
+        );
+
+        let records = pending_harvest_records_from_content_pipeline_run(&nodes)
+            .expect("stamped pending record should parse");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].artifact_id, "artifact-1");
+
+        let stub: Arc<dyn HttpPost> = Arc::new(StubHttpPost::succeeding(json!({"ok": true})));
+        let (seams, _ledger) = seams(stub);
+
+        let report = seams.drain(&records, ts(0));
+        let delivered = report.delivered.expect("one item delivered");
+
+        let found = seams
+            .lookup_pending(&delivered.item_id)
+            .expect("open gate should resolve");
+        assert_eq!(found.payload().gate_id, delivered.item_id);
+    }
+
+    #[test]
+    fn pending_harvest_records_from_content_pipeline_run_is_empty_when_pending_is_null() {
+        let mut nodes: HashMap<String, serde_json::Value> = HashMap::new();
+        nodes.insert(
+            CONTENT_PIPELINE_PERSIST_TO_BRAIN_NODE_NAME.to_string(),
+            json!({"posted": true, "skipped": false, "harvest_mode": "in_process", "pending": null}),
+        );
+
+        let records = pending_harvest_records_from_content_pipeline_run(&nodes)
+            .expect("null pending should parse to empty");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn pending_harvest_records_from_content_pipeline_run_is_empty_when_node_missing() {
+        let nodes: HashMap<String, serde_json::Value> = HashMap::new();
+        let records = pending_harvest_records_from_content_pipeline_run(&nodes)
+            .expect("missing node should parse to empty");
+        assert!(records.is_empty());
     }
 }
