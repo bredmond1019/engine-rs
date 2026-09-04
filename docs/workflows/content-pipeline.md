@@ -224,10 +224,25 @@ is pushed to Synapse — D53's fourth boundary-test channel: **mev writes the so
 Synapse still owns the derived index.** Two nodes do it:
 
 1. **`LearningArtifactPayloadNode`** (`learning_artifact.rs`) builds the `LearningArtifact` payload
-   — `{artifact_id, channel_type, source_ref, summary, digest_markdown, entities, language}` — and
-   stamps it flat as its own result. `build_learning_artifact_payload` is the single source of that
-   shape: `PersistToBrainNode` POSTs the output of the same function, so the written document and
-   the ingested payload can never drift.
+   — `{artifact_id, channel_type, source_ref, summary, digest_markdown, entities, language, title,
+   description}` — and stamps it flat as its own result. `build_learning_artifact_payload` is the
+   single source of that shape: `PersistToBrainNode` POSTs the output of the same function, so the
+   written document and the ingested payload can never drift.
+   - `title` is derived from `digest_markdown`'s own leading Markdown heading (the `#`/whitespace
+     stripped), falling back to `artifact_id` when `digest_markdown` has no leading heading or is
+     empty — the field is never empty, since `okf_core::str_field` defaults a missing key to `""`
+     and an empty `title` would still fail OKF validation while looking wired.
+   - `description` is `summary` verbatim: the field OKF frontmatter calls `description` is exactly
+     what this payload already calls `summary`, carried under a second key rather than a new source
+     of truth.
+   - `okf_core::LearningArtifact` (`core/okf-core/src/doc/learning_artifact.rs`) already reads and
+     emits both — `from_payload` populates them via `str_field("title")`/`str_field("description")`
+     and `frontmatter()` emits them as the second and third entries, right after `type`, since
+     commit `fe8da8a` (`OK.ticket.learning-artifact-missing-title-description-task1`). So a doc
+     materialized through this node now carries `title:`/`description:` frontmatter lines end to
+     end — the OKF-validation gap `EN.ticket.content-pipeline-payload-missing-okf-title-description`
+     tracked (`mev validate-brain` reporting these as missing required fields) is closed on both
+     the engine-rs payload side and the okf-core consumer side; no companion change is pending.
 2. **`MaterializeDocNode`** (`nodes/materialize_doc.rs`) — the *same generic node*
    `RESEARCH_AGENT` uses for opportunities, constructed here with model `"learning-artifact"` and
    `with_source_node("LearningArtifactPayloadNode")`. It calls the `DocMaterializer` seam, which
