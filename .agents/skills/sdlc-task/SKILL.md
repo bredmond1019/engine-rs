@@ -644,15 +644,25 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
    count out of this run's selected task count) is only a slice — never use that slice alone as "how
    many tasks are done" anywhere a count is written; use the cumulative count derived from the file
    itself. A resumed two-task spec must read "2 of 2" after its second run, not "1 of 1".
-2. Update `planning/status.md` (surgical Edit). **"Current focus" is APPEND-ONLY narrative** — never
+2. Before this edit, load the `write-okf-markdown` skill — this step edits an EXISTING file's YAML
+   frontmatter, and that skill carries the frontmatter-must-start-at-line-1 rule and the insert-point
+   trap (a row inserted after the OPENING `---` instead of the CLOSING one destroys the block, per
+   E_SYNC_WATERMARK_MALFORMED). HQ standing rule 6 and base-template standing rule 11 both require
+   this before writing or editing any `.md`.
+   Update `planning/status.md` (surgical Edit). **"Current focus" is APPEND-ONLY narrative** — never
    delete or rewrite any existing line under it; a prior block's narrative must survive this edit
    VERBATIM. The one exception: if an existing line already refers to THIS spec by name (e.g. from an
    earlier partial run), replace only that one line — never the whole section. If `blockDone`, flip
    this spec's Status to "Done" in the Progress Table and add ONE new line under "Current focus"
    recording that outcome, citing the cumulative task count from step 1 (e.g. "`<blockId>`: done (N of
    M tasks)"); otherwise keep Status "In progress" (a task subset ran) and optionally add a new line
-   under "Current focus" pointing at the next task, citing the same cumulative count. Refresh "Last
-   updated" to today's date.
+   under "Current focus" pointing at the next task, citing the same cumulative count. Refresh the BODY
+   line `**Last updated:**` — run: `date +%Y-%m-%d`. This is the only "Last updated" field this step
+   touches. The YAML FRONTMATTER block at the top of status.md (the `timestamp:` field, an RFC3339
+   value) is NOT this step's to write — no field in that frontmatter block is — because `mev
+   emit-state --write` regenerates the whole frontmatter block later in this same stage. Hand-editing
+   `timestamp` here and then having emit-state rewrite it afterward is how the two go out of step
+   with the HQ cache doc's `synced_from` (E_SYNC_DRIFT) — never touch `timestamp` in this step.
 3. **Flip the block's status in `planning/state.json`, validate-then-commit** — skip silently if
    there's no `planning/state.json`, OR if `blockDone` is false. Resolve the canonical block id from
    the status.md Progress Table row (the only judgment call in this step), then run this exact

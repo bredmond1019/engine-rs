@@ -12,8 +12,13 @@ $ARGUMENTS — optional free-text note to include in the handoff (e.g. "focus on
 
 ## Execution Model
 
-**Run entirely inline. Spawn no subagents, and do NOT invoke `/log-work`, `/commit`, or
-`/backlog-ticket` as skills — their steps are inlined below.**
+**Run entirely inline. Spawn no subagents.**
+
+**The `log.md` entry, the `status.md` bump and the commit are all written by Step 4 below — they
+are part of this command, not separate work.** So do not additionally invoke `/log-work`,
+`/commit` or `/backlog-ticket` as skills; their steps are already inlined. Finishing this command
+means Step 4 has run. **Never report `/log-work` or `/commit` as outstanding** — if you have not
+done Step 4, the handoff is not finished; go do it.
 
 This is deliberate and is the whole point of the command. `/handoff` exists to *serialize the
 current session's context to disk*, and the main agent is the only thing that holds that

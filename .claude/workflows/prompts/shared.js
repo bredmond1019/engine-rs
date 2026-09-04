@@ -436,6 +436,101 @@ print('FLIPPED:' + bid)
 }
 // <</shared:renderStateFlipScript>>
 
+// <<shared:renderStatusWriteScript>>
+// The D64-style validate-then-commit mutation for planning/status.md's authored body content --
+// a direct sibling of renderStateFlipScript above, for the analogous corpus write
+// (BT.ticket.bookkeep-writes-invalid-status-frontmatter). Captures the pre-write bytes, mutates
+// in memory, runs `mev validate-brain --sync` (one flag, never combined with another) BEFORE and
+// AFTER the write, and rolls back byte-exactly on any NET-NEW diagnostic -- the same delta-
+// attribution rule renderStateFlipScript and hooks/pre-push stage 1 already implement under D64.
+// Two write defects this script structurally cannot reintroduce: it NEVER touches any line at or
+// before the closing `---` fence (the YAML frontmatter block, including `timestamp` -- derived by
+// `mev emit-state --write` later in this same stage, never hand-written here), and its own new
+// body line is always inserted strictly AFTER that closing fence, never the opening one (the
+// EN.ticket.term-core-real-tmux-option-reads break). Shared for the same reason as
+// renderStateFlipScript -- executable Python performing a validated write both engines need
+// identically. `indent` exists only because the two prompts nest it at different depths.
+function renderStatusWriteScript({ runRoot, indent }) {
+  return `${indent}cd ${runRoot} && python3 -c "
+import subprocess, sys, shutil
+
+path = 'planning/status.md'
+recent_work_line = sys.argv[1]
+last_updated_date = sys.argv[2]
+
+with open(path, 'rb') as fh:
+    pre_bytes = fh.read()
+
+text = pre_bytes.decode('utf-8')
+lines = text.splitlines()
+
+fence_idx = [i for i, l in enumerate(lines) if l.strip() == '---']
+# A frontmatter block exists only when the OPENING fence is line 1 (write-okf-markdown). Without
+# anchoring on that, a body horizontal-rule pair reads as frontmatter and every guard below is
+# computed from the wrong offset -- skipping real body lines and inserting after the wrong fence.
+closing_fence = fence_idx[1] if (len(fence_idx) >= 2 and fence_idx[0] == 0) else -1
+
+# Never touch the YAML frontmatter block (every line at or before the closing fence) -- 'timestamp'
+# in there is derived by mev emit-state, not this stage's to write.
+for i in range(closing_fence + 1, len(lines)):
+    if lines[i].startswith('**Last updated:**'):
+        lines[i] = '**Last updated:** ' + last_updated_date
+        break
+
+# recent_work_line already carries the CALLER's own append-vs-replace decision baked in (the
+# caller passes the exact line text whether it is a brand-new line or a replacement for an
+# existing one it identified by reading the file first) -- this script only decides WHERE a
+# genuinely new line lands, never whether to dedupe one naming this spec.
+insert_at = None
+for i in range(closing_fence + 1, len(lines)):
+    if lines[i].strip().startswith('## Current focus'):
+        insert_at = i + 1
+        break
+if insert_at is None:
+    insert_at = closing_fence + 1 if closing_fence != -1 else len(lines)
+
+lines.insert(insert_at, recent_work_line)
+
+new_text = chr(10).join(lines)
+if text.endswith(chr(10)):
+    new_text += chr(10)
+
+mev_available = shutil.which('mev') is not None
+
+def diagnostics():
+    r = subprocess.run(['mev', 'validate-brain', '--sync'], capture_output=True, text=True)
+    out = (r.stdout + r.stderr).splitlines()
+    return set(l for l in out if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
+
+if not mev_available:
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(new_text)
+    print('STATUS_WRITE:unvalidated')
+    print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only line-level parsing')
+    sys.exit(0)
+
+baseline = diagnostics()
+
+with open(path, 'w', encoding='utf-8') as fh:
+    fh.write(new_text)
+
+after = diagnostics()
+net_new = after - baseline
+
+if net_new:
+    with open(path, 'wb') as fh:
+        fh.write(pre_bytes)
+    print('STATUS_REJECTED:written')
+    for line in sorted(net_new):
+        print('NET_NEW: ' + line)
+    sys.exit(1)
+
+outcome = 'written'
+print('STATUS_WRITE:' + outcome)
+" "<RECENT_WORK_LINE>" "<LAST_UPDATED_DATE>"`
+}
+// <</shared:renderStatusWriteScript>>
+
 // <<shared:renderTriagePrompt>>
 // The failure-triage prompt: classify a failure RETRYABLE vs MAJOR so the pipeline either makes a
 // bounded fix or bails to a human now. Shared because the two engines' copies were IDENTICAL apart

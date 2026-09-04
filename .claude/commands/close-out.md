@@ -336,7 +336,20 @@ Record what you did either way — fixed in place, ticketed, or carried over —
 **Skip this step if `--gap-check-only` was passed.** Instead, print a one-line summary:
 `Gap-check complete. Gating: <PASS|FAIL>. Coverage gaps filled: <N>. Docs patched: <yes|no>.`
 
-Otherwise, invoke the `/handoff` skill.
+Otherwise, invoke the `/handoff` skill — **and stay in this command until it has actually
+finished.** `/handoff` is not a report you hand back; it is the step that produces this command's
+last three artifacts:
+
+| Artifact | Written by |
+|---|---|
+| `planning/handoff.md` | `/handoff` Step 3 |
+| the `log.md` session entry + `status.md` timestamp | `/handoff` Step 4a-4b |
+| the commit | `/handoff` Step 4d |
+
+**`/close-out` is not complete until all three exist.** Two nested skills run inside this command
+(`/update-docs` in Step 3, `/handoff` here), each ending in its own Report section — do not mistake
+either sub-report for the end of `/close-out`. If you are about to write this command's Report and
+`log.md` has no entry for this session, you have stopped one step early: go back and finish Step 4.
 
 Pass the handoff note (the $ARGUMENTS remainder after stripping `--skip-coverage`, `--gap-check-only`, `--clean-worktree`, and `--merge-branch`). If non-blocking coverage gaps were found in Step 2, prepend a brief line to the note:
 
@@ -447,7 +460,15 @@ bullets. Link paths; never restate a file. See the `report-to-the-operator` skil
 ```
 <spec-slug> closed out — <gates>/<total> gates, coverage <ok | gap: ...>, docs <clean | patched: N>
 <doc standard: N upgraded | M ticketed | K carried over — omit the line entirely if nothing applied>
+- Logged + committed: <log.md entry title> / <commit sha>   (or why not, if --gap-check-only)
 - <anything that failed or was skipped, with the real error>
 Next: <command>
 ```
 Never restate the doc sweep or the coverage table — say the verdict and link the file.
+
+**The "Logged + committed" line is not optional and must name a real `log.md` entry and a real
+commit sha.** It exists because a run that stopped before Step 4 otherwise produces a report that
+looks identical to a complete one — gates green, coverage clean, docs patched — while the session
+went unlogged and uncommitted. If you cannot fill that line in, do not paper over it: go and run
+Step 4. The only case where it may say "skipped" is `--gap-check-only`, which does not reach Step 4
+by design.

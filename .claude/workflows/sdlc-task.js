@@ -530,6 +530,101 @@ print('FLIPPED:' + bid)
 }
 // <</shared:renderStateFlipScript>>
 
+// <<shared:renderStatusWriteScript>>
+// The D64-style validate-then-commit mutation for planning/status.md's authored body content --
+// a direct sibling of renderStateFlipScript above, for the analogous corpus write
+// (BT.ticket.bookkeep-writes-invalid-status-frontmatter). Captures the pre-write bytes, mutates
+// in memory, runs `mev validate-brain --sync` (one flag, never combined with another) BEFORE and
+// AFTER the write, and rolls back byte-exactly on any NET-NEW diagnostic -- the same delta-
+// attribution rule renderStateFlipScript and hooks/pre-push stage 1 already implement under D64.
+// Two write defects this script structurally cannot reintroduce: it NEVER touches any line at or
+// before the closing `---` fence (the YAML frontmatter block, including `timestamp` -- derived by
+// `mev emit-state --write` later in this same stage, never hand-written here), and its own new
+// body line is always inserted strictly AFTER that closing fence, never the opening one (the
+// EN.ticket.term-core-real-tmux-option-reads break). Shared for the same reason as
+// renderStateFlipScript -- executable Python performing a validated write both engines need
+// identically. `indent` exists only because the two prompts nest it at different depths.
+function renderStatusWriteScript({ runRoot, indent }) {
+  return `${indent}cd ${runRoot} && python3 -c "
+import subprocess, sys, shutil
+
+path = 'planning/status.md'
+recent_work_line = sys.argv[1]
+last_updated_date = sys.argv[2]
+
+with open(path, 'rb') as fh:
+    pre_bytes = fh.read()
+
+text = pre_bytes.decode('utf-8')
+lines = text.splitlines()
+
+fence_idx = [i for i, l in enumerate(lines) if l.strip() == '---']
+# A frontmatter block exists only when the OPENING fence is line 1 (write-okf-markdown). Without
+# anchoring on that, a body horizontal-rule pair reads as frontmatter and every guard below is
+# computed from the wrong offset -- skipping real body lines and inserting after the wrong fence.
+closing_fence = fence_idx[1] if (len(fence_idx) >= 2 and fence_idx[0] == 0) else -1
+
+# Never touch the YAML frontmatter block (every line at or before the closing fence) -- 'timestamp'
+# in there is derived by mev emit-state, not this stage's to write.
+for i in range(closing_fence + 1, len(lines)):
+    if lines[i].startswith('**Last updated:**'):
+        lines[i] = '**Last updated:** ' + last_updated_date
+        break
+
+# recent_work_line already carries the CALLER's own append-vs-replace decision baked in (the
+# caller passes the exact line text whether it is a brand-new line or a replacement for an
+# existing one it identified by reading the file first) -- this script only decides WHERE a
+# genuinely new line lands, never whether to dedupe one naming this spec.
+insert_at = None
+for i in range(closing_fence + 1, len(lines)):
+    if lines[i].strip().startswith('## Current focus'):
+        insert_at = i + 1
+        break
+if insert_at is None:
+    insert_at = closing_fence + 1 if closing_fence != -1 else len(lines)
+
+lines.insert(insert_at, recent_work_line)
+
+new_text = chr(10).join(lines)
+if text.endswith(chr(10)):
+    new_text += chr(10)
+
+mev_available = shutil.which('mev') is not None
+
+def diagnostics():
+    r = subprocess.run(['mev', 'validate-brain', '--sync'], capture_output=True, text=True)
+    out = (r.stdout + r.stderr).splitlines()
+    return set(l for l in out if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
+
+if not mev_available:
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(new_text)
+    print('STATUS_WRITE:unvalidated')
+    print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only line-level parsing')
+    sys.exit(0)
+
+baseline = diagnostics()
+
+with open(path, 'w', encoding='utf-8') as fh:
+    fh.write(new_text)
+
+after = diagnostics()
+net_new = after - baseline
+
+if net_new:
+    with open(path, 'wb') as fh:
+        fh.write(pre_bytes)
+    print('STATUS_REJECTED:written')
+    for line in sorted(net_new):
+        print('NET_NEW: ' + line)
+    sys.exit(1)
+
+outcome = 'written'
+print('STATUS_WRITE:' + outcome)
+" "<RECENT_WORK_LINE>" "<LAST_UPDATED_DATE>"`
+}
+// <</shared:renderStatusWriteScript>>
+
 // <<shared:renderTriagePrompt>>
 // The failure-triage prompt: classify a failure RETRYABLE vs MAJOR so the pipeline either makes a
 // bounded fix or bails to a human now. Shared because the two engines' copies were IDENTICAL apart
@@ -948,6 +1043,8 @@ const BOOKKEEP_SCHEMA = {
   required: ['statusUpdated'],
   properties: {
     statusUpdated:      { type: 'boolean', description: 'true if planning/status.md was updated' },
+    statusWriteValidated: { type: 'boolean', description: 'true if mev validate-brain --sync gated the planning/status.md mutation (before/after diff, net-new only); false when mev was not on PATH and the write landed with only line-level parsing (a degrade, not a pass)' },
+    statusWriteRejected: { type: 'boolean', description: 'true if the planning/status.md mutation introduced net-new corpus errors and was rolled back byte-exact; status.md on disk is unchanged from before this step ran' },
     tasksMarked:        { type: 'boolean', description: 'true if tasks.md task markers were updated' },
     blockStatusFlipped: { type: 'string', description: 'the state.json tracks[].blocks[].id flipped to "closed", or "" if none (partial run, no state.json, block not found, or the write was rejected by validation)' },
     stateWriteValidated: { type: 'boolean', description: 'true if mev validate-brain --state gated the state.json mutation (before/after diff, net-new only); false when mev was not on PATH and the write landed with only json.load-level parsing (a degrade, not a pass)' },
@@ -2653,25 +2750,63 @@ Target:
      (e.g. "2026-01-01 — tasks ${taskList.join(', ')} passed"). If the spec carries no such stub,
      do nothing — never invent one.
 
-3. Update planning/status.md (Edit tool, surgical). "Current focus" is APPEND-ONLY narrative — never
-   delete or rewrite any existing line under it; a prior block's narrative must survive this edit
-   VERBATIM. The one exception: if an existing line already refers to THIS spec ("${blockId}") by name
-   (e.g. from an earlier partial run), you may replace only that one line — never the whole section —
-   with the update below.
+3. Before editing planning/status.md, load the \`write-okf-markdown\` skill — this step edits an
+   EXISTING file's YAML frontmatter, and the skill carries the frontmatter-must-start-at-line-1 rule
+   and the insert-point trap (a row inserted after the OPENING \`---\` instead of the CLOSING one
+   destroys the block, per E_SYNC_WATERMARK_MALFORMED). HQ standing rule 6 and base-template standing
+   rule 11 both require this before writing or editing any \`.md\`; this stage is one of the fleet's
+   two highest-volume \`.md\` writers.
+   "Current focus" is APPEND-ONLY narrative — never delete or rewrite any existing line under it; a
+   prior block's narrative must survive this edit VERBATIM. The one exception: if an existing line
+   already refers to THIS spec ("${blockId}") by name (e.g. from an earlier partial run), delete
+   ONLY that one line now (Edit tool) — never the whole section — so the scripted write below lands
+   its replacement as a clean single line rather than a duplicate.
+   Compose the ONE new Current-focus line as plain text (do not write it into the file yet):
    ${blockDone
-     ? `- The full spec "${blockId}" is done — flip its Status to "Done" in the Progress Table.
-   - Add ONE new line under "Current focus" recording that "${blockId}" is done, citing the CUMULATIVE
-     task count you derived in step 2 (e.g. "${blockId}: done (N of ${allTasks.length} tasks)") — do
-     not touch any other existing line.`
-     : `- Keep the spec "In progress" (a task subset ran). Add ONE new line under "Current focus"
-   pointing at the next task if helpful, citing the cumulative count from step 2 — do not touch any
-   other existing line.`}
-   - Update "Last updated" — run: date +%Y-%m-%d
+     ? `- The full spec "${blockId}" is done. The line must record that, citing the CUMULATIVE task
+     count you derived in step 2 (e.g. "${blockId}: done (N of ${allTasks.length} tasks)").`
+     : `- The spec stays "In progress" (a task subset ran). The line should point at the next task if
+     helpful, citing the cumulative count from step 2.`}
+   Then run \`date +%Y-%m-%d\` to get today's date.
+
+   VALIDATE-THEN-COMMIT CONTRACT — the write must not stand unless \`mev validate-brain --sync\`
+   accepts it. Run ONE scripted mutation (never the Edit tool for this part) that captures the
+   pre-write bytes, mutates in memory, runs \`mev validate-brain --sync\` (one flag, never combined
+   with another flag) BEFORE and AFTER the write, and rejects — byte-exact rollback — any write that
+   introduces diagnostic lines NOT present in the BEFORE baseline. A pre-existing corpus error (e.g.
+   a sibling lane's unrelated breakage) must never block this write — NET-NEW only, the same delta-
+   attribution rule step 4 below and the push gate use under D64. Substitute the Current-focus line
+   for <RECENT_WORK_LINE> and today's date for <LAST_UPDATED_DATE> (keep both as the script's sole
+   argv, each quoted):
+${renderStatusWriteScript({ runRoot: runDir, indent: '   ' })}
+   This script structurally cannot reintroduce either of the two frontmatter write defects: it never
+   touches any line at or before the closing \`---\` fence (so \`timestamp\`, an RFC3339 value derived
+   by \`mev emit-state --write\` later in this same stage — step 5 below — is never hand-written
+   here, which is what keeps it from going out of step with the HQ cache doc's \`synced_from\`,
+   E_SYNC_DRIFT), and its own new body line always lands strictly AFTER that closing fence, never the
+   opening one (the historical EN.ticket.term-core-real-tmux-option-reads break). Read the script's
+   own stdout AND exit code — do not infer success yourself:
+     - "STATUS_WRITE:written" (exit 0) → mev validated the write and found no net-new diagnostics.
+       Set statusUpdated=true and statusWriteValidated=true. If step 2's "Block done" is yes, also
+       flip the Progress Table's Status cell for "${blockId}" to "Done" now (Edit tool — a plain body
+       table-cell edit, safe once the risky part above has already landed and validated).
+     - "STATUS_WRITE:unvalidated" (exit 0) → mev is not installed; the write landed unchecked
+       (line-level parsing only, matching how the harness degrades other absent tooling). Set
+       statusUpdated=true, statusWriteValidated=false, and copy the UNVALIDATED line verbatim into
+       notes — this is a DEGRADE, not a silent pass. Still flip the Progress Table cell as above when
+       "Block done" is yes.
+     - "STATUS_REJECTED:written" (exit 1) → the write introduced net-new corpus errors and was rolled
+       back; planning/status.md on disk is now byte-identical to its content before this step ran. Set
+       statusUpdated=false, statusWriteRejected=true, and copy every "NET_NEW:" line verbatim into
+       notes — this MUST be reported, never silently swallowed. Do NOT touch the Progress Table cell
+       this run even if "Block done" said yes; the block stays open (see step 4) until a clean write
+       lands on a later run.
 
 4. Flip the block's AUTHORED status in planning/state.json (skip this entire step silently if the repo
-   has no planning/state.json, OR if "Block done" above is "no"). state.json is the authoritative block
-   graph — leaving it stale poisons every derived surface, because \`mev emit-state\` reads this field
-   and NEVER infers completion from status.md.
+   has no planning/state.json, if "Block done" above is "no", OR if step 3's write was
+   STATUS_REJECTED — never flip state.json to closed while status.md itself failed to record the
+   close). state.json is the authoritative block graph — leaving it stale poisons every derived
+   surface, because \`mev emit-state\` reads this field and NEVER infers completion from status.md.
    - Resolve the block's canonical ID from the status.md Progress Table row (the <BlockID> column, or
      the id that row maps to in state.json). This is the only part of this step that stays your
      judgment call — the mutation itself is scripted below, not an Edit-tool diff.
@@ -2760,8 +2895,11 @@ EOF
 )" || echo "NOTHING_TO_COMMIT"
    cd ${runDir} && ${GIT} log --oneline -1`}
 
-Return via StructuredOutput: statusUpdated, tasksMarked, blockStatusFlipped, emitStateRan, postEmitHookRan, postEmitHookFailed, commitHash, notes.
+Return via StructuredOutput: statusUpdated, statusWriteValidated, statusWriteRejected, tasksMarked, blockStatusFlipped, emitStateRan, postEmitHookRan, postEmitHookFailed, commitHash, notes.
 `, withModel({ label: 'bookkeep', schema: BOOKKEEP_SCHEMA }, MODEL.bookkeep))
+  if (bookkeepResult?.statusWriteRejected) {
+    log(`status.md: write REJECTED — net-new corpus error(s) from mev validate-brain --sync; rolled back byte-exact. ${bookkeepResult?.notes || ''}`)
+  }
   if (bookkeepResult?.stateWriteRejected) {
     log(`state.json: write REJECTED — net-new schema error(s) from mev validate-brain --state; rolled back byte-exact, block NOT closed this run. ${bookkeepResult?.notes || ''}`)
   } else if (bookkeepResult?.blockStatusFlipped) {

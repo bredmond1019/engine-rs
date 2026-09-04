@@ -191,7 +191,20 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
    - If PASS, run `/update-docs --patch` to update documentation, running the COMMIT-SAFETY GUARD
      `&&`-joined before the docs commit (and its vault counterpart, if any patched/created doc lives
      under `planning/`).
-   - Update the status and log. In-place (non-worktree) only, after `mev emit-state --write`
+   - Update `planning/status.md` (surgical Edit). Before this edit, load the `write-okf-markdown`
+     skill — this step edits an EXISTING file's YAML frontmatter, and that skill carries the
+     frontmatter-must-start-at-line-1 rule and the insert-point trap (a row inserted after the
+     OPENING `---` instead of the CLOSING one destroys the block, per E_SYNC_WATERMARK_MALFORMED).
+     HQ standing rule 6 and base-template standing rule 11 both require this before writing or
+     editing any `.md`. "Current focus" is APPEND-ONLY narrative — never delete or rewrite an
+     existing line under it. Refresh the BODY line `**Last updated:**` — run: `date +%Y-%m-%d`. This
+     is the only "Last updated" field this step touches. The YAML FRONTMATTER block at the top of
+     status.md (the `timestamp:` field, an RFC3339 value) is NOT this step's to write — no field in
+     that frontmatter block is — because `mev emit-state --write` regenerates the whole frontmatter
+     block later in this same stage. Hand-editing `timestamp` here and then having emit-state
+     rewrite it afterward is how the two go out of step with the HQ cache doc's `synced_from`
+     (E_SYNC_DRIFT) — never touch `timestamp` in this step.
+   - Update the log. In-place (non-worktree) only, after `mev emit-state --write`
      succeeds: if `planning/harness.json` declares an OPTIONAL `postEmitCommitCommand`
      (BT.ticket.bookkeep-leaves-derived-output-uncommitted), run it — this is project policy, never
      an engine default, so an absent key is a silent no-op. A hook failure must be reported, never
