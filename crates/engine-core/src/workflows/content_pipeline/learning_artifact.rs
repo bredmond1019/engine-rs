@@ -237,6 +237,22 @@ mod tests {
         })
     }
 
+    /// Like [`output_json`], but with a caller-supplied `digest_markdown` so
+    /// the title-derivation cases below can exercise
+    /// `build_learning_artifact_payload` end to end rather than only
+    /// [`derive_title`] in isolation.
+    fn output_json_with_digest(digest_markdown: &str) -> serde_json::Value {
+        json!({
+            "artifact_id": "artifact-1",
+            "source_channel": "web_article",
+            "summary": "A concise summary.",
+            "entities": ["Acme Corp"],
+            "digest_markdown": digest_markdown,
+            "digest_html": null,
+            "translated_markdown": null,
+        })
+    }
+
     #[tokio::test]
     async fn builder_emits_the_exact_expected_payload_for_an_untranslated_run() {
         let mut ctx = empty_ctx(base_event(false));
@@ -375,5 +391,103 @@ mod tests {
     #[test]
     fn derive_title_falls_back_to_artifact_id_when_digest_is_empty() {
         assert_eq!(derive_title("", "artifact-1"), "artifact-1");
+    }
+
+    // -- Task 2: extend the suite for title/description, end to end through
+    // `build_learning_artifact_payload` (not only `derive_title` in
+    // isolation), plus the okf-core round trip. Per D68, these were red
+    // before task 1 landed `title`/`description` on the payload and okf-core
+    // commit `fe8da8a` taught `LearningArtifact` to read/emit them; task 1
+    // already applied in this working tree, so these assert the green state
+    // directly rather than re-demonstrating the prior failure.
+
+    #[tokio::test]
+    async fn builder_derives_title_from_the_digests_leading_heading() {
+        let mut ctx = empty_ctx(base_event(false));
+        put_result(
+            &mut ctx,
+            digest_render::NODE_NAME,
+            output_json_with_digest("# Real Title\n\nSome body text."),
+        );
+        put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
+
+        let payload = build_learning_artifact_payload(&ctx).expect("should build");
+        assert_eq!(payload["title"], json!("Real Title"));
+    }
+
+    #[tokio::test]
+    async fn builder_falls_back_to_artifact_id_when_digest_has_no_leading_heading() {
+        let mut ctx = empty_ctx(base_event(false));
+        put_result(
+            &mut ctx,
+            digest_render::NODE_NAME,
+            output_json_with_digest("Just prose, no heading here."),
+        );
+        put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
+
+        let payload = build_learning_artifact_payload(&ctx).expect("should build");
+        assert_eq!(payload["title"], json!("artifact-1"));
+    }
+
+    #[tokio::test]
+    async fn builder_falls_back_to_artifact_id_when_digest_is_empty() {
+        let mut ctx = empty_ctx(base_event(false));
+        put_result(
+            &mut ctx,
+            digest_render::NODE_NAME,
+            output_json_with_digest(""),
+        );
+        put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
+
+        let payload = build_learning_artifact_payload(&ctx).expect("should build");
+        assert_eq!(payload["title"], json!("artifact-1"));
+    }
+
+    #[tokio::test]
+    async fn builder_description_equals_summary_verbatim() {
+        let mut ctx = empty_ctx(base_event(false));
+        put_result(&mut ctx, digest_render::NODE_NAME, output_json(false));
+        put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
+
+        let payload = build_learning_artifact_payload(&ctx).expect("should build");
+        assert_eq!(payload["description"], payload["summary"]);
+        assert_eq!(payload["description"], json!("A concise summary."));
+    }
+
+    #[tokio::test]
+    async fn payload_round_trips_through_okf_core_learning_artifact_frontmatter() {
+        use okf_core::{BrainDocModel, LearningArtifact};
+
+        let mut ctx = empty_ctx(base_event(false));
+        put_result(
+            &mut ctx,
+            digest_render::NODE_NAME,
+            output_json_with_digest("# Real Title\n\nSome body text."),
+        );
+        put_result(&mut ctx, fetch_article::NODE_NAME, content_json());
+
+        let payload = build_learning_artifact_payload(&ctx).expect("should build");
+        let artifact = LearningArtifact::from_payload(&payload);
+        let fields = artifact.frontmatter();
+
+        let title = fields
+            .iter()
+            .find(|(key, _)| key == "title")
+            .map(|(_, value)| value.clone());
+        let description = fields
+            .iter()
+            .find(|(key, _)| key == "description")
+            .map(|(_, value)| value.clone());
+
+        assert_eq!(
+            title,
+            Some(okf_core::FrontmatterValue::Scalar("Real Title".to_string()))
+        );
+        assert_eq!(
+            description,
+            Some(okf_core::FrontmatterValue::Scalar(
+                "A concise summary.".to_string()
+            ))
+        );
     }
 }
