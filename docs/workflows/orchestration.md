@@ -254,6 +254,19 @@ same "needs either `blocks` or `roadmap`+`lane`" diagnostic. With one wired
 through the SAME `ChainStep` shape `resolve_explicit_chain` produces, so nothing downstream of it can
 tell a conductor-proposed chain from an authored one.
 
+**Wired into production as of `EN.ticket.wire-shipped-but-unreachable-seams`.** Before that ticket,
+`.with_conductor()` was called only from `graph.rs`'s own unit tests — a live `bastion serve`
+dispatch with no `blocks`/`roadmap` had nothing to fall back on and simply failed. `crates/engine-serve/src/workflows.rs`'s
+`register_orchestration_with_registry` now builds a real `ConductorSeamFn` and threads it into the
+`OrchestrationRunNode` via `.with_conductor()`, alongside the four sibling seams
+(`.with_resolve_depends_on()` / `.with_is_edge_met()` / `.with_is_block_open()` /
+`.with_hold_source()`) that function already wires. `mev_cwd`/`git_cwd`/the objective path all
+resolve from the dispatched event's `brain_root` — the same value the function's `RepoRegistry`
+resolution already reads off the event — and the seam shells out through the real `CommandRunner`
+convention (`engine_core::workflows::default_command_runner`), never a stub, on a live server. A
+live ORCHESTRATION dispatch carrying no `blocks`/`roadmap` now reaches `CONDUCTOR`'s proposal logic
+described below instead of failing outright.
+
 **Two inputs, never a third.** `conductor.rs`:
 
 - **The operator-written weekly objective** — `read_objective`, plain prose at

@@ -900,10 +900,15 @@ block.
   factory) still runs before `AppState`'s Postgres pool exists — the same gap `ORCHESTRATION`
   documents — but the closure body resolves both the reader's pool and the sink fresh per dispatch
   from a process-global `DurableHandle` cell (`journal::set_journal_durable_handle`/
-  `journal_durable_handle`, `EN.14.E`), so once something installs a handle (e.g. `bastion`'s
-  `serve/mod.rs`, out of this repo) a live run's journal read and its synchronous
-  `DebriefRendered` write-back are both live. With no handle installed, the reader self-skips to
-  an empty campaign and the sink drops the row, exactly as both did before this wiring.
+  `journal_durable_handle`, `EN.14.E`), so once something installs a handle a live run's journal
+  read and its synchronous `DebriefRendered` write-back are both live. `journal::install_durable_handle`
+  (`EN.ticket.wire-shipped-but-unreachable-seams`) is the documented, single-call production
+  entrypoint for that installation — a thin wrapper over `set_journal_durable_handle` named for the
+  one real call site that matters, boot time, with a pool-derived handle. Nothing in `engine-serve`
+  calls it in production yet: the actual call (e.g. from `bastion`'s `serve/mod.rs`, at its existing
+  `spawn_durable_writer(Some(pool))` site) is out of this repo and still needs a companion
+  `core/bastion`-side change. With no handle installed, the reader self-skips to an empty campaign
+  and the sink drops the row, exactly as both did before this wiring.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,

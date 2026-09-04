@@ -68,6 +68,32 @@ Resolved through the standard four layers (event `policy` override > named `prof
 seams to bastion's transport, and converts a real `telegram::ResponseVerdict` into
 `ApproveAndRunVerdict`, is a bastion-side block.
 
+## Extracting pending records from a `CONTENT_PIPELINE` run (`EN.ticket.wire-shipped-but-unreachable-seams` task 3)
+
+`ApproveAndRunSeams::drain` is the only thing that can ever populate the in-memory `OperatorQueue`
+(`lookup_pending`/`open_item` both read from it), but nothing fleet-wide called it outside this
+module's own tests and bastion's test fixtures — a real `CONTENT_PIPELINE` run's deferred
+harvest never reached a live `OperatorQueue`.
+
+`crate::workflows::approve_and_run::pending_harvest_records_from_content_pipeline_run(nodes:
+&HashMap<String, serde_json::Value>) -> Result<Vec<PendingHarvestRecord>, serde_json::Error>` closes
+the missing half of that gap. `content_pipeline::persist_to_brain`'s `Defer` arm (harvest mode
+`approval`) stamps a `PendingHarvestRecord`-shaped value under
+`ctx.nodes["PersistToBrainNode"]["pending"]` when a `CONTENT_PIPELINE` run finishes; this pure,
+unit-tested helper reads a finished run's `ctx.nodes` map, parses that value back into
+`PendingHarvestRecord`s (an empty `Vec` when the key is absent or `null` — nothing was deferred),
+and hands them back ready for a caller that already holds a live `ApproveAndRunSeams` to pass
+straight to `.drain(...)`.
+
+**The helper does no I/O and calls no seam itself** — it only locates and parses. `engine-core` has
+no dependency on `core/bastion`, so it cannot call `.drain()` on the live `ApproveAndRunSeams`
+instance from inside a `CONTENT_PIPELINE` run: that instance is constructed and held in
+`core/bastion/src/serve/mod.rs` (`ApproveAndRunSeams::new(...)`, ~line 1004). **A live
+`OperatorQueue` entry still requires a `core/bastion`-side call this repo does not make** — a
+companion bastion-side ticket must call this helper's output into `.drain(...)` after a served
+`CONTENT_PIPELINE` dispatch completes. Until that lands, `APPROVE_AND_RUN`'s queue has no
+naturally-occurring entry a real dispatch can produce.
+
 ## Registration (`engine-serve`)
 
 `register_approve_and_run` (`crates/engine-serve/src/workflows.rs`) populates both the
