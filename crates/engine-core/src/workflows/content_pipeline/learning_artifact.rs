@@ -82,16 +82,44 @@ fn read_source_ref(ctx: &TaskContext) -> Result<String, NodeError> {
         .ok_or_else(|| NodeError::new(format!("{NODE_NAME}: content missing `source_ref`")))
 }
 
+/// Derive the OKF `title` field from a digest's own leading Markdown
+/// heading: the first line of `digest_markdown`, if it starts (after
+/// trimming leading whitespace) with one or more `#` characters, has those
+/// `#` characters and any following whitespace stripped and is returned as
+/// the title. Falls back to `artifact_id` when `digest_markdown` is empty or
+/// its first line is not a heading, so the returned title is never empty —
+/// `okf_core::str_field` defaults a missing/empty key to `""`, and an empty
+/// `title` would still fail OKF validation while looking wired.
+fn derive_title(digest_markdown: &str, artifact_id: &str) -> String {
+    let first_line = digest_markdown.lines().next().unwrap_or("").trim_start();
+
+    if let Some(stripped) = first_line.strip_prefix('#') {
+        let heading = stripped.trim_start_matches('#').trim();
+        if !heading.is_empty() {
+            return heading.to_string();
+        }
+    }
+
+    artifact_id.to_string()
+}
+
 /// Build the `LearningArtifact` payload
 /// `{artifact_id, channel_type, source_ref, summary, digest_markdown,
-/// entities, language}` — the exact field set
-/// `okf_core::LearningArtifact::from_payload` consumes — from the run's
-/// `TaskContext`. Shared by `LearningArtifactPayloadNode` and
+/// entities, language, title, description}` — the seven-field shape
+/// `okf_core::LearningArtifact::from_payload` has always consumed, plus the
+/// `title`/`description` keys it now also reads (`OK.ticket.
+/// learning-artifact-missing-title-description-task1`, commit `fe8da8a`) —
+/// from the run's `TaskContext`. Shared by `LearningArtifactPayloadNode` and
 /// `PersistToBrainNode` so the two consumers can never drift.
 ///
 /// `language` is the event's `target_lang` when `translated_markdown` is
 /// present on the digest output, [`DEFAULT_LANGUAGE`] (`"en"`) otherwise (the
 /// digest was never translated, so it's still in its original language).
+///
+/// `title` is [`derive_title`]'s result over `output.digest_markdown` and
+/// `output.artifact_id`. `description` is `output.summary` verbatim — OKF
+/// frontmatter's `description` field and CONTENT_PIPELINE's `summary` are
+/// the same string carried under two keys, not two sources of truth.
 pub fn build_learning_artifact_payload(ctx: &TaskContext) -> Result<Value, NodeError> {
     let event = parse_event(ctx)?;
     let output = read_output(ctx)?;
@@ -109,6 +137,8 @@ pub fn build_learning_artifact_payload(ctx: &TaskContext) -> Result<Value, NodeE
         ))
     })?;
 
+    let title = derive_title(&output.digest_markdown, &output.artifact_id);
+
     Ok(json!({
         "artifact_id": output.artifact_id,
         "channel_type": channel_type,
@@ -117,6 +147,8 @@ pub fn build_learning_artifact_payload(ctx: &TaskContext) -> Result<Value, NodeE
         "digest_markdown": output.digest_markdown,
         "entities": output.entities,
         "language": language,
+        "title": title,
+        "description": output.summary,
     }))
 }
 
@@ -224,6 +256,8 @@ mod tests {
                 "digest_markdown",
                 "entities",
                 "language",
+                "title",
+                "description",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -239,6 +273,8 @@ mod tests {
         );
         assert_eq!(payload["entities"], json!(["Acme Corp"]));
         assert_eq!(payload["language"], json!("en"));
+        assert_eq!(payload["title"], json!("Digest"));
+        assert_eq!(payload["description"], json!("A concise summary."));
     }
 
     #[tokio::test]
@@ -310,5 +346,34 @@ mod tests {
         let node = LearningArtifactPayloadNode;
         let err = node.process(ctx).await.expect_err("should fail");
         assert!(err.message.contains("LearningArtifactPayloadNode"));
+    }
+
+    #[test]
+    fn derive_title_uses_the_leading_heading_when_present() {
+        assert_eq!(
+            derive_title("# Real Title\n\nSome body text.", "artifact-1"),
+            "Real Title"
+        );
+    }
+
+    #[test]
+    fn derive_title_strips_extra_leading_hashes_and_whitespace() {
+        assert_eq!(
+            derive_title("##   Spaced Title  \n\nbody", "artifact-1"),
+            "Spaced Title"
+        );
+    }
+
+    #[test]
+    fn derive_title_falls_back_to_artifact_id_when_no_leading_heading() {
+        assert_eq!(
+            derive_title("Just prose, no heading here.", "artifact-1"),
+            "artifact-1"
+        );
+    }
+
+    #[test]
+    fn derive_title_falls_back_to_artifact_id_when_digest_is_empty() {
+        assert_eq!(derive_title("", "artifact-1"), "artifact-1");
     }
 }
