@@ -391,6 +391,30 @@ pub fn set_journal_durable_handle(handle: DurableHandle) {
     }
 }
 
+/// Install the production journal `DurableHandle` at real server boot.
+///
+/// This is a thin, documented wrapper over [`set_journal_durable_handle`] —
+/// same effect, but named and doc'd for the one call site that matters: it
+/// **must be called exactly once**, at real server boot, with a
+/// pool-derived `DurableHandle` built by [`spawn_durable_writer`]
+/// (`crate::durable::spawn_durable_writer`). Calling it more than once
+/// simply overwrites the previously installed handle, matching
+/// `set_journal_durable_handle`'s own last-write-wins contract.
+///
+/// **The actual call site lives outside this repo**, in `core/bastion`'s
+/// server-boot path (wherever it constructs `AppState` and its Postgres
+/// pool) — the same boundary `AppState`'s own doc comment and this module's
+/// header comment already name for `campaigns`/`runs`. Nothing in
+/// `engine-serve` calls this function in production; it exists so that
+/// boundary has a documented, discoverable entrypoint to call instead of
+/// reaching for the lower-level `set_journal_durable_handle` (which stays
+/// available for internal/test use and is not being renamed or removed).
+///
+/// [`spawn_durable_writer`]: crate::durable::spawn_durable_writer
+pub fn install_durable_handle(handle: DurableHandle) {
+    set_journal_durable_handle(handle);
+}
+
 /// Clear the process-global journal `DurableHandle`, restoring the
 /// "no handle installed" self-skip default.
 pub fn clear_journal_durable_handle() {
@@ -490,6 +514,54 @@ mod tests {
         );
 
         super::clear_journal_durable_handle();
+        assert!(
+            super::journal_durable_handle().is_none(),
+            "cleared handle should read back None again"
+        );
+    }
+
+    /// Task 2 (EN.ticket.wire-shipped-but-unreachable-seams): the production
+    /// installer entrypoint, [`super::install_durable_handle`], behaves
+    /// identically to [`super::set_journal_durable_handle`] — installs a
+    /// test handle, confirms [`super::journal_durable_handle`] reads back
+    /// `Some`, confirms [`super::journal_sink_live`] forwards a row through
+    /// it, then clears it.
+    #[tokio::test]
+    async fn install_durable_handle_installs_a_working_journal_sink() {
+        let (handle, mut receiver) = crate::durable::test_handle();
+
+        super::install_durable_handle(handle);
+        assert!(
+            super::journal_durable_handle().is_some(),
+            "install_durable_handle should install a handle that reads back Some"
+        );
+
+        let sink = super::journal_sink_live();
+        let row = super::JournalRow {
+            id: Uuid::new_v4(),
+            campaign_id: "campaign-task2-installer".to_string(),
+            run_id: Uuid::new_v4(),
+            step: "debrief".to_string(),
+            kind: engine_contract::JournalDecisionKind::RecallConsulted,
+            reason: "task 2 installer entrypoint test".to_string(),
+            detail: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        sink(row.clone());
+
+        super::clear_journal_durable_handle();
+
+        let received = receiver
+            .try_recv()
+            .expect("sink should have sent the row onto the installed handle's channel");
+        match received {
+            crate::durable::DurableItem::Journal(received_row) => {
+                assert_eq!(received_row.id, row.id);
+                assert_eq!(received_row.campaign_id, row.campaign_id);
+            }
+            other => panic!("expected DurableItem::Journal, got {other:?}"),
+        }
+
         assert!(
             super::journal_durable_handle().is_none(),
             "cleared handle should read back None again"
