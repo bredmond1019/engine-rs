@@ -275,6 +275,15 @@ pub enum ConductorProposalError {
     /// it never falls back to an inferred goal. Wraps [`ConductorInputError`]
     /// so the underlying reason (missing vs. unreadable) is preserved.
     Objective(ConductorInputError),
+    /// `mev frontier --json` itself failed (spawn, non-zero exit, or
+    /// unparsable output) — see [`fetch_frontier_slate`]. Distinct from
+    /// [`Self::Objective`] because a missing objective and a broken slate
+    /// fetch are different operator-facing problems (fix the objective file
+    /// vs. fix `mev`), even though both are hard refusals here. Only
+    /// produced by [`propose_from_frontier`], which is the only caller in
+    /// this module that fetches the slate itself rather than taking it as
+    /// an argument.
+    Frontier(ConductorInputError),
     /// `repo:block_id` is not present in the slate this run's `mev frontier
     /// --json` returned. Covers both a real corpus block that just isn't in
     /// tonight's slate and an outright invented id — see the module note
@@ -301,6 +310,7 @@ impl std::fmt::Display for ConductorProposalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConductorProposalError::Objective(err) => write!(f, "{err}"),
+            ConductorProposalError::Frontier(err) => write!(f, "{err}"),
             ConductorProposalError::NotInSlate { repo, block_id } => write!(
                 f,
                 "conductor: proposed block '{repo}:{block_id}' is not in tonight's \
@@ -506,6 +516,52 @@ pub fn propose_chain<O: CommandOutputLike>(
         chain: crate::workflows::orchestration::chain::resolve_explicit_chain(survivors),
         dropped,
     })
+}
+
+/// End-to-end conductor entry point for the production `EN.12.F` seam
+/// ([`crate::workflows::orchestration::graph::ConductorSeamFn`]): fetches
+/// tonight's `mev frontier --json` slate via `runner`, proposes the WHOLE
+/// slate as the candidate list (every `(repo, block_id)` the slate
+/// contains, in slate order), and validates it through [`propose_chain`]
+/// exactly as an explicit, caller-supplied proposal would be.
+///
+/// The conductor itself never narrows the slate — narrowing (single-repo,
+/// a max chain length) is [`super::graph::apply_conductor_caps`]'s job,
+/// applied by the node AFTER this returns, per standing rule 6 (a knob
+/// trims the outcome; it does not change which candidates this function
+/// considers). Proposing the full slate here means [`propose_chain`]'s own
+/// subset check is trivially satisfied for every candidate — it still runs,
+/// so a future caller that narrows the candidate list before calling this
+/// keeps the same protection.
+///
+/// The one input [`propose_chain`] cannot supply on its own is the slate
+/// fetch: a spawn failure, non-zero exit, or unparsable `mev frontier
+/// --json` output is [`ConductorProposalError::Frontier`], distinct from
+/// [`ConductorProposalError::Objective`] so an operator sees which of the
+/// two hard-refusal causes actually applies.
+pub fn propose_from_frontier<O: CommandOutputLike>(
+    config: &ConductorConfig,
+    tasks_json_exists: &TasksJsonChecker,
+    runner: &Runner<O>,
+) -> Result<ProposalOutcome, ConductorProposalError> {
+    // Checked here too (ahead of the slate fetch, which shells out) so a
+    // missing objective refuses without ever invoking `runner` for `mev
+    // frontier --json` — [`propose_chain`] below re-checks this as its own
+    // first step regardless (it must, since it is also called directly with
+    // a caller-supplied `proposed` list that never went through this
+    // function), so this is a fast, side-effect-free short-circuit, not a
+    // change to what ultimately gets refused.
+    read_objective(config).map_err(ConductorProposalError::Objective)?;
+
+    let slate = fetch_frontier_slate(runner, config).map_err(ConductorProposalError::Frontier)?;
+
+    let proposed: Vec<(String, String)> = slate
+        .entries
+        .iter()
+        .map(|entry| (entry.repo.clone(), entry.id.clone()))
+        .collect();
+
+    propose_chain(config, &proposed, &slate, tasks_json_exists, runner)
 }
 
 #[cfg(test)]

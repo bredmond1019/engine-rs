@@ -275,6 +275,39 @@ pub fn repo_registry() -> Option<Arc<RepoRegistry>> {
         .and_then(|guard| guard.clone())
 }
 
+/// The `CommandRunner` shape the `CONDUCTOR` seam invokes `mev`/`git`
+/// through — `engine_core::policy::emit_state::Runner<CommandOutput>`,
+/// aliased here so [`conductor_command_runner_cell`]'s signature reads
+/// cleanly.
+type ConductorCommandRunner =
+    engine_core::policy::emit_state::Runner<engine_core::workflows::CommandOutput>;
+
+/// Process-global test override for the `CONDUCTOR` seam's `CommandRunner`
+/// (`EN.ticket.wire-shipped-but-unreachable-seams` task 1) — mirrors
+/// [`repo_registry_cell`]'s `OnceLock<RwLock<..>>` pattern. `None` (the
+/// default, and the only value any served request ever observes) means the
+/// production closure built in `register_orchestration_with_registry` falls
+/// back to the real subprocess runner
+/// (`engine_core::workflows::default_command_runner`); a test installs a
+/// stub here via [`set_conductor_command_runner_for_test`] so the CONDUCTOR
+/// branch can be driven through the full dispatcher without ever shelling
+/// out to a real `mev`/`git`.
+fn conductor_command_runner_cell() -> &'static RwLock<Option<ConductorCommandRunner>> {
+    static CELL: OnceLock<RwLock<Option<ConductorCommandRunner>>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(None))
+}
+
+/// Install a stub `CommandRunner` for the `CONDUCTOR` seam. Test-only —
+/// mirrors [`set_repo_registry`]'s leak caveat: `cargo nextest run` forks a
+/// process per test (CLAUDE.md standing rule 7), so a test that sets this
+/// need not restore `None` on the way out.
+#[cfg(test)]
+pub(crate) fn set_conductor_command_runner_for_test(runner: ConductorCommandRunner) {
+    if let Ok(mut guard) = conductor_command_runner_cell().write() {
+        *guard = Some(runner);
+    }
+}
+
 /// Resolve a repo registry from `ENGINE_BRAIN_ROOT` (via
 /// `RepoRegistry::from_env`) and install it as the process-global registry.
 /// On failure, logs the reason to stderr and leaves the registry unset —
@@ -1082,6 +1115,16 @@ pub fn register_orchestration_with_registry(
                     })?,
                 ),
             };
+            // `CONDUCTOR` (`EN.12.F` Task 4, wired here per
+            // `EN.ticket.wire-shipped-but-unreachable-seams` task 1): a
+            // clone of the SAME repo registry the gates above resolve,
+            // taken before `gates_repo_registry` is moved into
+            // `CorpusGates::new` — the conductor's `tasks.json` checker
+            // needs its own handle to resolve a proposed candidate's repo
+            // root.
+            let conductor_repo_registry = gates_repo_registry.clone();
+            let conductor_brain_root = orch_event.brain_root.clone();
+
             let gates = Arc::new(
                 engine_core::workflows::orchestration::corpus_gates::CorpusGates::new(
                     gates_repo_registry,
@@ -1118,8 +1161,60 @@ pub fn register_orchestration_with_registry(
             // /campaigns/{id}/abort` reach a live campaign.
             let (run_token, step_observer) = build_orchestration_seams(campaign_id);
 
+            // `CONDUCTOR` (`EN.12.F`, wired here per
+            // `EN.ticket.wire-shipped-but-unreachable-seams` task 1): a real
+            // `ConductorSeamFn` — `mev_cwd`/`git_cwd` both resolve to this
+            // event's `brain_root`, the SAME value the repo registry above
+            // was built from, and the objective path joins the same root
+            // with `conductor::DEFAULT_OBJECTIVE_PATH` per that constant's
+            // own doc comment ("resolved relative to `ConductorConfig::
+            // mev_cwd`"). The `tasks.json` checker resolves each candidate's
+            // repo root through `conductor_repo_registry` and looks for
+            // `<repo_root>/planning/<block_id>/tasks.json` — the same
+            // convention `SDLC_FLOW`'s own spec-dir resolution uses
+            // elsewhere in this file. The `CommandRunner` is the real
+            // subprocess runner (`crate::workflows::default_command_runner`,
+            // the SAME convention `EmitStateNode` uses for its own `Runner`
+            // seam) — never invoked when the event carries an explicit
+            // `blocks` or `roadmap`+`lane` chain, since `OrchestrationRunNode`
+            // only ever consults `conductor` on that one fallback branch.
+            let conductor_config =
+                engine_core::workflows::orchestration::conductor::ConductorConfig::new()
+                    .with_mev_cwd(&conductor_brain_root)
+                    .with_git_cwd(&conductor_brain_root)
+                    .with_objective_path(conductor_brain_root.join(
+                        engine_core::workflows::orchestration::conductor::DEFAULT_OBJECTIVE_PATH,
+                    ));
+            let conductor_tasks_json_exists: engine_core::workflows::orchestration::conductor::TasksJsonChecker =
+                Arc::new(move |repo: &str, block_id: &str| {
+                    conductor_repo_registry
+                        .resolve(repo)
+                        .map(|repo_root| {
+                            repo_root
+                                .join("planning")
+                                .join(block_id)
+                                .join("tasks.json")
+                                .is_file()
+                        })
+                        .unwrap_or(false)
+                });
+            let conductor_seam: engine_core::workflows::orchestration::graph::ConductorSeamFn =
+                Arc::new(move || {
+                    let runner = conductor_command_runner_cell()
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .unwrap_or_else(engine_core::workflows::default_command_runner);
+                    engine_core::workflows::orchestration::conductor::propose_from_frontier(
+                        &conductor_config,
+                        &conductor_tasks_json_exists,
+                        &runner,
+                    )
+                });
+
             let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
                 .with_campaign_id(campaign_id)
+                .with_conductor(conductor_seam)
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);
                     if let Some(err) = depends_on_gates.take_error() {
@@ -3407,5 +3502,82 @@ mod tests {
             Ok(_) => panic!("expected PolicyResolutionFailed, got Ok"),
             Err(other) => panic!("expected PolicyResolutionFailed, got {other}"),
         }
+    }
+
+    // --- CONDUCTOR wiring (EN.ticket.wire-shipped-but-unreachable-seams task 1) ---
+
+    /// An event carrying neither `blocks` nor `roadmap`+`lane` must reach
+    /// the CONDUCTOR seam wired in [`register_orchestration_with_registry`]
+    /// rather than falling straight through to the pre-CONDUCTOR hard
+    /// refusal ("ORCHESTRATION event needs either `blocks` or
+    /// `roadmap`+`lane`"). This fixture's brain root has no
+    /// `planning/objective.md`, so the CONDUCTOR seam refuses with
+    /// [`engine_core::workflows::orchestration::conductor::ConductorProposalError::Objective`]
+    /// (`ConductorInputError::ObjectiveMissing`) — a DIFFERENT, distinctly
+    /// worded error — before it would ever need to fetch the frontier
+    /// slate, so the injected stub `CommandRunner` panics if invoked at
+    /// all: a passing run here proves both that CONDUCTOR's logic (not the
+    /// old refusal) was reached, and that reaching it never shells out to a
+    /// real `mev`/`git`.
+    ///
+    /// Per D68: before `.with_conductor(conductor_seam)` was wired into
+    /// this function's node-builder chain, this exact test failed — the
+    /// node's error was "ORCHESTRATION event needs either `blocks` or
+    /// `roadmap`+`lane`" (the old refusal), not the CONDUCTOR-specific
+    /// "no weekly objective file" message asserted below.
+    #[tokio::test]
+    async fn register_orchestration_with_registry_reaches_conductor_with_no_blocks_or_roadmap() {
+        let dir = orchestration_brain_root(open_block_state_json());
+
+        set_conductor_command_runner_for_test(Arc::new(|program, args, _cwd| {
+            panic!(
+                "CONDUCTOR must refuse on the missing objective file before ever \
+                 shelling out to a real command, but got: {program} {args:?}"
+            );
+        }));
+
+        let mut dispatcher = Dispatcher::new();
+        register_orchestration_with_registry(
+            &mut dispatcher,
+            None,
+            Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+        );
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "ORCHESTRATION",
+                &serde_json::json!({
+                    "brain_root": dir.path(),
+                }),
+            )
+            .expect("ORCHESTRATION should dispatch to a runnable Workflow");
+
+        let ctx = workflow
+            .run(
+                serde_json::json!({ "brain_root": dir.path() }),
+                Box::new(|_ctx| {}),
+            )
+            .await
+            .expect("run itself should not error — the refusal is a stamped NodeRun");
+
+        let node_run = &ctx.node_runs[engine_core::workflows::orchestration::graph::NODE_NAME];
+        assert_eq!(
+            node_run.status,
+            engine_contract::NodeRunStatus::Failed,
+            "an event with no blocks/roadmap and no objective file must still fail — \
+             CONDUCTOR has nothing to propose from — but via CONDUCTOR's own refusal"
+        );
+        let message = node_run
+            .error
+            .as_deref()
+            .expect("a Failed NodeRun must carry an error message");
+        assert!(
+            message.contains("no weekly objective file"),
+            "expected CONDUCTOR's ObjectiveMissing refusal, got: {message}"
+        );
+        assert!(
+            !message.contains("needs either `blocks` or `roadmap`+`lane`"),
+            "must not fall through to the pre-CONDUCTOR hard refusal, got: {message}"
+        );
     }
 }
