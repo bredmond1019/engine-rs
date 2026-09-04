@@ -16,6 +16,59 @@ predictably-named reports alongside it.
 
 ---
 
+## Which command do I want?
+
+Start from your situation, not from the catalog. **Each row is where to begin** — the deeper docs
+are linked from there.
+
+| Your situation | Reach for | Then |
+|---|---|---|
+| "I know exactly what to change, it's one file" | [`/patch`](patch.md) | done — no review, no PR |
+| "One small tested change" | [`/ticket`](ticket.md) or [`/chore`](chore.md) to spec it | [`/sdlc-task <slug>`](../workflows/sdlc-task.js) runs it |
+| "A feature with several moving parts" | [`/ticket`](ticket.md) → [`/generate-tasks`](generate-tasks.md) | `/sdlc-flow <slug>` — ends in a PR |
+| "Several blocks, one repo, in order" | [`/plan <slug>`](plan.md) | [`/orchestrate <ids…>`](orchestrate.md) |
+| "Work spanning several repos" | [`/generate-roadmap`](generate-roadmap.md) | [`/begin-orchestration`](begin-orchestration.md), one session per repo |
+| **"I don't know how to cut this yet"** | [`/assess`](assess.md) → [`/seams`](seams.md) → [`/sequence`](sequence.md) | feed `sequence.md` to `/generate-roadmap` |
+| "Where is my multi-repo run right now?" | [`/roadmap-status --roadmap <slug>`](roadmap-status.md) | read-only, writes nothing |
+| "Lanes are running and something has piled up" | [`/orchestration-commander`](orchestration-commander.md) | drains the queue, reports what needs you |
+| **"The run just ended"** | [`/commander-retro`](commander-retro.md) → [`/consolidate-fleet`](consolidate-fleet.md) → [`/dispose-run`](dispose-run.md) | see below |
+| "A block needs a human decision" | [`/begin-session <slug>`](begin-session.md) | closes when the named artifact exists |
+
+### The escalating-ceremony ladder
+
+Pick the **cheapest rung that fits**. Every rung above adds a stage and a cost.
+
+```
+/patch          implement -> validate -> commit                     one file, low risk
+/sdlc-task      implement -> test -> fix -> commit                  one tested change
+/sdlc-flow      every task -> one review -> docs -> PR              a whole spec
+/orchestrate    a chain of blocks, one repo, one session            several blocks
+/begin-orchestration   a lane per repo, coordinated                 several repos
+```
+
+### After a run ends — the harvest
+
+Four commands, in order, each stopping where the next begins:
+
+1. **[`/commander-retro`](commander-retro.md)** — the commander reconstructs its own run from disk
+   (it is stateless and has no memory) and reports what it was **blind to**. Files nothing.
+2. **[`/consolidate-fleet`](consolidate-fleet.md)** — mines every lane's records across several
+   roadmaps for **mechanisms**, each with a counted breadth. Emits `disposal.json`. Writes no
+   `state.json`.
+3. **[`/dispose-run`](dispose-run.md)** — files those rows as blocks, `carryover[]` entries or
+   operator edges, and stops.
+4. **[`/generate-roadmap --from <analysis>`](generate-roadmap.md)** — only if the filed blocks need
+   lanes. Usually they do not.
+
+**Why four and not one:** a retro that also files is two jobs and the filing half never gets
+reviewed; consolidation proposes so a human can check before anything is written; disposal files
+rows so scheduling stays a separate decision. What a lane writes down in the first place is governed
+by [`finding-discipline.md`](../workflows/finding-discipline.md).
+
+**Full walkthrough with the diagram:** `docs/workflows/orchestration-runbook.md`.
+
+---
+
 - [Slash Commands](#slash-commands)
   - [Directory Layout](#directory-layout)
     - [Command Summary](#command-summary)
@@ -36,6 +89,7 @@ predictably-named reports alongside it.
     - [`/consolidate-run <roadmap-slug> [--repo <slug>]`](#consolidate-run-roadmap-slug---repo-slug)
     - [`/consolidate-fleet [<roadmap-slug>...] [--since-watermark]`](#consolidate-fleet-roadmap-slug---since-watermark)
     - [`/dispose-run <analysis-path>`](#dispose-run-analysis-path)
+    - [`/commander-retro <roadmap-slug>...`](#commander-retro-roadmap-slug)
     - [`/roadmap-status --roadmap <slug>`](#roadmap-status---roadmap-slug)
   - [Session Orientation](#session-orientation)
     - [`/wrap-up [note]`](#wrap-up-note)
@@ -116,7 +170,7 @@ All commands live directly in `.claude/commands/` — no subdirectories (except 
 | Planning | `/generate-roadmap`, `/generate-tasks`, `/plan`, `/ticket`, `/chore`, `/breakdown` (`/generate-master-plan` is superseded by `/plan --founding`, D65) |
 | SDLC | `/patch`, `/update-docs`, `/update-task`, `/review-PR`, `/close-out` |
 | Git | `/commit`, `/init-worktree`, `/clean-worktree`, `/start-block` |
-| Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/consolidate-fleet`, `/dispose-run`, `/roadmap-status` |
+| Orchestration | `/orchestrate`, `/begin-orchestration`, `/begin-session`, `/consolidate-run`, `/consolidate-fleet`, `/dispose-run`, `/commander-retro`, `/roadmap-status` |
 | E2E | `/test_auth_gate`, `/test_crud_api`, `/test_error_handling`, `/test_ui_form` |
 | Backlog | `/backlog-ticket`, `/initial-research` |
 | Distribution | `/sync-downstream-harness`, `/sync-all`, `/sync-global-commands`, `/sync-global-skills`, `/sync-brain-skills` |
@@ -367,10 +421,34 @@ recording the call. Flags: `--worktree` / `--no-worktree`, `--engine task|flow`,
 Wraps `/orchestrate` with the context a lane agent needs and the rules a **concurrent** run depends
 on: which chain, why, what may not be delegated, and who else is running. Resolves `BRAIN_ROOT`, the
 repo, the roadmap and the lane record (cross-checking the lane record's `roadmap` field against the
-one given), then applies the isolation policy — `base-template` is always `--worktree` (a chain there
-edits the engines running it), the brain root is always `--no-worktree` (corpus gates cannot pass in
-a worktree) — before handing off. `--roadmap` is **required and never inferred**. Also enforces the
+one given), then applies the isolation policy — `base-template` is **`--no-worktree`** (a worktree never
+protected a running chain: the Workflow harness executes a launch-time *copy* of the engine, so a
+chain editing `.claude/workflows/sdlc-*.js` does not change the engine already executing it in
+either mode), and the brain root is **`--no-worktree`, always** (corpus gates cannot pass in a
+worktree — measured 64 structure / 601 state errors versus 0/0 in the main tree) — before handing
+off. `--roadmap` is **required and never inferred**. Also enforces the
 heavy-gate concurrency cap, operator gates, and the same notes-file and decision-recording rules.
+**Step 1B — premise re-derivation.** A block record's facts go stale between authoring and
+execution, and a task built on a stale fact ships working code doing the wrong thing. So before task
+generation, for each block: pull every number and named artifact out of the record and **run one
+command per claim**, then amend the record in place with the new value and the date
+([D18, base-template](../../planning/decisions/D18-living-artifact-specs.md)).
+
+- Re-*reading* the record is not re-derivation — the record is the thing under test.
+- A premise that survives unchanged is a **result, not a no-op**.
+- Gated by `premise-rederivation`, whose fixture rejects the weaker "re-read the record" wording.
+- **Measured:** on the run that shipped it, **6 of 7 block records were wrong** — 15 premises, one of
+  which would have collided with working code. Detail: [`orchestration.md` § 1b](../../docs/workflows/orchestration.md#1b-premise-re-derivation).
+
+**Step 1C — roadmap resolution.** `planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`.
+A slug in **both** is an error **only when the legacy path is itself a roadmap** — it holds
+`lane-log.jsonl` or `roadmap.md`. Otherwise it is pre-plan residue and resolution proceeds silently.
+
+- **Why narrowed:** the pre-plan stages write `planning/<slug>/` on every multi-repo path, so the
+  unnarrowed rule fired on normal operation and hard-exited the fleet's watermark table.
+- **Measured:** 0 of 31 roadmaps and 0 directories under `planning/` held either marker — the rule's
+  true-positive population was empty. Gated by `roadmap-dir-resolution`, asserting both directions.
+
 At lane close it routes every still-`OPEN` lingering item to one of **three** homes rather than
 sweeping them all into `carryover[]`: operator-only work becomes an `operator` edge on the block it
 gates, permanently-true facts go to `reference[]`, and the rest becomes a `carryover[]` entry. This
@@ -421,6 +499,15 @@ on a block (the schema drops them silently — provenance goes in `origin.type: 
 an operator edge that gates nothing, and requires a `carryover[]` predicate proven unmet before
 commit. Checks `toolchain-freshness` immediately before writing, because `create-block --write`
 chains `emit-state --write` unconditionally. **HQ-only.**
+
+### `/commander-retro <roadmap-slug>... [--since <date>]`
+Run once after a multi-lane run ends. **Not a drain** — the commander is stateless per drain and has
+no memory of its own run, so this reconstructs it from the drain log, queue receipts, heartbeats and
+lease records, tagging every claim `OBSERVED` / `INFERRED` / **`UNKNOWN`**. The `UNKNOWN`s are the
+deliverable: each is a hole in what a drain can see. Also carries an **instrument-failures** section
+(every command that returned a plausible, confidently wrong answer) and a "where this session was
+wrong" section, which is what makes the rest credible. Files nothing and edits no lane record — if
+it surfaces work, `/consolidate-fleet` routes it. **HQ-only.**
 
 ### `/roadmap-status --roadmap <slug>`
 Read-only, mid-run view of one roadmap's live lanes across every repo — joins the roadmap's
@@ -591,6 +678,21 @@ whichever agent hits it first.
 break in the chain: a fresh session reading only `sequence.md` *is* the handoff test, performed
 rather than imagined. **Model:** Opus, Opus red team.
 
+**Which successor runs next is a count, not a judgement** — the distinct repos in the block table's
+**Repo** column. `/sequence` states it in its closing report, so the caller does not re-derive it.
+
+| Repos | Successor | Writes to | Pre-plan folder |
+|---|---|---|---|
+| **one** | [`/plan`](plan.md) | `planning/<slug>/` | stays put, beside `sequence.md` |
+| **several** | [`/generate-roadmap`](generate-roadmap.md) | `planning/roadmaps/<slug>/` | **moved** to `planning/roadmaps/<slug>/pre-plan/` (Step 7b) |
+
+**The invariant:** `planning/<slug>/` and `planning/roadmaps/<slug>/` are **never both populated**.
+The pre-plan stages all write `planning/<slug>/` before the successor is known, so without Step 7b
+the multi-repo path leaves the slug in two places every time — which used to hard-exit
+[`scripts/lane_log_watermark.py`](../../scripts/lane_log_watermark.py) and wedge every consolidation
+in the fleet. See [`/generate-roadmap`](generate-roadmap.md) Step 7b and
+[`/begin-orchestration`](begin-orchestration.md) Step 1C.
+
 ### `/define-design-system` — greenfield UI
 For a UI that **does not exist yet**: a new client project, a new side project, a new app. Emits the
 artifacts the first screen is built from — design tokens as real files, a Tailwind or `ThemeData`
@@ -666,6 +768,17 @@ Any departure from the authored cut must be stated with a reason, and the operat
 may not be silently re-decided. What this command still owns: lane assignment, the heavy budget,
 isolation, Wave 0 mechanics and both crosswalks — `/sequence` decides *what* and *in what order*,
 this decides *who runs it concurrently without colliding*.
+
+**Step 7b — relocate the pre-plan.** When `--from` named a `sequence.md`, move `planning/<slug>/`'s
+contents to `planning/roadmaps/<slug>/pre-plan/`, so the slug lives in one place. Four rules:
+
+- **After** the roadmap files are written and verified — a failed run must leave the pre-plan where
+  [`/sequence`](sequence.md) left it.
+- **Move, never copy or delete.** `evidence/` is the audit trail the roadmap cites.
+- **Through the real vault path** (`core/_planning/<repo>/<slug>/`), never the `planning/` symlink
+  face — `git mv` there fails with "source directory is empty" and silently does nothing.
+- **Then update the roadmap's `index.md` and re-run `--links` and `--structure`.** A move relocates
+  every relative link and index row at once, so those two flags are what catch a half-done move.
 
 **Session:** fresh (reading only `sequence.md`), and it ends without running anything. Each lane is
 then **one fresh Opus session per repo, held open for that lane's whole chain** — the lane agent is

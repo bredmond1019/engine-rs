@@ -106,6 +106,36 @@ downstream block waiting on its code, so there is nothing to defer (D65).
    shown capable of failing — a retro-fixture against the known-bad input, or the reproduction
    recorded in 3a. `tasksPassed` is agreement between gates, never proof of correctness.
 
+   **But a red task must be able to PASS ITS GATE, and by default it cannot — check this before
+   you order the tasks.** Every per-task gate demands green, so "write the test, watch it fail" as
+   its own task is unrunnable unless one of the three forms below is used. This is not theoretical:
+   `SY.ticket.pydantic-ctx-error-masks-422` bailed on it (`bail_class 5`, 2026-09-04), and the two
+   sibling tickets authored in the same session carried the identical defect. Pick a form, in this
+   order:
+
+   1. **Runtime inversion — the default, and it needs nothing from the harness.** Keep the test
+      green at every commit by inverting *inside* the test: break the precondition, assert the
+      failure, restore it, assert the pass. It proves strictly more than a committed red baseline
+      (it shows the gate reacting to the input, not merely failing once) and it leaves no red
+      commit for a concurrent lane to trip over. `/generate-tasks` argues this at length under
+      "Prefer a RUNTIME inversion over a committed red baseline" — read it there rather than
+      re-deriving it.
+   2. **`expect_red` on the task's own command.** Set `expect_red` (step 8) naming a command that
+      is already in that same task's `validation_commands`; the fast-test stage inverts its
+      verdict. **Boundary — this is what catches people out:** a task's `validation_commands`
+      *augment* the project's `gates:true` harness checks, they never replace them (D63), and
+      `expect_red` can never touch a harness gating check (D68). So if the repo's harness runs a
+      suite-wide gating check that will *also* observe your new test red — `pytest`, `cargo test`,
+      `jest` — `expect_red` alone is not enough and the task still bails.
+   3. **`perTask: false` on that harness check**, when form 2 is blocked by one. It drops the check
+      from the per-task tripwire; D56's terminal reconcile still runs its real command once per
+      full spec run, so coverage moves rather than disappears. Two costs to state in the ticket:
+      the reconcile does not run on a task-subset run or under `--test-depth full`, and suite-wide
+      breakage stops being attributable to the task that caused it.
+
+   **If none of the three applies, merge the test and the fix into ONE task.** An unrunnable task
+   ordering is worse than a slightly larger task.
+
    **Corollary for any verification step that shells out to an installed binary** (`mev`,
    `bastion`, or similar): state explicitly whether it checks **source** or **installed**
    behaviour. The two diverge, and the divergence is invisible unless named.
@@ -136,7 +166,13 @@ downstream block waiting on its code, so there is nothing to defer (D65).
    ]
    ```
    Populate `acceptance_criteria` and `validation_commands` per task — the empty arrays above are
-   the *shape*, not the target. Fleet-wide, 36% of tasks shipped with empty
+   the *shape*, not the target.
+
+   **`expect_red`** — optional, omit it for the ordinary case. Add it only to a task whose declared
+   deliverable IS a test observed failing (5a form 2): `"expect_red": ["<command>"]`, where every
+   entry also appears verbatim in that same task's `validation_commands`. The engine hard-refuses a
+   spec whose `expect_red` is not a subset of that task's own commands — it is never silently
+   ignored. It cannot name a `gates:true` harness check; re-read 5a's boundary before using it. Fleet-wide, 36% of tasks shipped with empty
    `acceptance_criteria` and 53% with empty `validation_commands` because the template's empty
    array was read as a default.
 
@@ -169,6 +205,13 @@ downstream block waiting on its code, so there is nothing to defer (D65).
       first task does about that.
     - **The gate is shown capable of failing** — a task orders the test before the fix, or names
       the fixture standing in for that.
+    - **Every red task can pass its own gate (5a) — can fail.** For each task whose deliverable is
+      a test observed failing, name which of 5a's three forms it uses. Then read this repo's
+      `planning/harness.json` and check no `gates: true` check with `perTask` unset or true will
+      observe that test red — a suite-wide runner (`pytest`, `cargo test`, `jest`) will, and
+      `expect_red` cannot reach it. If one will, this check **fails**: switch to a runtime
+      inversion, set `perTask: false` on that check, or merge the task into the fix, then re-run
+      the self-check. Reading the harness is the check; asserting "task 1 is fine" is not.
     - **Nothing this ticket depends on is unclassified** as built / half-built / absent.
 
 10. Report the paths and next step.

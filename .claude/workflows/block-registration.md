@@ -497,6 +497,72 @@ multi-repo initiative is a claim** — state it as one, so a reader can tell it 
 
 ---
 
+### C7 — Every registered block meets the self-sufficiency bar
+
+**This check exists because two commands that both author blocks drifted apart on what a block
+record has to contain, and the gap cost a real run about a third of its time.**
+
+`/plan` states the bar and the reason: *"`/generate-tasks` reads only the target block's record —
+not this narrative, not sibling blocks. Every block record must therefore be self-sufficient:
+concrete files (new vs modified, by path), observable acceptance criteria, an explicit out of
+scope, and any shared interfaces."*
+
+`/generate-roadmap` gates on something weaker — that the ID **resolves in `state.json`** — because
+its failure mode is a lane naming an ID the graph does not have. That is a real gate and it stays.
+But it is a gate on **existence, not on content**, and C1-C6 above are all structural: they ask
+about repos, edges, sizing, `exit` artifacts and prose residue. **None of them looks inside a
+record.** A block can pass every one of them and still be unbuildable.
+
+So: **registration is not closed until every registered block meets `/plan`'s bar**, whichever
+command authored it. Four things, all cheap here and expensive later — after this pass closes,
+concurrent lanes are running on these records.
+
+**1. `files[]` is verified against the tree, not asserted.** Open each path. A file listed as `new`
+that already exists is a rewrite the author did not intend; a file listed as `modified` that is
+absent is a task that cannot start. *Measured: a record listed `docs/sandbox/index.md` under
+`files.new` when it existed and carried nine live `related:` edges — an engine following it would
+have overwritten them.*
+
+**2. Acceptance criteria are read AS A SET, looking for the pair that cannot both hold.** Each one
+alone always looks reasonable; contradictions only appear in combination. *Measured: one record
+demanded zero pruned decision-citations while its own `out_of_scope` accepted pruning a ~45-slug
+tail, which is decision-citations. No implementation satisfies both, and the engine burned a full
+cycle proving the code was right and the spec was wrong.*
+
+**3. Every count is expressed as DERIVED, never as a literal.** "Exactly 8 items", "all 30 links",
+"the 11 slugs" rot on the same clock as the thing they count, and a criterion re-pinned to today's
+number rots again on the next. Write `N == the manifest's repo count`. *Measured three times in one
+run: a seed set a prose table put at 11 measured **2** on the live tree; a spike's "30 links, 7 file
+URIs" was stale; a `public repos walked (8 items)` assertion broke the moment a repo was added.*
+
+**4. Every named live artifact is re-derived at registration time.** A record naming a symbol, a
+line number, a command or a file states something checkable — check it. Name the **symbol**, not the
+line: line numbers move between authoring and execution. *Measured: a record pinned an exemption to
+`state.rs:566`; by execution that line was unrelated code and the list had moved to `:613`.*
+
+**And a criterion must be executable without destroying something.** *Measured: a record's
+acceptance criterion required running a teardown against "a V1 instance" — and the only registered
+instance was the toolkit's own source directory, so satisfying it literally would have dropped two
+databases, a Postgres role, a Redis index, a real GitHub repo, and the tree every later block read
+from.* Ask of each criterion: what does the cheapest way to satisfy this actually do?
+
+```bash
+# Every registered block, with the fields this check reads. Anything printing an
+# empty acceptance_criteria or files list has already failed.
+python3 - <<'PYEOF'
+import json, glob
+for p in sorted(glob.glob("planning/blocks/*.json")):
+    b = json.load(open(p))
+    f = b.get("files", {}) or {}
+    n, m = len(f.get("new", [])), len(f.get("modified", []))
+    print(f'{b["id"]:34} ac={len(b.get("acceptance_criteria",[])):>2}  '
+          f'files new/mod={n}/{m}  oos={len(b.get("out_of_scope",[])):>2}')
+PYEOF
+```
+
+For every row, open the files and read the criteria as a set. Record the findings here — **including
+"none"**, so a later reader can tell the check ran from the check being skipped.
+
 ## Traps
 
 - **`planning/state.json` round-trips with `ensure_ascii=False`** plus a trailing newline. The
