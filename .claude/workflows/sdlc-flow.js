@@ -3144,7 +3144,7 @@ ${renderStateFlipScript({ runRoot: worktreePath, indent: '        ' })}
     rollups, /attention boards, wave tables) need resyncing every time, not only on a full close.
     ${useWorktree
       ? `- Do NOT run \`mev emit-state --write\` here: this is a linked git worktree, where emit-state refuses to run. The authored edits are committed on the branch below (step 5); the derived surfaces regenerate on the base branch when this branch merges (/clean-worktree or /close-out --merge-branch run emit-state after integration). Set emitStateRan=false.`
-      : `- This run is IN PLACE on branch ${branchName} (in the main repo tree, not an isolated worktree) — emit-state is safe to run right here on the branch, the same way \`git commit\` already lands right here: cd ${worktreePath} && mev emit-state --write . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation. (This is separate from the --auto-merge path's own emit-state call in step 5 below, which re-derives again on ${prBase} after the PR merges — that call is unaffected and still runs unconditionally there.)`}
+      : `- This run is IN PLACE on branch ${branchName} (in the main repo tree, not an isolated worktree) — emit-state is safe to run right here on the branch, the same way \`git commit\` already lands right here: cd ${worktreePath} && mev emit-state --write${renderAgentFlag()} . If \`mev\` or brain.toml is absent (standalone repo), skip it silently and set emitStateRan=false; else emitStateRan=true. Do NOT hand-reimplement focus/rollup derivation. (This is separate from the --auto-merge path's own emit-state call in step 5 below, which re-derives again on ${prBase} after the PR merges — that call is unaffected and still runs unconditionally there.)`}
 
 2d. OPTIONAL post-emit commit hook. ${postEmitCommitCommand
       ? `planning/harness.json declares postEmitCommitCommand — run it ONLY when step 2c set emitStateRan=true
@@ -3429,7 +3429,7 @@ ${useWorktree ? `
    ${GIT} branch --list ${branchName}
 `}
 5. Regenerate derived surfaces on ${prBase} (you are now on ${prBase} in the main tree — emit-state is safe here):
-   mev emit-state --write
+   mev emit-state --write${renderAgentFlag()}
    This re-derives the one-way surfaces (focus, rollups, cache synced_from watermarks, tier tables,
    the HQ Operating Board, master-plan wave tables) from the authored state.json block-status flip the
    merge just landed. If \`mev\` or brain.toml is absent (a standalone repo), skip it silently and set
@@ -3489,3 +3489,80 @@ return {
   worklogFile,
   tokens: tokensBlock,
 }
+
+// <<shared:renderAgentFlag>>
+// Renders the `--agent <id>` argument for a `mev emit-state --write` invocation so a lane that
+// holds its own exclusive lease is exempt from mev's `refuse_if_quiesced` (BT.ticket.engines-
+// must-pass-agent-to-mev). Returns '' (empty string) when no identity resolves — an
+// unconditional flag would change every non-lane, standalone-repo run of these engines across
+// 18+ downstream repos with no brain.toml at all. Every failure path (missing brain.toml, no
+// lock dir, no lease file, unreadable/malformed lease JSON) falls through to '' rather than
+// throwing — this function must never be the reason an emit-state call does not run.
+//
+// Resolution order:
+//   1. FLEET_LANE_AGENT env var, if set and non-empty.
+//   2. Else the `agent` field of <lock_dir>/leases/lease-<repo>.json, where <repo> is the
+//      brain.toml [[repos]] slug whose repo_path resolves to (or is an ancestor of) cwd, and
+//      <lock_dir> uses the SAME precedence scripts/check_lane_agents.py's find_lock_dir()
+//      already uses: FLEET_LOCK_DIR env var, else a brain.toml found by walking up from cwd,
+//      joined with .fleet-locks. No new precedence is introduced.
+//   3. Else no identity resolves and '' is returned.
+function renderAgentFlag() {
+  try {
+    const envAgent = process.env.FLEET_LANE_AGENT
+    if (envAgent && envAgent.trim()) return ` --agent ${envAgent.trim()}`
+
+    const fs = require('fs')
+    const path = require('path')
+
+    function findBrainRoot(start) {
+      let dir = start
+      while (true) {
+        if (fs.existsSync(path.join(dir, 'brain.toml'))) return dir
+        const parent = path.dirname(dir)
+        if (parent === dir) return null
+        dir = parent
+      }
+    }
+
+    let lockDir = null
+    let brainRoot = null
+    if (process.env.FLEET_LOCK_DIR && process.env.FLEET_LOCK_DIR.trim()) {
+      lockDir = process.env.FLEET_LOCK_DIR.trim()
+      brainRoot = findBrainRoot(process.cwd())
+    } else {
+      brainRoot = findBrainRoot(process.cwd())
+      if (brainRoot) lockDir = path.join(brainRoot, '.fleet-locks')
+    }
+    if (!lockDir || !brainRoot) return ''
+
+    // Minimal [[repos]] table reader: brain.toml's array-of-tables entries are flat
+    // `key = "value"` lines, never nested or multi-line — a regex split is sufficient and
+    // avoids pulling in a TOML dependency this inlined, dependency-free block cannot have.
+    const tomlText = fs.readFileSync(path.join(brainRoot, 'brain.toml'), 'utf8')
+    const repoBlocks = tomlText.split(/^\[\[repos\]\]\s*$/m).slice(1)
+    const here = path.resolve(process.cwd())
+    let bestSlug = null
+    let bestDepth = -1
+    for (const block of repoBlocks) {
+      const slugMatch = block.match(/^\s*slug\s*=\s*"([^"]*)"/m)
+      const pathMatch = block.match(/^\s*repo_path\s*=\s*"([^"]*)"/m)
+      if (!slugMatch || !pathMatch) continue
+      const repoAbs = path.resolve(brainRoot, pathMatch[1])
+      if (here !== repoAbs && !here.startsWith(repoAbs + path.sep)) continue
+      const depth = repoAbs.split(path.sep).length
+      if (depth > bestDepth) { bestDepth = depth; bestSlug = slugMatch[1] }
+    }
+    if (!bestSlug) return ''
+
+    const leasePath = path.join(lockDir, 'leases', `lease-${bestSlug}.json`)
+    if (!fs.existsSync(leasePath)) return ''
+    const lease = JSON.parse(fs.readFileSync(leasePath, 'utf8'))
+    const agent = lease && lease.agent
+    if (agent && String(agent).trim()) return ` --agent ${String(agent).trim()}`
+    return ''
+  } catch (e) {
+    return ''
+  }
+}
+// <</shared:renderAgentFlag>>

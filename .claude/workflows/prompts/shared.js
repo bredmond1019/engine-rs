@@ -659,3 +659,80 @@ Return via StructuredOutput:${extraReturnFields}
 }
 // <</shared:renderImplementPrompt>>
 
+// <<shared:renderAgentFlag>>
+// Renders the `--agent <id>` argument for a `mev emit-state --write` invocation so a lane that
+// holds its own exclusive lease is exempt from mev's `refuse_if_quiesced` (BT.ticket.engines-
+// must-pass-agent-to-mev). Returns '' (empty string) when no identity resolves — an
+// unconditional flag would change every non-lane, standalone-repo run of these engines across
+// 18+ downstream repos with no brain.toml at all. Every failure path (missing brain.toml, no
+// lock dir, no lease file, unreadable/malformed lease JSON) falls through to '' rather than
+// throwing — this function must never be the reason an emit-state call does not run.
+//
+// Resolution order:
+//   1. FLEET_LANE_AGENT env var, if set and non-empty.
+//   2. Else the `agent` field of <lock_dir>/leases/lease-<repo>.json, where <repo> is the
+//      brain.toml [[repos]] slug whose repo_path resolves to (or is an ancestor of) cwd, and
+//      <lock_dir> uses the SAME precedence scripts/check_lane_agents.py's find_lock_dir()
+//      already uses: FLEET_LOCK_DIR env var, else a brain.toml found by walking up from cwd,
+//      joined with .fleet-locks. No new precedence is introduced.
+//   3. Else no identity resolves and '' is returned.
+function renderAgentFlag() {
+  try {
+    const envAgent = process.env.FLEET_LANE_AGENT
+    if (envAgent && envAgent.trim()) return ` --agent ${envAgent.trim()}`
+
+    const fs = require('fs')
+    const path = require('path')
+
+    function findBrainRoot(start) {
+      let dir = start
+      while (true) {
+        if (fs.existsSync(path.join(dir, 'brain.toml'))) return dir
+        const parent = path.dirname(dir)
+        if (parent === dir) return null
+        dir = parent
+      }
+    }
+
+    let lockDir = null
+    let brainRoot = null
+    if (process.env.FLEET_LOCK_DIR && process.env.FLEET_LOCK_DIR.trim()) {
+      lockDir = process.env.FLEET_LOCK_DIR.trim()
+      brainRoot = findBrainRoot(process.cwd())
+    } else {
+      brainRoot = findBrainRoot(process.cwd())
+      if (brainRoot) lockDir = path.join(brainRoot, '.fleet-locks')
+    }
+    if (!lockDir || !brainRoot) return ''
+
+    // Minimal [[repos]] table reader: brain.toml's array-of-tables entries are flat
+    // `key = "value"` lines, never nested or multi-line — a regex split is sufficient and
+    // avoids pulling in a TOML dependency this inlined, dependency-free block cannot have.
+    const tomlText = fs.readFileSync(path.join(brainRoot, 'brain.toml'), 'utf8')
+    const repoBlocks = tomlText.split(/^\[\[repos\]\]\s*$/m).slice(1)
+    const here = path.resolve(process.cwd())
+    let bestSlug = null
+    let bestDepth = -1
+    for (const block of repoBlocks) {
+      const slugMatch = block.match(/^\s*slug\s*=\s*"([^"]*)"/m)
+      const pathMatch = block.match(/^\s*repo_path\s*=\s*"([^"]*)"/m)
+      if (!slugMatch || !pathMatch) continue
+      const repoAbs = path.resolve(brainRoot, pathMatch[1])
+      if (here !== repoAbs && !here.startsWith(repoAbs + path.sep)) continue
+      const depth = repoAbs.split(path.sep).length
+      if (depth > bestDepth) { bestDepth = depth; bestSlug = slugMatch[1] }
+    }
+    if (!bestSlug) return ''
+
+    const leasePath = path.join(lockDir, 'leases', `lease-${bestSlug}.json`)
+    if (!fs.existsSync(leasePath)) return ''
+    const lease = JSON.parse(fs.readFileSync(leasePath, 'utf8'))
+    const agent = lease && lease.agent
+    if (agent && String(agent).trim()) return ` --agent ${String(agent).trim()}`
+    return ''
+  } catch (e) {
+    return ''
+  }
+}
+// <</shared:renderAgentFlag>>
+

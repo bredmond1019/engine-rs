@@ -623,7 +623,11 @@ return to step 6.
 - `rg`/`find` are symlink-blind and every `planning/` is a symlink into a `_planning/` vault — pass
   `-L`. At the brain root every sub-repo is also **gitignored**, so `-L` alone still skips them all
   — pass `-uu` too. A sweep reporting "clean" without both is not trustworthy. See
-  `begin-orchestration.md`'s Traps section for the same rule stated for that command.
+  `begin-orchestration.md`'s Traps section for the same rule stated for that command. **`-uu` also
+  disables `.gitignore`'s protection against `target/`/`node_modules/`, so pair it with
+  `--glob '!**/target/**' --glob '!**/node_modules/**' --glob '!**/.git/**'`** — this fleet's ~43GB
+  of Rust `target/` dirs otherwise get walked, pegging 350–500% CPU for minutes or hitting a Bash
+  timeout that reads as a hang, not a slow search.
 
 ## Required deliverable — the terminal `review.md`
 

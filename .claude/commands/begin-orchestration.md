@@ -547,7 +547,12 @@ work that has to be redone.
 - Every `planning/` is a symlink into a `_planning/` vault. Any `rg`/`find` sweep that must be
   exhaustive needs `-L`; one reporting "clean" without it is not trustworthy. **At the brain root,
   also pass `-uu`** — every sub-repo is gitignored there, so `rg` skips them all even with `-L`
-  alone, and a sweep missing `-uu` reports a false clean over the whole fleet.
+  alone, and a sweep missing `-uu` reports a false clean over the whole fleet. **`-uu` also disables
+  `.gitignore`'s protection against `target/`/`node_modules/`, so pair it with
+  `--glob '!**/target/**' --glob '!**/node_modules/**' --glob '!**/.git/**'`** — this fleet's repos
+  carry ~43GB of Rust `target/` dirs, and an unscoped `-uu` sweep walking them pegs 350–500% CPU for
+  minutes or hits a Bash timeout, reading as a hang rather than a slow search (measured 2026-09-03,
+  `check-blast-radius`).
 - `planning/state.json` is written with `ensure_ascii=False`. Script edits must round-trip with
   `json.dump(..., indent=2, ensure_ascii=False)` plus a trailing newline — the default escapes every
   em dash and turns a 3-field edit into ~130 lines of churn, and a conflict for every sibling lane.

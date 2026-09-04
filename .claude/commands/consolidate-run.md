@@ -97,7 +97,10 @@ Sweep `**/orchestration-run/<roadmap-slug>/*.md` from `BRAIN_ROOT` (or from the 
 - **`-L`** (follow symlinks) — every repo's `planning/` is a symlink into the vault, including
   inside worktrees. Without `-L` the sweep silently returns nothing for every repo.
 - **`-uu`** (search hidden/gitignored paths) — at the brain root, every sub-repo is gitignored from
-  the brain's own perspective. `-L` alone silently misses whole repos.
+  the brain's own perspective. `-L` alone silently misses whole repos. **Always pair `-uu` with
+  `--glob '!**/target/**' --glob '!**/node_modules/**' --glob '!**/.git/**'`** — `-uu` disables
+  `.gitignore`'s protection, and walking this fleet's ~43GB of Rust `target/` dirs pegs 350–500%
+  CPU for minutes or hits a Bash timeout that reads as a hang, not a slow search.
 
 **Dedup by `realpath`, before reading.** The same physical file is reachable through more than one
 symlink chain: a repo's own `planning/` symlink, and — inside a worktree — a *second* symlink chain

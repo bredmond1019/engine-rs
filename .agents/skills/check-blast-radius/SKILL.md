@@ -175,6 +175,31 @@ Before you delete on that basis, all three must be true:
   `-e`, because `rg -E` is `--encoding` and dies with an error that a `2>/dev/null` will swallow,
 - your positive control found something.
 
+**If that `rg` also needs `-uu` (`--no-ignore --hidden`) — e.g. because the target itself is
+gitignored — add explicit `--glob` excludes for build/vendor dirs, always.** `-u` alone already
+stops `rg` from honoring `.gitignore`, and this fleet's own repos carry **~43GB of Rust `target/`
+dirs** (`engine-rs` 16G, `bastion` 13G, `mev` 7.4G, others) plus `node_modules` — normally invisible
+to `rg` via `.gitignore`, but nothing filters them out once `-uu` is set. Measured 2026-09-03: an
+`rg -L -uu --no-messages` corpus sweep with no excludes pegged 350–500% CPU for 3+ minutes walking
+those directories, read from outside as a runaway/hung process. **From inside the session running
+it, this looks different and easier to misdiagnose: the command hits the Bash tool's timeout and
+returns exit 143, or never returns.** That reads as "no matches" or a hung tool, not as a slow
+search — one session nearly logged it as a clean negative on a dangling-reference check (standing
+rule 11's exact failure mode, arriving through a performance path instead of a flag-parsing one).
+If a `-uu` sweep times out or returns suspiciously fast-empty, suspect this before trusting the
+result — fall back to a targeted `grep -rl` over the specific directories in question plus a
+positive control on a value known to exist. The safe form:
+
+```bash
+rg -L -uu --no-messages \
+  --glob '!**/target/**' --glob '!**/node_modules/**' --glob '!**/.git/**' \
+  --glob '!**/.next/**' --glob '!**/dist/**' \
+  -l '<pattern>' .
+```
+
+Plain `-L` without `-uu` does not need this — `.gitignore` already keeps `rg` out of `target/`/
+`node_modules/` in that case.
+
 ## See also
 
 - `run-the-gates` — one flag per `validate-brain` invocation; a pipe's exit code is the pipe's.

@@ -111,7 +111,10 @@ never started: the gate is gone and the work is not.
 - **`timeout` does not exist on this macOS shell.**
 - **A piped command's `$?` is the pipe's**, not the command's. Redirect, then check.
 - **`rg`/`find` are symlink-blind** and every `planning/` is a symlink — pass `-L`, and `-uu` to
-  reach gitignored sub-repos.
+  reach gitignored sub-repos. **With `-uu`, also add
+  `--glob '!**/target/**' --glob '!**/node_modules/**' --glob '!**/.git/**'`** — `-uu` disables
+  `.gitignore`, and this fleet's ~43GB of Rust `target/` dirs will otherwise get walked, pegging
+  350–500% CPU or hitting a Bash timeout that reads as a hang, not a slow search.
 - **`state.json` round-trips** with `json.dump(..., indent=2, ensure_ascii=False)` plus a trailing
   newline. The default escapes every em dash and turns a three-field edit into ~130 lines of churn.
 - **Do not let a session grow.** If it turns out to need work an agent could have done alone, file
