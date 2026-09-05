@@ -1,5 +1,5 @@
 {
-  "version": "3f74e082c87ee42df4ba6367a3fc5eb80aaaa99c",
+  "version": "592c76b1bb1a4ed30b93d1db19eefb830dfa3336",
   "generated": "2026-09-05",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -42,7 +42,7 @@
     ".claude/commands/roadmap-status.md": "cafbf6908cc52cb2e996896efea69afbedf7281f702b14b25b0833565b1671d5",
     ".claude/commands/prime.md": "6635e8c48638d5720ea270666460e536eb87d49b4785518080e8040628785f73",
     ".claude/commands/plan.md": "f18da24739e24919e3e0f03fa7e8ae559bd395f665f7b735f0a3fbe4e428c832",
-    ".claude/commands/close-out.md": "191624ec092c6bf6e1189b7b3bd3cbe15987b9c2ca8f16cfa1370f73b4023b03",
+    ".claude/commands/close-out.md": "088a0fd449bb7d9f541990021d35cb2f6b8b9deba68598c4cfbdfa07d49a221c",
     ".claude/commands/commit.md": "fb9c00d28a9db7f05e731d31aad40fb43e8327c9d6fe9a30a374fd41afa8f9bb",
     ".claude/commands/orchestrate.md": "5a10f743708d8916cb137b63f05e99002e19e8b6edb3eb6cbeea4210e016adeb",
     ".claude/commands/test_auth_gate.md": "4c38bfdfd6172f001ead3912bfab139ccde1e7d4eee65053e890c93eb5df391c",
