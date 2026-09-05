@@ -1,5 +1,5 @@
 {
-  "version": "592c76b1bb1a4ed30b93d1db19eefb830dfa3336",
+  "version": "32b1c698e953d07027b8b7dc60e5a5046e9354a3",
   "generated": "2026-09-05",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -26,7 +26,7 @@
     ".claude/commands/define-design-system.md": "d06d842a0ff4e00f0ef3462f31033c43db21c3de940a0b228173c028bf372ba7",
     ".claude/commands/orchestration-commander.md": "93a02ce54a197853d79bd5696b01c03d03c758317f8b83e4fa0273f6d8b973f6",
     ".claude/commands/update-docs.md": "7059f2be76a1983ac3e50a4b60faa1e06d2a172d9f0810930dd1c136542f8de7",
-    ".claude/commands/generate-tasks.md": "1ed790128b289c103fa16d51f0023041dc20b72aa90f0259e8a4e12f19a341e2",
+    ".claude/commands/generate-tasks.md": "96fdbb5c6957dc7768fdec39c789275043b78dbb57522f414ace60e2cbb9e3ab",
     ".claude/commands/breakdown.md": "d26fc0ee89ee385bfba9c008b1b3f991684ea47084793809757162d53b73eae6",
     ".claude/commands/README.md": "f4fec8221517c1107472cfd46db6b1cba2a1cfda107ab5a0e058fdf9964f4f59",
     ".claude/commands/clean-worktree.md": "021573f12602b91329eb82bb0e6940e1810770c8f011fc946d42f2efeadefdc5",
@@ -36,9 +36,9 @@
     ".claude/commands/test_ui_form.md": "f0b6ef6730a503fac09cac70951b7bf4066f6063307e9fa44e5370294243b3e0",
     ".claude/commands/patch.md": "f18cc6e14f2a7af2406b684b02329b8a809f6bb3771dccd88e1f26bd09abc62e",
     ".claude/commands/sync-global-commands.md": "426ad0b8bd0fd375c604052c8bd7516835ed549b61c7dde3a65aa6e0735f927f",
-    ".claude/commands/ticket.md": "52e121c0c125f1cb5a2705494dd1c8c9d288c301892a7c7825341b2a993f3f67",
+    ".claude/commands/ticket.md": "6999b770c3e10f6b69c7a9fd4033f489f490b72919102a1fe8ab7d46c5da45ab",
     ".claude/commands/consolidate-run.md": "9d87e70e7a89163c23ed7f746f7741be2b34be114899a00ac892bcc8f117eab4",
-    ".claude/commands/chore.md": "a77f7850629c96717c6dee326615362c56591ff0001f1b07687f9608cb33fecf",
+    ".claude/commands/chore.md": "1d57db36518d6bd65caf8f2dbbd2e8353d7de774c253e789e570be740fe3d2ac",
     ".claude/commands/roadmap-status.md": "cafbf6908cc52cb2e996896efea69afbedf7281f702b14b25b0833565b1671d5",
     ".claude/commands/prime.md": "6635e8c48638d5720ea270666460e536eb87d49b4785518080e8040628785f73",
     ".claude/commands/plan.md": "f18da24739e24919e3e0f03fa7e8ae559bd395f665f7b735f0a3fbe4e428c832",

@@ -91,9 +91,28 @@ Plan one maintenance or housekeeping task — no behavior change, tests incident
    [
      { "task_id": 1, "title": "<First Task Name>", "description": "<specific action>", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": ["<path/to/file>"], "dependsOn": [] },
      { "task_id": 2, "title": "<Second Task Name>", "description": "<specific action>", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": ["<path/to/file>"], "dependsOn": [1] },
-     { "task_id": 3, "title": "Validate", "description": "Run the block record's validation_commands and confirm all pass.", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": [], "dependsOn": [1, 2] }
+     { "task_id": 3, "title": "<Last real change> — and validate", "description": "<the last substantive change>, then run the block record's validation_commands and confirm all pass.", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": ["<path/to/the/last/real/change>"], "dependsOn": [1, 2] }
    ]
    ```
+
+   **Every task names >=1 real file, including the last one — there is no exemption for a
+   validation task, and a standalone `"files": []` task can NEVER pass.** The engines' work
+   assertion (`renderWorkAssertion`, `.claude/workflows/sdlc-task.js:409`) aborts a task whose
+   commit's changed paths do not intersect its declared `files[]`; against an empty `files[]`
+   nothing can intersect, so it fails condition 2 on every attempt and every retry. It is enforced
+   structurally at `sdlc-task.js:2433` — the engine refuses to record the task passed without a
+   positive `workAssertionPassed` — and it is **hardcoded, independent of `harness.json`**:
+   `perTask: false` only filters harness gating checks and cannot reach it.
+
+   **A standalone Validate task is also redundant**, which is why folding it in costs nothing: a
+   project's `gates: true` harness checks already run after *every* task (D63), so a trailing
+   "re-run the validation commands" task re-runs what just ran. Fold the validation into the last
+   task that produces a diff.
+
+   Measured 2026-09-04: `OK.ticket.learning-artifact-missing-title-description` task 2 bailed
+   `bail_class 5` on exactly this — all five of its `validation_commands` passed and the block's
+   work was complete. This example was the trigger, not one author; 137 live "Validate" tasks
+   across the fleet carry the shape.
    Populate `acceptance_criteria` and `validation_commands` per task — the empty arrays above are
    the *shape*, not the target. Fleet-wide, 36% of tasks shipped with empty `acceptance_criteria`
    and 53% with empty `validation_commands` because the template's empty array was read as a

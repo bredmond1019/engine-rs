@@ -162,7 +162,7 @@ downstream block waiting on its code, so there is nothing to defer (D65).
    [
      { "task_id": 1, "title": "<First Task Name>", "description": "<specific action>", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": ["<file this task touches>"], "dependsOn": [] },
      { "task_id": 2, "title": "<Second Task Name>", "description": "<specific action>", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": ["<file this task touches>"], "dependsOn": [1] },
-     { "task_id": 3, "title": "Validate", "description": "Run the block record's validation_commands and confirm all pass.", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": [], "dependsOn": [1, 2] }
+     { "task_id": 3, "title": "<Last real change> — and validate", "description": "<the last substantive change>, then run the block record's validation_commands and confirm all pass.", "acceptance_criteria": [], "validation_commands": [], "max_attempts": 3, "files": ["<path/to/the/last/real/change>"], "dependsOn": [1, 2] }
    ]
    ```
    Populate `acceptance_criteria` and `validation_commands` per task — the empty arrays above are
@@ -189,8 +189,8 @@ downstream block waiting on its code, so there is nothing to defer (D65).
       `attempt_count` key authored by you (engine-owned).
     - **The block record validates** against `.claude/workflows/block.schema.json`, and `why`,
       `description`, and `out_of_scope` are all non-empty.
-    - **Every task names ≥1 concrete file** in `files[]`, **including the final Validate task —
-      there is no exemption, and the template above is wrong if you copy it literally.** The
+    - **Every task names ≥1 concrete file** in `files[]`, **including the final validation task —
+      there is no exemption.** The
       engines' work assertion (`renderWorkAssertion`, `sdlc-task.js:409`) aborts a task whose
       commit's changed paths do not intersect its declared `files[]`; against an empty `files[]`
       nothing can ever intersect, so a `"files": []` task fails condition 2 every single time.

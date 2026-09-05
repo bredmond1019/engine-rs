@@ -117,7 +117,23 @@ $ARGUMENTS — one of two input modes:
      fix the block. This is the proactive complement to the D19 thin-spec abort: D19 catches a thin
      spec after the fact; this prevents writing a confidently-wrong one in the first place.
 
-5a. **Read the actual source the block names — before writing any task.** This is not optional and
+5a. **Normalise every path to the REPO ROOT before you copy it into a task's `files[]`.** A block
+   record writes paths **fleet-root-relative** (`core/okf-core/src/doc/learning_artifact.rs`); the
+   engines' work assertion compares against `git diff --name-status HEAD~1 HEAD` run **inside the
+   repo**, which emits `src/doc/learning_artifact.rs`. The comparison is `grep -qFx` — an exact
+   whole-line match — so a verbatim copy never intersects and the task is a guaranteed
+   `WORK_ASSERTION_ABORT`.
+
+   **Strip the repo prefix when the block's repo matches the target repo.** If the record says
+   `core/okf-core/src/foo.rs` and you are authoring for `okf-core`, the task's `files[]` entry is
+   `src/foo.rs`. Verify rather than assume: run `git diff --name-status HEAD~1 HEAD` in the target
+   repo and confirm the form matches what you are about to write.
+
+   Measured 2026-09-04: `OK.ticket.learning-artifact-missing-title-description` task 1 cost a full
+   attempt to this before the engine self-corrected the path mid-run; the block record still
+   carries the fleet-root form.
+
+5b. **Read the actual source the block names — before writing any task.** This is not optional and
    it is the difference between a spec an engine can execute and one that names things that do not
    exist. For each file in the record's `files[]`:
    - **Modified files:** open them. Get the real function names, signatures, struct fields and
@@ -204,7 +220,8 @@ $ARGUMENTS — one of two input modes:
    holds; **revise the spec in place** if any fails, then re-check:
    - **`tasks.json` parses as valid JSON** and is a non-empty array (not wrapped in an object —
      orchestrator's `LoadTaskStateNode` expects a bare array).
-   - **Every task except the final Validate task names ≥1 file** in its `files[]` (so the dependency
+   - **Every task names ≥1 file** in its `files[]` — including the last one; there is no exemption
+     for a validation task (see "NEVER give the final task `files: []`" below) (so the dependency
      analysis and the gate-passing boundary review below can see boundaries). This does **not**
      imply the named files must be disjoint *across* tasks — two tasks are free to touch the same
      file under the sequential engines, since there is no inter-task merge to collide. This property
