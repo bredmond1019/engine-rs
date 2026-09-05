@@ -839,7 +839,3 @@ Skip this entire step if the run bailed OR Step 3.5 set `reconcileFailed = true`
     the commits already landed on the current branch.
   - Either way, remind the user to run **`/log-work`** afterward for the narrative `log.md` entry —
     the lean bookkeep close-out above only flips status markers, it never writes prose.
-
-
-
-

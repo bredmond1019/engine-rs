@@ -255,8 +255,10 @@ bullets. Link paths; never restate a file. See the `report-to-the-operator` skil
 - Any `operator`/`approval` edges filed this session, and what they gate
 - The `emit-state --write` summary, or that it was skipped (standalone)
 - What was committed
-- Next session: open a fresh session here → `/prime` (it surfaces the handoff automatically) →
-  run the first command listed in the handoff
+- Next session: open a fresh session in **the directory whose `planning/` this handoff belongs
+  to** — for a tier sub-brain that is the tier directory (e.g. `agentic-portfolio/core/`), not the
+  brain root — then `/prime` (it surfaces the handoff automatically) → run the first command listed
+  in the handoff
 
 If a settled architectural decision came out of this session, say so and suggest `/log-decision`
 — do not author one inline.

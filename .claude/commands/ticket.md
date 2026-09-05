@@ -189,7 +189,17 @@ downstream block waiting on its code, so there is nothing to defer (D65).
       `attempt_count` key authored by you (engine-owned).
     - **The block record validates** against `.claude/workflows/block.schema.json`, and `why`,
       `description`, and `out_of_scope` are all non-empty.
-    - **Every task names ≥1 concrete file** in `files[]` (Validate exempt).
+    - **Every task names ≥1 concrete file** in `files[]`, **including the final Validate task —
+      there is no exemption, and the template above is wrong if you copy it literally.** The
+      engines' work assertion (`renderWorkAssertion`, `sdlc-task.js:409`) aborts a task whose
+      commit's changed paths do not intersect its declared `files[]`; against an empty `files[]`
+      nothing can ever intersect, so a `"files": []` task fails condition 2 every single time.
+      **Prefer folding the final validation into the last task that produces a diff** and emitting
+      no standalone Validate task at all — `/generate-tasks` §4 argues this. Measured 2026-09-04:
+      `SY.ticket.recall-corpus-exclusivity` bailed twice on exactly this, and the two sibling
+      blocks' Validate tasks recorded `workAssertionPassed: true` for a check proven unable to
+      pass — `workAssertionPassed` is self-reported by the implement agent (`sdlc-task.js:996`),
+      so a standalone Validate task either bails or passes falsely. Neither is a gate.
     - **Compilable task boundaries — can fail.** Check whether any single breaking public-surface
       change is split across two or more tasks such that an intermediate task would leave the
       repository non-compiling under the per-task gate. If so this check **fails**: merge those

@@ -212,7 +212,3 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
    - Run the COMMIT-SAFETY GUARD `&&`-joined before the wrap-up commit — both the repo-local one and,
      in a vaulted repo, the vault one (`git -C <vault path>`) — then commit.
    - Create a pull request (PR) using git CLI or GitHub CLI (unless `--no-pr` is specified).
-
-
-
-
