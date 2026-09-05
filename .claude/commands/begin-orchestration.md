@@ -448,6 +448,47 @@ Each has already cost a real run in this fleet.
    either regresses to the failure mode this record exists to fix from the opposite direction —
    losing either the reasoning trail or the machine-diffable signal.
 
+   **The record shape** — every field `scripts/escalation.schema.json` requires, so the sweep
+   script can validate without parsing prose. This is background to the schema, not a substitute
+   for it; if the two ever disagree, the schema wins:
+
+   ```json
+   {
+     "ts_utc": "2026-09-05T14:22:07Z",
+     "repo": "engine-rs",
+     "lane": "engine-rs-lane-a",
+     "kind": "bail",
+     "severity": "blocking",
+     "channel": "notification",
+     "gate_id": "roadmap-slug/engine-rs/BA.21.A",
+     "summary": "BA.21.A bailed: spec's validation_command references a file deleted upstream.",
+     "verified_by": "grep -n validation_command planning/BA.21.A/spec.md\nvalidation_command: pytest tests/removed_module_test.py",
+     "durable_home": {"channel": "run-record", "ref": "engine-rs/planning/orchestration-run/roadmap-slug/notes.md#ba-21-a-bail"},
+     "verified_at_sha": "a1b2c3d",
+     "options": [
+       {"key": "skip", "label": "Skip block"},
+       {"key": "retarget", "label": "Retarget test"}
+     ]
+   }
+   ```
+
+   Notes on the fields most often gotten wrong:
+   - `verified_by` MUST be a real command line followed by its real output on the next line —
+     never a prose description like "measured" or "confirmed"; that shape fails validation.
+     The only other accepted shape is `UNVERIFIED: <who claimed it>`, for a claim taken on
+     someone's word rather than checked directly.
+   - `verified_at_sha` is the short git SHA of the SUBJECT repo — the repo the `verified_by`
+     command actually ran in — never the brain root's SHA. A brain SHA makes every cross-repo
+     escalation look permanently stale.
+   - `gate_id` is `<roadmap>/<repo>/<block>`, matching `notify-operator`'s `--gate-id` scoping.
+   - `channel` is `notification` (only for a reducible yes/no already declared as such — requires
+     `options`, 2-3 entries, each `label` at most 20 chars) or `session:<slug>` for anything
+     richer (never carries `options`).
+   - `summary` is capped at 1024 chars — trim to the substance and point at `durable_home` for
+     the full text rather than truncating mid-thought.
+   - `block` (the block id this escalation is scoped to) and `clears_when` (a predicate for when
+     it resolves) are optional; omit them rather than writing a null placeholder if unused.
+
    The lane log is the *cross-lane* channel and stays one line per block; this file is the *local*
    one and holds the detail. Anything that needs a ticket later, or that the next agent would
    otherwise rediscover the hard way, belongs here.

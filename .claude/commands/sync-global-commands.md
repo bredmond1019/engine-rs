@@ -15,6 +15,17 @@ related: [gc-blockA-sync-command]
 Installs all harness commands from `.claude/commands/` into `~/.claude/commands/`,
 excluding the `brain/` reference directory.
 
+## Sole owner of the HQ-only commands
+
+This path is the **sole owner** of the four commands `scripts/sync_downstream_harness.py`
+deliberately drops from every downstream repo via `EXCLUDED_COMMAND_FILENAMES` —
+`generate-roadmap.md`, `consolidate-fleet.md`, `dispose-run.md`, and `commander-retro.md`. The
+downstream path excludes them by design (they are HQ-only by nature, not by target), and the brain
+root is itself an `engines_only` sync target under D54, so neither sync path delivers them except
+this one. An `EXCLUDED_COMMAND_FILENAMES` entry means "globally installed only," not "unreachable" —
+this rule is stated once here for all four; see `scripts/check_global_commands_fresh.py` for the
+drift signal that reports any of them (or any other command) going stale against the install.
+
 ## Instructions
 
 1. **Guard — confirm you are in the base-template root.**
