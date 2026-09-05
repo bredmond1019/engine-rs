@@ -33,8 +33,8 @@ use crate::policy::RESOLVED_POLICY_IDENTITY;
 
 use super::policy::SdlcPolicy;
 use super::schema::{
-    CommittedDocs, CommittedFinalValidation, CommittedPr, CommittedReview, RunMeta, RunOutcomes,
-    SDLCState, TerminalSignal,
+    parse_task_range, CommittedDocs, CommittedFinalValidation, CommittedPr, CommittedReview,
+    RunMeta, RunOutcomes, SDLCState, TerminalSignal,
 };
 use super::task_loop::{bounded_review_attempts, latest_state, STRUCTURAL_ISSUE_THRESHOLD};
 #[cfg(test)]
@@ -733,6 +733,23 @@ impl Default for WrapUpNode {
     }
 }
 
+/// `true` iff the inbound event carried no `task_range` (or an empty one) --
+/// mirrors `sdlc_task::lean_bookkeep::is_full_run` exactly, same reasoning:
+/// reads the raw `ctx.event` directly rather than `state.tasks`, since by
+/// this point in the graph `state.tasks` may already be scoped to the
+/// selected ids and the full spec list is not recoverable from `state`
+/// alone. Added 2026-09-05 (round-5 triage DO-NOW,
+/// close-block-node-closes-a-block-on-a-partial-task-range-run): SDLC_FLOW's
+/// `WrapUpNode` never stamped this key, so `close_block::full_run_from_source`
+/// silently defaulted `true` for every SDLC_FLOW run and the partial-range
+/// guard in `CloseBlockNode::evaluate` stayed inert for the one engine the
+/// defect was originally found on.
+fn is_full_run(ctx: &TaskContext) -> Result<bool, NodeError> {
+    let task_range = ctx.event.get("task_range").and_then(|v| v.as_str());
+    let selected = parse_task_range(task_range).map_err(NodeError::new)?;
+    Ok(selected.is_none())
+}
+
 #[async_trait::async_trait]
 impl Node for WrapUpNode {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
@@ -903,11 +920,14 @@ impl Node for WrapUpNode {
             None => None,
         };
 
+        let full_run = is_full_run(&ctx)?;
+
         let mut output = json!({
             "log_entry": log_entry,
             "report": report,
             "status_suggestion": status_suggestion,
             "state": state_value,
+            "full_run": full_run,
         });
         if let Some(saved_to) = saved_to {
             output["saved_to"] = json!(saved_to);
@@ -1021,6 +1041,41 @@ mod tests {
         // and no bail note may leak into the happy-path wording.
         assert!(!log_entry.contains("BLOCKED"));
         assert!(!report.contains("Blocked:"));
+    }
+
+    /// Added 2026-09-05 (round-5 triage DO-NOW,
+    /// close-block-node-closes-a-block-on-a-partial-task-range-run): before
+    /// this, `WrapUpNode` never stamped `full_run` at all, so
+    /// `close_block::full_run_from_source` silently defaulted `true` for
+    /// every SDLC_FLOW run and a partial `task_range` run's block was closed
+    /// same as a full one.
+    #[tokio::test]
+    async fn wrap_up_stamps_full_run_true_with_no_task_range() {
+        let mut state = SDLCState::new("EN.3.B-sdlc-flow-docs-wrapup-pr");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+
+        let ctx = ctx_with_state(&state);
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["WrapUpNode"]["full_run"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn wrap_up_stamps_full_run_false_with_a_task_range() {
+        let mut state = SDLCState::new("EN.3.B-sdlc-flow-docs-wrapup-pr");
+        let mut task = SDLCTask::new(1, "One", "d1");
+        task.status = SDLCTaskStatus::Done;
+        state.tasks.push(task);
+
+        let mut ctx = ctx_with_state(&state);
+        ctx.event["task_range"] = json!("1-3");
+        let node = WrapUpNode::new().with_clock(fixed_clock("2026-07-18"));
+        let out = node.process(ctx).await.expect("process should succeed");
+
+        assert_eq!(out.nodes["WrapUpNode"]["full_run"], json!(false));
     }
 
     #[tokio::test]

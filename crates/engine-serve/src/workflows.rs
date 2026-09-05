@@ -2870,7 +2870,14 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_workflows_registers_all_seven_workflow_types() {
+    fn register_builtin_workflows_registers_a_founding_subset_of_workflow_types() {
+        // Renamed 2026-09-05 (round-5 triage DO-NOW) from
+        // `..._registers_all_seven_workflow_types` -- that name and a subset `assert!` loop can
+        // never catch a MISSING registration, because a subset check keeps passing as the real
+        // set grows past it (confirmed: this repo now registers 18 types, not 7). This test is
+        // deliberately a subset-membership check again, but honestly named as one; the sibling
+        // `register_builtin_workflows_registers_every_known_workflow_type` below is the one that
+        // actually catches an omission.
         let mut dispatcher = Dispatcher::new();
 
         register_builtin_workflows(&mut dispatcher);
@@ -2942,7 +2949,11 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_workflows_registers_all_twelve_workflow_types() {
+    fn register_builtin_workflows_registers_a_second_founding_subset_of_workflow_types() {
+        // Renamed 2026-09-05 (round-5 triage DO-NOW), same reasoning as the sibling test above:
+        // `..._registers_all_twelve_workflow_types` was a subset check under a name claiming
+        // completeness. See `register_builtin_workflows_registers_every_known_workflow_type`
+        // below for the actual completeness check.
         let mut dispatcher = Dispatcher::new();
 
         register_builtin_workflows(&mut dispatcher);
@@ -2966,6 +2977,51 @@ mod tests {
                 "expected {workflow_type} to be registered"
             );
         }
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_every_known_workflow_type() {
+        // Added 2026-09-05 (round-5 triage DO-NOW): the two subset tests above cannot catch a
+        // missing registration by construction -- a subset check keeps passing as the real set
+        // grows past it. This asserts the EXACT set, so an added `register_*` call that forgets
+        // to be wired into `register_builtin_workflows_with_registry`, or a type renamed without
+        // updating this list, both fail loudly. Update this list -- not the count alone -- when
+        // a new builtin workflow is added.
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        let mut expected = [
+            "SDLC_FLOW",
+            "SDLC_TASK",
+            "RESEARCH_AGENT",
+            "DIAGNOSTIC_INTAKE",
+            "PROPOSAL_GENERATOR",
+            "DELIVERABLE_RENDER",
+            "CONTENT_PIPELINE",
+            "LINKEDIN_POST",
+            "OPPORTUNITY_SET_STAGE",
+            "OPPORTUNITY_ADD_ACTION",
+            "HARVEST_APPROVE",
+            "LEAD_INGEST",
+            "APPROVE_AND_RUN",
+            "TERMINAL_PROBE",
+            "RECALL",
+            "ORCHESTRATION",
+            "DEBRIEF",
+            "CLAIM_REAFFIRM",
+        ]
+        .to_vec();
+        expected.sort_unstable();
+
+        let mut actual = dispatcher.registered_types();
+        actual.sort_unstable();
+
+        assert_eq!(
+            actual, expected,
+            "register_builtin_workflows_with_registry's registered set drifted from this test's \
+             expected list -- update whichever one is stale"
+        );
     }
 
     #[test]

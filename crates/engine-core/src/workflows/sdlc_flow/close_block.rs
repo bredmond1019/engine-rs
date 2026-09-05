@@ -962,10 +962,13 @@ impl CloseBlockNode {
         // A partial `task_range` run must not close its block either — the
         // JS engine's `fullRun` guard (`sdlc-task.js`): "the reconcile and
         // the block close only happen on a run covering EVERY task in the
-        // spec". `LeanBookkeepNode` (`EN.11.N` task 5) is the only stamper
-        // of this flag today; every `sdlc_flow` `WrapUpNode` stamp carries
-        // no `full_run` key at all, so [`full_run_from_source`] defaults
-        // `true` there and this branch stays inert for SDLC_FLOW runs.
+        // spec". `LeanBookkeepNode` (`EN.11.N` task 5) stamps this for
+        // SDLC_TASK; `WrapUpNode` stamps it for SDLC_FLOW as of 2026-09-05
+        // (round-5 triage DO-NOW, close-block-node-closes-a-block-on-a-
+        // partial-task-range-run) -- until then every `sdlc_flow` stamp
+        // carried no `full_run` key at all, so [`full_run_from_source`]
+        // silently defaulted `true` and this branch stayed inert for the one
+        // engine the defect was originally found on.
         if !full_run_from_source(ctx, self.state_source) {
             return CloseOutcome::Skipped {
                 reason: "run covered only a task_range subset, not the full spec — a partial \
