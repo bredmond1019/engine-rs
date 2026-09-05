@@ -24,6 +24,8 @@ following are excluded, as authored planning artifacts rather than build inputs:
   - `planning/harness.json` and `planning/state.json` (config the harness reads at gate
     time, not a build input);
   - any `tasks.json` (a spec's task list, read by the engines, not compiled);
+  - any `lane-*.json` or `*.jsonl` under planning/ (lane files, escalation logs -- authored,
+    read by tooling, never compiled);
   - anything under a `planning/*/sdlc/` directory (engine run state).
 Everything else under planning/ stays an ERROR.
 
@@ -79,10 +81,16 @@ def is_planning_authoring_artifact(fpath):
     AUTHORED PLANNING ARTIFACT -- edited and never compiled -- rather than a build input.
 
     Scoped exactly to the class named in the planning/-path rule's docstring: any `*.md`
-    under planning/, `planning/harness.json`, `planning/state.json`, any `tasks.json`, and
-    anything under a `planning/*/sdlc/` directory. Everything else under planning/ is
-    assumed to be a build input (a fixture, a test data file, a path a program reads at
-    compile/run time) and stays flagged.
+    under planning/, `planning/harness.json`, `planning/state.json`, any `tasks.json`, any
+    `lane-*.json` or `*.jsonl` under planning/, and anything under a `planning/*/sdlc/`
+    directory. Everything else under planning/ is assumed to be a build input (a fixture, a
+    test data file, a path a program reads at compile/run time) and stays flagged.
+
+    `lane-*.json` and `*.jsonl` were added 2026-09-05 (round-5 triage DO-NOW) — both are
+    authored planning artifacts of the same kind as the rest of this list (hand-edited,
+    read by tooling, never compiled), and their absence produced real false positives:
+    HQ.8.A's `planning/roadmaps/*/lane-*.json` paths, and BT.8.C's
+    `planning/roadmaps/*/escalations.jsonl` disposals.
     """
     norm = fpath.replace(os.sep, "/")
     if norm.endswith(".md"):
@@ -90,6 +98,10 @@ def is_planning_authoring_artifact(fpath):
     if norm in ("planning/harness.json", "planning/state.json"):
         return True
     if os.path.basename(norm) == "tasks.json":
+        return True
+    if norm.endswith(".jsonl"):
+        return True
+    if os.path.basename(norm).startswith("lane-") and norm.endswith(".json"):
         return True
     parts = norm.split("/")
     if "planning" in parts and "sdlc" in parts:
@@ -153,8 +165,19 @@ def load_repo_prefixes(start):
     return out
 
 
-def check(path, planning_root="planning"):
-    """Return (errors, warnings) for one record file."""
+def check(path, planning_root="planning", planning_is_symlinked=True):
+    """Return (errors, warnings) for one record file.
+
+    `planning_is_symlinked` says whether THIS repo's `planning/` is a symlink into a private
+    vault (true for every repo scaffolded under a `_planning/<repo>` tier) -- the case the
+    planning/-path rule below is actually about, because a build input there is invisible to
+    that repo's own CI checkout. It is False only for the brain root itself, whose `planning/`
+    is a real tracked directory that its own CI sees fine. Defaults to True (the historical,
+    unconditional behavior) so any caller that does not know better keeps flagging -- only
+    `main()`'s real fleet/single-repo walk passes False, and only for the HQ root. Added
+    2026-09-05 (round-5 triage DO-NOW) after HQ.8.A's `lane-*.json` paths and other HQ-root
+    records were false-flagged by a rule that is correct for every OTHER repo but not this one.
+    """
     problems = []
     warnings = []
 
@@ -261,7 +284,8 @@ def check(path, planning_root="planning"):
                 fpath = isinstance(f, dict) and f.get("path")
                 if isinstance(fpath, str) and (
                         fpath == "planning" or fpath.startswith("planning/")) and \
-                        not is_planning_authoring_artifact(fpath):
+                        not is_planning_authoring_artifact(fpath) and \
+                        planning_is_symlinked:
                     # `planning/` is a symlink into the private HQ vault, excluded from this
                     # repo's git by base-template/.gitignore:20 (the bare rule `/planning`).
                     # Code referencing such a path -- include_str!, a fixture path, a test
@@ -336,8 +360,15 @@ def blocks_dirs(fleet, planning):
     for dirpath, dirnames, _ in os.walk(root, followlinks=False):
         dirnames[:] = [d for d in dirnames
                        if d not in {"node_modules", ".git", "archive", "target"}]
+        parts = dirpath.split(os.sep)
+        if "tests" in parts:
+            # Deliberately-malformed negative fixtures (e.g. core/mev/tests/fixtures/blocks/)
+            # are not real block records and should never be validated as if they were.
+            # Added 2026-09-05 (round-5 triage DO-NOW) -- this was one of two independent
+            # reasons `--fleet` could never reach exit 0.
+            continue
         if os.path.basename(dirpath) == "blocks" and (
-                "_planning" in dirpath.split(os.sep)
+                "_planning" in parts
                 or dirpath.endswith(os.path.join("planning", "blocks"))):
             found.append(dirpath)
     return sorted(set(found))
@@ -362,7 +393,19 @@ def main():
             total += 1
             # `d` is the blocks/ dir; the repo's planning root is its parent. spec_dir values are
             # written repo-relative as `planning/<...>/`, so resolving them needs that root, not cwd.
-            problems, warnings = check(path, planning_root=os.path.dirname(d))
+            planning_root = os.path.dirname(d)
+            # Is THIS repo's own planning/ a symlink into a vault (every repo except the brain
+            # root)? In --fleet mode `d` came straight off the real filesystem walk, so a vaulted
+            # repo's path always carries a `_planning` segment and the HQ root's never does --
+            # `os.path.islink` can't tell them apart here because `d` is already the vault side
+            # (the real target, not the symlink). In single-repo mode `planning_root` IS the
+            # symlink face as the caller wrote it, so `islink` is the direct, correct check.
+            if args.fleet:
+                planning_is_symlinked = "_planning" in planning_root.replace(os.sep, "/").split("/")
+            else:
+                planning_is_symlinked = os.path.islink(planning_root)
+            problems, warnings = check(path, planning_root=planning_root,
+                                        planning_is_symlinked=planning_is_symlinked)
             if problems:
                 failed += 1
                 print(f"FAIL {path}")

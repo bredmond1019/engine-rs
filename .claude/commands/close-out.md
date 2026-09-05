@@ -435,11 +435,16 @@ If `--merge-branch` was passed:
    fixed here: an emit-state run always changes something, and a merge that lands looking clean while
    leaving derived files dirty in the working tree is worse than the merge failing outright.
    ```bash
-   git add planning/state.json planning/status.md docs/projects/*.md  # only the surfaces emit-state touched — never `git add -A`
+   git add planning/state.json planning/status.md docs/projects/*.md planning/*/sdlc/*state.json  # the surfaces emit-state touched, PLUS the block's own SDLC run-state — never `git add -A`
    git commit -m "chore: regenerate derived state after merging <branch-name>"
    ```
    Scope the `git add` to whatever `emit-state`'s own output named as touched, per the
    `commit-in-this-fleet` skill where this repo has one — never a broad `git add -A`/`git add .`.
+   **Also stage `planning/<block>/sdlc/sdlc-*state.json`** — the SDLC engines commit to the repo,
+   never to `planning/` (which belongs to HQ), so a block's own run-state — including its
+   append-only `bails[]` record — survives only if this step picks it up. Measured 2026-09-05:
+   nine blocks' worth of run-state sat uncommitted all day for exactly this reason before this
+   line existed.
    **Never push** — this command does not push under any flag; pushing is a separate, explicit step.
 
    Run it from the base branch (never a linked worktree — `emit-state` refuses there). If `mev` or

@@ -155,10 +155,19 @@ code doing the wrong thing (M4, `pattern-analysis-2026-09-02`).
 For each block in the resolved chain:
 
 1. **Extract** every quantitative claim and every named live artifact from that block's record —
-   `description`, `what`, `why`, `acceptance_criteria`. A "quantitative claim" is a count, a line
-   number, an "N of M", or any number a reader could check against the live system. A "named live
-   artifact" is a file, a symbol, a command, or a registered check the record names as existing or
-   behaving a specific way right now.
+   `description`, `what`, `why`, `acceptance_criteria`, **and `validation_commands`**. A
+   "quantitative claim" is a count, a line number, an "N of M", or any number a reader could check
+   against the live system. A "named live artifact" is a file, a symbol, a command, or a registered
+   check the record names as existing or behaving a specific way right now. **`validation_commands`
+   is not exempt just because it looks like configuration rather than prose** — a command inherited
+   unexamined into a spec is a load-bearing claim about the live system in exactly this sense, and
+   it is the field most likely to be copied forward without re-derivation because it doesn't read
+   like an assertion. MEASURED 2026-09-04: three of the four defects that bailed BT.7.A were
+   validation commands copied verbatim into a downstream spec — one referenced a file the block's
+   own evidence required deleting, one (`python3 -m pytest scripts -q`) failed at collection on a
+   pre-existing, unrelated `sys.exit(0)` elsewhere in `scripts/`, and one forbade documenting a
+   change the block's own AC1 had scoped narrower. Re-derive these exactly like any other claim: run
+   the command against the live corpus before trusting it, not just against the record's prose.
 2. **Run one command per claim.** Re-reading the record is not re-derivation — the record is the
    thing under test, so reading it again only confirms what it already says. Run the actual check
    (`grep`, `wc -l`, the named script, `bastion validate-brain`, whatever answers that specific

@@ -17,6 +17,20 @@ carries *what now works and how to check it*, and becomes entries in the fleet's
 catalogue (Step 5b). Both were being left on disk: the ledgers had never been consolidated at all
 until 2026-09-05, when nine of them holding 152 entries were found across six repos.
 
+## Where to run it
+
+**A fresh session at the brain root, on Opus.** It reads across every repo for one roadmap and holds
+them in view together; that correlation is the job, and it degrades if the context is already full.
+
+**Do not `/prime` first.** This command assembles its own input set in Step 3 from explicit paths —
+priming spends a large part of the window on orientation it will not use. The one exception is
+`planning/handoff.md`: if it exists, read that one file, because it is the previous session's
+unfinished business and it is cheap.
+
+The disposal half runs in a **different** session again — see
+[`/dispose-run`](dispose-run.md)'s own session note for why that separation is load-bearing rather
+than incidental.
+
 **Related:** the record contract itself (layout, frontmatter, `origin_roadmap`, `lifecycle`) is
 `BT.ticket.orchestration-run-record-contract` — this command depends on it and does not restate it.
 `/generate-roadmap --from <consolidated>` is the disposal path for what this command proposes.

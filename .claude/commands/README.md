@@ -65,6 +65,14 @@ reviewed; consolidation proposes so a human can check before anything is written
 rows so scheduling stays a separate decision. What a lane writes down in the first place is governed
 by [`finding-discipline.md`](../workflows/finding-discipline.md).
 
+**Each runs in its own fresh Opus session at the brain root — and 2 and 3 must not share one.**
+`/dispose-run` reads the `ungrounded[]` list naming fields the analysis could not support, and that
+contract only works when the reader is not the author: the same session fills those gaps from memory
+without noticing. Keep session 2 reachable while 3 runs; step 3 is meant to ask it questions.
+**Do not `/prime` first** — each command assembles its own inputs from explicit paths. Read
+`planning/handoff.md` if it exists; that is the only exception. Full reasoning:
+[`/dispose-run`](dispose-run.md) § "Run it in a FRESH Opus session".
+
 **Full walkthrough with the diagram:** `docs/workflows/orchestration-runbook.md`.
 
 ---
