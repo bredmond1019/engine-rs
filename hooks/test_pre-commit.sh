@@ -25,6 +25,7 @@ unset -v GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
 HOOK_SRC="$(cd "$(dirname "$0")" && pwd)/pre-commit"
 CHECKER_SRC="$(cd "$(dirname "$0")" && pwd)/check_frontmatter.py"
 GATE_SRC="$(cd "$(dirname "$0")" && pwd)/validate_brain_gate.sh"
+GATE3_SRC="$(cd "$(dirname "$0")" && pwd)/destructive_overwrite_gate.sh"
 BRAIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # check_frontmatter.py's two escape hatches delegate to base-template's
 # scripts/check_frontmatter_presence.py (BT.ticket.engine-docs-drift-tripwire HALF A).
@@ -66,6 +67,7 @@ new_repo() { # new_repo <dir>
     cp "$HOOK_SRC" hooks/pre-commit; chmod +x hooks/pre-commit
     cp "$CHECKER_SRC" hooks/check_frontmatter.py
     cp "$GATE_SRC" hooks/validate_brain_gate.sh
+    cp "$GATE3_SRC" hooks/destructive_overwrite_gate.sh
     # Mirror the sibling-repo layout check_frontmatter.py's _presence_check() expects:
     # <this test repo>/base-template/scripts/check_frontmatter_presence.py.
     if [ -n "$PRESENCE_SRC" ] && [ -f "$PRESENCE_SRC" ]; then
@@ -634,6 +636,201 @@ EOF
 commit_ok_gated "$R27" BASTION_SHIM_ERRORS="0 0" NESTED_ERROR_ON_FLAG="--graph" NESTED_REPO_ERROR_PATH="core/lane-a/planning/other.md"
 check "planning-lane: same sub-repo vault, symlinked-face shape, still blocks" "$([ "$RC" -ne 0 ]; echo $?)"
 check "planning-lane: block names lane-a's file" "$(printf '%s' "$OUT" | grep -q "core/lane-a/planning/other.md" ; echo $?)"
+
+# --- Gate 3: destructive-overwrite guard (status-marker survival) ----------------------
+# HQ.chore.a-write-to-an-existing-corpus-path-is-unguarded, task 2. Every case below
+# disables gate 2 (BRAIN_GRAPH_GATE=0) so it does not need a real brain.toml/bastion in
+# the throwaway fixture repo — gate 2 is exercised on its own above; these cases isolate
+# gate 3.
+
+# --- Case 28: a real BLOCKER marker is present in HEAD and gone from the re-staged
+# content, at the same path, with no compensating write -> blocked (the verified incident
+# shape from analysis.md: 28b62274f / bcf1df30b).
+R28="$WORK/r28"; new_repo "$R28"
+cat > "$R28/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+1. **BLOCKER (carried forward, unchanged): two commits are unpushed.** engine-rs and
+   claude-code-rs both have local commits nothing has pushed yet.
+2. Everything else is routine.
+EOF
+( cd "$R28" && git add handoff.md && BRAIN_GRAPH_GATE=0 git commit -q -m "initial handoff with open blocker" )
+cat > "$R28/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+Fresh session, nothing open.
+EOF
+( cd "$R28" && git add handoff.md )
+commit_ok_gated "$R28" BRAIN_GRAPH_GATE="0"
+check "gate 3: BLOCKER marker lost, no compensating write -> commit blocked" "$([ "$RC" -ne 0 ]; echo $?)"
+check "gate 3: refusal names the file" "$(printf '%s' "$OUT" | grep -q "handoff.md" ; echo $?)"
+check "gate 3: refusal cites gate 3" "$(printf '%s' "$OUT" | grep -q "gate 3" ; echo $?)"
+
+# --- Case 29: a legitimate full rewrite that never had a marker to lose -> allowed
+# (analysis.md's true-negative case, feb34b89f: no BLOCKER/STILL OPEN/UNRESOLVED existed
+# in either version, so there is nothing for the signal to flag).
+R29="$WORK/r29"; new_repo "$R29"
+cat > "$R29/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+Prior session notes, nothing marked open.
+EOF
+( cd "$R29" && git add handoff.md && BRAIN_GRAPH_GATE=0 git commit -q -m "initial handoff, no markers" )
+cat > "$R29/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff, rewritten
+---
+# Handoff
+
+Entirely new set of notes for the next session. Old notes are gone but none of them were
+ever an open item.
+EOF
+( cd "$R29" && git add handoff.md )
+commit_ok_gated "$R29" BRAIN_GRAPH_GATE="0"
+check "gate 3: full rewrite with no marker ever present -> commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+
+# --- Case 30: the marker is lost from handoff.md, but the SAME change adds a compensating
+# block to planning/knowledge.md -> allowed (analysis.md's D35/`/archive` pattern,
+# commit 7971e2fb6).
+R30="$WORK/r30"; new_repo "$R30"
+mkdir -p "$R30/planning"
+cat > "$R30/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+1. **STILL OPEN: the retry-budget question.** Needs an operator call before this closes.
+EOF
+cat > "$R30/planning/knowledge.md" <<'EOF'
+---
+type: Note
+title: Knowledge
+description: distilled durable knowledge
+---
+# Knowledge
+EOF
+( cd "$R30" && git add handoff.md planning/knowledge.md && BRAIN_GRAPH_GATE=0 git commit -q -m "initial handoff with open item, empty knowledge base" )
+cat > "$R30/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff, distilled
+---
+# Handoff
+
+Retry-budget question resolved and distilled into knowledge.md; nothing else open.
+EOF
+cat >> "$R30/planning/knowledge.md" <<'EOF'
+
+## Retry-budget policy (distilled 2026-09-04)
+
+Resolved: the retry budget is fixed at 3 attempts per task, decided by the operator, and
+does not vary by task kind. Superseded any earlier open question about this.
+EOF
+( cd "$R30" && git add handoff.md planning/knowledge.md )
+commit_ok_gated "$R30" BRAIN_GRAPH_GATE="0"
+check "gate 3: marker lost but compensating knowledge.md write in same commit -> succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+
+# --- Case 31: a RENAME of the same content (git detects it as R, not M) -> allowed even
+# though the marker is present in the old path and the new path is different (analysis.md
+# Q2's `/archive` rename case, commit 8d53ced13: content moves, it does not vanish).
+R31="$WORK/r31"; new_repo "$R31"
+cat > "$R31/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+1. **UNRESOLVED: pricing question.** Still needs an answer next session.
+2. Padding line to make this file large enough for git's rename heuristic to match it
+   against its renamed copy rather than treating it as an unrelated add/delete pair.
+3. More padding, unchanged between the two commits, so the bulk of the content is
+   identical and only the path moves.
+4. Yet more padding text that stays byte-for-byte the same across the rename.
+EOF
+( cd "$R31" && git add handoff.md && BRAIN_GRAPH_GATE=0 git commit -q -m "initial handoff with open item" )
+( cd "$R31" && mkdir -p planning/archive && git mv handoff.md planning/archive/handoff.md )
+commit_ok_gated "$R31" BRAIN_GRAPH_GATE="0"
+check "gate 3: renamed (not same-path) content -> commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+
+# --- Case 32: DESTRUCTIVE_OVERWRITE_GATE=0 is the escape hatch -> the same case 28
+# scenario commits cleanly.
+R32="$WORK/r32"; new_repo "$R32"
+cat > "$R32/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+1. **BLOCKER: two commits are unpushed.**
+EOF
+( cd "$R32" && git add handoff.md && BRAIN_GRAPH_GATE=0 git commit -q -m "initial handoff with open blocker" )
+cat > "$R32/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+Fresh session, nothing open.
+EOF
+( cd "$R32" && git add handoff.md )
+commit_ok_gated "$R32" BRAIN_GRAPH_GATE="0" DESTRUCTIVE_OVERWRITE_GATE="0"
+check "gate 3: DESTRUCTIVE_OVERWRITE_GATE=0 escape hatch -> commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+
+# --- Case 33: the gate script is missing -> degrades gracefully, warns, does not block.
+R33="$WORK/r33"; new_repo "$R33"
+rm -f "$R33/hooks/destructive_overwrite_gate.sh"
+cat > "$R33/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+1. **BLOCKER: two commits are unpushed.**
+EOF
+( cd "$R33" && git add handoff.md && BRAIN_GRAPH_GATE=0 git commit -q -m "initial handoff with open blocker" )
+cat > "$R33/handoff.md" <<'EOF'
+---
+type: Log
+title: Handoff
+description: session handoff
+---
+# Handoff
+
+Fresh session, nothing open.
+EOF
+( cd "$R33" && git add handoff.md )
+commit_ok_gated "$R33" BRAIN_GRAPH_GATE="0"
+check "gate 3: helper script missing -> degrades gracefully, commit succeeds" "$([ "$RC" -eq 0 ]; echo $?)"
+check "gate 3: helper script missing -> warns" "$(printf '%s' "$OUT" | grep -q "skipping destructive-overwrite gate" ; echo $?)"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi

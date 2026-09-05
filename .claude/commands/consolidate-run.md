@@ -1,7 +1,7 @@
 ---
 type: Command
 title: consolidate-run — Gather orchestration-run records across the fleet and propose carryover entries
-description: Discovers per-(repo x roadmap) orchestration-run records for one roadmap, cross-checks them against lane-log.jsonl, selects on D57's two-axis origin_roadmap rule, and proposes carryover[] entries with finding_id for mev's cross-repo correlation. Writes no state.json.
+description: Discovers per-(repo x roadmap) orchestration-run records for one roadmap, cross-checks them against lane-log.jsonl, selects on D57's two-axis origin_roadmap rule, proposes carryover[] entries with finding_id for mev's cross-repo correlation, and promotes each run's verification-ledger entries into the master test catalogue. Writes no state.json.
 ---
 # Consolidate Run — gather findings across the fleet for one roadmap
 
@@ -10,6 +10,12 @@ Lane runs leave findings in their own repos (`planning/orchestration-run/<roadma
 nothing gathers them. A defect observed once in four separate repos is four notes nobody correlates.
 This command implements **D57 section 5** — it gathers, correlates by `finding_id`, and proposes; it
 does not decide, and it does not write state.
+
+**It gathers two different things.** The prose records (`notes.md`, `review.md`) carry *what went
+wrong* and become proposed `carryover[]` entries (Step 5). The `verification-ledger.json` beside them
+carries *what now works and how to check it*, and becomes entries in the fleet's master test
+catalogue (Step 5b). Both were being left on disk: the ledgers had never been consolidated at all
+until 2026-09-05, when nine of them holding 152 entries were found across six repos.
 
 **Related:** the record contract itself (layout, frontmatter, `origin_roadmap`, `lifecycle`) is
 `BT.ticket.orchestration-run-record-contract` — this command depends on it and does not restate it.
@@ -111,6 +117,12 @@ counts the same finding and, worse, can read a stale worktree copy** instead of 
 a worktree branch that has since been abandoned or superseded still shows up as if it were live. Take
 the realpath as the retained path in every case; discard the worktree-routed alias.
 
+**Measured on the ledgers, 2026-09-05, because the fan-out is far worse than it looks for `*.md`:**
+a `find -L` for `verification-ledger.*` returned **144 paths that were 18 distinct files** — 9 JSON
+and 9 markdown. One okf-core ledger alone was reachable by **25** paths, through chains like
+`core/bastion/trees/engine-rs/trees/<block>/trees/sdlc/mev/trees/okf-core/planning/...`. Deduping by
+path string would have counted every finding in it 25 times.
+
 ## Step 4 — Selection: D57 section 3's two-axis rule
 
 Select records for consolidation on **both** axes, per
@@ -181,6 +193,60 @@ blocks revenue there now) and P2 in another (it is routine there). Dedup merges 
 shared `finding_id` — and keeps each repo's own `priority` value; it never collapses them to one
 number.
 
+## Step 5b — The verification ledgers: promote, or record why not
+
+Every run leaves a `verification-ledger.json` beside its `notes.md` — one entry per capability the
+run shipped, with a recipe for checking it (the contract is
+[`docs/sandbox/run-verification-ledger-prompt.md`](../../../docs/sandbox/run-verification-ledger-prompt.md)).
+Those entries are the run's answer to *"what can now be tested that could not be before"*, and until
+this step existed nothing ever collected them: on 2026-09-05 nine ledgers holding **152 entries**
+across six repos were found unconsolidated, the oldest two days old.
+
+**Make one call per entry.** The question is not "is this good work" — it shipped, it is. The
+question is **does this belong in the fleet's permanent test list**:
+
+| `scope` | The entry describes | Goes to |
+|---|---|---|
+| `fleet` | a durable surface — a registered `harness.json` check, a CLI verb or flag, a schema another repo reads, an engine behaviour, a documented instruction agents follow, a guard against a recurring mistake | [`docs/sandbox/test-catalogue.json`](../../../docs/sandbox/test-catalogue.json) |
+| `run-local` | a one-time state change — a data migration, a repair of one record, documentation prose with no code seam, or proof that one specific bug is fixed (that belongs in `remediation.json`) | [`test-catalogue-run-local.json`](../../../docs/sandbox/test-catalogue-run-local.json), with the reason |
+
+**The test for `fleet`: if this broke silently in six weeks, would anyone want to know?**
+
+**`call_site: NONE` does not settle it, and the two cases are opposite.** NONE because the entry is
+documentation is `run-local`. NONE because a real seam shipped with **no production caller** is a
+`fleet` entry *and a finding* — set `finding: true` and say why. That is the defect class the ledger
+contract was built for: code and its tests land, the block closes green, and the caller is never
+written. Measured across the first nine ledgers: **7 entries were findings of exactly this shape**,
+five of them in one repo, including a nine-kind serde seam with zero consumers.
+
+**Judge the recipe while you are there.** `how_to_verify` must be runnable cold by someone with no
+context. Mark `recipe_status: not-cold-runnable` with the reason when it is not — measured on the
+first pass, **18 of 152 were not**, almost all for the same two causes: a command with no working
+directory, and an "inspect the output" step with no assertion. A catalogue of tests nobody can run
+is worse than no catalogue, because it reads as coverage.
+
+**Then note what the docs owe.** A `fleet` entry is new functionality, and new functionality that no
+doc describes is how a capability becomes folklore. Set `docs: {page, state}` where `state` is
+`current` · `stale` · `missing`, naming the doc that should describe it. A `missing` or `stale`
+verdict is a finding for Step 5's proposal list like any other — not a separate errand.
+
+**Do not rewrite a ledger entry.** Carry `capability`, `how_to_verify`, `call_site` and the entry's
+`block` through verbatim; the catalogue's `origin` records the ledger path, block and roadmap so
+provenance survives promotion. **Never rename an `id`** — it is the join key that every environment's
+results row and every `remediation` ref points at.
+
+**An id already in the catalogue is a merge, not a skip and not an overwrite.** 47 of the first
+pass's ledger ids already existed there from an earlier hand-consolidation; the catalogue row was the
+curated one and the ledger row carried the provenance and the finding flag. Enrich, keeping both.
+
+**Statuses in a ledger are results, not catalogue data.** A ledger's `status`/`last_verified` say
+what happened when that lane checked it, in that place. They go to
+[`docs/sandbox/results/<env>.json`](../../../docs/sandbox/results/) — never into the catalogue, which
+carries no verdicts by design and whose checker rejects those fields outright.
+
+**Validate before finishing:** `python3 scripts/check_test_catalogue.py` from `BRAIN_ROOT`, exit 0.
+It is `gates: true` in HQ's `harness.json`, so a malformed write here red-gates every lane.
+
 ## Step 6 — Write boundary: no `state.json`, anywhere
 
 This command **writes no `state.json` in any repo.** One command writing state across nine repos is
@@ -188,10 +254,19 @@ the exact contention pattern that has already cost real runs in this fleet (CLAU
 10) — write authority stays narrow by design (D57 OD-4). It proposes; `/generate-roadmap --from`
 disposes, reusing the existing authoring path instead of creating a second one.
 
-The **only** write this command makes is stamping `lifecycle: consolidated` on the run records it
-consumed, so a re-run does not re-propose the same findings. It does not touch `carryover[]`,
-`tracks[]`, or any other `state.json` field in any repo — those writes belong to whatever consumes
-`consolidated-review.md`.
+It makes exactly **two** kinds of write, neither of them `state.json`:
+
+1. **`lifecycle: consolidated`** on the run records it consumed, so a re-run does not re-propose the
+   same findings.
+2. **The test catalogue** — `docs/sandbox/test-catalogue.json` and
+   `test-catalogue-run-local.json` (Step 5b), plus the ledger's own verdicts appended to
+   `docs/sandbox/results/<env>.json`. These are append-mostly and live in HQ, not in any repo's
+   `state.json`. **Never rename or delete an existing catalogue id** while doing it: every
+   environment's results row and every `remediation` ref joins on that id, so a rename silently
+   destroys one environment's history for that test.
+
+It does not touch `carryover[]`, `tracks[]`, or any other `state.json` field in any repo — those
+writes belong to whatever consumes `consolidated-review.md`.
 
 ## Report
 
@@ -200,6 +275,10 @@ bullets. Link paths; never restate a file. See the `report-to-the-operator` skil
 
 ```
 <roadmap>: <n> records across <m> repos — <k> carryover entries proposed
+Ledgers: <e> entries — <f> promoted to the catalogue, <r> run-local, <d> merged into existing ids
+- <any entry with call_site NONE that is a real unwired seam — name it; this is a finding, not a note>
+- <count of recipes marked not-cold-runnable, if any>
+- <docs owed: entries whose docs.state is missing or stale>
 - <the one selection surprise, if any (a block whose origin_roadmap disagreed with its ledger)>
-Proposed entries written to: <path>. No state.json was written.
+Proposed entries written to: <path>. Catalogue: <n> tests. No state.json was written.
 ```

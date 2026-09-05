@@ -1,5 +1,5 @@
 {
-  "version": "32b1c698e953d07027b8b7dc60e5a5046e9354a3",
+  "version": "b57a2ee7d64e1fe26c9e08013cc6d7ae721b07be",
   "generated": "2026-09-05",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -37,7 +37,7 @@
     ".claude/commands/patch.md": "f18cc6e14f2a7af2406b684b02329b8a809f6bb3771dccd88e1f26bd09abc62e",
     ".claude/commands/sync-global-commands.md": "426ad0b8bd0fd375c604052c8bd7516835ed549b61c7dde3a65aa6e0735f927f",
     ".claude/commands/ticket.md": "6999b770c3e10f6b69c7a9fd4033f489f490b72919102a1fe8ab7d46c5da45ab",
-    ".claude/commands/consolidate-run.md": "9d87e70e7a89163c23ed7f746f7741be2b34be114899a00ac892bcc8f117eab4",
+    ".claude/commands/consolidate-run.md": "065c7cf207710d9a9697c5d578de64ba8900b739c745bca5bb8233f4e6b6d5a2",
     ".claude/commands/chore.md": "1d57db36518d6bd65caf8f2dbbd2e8353d7de774c253e789e570be740fe3d2ac",
     ".claude/commands/roadmap-status.md": "cafbf6908cc52cb2e996896efea69afbedf7281f702b14b25b0833565b1671d5",
     ".claude/commands/prime.md": "6635e8c48638d5720ea270666460e536eb87d49b4785518080e8040628785f73",

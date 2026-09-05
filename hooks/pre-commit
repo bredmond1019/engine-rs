@@ -56,6 +56,35 @@
 #   - `bastion` not on PATH                   -> gate 2 skipped, warning only
 #   - hooks/validate_brain_gate.sh missing    -> gate 2 skipped, warning only
 #
+# --- Gate 3: destructive-overwrite guard (status-marker survival) ----------------------
+#
+# Why this exists: `HQ.chore.a-write-to-an-existing-corpus-path-is-unguarded`. Four times
+# in one run an agent replaced an existing tracked corpus file believing it was authoring a
+# new one — twice destroying open work (a still-open BLOCKER, and a block record filed
+# minutes earlier) that no existing gate could see, because both overwrites landed through
+# an ordinary, successful `git commit`. Full design record, including why this lives at
+# COMMIT time rather than write time and the measurement that produced the signal below:
+# planning/HQ.chore.a-write-to-an-existing-corpus-path-is-unguarded/analysis.md (Q1/Q2).
+#
+# Signal (measured, not assumed — analysis.md Q2): raw deletion size/ratio does NOT
+# separate a destructive overwrite from a legitimate one — a real legitimate handoff.md
+# rewrite deletes proportionally MORE than the verified destructive commit. What does
+# separate every case tested: a same-path modification (no rename detected) that removes
+# every instance of a small open-work marker vocabulary (BLOCKER / STILL OPEN / UNRESOLVED)
+# the prior content had, with no same-change compensating write to planning/knowledge.md,
+# planning/memory.md, or an archive/-prefixed path (the D35-distillation / `/archive`
+# pattern, which records where deleted content went instead of just discarding it).
+# Implemented once in hooks/destructive_overwrite_gate.sh so it can also be run standalone
+# against historical commit pairs (see analysis.md's observed-run section).
+#
+# Degrades gracefully, same spirit as gates 1 and 2:
+#   - no HEAD commit yet (first commit in the repo)      -> gate 3 skipped, silent
+#   - no staged modified .md files                       -> gate 3 skipped, silent
+#   - hooks/destructive_overwrite_gate.sh missing         -> gate 3 skipped, warning only
+# DESTRUCTIVE_OVERWRITE_GATE=0 is the escape hatch, same shape as gate 2's
+# BRAIN_GRAPH_GATE=0, in case the marker vocabulary or compensating-write heuristic needs
+# to be widened before it has been proven at scale.
+#
 set -uo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
@@ -118,6 +147,25 @@ elif [ -f "$gate_script" ]; then
   fi
 else
   echo "pre-commit: warning: $gate_script not found — skipping corpus graph/structure gate." >&2
+fi
+
+# --- Gate 3: destructive-overwrite guard (status-marker survival) ----------------------
+gate3_script="$repo_root/hooks/destructive_overwrite_gate.sh"
+if [ "${DESTRUCTIVE_OVERWRITE_GATE:-1}" = "0" ]; then
+  : # gate 3 explicitly disabled via DESTRUCTIVE_OVERWRITE_GATE=0
+elif ! git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+  : # no HEAD yet (first commit in this repo) -- nothing to compare against
+elif [ -f "$gate3_script" ]; then
+  # shellcheck source=hooks/destructive_overwrite_gate.sh
+  source "$gate3_script"
+  if ! check_destructive_overwrite "HEAD" ""; then
+    echo "" >&2
+    echo "pre-commit: BLOCKED (gate 3) — destructive overwrite (see above)." >&2
+    echo "" >&2
+    fail=1
+  fi
+else
+  echo "pre-commit: warning: $gate3_script not found — skipping destructive-overwrite gate." >&2
 fi
 
 if [ "$fail" -ne 0 ]; then
