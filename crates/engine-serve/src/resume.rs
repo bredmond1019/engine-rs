@@ -1287,6 +1287,7 @@ mod campaign_resume_tests {
             &|_| {},
             false,
             campaign_id,
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("step one should integrate cleanly");
@@ -1334,6 +1335,7 @@ mod campaign_resume_tests {
             &|_| {},
             false,
             campaign_id,
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("step two should integrate cleanly on resume");

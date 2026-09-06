@@ -430,6 +430,7 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             &|_: &StepProgress| {},
             false,
             Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
     });
@@ -468,6 +469,7 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             &|_: &StepProgress| {},
             false,
             Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         ),
     )
     .await
@@ -517,6 +519,7 @@ async fn an_unanswered_hold_exceeding_its_deadline_fails_loudly_and_names_the_bl
         &|_: &StepProgress| {},
         false,
         Uuid::new_v4(),
+        &|_repo: &str, _id: &str| {},
     )
     .await
     .expect_err("an unanswered hold must exceed its deadline and fail loudly");

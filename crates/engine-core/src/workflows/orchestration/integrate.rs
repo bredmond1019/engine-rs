@@ -1106,6 +1106,24 @@ pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
 /// additive over the pre-`EN.12.D` behavior.
 pub type JournalSinkFn = dyn Fn(engine_contract::JournalRow) + Send + Sync;
 
+/// An injected "close this block in `planning/state.json`" seam
+/// (`EN.ticket.orchestration-close-block-node-not-wired` task 1) — called
+/// with `(repo, block_id)` exactly once per successfully-completed
+/// block-kind step, immediately after that step's lane-log `"closed"`
+/// entry is appended and before the next step's dependency gate is
+/// evaluated. Never called for a step that fails or bails.
+///
+/// Mirrors [`StepObserverFn`]'s shape (a plain, `Send + Sync` callback with
+/// no return value the loop's control flow depends on) rather than
+/// [`JournalSinkFn`]'s `Option`-wrapped, journal-only threading — unlike
+/// journaling, closing the block is not optional instrumentation: every
+/// caller must supply a real seam (task 2 wires
+/// `engine-serve::workflows::register_orchestration_with_registry`'s real,
+/// `CloseBlockNode`-backed closure through
+/// `OrchestrationRunNode::with_close_block`); tests pass a no-op or a
+/// recording stub instead.
+pub type CloseBlockFn = dyn Fn(&str, &str) + Send + Sync;
+
 /// Build one [`engine_contract::JournalRow`] and forward it to
 /// `journal_sink`, if any. A `None` sink (the default via
 /// [`integrate_chain`]) is a true no-op: no row is even constructed.
@@ -1377,6 +1395,7 @@ pub async fn integrate_chain(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
         chain,
@@ -1396,6 +1415,7 @@ pub async fn integrate_chain(
         step_observer,
         default_use_worktree,
         campaign_id,
+        close_block,
         None,
         None,
     )
@@ -1429,6 +1449,7 @@ pub async fn integrate_chain_with_journal(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
     journal_sink: &JournalSinkFn,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     integrate_chain_impl(
@@ -1449,6 +1470,7 @@ pub async fn integrate_chain_with_journal(
         step_observer,
         default_use_worktree,
         campaign_id,
+        close_block,
         Some(journal_sink),
         None,
     )
@@ -1484,6 +1506,7 @@ pub async fn integrate_chain_with_dispatch(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
     dispatcher: &Dispatcher,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
@@ -1505,6 +1528,7 @@ pub async fn integrate_chain_with_dispatch(
         step_observer,
         default_use_worktree,
         campaign_id,
+        close_block,
         journal_sink,
         Some(dispatcher),
     )
@@ -1530,6 +1554,7 @@ async fn integrate_chain_impl(
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
     campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
     dispatcher: Option<&Dispatcher>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
@@ -1993,6 +2018,18 @@ async fn integrate_chain_impl(
         // stamping it, not a path reachable today.
         require_profile_stamp(&entry, &step.repo, &step.block_id)?;
         append_lane_log_line(roadmap_dir, &entry)?;
+
+        // `EN.ticket.orchestration-close-block-node-not-wired` task 1: flip
+        // this step's block to `"closed"` in `planning/state.json` — the
+        // exact gap the reproduction in that ticket names. Called only
+        // here, on the genuinely-integrated path (after the merge-stage
+        // check above and the lane-log 'closed' line just written), never
+        // on a step that failed, bailed, or ran only inside a worktree
+        // that was never merged. Fires BEFORE the next step's dependency
+        // gate is evaluated (the next loop iteration's `check_dependencies`
+        // call), so `state.json` and `lane-log.jsonl` can no longer
+        // disagree about whether this block is closed.
+        close_block(&step.repo, &step.block_id);
 
         // `EN.12.D` task 4: the integrated-step decision point — the child
         // ran AND its state write verified.
@@ -2741,6 +2778,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("chain should complete once the hold clears");
@@ -2821,6 +2859,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         );
 
         let checker_fut = async {
@@ -2855,6 +2894,7 @@ mod tests {
                     &|_: &StepProgress| {},
                     false,
                     uuid::Uuid::new_v4(),
+                    &|_repo: &str, _id: &str| {},
                 ),
             )
             .await
@@ -2968,6 +3008,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("chain should complete");
@@ -2977,6 +3018,129 @@ mod tests {
         assert_eq!(parsed["lane"], json!("repo-a"));
         assert_eq!(parsed["repo"], json!("repo-a"));
         assert_eq!(parsed["status"], json!("closed"));
+    }
+
+    /// `EN.ticket.orchestration-close-block-node-not-wired` task 1: the
+    /// close-block seam fires exactly once per successfully-completed
+    /// block-kind step, with the correct `(repo, block_id)`, after that
+    /// step's lane-log `"closed"` entry is on disk and before the next
+    /// step's dependency gate is evaluated. Per D68, this test was run
+    /// BEFORE the seam was wired into this loop and observed to record no
+    /// calls at all (there was nothing to invoke `close_block` yet); it now
+    /// asserts the wired behavior.
+    #[tokio::test]
+    async fn close_block_fires_once_per_completed_step_in_lane_log_order() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-b"), "B.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let closed: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = closed.clone();
+        let close_block = move |repo: &str, block_id: &str| {
+            recorded
+                .lock()
+                .unwrap()
+                .push((repo.to_string(), block_id.to_string()));
+        };
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-b", "B.1")];
+
+        let outcomes = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &close_block,
+        )
+        .await
+        .expect("chain should complete");
+        assert_eq!(outcomes.len(), 2);
+
+        let recorded = closed.lock().unwrap();
+        assert_eq!(
+            recorded.as_slice(),
+            &[
+                ("repo-a".to_string(), "A.1".to_string()),
+                ("repo-b".to_string(), "B.1".to_string()),
+            ],
+            "close_block must fire exactly once per completed step, in order, \
+             with the correct (repo, block_id): {recorded:?}"
+        );
+    }
+
+    /// A step that fails never reaches the merge/lane-log path, so
+    /// `close_block` must never fire for it — closing a block whose step
+    /// never actually integrated would flip `state.json` to `"closed"` on
+    /// a run that produced nothing durable.
+    #[tokio::test]
+    async fn close_block_does_not_fire_for_a_failed_step() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let runner = failing_runner("A.1");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let closed: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = closed.clone();
+        let close_block = move |repo: &str, block_id: &str| {
+            recorded
+                .lock()
+                .unwrap()
+                .push((repo.to_string(), block_id.to_string()));
+        };
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let err = integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            uuid::Uuid::new_v4(),
+            &close_block,
+        )
+        .await
+        .expect_err("a failing step must propagate its error");
+        assert!(matches!(err, IntegrateError::Execute(_)));
+
+        assert!(
+            closed.lock().unwrap().is_empty(),
+            "close_block must never fire for a step whose execute_step call failed"
+        );
     }
 
     /// A real lane, when given, is used as-is rather than falling back to
@@ -3013,6 +3177,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("chain should complete");
@@ -3063,6 +3228,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("chain should complete");
@@ -3144,6 +3310,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect_err("a failing step must propagate its error");
@@ -3204,6 +3371,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect_err("the original step failure must still surface");
@@ -3281,6 +3449,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect_err("the chain must stop on the first failing step");
@@ -3387,6 +3556,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("a budget halt is not an error — it returns Ok with what already integrated");
@@ -3472,6 +3642,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("an unreached ceiling must never halt the chain");
@@ -3618,6 +3789,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             campaign_id,
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("all three steps should integrate");
@@ -3696,6 +3868,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             campaign_id,
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect_err("the checkpoint write failure must surface");
@@ -3766,6 +3939,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
         )
         .await
@@ -3825,6 +3999,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
         )
         .await
@@ -3880,6 +4055,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
         )
         .await
@@ -3929,6 +4105,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
         )
         .await
@@ -3978,6 +4155,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
         )
         .await
@@ -4101,6 +4279,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
             &dispatcher,
         )
@@ -4167,6 +4346,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
             &dispatcher,
         )
@@ -4296,6 +4476,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
             &dispatcher,
         )
@@ -4373,6 +4554,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
             &dispatcher,
         )
@@ -4435,6 +4617,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             None,
             &dispatcher,
         )
@@ -4485,6 +4668,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
             &dispatcher,
         )
@@ -4541,6 +4725,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect_err("a dispatch step with no Dispatcher configured must fail");
@@ -4628,6 +4813,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
         )
         .await
@@ -4688,6 +4874,7 @@ mod tests {
             &|_: &StepProgress| {},
             false,
             uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
         )
         .await
         .expect("chain should complete");

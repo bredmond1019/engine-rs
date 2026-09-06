@@ -1077,6 +1077,13 @@ impl Node for OrchestrationRunNode {
                     // The resolved, event-overridable campaign id (EN.11.E
                     // task 3) — replaces task 2's freshly-minted placeholder.
                     campaign_id,
+                    // `EN.ticket.orchestration-close-block-node-not-wired`
+                    // task 1 added `integrate_chain`'s `close_block`
+                    // parameter; this call site is a placeholder no-op
+                    // pending task 2, which threads a real, `CloseBlockNode`
+                    // -backed seam through a `with_close_block(...)` builder
+                    // here (mirroring `with_resolve_depends_on` et al.).
+                    &|_repo: &str, _id: &str| {},
                 ))
                 .map_err(|err| NodeError::new(err.to_string()))
             })
