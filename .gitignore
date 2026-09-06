@@ -16,3 +16,13 @@ target/
 # crates/engine-core/planning/ (knowledge.md, memory.md, archived SDLC worklogs)
 # to its public GitHub remote for weeks. Anchored-rule gap, not a one-off.
 **/planning/
+
+# .cargo/config.toml — D57 un-track (docs/decisions/D57-rust-sdlc-iteration-speed.md). Working-tree
+# file may stay; it must never be tracked again — this fleet re-added it once before, the same day
+# D57 landed. It holds no live config: NO `rustc-wrapper = "sccache"` here, deliberately. Measured
+# 2026-07-29: sccache showed 25 compile requests / 0 executed / 0 hits / 0 misses. sccache refuses to
+# cache incremental compilations, and cargo passes `-C incremental` for the dev/test profile, so the
+# two are mutually exclusive — incremental wins for a loop that re-edits one crate 10-30 times.
+# Cold-CI route, if ever needed: RUSTC_WRAPPER + CARGO_INCREMENTAL=0 set in the CI environment, not
+# in this file.
+.cargo/config.toml
