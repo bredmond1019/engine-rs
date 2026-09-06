@@ -52,6 +52,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use engine_contract::TaskContext;
@@ -1092,6 +1093,50 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
 /// SSE through the same three-way fan-out `spawn_run`'s own node-boundary
 /// `on_progress` already used (`suspend::publish_step_progress`, reusing
 /// `suspend::progress_fanout`) — never a second progress mechanism.
+///
+/// Build the real close-block seam
+/// (`EN.ticket.orchestration-close-block-node-not-wired` task 2): flips
+/// `repo:block_id` to `"closed"` under `brain_root` via
+/// [`engine_core::workflows::sdlc_flow::close_block::close_block_direct`]'s
+/// guarded write (advisory lock, D71 operator gate,
+/// validate-then-rollback — the same guard `CloseBlockNode` applies for
+/// `SDLC_TASK`/`SDLC_FLOW`). `brain_root` — NOT a per-repo root — mirrors
+/// exactly what `CloseBlockNode::evaluate` itself resolves via
+/// `find_brain_root` before calling the same `attempt_close` this wraps:
+/// `close_block_direct`'s `root` parameter is the brain root
+/// `resolve_state_path`/`mev::set_block_status` locate each repo's own
+/// `planning/state.json` beneath, keyed by `repo_slug` — a per-repo
+/// resolved path (as `RepoRegistry::resolve` would give) is the WRONG
+/// value here. `integrate_chain`'s `close_block` seam returns nothing for
+/// its caller to act on, so an outcome other than a clean `Closed` is
+/// reported via `tracing::warn!` rather than silently swallowed — the
+/// block is simply left open in `planning/state.json`, exactly the
+/// pre-fix behavior, and the next run (or an operator) can still close it
+/// by hand.
+#[must_use]
+fn build_close_block_seam(
+    brain_root: PathBuf,
+) -> Arc<engine_core::workflows::orchestration::integrate::CloseBlockFn> {
+    Arc::new(move |repo: &str, block_id: &str| {
+        let outcome = engine_core::workflows::sdlc_flow::close_block::close_block_direct(
+            &brain_root,
+            repo,
+            block_id,
+        );
+        if !matches!(
+            outcome,
+            engine_core::workflows::sdlc_flow::close_block::CloseOutcome::Closed { .. }
+        ) {
+            tracing::warn!(
+                repo,
+                block_id,
+                outcome = %outcome.label(),
+                "close_block: state.json close did not report a clean CLOSED outcome"
+            );
+        }
+    })
+}
+
 pub fn register_orchestration_with_registry(
     dispatcher: &mut Dispatcher,
     repo_reg: Option<Arc<RepoRegistry>>,
@@ -1124,6 +1169,12 @@ pub fn register_orchestration_with_registry(
             // root.
             let conductor_repo_registry = gates_repo_registry.clone();
             let conductor_brain_root = orch_event.brain_root.clone();
+            // `EN.ticket.orchestration-close-block-node-not-wired` task 2:
+            // this event's own `brain_root` — `close_block_direct` (via
+            // `build_close_block_seam`, below) resolves a repo's
+            // `planning/state.json` from this the same way
+            // `CloseBlockNode::evaluate` resolves it via `find_brain_root`.
+            let close_block_root = orch_event.brain_root.clone();
 
             let gates = Arc::new(
                 engine_core::workflows::orchestration::corpus_gates::CorpusGates::new(
@@ -1212,9 +1263,26 @@ pub fn register_orchestration_with_registry(
                     )
                 });
 
+            // `EN.ticket.orchestration-close-block-node-not-wired` task 2:
+            // a real close-block seam — built by `build_close_block_seam`
+            // (below), the same way the four gate closures and the
+            // conductor seam above are: resolving `repo`'s root through
+            // `close_block_repo_registry` and flipping `repo:block_id` to
+            // `"closed"` in that repo's own `planning/state.json`. Split
+            // out into its own function (rather than inlined here like the
+            // conductor seam) so the registration's own test module can
+            // drive the REAL closure directly against a fixture repo,
+            // rather than only through a full dispatch that this fixture
+            // harness cannot carry to a genuine step completion (see the
+            // module doc of `engine-serve/tests/orchestration_registration_gates.rs`
+            // on why a step here always fails before reaching the
+            // integrated/close path).
+            let close_block_seam = build_close_block_seam(close_block_root);
+
             let node = engine_core::workflows::orchestration::graph::OrchestrationRunNode::new()
                 .with_campaign_id(campaign_id)
                 .with_conductor(conductor_seam)
+                .with_close_block(close_block_seam)
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);
                     if let Some(err) = depends_on_gates.take_error() {
@@ -3422,6 +3490,108 @@ mod tests {
         ] }
     ]
 }"#
+    }
+
+    // --- close-block seam (EN.ticket.orchestration-close-block-node-not-wired task 2) ---
+
+    /// A two-repo brain root (mirroring `engine-serve/tests/orchestration_registration_gates.rs`'s
+    /// own fixture convention): `repo-b`'s only block `B.1` `depends_on`
+    /// `repo-a`'s `A.1`, and `A.1` starts `"open"` — the exact shape a
+    /// dependent second block needs its first block's close to satisfy.
+    fn two_repo_dependency_brain_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_a_planning = dir.path().join("repo-a").join("planning");
+        std::fs::create_dir_all(&repo_a_planning).expect("mkdir repo-a/planning");
+        std::fs::write(
+            repo_a_planning.join("state.json"),
+            r#"{
+    "repo": "repo-a",
+    "kind": "project",
+    "updated": "2026-09-06",
+    "tracks": [
+        { "title": "wave 1", "blocks": [
+            { "id": "A.1", "title": "a1", "status": "open" }
+        ] }
+    ]
+}"#,
+        )
+        .expect("write repo-a/state.json");
+
+        let repo_b_planning = dir.path().join("repo-b").join("planning");
+        std::fs::create_dir_all(&repo_b_planning).expect("mkdir repo-b/planning");
+        std::fs::write(
+            repo_b_planning.join("state.json"),
+            r#"{
+    "repo": "repo-b",
+    "kind": "project",
+    "updated": "2026-09-06",
+    "tracks": [
+        { "title": "wave 1", "blocks": [
+            { "id": "B.1", "title": "b1", "status": "open", "depends_on": [
+                {"type": "block", "repo": "repo-a", "id": "A.1"}
+            ] }
+        ] }
+    ]
+}"#,
+        )
+        .expect("write repo-b/state.json");
+
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n\n\
+             [[repos]]\nslug = \"repo-b\"\nrepo_path = \"repo-b\"\n",
+        )
+        .expect("write brain.toml");
+        dir
+    }
+
+    /// `build_close_block_seam` is the exact closure
+    /// `register_orchestration_with_registry` wires via
+    /// `with_close_block(...)` — this test drives it directly (not a
+    /// hand-rolled stub) against a real two-repo fixture, and confirms it
+    /// is what actually flips `repo-a`'s `A.1` in `planning/state.json`
+    /// from `"open"` to `"closed"` — the same real write the registration
+    /// path performs. Before the seam fires, `CorpusGates` (the same
+    /// gate-reading mechanism `register_orchestration_with_registry` wires
+    /// `resolve_depends_on`/`is_edge_met` to) reports `repo-b`'s `B.1` as
+    /// blocked on `repo-a`'s `A.1`; after, a FRESH `CorpusGates` reading
+    /// the same files reports the edge met — i.e. the second block, `B.1`,
+    /// would now be admitted to start. A fresh `CorpusGates` instance is
+    /// used for the "after" read deliberately: `CorpusGates` caches each
+    /// repo's `state.json` for the life of one run (see that module's own
+    /// doc), so reusing the "before" instance would read back its own
+    /// stale cache regardless of what this seam just wrote to disk — this
+    /// test is about the seam's real on-disk effect, not that cache's
+    /// scope.
+    #[test]
+    fn build_close_block_seam_flips_state_json_so_the_dependent_block_becomes_admissible() {
+        let dir = two_repo_dependency_brain_root();
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry should build"));
+
+        let before_gates =
+            engine_core::workflows::orchestration::corpus_gates::CorpusGates::new(registry.clone());
+        assert!(
+            !before_gates.is_edge_met("repo-a", "A.1"),
+            "A.1 starts open — repo-b's B.1 must not be admitted yet"
+        );
+
+        let seam = build_close_block_seam(dir.path().to_path_buf());
+        seam("repo-a", "A.1");
+
+        let raw = std::fs::read_to_string(dir.path().join("repo-a/planning/state.json"))
+            .expect("read repo-a/state.json back");
+        assert!(
+            raw.contains("\"status\": \"closed\"") || raw.contains("\"status\":\"closed\""),
+            "the real close-block seam must flip A.1's authored status to closed on disk, got: {raw}"
+        );
+
+        let after_gates =
+            engine_core::workflows::orchestration::corpus_gates::CorpusGates::new(registry);
+        assert!(
+            after_gates.is_edge_met("repo-a", "A.1"),
+            "once A.1 is closed on disk, a fresh dependency-gate read must admit repo-b's B.1"
+        );
     }
 
     #[test]

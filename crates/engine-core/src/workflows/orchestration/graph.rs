@@ -116,7 +116,8 @@ use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome
 use super::execute::{default_flow_runner, EngineKind, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
 use super::integrate::{
-    integrate_chain, resolve_roadmap_dir, HoldSource, JournalSinkFn, NeverHeld, StepProgress,
+    integrate_chain, resolve_roadmap_dir, CloseBlockFn, HoldSource, JournalSinkFn, NeverHeld,
+    StepProgress,
 };
 
 /// The registered workflow type string, used both to register the workflow
@@ -640,6 +641,16 @@ pub struct OrchestrationRunNode {
     /// un-injected run emits nothing and behaves exactly as before this
     /// seam existed (CLAUDE.md standing rule 6).
     step_observer: StepObserverArc,
+    /// `EN.ticket.orchestration-close-block-node-not-wired` task 2: the
+    /// real seam [`integrate::integrate_chain`]'s `close_block` parameter
+    /// is threaded from — called exactly once per successfully-completed
+    /// block-kind step, flipping that step's block to `"closed"` in
+    /// `planning/state.json`. Defaults to a no-op
+    /// ([`Self::new`]) so an un-injected run behaves exactly as it did
+    /// before this field existed (CLAUDE.md standing rule 6); production
+    /// registration (`engine-serve::workflows::register_orchestration_with_registry`)
+    /// always overrides it via [`Self::with_close_block`].
+    close_block: Arc<CloseBlockFn>,
     /// A pre-resolved campaign id, supplied by a caller that already ran
     /// [`resolve_campaign_id`] itself (e.g. to register this run's
     /// cancellation token for campaign-scoped abort before the workflow
@@ -692,6 +703,7 @@ impl OrchestrationRunNode {
             run_flow: None,
             cancellation_token: None,
             step_observer: Arc::new(|_progress: &StepProgress| {}),
+            close_block: Arc::new(|_repo: &str, _block_id: &str| {}),
             campaign_id: None,
             conductor: None,
             journal_sink: None,
@@ -767,6 +779,23 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_step_observer(mut self, observer: StepObserverArc) -> Self {
         self.step_observer = observer;
+        self
+    }
+
+    /// Wire the real close-block seam — called exactly once per
+    /// successfully-completed block-kind step by
+    /// [`integrate::integrate_chain`], flipping that step's block to
+    /// `"closed"` in `planning/state.json`
+    /// (`EN.ticket.orchestration-close-block-node-not-wired` task 2).
+    /// With no seam wired (the default, [`Self::new`]), a step's
+    /// completion is still recorded in `lane-log.jsonl` but
+    /// `planning/state.json`'s authored status is left untouched — the
+    /// exact gap this ticket exists to close, preserved only as a
+    /// behavior-stable fallback for a caller that has not yet wired this
+    /// builder.
+    #[must_use]
+    pub fn with_close_block(mut self, close_block: Arc<CloseBlockFn>) -> Self {
+        self.close_block = close_block;
         self
     }
 
@@ -1009,6 +1038,9 @@ impl Node for OrchestrationRunNode {
         // Cloned before the `spawn_blocking` closure like every other owned
         // seam here — `Arc` clone, `Send + Sync + 'static`.
         let step_observer = self.step_observer.clone();
+        // `EN.ticket.orchestration-close-block-node-not-wired` task 2:
+        // cloned the same way — `Arc` clone, `Send + Sync + 'static`.
+        let close_block = self.close_block.clone();
 
         // `execute::FlowFuture` is deliberately not `Send` (see its own doc
         // comment: `Workflow::run`'s `OnProgress` callback is not `Send`),
@@ -1078,12 +1110,12 @@ impl Node for OrchestrationRunNode {
                     // task 3) — replaces task 2's freshly-minted placeholder.
                     campaign_id,
                     // `EN.ticket.orchestration-close-block-node-not-wired`
-                    // task 1 added `integrate_chain`'s `close_block`
-                    // parameter; this call site is a placeholder no-op
-                    // pending task 2, which threads a real, `CloseBlockNode`
-                    // -backed seam through a `with_close_block(...)` builder
-                    // here (mirroring `with_resolve_depends_on` et al.).
-                    &|_repo: &str, _id: &str| {},
+                    // task 2: the real, `close_block_direct`-backed seam
+                    // wired via `with_close_block(...)` — production
+                    // registration (`engine-serve`) always supplies one;
+                    // an un-injected `OrchestrationRunNode::new()` falls
+                    // back to a no-op, exactly the pre-task-2 behavior.
+                    close_block.as_ref(),
                 ))
                 .map_err(|err| NodeError::new(err.to_string()))
             })

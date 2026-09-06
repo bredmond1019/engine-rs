@@ -917,6 +917,31 @@ fn attempt_close(root: &Path, key: &str, repo_slug: &str, lock_timeout: Duration
     })
 }
 
+/// Close `repo:block_id` directly against `root`'s `planning/state.json`,
+/// under the same advisory lock + D71 operator gate +
+/// validate-then-rollback guard [`CloseBlockNode::process`] applies —
+/// without going through `ctx`/a `state_source` node's committed
+/// `SDLCState`.
+///
+/// `ORCHESTRATION`'s own close-block seam
+/// (`EN.ticket.orchestration-close-block-node-not-wired` task 2,
+/// [`crate::workflows::orchestration::integrate::CloseBlockFn`]) has no
+/// terminal node's stamped state to read a `block_id`/worktree back out
+/// of — `integrate_chain`'s caller already knows exactly which
+/// `(repo, block_id)` a just-integrated chain step closes, and calls this
+/// directly rather than driving a whole `CloseBlockNode` through a `ctx`
+/// it does not have. Skip-check semantics
+/// (`blocked`/`reconcile_failed`/partial-`task_range`) do not apply here:
+/// `integrate_chain` already gates this call to only the genuinely-
+/// integrated path (see that module's own doc on `close_block`), the same
+/// invariant those skip checks exist to enforce for `SDLC_TASK`/
+/// `SDLC_FLOW`.
+#[must_use]
+pub fn close_block_direct(root: &Path, repo: &str, block_id: &str) -> CloseOutcome {
+    let key = format!("{repo}:{block_id}");
+    attempt_close(root, &key, repo, DEFAULT_LOCK_TIMEOUT)
+}
+
 impl CloseBlockNode {
     /// The full skip-check -> root-resolution -> guarded-close pipeline,
     /// split out from `process` so it never has to touch `ctx` mutably —
