@@ -24,7 +24,7 @@ the engine can do, and [architecture.md](architecture.md) for how it's built.
 |---|---|
 | **[workflows/](workflows/README.md)** | **"What can this thing do, and how do I run it."** Every registered workflow, what each does, and how to trigger one. Also holds every per-workflow reference doc — file listing at [workflows/index.md](workflows/index.md) |
 | [architecture.md](architecture.md) | How the engine is built: crate layout, core types, injectable seams, data flow |
-| [cli.md](cli.md) | The command-line surface — synopsis, subcommands, flags, exit codes |
+| [cli.md](cli.md) | Retired — engine-rs has no CLI; kept only so existing links resolve |
 | [coming-soon.md](coming-soon.md) | What is planned and **does not exist yet**, each with its block ID and what it waits on |
 
 ## Tuning and running workflows

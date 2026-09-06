@@ -26,7 +26,7 @@ and in Postgres.
   out a typed, compiled alternative — see [docs/architecture.md](docs/architecture.md).
 
 There is **no standalone `engine-rs` binary**. It is a set of libraries meant to be embedded in a
-host process — see [docs/cli.md](docs/cli.md) and "No standalone binary" below.
+host process — see "No standalone binary" below (docs/cli.md is retired).
 
 ## Quickstart
 
@@ -101,8 +101,8 @@ flowchart TD
 
 There is no `main.rs` anywhere under `crates/` — `engine-serve` is a library meant to be linked
 into a host binary that calls `engine_serve::init_tracing()` and mounts its HTTP routes. See
-[docs/cli.md](docs/cli.md), which documents this explicitly and is the place a future CLI's
-synopsis/subcommands would land if one is ever added.
+docs/cli.md, retired, which documents this explicitly and would be the place a future CLI's
+synopsis/subcommands landed if one were ever added.
 
 ## Testing
 
@@ -163,7 +163,7 @@ and because of the three path dependencies above, it checks out `mev`, `okf-core
 - [docs/index.md](docs/index.md) — full documentation index, including per-workflow reference
   docs (content pipeline, research agent, SDLC graphs, and more).
 - [docs/architecture.md](docs/architecture.md), [docs/testing.md](docs/testing.md),
-  [docs/data-contract.md](docs/data-contract.md), [docs/cli.md](docs/cli.md)
+  [docs/data-contract.md](docs/data-contract.md)
 - Sibling repos this workspace depends on: <https://github.com/bredmond1019/mev>,
   <https://github.com/bredmond1019/okf-core>, <https://github.com/bredmond1019/claude-code-rs>
 
