@@ -277,6 +277,7 @@ async fn two_repo_chain_runs_end_to_end_with_per_step_cwd_and_one_lane_log_line_
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -336,6 +337,7 @@ async fn unmet_dependency_stops_the_chain_before_it_starts_and_names_the_edge() 
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -417,6 +419,7 @@ async fn admission_at_capacity_waits_rather_than_proceeding_or_failing_inner() {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -538,6 +541,7 @@ async fn an_operator_hold_pauses_and_resumes_without_rerunning_completed_blocks_
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -611,6 +615,7 @@ async fn a_corrupted_state_write_fails_the_run_loudly() {
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -796,6 +801,7 @@ async fn engine_written_lane_log_line_is_readable_by_the_real_discovery_script_w
         Some("prove-readability-lane"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -943,6 +949,7 @@ async fn cancellation_after_the_first_step_stops_the_chain_before_the_second_run
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -1046,6 +1053,7 @@ async fn a_chain_parked_on_a_never_clearing_hold_aborts_promptly_on_cancel_inner
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -1115,6 +1123,7 @@ async fn n_step_chain_calls_the_observer_exactly_n_times_with_correct_indices() 
         None,
         &observer,
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1189,6 +1198,7 @@ async fn the_observer_fires_after_the_lane_log_line_is_appended() {
         None,
         &observer,
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1229,6 +1239,7 @@ async fn no_observer_injected_changes_nothing() {
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1602,6 +1613,7 @@ async fn two_step_chain_attributes_cost_and_tokens_to_the_step_that_spent_them_w
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1926,6 +1938,7 @@ async fn mixed_research_block_chain_journals_research_before_block_runs() {
         Some("l"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         Some(&move |row| sink_fn(row)),
@@ -2020,6 +2033,7 @@ async fn unregistered_dispatch_key_stops_the_chain_through_the_integration_path(
         Some("l"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         Some(&move |row| sink_fn(row)),
@@ -2334,6 +2348,7 @@ async fn debrief_renders_for_a_campaign_produced_by_an_explicit_block_list_chain
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         campaign_id,
         &|_repo: &str, _id: &str| {},
         Some(&move |row| sink_fn(row)),
@@ -2516,6 +2531,7 @@ async fn path_b_the_same_action_under_unrestricted_permits_and_the_chain_complet
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -2572,6 +2588,7 @@ async fn path_c_the_run_record_written_under_each_profile_carries_that_profiles_
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )

@@ -999,6 +999,11 @@ impl Node for OrchestrationRunNode {
         // `Copy`, so this is captured into the `spawn_blocking` closure by
         // value like `poll_interval` above — no `Arc`/clone needed.
         let default_use_worktree = policy.default_use_worktree;
+        // `EN.ticket.orchestration-auto-pr-hardcoded-true-in-integrate-chain`
+        // task 1: captured the same way `default_use_worktree` is above —
+        // `bool` is `Copy`, so this crosses the `spawn_blocking` closure
+        // by value, no `Arc`/clone needed.
+        let default_auto_pr = policy.default_auto_pr;
         // `EN.12.F` Task 5: a conductor-proposed ("autonomous") run gets a
         // real campaign budget ceiling — `integrate::integrate_chain`'s
         // `campaign_budget` parameter has checked this at every block
@@ -1106,6 +1111,7 @@ impl Node for OrchestrationRunNode {
                     resolved_lane.as_deref(),
                     step_observer.as_ref(),
                     default_use_worktree,
+                    default_auto_pr,
                     // The resolved, event-overridable campaign id (EN.11.E
                     // task 3) — replaces task 2's freshly-minted placeholder.
                     campaign_id,

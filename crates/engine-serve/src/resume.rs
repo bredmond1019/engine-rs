@@ -1286,6 +1286,7 @@ mod campaign_resume_tests {
             None,
             &|_| {},
             false,
+            true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
         )
@@ -1334,6 +1335,7 @@ mod campaign_resume_tests {
             None,
             &|_| {},
             false,
+            true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
         )

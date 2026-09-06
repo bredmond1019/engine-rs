@@ -428,6 +428,18 @@ substitute for, giving the sandbox a real GitHub remote: with `auto_pr: false`,
 `PullRequestNode` is never exercised, so a run that must actually test the PR path still needs a
 real GitHub-hosted remote.
 
+**`default_auto_pr` now actually suppresses `PullRequestNode` on a real `ORCHESTRATION` dispatch,
+not only on a standalone `SDLC_TASK`/`SDLC_FLOW` dispatch**
+(`EN.ticket.orchestration-auto-pr-hardcoded-true-in-integrate-chain`). Before this fix,
+`OrchestrationRunNode::process` resolved the policy correctly, but `integrate_chain_impl`'s only
+call site of `execute_step` passed a literal `true` for `auto_pr` instead of the resolved value, so
+`policy.default_auto_pr: false` on an `ORCHESTRATION` event had zero effect — a real dispatch still
+hit `PullRequestNode` and, against a repo with no PR-capable remote, still bailed at
+`gh pr create failed: none of the git remotes configured for this repository point to a known
+GitHub host`. `policy.default_auto_pr` is now threaded from `OrchestrationRunNode::process` through
+`integrate_chain`/`integrate_chain_impl` into that `execute_step` call, mirroring how
+`default_use_worktree` was already threaded.
+
 ### `ORCHESTRATION` isolates by default
 
 `OrchestrationPolicy::default_use_worktree` is `true`: a dispatch that carries no `policy` field —

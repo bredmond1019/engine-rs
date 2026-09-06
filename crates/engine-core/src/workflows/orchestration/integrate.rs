@@ -1394,6 +1394,7 @@ pub async fn integrate_chain(
     lane: Option<&str>,
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
+    default_auto_pr: bool,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
@@ -1414,6 +1415,7 @@ pub async fn integrate_chain(
         lane,
         step_observer,
         default_use_worktree,
+        default_auto_pr,
         campaign_id,
         close_block,
         None,
@@ -1448,6 +1450,7 @@ pub async fn integrate_chain_with_journal(
     lane: Option<&str>,
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
+    default_auto_pr: bool,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: &JournalSinkFn,
@@ -1469,6 +1472,7 @@ pub async fn integrate_chain_with_journal(
         lane,
         step_observer,
         default_use_worktree,
+        default_auto_pr,
         campaign_id,
         close_block,
         Some(journal_sink),
@@ -1505,6 +1509,7 @@ pub async fn integrate_chain_with_dispatch(
     lane: Option<&str>,
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
+    default_auto_pr: bool,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
@@ -1527,6 +1532,7 @@ pub async fn integrate_chain_with_dispatch(
         lane,
         step_observer,
         default_use_worktree,
+        default_auto_pr,
         campaign_id,
         close_block,
         journal_sink,
@@ -1553,6 +1559,7 @@ async fn integrate_chain_impl(
     lane: Option<&str>,
     step_observer: &StepObserverFn,
     default_use_worktree: bool,
+    default_auto_pr: bool,
     campaign_id: uuid::Uuid,
     close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
@@ -1888,19 +1895,13 @@ async fn integrate_chain_impl(
             crate::policy::permission::resolve_permission_profile(
                 &registry.brain_root().join("brain.toml"),
             );
-        // `default_auto_pr` is hardcoded `true` here — behavior-stable
-        // with today's implicit default (the SDLC_FLOW schema's own serde
-        // default) — until a future task threads the real
-        // `OrchestrationPolicy::default_auto_pr` knob through
-        // `integrate_chain` from `OrchestrationRunNode::process`, the same
-        // shape `default_use_worktree` followed above it.
         let outcome = match execute_step(
             step,
             resolve_engine,
             registry,
             run_flow,
             default_use_worktree,
-            true,
+            default_auto_pr,
             campaign_id,
             None,
             None,
@@ -2097,6 +2098,8 @@ mod tests {
 
     use serde_json::json;
 
+    use super::super::execute::FlowInvocation;
+
     fn step(repo: &str, block_id: &str) -> ChainStep {
         ChainStep {
             repo: repo.to_string(),
@@ -2125,6 +2128,29 @@ mod tests {
         let recorded = calls.clone();
         let runner: FlowRunner = Arc::new(move |invocation| {
             recorded.lock().unwrap().push(invocation.block_id.clone());
+            Box::pin(async {
+                Ok(engine_contract::TaskContext {
+                    event: json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: json!({}),
+                    node_runs: std::collections::HashMap::new(),
+                })
+            })
+        });
+        (runner, calls)
+    }
+
+    /// Like [`recording_runner`] but captures the whole
+    /// [`FlowInvocation`], not just its `block_id` — used
+    /// by the `default_auto_pr` threading tests below to assert on
+    /// `invocation.auto_pr` directly, proving the value actually reached
+    /// the child invocation rather than merely that the chain didn't
+    /// error.
+    fn recording_invocation_runner() -> (FlowRunner, Arc<Mutex<Vec<FlowInvocation>>>) {
+        let calls: Arc<Mutex<Vec<FlowInvocation>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: FlowRunner = Arc::new(move |invocation| {
+            recorded.lock().unwrap().push(invocation);
             Box::pin(async {
                 Ok(engine_contract::TaskContext {
                     event: json!({}),
@@ -2777,6 +2803,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -2858,6 +2885,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         );
@@ -2893,6 +2921,7 @@ mod tests {
                     None,
                     &|_: &StepProgress| {},
                     false,
+                    true,
                     uuid::Uuid::new_v4(),
                     &|_repo: &str, _id: &str| {},
                 ),
@@ -3007,6 +3036,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3018,6 +3048,110 @@ mod tests {
         assert_eq!(parsed["lane"], json!("repo-a"));
         assert_eq!(parsed["repo"], json!("repo-a"));
         assert_eq!(parsed["status"], json!("closed"));
+    }
+
+    /// `EN.ticket.orchestration-auto-pr-hardcoded-true-in-integrate-chain`
+    /// task 1: `integrate_chain`'s `default_auto_pr: false` argument must
+    /// actually reach the child `FlowInvocation`, not be dropped at the
+    /// `execute_step` call site inside `integrate_chain_impl` the way it
+    /// was hardcoded to `true` before this fix. Per D68, this is the
+    /// false-case half of the pair — its companion (`_true` below) proves
+    /// the fix threads the value both ways rather than flipping today's
+    /// hardcode to a new one.
+    #[tokio::test]
+    async fn default_auto_pr_false_reaches_the_captured_invocation() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, calls) = recording_invocation_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            false,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+        )
+        .await
+        .expect("chain should complete");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            !recorded[0].auto_pr,
+            "integrate_chain's default_auto_pr:false must reach the captured \
+             FlowInvocation as auto_pr:false, not the old hardcoded true"
+        );
+    }
+
+    /// Companion to `default_auto_pr_false_reaches_the_captured_invocation`
+    /// — asserts `default_auto_pr:true` still reaches the invocation as
+    /// `true`, so the fix threads the resolved value rather than merely
+    /// flipping the hardcode's direction.
+    #[tokio::test]
+    async fn default_auto_pr_true_reaches_the_captured_invocation() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, calls) = recording_invocation_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        integrate_chain(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+        )
+        .await
+        .expect("chain should complete");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].auto_pr,
+            "integrate_chain's default_auto_pr:true must reach the captured \
+             FlowInvocation as auto_pr:true"
+        );
     }
 
     /// `EN.ticket.orchestration-close-block-node-not-wired` task 1: the
@@ -3068,6 +3202,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &close_block,
         )
@@ -3130,6 +3265,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &close_block,
         )
@@ -3176,6 +3312,7 @@ mod tests {
             Some("backend"),
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3227,6 +3364,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3309,6 +3447,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3370,6 +3509,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3448,6 +3588,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3555,6 +3696,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3641,6 +3783,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -3788,6 +3931,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
         )
@@ -3867,6 +4011,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             campaign_id,
             &|_repo: &str, _id: &str| {},
         )
@@ -3938,6 +4083,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -3998,6 +4144,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -4054,6 +4201,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -4104,6 +4252,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -4154,6 +4303,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -4278,6 +4428,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -4345,6 +4496,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -4475,6 +4627,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -4553,6 +4706,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -4616,6 +4770,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             None,
@@ -4667,6 +4822,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             Some(&move |row| sink_fn(row)),
@@ -4724,6 +4880,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -4812,6 +4969,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
             &move |row| sink_fn(row),
@@ -4873,6 +5031,7 @@ mod tests {
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )

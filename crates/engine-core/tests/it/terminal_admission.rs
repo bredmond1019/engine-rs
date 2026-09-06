@@ -429,6 +429,7 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         )
@@ -468,6 +469,7 @@ async fn a_held_step_consumes_no_permit_while_a_second_lane_proceeds_at_the_ceil
             None,
             &|_: &StepProgress| {},
             false,
+            true,
             Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
         ),
@@ -518,6 +520,7 @@ async fn an_unanswered_hold_exceeding_its_deadline_fails_loudly_and_names_the_bl
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )

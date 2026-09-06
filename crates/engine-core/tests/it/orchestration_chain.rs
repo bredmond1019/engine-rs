@@ -573,6 +573,7 @@ async fn block_n_plus_1s_tree_contains_block_ns_work() {
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -806,6 +807,7 @@ async fn a_failed_setup_worktree_step_stops_the_chain_via_execute_step() {
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -990,6 +992,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         Some("en-11-b-lane"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1018,6 +1021,7 @@ async fn lane_log_lines_use_the_fixed_ts_lane_repo_block_status_note_shape() {
         Some("en-11-b-lane"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1193,6 +1197,7 @@ async fn abort_between_blocks_leaves_block_one_committed_and_block_two_unstarted
         Some("en-11-f-lane"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1308,6 +1313,7 @@ async fn campaign_ceiling_below_one_blocks_cost_halts_at_first_boundary() {
         Some("en-11-f-lane"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1427,6 +1433,7 @@ async fn an_unmergeable_step_fails_the_step_and_never_closes_it() {
         Some("en-11-c-merge-fail-lane"),
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1520,6 +1527,7 @@ async fn planning_symlink_still_resolves_into_its_vault_after_the_merge_stage() 
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1708,6 +1716,7 @@ async fn run_recall_then_block_chain(
         None,
         &|_: &StepProgress| {},
         false,
+        true,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
         Some(&move |row: JournalRow| sink_fn(row)),
@@ -1868,6 +1877,7 @@ async fn unstated_policy_event_resolves_to_use_worktree_true_on_the_invocation()
         None,
         &|_: &StepProgress| {},
         policy.default_use_worktree,
+        policy.default_auto_pr,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
@@ -1927,6 +1937,7 @@ async fn explicit_false_policy_event_resolves_to_use_worktree_false_on_the_invoc
         None,
         &|_: &StepProgress| {},
         policy.default_use_worktree,
+        policy.default_auto_pr,
         Uuid::new_v4(),
         &|_repo: &str, _id: &str| {},
     )
