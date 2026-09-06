@@ -3,7 +3,6 @@ name = "engine-serve"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-publish.workspace = true
 
 [dependencies]
 engine-core = { path = "../engine-core" }
