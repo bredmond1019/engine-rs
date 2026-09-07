@@ -747,6 +747,13 @@ async fn node_context(
                     completed_at: Utc::now(),
                     status: NodeInvocationStatus::Success,
                     error: None,
+                    // Populated by EN.14.G task 2, which writes the
+                    // capped/marked payload at this same site; task 1 only
+                    // adds the fields, so this dispatch path keeps
+                    // compiling with the payload-retention no-op.
+                    payload: None,
+                    payload_truncated: false,
+                    payload_cap_bytes: 0,
                 },
             );
             on_progress(&ok_ctx);
@@ -791,6 +798,11 @@ async fn node_context(
                     completed_at: Utc::now(),
                     status: NodeInvocationStatus::Failed,
                     error: Some(err.message.clone()),
+                    // See the Ok branch above — task 2 wires this branch's
+                    // real cap accounting; task 1 only adds the fields.
+                    payload: None,
+                    payload_truncated: false,
+                    payload_cap_bytes: 0,
                 },
             );
             on_progress(&err_ctx);
