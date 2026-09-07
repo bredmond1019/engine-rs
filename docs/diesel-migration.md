@@ -179,7 +179,7 @@ Also unresolved from D84 Amendment 1 and not this port's to fix, but it will blo
 ## Still untested — know the edges of the evidence
 
 - Diesel's typed DSL against a `jsonb` column (would it close the one unchecked query?).
-- `node_invocations` — does not exist yet; nothing was modelled for it.
+- `node_invocations` — now exists (`EN.14.F`, [`0002_create_node_invocations.sql`](../crates/engine-store/migrations/0002_create_node_invocations.sql), read/write through `engine_store::{insert_node_invocation, list_node_invocations_for_run}`), but was added via `sqlx`, not diesel — still nothing modelled for it under this port.
 - Performance of DSL-generated SQL vs hand-written strings. All throughput numbers above came from
   raw `sql_query`.
 - `AsyncConnectionWrapper` under concurrent load (boot path only).
