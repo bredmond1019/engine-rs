@@ -102,14 +102,26 @@ Each of these exists because it has already caused a real failure in this fleet.
    {"ts":"<ISO-8601>","lane":"<lane-name>","repo":"<repo>","block":"<ID>","status":"closed|bailed|held","note":"<one line>"}
    ```
 
-   The log lives beside the roadmap driving the run, at `<roadmap_dir>/lane-log.jsonl` — resolve
-   `<roadmap_dir>` from the driving roadmap's slug via `/begin-orchestration`'s Step 1C rule (new
-   location `planning/roadmaps/<slug>/` first, then legacy `planning/<slug>/`; both existing is an
-   error), never a hardcoded `planning/<slug>/`. **If the chain has no driving roadmap, a run slug
-   fills the same `<slug>` position** — `<roadmap_dir>` becomes `planning/orchestration-run/<run-
-   slug>/`, the same convention already on disk for `harness-hardening` and
-   `carryover-improvements`, both run with no roadmap. A run with no roadmap is still a run and
-   still leaves evidence — do not skip the lane log.
+   The log lives at **`planning/roadmaps/<slug>/lane-log.jsonl`** — resolve `<slug>` via
+   `/begin-orchestration`'s Step 1D rule: the driving roadmap's directory name, or the operator's
+   `--run <slug>` verbatim when the chain has no roadmap. Never a hardcoded `planning/<slug>/`.
+
+   **A run with no roadmap is still a run and still leaves a lane log.** It takes its slug from
+   `/begin-orchestration --run <slug>` — an operator-named flag, never derived here. **Do not invent
+   one:** an invented slug is not reproducible, so a second run of the same work opens a second
+   record instead of appending to the first (measured 2026-09-05, when a carryover chain named
+   itself by hand mid-session).
+
+   > **Corrected 2026-09-06.** This rule previously said a roadmap-less run's log goes to
+   > `planning/orchestration-run/<run-slug>/`, "the same convention already on disk for
+   > `harness-hardening` and `carryover-improvements`." Both citations were false: `harness-hardening`
+   > has no `lane-log.jsonl` anywhere, and `carryover-improvements` keeps its under
+   > `planning/roadmaps/` because it *is* a roadmap. The real split is **lane log and escalations
+   > under `planning/roadmaps/<slug>/`; the run record under
+   > `planning/orchestration-run/<slug>/`** — one directory per axis, whether or not a roadmap
+   > document exists. A `--run` chain creates the former with no `roadmap.md` and no lane records in
+   > it, which is exactly how `scripts/lane_log_watermark.py`'s `is_roadmap_dir()` already tells a
+   > roadmap from something else.
 
    **Do not hand-edit a roadmap's generated regions.** Run `mev emit-state --write` and let the
    sequence table regenerate from `state.json`, which is the authority. Four concurrent sessions
@@ -122,9 +134,9 @@ Each of these exists because it has already caused a real failure in this fleet.
    repo**, where `<roadmap-slug>` is the driving roadmap's directory name (the one from `$ARGUMENTS`
    or the list file this chain runs from) — the same directory name `/begin-orchestration` resolves
    as its `run_record_dir`, so both commands address the same record. **If the chain has no
-   driving roadmap, use the same run slug that fills rule 8's `<roadmap_dir>` position** —
+   driving roadmap, use the same `--run` slug that fills rule 8's `<slug>` position** —
    `planning/orchestration-run/<run-slug>/notes.md` — so the record path and the lane-log path
-   resolve from the same slug. Do not skip this rule; a run with no roadmap still leaves evidence.
+   resolve from the same slug, in their two different directories. Do not skip this rule; a run with no roadmap still leaves evidence.
    The lane log carries one line per block for
    *sibling lanes*; this file carries everything else, for the *next session in this repo*. Defects
    found in passing, deferred fixes, decisions you took, traps re-confirmed, whatever the roadmap

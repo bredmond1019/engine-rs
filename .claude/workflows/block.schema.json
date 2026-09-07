@@ -257,6 +257,11 @@
       "type": "string",
       "description": "Constraints, follow-ups, or known edge cases not covered by this block."
     },
+    "fleet_correctness": {
+      "type": "string",
+      "description": "D80's blast-radius axis, orthogonal to `priority` and never blended or averaged with it. Closed vocabulary F0..F3 (uppercase); an out-of-vocabulary value is a schema violation here (state.json's own `TrackBlock`/`Carryover` fields instead preserve an unknown value via an Unknown(String) fallback -- see okf-core's `FleetCorrectness`).",
+      "enum": ["F0", "F1", "F2", "F3"]
+    },
     "created": {
       "type": "string",
       "description": "Authoring date. Bare vocabulary matching carryover[] and backlog[], not created_at (D65 section 10).",

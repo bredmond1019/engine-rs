@@ -260,6 +260,26 @@ print(chr(10).join(t[0].get('files', []) if t else []))
 }
 // <</shared:renderWorkAssertion>>
 
+// Operator-gated acceptance-criterion rule (BT.ticket.engines-must-not-author-unverified-records,
+// task 1). Measured 2026-08-21: /sdlc-flow's wrap-up stage authored a COMPLETED sign-off record
+// naming the operator for a criterion no operator had actually reviewed ("Brandon (operator, via
+// this session)"), because the agent had no way to represent "this AC item cannot be done by me"
+// and wrote a plausible completion instead. Every record-authoring stage in both engines must
+// carry this rule so an operator-gated criterion renders PENDING rather than fabricated-passed.
+// <<shared:renderOperatorGatedACRule>>
+function renderOperatorGatedACRule() {
+  return `OPERATOR-GATED ACCEPTANCE CRITERIA — before recording ANY acceptance-criterion item as
+passed/complete in this record, check whether it names an operator gate: a human decision, review,
+credential, judgement call, or sign-off that only the operator can give (e.g. "operator reviews the
+posts and approves", "Brandon signs off on the copy", a manual read-through only a person can
+attest to). Such an item is NOT yours to close. Record it as PENDING (operator gate) — never as
+passed, pass, done, or complete — and NEVER attribute a verdict on it to any named person or to
+"the operator, via this session": you did not perform the review, so no verdict of yours is
+evidence that it happened. Recording it PENDING is the correct, non-failing outcome — it is how you
+say "this item needs the operator," not a bail and not a defect in this run.`
+}
+// <</shared:renderOperatorGatedACRule>>
+
 // <<shared:renderEngineParseChecks>>
 function renderEngineParseChecks(files, cd, startIndex) {
   files = (files || []).filter(f => f.endsWith('.js'))
@@ -337,9 +357,44 @@ BASE_SHA = '${baseSha}'
 STATE_FILE = '${stateFile}'
 RUN_COMMITS = ${recordedCommitsJson}
 if not RUN_COMMITS:
-    base_diff = subprocess.run(['git','diff','--name-only',f'{BASE_SHA}..HEAD'], capture_output=True, text=True).stdout.strip()
-    if base_diff:
-        print(f'EMOJI CHECK: cannot scope diff -- no commits recorded in the run-state ({STATE_FILE}) for this run, but {BASE_SHA}..HEAD is non-empty. Refusing to pass on an unscoped diff.')
+    # No commits recorded by this run: nothing in BASE_SHA..HEAD is attributable to it, so the
+    # committed range is not this run's to judge (it may be entirely a sibling session's already-
+    # reviewed work). Judge this run's own UNCOMMITTED work instead -- tracked modifications plus
+    # untracked files -- so a concurrent sibling's committed history can never fail a diff this run
+    # never touched, while emoji this run itself is actively writing still fails closed.
+    hits = []
+    diff = subprocess.run(['git','diff','HEAD','-M','-U0','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
+    cur_file = None
+    cur_line = None
+    for line in diff:
+        if line.startswith('diff --git '):
+            cur_file = None; cur_line = None
+        elif line.startswith('+++ '):
+            p = line[4:]
+            cur_file = None if p == '/dev/null' else (p[2:] if p.startswith('b/') else p)
+        elif line.startswith('@@'):
+            m = re.match(r'@@ -\\d+(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@', line)
+            cur_line = int(m.group(1)) if m else None
+        elif cur_file and cur_line is not None and line.startswith('+') and not line.startswith('+++'):
+            content = line[1:]
+            if EMOJI.search(content) and FOOTER not in content:
+                hits.append(f'{cur_file}:{cur_line}: {content.rstrip()[:100]}')
+            cur_line += 1
+    status = subprocess.run(['git','status','--porcelain','--','*.md','*.mdx'], capture_output=True, text=True).stdout.splitlines()
+    for line in status:
+        if not line.startswith('??'):
+            continue
+        untracked_path = line[3:]
+        try:
+            with open(untracked_path, encoding='utf-8') as fh:
+                for lineno, content in enumerate(fh, start=1):
+                    if EMOJI.search(content) and FOOTER not in content:
+                        hits.append(f'{untracked_path}:{lineno}: {content.rstrip()[:100]}')
+        except (OSError, UnicodeDecodeError):
+            pass
+    if hits:
+        print(f'EMOJI CHECK FAIL (uncommitted work by this run -- no commits recorded yet in the run-state, {STATE_FILE}):')
+        [print(h) for h in hits[:25]]
         sys.exit(1)
     print('EMOJI CHECK: OK'); sys.exit(0)
 hits = []
@@ -369,18 +424,80 @@ PYEOF`
 // <</shared:renderEmojiGate>>
 
 // <<shared:renderStateFlipScript>>
-// The D64 validate-then-commit mutation for planning/state.json's authored block status: capture
-// the pre-write bytes, mutate in memory, run `mev validate-brain --state` BEFORE and AFTER, and
-// roll back byte-exactly on any NET-NEW diagnostic. Shared for the same reason as the emoji gate --
-// it is executable Python performing a validated write, and the two engines had a full 57-line copy
-// each. `indent` exists only because the two prompts nest it at different depths.
-function renderStateFlipScript({ runRoot, indent }) {
+// The deterministic block-status flip for planning/state.json's authored block status
+// (BT.ticket.sdlc-bookkeep-writes-block-status-deterministically). Outside a linked git worktree,
+// with `mev` on PATH and this repo resolvable in brain.toml's [[repos]] table, the rendered script
+// calls `mev set-block-status <repo>:<id> closed --write` and derives success/failure from ITS OWN
+// subprocess exit code -- never from an agent-authored payload field. That `--write` call always
+// carries the SAME `--agent <lane>` flag the adjacent `mev emit-state --write` call site already
+// uses (renderAgentFlag(), resolved once here at prompt-GENERATION time, exactly as that call site
+// does) -- reused rather than a second identity resolver. `<repo>` is resolved the same way
+// renderScopeFlag() resolves its `--scope` slug (the brain.toml [[repos]] walk-up matching cwd to
+// a registered repo_path); both are computed once, at generation time, and baked into the script
+// as literals, matching this file's existing convention for those two flags.
+//
+// WORKTREE-MODE DECISION (made here, not left implicit, per this ticket's task 1): a successful
+// `mev set-block-status --write` ALWAYS chains `emit-state --write` internally -- there is no flag
+// to suppress it -- and `emit-state` refuses to run inside a linked git worktree. So inside a
+// worktree this script NEVER calls `mev set-block-status` at all: the caller passes
+// `runningInWorktree: true` and the script falls straight to the SAME validated hand-edit this
+// region has always used (validated via `mev validate-brain --state` when `mev` is on PATH,
+// degraded json.load-only when it is not), with `stateWriteValidated` reflecting that distinction
+// exactly as before. Rewriting emit-state's own worktree-deferral behavior is out of scope for this
+// ticket; this decision only says which route THIS script takes.
+//
+// mev ABSENT, or this repo unregistered in brain.toml (no repo slug resolves), MUST DEGRADE, NEVER
+// BAIL: these engines ship to 18+ downstream repos with no brain.toml and no `mev` on PATH (D5,
+// standing rule 1: mechanism, never stack defaults). Both of those cases fall back to the identical
+// validated hand-edit the worktree case uses -- see the adjacent `emit-state` call site's identical
+// contract.
+//
+// Machine-readable result lines a caller's bookkeep prompt copies verbatim, never re-derives:
+//   deterministic path  -- "FLIPPED: <repo>:<id>" (exit 0) or "FLIP_REFUSED: <repo>:<id>" followed
+//                          by "MEV_OUTPUT: <line>" lines (exit 1) -- both read from mev's own exit
+//                          code, never from mev's stdout wording.
+//   hand-edit fallback  -- unchanged from before this ticket: "NOT_FOUND" (exit 0), "FLIPPED:<id>"
+//                          with an optional "UNVALIDATED:" line (exit 0), or "REJECTED:<id>" with
+//                          "NET_NEW:" lines (exit 1).
+//
+// `indent` exists only because the two prompts nest it at different depths.
+function renderStateFlipScript({ runRoot, indent, runningInWorktree = false }) {
+  const agentFlag = renderAgentFlag()
+  const scopeFlagRaw = renderScopeFlag()
+  const scopeMatch = scopeFlagRaw.match(/--scope\s+(\S+)/)
+  const repoSlug = scopeMatch ? scopeMatch[1] : null
+  const useDeterministic = !runningInWorktree && !!repoSlug
+
+  const agentTrim = agentFlag.trim()
+  const agentArgsPy = agentTrim
+    ? '[' + agentTrim.split(/\s+/).map(a => `'${a}'`).join(', ') + ']'
+    : '[]'
+
   return `${indent}cd ${runRoot} && python3 -c "
 import json, subprocess, sys, shutil
 
 path = 'planning/state.json'
 bid = sys.argv[1]
+USE_DETERMINISTIC = ${useDeterministic ? 'True' : 'False'}
+REPO_SLUG = '${repoSlug || ''}'
 
+mev_available = shutil.which('mev') is not None
+
+if USE_DETERMINISTIC and mev_available:
+    key = REPO_SLUG + ':' + bid
+    cmd = ['mev', 'set-block-status', key, 'closed', '--write'] + ${agentArgsPy}
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0:
+        print('FLIPPED: ' + key)
+        sys.exit(0)
+    print('FLIP_REFUSED: ' + key)
+    for line in (r.stdout + r.stderr).splitlines():
+        print('MEV_OUTPUT: ' + line)
+    sys.exit(1)
+
+# Fallback: mev is not on PATH, this repo has no resolvable brain.toml slug, or this run is inside
+# a linked git worktree (set-block-status's unconditional chained emit-state --write would trip
+# emit-state's own worktree refusal) -- degrade to the validated hand edit rather than bail.
 with open(path, 'rb') as fh:
     pre_bytes = fh.read()
 
@@ -398,8 +515,6 @@ for track in data.get('tracks', []):
 if not found:
     print('NOT_FOUND')
     sys.exit(0)
-
-mev_available = shutil.which('mev') is not None
 
 def diagnostics():
     r = subprocess.run(['mev', 'validate-brain', '--state'], capture_output=True, text=True)
@@ -675,6 +790,20 @@ Target:
    If a file outside your files[] looks wrong, is uncommitted, or appears to block this task, STOP:
    leave it exactly as it is and say so in notes. Do not fix it, do not revert it, do not stage it.
 
+3b. RELATED: DOC_ID RESOLUTION (BT.ticket.engines-must-not-author-unverified-records, rule 2) — if
+   this task creates or edits ANY markdown file carrying OKF frontmatter (every new \`.md\` under
+   \`docs/\` or \`planning/\` must, per CLAUDE.md standing rule 5/6), resolve every \`related:\` entry
+   BEFORE you write the file. A \`related:\` entry is a doc_id — the target file's own \`doc_id:\`
+   frontmatter field, defaulting to its filename stem when that field is absent — NEVER a filename, a
+   slug, a title, a task id, or a block id guessed from a sibling path. Confirm each target actually
+   resolves in the corpus (e.g. \`rg -L -n "^doc_id: <id>$" <repo>\`, or that a crawled file whose stem
+   is \`<id>\` exists — a leading \`_\` in a filename excludes it from the corpus, so such a target is
+   UNRESOLVED even though the file is on disk). An unresolvable target is OMITTED, not guessed —
+   dropping the whole \`related:\` field is the correct move when nothing resolves; writing an invented
+   doc_id red-gates the whole corpus (E_GRAPH_DANGLING_RELATED) for every concurrent lane, not just
+   this one. Load the \`write-okf-markdown\` skill for the full procedure, including the cross-repo
+   \`<scope>:<doc_id>\` prefix form a target outside this file's own scope needs.
+
 4. Follow every CLAUDE.md standing rule; add/update tests for new code/logic; verify any model ids /
    package names via the claude-api skill — never from memory.
 
@@ -754,6 +883,23 @@ Return via StructuredOutput:${extraReturnFields}
 }
 // <</shared:renderImplementPrompt>>
 
+// <<shared:vaultRelPathsFrom>>
+function vaultRelPathsFrom(filesModified, vault) {
+  if (!vault.vaulted || !Array.isArray(filesModified)) return []
+  return filesModified
+    .filter(f => typeof f === 'string' && (f === 'planning' || f.startsWith('planning/')))
+    .map(f => f.slice('planning/'.length))
+    // A stage may self-report a path carrying its own "(vault: <path>)" annotation --
+    // e.g. 'harness.json (vault: side/_planning/price-scout/harness.json)' -- which must
+    // be stripped before stat-ing, or the literal annotation text gets treated as part of
+    // the path (BT.chore.vault-commit-checker-misparses-its-own-annotation). Only the
+    // exact trailing " (vault: ...)" annotation shape is stripped -- a path containing
+    // unrelated, legitimate parentheses must survive untouched.
+    .map(f => f.replace(/\s*\(vault:[^)]*\)\s*$/, '').trim())
+    .filter(Boolean)
+}
+// <</shared:vaultRelPathsFrom>>
+
 // <<shared:renderAgentFlag>>
 // Renders the `--agent <id>` argument for a `mev emit-state --write` invocation so a lane that
 // holds its own exclusive lease is exempt from mev's `refuse_if_quiesced` (BT.ticket.engines-
@@ -830,4 +976,65 @@ function renderAgentFlag() {
   }
 }
 // <</shared:renderAgentFlag>>
+
+// <<shared:renderScopeFlag>>
+// Renders the `--scope <slug>` argument for a `mev emit-state --write` invocation so an
+// in-place lane's wrap-up/bookkeep regenerates only its OWN repo's derived surfaces instead of
+// the whole corpus (BT.ticket.engines-pass-scope-to-emit-state). Returns '' (empty string) when
+// no repo slug resolves -- an unconditional flag would break every non-lane, standalone-repo run
+// of these engines across 18+ downstream repos with no brain.toml at all. Every failure path (no
+// brain.toml, unreadable file, no matching repo) falls through to '' inside a try/catch -- this
+// function must never be the reason an emit-state call does not run.
+//
+// Resolution order (mirrors renderAgentFlag()'s FLEET_LANE_AGENT / lease-file precedence):
+//   1. FLEET_LANE_REPO env var, if set and non-empty.
+//   2. Else the brain.toml [[repos]] walk-up already used by renderAgentFlag(): the deepest
+//      repo_path that is cwd or an ancestor of cwd, yielding that entry's slug.
+//   3. Else no identity resolves and '' is returned.
+function renderScopeFlag () {
+  try {
+    const envRepo = process.env.FLEET_LANE_REPO
+    if (envRepo && envRepo.trim()) return ` --scope ${envRepo.trim()}`
+
+    const fs = require('fs')
+    const path = require('path')
+
+    function findBrainRoot(start) {
+      let dir = start
+      while (true) {
+        if (fs.existsSync(path.join(dir, 'brain.toml'))) return dir
+        const parent = path.dirname(dir)
+        if (parent === dir) return null
+        dir = parent
+      }
+    }
+
+    const brainRoot = findBrainRoot(process.cwd())
+    if (!brainRoot) return ''
+
+    // Minimal [[repos]] table reader: brain.toml's array-of-tables entries are flat
+    // `key = "value"` lines, never nested or multi-line — a regex split is sufficient and
+    // avoids pulling in a TOML dependency this inlined, dependency-free block cannot have.
+    const tomlText = fs.readFileSync(path.join(brainRoot, 'brain.toml'), 'utf8')
+    const repoBlocks = tomlText.split(/^\[\[repos\]\]\s*$/m).slice(1)
+    const here = path.resolve(process.cwd())
+    let bestSlug = null
+    let bestDepth = -1
+    for (const block of repoBlocks) {
+      const slugMatch = block.match(/^\s*slug\s*=\s*"([^"]*)"/m)
+      const pathMatch = block.match(/^\s*repo_path\s*=\s*"([^"]*)"/m)
+      if (!slugMatch || !pathMatch) continue
+      const repoAbs = path.resolve(brainRoot, pathMatch[1])
+      if (here !== repoAbs && !here.startsWith(repoAbs + path.sep)) continue
+      const depth = repoAbs.split(path.sep).length
+      if (depth > bestDepth) { bestDepth = depth; bestSlug = slugMatch[1] }
+    }
+    if (!bestSlug) return ''
+
+    return ` --scope ${bestSlug}`
+  } catch (e) {
+    return ''
+  }
+}
+// <</shared:renderScopeFlag>>
 
