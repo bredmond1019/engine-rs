@@ -130,6 +130,11 @@ Each of these exists because it has already caused a real failure in this fleet.
    centrally*. Per-repo `state.json` writes do not contend because they are different files; the log
    is append-only; the roadmap regenerates. That is the whole communication channel.
 
+   **The lane log is one of four artifacts a run leaves, not the only one.** Alongside this
+   `lane-log.jsonl`, a run also produces `notes.md`, the terminal `review.md`, and
+   `verification-ledger.json` (with its thin wrapper `verification-ledger.md`) — see rule 9 below
+   for the ledger's rules and `docs/sandbox/run-verification-ledger-prompt.md` for its schema.
+
 9. **Keep a running notes file — `planning/orchestration-run/<roadmap-slug>/notes.md` in this
    repo**, where `<roadmap-slug>` is the driving roadmap's directory name (the one from `$ARGUMENTS`
    or the list file this chain runs from) — the same directory name `/begin-orchestration` resolves
@@ -153,6 +158,19 @@ Each of these exists because it has already caused a real failure in this fleet.
    per `planning/decisions/D57-orchestration-run-artifact-contract.md`. Follow that contract; do not
    restate it here. In short: unresolved items never carry into a successor file — at lane close,
    promote any item still `OPEN` into `state.json` `carryover[]`.
+
+   **This run leaves a fourth artifact besides `notes.md` and `review.md`:**
+   `planning/orchestration-run/<roadmap-slug>/verification-ledger.json` and its thin wrapper
+   `verification-ledger.md` — the run-scoped record of what shipped and how to check it.
+   `docs/sandbox/run-verification-ledger-prompt.md` is the authority for the ledger's entry schema
+   (the exact JSON shape, `call_site`, `how_to_verify`); cite it, do not restate it here. Two rules
+   a lane gets wrong without reading it directly: an entry is **appended as each block closes**,
+   never batched at the end, so a bailed run still leaves a usable ledger; and the lane that
+   **built** a capability writes `status: untested` and never marks its own work verified — that is
+   the post-run verifier's job. Like the run record itself, a ledger is addressed per
+   (repo × roadmap) (D57) — a second wave against an existing ledger **appends** to it, it never
+   overwrites the file, which is exactly the clobber a sibling lane hit and repaired in commit
+   `559f1039d`.
 
    **Adopting a block not on this chain?** Append its ledger row **at adoption time, not at lane
    close**, with `origin_roadmap` set explicitly to that block's own driving roadmap (Rule 5's

@@ -461,9 +461,9 @@ PYEOF`
 //                          "NET_NEW:" lines (exit 1).
 //
 // `indent` exists only because the two prompts nest it at different depths.
-function renderStateFlipScript({ runRoot, indent, runningInWorktree = false }) {
-  const agentFlag = renderAgentFlag()
-  const scopeFlagRaw = renderScopeFlag()
+async function renderStateFlipScript({ runRoot, indent, runningInWorktree = false }) {
+  const agentFlag = await renderAgentFlag()
+  const scopeFlagRaw = await renderScopeFlag()
   const scopeMatch = scopeFlagRaw.match(/--scope\s+(\S+)/)
   const repoSlug = scopeMatch ? scopeMatch[1] : null
   const useDeterministic = !runningInWorktree && !!repoSlug
@@ -900,16 +900,36 @@ function vaultRelPathsFrom(filesModified, vault) {
 }
 // <</shared:vaultRelPathsFrom>>
 
+// <<shared:RENDER_IDENTITY_SCHEMA>>
+const RENDER_IDENTITY_SCHEMA = {
+  type: 'object',
+  required: ['value'],
+  properties: {
+    value: { type: 'string', description: 'the text after "VALUE:" on the probe script\'s stdout, or "" if that line is missing or the script produced no output' }
+  }
+}
+// <</shared:RENDER_IDENTITY_SCHEMA>>
+
 // <<shared:renderAgentFlag>>
-// Renders the `--agent <id>` argument for a `mev emit-state --write` invocation so a lane that
-// holds its own exclusive lease is exempt from mev's `refuse_if_quiesced` (BT.ticket.engines-
-// must-pass-agent-to-mev). Returns '' (empty string) when no identity resolves — an
-// unconditional flag would change every non-lane, standalone-repo run of these engines across
-// 18+ downstream repos with no brain.toml at all. Every failure path (missing brain.toml, no
-// lock dir, no lease file, unreadable/malformed lease JSON) falls through to '' rather than
-// throwing — this function must never be the reason an emit-state call does not run.
+// Renders the `--agent <id>` argument for a `mev emit-state --write` / `mev set-block-status
+// --write` invocation so a lane that holds its own exclusive lease is exempt from mev's
+// `refuse_if_quiesced` (BT.ticket.engines-must-pass-agent-to-mev). Returns '' (empty string) when
+// no identity resolves — an unconditional flag would change every non-lane, standalone-repo run
+// of these engines across 18+ downstream repos with no brain.toml at all.
 //
-// Resolution order:
+// MEASURED 2026-09-07 (BT.ticket.engine-helpers-call-require-which-the-workflow-runtime-does-not-
+// define): the Workflow script sandbox has NO `process` global at all, not merely no `require` —
+// a direct probe (`typeof process`) returned 'undefined'. The previous version of this function
+// read `process.env.FLEET_LANE_AGENT` as its very first statement, inside its own try/catch, so
+// every call threw immediately and fell straight to the catch's `return ''` — this function was
+// dead code, unconditionally, in every real engine run, not merely on the `require`-only
+// branches downstream of that line. There is no in-process fallback: env lookups and file reads
+// both go through a cheap probe agent, the same convention `detectPlanningVault()` /
+// `resolveRepoRoot()` above already use, and (per `verifyVaultCommit()`'s note above) the
+// resolution logic runs entirely inside the probe SCRIPT — the agent only transcribes its one
+// output line, it never reasons about TOML or lease-file structure itself.
+//
+// Resolution order (all decided inside the probe script):
 //   1. FLEET_LANE_AGENT env var, if set and non-empty.
 //   2. Else the `agent` field of <lock_dir>/leases/lease-<repo>.json, where <repo> is the
 //      brain.toml [[repos]] slug whose repo_path resolves to (or is an ancestor of) cwd, and
@@ -917,63 +937,98 @@ function vaultRelPathsFrom(filesModified, vault) {
 //      already uses: FLEET_LOCK_DIR env var, else a brain.toml found by walking up from cwd,
 //      joined with .fleet-locks. No new precedence is introduced.
 //   3. Else no identity resolves and '' is returned.
-function renderAgentFlag() {
-  try {
-    const envAgent = process.env.FLEET_LANE_AGENT
-    if (envAgent && envAgent.trim()) return ` --agent ${envAgent.trim()}`
+async function renderAgentFlag() {
+  const result = await agent(`
+Resolve this fleet lane's agent identity for a mev '--agent' exemption flag. Run this exact
+script with Bash, verbatim — do not reason about the resolution yourself, the script already
+decided it:
+\`\`\`
+python3 -c "
+import os, json, sys
 
-    const fs = require('fs')
-    const path = require('path')
+def find_brain_root(start):
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, 'brain.toml')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
 
-    function findBrainRoot(start) {
-      let dir = start
-      while (true) {
-        if (fs.existsSync(path.join(dir, 'brain.toml'))) return dir
-        const parent = path.dirname(dir)
-        if (parent === dir) return null
-        dir = parent
-      }
-    }
+def repo_blocks(text):
+    blocks, cur = [], None
+    for line in text.splitlines():
+        if line.strip() == '[[repos]]':
+            cur = []
+            blocks.append(cur)
+        elif cur is not None:
+            cur.append(line)
+    return [chr(10).join(b) for b in blocks]
 
-    let lockDir = null
-    let brainRoot = null
-    if (process.env.FLEET_LOCK_DIR && process.env.FLEET_LOCK_DIR.trim()) {
-      lockDir = process.env.FLEET_LOCK_DIR.trim()
-      brainRoot = findBrainRoot(process.cwd())
-    } else {
-      brainRoot = findBrainRoot(process.cwd())
-      if (brainRoot) lockDir = path.join(brainRoot, '.fleet-locks')
-    }
-    if (!lockDir || !brainRoot) return ''
+def block_value(block_text, key):
+    dq = chr(34)
+    for line in block_text.splitlines():
+        s = line.strip()
+        eq = s.find('=')
+        if eq == -1 or s[:eq].strip() != key:
+            continue
+        v = s[eq + 1:].strip()
+        if len(v) >= 2 and v[0] == dq and v[-1] == dq:
+            return v[1:-1]
+        return None
+    return None
 
-    // Minimal [[repos]] table reader: brain.toml's array-of-tables entries are flat
-    // `key = "value"` lines, never nested or multi-line — a regex split is sufficient and
-    // avoids pulling in a TOML dependency this inlined, dependency-free block cannot have.
-    const tomlText = fs.readFileSync(path.join(brainRoot, 'brain.toml'), 'utf8')
-    const repoBlocks = tomlText.split(/^\[\[repos\]\]\s*$/m).slice(1)
-    const here = path.resolve(process.cwd())
-    let bestSlug = null
-    let bestDepth = -1
-    for (const block of repoBlocks) {
-      const slugMatch = block.match(/^\s*slug\s*=\s*"([^"]*)"/m)
-      const pathMatch = block.match(/^\s*repo_path\s*=\s*"([^"]*)"/m)
-      if (!slugMatch || !pathMatch) continue
-      const repoAbs = path.resolve(brainRoot, pathMatch[1])
-      if (here !== repoAbs && !here.startsWith(repoAbs + path.sep)) continue
-      const depth = repoAbs.split(path.sep).length
-      if (depth > bestDepth) { bestDepth = depth; bestSlug = slugMatch[1] }
-    }
-    if (!bestSlug) return ''
+def best_slug(brain_root, cwd):
+    with open(os.path.join(brain_root, 'brain.toml')) as f:
+        text = f.read()
+    here = os.path.abspath(cwd)
+    best, best_depth = None, -1
+    for block in repo_blocks(text):
+        slug = block_value(block, 'slug')
+        repo_path = block_value(block, 'repo_path')
+        if not slug or not repo_path:
+            continue
+        repo_abs = os.path.abspath(os.path.join(brain_root, repo_path))
+        if here != repo_abs and not here.startswith(repo_abs + os.sep):
+            continue
+        depth = len(repo_abs.split(os.sep))
+        if depth > best_depth:
+            best_depth, best = depth, slug
+    return best
 
-    const leasePath = path.join(lockDir, 'leases', `lease-${bestSlug}.json`)
-    if (!fs.existsSync(leasePath)) return ''
-    const lease = JSON.parse(fs.readFileSync(leasePath, 'utf8'))
-    const agent = lease && lease.agent
-    if (agent && String(agent).trim()) return ` --agent ${String(agent).trim()}`
-    return ''
-  } catch (e) {
-    return ''
-  }
+env_agent = os.environ.get('FLEET_LANE_AGENT', '').strip()
+if env_agent:
+    print('VALUE:' + env_agent); sys.exit(0)
+
+brain_root = find_brain_root(os.getcwd())
+if not brain_root:
+    print('VALUE:'); sys.exit(0)
+
+slug = best_slug(brain_root, os.getcwd())
+if not slug:
+    print('VALUE:'); sys.exit(0)
+
+lock_dir = os.environ.get('FLEET_LOCK_DIR', '').strip() or os.path.join(brain_root, '.fleet-locks')
+lease_path = os.path.join(lock_dir, 'leases', 'lease-' + slug + '.json')
+if not os.path.exists(lease_path):
+    print('VALUE:'); sys.exit(0)
+
+try:
+    with open(lease_path) as f:
+        lease = json.load(f)
+    resolved = str(lease.get('agent') or '').strip()
+except Exception:
+    resolved = ''
+print('VALUE:' + resolved)
+"
+\`\`\`
+The script never fails destructively — any error inside it degrades to an empty VALUE: line.
+Return via StructuredOutput: value (the text after "VALUE:" on the script's stdout, or "" if that
+line is missing or the script produced no output).
+`, { label: 'render-agent-flag', schema: RENDER_IDENTITY_SCHEMA, model: 'haiku' })
+  const value = (result && typeof result.value === 'string') ? result.value.trim() : ''
+  return value ? ` --agent ${value}` : ''
 }
 // <</shared:renderAgentFlag>>
 
@@ -982,59 +1037,91 @@ function renderAgentFlag() {
 // in-place lane's wrap-up/bookkeep regenerates only its OWN repo's derived surfaces instead of
 // the whole corpus (BT.ticket.engines-pass-scope-to-emit-state). Returns '' (empty string) when
 // no repo slug resolves -- an unconditional flag would break every non-lane, standalone-repo run
-// of these engines across 18+ downstream repos with no brain.toml at all. Every failure path (no
-// brain.toml, unreadable file, no matching repo) falls through to '' inside a try/catch -- this
-// function must never be the reason an emit-state call does not run.
+// of these engines across 18+ downstream repos with no brain.toml at all.
+//
+// Same MEASURED 2026-09-07 finding as renderAgentFlag() above applies here identically: `process`
+// does not exist in the Workflow sandbox, so the old `process.env.FLEET_LANE_REPO` first
+// statement always threw and this function always returned '' — resolution now goes through the
+// same probe-script convention.
 //
 // Resolution order (mirrors renderAgentFlag()'s FLEET_LANE_AGENT / lease-file precedence):
 //   1. FLEET_LANE_REPO env var, if set and non-empty.
 //   2. Else the brain.toml [[repos]] walk-up already used by renderAgentFlag(): the deepest
 //      repo_path that is cwd or an ancestor of cwd, yielding that entry's slug.
 //   3. Else no identity resolves and '' is returned.
-function renderScopeFlag () {
-  try {
-    const envRepo = process.env.FLEET_LANE_REPO
-    if (envRepo && envRepo.trim()) return ` --scope ${envRepo.trim()}`
+async function renderScopeFlag() {
+  const result = await agent(`
+Resolve this fleet lane's own repo slug for a mev '--scope' argument. Run this exact script with
+Bash, verbatim — do not reason about the resolution yourself, the script already decided it:
+\`\`\`
+python3 -c "
+import os, sys
 
-    const fs = require('fs')
-    const path = require('path')
+def find_brain_root(start):
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, 'brain.toml')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
 
-    function findBrainRoot(start) {
-      let dir = start
-      while (true) {
-        if (fs.existsSync(path.join(dir, 'brain.toml'))) return dir
-        const parent = path.dirname(dir)
-        if (parent === dir) return null
-        dir = parent
-      }
-    }
+def repo_blocks(text):
+    blocks, cur = [], None
+    for line in text.splitlines():
+        if line.strip() == '[[repos]]':
+            cur = []
+            blocks.append(cur)
+        elif cur is not None:
+            cur.append(line)
+    return [chr(10).join(b) for b in blocks]
 
-    const brainRoot = findBrainRoot(process.cwd())
-    if (!brainRoot) return ''
+def block_value(block_text, key):
+    dq = chr(34)
+    for line in block_text.splitlines():
+        s = line.strip()
+        eq = s.find('=')
+        if eq == -1 or s[:eq].strip() != key:
+            continue
+        v = s[eq + 1:].strip()
+        if len(v) >= 2 and v[0] == dq and v[-1] == dq:
+            return v[1:-1]
+        return None
+    return None
 
-    // Minimal [[repos]] table reader: brain.toml's array-of-tables entries are flat
-    // `key = "value"` lines, never nested or multi-line — a regex split is sufficient and
-    // avoids pulling in a TOML dependency this inlined, dependency-free block cannot have.
-    const tomlText = fs.readFileSync(path.join(brainRoot, 'brain.toml'), 'utf8')
-    const repoBlocks = tomlText.split(/^\[\[repos\]\]\s*$/m).slice(1)
-    const here = path.resolve(process.cwd())
-    let bestSlug = null
-    let bestDepth = -1
-    for (const block of repoBlocks) {
-      const slugMatch = block.match(/^\s*slug\s*=\s*"([^"]*)"/m)
-      const pathMatch = block.match(/^\s*repo_path\s*=\s*"([^"]*)"/m)
-      if (!slugMatch || !pathMatch) continue
-      const repoAbs = path.resolve(brainRoot, pathMatch[1])
-      if (here !== repoAbs && !here.startsWith(repoAbs + path.sep)) continue
-      const depth = repoAbs.split(path.sep).length
-      if (depth > bestDepth) { bestDepth = depth; bestSlug = slugMatch[1] }
-    }
-    if (!bestSlug) return ''
+env_repo = os.environ.get('FLEET_LANE_REPO', '').strip()
+if env_repo:
+    print('VALUE:' + env_repo); sys.exit(0)
 
-    return ` --scope ${bestSlug}`
-  } catch (e) {
-    return ''
-  }
+brain_root = find_brain_root(os.getcwd())
+if not brain_root:
+    print('VALUE:'); sys.exit(0)
+
+with open(os.path.join(brain_root, 'brain.toml')) as f:
+    text = f.read()
+here = os.path.abspath(os.getcwd())
+best, best_depth = None, -1
+for block in repo_blocks(text):
+    slug = block_value(block, 'slug')
+    repo_path = block_value(block, 'repo_path')
+    if not slug or not repo_path:
+        continue
+    repo_abs = os.path.abspath(os.path.join(brain_root, repo_path))
+    if here != repo_abs and not here.startswith(repo_abs + os.sep):
+        continue
+    depth = len(repo_abs.split(os.sep))
+    if depth > best_depth:
+        best_depth, best = depth, slug
+print('VALUE:' + (best or ''))
+"
+\`\`\`
+The script never fails destructively — any error degrades to an empty VALUE: line.
+Return via StructuredOutput: value (the text after "VALUE:" on the script's stdout, or "" if that
+line is missing or the script produced no output).
+`, { label: 'render-scope-flag', schema: RENDER_IDENTITY_SCHEMA, model: 'haiku' })
+  const value = (result && typeof result.value === 'string') ? result.value.trim() : ''
+  return value ? ` --scope ${value}` : ''
 }
 // <</shared:renderScopeFlag>>
 

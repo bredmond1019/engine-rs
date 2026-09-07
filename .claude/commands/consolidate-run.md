@@ -209,6 +209,13 @@ number.
 
 ## Step 5b — The verification ledgers: promote, or record why not
 
+> **This step is now also invoked by `/consolidate-fleet` Step 5c, which is the normal entry point.**
+> `/consolidate-fleet` cites this section rather than copying it, so this remains the single home for
+> *how* to judge each entry; what moved there is *when* it runs. Do not duplicate these rules into
+> that command — the reason this step existed but did not run for two roadmaps on 2026-09-07 was that
+> it lived only under a command nobody invokes any more.
+
+
 Every run leaves a `verification-ledger.json` beside its `notes.md` — one entry per capability the
 run shipped, with a recipe for checking it (the contract is
 [`docs/sandbox/run-verification-ledger-prompt.md`](../../../docs/sandbox/run-verification-ledger-prompt.md)).

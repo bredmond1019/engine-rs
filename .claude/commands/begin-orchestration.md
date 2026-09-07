@@ -577,6 +577,19 @@ Each has already cost a real run in this fleet.
    — do not proceed with a known violation. **Deleting or emptying the record is never an
    acceptable way to make the check pass**; the record is the run's evidence.
 
+   **A run leaves four artifacts, not two.** Alongside this `notes.md` and the terminal `review.md`
+   (Rule 5 above), also create `planning/orchestration-run/<roadmap-slug>/verification-ledger.json`
+   and its thin wrapper `verification-ledger.md` — the run-scoped record of what shipped and how to
+   check it. `docs/sandbox/run-verification-ledger-prompt.md` is the authority for the ledger's
+   entry schema (the exact JSON shape, `call_site`, `how_to_verify`); cite it, do not restate it
+   here. Two rules a lane gets wrong without reading it directly: an entry is **appended as each
+   block closes**, never batched at the end, so a bailed run still leaves a usable ledger; and the
+   lane that **built** a capability writes `status: untested` and never marks its own work
+   verified — that is the post-run verifier's job. Like the run record itself, a ledger is
+   addressed per (repo × roadmap) (D57) — a second wave against an existing ledger **appends** to
+   it, it never overwrites the file, which is exactly the clobber a sibling lane hit and repaired
+   in commit `559f1039d`.
+
 6. **Resolve what you can; record the call.** A lane that stops at every ambiguity is worthless,
    and one that stops at none is dangerous. Decide the ordinary things yourself — a spec slug that
    does not quite match convention, which of two plausible `--from` plan files is meant, whether a
