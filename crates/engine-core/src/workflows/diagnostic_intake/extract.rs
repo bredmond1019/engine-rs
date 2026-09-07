@@ -593,18 +593,30 @@ mod tests {
     /// `set_current_dir(&isolated)` line below removed (so the fallback
     /// resolves to the real crate-root cwd nextest starts every test in,
     /// exactly the historical bug), this test FAILS — the `before`/`after`
-    /// byte comparison on the real tracked fixture differs, because the
-    /// unstamped write really does land on it. Restoring the
-    /// `set_current_dir(&isolated)` redirect makes it pass again. Both
-    /// observations were verified by hand for this task; the file was
-    /// restored via `git checkout --` immediately after the failing run
-    /// confirmed the corruption, before this test was committed.
+    /// byte comparison on the fixture differs, because the unstamped write
+    /// really does land on it. Restoring the `set_current_dir(&isolated)`
+    /// redirect makes it pass again. Both observations were verified by hand
+    /// for this task; the file was restored via `git checkout --` immediately
+    /// after the failing run confirmed the corruption, before this test was
+    /// committed.
+    ///
+    /// `crates/engine-core/planning/` is gitignored (`f0e7054` untracked it —
+    /// this crate's own planning content had leaked into the public repo), so
+    /// the fixture this test guards is no longer present on a fresh clone —
+    /// only on disks where it happened to survive from before that fix. The
+    /// test seeds it itself and restores whatever was on disk beforehand, so
+    /// it is hermetic on CI and non-destructive to a local dev copy.
     #[tokio::test]
     async fn process_never_writes_the_crate_committed_fixture_without_a_worktree_stamp() {
         let real_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("planning")
             .join("diagnostic-intake-state.json");
-        let before = std::fs::read(&real_fixture).expect("committed fixture exists");
+        let preexisting = std::fs::read(&real_fixture).ok();
+        std::fs::create_dir_all(real_fixture.parent().unwrap())
+            .expect("create the crate's planning dir");
+        std::fs::write(&real_fixture, b"{\"fixture\":\"sentinel\"}\n")
+            .expect("seed the fixture this test guards");
+        let before = std::fs::read(&real_fixture).expect("seeded fixture exists");
 
         let original_cwd = std::env::current_dir().expect("cwd readable");
         let isolated = temp_worktree();
@@ -622,12 +634,20 @@ mod tests {
 
         result.expect("process should still succeed without a worktree stamp");
 
-        let after = std::fs::read(&real_fixture).expect("committed fixture still exists");
+        let after = std::fs::read(&real_fixture).expect("fixture still exists");
         assert_eq!(
             before, after,
             "process must not modify the crate's tracked diagnostic-intake-state.json \
              fixture when driven without a SetupWorktreeNode stamp"
         );
+
+        match preexisting {
+            Some(bytes) => std::fs::write(&real_fixture, bytes)
+                .expect("restore the pre-existing fixture content"),
+            None => {
+                let _ = std::fs::remove_file(&real_fixture);
+            }
+        }
 
         let isolated_state = isolated
             .join("planning")
