@@ -75,8 +75,8 @@ project: brain                   # controlled; OMIT for cross-cutting docs
 status: active
 keywords: [three, to, seven, concrete, terms]
 related: [some-real-doc-id]
-created: 2026-08-29              # optional; when this file was first written
-updated: 2026-08-29              # optional; bump it yourself when you revise
+created: 2026-08-29              # when this file was first written — see below
+updated: 2026-08-29              # bump it EVERY time you revise the file — see below
 ---
 ```
 
@@ -87,6 +87,31 @@ a stale `updated` is invisible. Use `YYYY-MM-DD`, keep them after `related:` (th
 writes), and leave both off rather than let them go stale. Existing docs omit them; **do not backfill.**
 They are not `timestamp` (Log/ProjectStatus freshness, ISO-8601 with timezone, trap 4 below) and not
 `synced_from` (the cross-repo watermark behind `E_SYNC_DRIFT`).
+
+### `created:` / `updated:` — write them, and bump `updated:`
+
+They are optional to the *schema* and load-bearing in *practice*, which is a combination that
+reliably produces an empty field. Measured 2026-09-07: **57 and 52 of 657** frontmatter files in
+the corpus carried them — under 9% — and **0 of 25** authored pre-plan docs did.
+
+Fill both when you create a file, and **bump `updated:` whenever you meaningfully revise it**. Not
+for a typo; yes for anything that changes what the document says.
+
+**What reads them.** `planning/open-work/scripts/update_pre_plan.py` decides which folders under
+`open-work/pre-plan/` are cold enough to `/archive`, and `updated:` is its first-choice signal.
+When it is absent the script falls back to `git log --follow --diff-filter=MA`, then to mtime, and
+marks the row so the difference is visible — because those are **mechanical** dates. A reformat, a
+link repair or a fleet-wide path migration all move a git date without the thinking having moved,
+and exactly that happened: HQ D87 relocated 19 folders in one commit, so every naive git date read
+as "touched today". An authored `updated:` is the only date that means what a reader assumes it
+means.
+
+So: a doc with no `updated:` still gets a date — just a worse one, derived from whoever last
+touched the bytes. Write the honest one.
+
+**The seven authoring commands already seed both** (`/capture`, `/assess`, `/seams`, `/sequence`,
+`/plan`, `/define-design-system`, `/define-polish-standard`). If you are hand-writing a file, you
+are the one supplying them.
 
 ### The five traps that break the gates
 
