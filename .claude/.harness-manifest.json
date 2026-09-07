@@ -1,5 +1,5 @@
 {
-  "version": "5f4cc52ea7abdd56fed58a0b7095b682834b7da6",
+  "version": "d64089a9a4d2721537d0c994fa329142b2e5bc98",
   "generated": "2026-09-07",
   "files": {
     ".claude/commands/update-task.md": "47afa30cf2e5593c9b39b974d360f9f0f1b1ff6a5e30cc2f525042f283cd8720",
@@ -24,7 +24,7 @@
     ".claude/commands/sync-global-skills.md": "e0f0e5374fd8e413ba98a5b4b56aa97f3640eff0d45211b3c5225c4c02e62b59",
     ".claude/commands/generate-master-plan.md": "28c96669f9601840d94f9d4943e0b0837cbee46f82cad57592f0c25a1240b0e7",
     ".claude/commands/define-design-system.md": "bfe373c3a7b22bcf898286fbe1dcb3a0eb2599eb239efdd2b6f5a2b76753cfb1",
-    ".claude/commands/orchestration-commander.md": "93a02ce54a197853d79bd5696b01c03d03c758317f8b83e4fa0273f6d8b973f6",
+    ".claude/commands/orchestration-commander.md": "fd0dc56f3c8e9a40db3af4e351d8c8d4019b352869946a1a600bb6531ead33dd",
     ".claude/commands/update-docs.md": "7059f2be76a1983ac3e50a4b60faa1e06d2a172d9f0810930dd1c136542f8de7",
     ".claude/commands/generate-tasks.md": "96fdbb5c6957dc7768fdec39c789275043b78dbb57522f414ace60e2cbb9e3ab",
     ".claude/commands/breakdown.md": "d26fc0ee89ee385bfba9c008b1b3f991684ea47084793809757162d53b73eae6",
