@@ -102,6 +102,8 @@ doc_id: <slug>
 layer: [<inferred layer>]
 project: <repo slug>
 status: draft
+created: <YYYY-MM-DD — today's date>
+updated: <YYYY-MM-DD — today's date; bump this whenever you revise the file>
 keywords: [<3-5 terms>]
 related: [<≥1 real doc_id>]   # required — never leave empty; else this file is an isolated graph node (mev W_GRAPH_ISOLATED_NODE)
 ---

@@ -140,6 +140,8 @@ doc_id: seams-<slug>
 layer: [<layer>]
 project: <repo slug>
 status: active
+created: <YYYY-MM-DD — today's date>
+updated: <YYYY-MM-DD — today's date; bump this whenever you revise the file>
 keywords: [seams, integration, <3-5 terms>]
 related: [assessment-<slug>, <...>]
 ---

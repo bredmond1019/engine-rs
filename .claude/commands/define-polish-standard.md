@@ -170,6 +170,8 @@ doc_id: polish-standard-<slug>
 layer: [<surface|console|...>]
 project: <repo slug>
 status: active
+created: <YYYY-MM-DD — today's date>
+updated: <YYYY-MM-DD — today's date; bump this whenever you revise the file>
 keywords: [polish, ui, standard, <surface kinds>]
 related: [<≥1 real doc_id, qualified <scope>:<doc_id> if outside this scope>]
 ---

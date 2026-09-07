@@ -346,6 +346,8 @@ doc_id: plan-<slug>
 layer: [<inferred layer>]
 project: <repo slug>
 status: active
+created: <YYYY-MM-DD — today's date>
+updated: <YYYY-MM-DD — today's date; bump this whenever you revise the file>
 keywords: [<3-5 terms>]
 related: [<≥1 real doc_id>]   # required — never empty; else this is an isolated graph node
 ---

@@ -287,6 +287,8 @@ doc_id: sequence-<slug>
 layer: [<layer>]
 project: <repo slug or omit if cross-cutting>
 status: active
+created: <YYYY-MM-DD — today's date>
+updated: <YYYY-MM-DD — today's date; bump this whenever you revise the file>
 keywords: [sequencing, blocks, waves, <3-5 terms>]
 related: [seams-<slug>, assessment-<slug>]
 ---

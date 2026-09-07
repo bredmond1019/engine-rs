@@ -176,6 +176,8 @@ doc_id: assessment-<slug>
 layer: [<layer>]
 project: <repo slug>
 status: active
+created: <YYYY-MM-DD — today's date>
+updated: <YYYY-MM-DD — today's date; bump this whenever you revise the file>
 keywords: [assessment, <3-5 terms>]
 related: [<≥1 real doc_id>]
 ---

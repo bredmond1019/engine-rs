@@ -225,6 +225,8 @@ doc_id: design-system-<slug>
 layer: [<surface|...>]
 project: <repo slug>
 status: active
+created: <YYYY-MM-DD — today's date>
+updated: <YYYY-MM-DD — today's date; bump this whenever you revise the file>
 keywords: [design system, tokens, components, <surface kinds>]
 related: [<≥1 real doc_id>]
 ---
