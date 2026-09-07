@@ -5,7 +5,9 @@
 //! layer for the run state it owns. Built on the D2 persistence stack (`sqlx::PgPool`).
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use engine_contract::{EventsRow, JournalDecisionKind, JournalRow, TaskContext};
+use engine_contract::{
+    EventsRow, JournalDecisionKind, JournalRow, NodeInvocation, NodeInvocationStatus, TaskContext,
+};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
 use sqlx::{PgPool, Row};
@@ -276,6 +278,101 @@ pub async fn list_journal_rows_for_campaign(
                 reason: row.try_get("reason")?,
                 detail: row.try_get::<Json<serde_json::Value>, _>("detail")?.0,
                 created_at: row.try_get::<NaiveDateTime, _>("created_at")?.and_utc(),
+            })
+        })
+        .collect()
+}
+
+/// Serialize a [`NodeInvocationStatus`] to its snake_case wire string (e.g.
+/// `"success"`/`"failed"`) for storage in `node_invocations`'s `status` text
+/// column. Reuses the enum's own `#[serde(rename_all = "snake_case")]` tag
+/// rather than hand-maintaining a parallel string table — mirrors
+/// [`journal_kind_to_text`]'s shape exactly.
+fn node_invocation_status_to_text(status: NodeInvocationStatus) -> String {
+    match serde_json::to_value(status).expect("NodeInvocationStatus always serializes") {
+        serde_json::Value::String(s) => s,
+        other => unreachable!("NodeInvocationStatus must serialize to a string, got {other:?}"),
+    }
+}
+
+/// Inverse of [`node_invocation_status_to_text`]: decode a stored `status`
+/// string back into a [`NodeInvocationStatus`]. An unrecognized value is an
+/// `sqlx::Error` (via `Error::Decode`) rather than a panic, since it can only
+/// originate from a row a future/older engine-serve version wrote.
+fn node_invocation_status_from_text(text: &str) -> Result<NodeInvocationStatus, sqlx::Error> {
+    serde_json::from_value(serde_json::Value::String(text.to_string()))
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+}
+
+/// Insert one durable `node_invocations` row (EN.14.F task 3). Records a node
+/// **dispatch**, not an LLM call — see the module-level docs on
+/// [`engine_contract::node_invocation`] and [`crate`]'s sibling `journal`
+/// table for the per-dispatch vs. per-call distinction.
+///
+/// # Append-only, deliberately — NOT `upsert_event`'s pattern
+///
+/// Unlike [`upsert_event`]'s `INSERT ... ON CONFLICT (id) DO UPDATE`, this
+/// uses `ON CONFLICT (id) DO NOTHING`: each dispatch mints a fresh [`Uuid`]
+/// (`NodeInvocation::id`), so a conflict on `id` can only mean the exact same
+/// row was replayed — the resume case, where a fresh `engine-serve` process
+/// re-sends the rehydrated ledger from `seq = 0` (see `durable.rs`'s
+/// `durable_on_progress`). `DO NOTHING` makes that idempotent WITHOUT ever
+/// revising a recorded row in place; a genuine re-dispatch of the same node
+/// still inserts a brand new row, because it carries a new id.
+pub async fn insert_node_invocation(
+    pool: &PgPool,
+    row: &NodeInvocation,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO node_invocations \
+             (id, run_id, campaign_id, node, seq, started_at, completed_at, status, error) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(row.id)
+    .bind(&row.run_id)
+    .bind(&row.campaign_id)
+    .bind(&row.node)
+    .bind(row.seq as i64)
+    .bind(row.started_at)
+    .bind(row.completed_at)
+    .bind(node_invocation_status_to_text(row.status))
+    .bind(&row.error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// List a run's `node_invocations` rows ordered by `seq` ascending, so the
+/// ledger reads back in dispatch order (oldest dispatch first) — mirrors
+/// [`list_journal_rows_for_campaign`]'s shape.
+pub async fn list_node_invocations_for_run(
+    pool: &PgPool,
+    run_id: &str,
+) -> Result<Vec<NodeInvocation>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, run_id, campaign_id, node, seq, started_at, completed_at, status, error \
+         FROM node_invocations \
+         WHERE run_id = $1 \
+         ORDER BY seq ASC",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let status_text: String = row.try_get("status")?;
+            Ok(NodeInvocation {
+                id: row.try_get("id")?,
+                run_id: row.try_get("run_id")?,
+                campaign_id: row.try_get("campaign_id")?,
+                node: row.try_get("node")?,
+                seq: row.try_get::<i64, _>("seq")? as u64,
+                started_at: row.try_get::<NaiveDateTime, _>("started_at")?.and_utc(),
+                completed_at: row.try_get::<NaiveDateTime, _>("completed_at")?.and_utc(),
+                status: node_invocation_status_from_text(&status_text)?,
+                error: row.try_get("error")?,
             })
         })
         .collect()
