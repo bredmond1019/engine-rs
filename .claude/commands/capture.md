@@ -1,6 +1,6 @@
 # Capture — Scaffold a pre-plan notes file and optionally add a backlog ticket
 
-Captures rich conversation content from a planning or research session. Creates `planning/open-work/pre-plan/<slug>/notes.md` in the current repo as a structured holding area. If the `--backlog` flag is provided, it calls the `/backlog-ticket` command to create a backlog item pointing to these notes.
+Captures rich conversation content from a planning or research session. Creates `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md` in the current repo as a structured holding area. If the `--backlog` flag is provided, it calls the `/backlog-ticket` command to create a backlog item pointing to these notes.
 
 ## Variables
 
@@ -8,6 +8,23 @@ $ARGUMENTS — title or free-form description of what to capture, optionally inc
              A slug is derived from this automatically.
              Example: "--backlog Work email setup with instructions"
              Example: "notion-dashboard Notion API read-only dashboard concept"
+
+> **Where this writes — resolve `BRAIN_ROOT` first.** Walk **up** from the current working
+> directory until you find a `brain.toml` (its first line begins `# brain.toml`); that directory is
+> `BRAIN_ROOT`. Pre-plan output **always** goes to `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`,
+> never the current repo's own `planning/` — one place to look, whichever repo you invoked this
+> from. Scope the work *inside* the folder instead: set `project: <repo-slug>` in the frontmatter
+> and prefix the slug when it is repo-specific (`mev-error-handling`).
+>
+> **Why centralized** (HQ D87): `/sequence` decides the successor by counting repos, and the
+> multi-repo successor `/generate-roadmap` writes `planning/roadmaps/<slug>/`, which exists only in
+> HQ — so a leaf-repo pre-plan would have to migrate cross-repo on every multi-repo cut. That
+> migration is `/generate-roadmap` Step 7b, measured running 3 times in 34 roadmaps. Starting in HQ
+> removes the move. Note also that every repo's `planning/` is a symlink into `core/_planning/`
+> tracked by the one HQ git repo, so "local" was never a separate repository anyway.
+>
+> **If no `brain.toml` is found**, this is a standalone repo: write to `planning/open-work/pre-plan/<slug>/`
+> relative to the repo root, and say so in the report.
 
 ## Execution Model
 
@@ -39,7 +56,7 @@ already holds the context.
 
 ### Step 2 — Guard
 
-4. Check whether `planning/open-work/pre-plan/<slug>/` already exists. If it does and `notes.md` is present,
+4. Check whether `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` already exists. If it does and `notes.md` is present,
    stop and tell the user — do not overwrite existing content.
 
    Also check that the slug is not already taken elsewhere in this repo's `planning/`: a spec
@@ -52,7 +69,7 @@ already holds the context.
 
 ### Step 3 — Create the notes file
 
-5. Create `planning/open-work/pre-plan/<slug>/notes.md` using the Output Format below. You must populate the body sections with all the important details discussed during the session, but **do not invent content the user or agent hasn't provided/visually seen**. Ensure you capture file paths, class/struct names, functions, important snippets of code, and any additional content that will make it EXTREMELY easy for the next agent or the user to go dig into this note and know exactly what was discussed, how you got to this conclusion or initial research, where to go look to review/investigate further, etc.
+5. Create `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md` using the Output Format below. You must populate the body sections with all the important details discussed during the session, but **do not invent content the user or agent hasn't provided/visually seen**. Ensure you capture file paths, class/struct names, functions, important snippets of code, and any additional content that will make it EXTREMELY easy for the next agent or the user to go dig into this note and know exactly what was discussed, how you got to this conclusion or initial research, where to go look to review/investigate further, etc.
 
    **Mark every claim's standing. This is the single most important rule in this command.** A
    captured note is read weeks later, by someone with none of this session's context, and read as
@@ -80,7 +97,7 @@ already holds the context.
 
 ### Step 4 — Backlog ticket (only if --backlog flag is present)
 
-6. If the `--backlog` flag is provided in `$ARGUMENTS`, call the `/backlog-ticket` command, passing the title and referencing the newly created `planning/open-work/pre-plan/<slug>/notes.md` file. If the flag is not provided, skip this step.
+6. If the `--backlog` flag is provided in `$ARGUMENTS`, call the `/backlog-ticket` command, passing the title and referencing the newly created `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md` file. If the flag is not provided, skip this step.
 
 ### Step 5 — Report
 
@@ -91,7 +108,7 @@ bullets. Link paths; never restate a file. See the `report-to-the-operator` skil
 
 8. Confirm: output the local path created and (if applicable) confirm the backlog ticket was created.
 
-## Output Format — `planning/open-work/pre-plan/<slug>/notes.md`
+## Output Format — `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md`
 
 ```markdown
 ---

@@ -10,16 +10,33 @@ $ARGUMENTS — the assessment topic, plus optional flags.
 
 | Flag | What it does |
 |---|---|
-| `--slug <name>` | Output directory `planning/open-work/pre-plan/<name>/`. Default: kebab-case of the topic |
+| `--slug <name>` | Output directory `$BRAIN_ROOT/planning/open-work/pre-plan/<name>/`. Default: kebab-case of the topic |
 | `--areas "a; b; c"` | Name the recon areas explicitly instead of deriving them |
 | `--depth quick\|standard\|deep` | 3 / 5–6 / 8+ scouts. Default `standard` |
 | `--no-verify` | Skip the verification pass. Only for a throwaway look — never before `/plan` |
-| `--resume` | Re-read an existing `assessment.md` and run only the stages that are missing. Look in `planning/open-work/pre-plan/<slug>/` first, then `planning/roadmaps/<slug>/pre-plan/` — a slug whose `/sequence` went multi-repo was relocated there by `/generate-roadmap` Step 7b, and resuming against the pre-move path alone finds nothing and silently restarts from scratch |
+| `--resume` | Re-read an existing `assessment.md` and run only the stages that are missing. Look in `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` first, then `planning/roadmaps/<slug>/pre-plan/` — a slug whose `/sequence` went multi-repo was relocated there by `/generate-roadmap` Step 7b, and resuming against the pre-move path alone finds nothing and silently restarts from scratch |
+
+> **Where this writes — resolve `BRAIN_ROOT` first.** Walk **up** from the current working
+> directory until you find a `brain.toml` (its first line begins `# brain.toml`); that directory is
+> `BRAIN_ROOT`. Pre-plan output **always** goes to `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`,
+> never the current repo's own `planning/` — one place to look, whichever repo you invoked this
+> from. Scope the work *inside* the folder instead: set `project: <repo-slug>` in the frontmatter
+> and prefix the slug when it is repo-specific (`mev-error-handling`).
+>
+> **Why centralized** (HQ D87): `/sequence` decides the successor by counting repos, and the
+> multi-repo successor `/generate-roadmap` writes `planning/roadmaps/<slug>/`, which exists only in
+> HQ — so a leaf-repo pre-plan would have to migrate cross-repo on every multi-repo cut. That
+> migration is `/generate-roadmap` Step 7b, measured running 3 times in 34 roadmaps. Starting in HQ
+> removes the move. Note also that every repo's `planning/` is a symlink into `core/_planning/`
+> tracked by the one HQ git repo, so "local" was never a separate repository anyway.
+>
+> **If no `brain.toml` is found**, this is a standalone repo: write to `planning/open-work/pre-plan/<slug>/`
+> relative to the repo root, and say so in the report.
 
 ## Purpose
 
 Turn "I want to understand this system well enough to plan work on it" into **one dated,
-cited, independently re-checked artifact** — `planning/open-work/pre-plan/<slug>/assessment.md` — that a later
+cited, independently re-checked artifact** — `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md` — that a later
 session can plan from without re-deriving anything.
 
 This command produces **evidence, not a plan.** It may not propose a sequence, a wave, a block,
@@ -91,11 +108,11 @@ or an estimate. Those are `/seams` and `/sequence`.
    fill a gap with a plausible-sounding answer.
    ```
 
-   Write each scout's raw return verbatim to `planning/open-work/pre-plan/<slug>/evidence/<area>.md`. **You are the
+   Write each scout's raw return verbatim to `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/evidence/<area>.md`. **You are the
    only writer** — scouts return text, you write files.
 
 6. **Synthesize.** In this session, holding all returns at once. Write
-   `planning/open-work/pre-plan/<slug>/assessment.md` in the Output Format below. While synthesizing:
+   `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md` in the Output Format below. While synthesizing:
    - Reconcile contradictions between scouts explicitly — name both and say which you believe and why.
    - Mark every claim's confidence. An `inferred` claim may not be stated as fact.
    - Keep the code map: every file, symbol, struct, function and interface a finding touches.
@@ -108,7 +125,7 @@ or an estimate. Those are `/seams` and `/sequence`.
    - Sonnet is correct here; this is lookup with a verdict.
    - Re-derive **every absolute number** (counts, percentages, totals). Numbers rot; the ratios a
      conclusion rests on usually survive. Say which is which.
-   - Write `planning/open-work/pre-plan/<slug>/verification.md`, and add a banner at the top of `assessment.md`
+   - Write `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/verification.md`, and add a banner at the top of `assessment.md`
      pointing at it. **Where the two disagree, verification wins** — it is later and was checked
      against source.
    - Any claim that comes back REFUTED must be corrected **in `assessment.md` itself**, not only
@@ -127,7 +144,7 @@ or an estimate. Those are `/seams` and `/sequence`.
    Budget: two rounds of discovery, one targeted follow-up, one verification pass. Exceeding that
    requires the user's say-so — ask.
 
-10. **Write the index.** If `planning/open-work/pre-plan/<slug>/` holds more than three documents, write an
+10. **Write the index.** If `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` holds more than three documents, write an
     `index.md` with a reading order and an "if you only need one thing" router. Update the parent
     `planning/index.md` per the project's standing rules.
 
@@ -149,7 +166,7 @@ principle as handing verifiers claims instead of conclusions, applied one level 
 Close with `/handoff` and tell the operator, in these words or close to them:
 
 ```
-Assessment complete: planning/open-work/pre-plan/<slug>/assessment.md (+ verification.md, evidence/)
+Assessment complete: $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md (+ verification.md, evidence/)
 
 Start a FRESH session — Opus — and run:
   /seams <slug>
@@ -230,9 +247,9 @@ instead of the code to write.>
 ## Report
 
 ```
-planning/open-work/pre-plan/<slug>/assessment.md      (<N> areas, <M> findings)
-planning/open-work/pre-plan/<slug>/verification.md    (<V> claims re-checked: <x> verified, <y> refuted, <z> partial)
-planning/open-work/pre-plan/<slug>/evidence/          <N> scout reports
+$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md      (<N> areas, <M> findings)
+$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/verification.md    (<V> claims re-checked: <x> verified, <y> refuted, <z> partial)
+$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/evidence/          <N> scout reports
 
 Hand spot-checks: <3 citations, result each>
 Refuted and corrected in place: <list, or none>

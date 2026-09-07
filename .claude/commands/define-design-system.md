@@ -8,9 +8,26 @@ $ARGUMENTS — what is being built, plus flags.
 | Flag | What it does |
 |---|---|
 | `--surface <web\|mobile\|tui\|desktop>` | Repeatable. Each gets its own stack and component inventory |
-| `--slug <name>` | Output to `planning/open-work/pre-plan/<name>/design-system.md` + the artifacts it names |
+| `--slug <name>` | Output to `$BRAIN_ROOT/planning/open-work/pre-plan/<name>/design-system.md` + the artifacts it names |
 | `--from <path>` | A brand guide, a client's existing site, a reference product to derive from |
 | `--house` | Adopt the practice's default stack without re-deciding it (step 2) |
+
+> **Where this writes — resolve `BRAIN_ROOT` first.** Walk **up** from the current working
+> directory until you find a `brain.toml` (its first line begins `# brain.toml`); that directory is
+> `BRAIN_ROOT`. Pre-plan output **always** goes to `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`,
+> never the current repo's own `planning/` — one place to look, whichever repo you invoked this
+> from. Scope the work *inside* the folder instead: set `project: <repo-slug>` in the frontmatter
+> and prefix the slug when it is repo-specific (`mev-error-handling`).
+>
+> **Why centralized** (HQ D87): `/sequence` decides the successor by counting repos, and the
+> multi-repo successor `/generate-roadmap` writes `planning/roadmaps/<slug>/`, which exists only in
+> HQ — so a leaf-repo pre-plan would have to migrate cross-repo on every multi-repo cut. That
+> migration is `/generate-roadmap` Step 7b, measured running 3 times in 34 roadmaps. Starting in HQ
+> removes the move. Note also that every repo's `planning/` is a symlink into `core/_planning/`
+> tracked by the one HQ git repo, so "local" was never a separate repository anyway.
+>
+> **If no `brain.toml` is found**, this is a standalone repo: write to `planning/open-work/pre-plan/<slug>/`
+> relative to the repo root, and say so in the report.
 
 ## Purpose
 
@@ -196,7 +213,7 @@ question — the same handoff test as everywhere else.
 Close by telling the operator:
 
 ```
-Design system: planning/open-work/pre-plan/<slug>/design-system.md
+Design system: $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/design-system.md
 Emitted: <token file> · <theme config> · <n> components
 Stack: <named>, <matching the fleet | departing because ...>
 
@@ -275,7 +292,7 @@ starts, and what is deliberately not systematised.>
 ## Report
 
 ```
-planning/open-work/pre-plan/<slug>/design-system.md
+$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/design-system.md
 Emitted: <files>
 Components: <n> (<s> state containers · <c> product components)
 Stack: <fleet-matching | departures listed>

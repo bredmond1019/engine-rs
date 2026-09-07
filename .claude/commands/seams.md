@@ -10,7 +10,24 @@ $ARGUMENTS — the assessment slug, plus optional flags. Example: `orchestration
 | Flag | What it does |
 |---|---|
 | `--spike <n>` | Run up to `n` spikes instead of the default 1. `--spike 0` disables |
-| `--from <path>` | Read an assessment that is not at `planning/open-work/pre-plan/<slug>/assessment.md` |
+| `--from <path>` | Read an assessment that is not at `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md` |
+
+> **Where this writes — resolve `BRAIN_ROOT` first.** Walk **up** from the current working
+> directory until you find a `brain.toml` (its first line begins `# brain.toml`); that directory is
+> `BRAIN_ROOT`. Pre-plan output **always** goes to `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`,
+> never the current repo's own `planning/` — one place to look, whichever repo you invoked this
+> from. Scope the work *inside* the folder instead: set `project: <repo-slug>` in the frontmatter
+> and prefix the slug when it is repo-specific (`mev-error-handling`).
+>
+> **Why centralized** (HQ D87): `/sequence` decides the successor by counting repos, and the
+> multi-repo successor `/generate-roadmap` writes `planning/roadmaps/<slug>/`, which exists only in
+> HQ — so a leaf-repo pre-plan would have to migrate cross-repo on every multi-repo cut. That
+> migration is `/generate-roadmap` Step 7b, measured running 3 times in 34 roadmaps. Starting in HQ
+> removes the move. Note also that every repo's `planning/` is a symlink into `core/_planning/`
+> tracked by the one HQ git repo, so "local" was never a separate repository anyway.
+>
+> **If no `brain.toml` is found**, this is a standalone repo: write to `planning/open-work/pre-plan/<slug>/`
+> relative to the repo root, and say so in the report.
 
 ## Purpose
 
@@ -19,13 +36,13 @@ question in between: where does the new work attach to the old, and what breaks 
 attachment is wrong.** It is the stage most often skipped and the one whose absence most reliably
 produces a plan that is coherent on paper and unbuildable in practice.
 
-Output: `planning/open-work/pre-plan/<slug>/seams.md`.
+Output: `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/seams.md`.
 
 It produces **no blocks, no waves, no estimates.** Those are `/sequence`.
 
 ## Instructions
 
-1. Resolve the slug. Read `planning/open-work/pre-plan/<slug>/assessment.md`, `verification.md` if present, and
+1. Resolve the slug. Read `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md`, `verification.md` if present, and
    `CLAUDE.md`. **Where assessment and verification disagree, verification wins.** If no
    assessment exists, stop and point at `/assess`.
 
@@ -115,7 +132,7 @@ Two conditions send it to a fresh session instead:
 Close by telling the operator:
 
 ```
-Seam map complete: planning/open-work/pre-plan/<slug>/seams.md
+Seam map complete: $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/seams.md
 
 <N> forks need your answer before sequencing — they change the cut, so none can be
 deferred into planning:
@@ -196,7 +213,7 @@ shrinks the work.>
 ## Report
 
 ```
-planning/open-work/pre-plan/<slug>/seams.md
+$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/seams.md
 
 Capabilities:  <b> built · <h> half-built · <a> absent
 Seams:         <n> (<u> with unknown blast radius)

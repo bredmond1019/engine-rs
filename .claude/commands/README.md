@@ -334,18 +334,22 @@ worklog section this run reads and writes (see Run Artifacts below).
 ### Directory Layout
 
 `planning/` is split by **who reads it** (HQ D87). Everything an agent generates and consumes stays
-at the top level; everything you author and come back to lives under `open-work/`:
+in this repo's own `planning/`; everything you author and come back to is centralized at the brain
+root, so there is one place to look whichever repo you were in:
 
 ```
-planning/
-  open-work/                 <- YOURS. Authored narrative, read by a human.
-    pre-plan/<slug>/         <- /capture, /assess, /seams, /sequence, /plan,
-                                /define-design-system, /define-polish-standard
+$BRAIN_ROOT/planning/          <- HQ. Resolve by walking up for brain.toml.
+  open-work/                   <- YOURS. Authored narrative, read by a human.
+    pre-plan/<slug>/           <- /capture, /assess, /seams, /sequence, /plan,
+                                  /define-design-system, /define-polish-standard
+                                  ALWAYS here, never the leaf repo's planning/.
+                                  Scope with `project:` + a repo-prefixed slug.
   roadmaps/  epics/  decisions/                    <- yours, already separate
   status.md  context.md  backlog.md  objective.md  <- yours, at the root
   knowledge.md  memory.md  handoff.md  index.md
 
-  <BlockID>/  blocks/  orchestration-run/  artifacts/  archive/   <- the agent's
+<this repo>/planning/           <- the agent's, and repo-local
+  <BlockID>/  blocks/  orchestration-run/  artifacts/  archive/
   state.json  harness.json  lane-*.json
 ```
 

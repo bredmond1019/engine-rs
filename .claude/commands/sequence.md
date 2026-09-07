@@ -12,6 +12,23 @@ $ARGUMENTS — the slug, plus optional flags. Example: `orchestration-extensions
 | `--single-repo` | The work lands in one repo; skip the ownership split and hand off to `/plan` |
 | `--no-redteam` | Skip the adversarial pass. Do not use before authoring a real plan |
 
+> **Where this writes — resolve `BRAIN_ROOT` first.** Walk **up** from the current working
+> directory until you find a `brain.toml` (its first line begins `# brain.toml`); that directory is
+> `BRAIN_ROOT`. Pre-plan output **always** goes to `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`,
+> never the current repo's own `planning/` — one place to look, whichever repo you invoked this
+> from. Scope the work *inside* the folder instead: set `project: <repo-slug>` in the frontmatter
+> and prefix the slug when it is repo-specific (`mev-error-handling`).
+>
+> **Why centralized** (HQ D87): `/sequence` decides the successor by counting repos, and the
+> multi-repo successor `/generate-roadmap` writes `planning/roadmaps/<slug>/`, which exists only in
+> HQ — so a leaf-repo pre-plan would have to migrate cross-repo on every multi-repo cut. That
+> migration is `/generate-roadmap` Step 7b, measured running 3 times in 34 roadmaps. Starting in HQ
+> removes the move. Note also that every repo's `planning/` is a symlink into `core/_planning/`
+> tracked by the one HQ git repo, so "local" was never a separate repository anyway.
+>
+> **If no `brain.toml` is found**, this is a standalone repo: write to `planning/open-work/pre-plan/<slug>/`
+> relative to the repo root, and say so in the report.
+
 ## Purpose
 
 Turn `seams.md` into **the cut**: an ordered set of candidate blocks, each with an owning repo,
@@ -21,20 +38,20 @@ makes later work verifiable.
 **Which successor consumes this is a COUNT, not a judgement call** — state it in the closing
 report so the caller does not have to re-derive it, and so this stage can be a deterministic node in
 a sequential workflow: count the distinct values in the block table's **Repo** column.
-`== 1` -> `/plan <slug>`, which authors `plan.md` into `planning/open-work/pre-plan/<slug>/` alongside this file.
-`> 1` -> `/generate-roadmap <slug> --from planning/open-work/pre-plan/<slug>/sequence.md`, which writes
+`== 1` -> `/plan <slug>`, which authors `plan.md` into `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` alongside this file.
+`> 1` -> `/generate-roadmap <slug> --from $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md`, which writes
 `planning/roadmaps/<slug>/` and, in its Step 7b, MOVES this folder to
 `planning/roadmaps/<slug>/pre-plan/`. The invariant both paths maintain is that
-`planning/open-work/pre-plan/<slug>/` and `planning/roadmaps/<slug>/` are never both populated.
+`$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` and `planning/roadmaps/<slug>/` are never both populated.
 
-Output: `planning/open-work/pre-plan/<slug>/sequence.md`. It is the **only** input `/plan` (one repo) or
+Output: `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md`. It is the **only** input `/plan` (one repo) or
 `/generate-roadmap` (multiple repos) needs.
 
 This stage does not author block records or register `state.json`. That is `/plan`.
 
 ## Instructions
 
-1. Read `planning/open-work/pre-plan/<slug>/seams.md`, `assessment.md`, `verification.md`, `CLAUDE.md`, and the
+1. Read `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/seams.md`, `assessment.md`, `verification.md`, `CLAUDE.md`, and the
    in-scope repos' `planning/context.md`. If `seams.md` is missing, stop and point at `/seams` —
    sequencing from an assessment alone produces a cut along architectural layers, which is the
    failure mode this whole pipeline exists to avoid.
@@ -260,12 +277,12 @@ costs nothing but a new session.
 Close with `/handoff` and tell the operator:
 
 ```
-Sequence complete: planning/open-work/pre-plan/<slug>/sequence.md
+Sequence complete: $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md
 <n> waves · <m> blocks (<r> registered, <c> candidates) · <e> operator errands
 
 Start a FRESH session — Opus — and run ONE of:
   /plan "<initiative>"                                       — one repo
-  /generate-roadmap <slug> --from planning/open-work/pre-plan/<slug>/sequence.md — several repos
+  /generate-roadmap <slug> --from $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md — several repos
 
 <Say which, and why: repo count and block count.>
 
@@ -388,7 +405,7 @@ naming an unregistered ID stops or improvises.*
 ## Report
 
 ```
-planning/open-work/pre-plan/<slug>/sequence.md
+$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md
 
 Waves: <n>   Blocks: <m>  (<r> registered, <c> candidates -> Wave 0)   Operator errands: <e>
 Block IDs allocated: <per repo, e.g. EN.12.A-EN.13.F (28) · MV.4.A-MV.4.C (3)>
@@ -401,5 +418,5 @@ Red team: <x> landed, <y> rejected
 Handoff test on block 1: PASS | FAIL — <what was missing>
 
 Next:  /plan "<the initiative>"                    (one repo)
-       /generate-roadmap <slug> --from planning/open-work/pre-plan/<slug>/sequence.md   (several repos)
+       /generate-roadmap <slug> --from $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md   (several repos)
 ```
