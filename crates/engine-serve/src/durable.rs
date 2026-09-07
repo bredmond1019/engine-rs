@@ -546,6 +546,9 @@ mod tests {
             completed_at: Utc::now(),
             status: NodeInvocationStatus::Success,
             error: None,
+            payload: None,
+            payload_truncated: false,
+            payload_cap_bytes: 0,
         }
     }
 

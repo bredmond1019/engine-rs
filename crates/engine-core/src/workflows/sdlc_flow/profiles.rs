@@ -39,6 +39,9 @@ pub fn baseline() -> PartialPolicy {
         review_diff_max_chars: Some(120_000),
         // Restates the built-in default verbatim — baseline's no-op contract.
         max_review_attempts: Some(3),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract (EN.14.G).
+        node_invocation_payload_cap_bytes: Some(crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES),
         ..Default::default()
     }
 }
@@ -86,6 +89,10 @@ pub fn cheap_fast() -> PartialPolicy {
         // passes before the run bails to `WrapUpNode` rather than
         // continuing to spend on this profile's cheapest-and-fastest tiers.
         max_review_attempts: Some(2),
+        // The cost/latency floor for retained payloads too (EN.14.G):
+        // below the built-in default, so a dispatch's retained output
+        // truncates sooner on this profile.
+        node_invocation_payload_cap_bytes: Some(8_192),
         ..Default::default()
     }
 }
@@ -250,6 +257,10 @@ pub fn thorough() -> PartialPolicy {
         // `batch-reviewer`'s 200_000 ceiling — so the quality ceiling's
         // reviewer sees the most of a task's real diff before truncation.
         review_diff_max_chars: Some(400_000),
+        // The quality ceiling for retained payloads too (EN.14.G): above
+        // the built-in default, so this profile's ledger keeps more of a
+        // dispatch's output before truncating it.
+        node_invocation_payload_cap_bytes: Some(262_144),
     }
 }
 
@@ -335,6 +346,7 @@ mod tests {
         assert!(transport_retry.max_attempts.is_some());
         assert!(transport_retry.initial_backoff_ms.is_some());
         assert!(p.review_diff_max_chars.is_some());
+        assert!(p.node_invocation_payload_cap_bytes.is_some());
     }
 
     #[test]
@@ -521,6 +533,39 @@ mod tests {
             baseline().max_review_attempts,
             Some(super::super::policy::SdlcPolicy::default().max_review_attempts),
             "baseline must restate the built-in default (its no-op contract)"
+        );
+    }
+
+    /// EN.14.G / standing rule 6: the payload-retention cap is a knob, not
+    /// a `const`, so the three canonical profiles must set it explicitly —
+    /// `baseline` restating the built-in default, `cheap-fast` below it,
+    /// `thorough` above it. `pragmatist`/`batch-reviewer` are not required
+    /// to set it (it falls through to the built-in default via `node_
+    /// context`'s untyped read), so they are deliberately excluded here.
+    #[test]
+    fn baseline_cheap_fast_and_thorough_set_node_invocation_payload_cap_bytes_explicitly() {
+        let default_cap =
+            super::super::policy::SdlcPolicy::default().node_invocation_payload_cap_bytes;
+        assert_eq!(
+            baseline().node_invocation_payload_cap_bytes,
+            Some(default_cap),
+            "baseline must restate the built-in default (its no-op contract)"
+        );
+
+        let cheap_fast_cap = cheap_fast()
+            .node_invocation_payload_cap_bytes
+            .expect("cheap-fast must set node_invocation_payload_cap_bytes explicitly");
+        assert!(
+            cheap_fast_cap < default_cap,
+            "cheap-fast ({cheap_fast_cap}) must be the cost/latency floor, below the default ({default_cap})"
+        );
+
+        let thorough_cap = thorough()
+            .node_invocation_payload_cap_bytes
+            .expect("thorough must set node_invocation_payload_cap_bytes explicitly");
+        assert!(
+            thorough_cap > default_cap,
+            "thorough ({thorough_cap}) must be the quality ceiling, above the default ({default_cap})"
         );
     }
 }

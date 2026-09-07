@@ -62,6 +62,9 @@ pub fn baseline() -> PartialSdlcTaskPolicy {
             max_attempts: Some(d.transport_retry.max_attempts),
             initial_backoff_ms: Some(d.transport_retry.initial_backoff_ms),
         }),
+        // Restates the built-in default verbatim — baseline's no-op
+        // contract (EN.14.G).
+        node_invocation_payload_cap_bytes: Some(d.node_invocation_payload_cap_bytes),
     }
 }
 
@@ -101,6 +104,9 @@ pub fn cheap_fast() -> PartialSdlcTaskPolicy {
             max_attempts: Some(2),
             initial_backoff_ms: Some(200),
         }),
+        // The cost/latency floor for retained payloads too (EN.14.G):
+        // below the built-in default.
+        node_invocation_payload_cap_bytes: Some(8_192),
     }
 }
 
@@ -141,6 +147,9 @@ pub fn thorough() -> PartialSdlcTaskPolicy {
             max_attempts: Some(5),
             initial_backoff_ms: Some(500),
         }),
+        // The quality ceiling for retained payloads too (EN.14.G): above
+        // the built-in default.
+        node_invocation_payload_cap_bytes: Some(262_144),
     }
 }
 
@@ -302,6 +311,28 @@ mod tests {
     fn thorough_keeps_full_test_depth_and_cheap_fast_switches_to_fast() {
         assert_eq!(thorough().test_depth, Some(TestDepth::Full));
         assert_eq!(cheap_fast().test_depth, Some(TestDepth::Fast));
+    }
+
+    /// EN.14.G / standing rule 6: `baseline` restates the built-in payload
+    /// cap, `cheap-fast` is the cost floor, `thorough` the quality
+    /// ceiling.
+    #[test]
+    fn baseline_cheap_fast_and_thorough_set_node_invocation_payload_cap_bytes_explicitly() {
+        let default_cap = SdlcTaskPolicy::default().node_invocation_payload_cap_bytes;
+        assert_eq!(
+            baseline().node_invocation_payload_cap_bytes,
+            Some(default_cap)
+        );
+
+        let cheap_fast_cap = cheap_fast()
+            .node_invocation_payload_cap_bytes
+            .expect("cheap-fast must set node_invocation_payload_cap_bytes explicitly");
+        assert!(cheap_fast_cap < default_cap);
+
+        let thorough_cap = thorough()
+            .node_invocation_payload_cap_bytes
+            .expect("thorough must set node_invocation_payload_cap_bytes explicitly");
+        assert!(thorough_cap > default_cap);
     }
 
     fn event_context(body: serde_json::Value) -> TaskContext {

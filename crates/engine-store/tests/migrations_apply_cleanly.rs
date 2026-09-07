@@ -97,11 +97,14 @@ async fn assert_journal_table_and_index_exist(pool: &PgPool) -> Result<(), Strin
 }
 
 /// Assert EN.14.F task 3's `node_invocations` table migration produced exactly
-/// the schema documented in `0002_create_node_invocations.sql`:
-/// `started_at`/`completed_at` are `timestamp` WITHOUT time zone (not
-/// `timestamptz`), `status` is `text`, and the `(run_id, seq)` index exists so
-/// `list_node_invocations_for_run`'s query never falls back to a full table
-/// scan. Mirrors [`assert_journal_table_and_index_exist`] exactly.
+/// the schema documented in `0002_create_node_invocations.sql`, EXTENDED by
+/// EN.14.G task 3's `0003_add_node_invocation_payload.sql`: `started_at`/
+/// `completed_at` are `timestamp` WITHOUT time zone (not `timestamptz`),
+/// `status` is `text`, `payload` is `json` (not `jsonb` — the same trap
+/// `0001_create_journal.sql`'s header already documents for `detail`), and
+/// the `(run_id, seq)` index exists so `list_node_invocations_for_run`'s
+/// query never falls back to a full table scan. Mirrors
+/// [`assert_journal_table_and_index_exist`] exactly.
 async fn assert_node_invocations_table_and_index_exist(pool: &PgPool) -> Result<(), String> {
     let columns = sqlx::query(
         "SELECT column_name, data_type FROM information_schema.columns \
@@ -144,6 +147,12 @@ async fn assert_node_invocations_table_and_index_exist(pool: &PgPool) -> Result<
     expect_type("completed_at", "timestamp without time zone")?;
     expect_type("status", "text")?;
     expect_type("error", "text")?;
+    // EN.14.G task 3: `payload` MUST be `json`, not `jsonb` — matching
+    // `0001_create_journal.sql`'s `detail` column and `postgres.rs`'s
+    // dependence on that exact type.
+    expect_type("payload", "json")?;
+    expect_type("payload_truncated", "boolean")?;
+    expect_type("payload_cap_bytes", "bigint")?;
 
     let index_count: i64 = sqlx::query(
         "SELECT count(*) AS count FROM pg_indexes \

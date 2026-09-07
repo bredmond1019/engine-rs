@@ -325,8 +325,9 @@ pub async fn insert_node_invocation(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO node_invocations \
-             (id, run_id, campaign_id, node, seq, started_at, completed_at, status, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             (id, run_id, campaign_id, node, seq, started_at, completed_at, status, error, \
+              payload, payload_truncated, payload_cap_bytes) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(row.id)
@@ -338,6 +339,9 @@ pub async fn insert_node_invocation(
     .bind(row.completed_at)
     .bind(node_invocation_status_to_text(row.status))
     .bind(&row.error)
+    .bind(row.payload.as_ref().map(Json))
+    .bind(row.payload_truncated)
+    .bind(row.payload_cap_bytes as i64)
     .execute(pool)
     .await?;
     Ok(())
@@ -351,7 +355,8 @@ pub async fn list_node_invocations_for_run(
     run_id: &str,
 ) -> Result<Vec<NodeInvocation>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, run_id, campaign_id, node, seq, started_at, completed_at, status, error \
+        "SELECT id, run_id, campaign_id, node, seq, started_at, completed_at, status, error, \
+                payload, payload_truncated, payload_cap_bytes \
          FROM node_invocations \
          WHERE run_id = $1 \
          ORDER BY seq ASC",
@@ -363,6 +368,7 @@ pub async fn list_node_invocations_for_run(
     rows.into_iter()
         .map(|row| {
             let status_text: String = row.try_get("status")?;
+            let payload: Option<Json<serde_json::Value>> = row.try_get("payload")?;
             Ok(NodeInvocation {
                 id: row.try_get("id")?,
                 run_id: row.try_get("run_id")?,
@@ -373,6 +379,9 @@ pub async fn list_node_invocations_for_run(
                 completed_at: row.try_get::<NaiveDateTime, _>("completed_at")?.and_utc(),
                 status: node_invocation_status_from_text(&status_text)?,
                 error: row.try_get("error")?,
+                payload: payload.map(|Json(v)| v),
+                payload_truncated: row.try_get("payload_truncated")?,
+                payload_cap_bytes: row.try_get::<i64, _>("payload_cap_bytes")? as u64,
             })
         })
         .collect()

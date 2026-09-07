@@ -314,6 +314,16 @@ pub struct SdlcPolicy {
     /// recreate the very rubber-stamp failure the real-diff fix exists to
     /// eliminate.
     pub review_diff_max_chars: u32,
+    /// The per-payload retention cap `node_context` applies to a dispatch's
+    /// output before appending it to the `node_invocations` ledger
+    /// (EN.14.G). Read back UNTYPED off the `ResolvedPolicy` stamp by
+    /// [`crate::invocations::payload_cap_from_resolved_policy`] — this
+    /// field's only job is to reach that stamp via
+    /// [`crate::policy::stamp_resolved_policy`], which serializes the
+    /// whole policy. Behavior-stable default:
+    /// [`crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES`], so introducing
+    /// this knob changes no existing run's ledger.
+    pub node_invocation_payload_cap_bytes: u64,
 }
 
 impl Default for SdlcPolicy {
@@ -350,6 +360,7 @@ impl Default for SdlcPolicy {
             // well inside a 200k-token window even after the acceptance
             // criteria and the model's own reasoning.
             review_diff_max_chars: 120_000,
+            node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
         }
     }
 }
@@ -376,6 +387,7 @@ pub struct PartialPolicy {
     pub retry_feedback: Option<PartialRetryFeedback>,
     pub transport_retry: Option<PartialTransportRetry>,
     pub review_diff_max_chars: Option<u32>,
+    pub node_invocation_payload_cap_bytes: Option<u64>,
 }
 
 /// All-optional mirror of [`ModelTiers`] for per-stage partial overrides.
@@ -518,6 +530,10 @@ impl crate::policy::Policy for SdlcPolicy {
                 base.review_diff_max_chars,
                 over.review_diff_max_chars,
             ),
+            node_invocation_payload_cap_bytes: merge_opt(
+                base.node_invocation_payload_cap_bytes,
+                over.node_invocation_payload_cap_bytes,
+            ),
         }
     }
 }
@@ -580,6 +596,48 @@ mod tests {
         assert!(!policy.llm_triage);
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.max_review_attempts, 3);
+    }
+
+    /// EN.14.G task 3's central round-trip: `stamp_resolved_policy` puts
+    /// `node_invocation_payload_cap_bytes` into
+    /// `ctx.nodes["ResolvedPolicy"]` with no new stamping code (it
+    /// serializes the whole resolved policy), and
+    /// `invocations::payload_cap_from_resolved_policy` reads back exactly
+    /// that value — the seam that lets a framework-level dispatch site
+    /// attribute cost to a value it never typed against.
+    #[test]
+    fn resolved_policy_stamp_round_trips_the_payload_cap_via_invocations_reader() {
+        let profile = profiles::cheap_fast();
+        let resolved = resolve(SdlcPolicy::default(), None, Some(&profile), None);
+        let expected_cap = resolved.node_invocation_payload_cap_bytes;
+        assert_ne!(
+            expected_cap,
+            SdlcPolicy::default().node_invocation_payload_cap_bytes,
+            "test must exercise a non-default resolved cap or the round-trip is vacuous"
+        );
+
+        let mut ctx = engine_contract::TaskContext {
+            event: serde_json::json!({}),
+            nodes: Default::default(),
+            metadata: serde_json::json!({}),
+            node_runs: Default::default(),
+        };
+        crate::policy::stamp_resolved_policy(&mut ctx, &resolved).expect("stamp should succeed");
+
+        let stamped = ctx
+            .nodes
+            .get(crate::policy::RESOLVED_POLICY_IDENTITY)
+            .and_then(serde_json::Value::as_object)
+            .expect("ResolvedPolicy stamp is a JSON object");
+        assert_eq!(
+            stamped.get("node_invocation_payload_cap_bytes"),
+            Some(&serde_json::json!(expected_cap))
+        );
+
+        assert_eq!(
+            crate::invocations::payload_cap_from_resolved_policy(&ctx),
+            expected_cap
+        );
     }
 
     #[test]
@@ -1465,6 +1523,10 @@ mod tests {
             "review_diff_max_chars",
             "task_loop.rs::bound_review_diff, end_review.rs (EndReviewNode's diff budget)",
         ),
+        (
+            "node_invocation_payload_cap_bytes",
+            "invocations.rs::payload_cap_from_resolved_policy (read UNTYPED off the ResolvedPolicy stamp by node_context, workflow.rs)",
+        ),
     ];
 
     #[test]
@@ -1491,6 +1553,7 @@ mod tests {
             retry_feedback,
             transport_retry,
             review_diff_max_chars,
+            node_invocation_payload_cap_bytes,
         );
 
         let mut actual: Vec<&str> = field_names.to_vec();
