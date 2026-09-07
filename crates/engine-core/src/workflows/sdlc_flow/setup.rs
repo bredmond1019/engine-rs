@@ -503,14 +503,19 @@ impl Node for SetupWorktreeNode {
                     // misread as exactly that failure and refuse loudly.
                     // The operator has decided (2026-09-05) that a plain,
                     // git-tracked `planning/` becomes the supported DEFAULT
-                    // for future repos too, but with no config mechanism yet
-                    // to declare that per repo (a separate, later design
-                    // task — deliberately out of scope here), the only
-                    // repo this can be verified true for today is the brain
-                    // root itself, exactly the pattern
-                    // `resolve_isolation` (`workflows/orchestration/execute.rs`)
-                    // already uses to special-case it: canonicalize `root`
-                    // and the registry's `brain_root()` and compare.
+                    // for future repos too. The brain root is always exempt
+                    // (canonicalize `root` and the registry's `brain_root()`
+                    // and compare — the pattern `resolve_isolation` in
+                    // `workflows/orchestration/execute.rs` already uses).
+                    // Any OTHER repo now exempts itself the same way any
+                    // other `brain.toml` fact reaches this node: by
+                    // declaring `non_vaulted_planning = true` on its own
+                    // `[[repos]]` entry (mev's `RepoEntry`, `#[serde(default)]`
+                    // -> `false`), read through
+                    // `RepoRegistry::declares_non_vaulted_planning`, which
+                    // only ever answers for a slug the registry actually
+                    // admitted (an entry mev skipped — escaping or
+                    // non-directory `repo_path` — can never grant this).
                     // Canonicalization failure (no registry, or a path that
                     // doesn't resolve) falls through to the ordinary,
                     // unchanged vault-symlink handling below, exactly as
@@ -526,10 +531,18 @@ impl Node for SetupWorktreeNode {
                         })
                         .unwrap_or(false);
 
-                    if is_brain_root {
-                        // Non-vaulted brain root: leave the worktree's
-                        // checked-out planning/ exactly as git left it — no
-                        // symlink install, no deletion.
+                    let declares_non_vaulted_planning = self
+                        .registry
+                        .as_deref()
+                        .map(|registry| registry.declares_non_vaulted_planning(&root))
+                        .unwrap_or(false);
+
+                    if is_brain_root || declares_non_vaulted_planning {
+                        // Non-vaulted brain root, or a repo that has
+                        // declared its own `planning/` is real, git-tracked
+                        // content: leave the worktree's checked-out
+                        // planning/ exactly as git left it — no symlink
+                        // install, no deletion.
                     } else {
                         let canonical_planning =
                             std::fs::canonicalize(&planning_source).map_err(|err| {
@@ -4302,6 +4315,109 @@ repo_path = "alpha"
                 .expect("the checked-out spec content must survive untouched"),
             "{}",
             "nothing inside the checked-out planning/ directory may be altered"
+        );
+    }
+
+    // --- non-brain-root `non_vaulted_planning` declaration (EN.ticket.non-vaulted-planning-needs-a-per-repo-declaration) --
+
+    /// A non-brain-root repo (`alpha`), optionally declaring
+    /// `non_vaulted_planning = true` on its own `brain.toml` `[[repos]]`
+    /// entry, with a real, populated `planning/` directory at its own root
+    /// (the same "plain, git-tracked content" shape `brain_with_real_planning`
+    /// uses for the vaulted case, so the two fixtures differ only in the
+    /// flag and the entry's `slug` never being the brain root).
+    #[cfg(unix)]
+    fn non_root_repo_declaring_non_vaulted_planning(
+        flag: bool,
+    ) -> (tempfile::TempDir, Arc<RepoRegistry>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("alpha")).expect("mkdir alpha");
+        let flag_line = if flag {
+            "non_vaulted_planning = true\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            format!("\n[[repos]]\nslug = \"alpha\"\nrepo_path = \"alpha\"\n{flag_line}"),
+        )
+        .expect("write brain.toml");
+        let registry =
+            Arc::new(RepoRegistry::from_brain_root(dir.path()).expect("registry builds"));
+        let alpha_root = registry.resolve("alpha").expect("alpha resolves");
+        let real_planning = alpha_root.join("planning");
+        std::fs::create_dir_all(real_planning.join("my-spec")).expect("mkdir planning/my-spec");
+        std::fs::write(real_planning.join("my-spec").join("tasks.json"), "{}")
+            .expect("write tasks.json");
+        (dir, registry)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_brain_root_repo_declaring_non_vaulted_planning_is_left_alone() {
+        // Positive case, AC1: a non-brain-root repo whose brain.toml entry
+        // sets `non_vaulted_planning = true` must complete SetupWorktreeNode
+        // with `use_worktree: true`, leaving the worktree's checked-out
+        // `planning/` exactly as git left it.
+        let (_brain, registry) = non_root_repo_declaring_non_vaulted_planning(true);
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner_with_plain_planning_checkout(0))
+            .with_registry(registry.clone());
+        let event = json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" });
+
+        let out = node
+            .process(empty_context(event))
+            .await
+            .expect("a repo declaring non_vaulted_planning must not be refused");
+        let worktree_path = PathBuf::from(
+            out.nodes.get("SetupWorktreeNode").expect("output present")["worktree_path"]
+                .as_str()
+                .expect("worktree_path is a string"),
+        );
+        let worktree_planning = worktree_path.join("planning");
+
+        let meta = std::fs::symlink_metadata(&worktree_planning)
+            .expect("the checked-out planning/ directory must still be there");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "a declared non-vaulted planning/ directory must NOT be replaced by a symlink"
+        );
+        assert!(
+            meta.is_dir(),
+            "planning/ must remain the plain directory git checked out"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree_planning.join("my-spec").join("tasks.json"))
+                .expect("the checked-out spec content must survive untouched"),
+            "{}",
+            "nothing inside the checked-out planning/ directory may be altered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_brain_root_repo_without_the_flag_is_still_refused() {
+        // NEGATIVE CONTROL, AC2: the identical fixture WITHOUT the flag must
+        // still hit the non-empty stale-directory refusal, unchanged. This is
+        // the test that distinguishes "this repo declared itself exempt"
+        // from "every repo is now exempt" — the positive case alone cannot.
+        let (_brain, registry) = non_root_repo_declaring_non_vaulted_planning(false);
+        let node = SetupWorktreeNode::new()
+            .with_runner(worktree_creating_runner_with_plain_planning_checkout(0))
+            .with_registry(registry.clone());
+        let event = json!({ "spec_slug": "my-spec", "use_worktree": true, "repo": "alpha" });
+
+        let err = node.process(empty_context(event)).await.expect_err(
+            "without the declaration, a stale tracked planning/ directory must still be refused",
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("non-empty directory"),
+            "error should name the non-empty directory; got: {message}"
+        );
+        assert!(
+            message.contains("Refusing to delete it"),
+            "the refusal message must be unchanged; got: {message}"
         );
     }
 

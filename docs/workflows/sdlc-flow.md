@@ -49,7 +49,7 @@ are runtime-only — declared but not walked by the graph's acyclic-shape valida
 
 | Node | Kind | What it does |
 |---|---|---|
-| `SetupWorktreeNode` | Deterministic | Creates/reattaches the spec's git worktree (`git worktree add`, or reattach if `resume` and it already exists on disk). Resolves the 4-layer `SdlcPolicy` (event `policy` > event `profile` > `harness.json` > built-in default) and stamps it into ctx as `ResolvedPolicy` — see [sdlc-flow-policy.md](sdlc-flow-policy.md). Its planning-install guard supports two shapes of source-repo `planning/`: a D46 vault symlink (installs/repairs the worktree's own symlink to the same target, refusing loudly only when a genuinely stale, non-empty tracked directory is left over from a base branch that should have untracked it) and a plain, git-tracked directory — the non-vaulted default — which `git worktree add` checks out like any other tracked path and which the guard leaves alone entirely: no symlink installed, nothing deleted. |
+| `SetupWorktreeNode` | Deterministic | Creates/reattaches the spec's git worktree (`git worktree add`, or reattach if `resume` and it already exists on disk). Resolves the 4-layer `SdlcPolicy` (event `policy` > event `profile` > `harness.json` > built-in default) and stamps it into ctx as `ResolvedPolicy` — see [sdlc-flow-policy.md](sdlc-flow-policy.md). Its planning-install guard supports two shapes of source-repo `planning/`: a D46 vault symlink (installs/repairs the worktree's own symlink to the same target, refusing loudly only when a genuinely stale, non-empty tracked directory is left over from a base branch that should have untracked it) and a plain, git-tracked directory, which `git worktree add` checks out like any other tracked path and which the guard leaves alone entirely: no symlink installed, nothing deleted. The brain root is always treated as the latter. Any OTHER repo gets the same treatment only if it opts in — see **"Declaring a non-vaulted `planning/`"** below; without the declaration, a repo whose base branch still tracks a real `planning/` directory hits the non-empty-directory refusal exactly as before. |
 | `SpecExistsRouterNode` | Deterministic router | Routes to `LoadTaskStateNode` if `sdlc-flow-state.json` or `tasks.json` already exists under `planning/<slug>/`, else to `GenerateTasksNode`. |
 | `GenerateTasksNode` | **Model** (Opus, tunable via policy) | Planning-fallback path only — gathers `planning/<slug>/*.md` context and prompts for a task list, writing `tasks.json` + `tasks.md`. Sets `config.json_schema` and prefers the model's structured output (`ctx.nodes["GenerateTasksNode"]["structured"]`) over fence-stripped text parsing, falling back to `strip_json_fence` + `serde_json::from_str` when structured output is absent. Reads `model_tiers.generate` and `timeouts.generate`; Opus is the built-in default for `model_tiers.generate`, chosen to be byte-identical to the removed hardcode. |
 | `LoadTaskStateNode` | Deterministic | Honours `resume`: with `resume: true` loads `sdlc-flow-state.json` if present, otherwise archives it to `.superseded-<run_id>.bak` and bootstraps a fresh `SDLCState` from `tasks.json`. Applies the event's `task_range` filter. See [Restart vs. resume](#restart-vs-resume--what-resume-actually-does). |
@@ -467,6 +467,22 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
     `brain.toml` slug is reachable; set, it intersects. It exists so a future
     internet-exposed deployment can shrink the reachable set (e.g. to `engine-rs,bastion`) without
     editing the brain.
+  - **Declaring a non-vaulted `planning/`.** A repo's `[[repos]]` entry in `brain.toml` may set
+    `non_vaulted_planning = true` (mev's `RepoEntry::non_vaulted_planning`, `#[serde(default)]` —
+    absent or `false` is the default, fail-closed) to tell `SetupWorktreeNode` that this repo's
+    `planning/` is real, git-tracked content, not a D46 vault symlink. `RepoRegistry` records the
+    flag only for slugs it actually admits — an entry skipped for an escaping or non-directory
+    `repo_path` can never carry it — and exposes it via
+    `RepoRegistry::declares_non_vaulted_planning(path)`. `SetupWorktreeNode` widens its brain-root
+    exemption to `is_brain_root || declares_non_vaulted_planning`: a declaring repo's worktree keeps
+    exactly what `git worktree add` checked out into `planning/` — no symlink installed, nothing
+    deleted — the same treatment the brain root always got. **What it does NOT exempt:** the
+    declaration only changes which repos are treated as "plain, git-tracked `planning/`"; it does
+    not touch the refusal itself. A repo — declaring or not — whose worktree `planning/` is a
+    genuinely stale, non-empty *tracked* directory left over from replacing a D46 vault symlink with
+    a plain directory (or vice versa) still needs a human to untrack/remove it; the guard still
+    refuses to silently delete tracked content. Omitting the field is unchanged, fail-closed
+    behavior for every existing repo.
   - **Absent `repo` — byte-identical to pre-`EN.3.K` behavior.** An event with no `repo` field
     resolves its target root to `std::env::current_dir()`, exactly as before this block: the same
     relative `worktree_path` (`"."` / `trees/{branch}`), the same `Path::new(".")` git cwds, and the

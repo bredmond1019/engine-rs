@@ -22,7 +22,7 @@
 //! Modelled directly on [`crate::brain_root`]: typed errors, no panics, no
 //! silent `.` fallback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -105,6 +105,14 @@ impl From<BrainRootError> for RepoRegistryError {
 pub struct RepoRegistry {
     brain_root: PathBuf,
     entries: BTreeMap<String, PathBuf>,
+    /// Slugs whose `brain.toml` `[[repos]]` entry set `non_vaulted_planning
+    /// = true` (mev's `RepoEntry::non_vaulted_planning`, `#[serde(default)]`
+    /// so absent means `false`). Populated only for slugs the loop above
+    /// actually admits into `entries` — a skipped entry (escaping
+    /// `repo_path`, or not a directory) must never grant this exemption,
+    /// so the flag is recorded from the same loop iteration that inserts
+    /// into `entries`, never independently of it.
+    non_vaulted_planning: BTreeSet<String>,
 }
 
 impl RepoRegistry {
@@ -128,6 +136,7 @@ impl RepoRegistry {
         let allowlist = read_allowlist();
 
         let mut entries = BTreeMap::new();
+        let mut non_vaulted_planning = BTreeSet::new();
         for repo in &config.repos {
             if let Some(allowed) = &allowlist {
                 if !allowed.contains(&repo.slug) {
@@ -146,12 +155,16 @@ impl RepoRegistry {
                 continue;
             }
 
+            if repo.non_vaulted_planning {
+                non_vaulted_planning.insert(repo.slug.clone());
+            }
             entries.insert(repo.slug.clone(), candidate);
         }
 
         Ok(RepoRegistry {
             brain_root: root.to_path_buf(),
             entries,
+            non_vaulted_planning,
         })
     }
 
@@ -192,6 +205,32 @@ impl RepoRegistry {
                 slug: slug.to_string(),
                 known: self.entries.keys().cloned().collect(),
             })
+    }
+
+    /// `true` when `path` resolves (after canonicalization) to a registry
+    /// entry whose `brain.toml` `[[repos]]` row set `non_vaulted_planning =
+    /// true`.
+    ///
+    /// This is a per-repo declaration, not a per-path guess: a `path` that
+    /// canonicalizes to a slug's `repo_path` inherits exactly that slug's
+    /// flag, nothing else. A `path` matching no known entry (or that fails
+    /// to canonicalize, e.g. it doesn't exist yet) returns `false` — the
+    /// fail-closed default, identical to what an entry `mev` skipped at
+    /// construction (an escaping or non-directory `repo_path`) already gets,
+    /// since a skipped entry is never inserted into `entries` and so can
+    /// never match here either.
+    #[must_use]
+    pub fn declares_non_vaulted_planning(&self, path: &Path) -> bool {
+        let Ok(canonical_path) = path.canonicalize() else {
+            return false;
+        };
+        self.entries.iter().any(|(slug, entry_path)| {
+            entry_path
+                .canonicalize()
+                .map(|canonical_entry| canonical_entry == canonical_path)
+                .unwrap_or(false)
+                && self.non_vaulted_planning.contains(slug)
+        })
     }
 }
 
