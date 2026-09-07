@@ -46,7 +46,7 @@ Look in this order and **stop at the first hit**:
    gates several, and the operator should see all of them.
 2. **A roadmap's Wave 0 session table** (`--roadmap`, or search `planning/*/roadmap.md`) — where
    sessions live before the edge type exists.
-3. **`planning/<slug>/notes.md`** — a `/capture` holding area.
+3. **`planning/open-work/pre-plan/<slug>/notes.md`** — a `/capture` holding area.
 
 If it resolves nowhere, **stop and say so.** Do not invent a session; a fabricated exit condition is
 worse than no session, because it will be marked done.
@@ -101,7 +101,7 @@ never started: the gate is gone and the work is not.
 
 ## Files
 
-- **Reads:** `planning/state.json`, the roadmap, `planning/<slug>/notes.md`, `brain.toml`
+- **Reads:** `planning/state.json`, the roadmap, `planning/open-work/pre-plan/<slug>/notes.md`, `brain.toml`
 - **Writes:** the exit artifact, the gate clearing, and nothing else
 - **Never writes:** another repo's `state.json` — report the change you want and let that repo apply
   it. One command writing state across repos is the contention pattern this fleet keeps getting bitten by.

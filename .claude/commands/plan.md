@@ -10,21 +10,21 @@ $ARGUMENTS — free-text description of the feature, experiment, or body of work
 | `--founding` | This is the project's founding roadmap — a new repo's first blocks. Adds the Goal / Destination / Architecture framing and writes to `planning/founding/`. Invoked by `/new-project`. |
 | `--clarify` | Force the clarify gate on regardless of `planning/harness.json`. |
 | `--no-redteam` | Skip the adversarial pass (step 10). For a small, low-risk initiative only. |
-| `--lane` | Also emit `planning/<slug>/lane-<slug>.json` (D71), authored against `.claude/workflows/lane.schema.json`, so `/begin-orchestration --roadmap <slug> --lane <slug>` can drive this initiative's blocks in dependency order — the same mechanism `/generate-roadmap` gives a multi-repo program. **Opt-in, not the default**: most `/plan` output is never meant to be orchestrated (small initiatives run block-by-block, by hand, on purpose), and silently emitting an extra artifact every time would surprise that far more common caller. See step 7c and the Output Format below. |
+| `--lane` | Also emit `planning/open-work/pre-plan/<slug>/lane-<slug>.json` (D71), authored against `.claude/workflows/lane.schema.json`, so `/begin-orchestration --roadmap <slug> --lane <slug>` can drive this initiative's blocks in dependency order — the same mechanism `/generate-roadmap` gives a multi-repo program. **Opt-in, not the default**: most `/plan` output is never meant to be orchestrated (small initiatives run block-by-block, by hand, on purpose), and silently emitting an extra artifact every time would surprise that far more common caller. See step 7c and the Output Format below. |
 
 ## Purpose
 
 Author **one initiative**: a coherent body of work in **one repo**, spanning one or more blocks.
-**This command writes IN PLACE, into `planning/<slug>/`** — `plan.md` lands beside the
+**This command writes IN PLACE, into `planning/open-work/pre-plan/<slug>/`** — `plan.md` lands beside the
 `sequence.md` it was authored from, and any pre-plan artifacts (`assessment.md`, `seams.md`,
 `evidence/`) stay exactly where `/assess` left them. That is deliberate and is one half of an
-invariant: `planning/<slug>/` and `planning/roadmaps/<slug>/` are never both populated. This command
+invariant: `planning/open-work/pre-plan/<slug>/` and `planning/roadmaps/<slug>/` are never both populated. This command
 satisfies it by staying put; `/generate-roadmap` satisfies it by relocating the pre-plan into
 `planning/roadmaps/<slug>/pre-plan/` (its Step 7b). Do not move anything here.
 
 Output is two things, plus a third when `--lane` is passed:
 
-- `planning/<slug>/plan.md` — the authored **narrative**: the goal, the sequencing rationale, the
+- `planning/open-work/pre-plan/<slug>/plan.md` — the authored **narrative**: the goal, the sequencing rationale, the
   architecture framing, the cut list. Everything true of the *set* rather than of any one block.
 - `planning/blocks/<BlockID>.json` — one **block record** per block. The definition of each
   member.
@@ -49,7 +49,7 @@ re-derived anyway (D65).
 >
 > **Upstream.** For work on an existing system large enough that the cut is not obvious, the
 > pre-plan pipeline runs first: `/assess` → `/seams` → `/sequence`. Its output,
-> `planning/<slug>/sequence.md`, is this command's authored input (step 3a). Planning a
+> `planning/open-work/pre-plan/<slug>/sequence.md`, is this command's authored input (step 3a). Planning a
 > substantial change to an existing subsystem without a seam map produces a cut along
 > architectural layers, which is the failure mode where nothing is usable until the end.
 
@@ -77,7 +77,7 @@ re-derived anyway (D65).
    architecture. Read the files the blocks will touch. When revising an existing initiative, read
    its `plan.md` and every block record it already owns; preserve completed work.
 
-3a. **Read the pre-plan artifacts if they exist.** Check `planning/<slug>/` for `sequence.md`,
+3a. **Read the pre-plan artifacts if they exist.** Check `planning/open-work/pre-plan/<slug>/` for `sequence.md`,
    `seams.md`, `assessment.md` (and `verification.md`).
 
    - **`sequence.md` is this command's authored input.** Its cut, its wave boundaries, its
@@ -151,7 +151,7 @@ re-derived anyway (D65).
      *bounds*.
 
 6. Choose a short descriptive slug (e.g. `keyboard-nav`, `auth-refresh`). With `--founding` the
-   slug is `founding`. Create `planning/<slug>/` if absent.
+   slug is `founding`. Create `planning/open-work/pre-plan/<slug>/` if absent.
 
 7. **Write each block record and register it.** For every block, read and follow
    `.claude/workflows/block-registration.md` — the canonical procedure for the block ID, the
@@ -175,9 +175,17 @@ re-derived anyway (D65).
 
    - `lane` = `<slug>`. `roadmap` = `<slug>` — this is what makes the initiative resolve the same
      way a roadmap does: `/begin-orchestration`'s bare-slug resolution checks
-     `planning/roadmaps/<slug>/` first, then falls back to legacy `planning/<slug>/` — the exact
-     directory this command already writes to. No change to `/begin-orchestration` is needed or
-     permitted; this only works because that fallback already exists.
+     `planning/roadmaps/<slug>/` first, then falls back to legacy `planning/<slug>/`. No change to
+     `/begin-orchestration` is needed or permitted; this only works because that fallback exists.
+
+   - **The lane record is the one artifact that does NOT move into `open-work/` (HQ D87).** The
+     narrative goes to `planning/open-work/pre-plan/<slug>/plan.md`; the lane record stays at
+     `planning/<slug>/lane-<slug>.json`. That split is deliberate and follows D65's rule that
+     authored narrative and machine records live apart: `planning/<slug>/` is the only location
+     both `/begin-orchestration`'s fallback AND mev's `discover_lane_files` read, and `open-work/`
+     is explicitly excluded from the latter (`NON_ROADMAP_DIR_NAMES`, `lane_segments.rs`) so a
+     record left there would be attributed to the slug `open-work` rather than to this initiative.
+     Writing the lane record under `open-work/` therefore makes it unreachable — do not do it.
    - `blocks[]` — every block written in step 7, **in dependency order** (the order later blocks
      depend on earlier ones, matching the Sequence Table), each as
      `{"id": "<BlockID>", "origin_roadmap": "<slug>", "repo": "<this repo's slug>"}`. IDs must be
@@ -191,7 +199,7 @@ re-derived anyway (D65).
    - Validate before handing over: `python3 <path-to-base-template>/scripts/check_lane_records.py --planning planning`.
      A failure here means the lane file, not the plan, is wrong — fix and re-run.
 
-8. **Write the narrative** to `planning/<slug>/plan.md` using the Output Format below. The
+8. **Write the narrative** to `planning/open-work/pre-plan/<slug>/plan.md` using the Output Format below. The
    narrative holds only what is true of the set — it must not duplicate a block's what/why/files,
    which live in the block records and would immediately drift.
 
@@ -291,7 +299,7 @@ decomposing everything now burns tokens on work that gets re-derived (D65).
 Close with `/handoff` and tell the operator:
 
 ```
-Plan authored: planning/<slug>/plan.md — <N> phases, <M> blocks in planning/blocks/
+Plan authored: planning/open-work/pre-plan/<slug>/plan.md — <N> phases, <M> blocks in planning/blocks/
 Handoff test on <first block ID>: PASS | FAIL — <what was missing>
 
 Start a FRESH session per block — Sonnet is right for most; use Opus when the block
@@ -310,7 +318,7 @@ Handoff written to planning/handoff.md.
 - `CLAUDE.md` — standing rules, stack, build/test/validate commands (start here)
 - `planning/context.md` — why the project exists; `planning/status.md` — current state
 - `planning/harness.json` — validation commands + UI-test config
-- `planning/blocks/` — block records; `planning/<slug>/` — initiative narratives
+- `planning/blocks/` — block records; `planning/open-work/pre-plan/<slug>/` — initiative narratives
 - `.claude/workflows/block.schema.json` — the block record field contract
 - `.claude/workflows/block-registration.md` — the shared registration procedure
 - `.claude/workflows/lane.schema.json` — the lane record field contract (`--lane` output, D71)
@@ -404,7 +412,7 @@ cut is a decision with a date on it. Make this list longer than is comfortable.>
 ## Report
 
 ```
-planning/<slug>/plan.md            (<N> phases, <M> blocks)
+planning/open-work/pre-plan/<slug>/plan.md            (<N> phases, <M> blocks)
 planning/blocks/                   <M> block records written
 state.json: <created | already existed>, <M> blocks registered
 planning/<slug>/lane-<slug>.json   <written, <M> blocks | not requested (--lane not passed)>

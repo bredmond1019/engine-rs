@@ -10,7 +10,7 @@ $ARGUMENTS — the assessment slug, plus optional flags. Example: `orchestration
 | Flag | What it does |
 |---|---|
 | `--spike <n>` | Run up to `n` spikes instead of the default 1. `--spike 0` disables |
-| `--from <path>` | Read an assessment that is not at `planning/<slug>/assessment.md` |
+| `--from <path>` | Read an assessment that is not at `planning/open-work/pre-plan/<slug>/assessment.md` |
 
 ## Purpose
 
@@ -19,13 +19,13 @@ question in between: where does the new work attach to the old, and what breaks 
 attachment is wrong.** It is the stage most often skipped and the one whose absence most reliably
 produces a plan that is coherent on paper and unbuildable in practice.
 
-Output: `planning/<slug>/seams.md`.
+Output: `planning/open-work/pre-plan/<slug>/seams.md`.
 
 It produces **no blocks, no waves, no estimates.** Those are `/sequence`.
 
 ## Instructions
 
-1. Resolve the slug. Read `planning/<slug>/assessment.md`, `verification.md` if present, and
+1. Resolve the slug. Read `planning/open-work/pre-plan/<slug>/assessment.md`, `verification.md` if present, and
    `CLAUDE.md`. **Where assessment and verification disagree, verification wins.** If no
    assessment exists, stop and point at `/assess`.
 
@@ -115,7 +115,7 @@ Two conditions send it to a fresh session instead:
 Close by telling the operator:
 
 ```
-Seam map complete: planning/<slug>/seams.md
+Seam map complete: planning/open-work/pre-plan/<slug>/seams.md
 
 <N> forks need your answer before sequencing — they change the cut, so none can be
 deferred into planning:
@@ -194,7 +194,7 @@ shrinks the work.>
 ## Report
 
 ```
-planning/<slug>/seams.md
+planning/open-work/pre-plan/<slug>/seams.md
 
 Capabilities:  <b> built · <h> half-built · <a> absent
 Seams:         <n> (<u> with unknown blast radius)

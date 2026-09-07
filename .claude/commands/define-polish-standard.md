@@ -8,7 +8,7 @@ $ARGUMENTS — what the standard covers, plus flags.
 | Flag | What it does |
 |---|---|
 | `--surface <web\|mobile\|tui\|desktop>` | The surface kind. **Repeatable** — a product with a web app and a phone app gets one section per surface, because the rules differ |
-| `--slug <name>` | Output goes to `planning/<name>/polish-standard.md`. Default: kebab-case of the description |
+| `--slug <name>` | Output goes to `planning/open-work/pre-plan/<name>/polish-standard.md`. Default: kebab-case of the description |
 | `--from <path>` | An existing standard, style guide, or design doc to build on rather than replace |
 | `--no-calibrate` | Skip the two-agent calibration. Only for a throwaway draft — never before an assessment reads it |
 
@@ -17,7 +17,7 @@ $ARGUMENTS — what the standard covers, plus flags.
 "Clean and polished" cannot be assessed against nothing. Without a written standard you get
 opinions; opinions differ between reviewers; and opinions do not become blocks of work.
 
-This command writes `planning/<slug>/polish-standard.md`: a **falsifiable** description of what
+This command writes `planning/open-work/pre-plan/<slug>/polish-standard.md`: a **falsifiable** description of what
 good looks like for this specific product, specific enough that two people shown the same
 screenshot reach the same verdict.
 
@@ -144,14 +144,14 @@ defect in the standard, and it comes back here rather than being answered in the
 Close by telling the operator:
 
 ```
-Polish standard: planning/<slug>/polish-standard.md
+Polish standard: planning/open-work/pre-plan/<slug>/polish-standard.md
 Surfaces: <list>   Items: <n>   Out of scope: <n>
 
 Calibration: AGREED after <k> round(s) — <what was tightened>
              | NOT CONVERGENT on <items> — moved to Out of Scope | needs your call
 
 Use it:
-  /assess "<...> with a UI meeting planning/<slug>/polish-standard.md" ...
+  /assess "<...> with a UI meeting planning/open-work/pre-plan/<slug>/polish-standard.md" ...
   or as the acceptance criteria source for a UI /ticket
 
 <If escalation triggered:>
@@ -231,7 +231,7 @@ rather than guessing.
 ## Report
 
 ```
-planning/<slug>/polish-standard.md
+planning/open-work/pre-plan/<slug>/polish-standard.md
 
 Surfaces: <list>
 Items: <n> (<s> state · <f> foundation · <p> per-surface)

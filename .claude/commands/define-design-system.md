@@ -8,7 +8,7 @@ $ARGUMENTS — what is being built, plus flags.
 | Flag | What it does |
 |---|---|
 | `--surface <web\|mobile\|tui\|desktop>` | Repeatable. Each gets its own stack and component inventory |
-| `--slug <name>` | Output to `planning/<name>/design-system.md` + the artifacts it names |
+| `--slug <name>` | Output to `planning/open-work/pre-plan/<name>/design-system.md` + the artifacts it names |
 | `--from <path>` | A brand guide, a client's existing site, a reference product to derive from |
 | `--house` | Adopt the practice's default stack without re-deciding it (step 2) |
 
@@ -196,7 +196,7 @@ question — the same handoff test as everywhere else.
 Close by telling the operator:
 
 ```
-Design system: planning/<slug>/design-system.md
+Design system: planning/open-work/pre-plan/<slug>/design-system.md
 Emitted: <token file> · <theme config> · <n> components
 Stack: <named>, <matching the fleet | departing because ...>
 
@@ -273,7 +273,7 @@ starts, and what is deliberately not systematised.>
 ## Report
 
 ```
-planning/<slug>/design-system.md
+planning/open-work/pre-plan/<slug>/design-system.md
 Emitted: <files>
 Components: <n> (<s> state containers · <c> product components)
 Stack: <fleet-matching | departures listed>

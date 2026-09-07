@@ -1,6 +1,6 @@
 # Capture — Scaffold a pre-plan notes file and optionally add a backlog ticket
 
-Captures rich conversation content from a planning or research session. Creates `planning/<slug>/notes.md` in the current repo as a structured holding area. If the `--backlog` flag is provided, it calls the `/backlog-ticket` command to create a backlog item pointing to these notes.
+Captures rich conversation content from a planning or research session. Creates `planning/open-work/pre-plan/<slug>/notes.md` in the current repo as a structured holding area. If the `--backlog` flag is provided, it calls the `/backlog-ticket` command to create a backlog item pointing to these notes.
 
 ## Variables
 
@@ -39,12 +39,20 @@ already holds the context.
 
 ### Step 2 — Guard
 
-4. Check whether `planning/<slug>/` already exists. If it does and `notes.md` is present,
+4. Check whether `planning/open-work/pre-plan/<slug>/` already exists. If it does and `notes.md` is present,
    stop and tell the user — do not overwrite existing content.
+
+   Also check that the slug is not already taken elsewhere in this repo's `planning/`: a spec
+   directory `planning/<slug>/`, a block record `planning/blocks/<slug>.json`, or a roadmap
+   `planning/roadmaps/<slug>/`. If any exists, stop and ask for a different slug. Before HQ D87
+   moved captures under `open-work/`, a `/capture` slug that collided with a spec directory passed
+   this guard — the directory had no `notes.md` — and wrote into the block's own folder. The
+   namespaces are separate now, so a collision no longer corrupts anything; it still means two
+   different things share one name, which is what makes them unfindable later.
 
 ### Step 3 — Create the notes file
 
-5. Create `planning/<slug>/notes.md` using the Output Format below. You must populate the body sections with all the important details discussed during the session, but **do not invent content the user or agent hasn't provided/visually seen**. Ensure you capture file paths, class/struct names, functions, important snippets of code, and any additional content that will make it EXTREMELY easy for the next agent or the user to go dig into this note and know exactly what was discussed, how you got to this conclusion or initial research, where to go look to review/investigate further, etc.
+5. Create `planning/open-work/pre-plan/<slug>/notes.md` using the Output Format below. You must populate the body sections with all the important details discussed during the session, but **do not invent content the user or agent hasn't provided/visually seen**. Ensure you capture file paths, class/struct names, functions, important snippets of code, and any additional content that will make it EXTREMELY easy for the next agent or the user to go dig into this note and know exactly what was discussed, how you got to this conclusion or initial research, where to go look to review/investigate further, etc.
 
    **Mark every claim's standing. This is the single most important rule in this command.** A
    captured note is read weeks later, by someone with none of this session's context, and read as
@@ -72,7 +80,7 @@ already holds the context.
 
 ### Step 4 — Backlog ticket (only if --backlog flag is present)
 
-6. If the `--backlog` flag is provided in `$ARGUMENTS`, call the `/backlog-ticket` command, passing the title and referencing the newly created `planning/<slug>/notes.md` file. If the flag is not provided, skip this step.
+6. If the `--backlog` flag is provided in `$ARGUMENTS`, call the `/backlog-ticket` command, passing the title and referencing the newly created `planning/open-work/pre-plan/<slug>/notes.md` file. If the flag is not provided, skip this step.
 
 ### Step 5 — Report
 
@@ -83,7 +91,7 @@ bullets. Link paths; never restate a file. See the `report-to-the-operator` skil
 
 8. Confirm: output the local path created and (if applicable) confirm the backlog ticket was created.
 
-## Output Format — `planning/<slug>/notes.md`
+## Output Format — `planning/open-work/pre-plan/<slug>/notes.md`
 
 ```markdown
 ---

@@ -21,20 +21,20 @@ makes later work verifiable.
 **Which successor consumes this is a COUNT, not a judgement call** — state it in the closing
 report so the caller does not have to re-derive it, and so this stage can be a deterministic node in
 a sequential workflow: count the distinct values in the block table's **Repo** column.
-`== 1` -> `/plan <slug>`, which authors `plan.md` into `planning/<slug>/` alongside this file.
-`> 1` -> `/generate-roadmap <slug> --from planning/<slug>/sequence.md`, which writes
+`== 1` -> `/plan <slug>`, which authors `plan.md` into `planning/open-work/pre-plan/<slug>/` alongside this file.
+`> 1` -> `/generate-roadmap <slug> --from planning/open-work/pre-plan/<slug>/sequence.md`, which writes
 `planning/roadmaps/<slug>/` and, in its Step 7b, MOVES this folder to
 `planning/roadmaps/<slug>/pre-plan/`. The invariant both paths maintain is that
-`planning/<slug>/` and `planning/roadmaps/<slug>/` are never both populated.
+`planning/open-work/pre-plan/<slug>/` and `planning/roadmaps/<slug>/` are never both populated.
 
-Output: `planning/<slug>/sequence.md`. It is the **only** input `/plan` (one repo) or
+Output: `planning/open-work/pre-plan/<slug>/sequence.md`. It is the **only** input `/plan` (one repo) or
 `/generate-roadmap` (multiple repos) needs.
 
 This stage does not author block records or register `state.json`. That is `/plan`.
 
 ## Instructions
 
-1. Read `planning/<slug>/seams.md`, `assessment.md`, `verification.md`, `CLAUDE.md`, and the
+1. Read `planning/open-work/pre-plan/<slug>/seams.md`, `assessment.md`, `verification.md`, `CLAUDE.md`, and the
    in-scope repos' `planning/context.md`. If `seams.md` is missing, stop and point at `/seams` —
    sequencing from an assessment alone produces a cut along architectural layers, which is the
    failure mode this whole pipeline exists to avoid.
@@ -260,12 +260,12 @@ costs nothing but a new session.
 Close with `/handoff` and tell the operator:
 
 ```
-Sequence complete: planning/<slug>/sequence.md
+Sequence complete: planning/open-work/pre-plan/<slug>/sequence.md
 <n> waves · <m> blocks (<r> registered, <c> candidates) · <e> operator errands
 
 Start a FRESH session — Opus — and run ONE of:
   /plan "<initiative>"                                       — one repo
-  /generate-roadmap <slug> --from planning/<slug>/sequence.md — several repos
+  /generate-roadmap <slug> --from planning/open-work/pre-plan/<slug>/sequence.md — several repos
 
 <Say which, and why: repo count and block count.>
 
@@ -386,7 +386,7 @@ naming an unregistered ID stops or improvises.*
 ## Report
 
 ```
-planning/<slug>/sequence.md
+planning/open-work/pre-plan/<slug>/sequence.md
 
 Waves: <n>   Blocks: <m>  (<r> registered, <c> candidates -> Wave 0)   Operator errands: <e>
 Block IDs allocated: <per repo, e.g. EN.12.A-EN.13.F (28) · MV.4.A-MV.4.C (3)>
@@ -399,5 +399,5 @@ Red team: <x> landed, <y> rejected
 Handoff test on block 1: PASS | FAIL — <what was missing>
 
 Next:  /plan "<the initiative>"                    (one repo)
-       /generate-roadmap <slug> --from planning/<slug>/sequence.md   (several repos)
+       /generate-roadmap <slug> --from planning/open-work/pre-plan/<slug>/sequence.md   (several repos)
 ```
