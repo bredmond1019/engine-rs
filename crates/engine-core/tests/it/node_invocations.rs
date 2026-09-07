@@ -183,6 +183,217 @@ async fn a_failed_dispatch_produces_a_failed_ledger_row_carrying_the_error_messa
 }
 
 // ---------------------------------------------------------------------------
+// EN.14.G task 2: payload retention on the invocation record.
+// ---------------------------------------------------------------------------
+
+/// THE BLOCK'S CENTRAL TEST. `RetryNode` writes a DISTINCT `{"count": n}`
+/// payload on each of its three attempts (see its `process` above). Both
+/// attempt 1's and attempt 2's payloads must be retrievable from the ledger
+/// and must differ from each other — the audit `ctx.nodes` alone cannot
+/// answer, because it holds only the LATEST attempt's slot.
+///
+/// POSITIVE CONTROL (carryover `gate-scope-must-be-shown-capable-of-failing`):
+/// the same test asserts that the latest-only view — what `ctx.nodes` itself
+/// holds — canNOT distinguish attempt 1 from attempt 2, proving the ledger
+/// assertion above is actually capable of failing rather than vacuously true.
+#[tokio::test]
+async fn retried_node_ledger_retains_distinct_payloads_per_attempt() {
+    let workflow = Workflow::new(retry_registry(), retry_schema());
+    let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("workflow should complete");
+
+    let invocations = engine_core::invocations::read_invocations(&result.metadata);
+    let retry_invocations: Vec<_> = invocations
+        .iter()
+        .filter(|inv| inv.node == "RetryNode")
+        .collect();
+    assert_eq!(
+        retry_invocations.len(),
+        3,
+        "RetryNode dispatched 3 times in this fixture"
+    );
+
+    let attempt1_payload = retry_invocations[0]
+        .payload
+        .clone()
+        .expect("attempt 1 should have a retained payload");
+    let attempt2_payload = retry_invocations[1]
+        .payload
+        .clone()
+        .expect("attempt 2 should have a retained payload");
+
+    assert_eq!(attempt1_payload, serde_json::json!({ "count": 1 }));
+    assert_eq!(attempt2_payload, serde_json::json!({ "count": 2 }));
+    assert_ne!(
+        attempt1_payload, attempt2_payload,
+        "attempt 1 and attempt 2 must retain DISTINCT payloads — the exact \
+         question the motivating audit (run 88bd80a0) could not answer"
+    );
+
+    // POSITIVE CONTROL: the latest-only view is exactly what `ctx.nodes`
+    // holds for this node identity — its single overwritten slot. Assert it
+    // CANNOT distinguish the two attempts, proving the ledger assertion
+    // above is capable of failing (a regression that stopped writing
+    // per-attempt payloads and instead exposed only the latest one would
+    // pass the naive check below while failing the real one above).
+    let latest_only_view = result
+        .nodes
+        .get("RetryNode")
+        .cloned()
+        .expect("ctx.nodes holds RetryNode's latest slot");
+    assert_eq!(
+        latest_only_view,
+        serde_json::json!({ "count": 3 }),
+        "ctx.nodes holds only the LATEST attempt"
+    );
+    assert_ne!(
+        latest_only_view, attempt1_payload,
+        "the latest-only view must fail to reproduce attempt 1's payload — \
+         this is the control proving the ledger is doing real work"
+    );
+}
+
+/// A node that, on entry, stamps a small `ResolvedPolicy` cap into
+/// `ctx.nodes` — mimicking what `stamp_resolved_policy` (task 3) does for a
+/// real workflow — so the NEXT node's dispatch reads a cap small enough to
+/// force truncation. `payload_cap_from_resolved_policy` reads this off the
+/// PRE-CALL context, and `ctx.nodes` persists across dispatches within one
+/// workflow run, so stamping it here is visible to the following node.
+struct StampSmallCapNode {
+    cap_bytes: u64,
+}
+
+#[async_trait::async_trait]
+impl Node for StampSmallCapNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            engine_core::policy::profiles::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::json!({
+                engine_core::invocations::NODE_INVOCATION_PAYLOAD_CAP_BYTES_FIELD: self.cap_bytes,
+            }),
+        );
+        ctx.nodes.insert(
+            self.name().to_string(),
+            serde_json::json!({ "stamped": true }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "StampSmallCapNode"
+    }
+}
+
+/// A node that writes a payload far larger than any small test cap.
+struct BigPayloadNode;
+
+#[async_trait::async_trait]
+impl Node for BigPayloadNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            self.name().to_string(),
+            serde_json::json!({ "modified_files": vec!["a-long-path/file.rs"; 10_000] }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "BigPayloadNode"
+    }
+}
+
+/// An over-cap payload must be stored EXPLICITLY marked as truncated — never
+/// silently shortened — with `payload_truncated` true and `payload_cap_bytes`
+/// recording the cap actually applied.
+#[tokio::test]
+async fn over_cap_payload_is_recorded_truncated_not_silently_shortened() {
+    const SMALL_CAP: u64 = 64;
+
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(StampSmallCapNode {
+        cap_bytes: SMALL_CAP,
+    }));
+    registry.register(Box::new(BigPayloadNode));
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        "StampSmallCapNode".to_string(),
+        NodeConfig::new("StampSmallCapNode", vec!["BigPayloadNode".to_string()]),
+    );
+    nodes.insert(
+        "BigPayloadNode".to_string(),
+        NodeConfig::new("BigPayloadNode", vec![]),
+    );
+    let schema = engine_core::WorkflowSchema::new("cap-test", "StampSmallCapNode", nodes);
+    let workflow = Workflow::new(registry, schema);
+    let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("workflow should complete");
+
+    let invocations = engine_core::invocations::read_invocations(&result.metadata);
+    let big = invocations
+        .iter()
+        .find(|inv| inv.node == "BigPayloadNode")
+        .expect("BigPayloadNode should have a ledger row");
+
+    assert!(
+        big.payload_truncated,
+        "an over-cap payload must be marked truncated"
+    );
+    assert_eq!(
+        big.payload_cap_bytes, SMALL_CAP,
+        "the row must record the cap ACTUALLY APPLIED"
+    );
+    let payload = big
+        .payload
+        .as_ref()
+        .expect("a truncated payload is still Some — an explicit replacement, not None");
+    assert!(
+        payload.get("modified_files").is_none(),
+        "the truncated payload must never carry a shortened copy of the \
+         original shape — a caller must never mistake it for a short one"
+    );
+}
+
+/// A dispatch returning `Err` has no output payload, but still records the
+/// cap that WOULD have applied — every row interpretable on the same terms.
+#[tokio::test]
+async fn failed_dispatch_records_no_payload_but_still_records_the_cap() {
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(AlwaysFailsNode));
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        "AlwaysFailsNode".to_string(),
+        NodeConfig::new("AlwaysFailsNode", vec![]),
+    );
+    let schema = engine_core::WorkflowSchema::new("fails", "AlwaysFailsNode", nodes);
+    let workflow = Workflow::new(registry, schema);
+    let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("run should return Ok(ctx) even though the node failed");
+
+    let invocations = engine_core::invocations::read_invocations(&result.metadata);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].payload, None);
+    assert!(!invocations[0].payload_truncated);
+    assert_eq!(
+        invocations[0].payload_cap_bytes,
+        engine_core::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
+        "no ResolvedPolicy stamp exists in this fixture, so the framework \
+         default cap is what would have applied"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Task 5: per-run byte growth on a MULTI-NODE run.
 //
 // The spike's control graph was one node deep, so it could not see the
