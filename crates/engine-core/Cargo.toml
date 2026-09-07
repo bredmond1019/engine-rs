@@ -27,7 +27,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-engine-serve = { path = "../engine-serve" }
 tempfile = { workspace = true }
 # Test-only: EN.11.I task 2's instrumentation tests capture emitted tracing
 # events via `tracing_subscriber`'s `Layer`/`Registry` machinery, asserting

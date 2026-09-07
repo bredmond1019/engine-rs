@@ -31,3 +31,15 @@ test-fixtures = []
 [dev-dependencies]
 engine-serve = { path = ".", features = ["test-fixtures"] }
 tempfile = { workspace = true }
+claude-code-rs = { workspace = true }
+
+# ONE integration-test binary, not one per file. cargo builds a separate binary for every
+# `tests/*.rs`, and each statically links this crate plus its dependency graph. These modules were
+# moved from `engine-core`'s own single-binary `tests/it/` layout (see that crate's
+# `tests/it/main.rs` for the full rationale) because they depend on `engine-serve` itself. Per-test
+# isolation is unchanged: `cargo nextest run` (CLAUDE.md standing rule 8) runs each test in its own
+# process regardless. The 8 pre-existing loose files directly under `tests/` are a separate,
+# out-of-scope concern — only this new binary is added here.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

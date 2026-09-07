@@ -440,7 +440,7 @@ fn golden_fixture_pt_br_markdown_matches_byte_for_byte() {
     assert_eq!(
         rendered, GOLDEN_PT_BR,
         "pt-BR rendered markdown drifted from the checked-in golden fixture \
-         at crates/engine-core/tests/fixtures/deliverable_render_pt_br.md — \
+         at crates/engine-serve/tests/fixtures/deliverable_render_pt_br.md — \
          if the drift is intentional, regenerate the fixture and review the diff"
     );
 }
@@ -455,7 +455,7 @@ fn golden_fixture_en_us_markdown_matches_byte_for_byte() {
     assert_eq!(
         rendered, GOLDEN_EN_US,
         "en-US rendered markdown drifted from the checked-in golden fixture \
-         at crates/engine-core/tests/fixtures/deliverable_render_en_us.md — \
+         at crates/engine-serve/tests/fixtures/deliverable_render_en_us.md — \
          if the drift is intentional, regenerate the fixture and review the diff"
     );
 }
