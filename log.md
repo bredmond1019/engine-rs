@@ -14,6 +14,23 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-07]
+
+### EN.14.F — `node_invocations` table and the framework writer that fills it (PASS)
+- **What:** Ran `/sdlc-flow` on branch `EN.14.F-flow` through all 5 tasks, PASS review. Task 1 added the `NodeInvocation`/`NodeInvocationStatus` data-contract type and its append-only, run-scoped `engine-core::invocations` ledger (`append_invocation`/`read_invocations`/`next_seq`), mirroring `sessions.rs`. Task 2 wired `node_context` (`workflow.rs`) to append one ledger row per dispatch on both the Ok and Err branches, proven by a retry-loop integration test showing the ledger strictly exceeds `ctx.nodes`' distinct-key count plus a failed-dispatch test. Task 3 added the `node_invocations` sqlx migration (append-only, run_id/seq index) and `engine-store`'s `insert_node_invocation` (`ON CONFLICT DO NOTHING`) / `list_node_invocations_for_run`. Task 4 gave `DurableItem` a `NodeInvocation` variant so `durable_on_progress` forwards only newly-appended ledger entries via a per-closure high-water mark, and `spawn_durable_writer` persists them append-only, self-skipping with no pool. Task 5 added a 12-node chain test proving per-dispatch serialized `ctx.metadata` growth is bounded (~225 bytes/dispatch) and linear, plus a source-level check that `node_context` still clones the full `TaskContext` exactly once; full harness suite green. Notable decisions: task 1 diverged only cosmetically from `sessions.rs`'s no-root-re-export precedent by also re-exporting the two new types from `engine-contract`'s crate root for consistency with `journal`/`events`/`envelope`; task 4 additionally exported `insert_node_invocation`/`list_node_invocations_for_run` from `engine-store`'s crate root (task 3 had added them but never exported them), a minimal directly-required addition folded into the same commit. Docs: `docs/diesel-migration.md` updated. Closes `EN.14.F`.
+- Next: `EN.14.G` — payload retention on the invocation record, with a recorded truncation cap.
+
+```
+e4697a6 docs: update docs for EN.14.F
+28f83ee feat: implement EN.14.F-task5
+4837e3c feat: implement EN.14.F-task4
+cac30a7 feat: implement EN.14.F-task3
+21c37a0 feat: implement EN.14.F-task2
+7de0152 feat: implement EN.14.F-task1
+6fcac34 fix: diagnostic_intake regression test no longer depends on a git-tracked planning/ fixture
+6b52f0b chore(harness): sync base-template — engine TDZ fix: RENDER_IDENTITY_SCHEMA declared above its users (5448cb9)
+```
+
 ## [run: 2026-09-03]
 
 ### EN.6.L — CLAIM_REAFFIRM: distilled-claim reaffirmation via queue-drain (PASS)
