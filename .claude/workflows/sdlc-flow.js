@@ -2497,6 +2497,16 @@ const BAIL_REASONS = [
 ].map((r, i) => `  ${i + 1}. ${r}`).join('\n')
 // <</shared:BAIL_REASONS>>
 
+// <<shared:RENDER_IDENTITY_SCHEMA>>
+const RENDER_IDENTITY_SCHEMA = {
+  type: 'object',
+  required: ['value'],
+  properties: {
+    value: { type: 'string', description: 'the text after "VALUE:" on the probe script\'s stdout, or "" if that line is missing or the script produced no output' }
+  }
+}
+// <</shared:RENDER_IDENTITY_SCHEMA>>
+
 // ----------------------------------------------------------------
 // Test stage helper (shared by per-task tripwire + the review's re-run)
 // gatingOnly=true → fast tripwire (gating checks); false → full authoritative suite.
@@ -3842,16 +3852,6 @@ return {
   worklogFile,
   tokens: tokensBlock,
 }
-
-// <<shared:RENDER_IDENTITY_SCHEMA>>
-const RENDER_IDENTITY_SCHEMA = {
-  type: 'object',
-  required: ['value'],
-  properties: {
-    value: { type: 'string', description: 'the text after "VALUE:" on the probe script\'s stdout, or "" if that line is missing or the script produced no output' }
-  }
-}
-// <</shared:RENDER_IDENTITY_SCHEMA>>
 
 // <<shared:renderAgentFlag>>
 // Renders the `--agent <id>` argument for a `mev emit-state --write` / `mev set-block-status

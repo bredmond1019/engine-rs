@@ -590,6 +590,17 @@ Each has already cost a real run in this fleet.
    it, it never overwrites the file, which is exactly the clobber a sibling lane hit and repaired
    in commit `559f1039d`.
 
+   **When a capability this lane shipped is found BROKEN, the remediation half of the ledger
+   contract is what to write — not a note, not a ping.** File the ticket, then record
+   `{block, opened_at, note}` on the failing ledger entry itself, keyed on the entry's own id and
+   the block id it already carries. That run-local object carries **no `finding` number** — only
+   `/consolidate-run` Step 5b, promoting it into HQ's `docs/sandbox/remediation.json`, assigns
+   one, because `finding` is a required unique integer pointing at a `### N.` heading in HQ's
+   findings.md and four concurrent lanes appending headings to one shared file is exactly the
+   contention this defers. `docs/sandbox/run-verification-ledger-prompt.md` is the authority for
+   the object's shape; `.claude/commands/consolidate-run.md` Step 5b is the authority for the
+   promotion. Cite both, do not restate them here.
+
 6. **Resolve what you can; record the call.** A lane that stops at every ambiguity is worthless,
    and one that stops at none is dangerous. Decide the ordinary things yourself — a spec slug that
    does not quite match convention, which of two plausible `--from` plan files is meant, whether a
