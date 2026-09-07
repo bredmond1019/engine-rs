@@ -8,11 +8,13 @@
 pub mod envelope;
 pub mod events;
 pub mod journal;
+pub mod node_invocation;
 pub mod task_context;
 
 pub use envelope::{ChannelType, IngressEnvelope, ReplyContext, SourcePayload};
 pub use events::EventsRow;
 pub use journal::{JournalDecisionKind, JournalRow};
+pub use node_invocation::{NodeInvocation, NodeInvocationStatus};
 pub use task_context::{NodeRun, NodeRunStatus, TaskContext, Usage};
 
 /// Placeholder identifying this crate; exists so the workspace has at least one

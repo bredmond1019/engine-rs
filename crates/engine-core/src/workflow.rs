@@ -11,11 +11,12 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use engine_contract::{NodeRun, NodeRunStatus, TaskContext};
+use engine_contract::{NodeInvocation, NodeInvocationStatus, NodeRun, NodeRunStatus, TaskContext};
 use uuid::Uuid;
 
 use crate::budget::{Budget, BudgetDecision, BudgetHaltReason, BudgetLedger};
 use crate::cancellation::{stamp_cancelled, CancellationToken};
+use crate::invocations::{append_invocation, next_seq};
 use crate::node::NodeRegistry;
 use crate::schema::WorkflowSchema;
 use crate::suspend::{self, stamp_suspended, PauseSignal, SuspendReason, Suspension};
@@ -716,6 +717,11 @@ async fn node_context(
     let run_id = read_run_id(&pre_call_ctx.metadata);
     let campaign_id = read_campaign_id(&pre_call_ctx);
 
+    // Captured before `node.process` is called; the invocation record's
+    // `started_at`/`completed_at` bracket the dispatch itself, not the
+    // framework bookkeeping around it.
+    let started_at = Utc::now();
+
     match node.process(ctx).await {
         Ok(mut ok_ctx) => {
             if let Some(run) = ok_ctx.node_runs.get_mut(&identity) {
@@ -727,6 +733,21 @@ async fn node_context(
                 run_id = run_id.as_deref(),
                 campaign_id = campaign_id.as_deref(),
                 "node dispatched"
+            );
+            let seq = next_seq(&ok_ctx.metadata);
+            append_invocation(
+                &mut ok_ctx.metadata,
+                NodeInvocation {
+                    id: Uuid::new_v4(),
+                    run_id: run_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    node: identity.clone(),
+                    seq,
+                    started_at,
+                    completed_at: Utc::now(),
+                    status: NodeInvocationStatus::Success,
+                    error: None,
+                },
             );
             on_progress(&ok_ctx);
             (ok_ctx, false)
@@ -752,6 +773,25 @@ async fn node_context(
                 campaign_id = campaign_id.as_deref(),
                 error = %err.message,
                 "node failed"
+            );
+            // Appended after the session replay above and before the
+            // `on_progress` snapshot below, so the callback's view of this
+            // dispatch already carries the invocation row — the same
+            // ordering the session replay comment states for its own reason.
+            let seq = next_seq(&err_ctx.metadata);
+            append_invocation(
+                &mut err_ctx.metadata,
+                NodeInvocation {
+                    id: Uuid::new_v4(),
+                    run_id: run_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    node: identity.clone(),
+                    seq,
+                    started_at,
+                    completed_at: Utc::now(),
+                    status: NodeInvocationStatus::Failed,
+                    error: Some(err.message.clone()),
+                },
             );
             on_progress(&err_ctx);
             (err_ctx, true)

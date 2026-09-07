@@ -35,10 +35,29 @@
 //! background bridge, and one self-skip-without-`DATABASE_URL` discipline.
 //! Journal rows are inserted append-only via `engine_store::insert_journal_row`
 //! (never revised in place, unlike a snapshot's upsert-by-`run_id`).
+//!
+//! EN.14.F task 4 widens [`DurableItem`] again, the same way, to carry
+//! `node_invocations` rows: a third variant on the same enum, the same one
+//! writer task, the same pool-is-`None` self-skip — never a second channel.
+//! Invocation rows are inserted append-only via
+//! `engine_store::insert_node_invocation` (`ON CONFLICT (id) DO NOTHING`,
+//! never revised in place). [`durable_on_progress`] forwards only the
+//! invocations not yet sent for its run, using a per-closure high-water mark
+//! (`sent: usize`): the ledger (`engine_core::invocations::read_invocations`)
+//! is append-only and order-preserving, so a suffix slice from that mark is
+//! exactly the delta since the last snapshot. A resume landing in a fresh
+//! `engine-serve` process starts a fresh closure with `sent = 0`, so it
+//! re-sends the whole rehydrated ledger from the top — the same "no
+//! `seen_runs` set" reasoning this module already gives for snapshots applies
+//! here too, and `insert_node_invocation`'s `ON CONFLICT (id) DO NOTHING`
+//! absorbs the resend idempotently (each row's `id` is unchanged across
+//! processes, since it was minted once at dispatch time and carried in the
+//! rehydrated `TaskContext`).
 
 use chrono::{DateTime, Utc};
-use engine_contract::{EventsRow, JournalRow, TaskContext};
-use engine_store::{insert_journal_row, touch, upsert_event};
+use engine_contract::{EventsRow, JournalRow, NodeInvocation, TaskContext};
+use engine_core::invocations::read_invocations;
+use engine_store::{insert_journal_row, insert_node_invocation, touch, upsert_event};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -54,16 +73,18 @@ pub struct DurableMessage {
     pub snapshot: TaskContext,
 }
 
-/// One item flowing down the durable writer's channel: either a run snapshot
-/// (persisted via `engine_store::upsert_event`) or a journal row (persisted
-/// via `engine_store::insert_journal_row`, append-only). Widening the
-/// channel's payload to this enum — rather than adding a second channel —
-/// keeps one writer task and one bridge for both kinds of durable record, and
-/// both inherit the same pool-is-`None` self-skip.
+/// One item flowing down the durable writer's channel: a run snapshot
+/// (persisted via `engine_store::upsert_event`), a journal row (persisted via
+/// `engine_store::insert_journal_row`, append-only), or a node-invocation row
+/// (persisted via `engine_store::insert_node_invocation`, append-only).
+/// Widening the channel's payload to this enum — rather than adding a second
+/// or third channel — keeps one writer task and one bridge for every kind of
+/// durable record, and all three inherit the same pool-is-`None` self-skip.
 #[derive(Debug, Clone)]
 pub enum DurableItem {
     Snapshot(DurableMessage),
     Journal(JournalRow),
+    NodeInvocation(NodeInvocation),
 }
 
 /// Cheaply-cloneable handle for sending snapshots (and journal rows) to the
@@ -96,6 +117,15 @@ impl DurableHandle {
     /// decision record, not the run's authoritative state.
     pub fn send_journal(&self, row: JournalRow) {
         let _ = self.sender.send(DurableItem::Journal(row));
+    }
+
+    /// Send a node-invocation row to the background writer. Same
+    /// swallowed-error contract as [`DurableHandle::send`] and
+    /// [`DurableHandle::send_journal`]: a dropped invocation write must never
+    /// fail or interrupt the run — it is a best-effort telemetry record, not
+    /// the run's authoritative state.
+    pub fn send_node_invocation(&self, invocation: NodeInvocation) {
+        let _ = self.sender.send(DurableItem::NodeInvocation(invocation));
     }
 
     /// The Postgres pool this handle was constructed with, if any —
@@ -200,6 +230,16 @@ pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
                         );
                     }
                 }
+                DurableItem::NodeInvocation(row) => {
+                    if let Err(err) = insert_node_invocation(pool, &row).await {
+                        tracing::warn!(
+                            node = %row.node,
+                            seq = row.seq,
+                            error = %err,
+                            "durable write: insert_node_invocation failed"
+                        );
+                    }
+                }
             }
         }
     });
@@ -208,19 +248,45 @@ pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
 }
 
 /// Build an `on_progress`-compatible closure that forwards every snapshot for
-/// `run_id` to `handle`. `workflow_type` and `data` are captured once (they
-/// are constant for the run's lifetime) so the closure only needs the
+/// `run_id` to `handle`, plus (EN.14.F task 4) every `node_invocations`
+/// ledger entry not yet sent. `workflow_type` and `data` are captured once
+/// (they are constant for the run's lifetime) so the closure only needs the
 /// per-boundary `TaskContext` snapshot, matching
 /// `engine_core::workflow::OnProgress<'a>`'s signature
 /// (`Box<dyn FnMut(&TaskContext) + 'a>`).
+///
+/// # The invocation high-water mark, and the fresh-process resume case
+///
+/// The closure keeps its own `sent: usize` high-water mark, starting at 0.
+/// `engine_core::invocations::read_invocations` is append-only and
+/// order-preserving, so on each snapshot the entries at `[sent..]` are
+/// exactly the ones not yet forwarded; after sending them, `sent` advances to
+/// the ledger's new length. A resume that lands in a **fresh** `engine-serve`
+/// process builds a brand-new closure, so it starts at `sent = 0` again and
+/// re-sends the whole rehydrated ledger from the top on its first snapshot —
+/// this module already gives the same reasoning for having no per-process
+/// `seen_runs` set for snapshot upserts, and the same idempotent-resend
+/// contract makes it safe here too: `engine_store::insert_node_invocation`'s
+/// `ON CONFLICT (id) DO NOTHING` absorbs the resend without ever revising a
+/// recorded row, because every entry's `id` was minted once at dispatch time
+/// and travels with the rehydrated `TaskContext`.
 pub fn durable_on_progress(
     handle: DurableHandle,
     run_id: Uuid,
     workflow_type: String,
     data: serde_json::Value,
 ) -> impl FnMut(&TaskContext) + Send + 'static {
+    let mut sent: usize = 0;
     move |snapshot: &TaskContext| {
         handle.record(run_id, &workflow_type, &data, snapshot);
+
+        let invocations = read_invocations(&snapshot.metadata);
+        if invocations.len() > sent {
+            for invocation in &invocations[sent..] {
+                handle.send_node_invocation(invocation.clone());
+            }
+            sent = invocations.len();
+        }
     }
 }
 
@@ -463,5 +529,129 @@ mod tests {
 
         // Must not panic even though nothing is listening.
         handle.send_journal(sample_journal_row(Uuid::new_v4()));
+    }
+
+    // ---- EN.14.F task 4: node-invocation rows over the durable channel ----
+
+    fn sample_invocation(node: &str, seq: u64) -> NodeInvocation {
+        use engine_contract::NodeInvocationStatus;
+
+        NodeInvocation {
+            id: Uuid::new_v4(),
+            run_id: Some("run-1".to_string()),
+            campaign_id: None,
+            node: node.to_string(),
+            seq,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            status: NodeInvocationStatus::Success,
+            error: None,
+        }
+    }
+
+    /// A snapshot carrying a `node_invocations` ledger reaches the same
+    /// channel a snapshot's own record uses, tagged as
+    /// [`DurableItem::NodeInvocation`] — the enum-widening this task adds.
+    #[test]
+    fn node_invocation_reaches_the_background_writer_via_the_same_channel() {
+        let (handle, mut receiver) = test_handle();
+        let invocation = sample_invocation("Implement", 0);
+
+        handle.send_node_invocation(invocation.clone());
+
+        let received = receiver
+            .try_recv()
+            .expect("a node-invocation item should be queued");
+        let DurableItem::NodeInvocation(received_invocation) = received else {
+            panic!("expected a NodeInvocation item from send_node_invocation");
+        };
+        assert_eq!(received_invocation, invocation);
+    }
+
+    /// The core of task 4: `durable_on_progress`'s high-water mark forwards
+    /// only invocations not yet sent. A snapshot carrying three invocations
+    /// sends exactly three `DurableItem::NodeInvocation` items; a following
+    /// snapshot carrying those same three plus one more sends exactly one
+    /// more — no re-sends, no gaps.
+    #[test]
+    fn durable_on_progress_forwards_only_unsent_invocations() {
+        use engine_core::invocations::append_invocation;
+
+        let (sender, mut receiver) = mpsc::unbounded_channel::<DurableItem>();
+        let handle = DurableHandle { sender, pool: None };
+        let run_id = Uuid::new_v4();
+
+        let mut on_progress =
+            durable_on_progress(handle, run_id, "fixture".to_string(), serde_json::json!({}));
+
+        // First snapshot: three invocations.
+        let mut snapshot = all_pending_snapshot(&["Implement"]);
+        append_invocation(&mut snapshot.metadata, sample_invocation("Implement", 0));
+        append_invocation(&mut snapshot.metadata, sample_invocation("Implement", 1));
+        append_invocation(&mut snapshot.metadata, sample_invocation("Implement", 2));
+        on_progress(&snapshot);
+
+        // Drain the one Snapshot item this closure also always sends.
+        let first = receiver.try_recv().expect("snapshot item queued");
+        assert!(matches!(first, DurableItem::Snapshot(_)));
+
+        let mut first_batch = Vec::new();
+        while let Ok(item) = receiver.try_recv() {
+            let DurableItem::NodeInvocation(inv) = item else {
+                panic!("expected only NodeInvocation items after the snapshot item");
+            };
+            first_batch.push(inv);
+        }
+        assert_eq!(first_batch.len(), 3, "all three invocations sent once");
+
+        // Second snapshot: the same three plus one more.
+        append_invocation(&mut snapshot.metadata, sample_invocation("Implement", 3));
+        on_progress(&snapshot);
+
+        let second = receiver.try_recv().expect("snapshot item queued");
+        assert!(matches!(second, DurableItem::Snapshot(_)));
+
+        let mut second_batch = Vec::new();
+        while let Ok(item) = receiver.try_recv() {
+            let DurableItem::NodeInvocation(inv) = item else {
+                panic!("expected only NodeInvocation items after the snapshot item");
+            };
+            second_batch.push(inv);
+        }
+        assert_eq!(
+            second_batch.len(),
+            1,
+            "only the one new invocation is forwarded — the high-water mark holds"
+        );
+        assert_eq!(second_batch[0].seq, 3);
+    }
+
+    /// With the pool absent, sending a node-invocation row through a live
+    /// writer task (`spawn_durable_writer(None)`) is a no-op that returns
+    /// normally and never panics or errors — the same self-skip contract
+    /// snapshots and journal rows already have.
+    #[tokio::test]
+    async fn node_invocation_write_self_skips_when_no_pool_is_configured() {
+        let handle = spawn_durable_writer(None);
+
+        handle.send_node_invocation(sample_invocation("Implement", 0));
+        handle.send_node_invocation(sample_invocation("Implement", 1));
+
+        // Give the background task a chance to drain the channel; there is
+        // nothing to assert against Postgres (no pool exists), so this test
+        // passes as long as sending/draining does not panic.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// A send failure (the writer task having ended, i.e. the receiver
+    /// dropped) is swallowed, not propagated — the same invariant already
+    /// exercised for snapshots and journal rows, now for node-invocation rows.
+    #[test]
+    fn node_invocation_send_failure_is_swallowed_not_propagated() {
+        let (handle, receiver) = test_handle();
+        drop(receiver);
+
+        // Must not panic even though nothing is listening.
+        handle.send_node_invocation(sample_invocation("Implement", 0));
     }
 }

@@ -34,6 +34,7 @@ mod held_session;
 mod linkedin_post_e2e;
 mod locale_rate_card;
 mod materialize_doc;
+mod node_invocations;
 mod operator_queue;
 mod opportunity_loop_e2e;
 mod orchestration;

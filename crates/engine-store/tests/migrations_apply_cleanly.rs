@@ -96,6 +96,74 @@ async fn assert_journal_table_and_index_exist(pool: &PgPool) -> Result<(), Strin
     Ok(())
 }
 
+/// Assert EN.14.F task 3's `node_invocations` table migration produced exactly
+/// the schema documented in `0002_create_node_invocations.sql`:
+/// `started_at`/`completed_at` are `timestamp` WITHOUT time zone (not
+/// `timestamptz`), `status` is `text`, and the `(run_id, seq)` index exists so
+/// `list_node_invocations_for_run`'s query never falls back to a full table
+/// scan. Mirrors [`assert_journal_table_and_index_exist`] exactly.
+async fn assert_node_invocations_table_and_index_exist(pool: &PgPool) -> Result<(), String> {
+    let columns = sqlx::query(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_name = 'node_invocations'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("failed to read information_schema.columns for node_invocations: {e}"))?;
+
+    if columns.is_empty() {
+        return Err("node_invocations table does not exist after migrating".to_string());
+    }
+
+    let mut by_name = std::collections::HashMap::new();
+    for row in &columns {
+        let name: String = row.try_get("column_name").map_err(|e| e.to_string())?;
+        let data_type: String = row.try_get("data_type").map_err(|e| e.to_string())?;
+        by_name.insert(name, data_type);
+    }
+
+    let expect_type = |col: &str, expected: &str| -> Result<(), String> {
+        match by_name.get(col) {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(format!(
+                "node_invocations.{col} has type \"{actual}\", expected \"{expected}\""
+            )),
+            None => Err(format!("node_invocations is missing column \"{col}\"")),
+        }
+    };
+
+    expect_type("id", "uuid")?;
+    expect_type("run_id", "text")?;
+    expect_type("campaign_id", "text")?;
+    expect_type("node", "text")?;
+    expect_type("seq", "bigint")?;
+    // The trap this whole block warns about: WITHOUT time zone, not "timestamp
+    // with time zone" — matches alembic's sa.DateTime() and the reader's
+    // try_get::<NaiveDateTime>.
+    expect_type("started_at", "timestamp without time zone")?;
+    expect_type("completed_at", "timestamp without time zone")?;
+    expect_type("status", "text")?;
+    expect_type("error", "text")?;
+
+    let index_count: i64 = sqlx::query(
+        "SELECT count(*) AS count FROM pg_indexes \
+         WHERE tablename = 'node_invocations' AND indexname = 'node_invocations_run_id_seq_idx'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("failed to query pg_indexes for node_invocations: {e}"))?
+    .try_get("count")
+    .map_err(|e| e.to_string())?;
+
+    if index_count != 1 {
+        return Err(format!(
+            "expected exactly one node_invocations_run_id_seq_idx index, found {index_count}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Build the admin connection string this test was configured with (must be able
 /// to `CREATE DATABASE`/`DROP DATABASE`), and read back the maintenance database's
 /// name so cleanup can reconnect to it.
@@ -152,6 +220,7 @@ async fn migrations_apply_cleanly_to_a_scratch_database_created_from_empty() {
             .map_err(|e| format!("second (idempotent) migration run failed: {e}"))?;
 
         assert_journal_table_and_index_exist(&scratch_pool).await?;
+        assert_node_invocations_table_and_index_exist(&scratch_pool).await?;
 
         scratch_pool.close().await;
         Ok(())

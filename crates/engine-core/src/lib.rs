@@ -14,6 +14,7 @@ pub mod completion;
 pub mod cron;
 pub mod dispatch;
 pub mod evals;
+pub mod invocations;
 pub mod locale;
 pub mod loop_combinator;
 pub mod node;
