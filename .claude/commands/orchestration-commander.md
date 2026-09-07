@@ -15,11 +15,11 @@ existed (`brain/commander`, `brain/liaison`) and one of them was never read. A `
 run watched it age from 2673m to 3198m across 23 drains and was correctly forbidden to touch it,
 because step 1c drains only its own lane. The commander itself named the row — *"a repo with a
 queue but no lane has no drainer"* — and tracked it to **instance 16** without anything in the
-fleet being able to close it (`planning/open-work/orchestration-runs/new-work-log.md:75`).
+fleet being able to close it (`$BRAIN_ROOT/planning/open-work/orchestration-runs/new-work-log.md:75`).
 
 **Where the continuity lives: the board, not your memory.** A drain carries nothing across drains,
 and it does not have to. Connecting one lane's question to another lane's answer is a *lookup on
-`planning/open-work/orchestration-runs/new-work-log.md`*, not a recollection — write the row, cite it as
+`$BRAIN_ROOT/planning/open-work/orchestration-runs/new-work-log.md`*, not a recollection — write the row, cite it as
 `instance N of <row>` on every recurrence, and the count is on disk where the next drain, and the
 next session, can read it. This is measured, not aspirational: the row above was carried across
 two runs, two sessions and 40+ drains entirely this way, and the board carries 18 `instance N of`
@@ -138,18 +138,18 @@ a permission decision. Refuse that one every time.
 instruction a drain can execute. Everything below is a **shell command**, run as written.
 
 **0. Read the open-work board FIRST — before the queue sweep in (a), before anything else in this
-drain.** **The board is `planning/open-work/orchestration-runs/new-work-log.md`** — the fleet's single durable listing
+drain.** **The board is `$BRAIN_ROOT/planning/open-work/orchestration-runs/new-work-log.md`** — the fleet's single durable listing
 of every named recovery item and alert a past drain has surfaced and left open, newest first, one
 `##` heading per row. Read its open rows now, so every later step already knows what has been found
 before, and a repeat is reported as `instance N of <row>` (steps 4-5) instead of rediscovered from
 scratch. Measured cost of skipping this: a finding written at 05:45Z was re-diagnosed from first
 principles five hours later by a different role that never read the board.
 
-**Do not confuse it with `planning/open-work/index.md`, which is the directory index for
+**Do not confuse it with `$BRAIN_ROOT/planning/open-work/index.md`, which is the directory index for
 `open-work/` — a 74-line table of what each file in that directory is for, not a findings board.**
 Earlier revisions of this command named `index.md` here and at step 5; the drains wrote to
 `new-work-log.md` anyway (2026-09-04 run: 5 commits, all to `new-work-log.md`;
-`git log --oneline -- planning/open-work/orchestration-runs/new-work-log.md` shows the drain-by-drain series). This is
+`git log --oneline -- $BRAIN_ROOT/planning/open-work/orchestration-runs/new-work-log.md` shows the drain-by-drain series). This is
 the same documentation-rot class the 2026-09-02 retro caught in step 3's `emit_state_write.sh`
 path, inside the command that runs it. Read `index.md` only to find a file; write findings to
 `new-work-log.md`. If the board does not exist yet, note that and continue — step 5 creates it.
@@ -339,7 +339,7 @@ pure function of `state.json` — so it is **surfaced, never touched**. Route ea
 state, checking case 0 first, then falling through to exactly three more cases:
 
 **Before filing any of the four cases below as a fresh finding, check it against the open-work
-board read in step 1.** If this repo/cause already has an open row on `planning/open-work/index.md`,
+board read in step 1.** If this repo/cause already has an open row on `$BRAIN_ROOT/planning/open-work/index.md`,
 report this occurrence as `instance N of <row>` and update that row's count — never append a new
 row for a cause already on the board. Re-deriving a finding that is already written down is
 costly and invisible, because it looks exactly like fresh work while producing nothing new.
@@ -442,12 +442,12 @@ to — so it falls through to case 3 and is alerted exactly as before. A case th
 scenarios would be a regression wearing a fix's clothes; case 0 quiets only the first.
 
 ### 5. Maintain the board
-Update `planning/open-work/orchestration-runs/new-work-log.md` (**the board — not `index.md`, see step 1.0**) — a
+Update `$BRAIN_ROOT/planning/open-work/orchestration-runs/new-work-log.md` (**the board — not `index.md`, see step 1.0**) — a
 single durable listing of everything steps 1d and 4 surfaced that is still open, so a human
 scanning one file sees every named recovery item and alert across every past drain, not just this
 one. Append/update rather than rewrite: an item closes only when a human resolves it or a later
 drain observes it gone, not when a newer drain simply forgets to relist it. Create the file (with
-OKF frontmatter — this repo's standing rule 5) and its `planning/open-work/index.md` row on the
+OKF frontmatter — this repo's standing rule 5) and its `$BRAIN_ROOT/planning/open-work/index.md` row on the
 first drain that needs it; consult the `write-okf-markdown` skill first.
 
 **This step is the whole memory of the role, so it is not optional and it is not "filing work."**
@@ -528,7 +528,7 @@ field. The same is true of any future supervisory lane.
 ## Stateless per drain
 
 Nothing is carried between drains except what is already on disk: the queue directories, the
-lease/registry records, `planning/open-work/index.md`, and the heartbeat file. Each drain reads
+lease/registry records, `$BRAIN_ROOT/planning/open-work/index.md`, and the heartbeat file. Each drain reads
 that state fresh and writes back only what changed. This is deliberate, not an oversight — a
 stateless drain never accumulates context across ~48+ runs a day, so the cost of a drain does not
 grow with how long the commander has been running, and a drain that crashes mid-way loses nothing
@@ -551,7 +551,7 @@ that the next drain cannot reconstruct from disk.
 - **The commander never runs an SDLC engine and never implements a block.** Its only writes are:
   its own `ADDRESS` file and queue directories (once, at run start), queue-directory transitions
   (step 1), relayed messages (step 2), whatever `emit_state_write.sh` derives and commits (step 3),
-  `planning/open-work/orchestration-runs/new-work-log.md` (step 5), and the heartbeat file and drain-log record
+  `$BRAIN_ROOT/planning/open-work/orchestration-runs/new-work-log.md` (step 5), and the heartbeat file and drain-log record
   (step 6). If a drain finds itself about to touch application code or a spec's `tasks.json`,
   stop — that is a lane's job, not this one's.
 - **It writes no record any staleness threshold can judge** — no `lane-agents/` claim, no lease.

@@ -38,8 +38,8 @@ the cheapest. **Never move anything before Step 2's distillation is written.**
 3. **Confirm the target is genuinely cold.** If it looks active (recent `status: active`, in-flight blocks,
    referenced as "now"/"next" in a `status.md`), STOP and ask the operator to confirm before archiving.
 
-   **For a folder under `planning/open-work/pre-plan/`, do not re-derive this by reading prose —
-   the answer is already computed.** Run `python3 planning/open-work/scripts/update_pre_plan.py`
+   **For a folder under `$BRAIN_ROOT/planning/open-work/pre-plan/`, do not re-derive this by reading prose —
+   the answer is already computed.** Run `python3 $BRAIN_ROOT/planning/open-work/scripts/update_pre_plan.py`
    and read the target's row in `pre-plan/index.md`: it carries the last-touched date (the doc's
    own OKF `updated:` where present, else git, else mtime), every live surface that still points
    at the folder, and a verdict. `COLD` means nothing live references it and nobody has touched it
@@ -49,7 +49,7 @@ the cheapest. **Never move anything before Step 2's distillation is written.**
    date for every pre-plan folder rather than the real one, and a bare name search counts a repo's
    own vault path as a reference (measured: 47 false hits for one slug). If you are checking by
    hand anyway, use the same signals the script does — see
-   `planning/open-work/scripts/README.md` § "The one generator that is not about blocks".
+   `$BRAIN_ROOT/planning/open-work/scripts/README.md` § "The one generator that is not about blocks".
 
 ### Step 1 — Read the target for residue
 

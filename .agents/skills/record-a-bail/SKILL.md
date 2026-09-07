@@ -20,7 +20,7 @@ around the `bail_reason` assignment sites in both files. What they cannot do mec
 
 ## Why this exists: the measured failure
 
-2026-08-24, `planning/open-work/bail-signature-replay.md`: the `autonomous-foundation` run produced
+2026-08-24, `bail-signature-replay.md` (retired 2026-09-07): the `autonomous-foundation` run produced
 nine bails across two repos sharing one root cause (a fleet-wide gate reading a file the failing
 lane did not own). Only seven `bail_reason` strings survived the run window, four of them mev's, and
 clustering the surviving prose split that ONE defect into three groups — because one entry phrased

@@ -97,7 +97,7 @@ the corpus carried them — under 9% — and **0 of 25** authored pre-plan docs 
 Fill both when you create a file, and **bump `updated:` whenever you meaningfully revise it**. Not
 for a typo; yes for anything that changes what the document says.
 
-**What reads them.** `planning/open-work/scripts/update_pre_plan.py` decides which folders under
+**What reads them.** `$BRAIN_ROOT/planning/open-work/scripts/update_pre_plan.py` decides which folders under
 `open-work/pre-plan/` are cold enough to `/archive`, and `updated:` is its first-choice signal.
 When it is absent the script falls back to `git log --follow --diff-filter=MA`, then to mtime, and
 marks the row so the difference is visible — because those are **mechanical** dates. A reformat, a

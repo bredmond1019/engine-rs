@@ -218,14 +218,14 @@ predictably-named output file.
 | Session End | `/handoff [note]` | Write handoff + log work + commit; hands off to a fresh session | `planning/handoff.md`, status.md, log.md, git |
 | Session End | `/close-out [--base <ref>] [--gap-check-only] [--skip-coverage] [--clean-worktree \| --merge-branch] [note]` | Resolve diff base (loud-fail if none) → verify coverage → patch docs → clean worktree/merge branch (opt.) → hand off; the quality-close pipeline | status.md, log.md, docs/, git |
 | Block Setup | `/start-block [name]` | Flip a spec to `In progress` in status.md | status.md |
-| **0 — Pre-plan** | `/assess <topic>` | Fan out fresh recon agents, then a second fresh set to re-check the load-bearing claims | `planning/open-work/pre-plan/<slug>/assessment.md` · `verification.md` · `evidence/` |
-| **0 — Pre-plan** | `/seams <slug>` | Built/half-built/absent, attachment points with one writer per side, blast radius, one spike, the operator's forks | `planning/open-work/pre-plan/<slug>/seams.md` |
-| **0 — Pre-plan** | `/sequence <slug>` | Cut into ordered blocks that each ship something usable; owning repo per block | `planning/open-work/pre-plan/<slug>/sequence.md` |
-| **0 — UI (greenfield)** | `/define-design-system <desc> --surface <kind>` | Tokens, components and rules a new UI is built from; proved by building one real screen | `planning/open-work/pre-plan/<slug>/design-system.md` + emitted token/theme/component files |
-| **0 — UI (existing)** | `/define-polish-standard <desc> --surface <kind>` | The falsifiable standard a UI is judged against, calibrated until two reviewers agree | `planning/open-work/pre-plan/<slug>/polish-standard.md` |
+| **0 — Pre-plan** | `/assess <topic>` | Fan out fresh recon agents, then a second fresh set to re-check the load-bearing claims | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md` · `verification.md` · `evidence/` |
+| **0 — Pre-plan** | `/seams <slug>` | Built/half-built/absent, attachment points with one writer per side, blast radius, one spike, the operator's forks | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/seams.md` |
+| **0 — Pre-plan** | `/sequence <slug>` | Cut into ordered blocks that each ship something usable; owning repo per block | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md` |
+| **0 — UI (greenfield)** | `/define-design-system <desc> --surface <kind>` | Tokens, components and rules a new UI is built from; proved by building one real screen | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/design-system.md` + emitted token/theme/component files |
+| **0 — UI (existing)** | `/define-polish-standard <desc> --surface <kind>` | The falsifiable standard a UI is judged against, calibrated until two reviewers agree | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/polish-standard.md` |
 | **1 — Roadmap** | `/plan --founding` | A new project's founding roadmap — block records, not a hand-written master plan | `planning/founding/plan.md` + `planning/blocks/*.json` |
 | **1 — Plan** | `/generate-tasks <name>` · `/generate-tasks --from <path>` | Write the full task spec from a master-plan block, **or** from a standalone block file (`--from`) | `planning/<name>/tasks.md` |
-| **1 — Plan (ad-hoc)** | `/chore` · `/ticket` · `/plan <desc>` | Plan ad-hoc work from a free-text description (not a roadmap block). `/ticket` reproduces the failure first and orders the test before the fix; `/chore` takes a pre-change gate baseline | `planning/blocks/<BlockID>.json` + `planning/<BlockID>/tasks.json` — or `planning/open-work/pre-plan/<slug>/plan.md` for `/plan` |
+| **1 — Plan (ad-hoc)** | `/chore` · `/ticket` · `/plan <desc>` | Plan ad-hoc work from a free-text description (not a roadmap block). `/ticket` reproduces the failure first and orders the test before the fix; `/chore` takes a pre-change gate baseline | `planning/blocks/<BlockID>.json` + `planning/<BlockID>/tasks.json` — or `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/plan.md` for `/plan` |
 | **1 — Plan (opt.)** | `/breakdown <spec>` | Decompose spec into atomic, agent-executable sub-steps | `planning/<name>/breakdown.md` |
 | **2-5 — Build** | `/sdlc-task <spec>` · `/sdlc-flow <spec>` | The engines do implement → test → fix (→ review → docs → PR, flow only) in one run. There are no hand-invoked stage commands any more. | `planning/<spec>/sdlc/*state.json` (+ `worklog.md`, flow only) |
 | **2 — Hotfix** | `/patch` | Implement → validate → commit for low-risk single-file fixes; skips test/review/document | git history |
@@ -253,15 +253,15 @@ UI FOUNDATIONS             ← only when the work has a visual surface. Beside t
 
 PHASE 0 — PRE-PLAN         ← existing system, cut not obvious. Skip for a known block.
                            ← "|" = fresh session required.  "·" = same session continues.
-  /assess <topic>          → planning/open-work/pre-plan/<slug>/assessment.md + verification.md + evidence/
+  /assess <topic>          → $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md + verification.md + evidence/
       | fresh — /seams must be free to refute those classifications
-  /seams <slug>            → planning/open-work/pre-plan/<slug>/seams.md      (+ the operator answers its forks)
+  /seams <slug>            → $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/seams.md      (+ the operator answers its forks)
       · same session
-  /sequence <slug>         → planning/open-work/pre-plan/<slug>/sequence.md
+  /sequence <slug>         → $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md
       | fresh — a fresh reader of sequence.md IS the handoff test
         ↓
-  one repo   → /plan             → planning/open-work/pre-plan/<slug>/plan.md + planning/blocks/*.json
-  many repos → /generate-roadmap --from planning/open-work/pre-plan/<slug>/sequence.md
+  one repo   → /plan             → $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/plan.md + planning/blocks/*.json
+  many repos → /generate-roadmap --from $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md
                                  → planning/roadmaps/<slug>/{roadmap.md,lane-*.json,lane-log.jsonl}
       | fresh, ONE PER LANE, held open for that lane's whole chain
                                  → /begin-orchestration --roadmap ... --lane ... → /orchestrate
@@ -477,7 +477,7 @@ command per claim**, then amend the record in place with the new value and the d
 A slug in **both** is an error **only when the legacy path is itself a roadmap** — it holds
 `lane-log.jsonl` or `roadmap.md`. Otherwise it is pre-plan residue and resolution proceeds silently.
 
-- **Why narrowed:** the pre-plan stages write `planning/open-work/pre-plan/<slug>/` on every multi-repo path, so the
+- **Why narrowed:** the pre-plan stages write `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` on every multi-repo path, so the
   unnarrowed rule fired on normal operation and hard-exited the fleet's watermark table.
 - **Measured:** 0 of 31 roadmaps and 0 directories under `planning/` held either marker — the rule's
   true-positive population was empty. Gated by `roadmap-dir-resolution`, asserting both directions.
@@ -663,11 +663,11 @@ out to be a rewrite.
 
 | Command | Writes | Answers |
 |---|---|---|
-| `/assess <topic> [--slug <name>] [--areas "..."] [--depth quick\|standard\|deep]` | `planning/open-work/pre-plan/<slug>/assessment.md` · `verification.md` · `evidence/` | What is actually there, with proof, and which claims survived re-checking |
-| `/seams <slug> [--spike <n>]` | `planning/open-work/pre-plan/<slug>/seams.md` | Built / half-built / absent; what to reuse; what to delete; blast radius; the forks the operator must decide |
-| `/sequence <slug> [--single-repo]` | `planning/open-work/pre-plan/<slug>/sequence.md` | The cut into blocks, each shipping something usable, with owning repo and cross-repo contract author |
-| `/define-design-system <desc> --surface <kind>` | `planning/open-work/pre-plan/<slug>/design-system.md` + token/theme/component files | What a **new** UI is built from — tokens, a justified component inventory, the rules |
-| `/define-polish-standard <desc> --surface <kind>` | `planning/open-work/pre-plan/<slug>/polish-standard.md` | What "polished" means for an **existing** product, in items that can be failed by looking |
+| `/assess <topic> [--slug <name>] [--areas "..."] [--depth quick\|standard\|deep]` | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/assessment.md` · `verification.md` · `evidence/` | What is actually there, with proof, and which claims survived re-checking |
+| `/seams <slug> [--spike <n>]` | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/seams.md` | Built / half-built / absent; what to reuse; what to delete; blast radius; the forks the operator must decide |
+| `/sequence <slug> [--single-repo]` | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md` | The cut into blocks, each shipping something usable, with owning repo and cross-repo contract author |
+| `/define-design-system <desc> --surface <kind>` | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/design-system.md` + token/theme/component files | What a **new** UI is built from — tokens, a justified component inventory, the rules |
+| `/define-polish-standard <desc> --surface <kind>` | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/polish-standard.md` | What "polished" means for an **existing** product, in items that can be failed by looking |
 
 ### `/assess`
 Establishes ground truth first — builds, runs the gated checks, and **runs the subsystem once** if
@@ -716,11 +716,11 @@ rather than imagined. **Model:** Opus, Opus red team.
 
 | Repos | Successor | Writes to | Pre-plan folder |
 |---|---|---|---|
-| **one** | [`/plan`](plan.md) | `planning/open-work/pre-plan/<slug>/` | stays put, beside `sequence.md` |
+| **one** | [`/plan`](plan.md) | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` | stays put, beside `sequence.md` |
 | **several** | [`/generate-roadmap`](generate-roadmap.md) | `planning/roadmaps/<slug>/` | **moved** to `planning/roadmaps/<slug>/pre-plan/` (Step 7b) |
 
-**The invariant:** `planning/open-work/pre-plan/<slug>/` and `planning/roadmaps/<slug>/` are **never both populated**.
-The pre-plan stages all write `planning/open-work/pre-plan/<slug>/` before the successor is known, so without Step 7b
+**The invariant:** `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` and `planning/roadmaps/<slug>/` are **never both populated**.
+The pre-plan stages all write `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` before the successor is known, so without Step 7b
 the multi-repo path leaves the slug in two places every time — which used to hard-exit
 [`scripts/lane_log_watermark.py`](../../scripts/lane_log_watermark.py) and wedge every consolidation
 in the fleet. See [`/generate-roadmap`](generate-roadmap.md) Step 7b and
@@ -802,7 +802,7 @@ may not be silently re-decided. What this command still owns: lane assignment, t
 isolation, Wave 0 mechanics and both crosswalks — `/sequence` decides *what* and *in what order*,
 this decides *who runs it concurrently without colliding*.
 
-**Step 7b — relocate the pre-plan.** When `--from` named a `sequence.md`, move `planning/open-work/pre-plan/<slug>/`'s
+**Step 7b — relocate the pre-plan.** When `--from` named a `sequence.md`, move `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`'s
 contents to `planning/roadmaps/<slug>/pre-plan/`, so the slug lives in one place. Four rules:
 
 - **After** the roadmap files are written and verified — a failed run must leave the pre-plan where
@@ -902,12 +902,12 @@ reported as such instead of being restated at greater length.
 ### Pre-planning capture — `/capture`
 
 Before something is ready to plan, use `/capture` to park rich conversation notes without
-losing them. Creates `planning/open-work/pre-plan/<slug>/notes.md` with a structured scaffold and adds a
+losing them. Creates `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md` with a structured scaffold and adds a
 pointer ticket to the brain's `planning/backlog.md`.
 
 | Command | Use for | Writes to |
 |---|---|---|
-| `/capture <title>` | Rich pre-plan notes — detailed enough to need a file, not yet a plan | `planning/open-work/pre-plan/<slug>/notes.md` + brain backlog |
+| `/capture <title>` | Rich pre-plan notes — detailed enough to need a file, not yet a plan | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md` + brain backlog |
 
 Captures are read weeks later with none of the originating context, and read as fact unless they
 say otherwise — so every substantive claim is tagged **VERIFIED** (read in source or observed
@@ -944,7 +944,7 @@ Output feeds the rest of the pipeline unchanged.
 |---|---|---|---|
 | `/chore <description>` | Maintenance / housekeeping — no behavior change | `planning/blocks/<Prefix>.chore.<slug>.json` + `planning/<BlockID>/tasks.json` | `/ticket`, if it turns out to change behavior |
 | `/ticket <description>` | Bug fix or targeted enhancement requiring tests + observable AC | `planning/blocks/<Prefix>.ticket.<slug>.json` + `planning/<BlockID>/tasks.json` (+ rendered `tasks.md`) | `/plan` on size · `/assess` when the behavior can't be reproduced or the half-built question can't be answered |
-| `/plan <description>` | Any ad-hoc or experimental feature — several blocks in one repo | `planning/open-work/pre-plan/<slug>/plan.md` + `planning/blocks/*.json` | `/generate-roadmap` if it spans repos · `/assess` per its own floor |
+| `/plan <description>` | Any ad-hoc or experimental feature — several blocks in one repo | `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/plan.md` + `planning/blocks/*.json` | `/generate-roadmap` if it spans repos · `/assess` per its own floor |
 
 `/chore` and `/ticket` are the **one-session** commands: they author the block record *and* its
 task list in the same pass, because a one-off has no downstream block waiting on its code and so
@@ -973,7 +973,7 @@ Reference table), so `/orchestrate` can drive it as a branch train or `/generate
 planning/plan-<slug>/plan.md` can decompose a single block into a `tasks.md` → `/sdlc-flow`, all
 **without** touching `master-plan.md`. See `planning/decisions/D34-adhoc-planning-seam.md`.
 
-`/plan` reads **`planning/open-work/pre-plan/<slug>/sequence.md`** when Phase 0 has run, and carries its cut, wave
+`/plan` reads **`$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/sequence.md`** when Phase 0 has run, and carries its cut, wave
 boundaries, `ships` lines, `depends_on` edges, named files and recorded fork answers through rather
 than re-deriving them — a silent departure means the seam analysis was done and then ignored, so any
 departure has to be stated in the Sequencing Rationale with a reason. Where `assessment.md` and

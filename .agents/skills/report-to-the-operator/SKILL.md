@@ -115,7 +115,7 @@ Two rules for writing one:
 
 - **Give a fenced example, not a description.** An example is copied; a description is interpreted.
 - **Separate disk from chat.** If a section specifies a file (frontmatter, a template), title it so
-  that is obvious — `## Output Format — planning/open-work/pre-plan/<slug>/notes.md` — and keep the chat contract in a
+  that is obvious — `## Output Format — $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/notes.md` — and keep the chat contract in a
   separate `## Report`. Conflating them is why some commands specify a 70-line "report" that was
   never meant to be spoken.
 
