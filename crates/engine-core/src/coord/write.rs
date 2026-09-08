@@ -1623,6 +1623,20 @@ mod tests {
         }
     }
 
+    /// An RFC 3339 timestamp for *now*, for the one test below whose assertion depends on the
+    /// lease being judged LIVE by `mev::brain::lease::check_quiesce`.
+    ///
+    /// That guard skips any lease whose liveness timestamp (`heartbeat`, falling back to
+    /// `acquired_at`) is more than `LEASE_STALE_THRESHOLD_SECONDS` (10800s / 3h) old, and
+    /// `lease()` stamps `heartbeat` from `now_iso`. A frozen literal therefore stops quiescing
+    /// anything three hours after the instant it names: the test passes when it is written and
+    /// then fails forever after against an unchanged tree. Every OTHER test in this module may
+    /// keep its frozen literal — they assert on the recorded field values, never through the
+    /// staleness guard.
+    fn now_iso() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
     #[test]
     fn lease_writes_a_record_readable_via_read_typed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1798,6 +1812,8 @@ mod tests {
         // take an already-resolved lock dir, so the two must agree on the SAME path here.
         let lock_dir = root.join(".fleet-locks");
         let no_blocks: Vec<String> = Vec::new();
+        // Must be live NOW, not a frozen literal — see `now_iso`'s comment above.
+        let now = now_iso();
 
         // No lease yet: clear to proceed (block key does not exist, so this reports
         // E_BLOCK_NOT_FOUND rather than mutating anything — proof the guard itself is clear,
@@ -1823,7 +1839,7 @@ mod tests {
             "engine-rs",
             "test-lane",
             "engine-rs-holder",
-            "2026-09-08T10:00:00Z",
+            &now,
             None,
             &no_blocks,
         );
