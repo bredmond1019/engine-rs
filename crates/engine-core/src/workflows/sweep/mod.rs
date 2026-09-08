@@ -8,8 +8,8 @@
 //! `schedule.entries` stays empty).
 //!
 //! Submodules, one per pipeline stage — the same section breaks the Python script itself uses:
-//! - [`snapshot`] — `build_raw_snapshot` + `semantic_projection` (task 2, this task)
-//! - `diff` — `diff_snapshots` / `build_dedup_history` (task 3, not yet ported)
+//! - [`snapshot`] — `build_raw_snapshot` + `semantic_projection` (task 2)
+//! - [`diff`] — `diff_snapshots` / `build_dedup_history` (task 3, this task)
 //! - `route` — `route_escalation` / `route_non_escalation_diff` + the three `GatedAction`
 //!   integration (task 4, not yet ported)
 //!
@@ -17,8 +17,13 @@
 //! nothing in this module is wired to a schedule anywhere (Fork 4 is a hard boundary — see the
 //! block record's `out_of_scope`).
 
+pub mod diff;
 pub mod snapshot;
 
+pub use diff::{
+    build_dedup_history, diff_snapshots, escalation_key, parse_iso, summarize_discovery_diff,
+    DedupEntry, DiscoveryDiff, EscalationKey,
+};
 pub use snapshot::{
     build_raw_snapshot, build_raw_snapshot_with, escalation_stale, git_head_sha,
     list_snapshot_files, load_snapshot, read_escalations, semantic_projection, snapshot_filename,
