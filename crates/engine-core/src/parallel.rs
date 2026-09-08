@@ -18,6 +18,39 @@ use engine_contract::TaskContext;
 
 use crate::node::{Node, NodeError};
 
+/// How a `ParallelNode` reacts when one of its branches returns `Err`.
+///
+/// The default, [`BranchFailure::FailRun`], is today's behavior byte-for-byte:
+/// the first branch error is propagated as the node's own error and every
+/// other branch's output — successful or not — is discarded. Opting into
+/// [`BranchFailure::Tolerate`] is the adopting workflow's job; nothing in
+/// this repo does so today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BranchFailure {
+    /// Propagate the first branch `Err` as this node's error, discarding
+    /// every branch's output. This is the default and today's behavior.
+    #[default]
+    FailRun,
+    /// Merge every `Ok` branch exactly as `FailRun` would, and additionally
+    /// stamp a per-branch outcome record (see [`BranchOutcome`]) onto
+    /// `ctx.nodes` under this node's own identity. The node returns `Ok`
+    /// even when one or more branches failed.
+    Tolerate,
+}
+
+/// A single branch's outcome, recorded under the `ParallelNode`'s own
+/// identity in `ctx.nodes` when running under [`BranchFailure::Tolerate`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BranchOutcome {
+    /// The branch's own `Node::name()`.
+    pub branch: String,
+    /// `true` if the branch returned `Ok`, `false` if it returned `Err`.
+    pub ok: bool,
+    /// The branch's error text, present only when `ok` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// A node that fans out to a fixed, ordered list of branch nodes, runs them
 /// in parallel over a cloned `TaskContext` each, and merges their `nodes` +
 /// `node_runs` output back into a single `TaskContext`.
@@ -27,17 +60,49 @@ use crate::node::{Node, NodeError};
 pub struct ParallelNode {
     identity: String,
     branches: Vec<Box<dyn Node>>,
+    branch_failure: BranchFailure,
 }
 
 impl ParallelNode {
     /// Build a `ParallelNode` under `identity`, fanning out to `branches` in
     /// the given order. That declared order is the tie-break order used by
     /// the merge: later branches win on key collision.
+    ///
+    /// Defaults to [`BranchFailure::FailRun`] — today's behavior.
     pub fn new(identity: impl Into<String>, branches: Vec<Box<dyn Node>>) -> Self {
         Self {
             identity: identity.into(),
             branches,
+            branch_failure: BranchFailure::default(),
         }
+    }
+
+    /// Set this node's [`BranchFailure`] mode.
+    pub fn with_branch_failure(mut self, branch_failure: BranchFailure) -> Self {
+        self.branch_failure = branch_failure;
+        self
+    }
+
+    /// Merge a set of successful branch outputs into `base` in declared
+    /// order: a later branch's entry overwrites an earlier branch's entry on
+    /// key collision (last-write-wins).
+    fn merge_branch_outputs(base: TaskContext, branch_outputs: Vec<TaskContext>) -> TaskContext {
+        let mut merged = base;
+        let mut merged_nodes: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut merged_node_runs: HashMap<String, engine_contract::NodeRun> = HashMap::new();
+
+        for branch_ctx in branch_outputs {
+            for (key, value) in branch_ctx.nodes {
+                merged_nodes.insert(key, value);
+            }
+            for (key, value) in branch_ctx.node_runs {
+                merged_node_runs.insert(key, value);
+            }
+        }
+
+        merged.nodes.extend(merged_nodes);
+        merged.node_runs.extend(merged_node_runs);
+        merged
     }
 }
 
@@ -59,34 +124,60 @@ impl Node for ParallelNode {
         )
         .await;
 
-        // Propagate the first branch failure, if any, as this node's error.
-        let mut branch_outputs = Vec::with_capacity(branch_results.len());
-        for result in branch_results {
-            match result {
-                Ok(out) => branch_outputs.push(out),
-                Err(err) => return Err(err),
+        match self.branch_failure {
+            BranchFailure::FailRun => {
+                // Propagate the first branch failure, if any, as this node's
+                // error — today's behavior, byte-for-byte.
+                let mut branch_outputs = Vec::with_capacity(branch_results.len());
+                for result in branch_results {
+                    match result {
+                        Ok(out) => branch_outputs.push(out),
+                        Err(err) => return Err(err),
+                    }
+                }
+
+                let merged = Self::merge_branch_outputs(ctx, branch_outputs);
+                Ok(merged)
+            }
+            BranchFailure::Tolerate => {
+                // Merge every Ok branch exactly as FailRun would, and stamp
+                // a per-branch outcome record for every branch (ok and err
+                // alike) onto ctx.nodes under this node's own identity.
+                let mut outcomes = Vec::with_capacity(branch_results.len());
+                let mut branch_outputs = Vec::with_capacity(branch_results.len());
+
+                for (node, result) in self.branches.iter().zip(branch_results) {
+                    match result {
+                        Ok(out) => {
+                            outcomes.push(BranchOutcome {
+                                branch: node.name().to_string(),
+                                ok: true,
+                                error: None,
+                            });
+                            branch_outputs.push(out);
+                        }
+                        Err(err) => {
+                            outcomes.push(BranchOutcome {
+                                branch: node.name().to_string(),
+                                ok: false,
+                                error: Some(err.to_string()),
+                            });
+                        }
+                    }
+                }
+
+                let mut merged = Self::merge_branch_outputs(ctx, branch_outputs);
+                let outcome_value = serde_json::to_value(&outcomes).map_err(|err| {
+                    NodeError::new(format!(
+                        "ParallelNode '{}': failed to serialize branch outcomes: {err}",
+                        self.identity
+                    ))
+                })?;
+                merged.nodes.insert(self.identity.clone(), outcome_value);
+
+                Ok(merged)
             }
         }
-
-        let mut merged = ctx;
-        let mut merged_nodes: HashMap<String, serde_json::Value> = HashMap::new();
-        let mut merged_node_runs: HashMap<String, engine_contract::NodeRun> = HashMap::new();
-
-        // Merge in declared branch order: a later branch's entry overwrites
-        // an earlier branch's entry on key collision (last-write-wins).
-        for branch_ctx in branch_outputs {
-            for (key, value) in branch_ctx.nodes {
-                merged_nodes.insert(key, value);
-            }
-            for (key, value) in branch_ctx.node_runs {
-                merged_node_runs.insert(key, value);
-            }
-        }
-
-        merged.nodes.extend(merged_nodes);
-        merged.node_runs.extend(merged_node_runs);
-
-        Ok(merged)
     }
 
     fn name(&self) -> &str {
@@ -239,5 +330,96 @@ mod tests {
             .await
             .expect("process should succeed");
         assert!(out.nodes.contains_key("KeyA"));
+    }
+
+    #[tokio::test]
+    async fn tolerate_mode_merges_survivors_and_returns_ok() {
+        let branches: Vec<Box<dyn Node>> = vec![
+            Box::new(WriterBranch {
+                identity: "SurvivingBranch",
+                write_key: "Survivor",
+                value: serde_json::json!({ "ok": true }),
+            }),
+            Box::new(FailingBranch {
+                identity: "FailingBranch",
+                message: "simulated failure",
+            }),
+        ];
+        let parallel =
+            ParallelNode::new("Fanout", branches).with_branch_failure(BranchFailure::Tolerate);
+
+        let out = parallel
+            .process(empty_context())
+            .await
+            .expect("tolerate mode should return Ok even with a failing branch");
+
+        assert_eq!(
+            out.nodes.get("Survivor"),
+            Some(&serde_json::json!({ "ok": true }))
+        );
+    }
+
+    #[tokio::test]
+    async fn tolerate_mode_records_per_branch_outcome_under_node_identity() {
+        let branches: Vec<Box<dyn Node>> = vec![
+            Box::new(WriterBranch {
+                identity: "SurvivingBranch",
+                write_key: "Survivor",
+                value: serde_json::json!({ "ok": true }),
+            }),
+            Box::new(FailingBranch {
+                identity: "FailingBranch",
+                message: "simulated failure",
+            }),
+        ];
+        let parallel =
+            ParallelNode::new("Fanout", branches).with_branch_failure(BranchFailure::Tolerate);
+
+        let out = parallel
+            .process(empty_context())
+            .await
+            .expect("tolerate mode should return Ok");
+
+        let outcomes: Vec<BranchOutcome> = serde_json::from_value(
+            out.nodes
+                .get("Fanout")
+                .cloned()
+                .expect("outcome record should be stamped under the node's own identity"),
+        )
+        .expect("outcome record should deserialize as Vec<BranchOutcome>");
+
+        assert_eq!(outcomes.len(), 2);
+
+        let surviving = outcomes
+            .iter()
+            .find(|o| o.branch == "SurvivingBranch")
+            .expect("surviving branch outcome present");
+        assert!(surviving.ok);
+        assert!(surviving.error.is_none());
+
+        let failing = outcomes
+            .iter()
+            .find(|o| o.branch == "FailingBranch")
+            .expect("failing branch outcome present");
+        assert!(!failing.ok);
+        assert_eq!(failing.error.as_deref(), Some("simulated failure"));
+    }
+
+    #[async_trait::async_trait]
+    impl Node for FailingBranch {
+        async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+            Err(NodeError::new(self.message.to_string()))
+        }
+
+        fn name(&self) -> &str {
+            self.identity
+        }
+    }
+
+    /// A branch node that always fails with a fixed error message, used to
+    /// exercise `BranchFailure::Tolerate`.
+    struct FailingBranch {
+        identity: &'static str,
+        message: &'static str,
     }
 }

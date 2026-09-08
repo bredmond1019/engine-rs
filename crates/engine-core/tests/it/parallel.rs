@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use engine_contract::{NodeRun, NodeRunStatus, TaskContext};
-use engine_core::{Node, NodeError, ParallelNode};
+use engine_core::{BranchFailure, Node, NodeError, ParallelNode};
 
 fn empty_context() -> TaskContext {
     TaskContext {
@@ -77,9 +77,10 @@ impl Node for FailingBranch {
 ///
 /// This test states the desired `Tolerate` behavior executably: a two-branch
 /// fan-out where one branch fails should still return `Ok` with the
-/// surviving branch's key present in the merged context. It is expected to
-/// FAIL against today's `ParallelNode`, which has no tolerate mode at all
-/// and unconditionally returns the first branch's `Err`.
+/// surviving branch's key present in the merged context. Under today's
+/// default `BranchFailure::FailRun` this fails (the first branch `Err` is
+/// propagated and every branch's output is discarded); opting into
+/// `BranchFailure::Tolerate` is what makes it pass.
 #[tokio::test]
 async fn fanout_tolerates_one_failing_branch_and_keeps_survivor_output() {
     let branches: Vec<Box<dyn Node>> = vec![
@@ -93,7 +94,7 @@ async fn fanout_tolerates_one_failing_branch_and_keeps_survivor_output() {
             message: "simulated branch failure",
         }),
     ];
-    let fanout = ParallelNode::new("Fanout", branches);
+    let fanout = ParallelNode::new("Fanout", branches).with_branch_failure(BranchFailure::Tolerate);
 
     let out = fanout
         .process(empty_context())
