@@ -1146,6 +1146,19 @@ fn build_close_block_seam(
     })
 }
 
+/// The registry-nickname identity a Rust-driven chain registers,
+/// heartbeats, leases, and drains its inbox as
+/// (`EN.ticket.wire-coord-handle-into-orchestration-run-node`) —
+/// `<engine_core::build_info::WRITER>-<hostname>-<pid>`, unique per running
+/// process the same way `host_stamp()`'s other callers (e.g.
+/// `SdlcFlowState::to_committed_state_json`) already stamp process
+/// identity, so two Rust-driven chains on the same host never collide on
+/// one registry claim.
+fn coord_agent_identity() -> String {
+    let (hostname, pid) = engine_core::build_info::host_stamp();
+    format!("{}-{hostname}-{pid}", engine_core::build_info::WRITER)
+}
+
 pub fn register_orchestration_with_registry(
     dispatcher: &mut Dispatcher,
     repo_reg: Option<Arc<RepoRegistry>>,
@@ -1292,6 +1305,7 @@ pub fn register_orchestration_with_registry(
                 .with_campaign_id(campaign_id)
                 .with_conductor(conductor_seam)
                 .with_close_block(close_block_seam)
+                .with_coord_agent(coord_agent_identity())
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);
                     if let Some(err) = depends_on_gates.take_error() {
