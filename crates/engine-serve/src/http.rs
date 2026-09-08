@@ -91,6 +91,16 @@
 //!   degraded view is a normal answer, not a fault; a `5xx` is reserved for
 //!   an outright failure to resolve the brain root at all. See
 //!   `get_coordination`.
+//! - `GET /api/roadmaps/{slug}/status` (`EN.15.H` task 2) — the typed join
+//!   behind `/roadmap-status --roadmap <slug>`: `lane-log.jsonl`, per-repo
+//!   run records, per-spec SDLC state, each repo's `state.json` operator
+//!   edges/carryover, and a corpus-wide `validate-brain --state`, via
+//!   `engine_core::roadmap_status::discover`. No `X-API-Key` gate — copies
+//!   `/api/coordination` immediately above, the only other `/api/`-prefixed
+//!   route this service carries. Always `200` on a resolved roadmap, even
+//!   one whose `lane-log.jsonl` carries a malformed line
+//!   (`malformed_lines` is populated, not a fault); `404` for an unknown or
+//!   ambiguous roadmap slug. See `get_roadmap_status`.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -299,7 +309,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // `get_coordination`'s doc comment for why it carries no `X-API-Key` gate. Collides
         // with no other registered path, literal or dynamic, so registration order here does
         // not matter.
-        .route("/api/coordination", web::get().to(get_coordination));
+        .route("/api/coordination", web::get().to(get_coordination))
+        // `EN.15.H` task 2. Collides with no other registered path — `/api/coordination` above
+        // has no dynamic segment and `/api/roadmaps/{slug}/status` shares no literal prefix
+        // segment with it beyond `/api/`, so registration order here does not matter either.
+        .route(
+            "/api/roadmaps/{slug}/status",
+            web::get().to(get_roadmap_status),
+        );
 }
 
 /// `EN.ticket.stamp-engine-sha-on-every-run` task 3: `engine_build_sha` here must equal the
@@ -931,6 +948,41 @@ async fn get_coordination() -> impl Responder {
     HttpResponse::Ok().json(view)
 }
 
+/// `GET /api/roadmaps/{slug}/status` (`EN.15.H` task 2) — the typed join behind
+/// `/roadmap-status --roadmap <slug>`, read fresh on every request via
+/// `engine_core::roadmap_status::discover`.
+///
+/// **No `X-API-Key` gate.** This copies `/api/coordination` immediately above — the only other
+/// `/api/`-prefixed route this file carries — rather than inventing a third auth policy here.
+///
+/// **`200` on any resolved roadmap, even a degraded one.** A `lane-log.jsonl` line that fails to
+/// parse as JSON is reported at the top level as `malformed_lines` (with its byte offset) rather
+/// than dropped or turned into an error — see `engine_core::roadmap_status`'s own doc comment
+/// for why. `404` is for an unresolved slug (`RoadmapStatusError::NotFound` — no roadmap
+/// directory found at all) or an ambiguous one (`RoadmapStatusError::Ambiguous` — the slug
+/// exists at both the new and legacy roadmap paths, which this route never silently prefers
+/// between). A `5xx` is reserved for an outright failure to resolve the fleet's brain root at
+/// all, matching `get_coordination`'s own contract.
+async fn get_roadmap_status(path: web::Path<String>) -> impl Responder {
+    let slug = path.into_inner();
+
+    let brain_root = match engine_core::brain_root::resolve_brain_root() {
+        Ok(root) => root,
+        Err(err) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("cannot resolve brain root: {err}"),
+            }));
+        }
+    };
+
+    match engine_core::roadmap_status::discover(&brain_root, &slug) {
+        Ok(result) => HttpResponse::Ok().json(result),
+        Err(err) => HttpResponse::NotFound().json(serde_json::json!({
+            "error": err.to_string(),
+        })),
+    }
+}
+
 #[cfg(test)]
 // `registry_test_lock()`'s std `MutexGuard` is held across `.await` points by design — it
 // serializes tests that share the global suspend registry, not data an async task contends
@@ -1183,6 +1235,166 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get().uri("/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    // --- EN.15.H task 2: GET /api/roadmaps/{slug}/status ---------------------
+
+    /// Write `<root>/planning/roadmaps/<slug>/lane-log.jsonl` with the given raw content.
+    fn write_lane_log(root: &std::path::Path, slug: &str, content: &str) {
+        let dir = root.join("planning").join("roadmaps").join(slug);
+        std::fs::create_dir_all(&dir).expect("create roadmap dir");
+        std::fs::write(dir.join("lane-log.jsonl"), content).expect("write lane-log.jsonl");
+    }
+
+    /// `EN.15.H` task 2: a healthy fixture roadmap returns `200` with the joined shape — reached
+    /// through the shared `configure` route table, matching the coordination route tests' own
+    /// discipline. `ENGINE_BRAIN_ROOT` points at a scratch tree built by this test rather than a
+    /// committed fixture, since the join reads fleet-wide relative to that root.
+    #[actix_web::test]
+    async fn roadmap_status_route_returns_the_joined_view_for_a_healthy_roadmap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_lane_log(
+            tmp.path(),
+            "demo",
+            &format!(
+                "{}\n",
+                serde_json::json!({
+                    "repo": "engine-rs",
+                    "lane": "lane-a",
+                    "block": "EN.1.A",
+                    "status": "done",
+                    "ts": "2026-09-08T00:00:00Z",
+                })
+            ),
+        );
+        std::env::set_var("ENGINE_BRAIN_ROOT", tmp.path());
+        std::env::remove_var("FLEET_LOCK_DIR");
+
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/roadmaps/demo/status")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["roadmap"], "demo");
+        assert_eq!(body["repos_in_lane_log"], serde_json::json!(["engine-rs"]));
+        assert_eq!(
+            body["lanes"]["engine-rs"]["blocks"]
+                .as_array()
+                .expect("blocks is an array")
+                .len(),
+            1
+        );
+        assert!(body["malformed_lines"]
+            .as_array()
+            .expect("malformed_lines is an array")
+            .is_empty());
+
+        std::env::remove_var("ENGINE_BRAIN_ROOT");
+    }
+
+    /// `EN.15.H` task 2 acceptance criterion: a roadmap whose lane-log carries a malformed line
+    /// returns `200` with `malformed_lines` populated, never a `5xx`.
+    #[actix_web::test]
+    async fn roadmap_status_route_reports_malformed_lines_instead_of_a_5xx() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let good_line = serde_json::json!({
+            "repo": "engine-rs",
+            "lane": "lane-a",
+            "block": "EN.1.A",
+            "status": "done",
+        })
+        .to_string();
+        write_lane_log(
+            tmp.path(),
+            "demo",
+            &format!("{good_line}\n{{not valid json\n"),
+        );
+        std::env::set_var("ENGINE_BRAIN_ROOT", tmp.path());
+        std::env::remove_var("FLEET_LOCK_DIR");
+
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/roadmaps/demo/status")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "a malformed lane-log line must never surface as a 5xx"
+        );
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let malformed = body["malformed_lines"]
+            .as_array()
+            .expect("malformed_lines is an array");
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0]["line_number"], 2);
+
+        std::env::remove_var("ENGINE_BRAIN_ROOT");
+    }
+
+    /// An unresolvable roadmap slug returns `404`, not a `5xx`.
+    #[actix_web::test]
+    async fn roadmap_status_route_returns_404_for_an_unknown_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("ENGINE_BRAIN_ROOT", tmp.path());
+        std::env::remove_var("FLEET_LOCK_DIR");
+
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/roadmaps/no-such-roadmap/status")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 404);
+
+        std::env::remove_var("ENGINE_BRAIN_ROOT");
+    }
+
+    /// `EN.15.H` task 2, "no existing route's path or auth behaviour changed": adding this route
+    /// leaves `/api/coordination` and `/health` unaffected.
+    #[actix_web::test]
+    async fn adding_the_roadmap_status_route_leaves_coordination_and_health_unaffected() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+
+        let req = test::TestRequest::get()
+            .uri("/api/coordination")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 200);
     }

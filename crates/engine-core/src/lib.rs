@@ -24,6 +24,7 @@ pub mod operator;
 pub mod parallel;
 pub mod policy;
 pub mod repo_registry;
+pub mod roadmap_status;
 pub mod routing;
 pub mod schema;
 pub mod sessions;
