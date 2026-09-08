@@ -38,6 +38,7 @@ English, and how to trigger one. This page is just the file listing.
 | [approve-and-run.md](approve-and-run.md) | The `APPROVE_AND_RUN` micro-workflow — draining pending records, resolving a verdict into a ledger row plus an authorized execution |
 | [terminal-probe.md](terminal-probe.md) | The `TERMINAL_PROBE` graph — the read-only session/observe diagnostic for the terminal stack |
 | [sweep.md](sweep.md) | The `SWEEP` workflow — the roadmap sweep ported field-for-field from `roadmap_sweep.py`, its single-node shape, and the permission-profile-gated routing |
+| [commander.md](commander.md) | The `COMMANDER` workflow — the `/orchestration-commander` drain loop ported as a two-node graph: whole-fleet inbox discovery, the scoped emit + manifest-only commit, the never-skipping drain-log append, the heartbeat, and the one gated triage step |
 
 Docs for capabilities that are **not** workflows — the crate architecture, the CLI, the data
 contract, terminal internals, suspend/resume, the harvest gate — are one level up in
