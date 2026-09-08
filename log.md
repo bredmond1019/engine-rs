@@ -16,6 +16,19 @@ related: [status, context]
 
 ## [run: 2026-09-08]
 
+### EN.15.H — `ROADMAP_STATUS` as a route (PASS)
+- **What:** Ran `/sdlc-flow` on branch `EN.15.H-flow` through both tasks, PASS review. Task 1 added `engine_core::roadmap_status`, a typed `LaneResult` join over `lane-log.jsonl`, per-repo orchestration-run records, per-spec `sdlc-*state.json`, per-repo `state.json` (operator gates + carryover), and `coord`'s registry/leases/queue-depth, with cached-parent realpath dedup and byte-offset-reported malformed lane-log lines. Task 2 registered `GET /api/roadmaps/{slug}/status` in `engine-serve`, extended the join with `validate_brain`/`coverage_caveat`/full `MessageQueueState` parity fields, and added a live parity test suite shelling out to base-template's canonical 1382-line `roadmap_status_discovery.py` oracle (asserted not to be HQ's 891-line deprecated fork), agreeing field-for-field except the one deliberate `malformed_lines` divergence. Notable decisions: message-queue depth for task 1 deliberately reuses `engine_core::coord`'s flat reader rather than the Python's nested per-repo/per-lane layout, reconciled only in task 2's dedicated `discover_queue_state()`; `resolve_block_to_spec_slug` ported via a `std::sync::OnceLock`-cached regex; `sdlc_state` liveness compared as a bucketed "live"/"stale" string rather than raw age to avoid wall-clock flakiness. Closes `EN.15.H`. `docs/architecture.md` updated.
+
+```
+052edc4 docs: update docs for EN.15.H
+cc5e55c feat: implement EN.15.H-task2
+93fa3db feat: implement EN.15.H-task1
+```
+
+Next: `EN.chore.mini-visit-plist-and-rebuild` — the remaining `EN.15.*` blocks (C-L) stay blocked on `mev`/`base-template` deps and an operator install gate (per `planning/status.md`'s `blocked` frontmatter list).
+
+
+
 ### EN.15.B — `CloseBlockNode` closes through the guard as itself (PASS)
 - **What:** Ran `/sdlc-flow` on branch `EN.15.B-flow` through both tasks, PASS review. Task 1 added an optional agent identity to `SDLCFlowEventSchema`, threaded through `registry_for_policy_with_cancellation` into both `EmitStateNode` and `CloseBlockNode` via a new `registry_with_agent` helper and `CloseBlockNode::with_agent`, wired end-to-end from the `engine-serve` dispatch site, plus a trait-level `Node::agent()` introspection seam so guard tests can confirm the production registry (not a hand-built node) threads one identity into both nodes. Task 2 rewired `CloseBlockNode` to close through mev's guarded `set_block_status_as` with the chain's own lane identity instead of the permissive wrapper: a closure attempted under a foreign `scope: repo` lease is refused (surfacing as `CloseOutcome::Unvalidated` with `E_QUIESCE_LEASE_HELD` in the reason string) while a closure under the chain's own lease succeeds; `CloseBlockNode`'s own `.mev-emit.lock` acquisition is explicitly dropped before calling `set_block_status_as`, since that entry point now acquires the same lockfile internally and holding both would self-deadlock. Notable decisions: `close_block_direct` (the ORCHESTRATION integrate-step seam) is unchanged — still `agent: None`/`dir: root`, reproducing its pre-existing unguarded behavior — out of this block's declared `close_block.rs` scope; AC-4 (`W_MEV_UNGUARDED_WRITER` no longer naming engine-rs) is NOT independently verified by a test this run, recorded as a D18 amendment on the block record rather than silently absorbed. Closes `EN.15.B`.
 
