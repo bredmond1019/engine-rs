@@ -16,9 +16,10 @@
 use std::collections::HashMap;
 
 use engine_contract::TaskContext;
-use engine_core::node::{Node, NodeError, NodeRegistry};
-use engine_core::nodes::aggregate::AggregateNode;
+use engine_core::node::{Node, NodeError, NodeExt, NodeRegistry};
+use engine_core::nodes::aggregate::{AggregateNode, MissingSource};
 use engine_core::nodes::fan_out::FanOutNode;
+use engine_core::parallel::{BranchFailure, ParallelNode};
 use engine_core::schema::{NodeConfig, WorkflowSchema};
 use engine_core::workflow::Workflow;
 use serde_json::{json, Value};
@@ -153,4 +154,134 @@ async fn fan_out_to_aggregate_to_persist_produces_one_merged_digest_payload_for_
             "node {name} should have run to success"
         );
     }
+}
+
+// -- EN.ticket.parallel-node-partial-success task 4 ------------------------
+//
+// End-to-end coverage that `ParallelNode::BranchFailure::Tolerate` and
+// `AggregateNode::MissingSource::Skip` are a matched pair through a real
+// `Workflow::run` (not a hand-called `.process()` chain): a fan-out with one
+// failing branch feeding a `Skip` aggregate completes with the survivors in
+// declared order, while the same fan-out feeding the default `Fail`
+// aggregate still fails the run — pinning that a `Tolerate` fan-out paired
+// with a `Fail` aggregate reintroduces the original bug one node later.
+
+const PARTIAL_SOURCE_COUNT: usize = 3;
+/// The branch index that always fails in the partial-success fixtures below.
+const FAILING_BRANCH_INDEX: usize = 1;
+
+/// Always fails — stands in for a flaky branch in the `Tolerate` fixtures.
+struct FailingSourceNode;
+
+#[async_trait::async_trait]
+impl Node for FailingSourceNode {
+    async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        Err(NodeError::new("simulated branch failure"))
+    }
+
+    fn name(&self) -> &str {
+        "FailingSourceNode"
+    }
+}
+
+/// Builds the `PARTIAL_SOURCE_COUNT` branches `FanOutNode` would have built
+/// for `"Source"`, except branch [`FAILING_BRANCH_INDEX`] always fails —
+/// each wrapped under exactly the identity `FanOutNode::branch_identity`
+/// would assign, so `AggregateNode::for_fan_out("Aggregate", "Source", ..)`
+/// reads the same keys a real `FanOutNode` would have produced.
+fn partial_failure_branches() -> Vec<Box<dyn Node>> {
+    (0..PARTIAL_SOURCE_COUNT)
+        .map(|i| {
+            let identity = FanOutNode::branch_identity("Source", i);
+            if i == FAILING_BRANCH_INDEX {
+                Box::new((Box::new(FailingSourceNode) as Box<dyn Node>).with_identity(identity))
+                    as Box<dyn Node>
+            } else {
+                let instance = Box::new(SourceNode {
+                    value: json!({ "i": i }),
+                }) as Box<dyn Node>;
+                Box::new(instance.with_identity(identity)) as Box<dyn Node>
+            }
+        })
+        .collect()
+}
+
+/// A `FanOut -> Aggregate` fixture (no persist stage — this fixture is only
+/// exercising the `ParallelNode`/`AggregateNode` pairing) where `FanOut` is a
+/// `ParallelNode` running under `BranchFailure::Tolerate` with one failing
+/// branch, and `Aggregate` runs under the given `missing_source` mode.
+fn partial_failure_workflow(missing_source: MissingSource) -> Workflow {
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        "FanOut".to_string(),
+        NodeConfig::new("FanOut", vec!["Aggregate".to_string()]),
+    );
+    nodes.insert(
+        "Aggregate".to_string(),
+        NodeConfig::new("Aggregate", vec![]),
+    );
+    let schema = WorkflowSchema::new("FAN_OUT_AGGREGATE_PARTIAL_FIXTURE", "FanOut", nodes);
+
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(
+        ParallelNode::new("FanOut", partial_failure_branches())
+            .with_branch_failure(BranchFailure::Tolerate),
+    ));
+    registry.register(Box::new(
+        AggregateNode::for_fan_out("Aggregate", "Source", PARTIAL_SOURCE_COUNT)
+            .with_missing_source(missing_source),
+    ));
+
+    Workflow::new_validated(registry, schema)
+        .expect("partial-failure fixture graph should validate")
+}
+
+#[tokio::test]
+async fn tolerate_fan_out_feeding_skip_aggregate_completes_with_survivors_in_declared_order() {
+    let workflow = partial_failure_workflow(MissingSource::Skip);
+
+    let ctx = workflow
+        .run(json!({}), Box::new(|_| {}))
+        .await
+        .expect("Tolerate fan-out + Skip aggregate should complete the run");
+
+    // The failing branch's identity never lands in ctx.nodes...
+    let failing_identity = FanOutNode::branch_identity("Source", FAILING_BRANCH_INDEX);
+    assert!(!ctx.nodes.contains_key(&failing_identity));
+
+    // ...and the surviving branches arrive in declared order, not
+    // `HashMap` iteration order, with the missing middle entry omitted
+    // rather than reindexed.
+    assert_eq!(
+        ctx.nodes.get("Aggregate"),
+        Some(&json!([{ "i": 0 }, { "i": 2 }]))
+    );
+}
+
+#[tokio::test]
+async fn tolerate_fan_out_feeding_fail_aggregate_still_fails_the_run() {
+    // The mismatched pairing: a Tolerate fan-out's missing branch key is
+    // exactly what a default-Fail aggregate hard-errors on, reintroducing
+    // the original bug one node later. This must still fail, deliberately.
+    //
+    // `Workflow::walk` records a failed node's status on `ctx.node_runs`
+    // rather than surfacing it as an `Err` from `Workflow::run` (see the
+    // existing per-node `NodeRunStatus::Success` assertions above) — so
+    // "still fails" is asserted at that same node-run boundary, not via
+    // `Workflow::run`'s own `Result`.
+    let workflow = partial_failure_workflow(MissingSource::Fail);
+
+    let ctx = workflow
+        .run(json!({}), Box::new(|_| {}))
+        .await
+        .expect("Workflow::run itself still completes; the failure is node-level");
+
+    assert_eq!(
+        ctx.node_runs.get("Aggregate").map(|r| r.status),
+        Some(engine_contract::NodeRunStatus::Failed),
+        "Tolerate fan-out + Fail aggregate must still fail the Aggregate node"
+    );
+    // The run never reached a "Aggregate" output key on ctx.nodes — the
+    // node's hard-error path never inserts one.
+    assert!(!ctx.nodes.contains_key("Aggregate"));
 }
