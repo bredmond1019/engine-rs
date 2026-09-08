@@ -193,6 +193,53 @@ diagnostic) is logged via `tracing::warn!` rather than silently swallowed; `clos
 fire-and-forget signature gives the seam no other channel to report through, so the block is simply
 left open in `state.json` and can still be closed by hand or on a later run.
 
+## A bail or a stuck operator hold now writes an escalation and a bails[] entry (`EN.15.G`)
+
+A step that fails on the BAIL path (`execute_step` returns an error) or the HOLD path
+(`wait_for_clearance` times out or loses a cancellation race) no longer just propagates the error
+and appends its `bailed` `lane-log.jsonl` line — `integrate.rs`'s `record_bail_escalation` also
+best-effort composes and appends a schema-valid `escalations.jsonl` line plus a `bails.jsonl`
+entry, so a chain's own failures show up in the same two files agent lanes already write to by
+hand. Both writes are **best-effort**, matching this loop's existing `let _ =
+append_lane_log_line(...)`/`let _ = write_checkpoint(...)` pattern: a failure to compose or append
+either record is logged via `tracing::warn!` and swallowed — it can never mask, replace, or delay
+the real `IntegrateError` the step already failed with. Only appends, via `append_escalation_line`/
+`append_bail_line` — never rewrites or truncates either file, since a sibling lane appends its own
+lines to the same `escalations.jsonl` by design.
+
+The record composition lives in `crates/engine-core/src/workflows/orchestration/escalate.rs`
+(`EscalationRecord`, `BailEntry`), a schema-valid-by-construction type pair rather than a
+serializer with a runtime validity check:
+
+- `EscalationOptions` is an enum of exactly `Two([_; 2])`/`Three([_; 3])` variants, not a
+  `Vec`-backed struct with a length check, so a fourth notification option is structurally
+  unrepresentable in any value a caller can hold.
+- `EscalationChannel::session(lane)` (the channel used here) carries no `options` field at the
+  type level — `session:<lane>` never emits one, enforced by the shape, not an omission rule in
+  the serializer.
+- `VerifiedBy::new` ports `check_escalations.py`'s exact two regexes (an `UNVERIFIED:` prefix vs. a
+  multi-line command-plus-output block), so the Rust and Python halves check the same shape; this
+  composed record uses the Evidence form — `integrate_chain step <repo>::<block_id>` followed by
+  the actual `IntegrateError` display text, since that is the directly-observed evidence.
+- `check_id` distinguishes the two call sites in `bails.jsonl`: `"operator-hold"` for the HOLD
+  path, `"orchestration-step"` for the BAIL path.
+- `BailEntry::new` refuses an empty `failing_artifact` unconditionally — unlike the general
+  record-a-bail convention, which tolerates a null one when a check names no path, this
+  block-granularity layer's own acceptance criteria require it non-empty always. The artifact is
+  the block's own SDLC state-file path, prefixed with the repo slug for cross-repo disambiguation
+  (`<repo>/planning/<block_id>/sdlc/<engine-state-file>`), and doubles as the sole entry in
+  `declared_files`, so ownership classification (`BailOwnership::classify`) always resolves to
+  self for a chain-originated bail.
+- `verified_at_sha` is obtained by shelling `git rev-parse --short=7 HEAD` in the **subject
+  repo's** own resolved path (`RepoRegistry::resolve`), never the brain root's; if the repo path
+  or its sha cannot be resolved, both writes are skipped with a `tracing::warn!` rather than
+  attempted with a wrong or missing sha.
+
+A cross-validation test (`crates/engine-core/tests/it/escalate.rs`) shells out to the real
+`check_escalations.py` against Rust-composed lines — a headline pass, a missing-field rejection, a
+prose-`verified_by` rejection, a positive-control accept, and a notification-channel round-trip —
+so the two implementations are proven to agree on the same wire shape, not merely believed to.
+
 ## Fleet coordination: a Rust-driven chain is now visible to `bastion coord status`
 
 Before `EN.ticket.wire-coord-handle-into-orchestration-run-node`, the coordination machinery added
@@ -250,6 +297,33 @@ campaign — every block in the chain, not just the block currently running. A c
 `CancellationToken`, registered in `CampaignRegistry` under the campaign's id, is what
 `integrate.rs`'s per-boundary check (above) observes. See `docs/architecture.md`'s "Campaign abort
 endpoint" entry for the route contract.
+
+## A driven chain now writes a live run record (`EN.15.G`)
+
+`docs/architecture.md`'s Journal entry already documents `journal.rs` rendering a `JournalRow`
+slice plus a caller-supplied `RunRecordMeta` into D57-shaped `notes.md`/`review.md` — but until
+`EN.15.G`, nothing in production actually called those renderers; they were reachable only from
+tests. `engine-serve::journal::drive_chain_with_run_record` is the first production caller: it
+wraps `integrate::integrate_chain_with_run_record` (`crates/engine-core/src/workflows/
+orchestration/integrate.rs`), a chain entry point identical to `integrate_chain_with_coord` plus
+one new argument, a `run_record_sink: Option<&RunRecordSinkFn>`.
+
+`RunRecordSinkFn` (`type RunRecordSinkFn = dyn Fn(RunRecordLifecycle) + Send + Sync`) fires exactly
+twice per driven chain — `RunRecordLifecycle::Started` immediately before the real step loop
+begins, `RunRecordLifecycle::Terminal` the instant it returns, `Ok` or `Err`/bail alike — mirroring
+the existing `JournalSinkFn` injection pattern rather than giving `engine-core` a dependency on
+`engine-serve`'s renderer. `journal.rs`'s production sink re-renders and overwrites both
+`notes.md`/`review.md` in the roadmap directory on every transition: `Started` writes with
+`meta.run_ended: None` (`lifecycle: active`), `Terminal` writes with an end timestamp
+(`lifecycle: lane-complete`). Because `Terminal` fires on every return path — only a hard process
+kill prevents it — a run that is killed mid-chain is left showing `lifecycle: active` (the correct
+signal that it stopped without a clean terminal state), while a run that returns cleanly, bailed or
+not, always clears to `lifecycle: lane-complete`.
+
+All four existing `integrate_chain*` wrapper signatures (`integrate_chain`,
+`integrate_chain_with_journal`, `integrate_chain_with_coord`, `integrate_chain_with_dispatch`) are
+unchanged — `integrate_chain_with_run_record` is a new wrapper, not a modified one, so none of
+their existing call sites needed to move.
 
 ## `DEBRIEF`'s two outputs: the ops digest and `POST_DRAFT` (`EN.12.M`)
 

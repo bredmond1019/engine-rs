@@ -19,13 +19,22 @@
 //! clean `404`, never a `500`. This mirrors `crate::resume::rehydrate_from_store`,
 //! which returns `None` on a missing pool so its caller 404s uniformly.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use async_trait::async_trait;
 use engine_contract::{JournalDecisionKind, JournalRow};
+use engine_core::repo_registry::RepoRegistry;
+use engine_core::workflows::orchestration::chain::ChainStep;
 use engine_core::workflows::orchestration::debrief::JournalReader;
-use engine_core::workflows::orchestration::integrate::JournalSinkFn;
+use engine_core::workflows::orchestration::execute::{EngineKind, ExecutionOutcome, FlowRunner};
+use engine_core::workflows::orchestration::gates::{AdmissionGate, DependencyEdge};
+use engine_core::workflows::orchestration::integrate::{
+    integrate_chain_with_run_record, CloseBlockFn, HoldSource, IntegrateError, JournalSinkFn,
+    RunRecordLifecycle, RunRecordSinkFn, StepObserverFn,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -292,6 +301,139 @@ pub fn render_review_md(campaign_id: &Uuid, rows: &[JournalRow], meta: &RunRecor
         "This campaign integrated {integrated} step(s), bailed {bailed} time(s), and was halted by a budget cap {halted} time(s).\n",
     ));
     out
+}
+
+// ---------------------------------------------------------------------------
+// `EN.15.G` task 3 — the FIRST production caller of `render_notes_md` /
+// `render_review_md`.
+//
+// Before this, both renderers had seven test call sites
+// (`crates/engine-serve/tests/journal_integration.rs`) and zero production
+// ones — exactly the `call_site: NONE` shape: tested, green, and
+// unreachable from a real run. `drive_chain_with_run_record` below is a
+// real (non-test) caller: it drives an actual chain through
+// `integrate_chain_with_run_record` and, via the `RunRecordSinkFn` it
+// wires, rewrites `notes.md`/`review.md` at the chain's `Started` and
+// `Terminal` lifecycle transitions.
+// ---------------------------------------------------------------------------
+
+/// In-process accumulator of the [`JournalRow`]s a driven chain emits, shared between the
+/// `journal_sink` closure that fills it (called once per decision point,
+/// `integrate::emit_journal`) and the `run_record_sink` closure that reads it back to render
+/// `notes.md`/`review.md`'s "running tab" — both are plain, synchronous `Send + Sync`
+/// closures the `engine-core` loop calls directly, never handed an async `JournalReader` the
+/// way the durable Postgres path is (see this module's `LiveJournalReader`); a local `Vec`
+/// avoids needing to `.await` inside a sync callback.
+type SharedRows = Arc<Mutex<Vec<JournalRow>>>;
+
+fn recording_journal_sink(rows: SharedRows) -> Arc<JournalSinkFn> {
+    Arc::new(move |row: JournalRow| {
+        if let Ok(mut guard) = rows.lock() {
+            guard.push(row);
+        }
+    })
+}
+
+/// The production [`RunRecordSinkFn`]: on every lifecycle transition, re-renders
+/// `notes.md`/`review.md` from whatever rows `recording_journal_sink` has accumulated so far
+/// and overwrites both files in `roadmap_dir`. `RunRecordLifecycle::Started` writes with
+/// `meta.run_ended: None` (`lifecycle: active`); `RunRecordLifecycle::Terminal` writes with
+/// `run_ended: Some(<now>)` (`lifecycle: lane-complete`) — see [`RunRecordMeta::lifecycle`].
+/// A process killed between the two calls therefore leaves the `Started` write on disk,
+/// `lifecycle: active` forever, which is exactly the shape `mev lanes` needs to report a dead
+/// run `degraded` rather than `live`. Both writes are best-effort (`tracing::warn!` on a
+/// filesystem error) — a rendering failure must never mask the chain's own real outcome, which
+/// this sink has no way to influence anyway (it returns nothing `integrate_chain_impl`'s
+/// control flow depends on).
+fn run_record_sink(
+    roadmap_dir: PathBuf,
+    campaign_id: Uuid,
+    meta: RunRecordMeta,
+    rows: SharedRows,
+) -> Arc<RunRecordSinkFn> {
+    Arc::new(move |lifecycle| {
+        let mut meta = meta.clone();
+        if lifecycle == RunRecordLifecycle::Terminal {
+            meta.run_ended = Some(chrono::Utc::now().to_rfc3339());
+        }
+        let snapshot: Vec<JournalRow> = rows.lock().map(|guard| guard.clone()).unwrap_or_default();
+        let notes = render_notes_md(&campaign_id, &snapshot, &meta);
+        let review = render_review_md(&campaign_id, &snapshot, &meta);
+        if let Err(err) = std::fs::write(roadmap_dir.join("notes.md"), notes) {
+            tracing::warn!(
+                error = %err,
+                path = %roadmap_dir.join("notes.md").display(),
+                "EN.15.G: failed to write notes.md"
+            );
+        }
+        if let Err(err) = std::fs::write(roadmap_dir.join("review.md"), review) {
+            tracing::warn!(
+                error = %err,
+                path = %roadmap_dir.join("review.md").display(),
+                "EN.15.G: failed to write review.md"
+            );
+        }
+    })
+}
+
+/// Drive a real chain end to end through
+/// [`integrate_chain_with_run_record`](engine_core::workflows::orchestration::integrate::integrate_chain_with_run_record)
+/// while maintaining its D57 run record (`notes.md`/`review.md`) in `roadmap_dir` — the first
+/// production caller of [`render_notes_md`]/[`render_review_md`] (see this section's module
+/// doc). Every argument besides `meta` mirrors `integrate_chain_with_run_record`'s own; `meta`
+/// supplies the `(repo, roadmap, lane, run_started)` identity a D57 record is addressed by
+/// (`RunRecordMeta`'s own doc) — its `run_ended` field is ignored (overwritten at each
+/// lifecycle transition) and may be left `None`.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_chain_with_run_record(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: Uuid,
+    close_block: &CloseBlockFn,
+    meta: RunRecordMeta,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    let rows: SharedRows = Arc::new(Mutex::new(Vec::new()));
+    let journal_sink = recording_journal_sink(rows.clone());
+    let record_sink = run_record_sink(roadmap_dir.to_path_buf(), campaign_id, meta, rows);
+
+    integrate_chain_with_run_record(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        None,
+        None,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        Some(journal_sink.as_ref()),
+        None,
+        Some(record_sink.as_ref()),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -721,5 +863,211 @@ mod tests {
         let resp = test::call_service(&app, req).await;
 
         assert_eq!(resp.status(), 404);
+    }
+}
+
+/// `EN.15.G` task 3: proves `drive_chain_with_run_record` — the production caller added
+/// above — actually calls `render_notes_md`/`render_review_md` by driving a REAL chain
+/// through `integrate_chain_with_run_record`, never by calling either renderer directly.
+#[cfg(test)]
+mod run_record_lifecycle_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use engine_core::repo_registry::RepoRegistry;
+    use engine_core::workflows::orchestration::execute::{EngineKind, FlowRunner};
+    use engine_core::workflows::orchestration::gates::AdmissionGate;
+    use engine_core::workflows::orchestration::integrate::NeverHeld;
+    use uuid::Uuid;
+
+    use super::{drive_chain_with_run_record, ChainStep, RunRecordMeta};
+
+    fn step(repo: &str, block_id: &str) -> ChainStep {
+        ChainStep {
+            repo: repo.to_string(),
+            block_id: block_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn one_repo_registry() -> (tempfile::TempDir, RepoRegistry) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("repo-a")).unwrap();
+        std::fs::write(
+            dir.path().join("brain.toml"),
+            "[[repos]]\nslug = \"repo-a\"\nrepo_path = \"repo-a\"\n",
+        )
+        .unwrap();
+        let registry = RepoRegistry::from_brain_root(dir.path()).expect("registry");
+        (dir, registry)
+    }
+
+    fn write_done_state(repo_path: &std::path::Path, block_id: &str) {
+        let dir = repo_path.join("planning").join(block_id).join("sdlc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sdlc-flow-state.json"),
+            serde_json::json!({"status": "done"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn test_meta() -> RunRecordMeta {
+        RunRecordMeta {
+            repo: "repo-a".to_string(),
+            roadmap: "roadmap-a".to_string(),
+            lane: "repo-a".to_string(),
+            run_started: "2026-09-08T00:00:00+00:00".to_string(),
+            run_ended: None,
+        }
+    }
+
+    /// Acceptance criterion: a chain run to a clean terminal node CLEARS `lifecycle:`,
+    /// asserted by re-reading the record after the run — driven for real through
+    /// `drive_chain_with_run_record`, never by calling `render_notes_md` directly.
+    #[tokio::test]
+    async fn clean_terminal_clears_lifecycle_in_the_written_run_record() {
+        let (dir, registry) = one_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let runner: FlowRunner = Arc::new(move |_invocation| {
+            Box::pin(async {
+                Ok(engine_contract::TaskContext {
+                    event: serde_json::json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: serde_json::json!({}),
+                    node_runs: std::collections::HashMap::new(),
+                })
+            })
+        });
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let hold = NeverHeld;
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let campaign_id = Uuid::new_v4();
+        let chain = vec![step("repo-a", "A.1")];
+
+        let outcomes = drive_chain_with_run_record(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &hold,
+            Duration::from_millis(1),
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_| {},
+            false,
+            true,
+            campaign_id,
+            &|_repo: &str, _id: &str| {},
+            test_meta(),
+        )
+        .await
+        .expect("clean chain should integrate and return outcomes");
+        assert_eq!(outcomes.len(), 1);
+
+        let notes = std::fs::read_to_string(roadmap_dir.path().join("notes.md"))
+            .expect("notes.md should have been written");
+        assert!(
+            notes.contains("lifecycle: lane-complete"),
+            "expected a clean terminal run to clear lifecycle, got:\n{notes}"
+        );
+        let review = std::fs::read_to_string(roadmap_dir.path().join("review.md"))
+            .expect("review.md should have been written");
+        assert!(
+            review.contains("lifecycle: lane-complete"),
+            "expected a clean terminal run to clear lifecycle, got:\n{review}"
+        );
+    }
+
+    /// Acceptance criterion: a chain killed mid-run leaves `lifecycle: active`. Simulated by
+    /// aborting the driving task while a step is still in flight — unlike a bail or a
+    /// cancellation (both of which still return from `integrate_chain_impl` and fire
+    /// `Terminal`), an abort truly stops the future without running any more of this
+    /// process's code, the same as a `kill -9` would.
+    #[tokio::test]
+    async fn killed_mid_run_leaves_lifecycle_active_in_the_written_run_record() {
+        let (_dir, registry) = one_repo_registry();
+
+        // Hangs forever — the abort below fires while this step is still "running", well
+        // after `RunRecordLifecycle::Started` already wrote `lifecycle: active` to disk.
+        let runner: FlowRunner = Arc::new(move |_invocation| {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok(engine_contract::TaskContext {
+                    event: serde_json::json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: serde_json::json!({}),
+                    node_runs: std::collections::HashMap::new(),
+                })
+            })
+        });
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let hold = NeverHeld;
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let roadmap_path = roadmap_dir.path().to_path_buf();
+        let campaign_id = Uuid::new_v4();
+        let chain = vec![step("repo-a", "A.1")];
+        let meta = test_meta();
+
+        // `execute::FlowFuture` is deliberately not `Send` (see `graph.rs`'s own doc on that
+        // exact point), so the driving future can't cross `tokio::spawn`'s `Send` bound —
+        // `spawn_local` on a `LocalSet` is the abort-capable equivalent that doesn't need one.
+        let local = tokio::task::LocalSet::new();
+        let handle = local.spawn_local(async move {
+            let _ = drive_chain_with_run_record(
+                &chain,
+                &resolve_deps,
+                &is_met,
+                &admission,
+                &hold,
+                Duration::from_millis(1),
+                None,
+                &resolve_engine,
+                &registry,
+                &runner,
+                &roadmap_path,
+                None,
+                &|_| {},
+                false,
+                true,
+                campaign_id,
+                &|_repo: &str, _id: &str| {},
+                meta,
+            )
+            .await;
+        });
+
+        local
+            .run_until(async {
+                // Give `Started` a chance to write before the abort — the write itself is
+                // synchronous, but the spawned task needs a scheduler tick to reach it.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                handle.abort();
+                let _ = handle.await;
+            })
+            .await;
+
+        let notes = std::fs::read_to_string(roadmap_dir.path().join("notes.md"))
+            .expect("Started should already have written notes.md");
+        assert!(
+            notes.contains("lifecycle: active"),
+            "expected a killed-mid-run record to stay active, got:\n{notes}"
+        );
+        assert!(
+            !notes.contains("lifecycle: lane-complete"),
+            "Terminal must never have fired for an aborted run, got:\n{notes}"
+        );
     }
 }

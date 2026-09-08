@@ -81,6 +81,10 @@ use super::checkpoint::{
 };
 use super::coord_lane::CoordHandle;
 use super::dispatch::{execute_dispatch_step, DispatchStepError};
+use super::escalate::{
+    append_bail_line, append_escalation_line, BailEntry, EscalationChannel, EscalationKind,
+    EscalationRecord, EscalationSeverity, NewBailEntry, NewEscalation,
+};
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
 use crate::nodes::brain_client::RECALL_NODE_NAME;
@@ -259,6 +263,151 @@ fn state_path_for(repo_path: &Path, block_id: &str, engine: EngineKind) -> PathB
         .join(block_id)
         .join("sdlc")
         .join(filename)
+}
+
+/// The subject repo's own short git SHA — never the brain root's, per
+/// `escalation.schema.json`'s `verified_at_sha` field docs (a brain SHA would make every
+/// cross-repo escalation look permanently stale). Runs `git rev-parse --short=7 HEAD`
+/// inside `repo_path`; `None` on any failure (not a git checkout, no `git` on `PATH`, a
+/// non-UTF8 or empty result) — the caller treats that as "cannot compose this escalation
+/// right now" rather than fabricating a placeholder SHA that would fail
+/// [`EscalationRecord::new`]'s own SHA-shape check anyway.
+fn subject_repo_short_sha(repo_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+/// `EN.15.G` Task 2: compose and best-effort append a schema-valid escalation line
+/// (`escalations.jsonl`) plus a `bails[]` entry (`bails.jsonl`) for a step that bailed on
+/// the BAIL path (`execute_step` failed) or the HOLD path (`wait_for_clearance` timed out
+/// or lost a cancellation race). Both writes are **best-effort**, matching every other
+/// write in this loop's bail handling (`let _ = append_lane_log_line(...)`,
+/// `let _ = write_checkpoint(...)`): a failure to compose or append either record is
+/// logged via `tracing::warn!` and swallowed — it must never mask, replace, or delay
+/// propagating the real [`IntegrateError`] the step already failed with. Appends only,
+/// via [`append_escalation_line`]/[`append_bail_line`] — never rewrites or truncates
+/// either file, since agent lanes append their own lines to the same `escalations.jsonl`
+/// by design.
+fn record_bail_escalation(
+    roadmap_dir: &Path,
+    registry: &RepoRegistry,
+    step: &ChainStep,
+    lane: &str,
+    check_id: &str,
+    engine: EngineKind,
+    err_display: &str,
+) {
+    let roadmap = step.roadmap.as_deref().unwrap_or("no-roadmap");
+    let gate_id = format!("{roadmap}/{}/{}", step.repo, step.block_id);
+    let state_relpath = state_path_for(Path::new(""), &step.block_id, engine)
+        .to_string_lossy()
+        .into_owned();
+    let failing_artifact = format!("{}/{state_relpath}", step.repo);
+
+    let Ok(repo_path) = registry.resolve(&step.repo) else {
+        tracing::warn!(
+            repo = %step.repo,
+            block_id = %step.block_id,
+            "EN.15.G: could not resolve repo path; skipping bail escalation and bails[] entry"
+        );
+        return;
+    };
+    let Some(sha) = subject_repo_short_sha(&repo_path) else {
+        tracing::warn!(
+            repo = %step.repo,
+            block_id = %step.block_id,
+            "EN.15.G: could not resolve subject repo sha; skipping bail escalation"
+        );
+        return;
+    };
+
+    let summary: String = err_display
+        .chars()
+        .take(super::escalate::SUMMARY_MAX_CHARS)
+        .collect();
+    let verified_by = format!(
+        "integrate_chain step {}::{}\n{err_display}",
+        step.repo, step.block_id
+    );
+
+    match EscalationChannel::session(lane) {
+        Ok(channel) => match EscalationRecord::new(NewEscalation {
+            ts_utc: Utc::now().to_rfc3339(),
+            repo: step.repo.clone(),
+            lane: lane.to_string(),
+            kind: EscalationKind::Bail,
+            severity: EscalationSeverity::Blocking,
+            channel,
+            block: Some(step.block_id.clone()),
+            gate_id: gate_id.clone(),
+            summary,
+            verified_by,
+            durable_home: serde_json::json!({
+                "channel": "lane-log",
+                "ref": format!(
+                    "{}/planning/orchestration-run/{roadmap}/lane-log.jsonl#block={}",
+                    step.repo, step.block_id
+                ),
+            }),
+            verified_at_sha: sha,
+            clears_when: None,
+            host: None,
+        }) {
+            Ok(record) => {
+                let path = roadmap_dir.join("escalations.jsonl");
+                if let Err(err) = append_escalation_line(&path, &record) {
+                    tracing::warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "EN.15.G: failed to append escalations.jsonl line"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "EN.15.G: refused to compose bail escalation");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "EN.15.G: refused to compose bail escalation channel");
+        }
+    }
+
+    match BailEntry::new(NewBailEntry {
+        occurred_at: Utc::now().to_rfc3339(),
+        block_id: step.block_id.clone(),
+        check_id: check_id.to_string(),
+        failing_artifact: failing_artifact.clone(),
+        declared_files: vec![failing_artifact],
+        bail_class: None,
+        reason: err_display.to_string(),
+    }) {
+        Ok(entry) => {
+            let path = roadmap_dir.join("bails.jsonl");
+            if let Err(err) = append_bail_line(&path, &entry) {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "EN.15.G: failed to append bails.jsonl line"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "EN.15.G: refused to compose bails[] entry");
+        }
+    }
 }
 
 /// Read the state file `outcome`'s block should have written and confirm
@@ -1107,6 +1256,31 @@ pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
 /// additive over the pre-`EN.12.D` behavior.
 pub type JournalSinkFn = dyn Fn(engine_contract::JournalRow) + Send + Sync;
 
+/// A lifecycle transition a driven chain has reached (`EN.15.G` task 3) — fired around the
+/// whole [`integrate_chain_impl`] call so a caller can maintain a D57 run record
+/// (`notes.md`/`review.md`) whose `lifecycle:` frontmatter field self-heals: `Started` fires
+/// exactly once before any step is looked at, `Terminal` fires exactly once immediately
+/// before the call returns — `Ok` or `Err` alike, a bail included, since a bail still reaches
+/// this function's own return. A record rewritten to `Started` and never rewritten to
+/// `Terminal` is a run that was killed before it could return at all (`kill -9`, not a bail or
+/// a cancel) — exactly the shape `mev lanes` needs to report a dead run `degraded` rather than
+/// `live`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunRecordLifecycle {
+    Started,
+    Terminal,
+}
+
+/// An injected "maintain this chain's D57 run record" seam (`EN.15.G` task 3) — mirrors
+/// [`JournalSinkFn`]'s shape and rationale exactly: `engine-core` cannot depend on
+/// `engine-serve` (the crate that owns `render_notes_md`/`render_review_md` and does the
+/// actual file write), so the renderer is injected here rather than called directly.
+/// Production wiring (`engine_serve::journal`) hands this a closure that re-renders and
+/// rewrites `notes.md`/`review.md` on every call; tests substitute a closure that records
+/// into a `Vec`/`Mutex` instead. Reached only through [`integrate_chain_with_run_record`] —
+/// every other `integrate_chain*` entry point passes `None`, making this strictly additive.
+pub type RunRecordSinkFn = dyn Fn(RunRecordLifecycle) + Send + Sync;
+
 /// An injected "close this block in `planning/state.json`" seam
 /// (`EN.ticket.orchestration-close-block-node-not-wired` task 1) — called
 /// with `(repo, block_id)` exactly once per successfully-completed
@@ -1422,6 +1596,7 @@ pub async fn integrate_chain(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1480,6 +1655,7 @@ pub async fn integrate_chain_with_journal(
         Some(journal_sink),
         None,
         None,
+        None,
     )
     .await
 }
@@ -1535,6 +1711,7 @@ pub async fn integrate_chain_with_coord(
         None,
         None,
         coord,
+        None,
     )
     .await
 }
@@ -1596,6 +1773,66 @@ pub async fn integrate_chain_with_dispatch(
         journal_sink,
         Some(dispatcher),
         None,
+        None,
+    )
+    .await
+}
+
+/// Identical to [`integrate_chain_with_coord`], plus a [`RunRecordSinkFn`] fired at chain
+/// start and again at the terminal node (`EN.15.G` task 3) — the injection seam
+/// `engine-serve`'s `journal.rs` uses to keep a D57 run record's `lifecycle:` field
+/// self-healing across a kill mid-run. See [`RunRecordSinkFn`]'s own doc for why this is
+/// injected rather than `engine-core` calling `render_notes_md`/`render_review_md` directly.
+/// `run_record_sink: None` is behavior-identical to [`integrate_chain_with_coord`] itself.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_run_record(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    journal_sink: Option<&JournalSinkFn>,
+    coord: Option<&CoordHandle>,
+    run_record_sink: Option<&RunRecordSinkFn>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        journal_sink,
+        None,
+        coord,
+        run_record_sink,
     )
     .await
 }
@@ -1618,8 +1855,76 @@ impl Drop for StepLeaseGuard<'_> {
     }
 }
 
+/// `EN.15.G` task 3: thin lifecycle wrapper over [`integrate_chain_impl_inner`] — fires
+/// `run_record_sink`'s [`RunRecordLifecycle::Started`] before the real loop starts and
+/// [`RunRecordLifecycle::Terminal`] the instant it returns, `Ok` or `Err` alike. Kept
+/// separate from the loop itself (rather than threading the sink through every one of its
+/// many early-return paths) precisely so `Terminal` is guaranteed to fire on every return
+/// this function has — the only way to observe `Started` without a matching `Terminal` is
+/// for the process to die before this `async fn` ever resumes, which is the "killed mid-run"
+/// case the sink's own doc names.
 #[allow(clippy::too_many_arguments)]
 async fn integrate_chain_impl(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    journal_sink: Option<&JournalSinkFn>,
+    dispatcher: Option<&Dispatcher>,
+    coord: Option<&CoordHandle>,
+    run_record_sink: Option<&RunRecordSinkFn>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    if let Some(sink) = run_record_sink {
+        sink(RunRecordLifecycle::Started);
+    }
+    let result = integrate_chain_impl_inner(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        journal_sink,
+        dispatcher,
+        coord,
+    )
+    .await;
+    if let Some(sink) = run_record_sink {
+        sink(RunRecordLifecycle::Terminal);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn integrate_chain_impl_inner(
     chain: &[ChainStep],
     resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
     is_edge_met: &dyn Fn(&str, &str) -> bool,
@@ -1829,14 +2134,24 @@ async fn integrate_chain_impl(
         )
         .await
         {
-            let entry =
-                LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string())
-                    .with_identity(None)
-                    .with_permission_profile(Some(resolved_permission_profile_identifier(
-                        registry,
-                    )));
+            let hold_lane = lane.unwrap_or(step.repo.as_str());
+            let entry = LaneLogEntry::bailed(step, hold_lane, err.to_string())
+                .with_identity(None)
+                .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
+            // `EN.15.G` task 2: the HOLD path — a hold that timed out (or lost a
+            // cancellation race) leaves no trail an agent lane leaves without this. See
+            // `record_bail_escalation`'s own doc for why every effect here is best-effort.
+            record_bail_escalation(
+                roadmap_dir,
+                registry,
+                step,
+                hold_lane,
+                "operator-hold",
+                resolve_engine(&step.repo, &step.block_id),
+                &err.to_string(),
+            );
             return Err(err);
         }
 
@@ -2071,6 +2386,19 @@ async fn integrate_chain_impl(
                     )));
                 let _ = append_lane_log_line(roadmap_dir, &entry);
                 let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                // `EN.15.G` task 2: the BAIL path — a bail that leaves no escalation and
+                // no `bails[]` entry is precisely the trail-less behaviour this block
+                // exists to end. See `record_bail_escalation`'s own doc for why every
+                // effect here is best-effort.
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    step_lane,
+                    "orchestration-step",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &integrate_err.to_string(),
+                );
                 // `EN.12.D` task 4: no child `ctx` exists for a step whose
                 // `execute_step` call itself failed — the row keys on a
                 // fresh id, same as the pre-dispatch decision points above.

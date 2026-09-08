@@ -29,6 +29,7 @@ mod content_pipeline_materialize_e2e;
 mod coord_chain;
 mod coord_parity;
 mod corpus_gates_parity;
+mod escalate;
 mod evals_slice;
 mod fan_out_aggregate;
 mod gate_timeout_fixture;

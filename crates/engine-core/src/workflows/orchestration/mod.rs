@@ -67,6 +67,13 @@
 //!   `coord::write` seam (`EN.15.C`). [`integrate`]'s
 //!   `integrate_chain_impl` calls it at the block boundaries; with no
 //!   handle at all (`coord: None`), the loop behaves exactly as before.
+//! - [`escalate`] (`EN.15.G` Task 1) — composition of a schema-valid
+//!   `escalations.jsonl` line: all eleven fields the base-template
+//!   `escalation.schema.json` requires, a `verified_by` whose prose is
+//!   refused at composition time (not merely by the checker later), and a
+//!   four-`option` `notification` record made structurally unrepresentable
+//!   rather than rejected at runtime. [`integrate`] (Task 2) calls it on
+//!   the bail and hold paths.
 
 pub mod chain;
 pub mod checkpoint;
@@ -76,6 +83,7 @@ pub mod corpus_gates;
 pub mod debrief;
 pub mod dispatch;
 pub mod engine_kind;
+pub mod escalate;
 pub mod execute;
 pub mod gates;
 pub mod graph;
