@@ -124,6 +124,7 @@ table is a reader's copy.
 |---|---|---|
 | `CLAIM_REAFFIRM` | Re-checks every stale distilled D35 claim (`knowledge.md`/`memory.md`) against fresh corpus evidence via a queue-drain loop, and writes one reviewable markdown proposal report — never a write-back. | [claim-reaffirm.md](claim-reaffirm.md) |
 | `SWEEP` | The roadmap-status sweep, ported field-for-field from `scripts/roadmap_sweep.py`: snapshots fleet state, diffs it against the last sweep, and routes what changed (notify, wake a lane, or nothing) under a permission profile. Dispatchable, not scheduled — the Python script stays the oracle. | [sweep.md](sweep.md) |
+| `COMMANDER` | Ports `/orchestration-commander`'s drain loop: discovers every lane's inbox under the fleet lock dir (not just the caller's own), routes and completes each message by priority, runs a scoped emit + manifest-only commit, appends a drain-log row that never skips, stamps a heartbeat, then the block's one gated triage step. Dispatchable, not scheduled — `commander_drain.sh` keeps its own cadence. | [commander.md](commander.md) |
 
 ## Where a workflow's prompts live
 

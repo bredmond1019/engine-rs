@@ -1508,12 +1508,35 @@ pub fn register_sweep_with(
     );
 }
 
+/// Register the `COMMANDER` workflow (`engine_core::workflows::commander`, `EN.15.F` task 5):
+/// the drain-as-a-workflow port — discover every lane's inbox under the fleet lock dir, route
+/// by kind and complete with receipts, run the scoped emit + manifest-ONLY commit, append the
+/// drain-log without ever skipping, stamp the heartbeat, then the block's one gated
+/// `ClaudeCodeStep` (`GatedAction::RunDrain`). Neither graph node here takes an injectable
+/// placeholder transport/waker (unlike `SWEEP`), so — mirroring `register_recall`/
+/// `register_terminal_probe`'s shape rather than `register_sweep`'s — there is a single
+/// registration entry point. Registering makes `COMMANDER` dispatchable via
+/// `Dispatcher::dispatch_with_event`; per Fork 4 (this block's `out_of_scope`), it does NOT
+/// schedule it anywhere — `planning/harness.json`'s `schedule.entries` stays `[]`, and
+/// `base-template/scripts/commander_drain.sh` stays and is unmodified (Fork 2).
+pub fn register_commander(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::commander::schema(),
+        Box::new(|_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::commander::registry(),
+                engine_core::workflows::commander::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `SDLC_TASK`, `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `LINKEDIN_POST`, `OPPORTUNITY_SET_STAGE`,
 /// `OPPORTUNITY_ADD_ACTION`, `HARVEST_APPROVE`, `LEAD_INGEST`,
 /// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, `RECALL`, `ORCHESTRATION`,
-/// `DEBRIEF`, `CLAIM_REAFFIRM`, and `SWEEP`; future
+/// `DEBRIEF`, `CLAIM_REAFFIRM`, `SWEEP`, and `COMMANDER`; future
 /// builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
@@ -1563,6 +1586,7 @@ pub fn register_builtin_workflows_with_registry(
     register_debrief(dispatcher);
     register_claim_reaffirm(dispatcher);
     register_sweep(dispatcher);
+    register_commander(dispatcher);
 }
 
 #[cfg(test)]
@@ -3193,6 +3217,7 @@ mod tests {
             "DEBRIEF",
             "CLAIM_REAFFIRM",
             "SWEEP",
+            "COMMANDER",
         ]
         .to_vec();
         expected.sort_unstable();
@@ -3261,6 +3286,24 @@ mod tests {
         register_builtin_workflows(&mut dispatcher);
 
         assert!(dispatcher.is_registered("SWEEP"));
+    }
+
+    #[test]
+    fn register_commander_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_commander(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("COMMANDER"));
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_commander() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("COMMANDER"));
     }
 
     #[test]
