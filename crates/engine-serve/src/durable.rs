@@ -57,6 +57,7 @@
 use chrono::{DateTime, Utc};
 use engine_contract::{EventsRow, JournalRow, NodeInvocation, TaskContext};
 use engine_core::invocations::read_invocations;
+use engine_core::progress::{NodeProgress, ProgressSink};
 use engine_store::{insert_journal_row, insert_node_invocation, touch, upsert_event};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -73,18 +74,34 @@ pub struct DurableMessage {
     pub snapshot: TaskContext,
 }
 
+/// A single [`NodeProgress`] update tagged with the `run_id` it belongs to —
+/// `NodeProgress` itself (defined in `engine_core::progress`) is run-agnostic
+/// by design (task 1: the seam is a plain per-node concern), but a consumer
+/// of this channel (the durable writer here, and the SSE tee added in a
+/// later task of this block) needs to know which run it is for.
+#[derive(Debug, Clone)]
+pub struct ProgressMessage {
+    pub run_id: Uuid,
+    pub progress: NodeProgress,
+}
+
 /// One item flowing down the durable writer's channel: a run snapshot
 /// (persisted via `engine_store::upsert_event`), a journal row (persisted via
-/// `engine_store::insert_journal_row`, append-only), or a node-invocation row
-/// (persisted via `engine_store::insert_node_invocation`, append-only).
+/// `engine_store::insert_journal_row`, append-only), a node-invocation row
+/// (persisted via `engine_store::insert_node_invocation`, append-only), or a
+/// mid-node progress update (deliberately **not** persisted — advisory and
+/// droppable by design, see `engine_core::progress`; the writer below simply
+/// drains and discards it, same as the pool-absent self-skip).
 /// Widening the channel's payload to this enum — rather than adding a second
 /// or third channel — keeps one writer task and one bridge for every kind of
-/// durable record, and all three inherit the same pool-is-`None` self-skip.
+/// item flowing to it, and every variant inherits the same "never blocks or
+/// fails the caller" discipline.
 #[derive(Debug, Clone)]
 pub enum DurableItem {
     Snapshot(DurableMessage),
     Journal(JournalRow),
     NodeInvocation(NodeInvocation),
+    Progress(ProgressMessage),
 }
 
 /// Cheaply-cloneable handle for sending snapshots (and journal rows) to the
@@ -126,6 +143,21 @@ impl DurableHandle {
     /// the run's authoritative state.
     pub fn send_node_invocation(&self, invocation: NodeInvocation) {
         let _ = self.sender.send(DurableItem::NodeInvocation(invocation));
+    }
+
+    /// Send a mid-node progress update to the background writer, tagged with
+    /// the `run_id` it belongs to. Same swallowed-error contract as
+    /// [`DurableHandle::send`]: a dropped progress send must never fail or
+    /// interrupt the run — progress is advisory by design (see
+    /// `engine_core::progress::ProgressSink`), and this method is itself the
+    /// non-blocking `try_send`-style boundary [`DurableProgressSink::emit`]
+    /// relies on to satisfy `ProgressSink`'s never-block contract: an
+    /// unbounded `mpsc::send` returns immediately (it only ever fails when
+    /// the receiver has been dropped, which this swallows).
+    pub fn send_progress(&self, run_id: Uuid, progress: NodeProgress) {
+        let _ = self
+            .sender
+            .send(DurableItem::Progress(ProgressMessage { run_id, progress }));
     }
 
     /// The Postgres pool this handle was constructed with, if any —
@@ -240,6 +272,15 @@ pub fn spawn_durable_writer(pool: Option<PgPool>) -> DurableHandle {
                         );
                     }
                 }
+                DurableItem::Progress(_message) => {
+                    // Deliberately not persisted: progress is advisory and
+                    // droppable by design (`engine_core::progress`), and
+                    // this block's `out_of_scope` explicitly excludes
+                    // durable/replayable progress. The writer just drains
+                    // and discards it here; the SSE tee that actually
+                    // surfaces it to a consumer is added in a later task of
+                    // this block.
+                }
             }
         }
     });
@@ -287,6 +328,41 @@ pub fn durable_on_progress(
             }
             sent = invocations.len();
         }
+    }
+}
+
+/// The live `engine_core::progress::ProgressSink` implementation
+/// (`EN.ticket.node-progress-sink` task 2): forwards every [`NodeProgress`]
+/// a node emits into the same `mpsc` channel [`durable_on_progress`] already
+/// feeds, tagged with the `run_id` it belongs to.
+///
+/// No `TaskContext` is cloned or touched anywhere on this path — the
+/// payload is the typed `NodeProgress` only, per the block's design
+/// (`DurableHandle::send_progress` takes `NodeProgress` by value and the
+/// struct below holds nothing but the handle and the run id).
+///
+/// `emit` never blocks and never fails the caller: it delegates directly to
+/// [`DurableHandle::send_progress`], whose underlying `mpsc::UnboundedSender::send`
+/// returns immediately and only ever errors when the receiver has already
+/// been dropped — an error this sink swallows, matching `ProgressSink`'s
+/// contract that a dropped update must never fail or slow a run.
+#[derive(Clone)]
+pub struct DurableProgressSink {
+    handle: DurableHandle,
+    run_id: Uuid,
+}
+
+impl DurableProgressSink {
+    /// Build a sink that forwards every emitted [`NodeProgress`] for
+    /// `run_id` into `handle`'s channel.
+    pub fn new(handle: DurableHandle, run_id: Uuid) -> Self {
+        Self { handle, run_id }
+    }
+}
+
+impl ProgressSink for DurableProgressSink {
+    fn emit(&self, update: NodeProgress) {
+        self.handle.send_progress(self.run_id, update);
     }
 }
 
@@ -463,6 +539,48 @@ mod tests {
         assert_eq!(received.workflow_type, "fixture");
         assert_eq!(received.data, serde_json::json!({ "k": "v" }));
         assert_eq!(received.snapshot, snapshot);
+    }
+
+    /// Mirrors `durable_on_progress_forwards_snapshots_to_the_handle`: build
+    /// the live sink, emit, and read the item off the receiving end of the
+    /// channel — asserting it arrives as `DurableItem::Progress`, tagged
+    /// with the right `run_id`, carrying the `NodeProgress` unchanged and no
+    /// `TaskContext` anywhere in the payload.
+    #[test]
+    fn durable_progress_sink_forwards_updates_to_the_handle() {
+        let (handle, mut receiver) = test_handle();
+        let run_id = Uuid::new_v4();
+        let sink = DurableProgressSink::new(handle, run_id);
+
+        let update = NodeProgress::new("capture", 3, 7).with_label("query 3");
+        sink.emit(update.clone());
+
+        let received = receiver.try_recv().expect("a message should be queued");
+        let DurableItem::Progress(received) = received else {
+            panic!("expected a Progress item from DurableProgressSink");
+        };
+        assert_eq!(received.run_id, run_id);
+        assert_eq!(received.progress, update);
+    }
+
+    /// `durable_on_progress`'s existing behavior (and its own test above,
+    /// `durable_on_progress_forwards_snapshots_to_the_handle`) is unchanged
+    /// by this task: it still forwards only `Snapshot`/`NodeInvocation`
+    /// items and knows nothing about `DurableProgressSink` or `Progress`
+    /// items — the two seams are additive, not entangled.
+    #[test]
+    fn durable_on_progress_still_only_emits_snapshot_and_invocation_items() {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<DurableItem>();
+        let handle = DurableHandle { sender, pool: None };
+        let run_id = Uuid::new_v4();
+
+        let mut on_progress =
+            durable_on_progress(handle, run_id, "fixture".to_string(), serde_json::json!({}));
+        on_progress(&all_pending_snapshot(&["MarkerNode"]));
+
+        let received = receiver.try_recv().expect("a message should be queued");
+        assert!(matches!(received, DurableItem::Snapshot(_)));
+        assert!(receiver.try_recv().is_err(), "no extra items expected");
     }
 
     fn sample_journal_row(run_id: Uuid) -> JournalRow {
