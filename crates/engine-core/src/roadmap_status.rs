@@ -619,12 +619,120 @@ pub struct BlockActivity {
     pub sdlc_state: Option<SdlcState>,
 }
 
-/// A repo lease/queue view for one lane, joined from [`crate::coord`]'s already-shipped
-/// registry/lease reader rather than a second implementation.
+/// Unread (`inbox/`) depth and staleness for one repo x lane queue under
+/// `<lock_dir>/queue/<repo>/<lane>/`. Field-for-field the Python oracle's own
+/// `discover_queue_state` shape (EN.15.H task 2 parity): a missing queue directory is
+/// `exists: Some(false)` with `inbox_count: None`, never a silent `0`; a repo whose lane name is
+/// unknown (it never appears in `lane-log.jsonl` — it only wrote a run record) is the distinct
+/// "no lane name known" shape carrying `note`, since queue depth cannot even be looked up
+/// without a lane name. This is a SEPARATE reader from [`crate::coord`]'s own message sweep
+/// (which reads a flat `<lock_dir>/queue/inbox/*.json`, the fleet's actual live layout per
+/// `EN.15.A`) — the Python oracle's per-repo/per-lane `<lock_dir>/queue/<repo>/<lane>/inbox/`
+/// layout is what this module's parity test measures against, so this function mirrors THAT
+/// contract rather than reusing `coord`'s reader, which answers a different (and, on the live
+/// fleet tree, the actually-current) question.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MessageQueueState {
-    pub inbox_count: usize,
+    pub queue_dir: Option<PathBuf>,
+    pub exists: Option<bool>,
+    pub inbox_count: Option<usize>,
     pub oldest_unread_sent_at: Option<String>,
+    pub oldest_unread_age_seconds: Option<f64>,
+    pub note: Option<String>,
+}
+
+/// The `note` carried by [`MessageQueueState`] when a repo's lane name could not be resolved
+/// from `lane-log.jsonl` — matches the Python oracle's literal string so a parity test can
+/// compare it directly.
+pub const NO_LANE_NAME_NOTE: &str = "no lane name known for this repo (absent from lane-log.jsonl)";
+
+/// First-seen lane name per repo from raw lane-log entries. The message queue is lane-addressed
+/// (`queue/<repo>/<lane>/`), not merely repo-addressed, and `lane-log.jsonl` is the only one of
+/// the joined artifact families that carries a lane name at all. Mirrors the Python oracle's
+/// `lane_names_by_repo`.
+fn lane_names_by_repo(entries: &[Value]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for e in entries {
+        let (Some(repo), Some(lane)) = (
+            e.get("repo").and_then(|v| v.as_str()),
+            e.get("lane").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        out.entry(repo.to_string())
+            .or_insert_with(|| lane.to_string());
+    }
+    out
+}
+
+/// Unread (`inbox/`) depth and the age of the oldest unread item for one repo x lane queue.
+/// Mirrors the Python oracle's `discover_queue_state` exactly, including the rounding
+/// (`round(total_seconds, 1)`) so the two never disagree on a rounding boundary.
+pub fn discover_queue_state(
+    lock_dir: &Path,
+    repo: &str,
+    lane: &str,
+    now: DateTime<Utc>,
+) -> MessageQueueState {
+    let queue_dir = lock_dir.join("queue").join(repo).join(lane);
+    if !queue_dir.is_dir() {
+        return MessageQueueState {
+            queue_dir: Some(queue_dir),
+            exists: Some(false),
+            inbox_count: None,
+            oldest_unread_sent_at: None,
+            oldest_unread_age_seconds: None,
+            note: None,
+        };
+    }
+    let inbox_dir = queue_dir.join("inbox");
+    let mut files: Vec<PathBuf> = if inbox_dir.is_dir() {
+        fs::read_dir(&inbox_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    files.sort();
+
+    let mut oldest_sent_at: Option<String> = None;
+    let mut oldest_dt: Option<DateTime<Utc>> = None;
+    for file in &files {
+        let Ok(text) = fs::read_to_string(file) else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(sent_at) = data.get("sent_at").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(dt) = parse_iso(sent_at) else {
+            continue;
+        };
+        let is_older = oldest_dt.map(|cur| dt < cur).unwrap_or(true);
+        if is_older {
+            oldest_dt = Some(dt);
+            oldest_sent_at = Some(sent_at.to_string());
+        }
+    }
+    let oldest_age = oldest_dt.map(|dt| {
+        let secs = (now - dt).num_milliseconds() as f64 / 1000.0;
+        (secs * 10.0).round() / 10.0
+    });
+
+    MessageQueueState {
+        queue_dir: Some(queue_dir),
+        exists: Some(true),
+        inbox_count: Some(files.len()),
+        oldest_unread_sent_at: oldest_sent_at,
+        oldest_unread_age_seconds: oldest_age,
+        note: None,
+    }
 }
 
 /// The full per-repo view: everything `/roadmap-status` reports about one lane.
@@ -640,6 +748,46 @@ pub struct LaneResult {
     pub message_queue: MessageQueueState,
 }
 
+/// The literal caveat string the Python oracle attaches to `operator_coverage_total` — kept
+/// verbatim so a parity test can compare it directly rather than paraphrase it.
+pub const COVERAGE_CAVEAT: &str = "gates recorded only in roadmap prose tables (e.g. planning/operator-surface/roadmap.md) are invisible to this graph-only read";
+
+/// One corpus-wide `bastion validate-brain --state <root>` invocation, run ONCE per sweep (never
+/// per lane — see the Python oracle's own doc comment on `run_validate_brain`: the binary always
+/// validates the whole corpus regardless of the path given, so a per-repo field would be a false
+/// green for every repo but one). A direct `Command::output()` (no shell, no pipe) so
+/// `exit_code` is the binary's own exit code, never a pipe's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidateBrainResult {
+    pub cmd: String,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+}
+
+/// Run `bastion validate-brain --state <root>` once for the whole sweep. A missing `bastion`
+/// binary (or any other spawn failure) is reported via `error` with `exit_code: None`, never a
+/// panic — mirrors the Python oracle's own `except (OSError, FileNotFoundError)` branch.
+pub fn run_validate_brain(root: &Path) -> ValidateBrainResult {
+    let cmd = format!("bastion validate-brain --state {}", root.display());
+    match std::process::Command::new("bastion")
+        .arg("validate-brain")
+        .arg("--state")
+        .arg(root)
+        .output()
+    {
+        Ok(output) => ValidateBrainResult {
+            cmd,
+            exit_code: output.status.code(),
+            error: None,
+        },
+        Err(e) => ValidateBrainResult {
+            cmd,
+            exit_code: None,
+            error: Some(format!("could not invoke: {e}")),
+        },
+    }
+}
+
 /// The full join for one roadmap. Writes nothing, ever. Empty sections are represented
 /// explicitly (empty list/map), never omitted — a roadmap with zero lane-log lines resolves
 /// cleanly with `lanes` empty rather than erroring, the same way an empty run is a legitimate
@@ -652,6 +800,8 @@ pub struct RoadmapStatusResult {
     pub repos_in_lane_log: Vec<String>,
     pub repos_with_run_record_only: Vec<String>,
     pub operator_coverage_total: usize,
+    pub coverage_caveat: String,
+    pub validate_brain: ValidateBrainResult,
     /// The one deliberate divergence from the Python oracle: a truncated `lane-log.jsonl` line
     /// reported with its byte offset, never silently skipped.
     pub malformed_lines: Vec<MalformedLaneLogLine>,
@@ -788,22 +938,32 @@ pub fn discover_at(
             lane.leases.push(entry.clone());
         }
     }
-    for entry in &coordination.messages {
-        let Some(message) = entry.message.typed() else {
-            continue;
+    // Message-queue depth: per-repo/per-lane, field-for-field the Python oracle's
+    // `discover_queue_state` shape — see [`MessageQueueState`]'s doc comment for why this is a
+    // separate reader from `coordination.messages` above rather than a second use of it.
+    let lock_dir = coord::resolve_lock_dir(root);
+    let lane_names = lane_names_by_repo(&lane_entries);
+    let lane_repos: Vec<String> = lanes.keys().cloned().collect();
+    for repo in lane_repos {
+        let mq = match lane_names.get(&repo) {
+            Some(lane) => discover_queue_state(&lock_dir, &repo, lane, now),
+            None => MessageQueueState {
+                queue_dir: None,
+                exists: None,
+                inbox_count: None,
+                oldest_unread_sent_at: None,
+                oldest_unread_age_seconds: None,
+                note: Some(NO_LANE_NAME_NOTE.to_string()),
+            },
         };
-        if let Some(lane) = lanes.get_mut(&message.subject.repo) {
-            lane.message_queue.inbox_count += 1;
-            let is_older = lane
-                .message_queue
-                .oldest_unread_sent_at
-                .as_deref()
-                .is_none_or(|existing| message.sent_at.as_str() < existing);
-            if is_older {
-                lane.message_queue.oldest_unread_sent_at = Some(message.sent_at.clone());
-            }
+        if let Some(lane_result) = lanes.get_mut(&repo) {
+            lane_result.message_queue = mq;
         }
     }
+
+    // One corpus-wide `validate-brain` call per sweep, reported once at the top level — never
+    // per lane. See [`run_validate_brain`]'s doc comment for why a per-repo join cannot work.
+    let validate_brain = run_validate_brain(root);
 
     Ok(RoadmapStatusResult {
         roadmap: roadmap_slug.to_string(),
@@ -812,6 +972,8 @@ pub fn discover_at(
         repos_in_lane_log: repos_in_log,
         repos_with_run_record_only,
         operator_coverage_total: coverage_total,
+        coverage_caveat: COVERAGE_CAVEAT.to_string(),
+        validate_brain,
         malformed_lines,
     })
 }
