@@ -296,6 +296,26 @@ mod tests {
                 &["resolve_depends_on", "is_edge_met", "is_block_open"],
             ),
             ("engine_kind.rs", &["from_sdlc_workflow"]),
+            // Scan-list drift fix (`EN.15.G` Task 4): `escalate.rs` landed in Task 1 without
+            // this guard's allowlist being updated, which is exactly the drift this test
+            // exists to catch. Its string-taking `pub fn`s are all identifier-shaped builder
+            // args (`VerifiedBy::new`, `EscalationChannel::session`, `EscalationOption::new`,
+            // `VerifiedBy::as_str`) — evidence/slug/option-label composition, never a
+            // runner-name escape hatch.
+            (
+                "escalate.rs",
+                &[
+                    "new",
+                    "session",
+                    "as_str",
+                    "as_wire_str",
+                    "kind",
+                    "channel",
+                    "repo",
+                    "classify",
+                    "failing_artifact",
+                ],
+            ),
             // `workflow_key` reads `ChainStep::block_id` back out as the `Dispatcher`
             // registry key a `dispatch` step names — a struct-field accessor over an
             // already-parsed `ChainStep`, not a string-typed runner-selection entry
