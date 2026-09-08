@@ -180,7 +180,19 @@ engine-rs/
 │   │                         missing lock dir/subdirectory is a legitimate empty-fleet `Live`
 │   │                         state; fleet-concurrency slots are found by non-recursive listing at
 │   │                         the lock-dir root only, so a decoy subdirectory can never be read as
-│   │                         a slot)
+│   │                         a slot), roadmap_status.rs (`EN.15.H` — a typed `LaneResult` join
+│   │                         reproducing base-template's Python `roadmap_status_discovery.py`
+│   │                         oracle in Rust: `lane-log.jsonl`, per-repo `orchestration-run`
+│   │                         records, per-spec `sdlc/sdlc-*state.json` liveness, each repo's
+│   │                         `state.json` operator gates/carryover, and `crate::coord`'s
+│   │                         registry/leases/message-queue depth, deduped by cached-parent
+│   │                         `realpath` and reporting a malformed lane-log line by byte offset;
+│   │                         task 2 extended the result with `validate_brain` (a real `bastion
+│   │                         validate-brain --state <root>` subprocess call), a `coverage_caveat`
+│   │                         string, and a dedicated `discover_queue_state()` mirroring the
+│   │                         Python's nested `<lock_dir>/queue/<repo>/<lane>/` layout — kept
+│   │                         separate from `crate::coord`'s own flat queue/inbox reader, since the
+│   │                         two answer different questions by design)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -861,7 +873,13 @@ block.
   /api/coordination` (`EN.15.A`) is ungated like `GET /workflows` and always returns `200` with
   `engine_core::coord::read_coordination_view`'s joined fleet-coordination JSON — a degraded read
   (a malformed lock-tree record) still comes back `200` with `status: "degraded"` and named
-  `degradation_reasons`; only `resolve_brain_root()` erroring returns `5xx`. `GET /campaigns/{id}`
+  `degradation_reasons`; only `resolve_brain_root()` erroring returns `5xx`. `GET
+  /api/roadmaps/{slug}/status` (`EN.15.H`) is likewise unauthenticated and mirrors
+  `/api/coordination`'s shape: it always returns `200` with
+  `engine_core::roadmap_status`'s joined `LaneResult` JSON for that roadmap slug — lane-log
+  liveness, per-repo operator gates/carryover, `validate_brain`, and `coverage_caveat` — a Rust
+  parity port of base-template's Python `roadmap_status_discovery.py` oracle, verified field-for-
+  field against it in `crates/engine-core/tests/it/roadmap_status.rs`. `GET /campaigns/{id}`
   (`EN.11.E`) is the same X-API-Key gate over `LiveStateStore::list_campaign_runs`: `200
   {campaign_id, runs: [...], total_cost_usd, total_tokens, possibly_truncated}` for a known
   campaign, `404` for both an unknown campaign id and a malformed/non-UUID path segment. The
