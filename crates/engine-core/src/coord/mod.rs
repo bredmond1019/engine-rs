@@ -5,9 +5,10 @@
 //! frontmatter). This module is the ONE reader that joins them, using `okf-core`'s already-
 //! shipped types (`okf_core::coord::*`, from `OK.6.A`) — it defines no record shape of its own.
 //!
-//! **Strictly read-only.** This module opens files and never writes one; the write path
-//! belongs to `EN.15.C`. `crates/engine-serve/src/coordination.rs` (`EN.15.A` task 3) is the
-//! only consumer that turns this into an HTTP response.
+//! **This top-level module is strictly read-only** — the functions declared directly here open
+//! files and never write one. The write path lives in the sibling [`write`] submodule
+//! (`EN.15.C`). `crates/engine-serve/src/coordination.rs` (`EN.15.A` task 3) is the only
+//! consumer that turns this reader into an HTTP response.
 //!
 //! ## On-disk layout (verified against the live tree 2026-09-08 — see the OK.6.A/EN.15.A block
 //! records; do not re-derive this from first principles)
@@ -55,6 +56,10 @@ use okf_core::{
     Coord, Escalation, HeartbeatRecord, HeartbeatValue, Lease, LeaseRecord, Message, Registry,
     RegistryClaim, Slot, SlotRecord,
 };
+
+/// The write side — `EN.15.C`. Sibling to this read-only reader: one seam every coordination
+/// write goes through (schema-validate, stamp `host`, snapshot to `.prev/`, then write).
+pub mod write;
 
 /// The env var honoured as the first-precedence lock-dir override, mirroring
 /// `base-template/scripts/fleet_concurrency_check.py`'s `--lock-dir` / `FLEET_LOCK_DIR`.
