@@ -26,12 +26,37 @@
 //! fresh one-shot channel pre-loaded with the cached terminal frame — one
 //! `Ok` frame, then `Closed` — rather than a channel nobody will ever publish
 //! to again.
+//!
+//! **NodeProgress, a second, distinct event shape (`EN.ticket.node-progress-sink`
+//! task 3).** [`StreamFrame`] carries a `TaskContext` snapshot at a node
+//! *boundary*; `engine_core::progress::NodeProgress` is a small typed
+//! mid-node update a node reports as it completes each unit of its own work
+//! (task 1/2 of the same block; not yet adopted by any node — see the
+//! block's `out_of_scope`). The two are never conflated into one payload
+//! shape: a progress update is carried as its own [`ProgressFrame`], on its
+//! own per-run broadcast channel (registered in [`Registry`], alongside —
+//! not instead of — the state channel), and encoded on the wire as its own
+//! SSE `event: progress` frame — a state frame carries no `event:` line at
+//! all (its wire shape is unchanged from before this task, since an
+//! existing consumer test parses it by stripping a literal `data: `
+//! prefix), which is the SSE spec's default event type `message`. A
+//! consumer tells the two apart by that `event:` type alone (`progress` vs.
+//! the implicit `message`), never by guessing from payload contents.
+//! [`stream_event`] tees both channels into one response via
+//! [`futures::stream::select`]. Progress is advisory and droppable by design
+//! (`engine_core::progress`): unlike the state channel, there is no terminal
+//! cache for it — [`subscribe_progress`] gives a reconnecting or
+//! late-connecting client an already-closed channel instead of any
+//! backfill, and the run's progress sender is retired at the same terminal
+//! transitions ([`publish_terminal`], [`publish_suspended`]) that retire the
+//! state sender.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{OnceLock, RwLock};
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use engine_contract::TaskContext;
+use engine_core::progress::NodeProgress;
 use futures::stream;
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -59,6 +84,34 @@ pub struct StreamFrame {
     pub terminal: bool,
 }
 
+/// One mid-node progress frame: the run's `event_id` plus the reporting
+/// node's identity and `done`/`total` counts (and optional `label`), lifted
+/// straight from `engine_core::progress::NodeProgress`. Deliberately a
+/// distinct type from [`StreamFrame`] rather than an optional field on it —
+/// a progress update never carries a `TaskContext`, and a consumer must be
+/// able to tell the two apart from the SSE `event:` type alone, without
+/// inspecting payload shape (see [`encode_progress_sse`] / [`encode_sse`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProgressFrame {
+    pub event_id: Uuid,
+    pub node: String,
+    pub done: usize,
+    pub total: usize,
+    pub label: Option<String>,
+}
+
+impl ProgressFrame {
+    fn from_update(event_id: Uuid, update: &NodeProgress) -> Self {
+        Self {
+            event_id,
+            node: update.node.clone(),
+            done: update.done,
+            total: update.total,
+            label: update.label.clone(),
+        }
+    }
+}
+
 /// Registry of live per-run senders, plus a side cache of the single last
 /// (terminal) frame for runs that have already finished — both behind
 /// **one** lock. `subscribe`'s "is this run terminal, or should I get/create
@@ -73,6 +126,11 @@ pub struct StreamFrame {
 struct Registry {
     live: StdHashMap<RunId, broadcast::Sender<StreamFrame>>,
     terminal: TerminalCache,
+    /// Per-run progress senders (task 3). No terminal cache here — progress
+    /// is advisory and deliberately not replayed to a late subscriber (see
+    /// [`subscribe_progress`]) — so this is just a live map, retired at the
+    /// same terminal transitions that retire `live`.
+    progress: StdHashMap<RunId, broadcast::Sender<ProgressFrame>>,
 }
 
 /// Bounded FIFO cache of terminal frames, mirroring
@@ -108,6 +166,7 @@ fn registry() -> &'static RwLock<Registry> {
         RwLock::new(Registry {
             live: StdHashMap::new(),
             terminal: TerminalCache::default(),
+            progress: StdHashMap::new(),
         })
     })
 }
@@ -175,6 +234,11 @@ pub fn publish_terminal(run_id: RunId, final_context: &TaskContext) {
     }
     guard.terminal.insert(run_id, frame);
     guard.live.remove(&run_id);
+    // Retire the progress sender at the same transition: no further
+    // NodeProgress for a finished run, and this is what lets a
+    // `subscribe_progress` call racing this one observe either "live" or
+    // "gone", never a channel nobody will ever publish to again.
+    guard.progress.remove(&run_id);
 }
 
 /// Publish a `status: "suspended"`, `terminal: true` frame and retire the
@@ -198,6 +262,7 @@ pub fn publish_suspended(run_id: RunId, snapshot: &TaskContext) {
     }
     guard.terminal.insert(run_id, frame);
     guard.live.remove(&run_id);
+    guard.progress.remove(&run_id);
 }
 
 /// Drop `run_id`'s cached terminal frame (and any retired sender) so a
@@ -248,6 +313,70 @@ pub fn subscribe(run_id: RunId) -> broadcast::Receiver<StreamFrame> {
         .subscribe()
 }
 
+/// Get-or-create the live progress sender for `run_id`. Mirrors
+/// [`sender_for`] exactly — same lazy get-or-create shape, same "a stray
+/// send after the run has already gone terminal just re-mints an entry
+/// nobody retires" acceptance that the state channel's `sender_for`/`publish`
+/// pair already lives with (task 3 does not change that convention, only
+/// adds a second channel following it).
+fn progress_sender_for(run_id: RunId) -> broadcast::Sender<ProgressFrame> {
+    {
+        let guard = registry()
+            .read()
+            .expect("stream registry lock poisoned on read");
+        if let Some(sender) = guard.progress.get(&run_id) {
+            return sender.clone();
+        }
+    }
+    let mut guard = registry()
+        .write()
+        .expect("stream registry lock poisoned on write");
+    guard
+        .progress
+        .entry(run_id)
+        .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+        .clone()
+}
+
+/// Publish one [`NodeProgress`] update for `run_id`. A send with no active
+/// subscribers is a no-op, exactly like [`publish`] — the tee must never
+/// treat "nobody is listening right now" as a failure the caller has to
+/// handle.
+pub fn publish_progress(run_id: RunId, update: &NodeProgress) {
+    let sender = progress_sender_for(run_id);
+    let _ = sender.send(ProgressFrame::from_update(run_id, update));
+}
+
+/// Subscribe to `run_id`'s progress tee. Unlike [`subscribe`], there is
+/// nothing to replay: progress is advisory and droppable by design, so a
+/// client that connects after the run has already gone terminal gets an
+/// **already-closed** channel (zero senders) rather than a live one nobody
+/// will ever publish to again, and never a backfill of updates it missed
+/// while it was away.
+///
+/// Takes the write lock unconditionally, mirroring [`subscribe`]'s own
+/// atomicity argument: this check-then-act must be atomic relative to
+/// [`publish_terminal`]'s/[`publish_suspended`]'s single-lock retirement of
+/// `guard.progress`, or a subscribe landing in that window could mint a
+/// fresh live entry immediately after the run retired it.
+pub fn subscribe_progress(run_id: RunId) -> broadcast::Receiver<ProgressFrame> {
+    let mut guard = registry()
+        .write()
+        .expect("stream registry lock poisoned on write");
+
+    if guard.terminal.entries.contains_key(&run_id) {
+        let (one_shot, receiver) = broadcast::channel(1);
+        drop(one_shot);
+        return receiver;
+    }
+
+    guard
+        .progress
+        .entry(run_id)
+        .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+        .subscribe()
+}
+
 /// Pull the next frame off `receiver`, transparently skipping past a
 /// [`broadcast::error::RecvError::Lagged`] gap rather than panicking or
 /// treating it as end-of-stream — a slow SSE client falls behind, not the
@@ -262,10 +391,42 @@ async fn recv_next(receiver: &mut broadcast::Receiver<StreamFrame>) -> Option<St
     }
 }
 
-/// Encode one [`StreamFrame`] as a single SSE `data:` event.
+/// [`recv_next`]'s counterpart for the progress channel.
+async fn recv_next_progress(
+    receiver: &mut broadcast::Receiver<ProgressFrame>,
+) -> Option<ProgressFrame> {
+    loop {
+        match receiver.recv().await {
+            Ok(frame) => return Some(frame),
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
+/// Encode one [`StreamFrame`] as a single SSE `data:` event — byte-identical
+/// to this function's shape before task 3 (no explicit `event:` line, so it
+/// carries the SSE default event type `message`). Existing consumers
+/// (`crates/engine-serve/tests/async_lifecycle.rs`'s
+/// `stream_delivers_one_frame_per_node_transition_then_a_terminal_frame`
+/// strips a literal `"data: "` prefix off every frame) depend on this shape
+/// staying exactly as it was — see [`encode_progress_sse`] for how the two
+/// event shapes are still distinguished.
 fn encode_sse(frame: &StreamFrame) -> web::Bytes {
     let payload = serde_json::to_string(frame).unwrap_or_else(|_| "{}".to_string());
     web::Bytes::from(format!("data: {payload}\n\n"))
+}
+
+/// Encode one [`ProgressFrame`] as a single SSE event, typed `event:
+/// progress` — the explicit type is what makes it distinguishable from a
+/// [`StreamFrame`] (which carries no `event:` line, so it is the SSE
+/// default type `message`) by event type alone, without a consumer ever
+/// needing to inspect payload contents. Never a `TaskContext` — see the
+/// module's NodeProgress doc section for why the two payload shapes are
+/// kept distinct.
+fn encode_progress_sse(frame: &ProgressFrame) -> web::Bytes {
+    let payload = serde_json::to_string(frame).unwrap_or_else(|_| "{}".to_string());
+    web::Bytes::from(format!("event: progress\ndata: {payload}\n\n"))
 }
 
 /// `GET /events/{event_id}/stream` — the SSE progress stream. `X-API-Key`
@@ -310,11 +471,30 @@ pub async fn stream_event(
     }
 
     let receiver = subscribe(event_id);
-    let body = stream::unfold(receiver, |mut receiver| async move {
+    let state_stream = stream::unfold(receiver, |mut receiver| async move {
         recv_next(&mut receiver)
             .await
             .map(|frame| (Ok::<_, actix_web::Error>(encode_sse(&frame)), receiver))
     });
+
+    // Tee the progress channel in alongside the state channel: two distinct
+    // SSE event types on the one connection (see the module's NodeProgress
+    // doc section). `subscribe_progress` retires with the run exactly when
+    // `subscribe`'s state channel does (both cleared under one write lock in
+    // `publish_terminal`/`publish_suspended`), so `select` below completes
+    // once both sides have closed rather than hanging on a progress channel
+    // nobody will ever publish to again.
+    let progress_receiver = subscribe_progress(event_id);
+    let progress_stream = stream::unfold(progress_receiver, |mut receiver| async move {
+        recv_next_progress(&mut receiver).await.map(|frame| {
+            (
+                Ok::<_, actix_web::Error>(encode_progress_sse(&frame)),
+                receiver,
+            )
+        })
+    });
+
+    let body = stream::select(state_stream, progress_stream);
 
     HttpResponse::Ok()
         .content_type("text/event-stream")
@@ -539,5 +719,126 @@ mod tests {
         // receivers) must be swallowed, not propagated as a panic.
         publish(run_id, &fixture_context("nobody listening"));
         publish_terminal(run_id, &fixture_context("nobody listening"));
+    }
+
+    // --- Task 3: NodeProgress as a distinct SSE event type ------------
+
+    fn fixture_progress(node: &str, done: usize, total: usize) -> NodeProgress {
+        NodeProgress::new(node, done, total)
+    }
+
+    #[test]
+    fn state_and_progress_frames_are_distinguishable_by_event_type_alone() {
+        // The acceptance criterion is literal: a consumer must be able to
+        // tell the two SSE event shapes apart by their `event:` type, never
+        // by inspecting or guessing from the `data:` payload. `encode_sse`
+        // (state) carries no `event:` line at all — it must stay
+        // byte-identical to its pre-task-3 shape, since an existing
+        // consumer (`async_lifecycle.rs`) strips a literal `"data: "`
+        // prefix off every frame — so its SSE event type is the spec
+        // default, `message`. `encode_progress_sse` carries an explicit
+        // `event: progress` line. A consumer distinguishes the two by
+        // whether an `event:` line is present/what it names, never by
+        // parsing the JSON payload.
+        let state_frame = StreamFrame {
+            event_id: Uuid::new_v4(),
+            status: "running".to_string(),
+            task_context: fixture_context("marker"),
+            terminal: false,
+        };
+        let progress_frame = ProgressFrame {
+            event_id: Uuid::new_v4(),
+            node: "capture".to_string(),
+            done: 3,
+            total: 7,
+            label: None,
+        };
+
+        let state_bytes = encode_sse(&state_frame);
+        let progress_bytes = encode_progress_sse(&progress_frame);
+        let state_text = String::from_utf8(state_bytes.to_vec()).expect("utf8");
+        let progress_text = String::from_utf8(progress_bytes.to_vec()).expect("utf8");
+
+        assert!(
+            !state_text.contains("event:"),
+            "state frames carry no event: line (default SSE type `message`), got: {state_text}"
+        );
+        assert!(
+            progress_text.starts_with("event: progress\n"),
+            "got: {progress_text}"
+        );
+        assert_ne!(state_text, progress_text);
+
+        // The progress payload never carries a `task_context` key — a
+        // consumer distinguishing by event type never needs to check this,
+        // but it also rules out a payload-shape ambiguity between the two.
+        assert!(!progress_text.contains("task_context"));
+    }
+
+    #[tokio::test]
+    async fn publish_progress_delivers_records_in_order_to_a_subscriber() {
+        let run_id = Uuid::new_v4();
+        let mut receiver = subscribe_progress(run_id);
+
+        publish_progress(run_id, &fixture_progress("capture", 1, 7));
+        publish_progress(run_id, &fixture_progress("capture", 2, 7));
+
+        let first = recv_next_progress(&mut receiver).await.expect("frame 1");
+        assert_eq!(first.event_id, run_id);
+        assert_eq!(first.node, "capture");
+        assert_eq!(first.done, 1);
+        assert_eq!(first.total, 7);
+
+        let second = recv_next_progress(&mut receiver).await.expect("frame 2");
+        assert_eq!(second.done, 2);
+    }
+
+    #[tokio::test]
+    async fn progress_publish_with_no_subscribers_does_not_panic() {
+        let run_id = Uuid::new_v4();
+        publish_progress(run_id, &fixture_progress("capture", 1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_reconnecting_client_after_terminal_gets_no_progress_backfill() {
+        let run_id = Uuid::new_v4();
+        let mut receiver = subscribe_progress(run_id);
+        publish_progress(run_id, &fixture_progress("capture", 1, 2));
+        publish_terminal(run_id, &fixture_context("done"));
+
+        // The one update published before the run finished still reaches an
+        // already-connected subscriber (this isn't a "no progress at all"
+        // guarantee, only "no backfill for a NEW subscriber") — drain it.
+        let already_seen = recv_next_progress(&mut receiver)
+            .await
+            .expect("the pre-terminal update should still reach an already-listening subscriber");
+        assert_eq!(already_seen.done, 1);
+
+        // Nothing further follows it — the progress channel closes with the
+        // run rather than delivering a terminal frame of its own.
+        assert!(
+            recv_next_progress(&mut receiver).await.is_none(),
+            "progress channel should close, not deliver a terminal frame"
+        );
+
+        // A client that only connects *after* the run has gone terminal
+        // must not receive the earlier progress update — no backfill.
+        let mut late_receiver = subscribe_progress(run_id);
+        assert!(
+            recv_next_progress(&mut late_receiver).await.is_none(),
+            "late progress subscriber must see an already-closed channel, not a backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_channel_closes_when_run_goes_suspended() {
+        let run_id = Uuid::new_v4();
+        let mut receiver = subscribe_progress(run_id);
+        publish_suspended(run_id, &fixture_context("paused"));
+
+        assert!(
+            recv_next_progress(&mut receiver).await.is_none(),
+            "progress channel should close when the run suspends"
+        );
     }
 }
