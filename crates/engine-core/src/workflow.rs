@@ -248,6 +248,15 @@ impl Workflow {
         self.registry.contains(identity)
     }
 
+    /// Read access to the assembled node registry — lets a dispatch-level
+    /// guard test (`EN.15.B` task 1) confirm a SPECIFIC node this workflow's
+    /// registry factory actually constructed carries a specific
+    /// [`crate::node::Node::agent`] identity, without downcasting the
+    /// trait object or reaching into a private field.
+    pub fn registry(&self) -> &NodeRegistry {
+        &self.registry
+    }
+
     /// `entry().or_insert` only: adds `Pending` entries for schema nodes the
     /// rehydrated `ctx` has never heard of (schema drift between suspend and
     /// resume), and never clobbers an existing `NodeRun` — a resumed run's

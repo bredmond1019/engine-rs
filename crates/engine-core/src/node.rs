@@ -122,6 +122,22 @@ pub trait Node: Send + Sync {
     fn as_router(&self) -> Option<&dyn Router> {
         None
     }
+
+    /// The lane identity this node instance was configured with (e.g. via
+    /// a `with_agent` builder), if any — a trait-level introspection seam
+    /// so a guard test can confirm a SPECIFIC registry constructor actually
+    /// wired an identity into a SPECIFIC node instance it produced, without
+    /// downcasting the `dyn Node` trait object (`EN.15.B` task 1: the
+    /// closed ticket's own tests were thorough and all passed, and still
+    /// missed the bare production `EmitStateNode::new()` call site,
+    /// precisely because each test built its own node instead of
+    /// inspecting what a registry constructor built). Defaults to `None`
+    /// for every node that carries no such identity — the overwhelming
+    /// majority. Never consulted by `process()` or the runner; test-only
+    /// surface.
+    fn agent(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A delegating identity wrapper: overrides `Node::name()` with an owned

@@ -14,6 +14,19 @@ related: [status, context]
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
 
+## [run: 2026-09-08]
+
+### EN.15.B — `CloseBlockNode` closes through the guard as itself (PASS)
+- **What:** Ran `/sdlc-flow` on branch `EN.15.B-flow` through both tasks, PASS review. Task 1 added an optional agent identity to `SDLCFlowEventSchema`, threaded through `registry_for_policy_with_cancellation` into both `EmitStateNode` and `CloseBlockNode` via a new `registry_with_agent` helper and `CloseBlockNode::with_agent`, wired end-to-end from the `engine-serve` dispatch site, plus a trait-level `Node::agent()` introspection seam so guard tests can confirm the production registry (not a hand-built node) threads one identity into both nodes. Task 2 rewired `CloseBlockNode` to close through mev's guarded `set_block_status_as` with the chain's own lane identity instead of the permissive wrapper: a closure attempted under a foreign `scope: repo` lease is refused (surfacing as `CloseOutcome::Unvalidated` with `E_QUIESCE_LEASE_HELD` in the reason string) while a closure under the chain's own lease succeeds; `CloseBlockNode`'s own `.mev-emit.lock` acquisition is explicitly dropped before calling `set_block_status_as`, since that entry point now acquires the same lockfile internally and holding both would self-deadlock. Notable decisions: `close_block_direct` (the ORCHESTRATION integrate-step seam) is unchanged — still `agent: None`/`dir: root`, reproducing its pre-existing unguarded behavior — out of this block's declared `close_block.rs` scope; AC-4 (`W_MEV_UNGUARDED_WRITER` no longer naming engine-rs) is NOT independently verified by a test this run, recorded as a D18 amendment on the block record rather than silently absorbed. Closes `EN.15.B`.
+
+```
+008b6a1 docs: update docs for EN.15.B
+0a7c5f3 feat: implement EN.15.B-task2
+b040046 feat: implement EN.15.B-task1
+```
+
+Next: `EN.15.C` — `coord` write side, with an HTTP face — now unblocked, per `planning/status.md`'s `blocked` frontmatter list.
+
 ## [run: 2026-09-07]
 
 ### EN.15.A — `coord` reader + `GET /api/coordination` (PASS)

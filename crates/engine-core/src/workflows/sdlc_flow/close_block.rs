@@ -13,36 +13,48 @@
 //! own**; mev owns the corpus write, the snapshot, and the restore, and a
 //! second copy of that contract here would drift.
 //!
-//! ## The two CLI-only guards, taken explicitly
+//! ## The two CLI-only guards, taken explicitly (and, as of `EN.15.B` task 2,
+//! ## one of them retired in favour of the library's own)
 //!
-//! Confirmed 2026-08-20 (task 2 of this ticket): `mev::set_block_status` has
-//! neither of the two guards `mev main.rs`'s `set-block-status` CLI command
-//! wraps it in:
+//! Confirmed 2026-08-20 (task 2 of the wrap-up-closes-the-block ticket):
+//! `mev::set_block_status` — the PERMISSIVE wrapper — has neither of the two
+//! guards `mev main.rs`'s `set-block-status` CLI command wraps it in. `mev`
+//! `MV.20.B` moved both guards into the library behind a guarded,
+//! identity-taking counterpart, [`mev::set_block_status_as`], and this node
+//! (`EN.15.B` task 2) now calls THAT instead of the permissive wrapper:
 //!
-//! - **The advisory `.mev-emit.lock`** (`mev::brain::lock::acquire_lock`,
-//!   public) — `set_block_status` chains into `emit_state` on a successful
-//!   write, so racing it against a concurrent `mev emit-state --write`
-//!   regenerates derived views mid-edit. Held for the duration of the write
-//!   here and released on every exit path (`LockGuard`'s `Drop`).
-//! - **The D71 operator gate** (`E_BLOCK_OPERATOR_GATED`) — built in
-//!   `main.rs` on a *private* helper, `block_has_unmet_operator_gate`
-//!   (`main.rs:1319`), so it cannot be called directly from here.
-//!   [`block_has_unmet_operator_gate`] below is a reimplementation against
-//!   only the *public* mev items the private helper itself uses
-//!   (`mev::brain::config::find_brain_config`,
-//!   `mev::brain::state::{discover_state_files, load_state, BlockedBy}`).
-//!   Taken unconditionally here, not only on a transition to `in_progress`
-//!   (the upstream check's literal condition): this node is an autonomous
-//!   caller closing blocks with no human in the loop — exactly what D71
-//!   exists to constrain — and the condition is one string comparison away
-//!   from applying to `"closed"` too.
+//! - **The advisory `.mev-emit.lock`** (`mev::brain::lock::acquire_lock`) —
+//!   [`mev::set_block_status_as`] now acquires this itself, internally, for
+//!   the duration of its own write. This node still takes its OWN advisory
+//!   lock first (`_lock_guard` below) to make the pre-write revision
+//!   snapshot + baseline validate atomic against a concurrent writer, but
+//!   drops it before calling into `set_block_status_as` — holding both at
+//!   once, in the same process, would self-deadlock (the lockfile records
+//!   this process's own pid, so a second `acquire_lock` call from the same
+//!   process finds it "held" by a live pid and only gives up once
+//!   `mev::brain::lock::DEFAULT_LOCK_TIMEOUT` elapses). A `LOCK_HELD`
+//!   outcome from a GENUINELY contended lock is therefore still caught —
+//!   before this node ever reaches the mev call, by the manual acquire
+//!   below.
+//! - **The D71 operator gate** (`E_BLOCK_OPERATOR_GATED`) — `mev`'s own
+//!   internal check only fires for `status == "in_progress"`
+//!   (`set_block_status_refusal`), never `"closed"`, so this node's own
+//!   [`block_has_unmet_operator_gate`] reimplementation below is still the
+//!   only thing gating a close on an unmet operator edge. Taken
+//!   unconditionally here, not only on a transition to `in_progress`: this
+//!   node is an autonomous caller closing blocks with no human in the
+//!   loop — exactly what D71 exists to constrain.
 //!
-//! A guard that exists only in a CLI is not a guard on a library, and this
-//! node is the first in-process caller of `set_block_status`. The durable
-//! fix — moving both guards into the library so no caller can bypass them —
-//! is filed upstream as `mev:MV.ticket.set-block-status-cli-only-guards`
-//! (`core/mev/planning/blocks/MV.ticket.set-block-status-cli-only-guards.json`)
-//! and referenced here rather than duplicated further.
+//! `EN.15.B`'s actual subject is a THIRD guard, new with `MV.20.B`: the
+//! quiesce LEASE (`E_QUIESCE_LEASE_HELD`). [`mev::set_block_status_as`]
+//! takes an `agent` identity and refuses a write that lands inside a
+//! sibling lane's declared exclusive lease — UNLESS the lease is this same
+//! agent's own. This node's `agent` field (task 1) carries that identity;
+//! `None` (the default) behaves like any other unidentified caller: it can
+//! never self-exempt, so it is refused by any live exclusive lease,
+//! including one it might have written itself. Production wiring goes
+//! through `graph.rs`'s `registry_with_agent`, which sets the SAME identity
+//! string on this node and `EmitStateNode`.
 //!
 //! ## Validate-then-rollback on the authored write, composed from mev's own
 //! ## primitives (task 4)
@@ -278,6 +290,17 @@ pub const DEFAULT_STATE_SOURCE: &str = "WrapUpNode";
 pub struct CloseBlockNode {
     lock_timeout: Duration,
     state_source: &'static str,
+    /// Lane identity this node will pass to mev's guarded `set_block_status`
+    /// entry point so its own closure self-exempts a `scope: repo` lease it
+    /// holds, while a lease held by a DIFFERENT agent still refuses it
+    /// (`EN.15.B`). Threaded here in task 1 so `graph.rs`'s registry
+    /// constructors can wire the SAME identity string into this node and
+    /// `EmitStateNode` from one source; task 2 is what makes the node's own
+    /// `mev::set_block_status` call sites actually read this field instead
+    /// of calling the permissive wrapper. `None` (the default) preserves
+    /// today's behavior exactly — this field is inert until task 2 wires it
+    /// into the mev call.
+    agent: Option<String>,
 }
 
 impl CloseBlockNode {
@@ -286,6 +309,7 @@ impl CloseBlockNode {
         Self {
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
             state_source: DEFAULT_STATE_SOURCE,
+            agent: None,
         }
     }
 
@@ -308,6 +332,17 @@ impl CloseBlockNode {
     #[must_use]
     pub fn with_state_source(mut self, source: &'static str) -> Self {
         self.state_source = source;
+        self
+    }
+
+    /// Set the lane identity this node passes to mev's guarded
+    /// `set_block_status_as` entry point (task 2), so this node's own
+    /// closure self-exempts an exclusive lease it holds while a lease held
+    /// by a different agent still refuses it. Leaving this unset keeps
+    /// today's behavior exactly — see the field's own doc comment.
+    #[must_use]
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
         self
     }
 }
@@ -722,8 +757,17 @@ fn classify_report(key: &str, report: &Report) -> CloseOutcome {
 
 /// The guarded close itself: operator gate, then the advisory lock (held
 /// across the write, released via `LockGuard`'s `Drop` on every exit path
-/// below), then `mev::set_block_status(root, key, "closed", true, None)` wrapped
-/// in the validate-then-rollback guard (module doc comment, "task 4").
+/// below), then `mev::set_block_status_as(root, key, "closed", true, None, agent,
+/// None, dir)` wrapped in the validate-then-rollback guard (module doc
+/// comment, "task 4").
+///
+/// `dir` is the repo's own checkout path (matching a `brain.toml` `[[repos]]`
+/// `repo_path` entry) — the same identity `mev`'s own `quiesce_refusal` uses
+/// to resolve which repo's lease governs this write (`EN.15.B` task 2).
+/// `agent` is the lane identity this node was constructed with
+/// ([`CloseBlockNode::with_agent`]); `None` behaves like any other
+/// unidentified caller of the guarded entry point — refused by any live
+/// exclusive lease, never self-exempted.
 ///
 /// Production always calls this through [`attempt_close`], which supplies
 /// real `mev::validate_brain_state` as `validate`. Tests inject a fake
@@ -734,8 +778,10 @@ fn classify_report(key: &str, report: &Report) -> CloseOutcome {
 /// still go through real mev calls and real files, per the testing strategy.
 fn attempt_close_with_validator(
     root: &Path,
+    dir: &Path,
     key: &str,
     repo_slug: &str,
+    agent: Option<&str>,
     lock_timeout: Duration,
     mut validate: impl FnMut(&Path) -> Result<Report, String>,
 ) -> CloseOutcome {
@@ -745,7 +791,7 @@ fn attempt_close_with_validator(
         };
     }
 
-    let _lock_guard = match acquire_lock(root, lock_timeout) {
+    let lock_guard = match acquire_lock(root, lock_timeout) {
         Ok(guard) => guard,
         Err(LockError::Held {
             holder_pid,
@@ -769,11 +815,16 @@ fn attempt_close_with_validator(
 
     // The state.json this close will (or will not) write. `None` means no
     // state.json is registered for this repo slug at all — fall through to
-    // `set_block_status` directly and let its own diagnostics (typically
+    // `set_block_status_as` directly and let its own diagnostics (typically
     // `E_BLOCK_NOT_FOUND`) explain why, rather than failing on our own
     // resolution first.
     let Some(state_path) = resolve_state_path(root, repo_slug) else {
-        return match mev::set_block_status(
+        // Drop our own advisory-lock guard before calling into mev's guarded
+        // entry point — it acquires the SAME `.mev-emit.lock` itself for the
+        // duration of its write, and holding both from this one process
+        // would self-deadlock (see the module doc comment).
+        drop(lock_guard);
+        return match mev::set_block_status_as(
             root, key, "closed", true,
             // `scope: None` — the unscoped, fleet-wide regeneration this call has
             // always performed. mev `MV.14.A` added this parameter; it narrows only
@@ -783,11 +834,11 @@ fn attempt_close_with_validator(
             // this is byte-identical to the pre-MV.14.A behaviour. Passing a real
             // `ScopeDependencySet` is deliberate follow-up work on this side; MV.14.A
             // only makes the flag exist.
-            None,
+            None, agent, None, dir,
         ) {
             Ok(report) => classify_report(key, &report),
             Err(err) => CloseOutcome::Unvalidated {
-                reason: format!("mev::set_block_status errored: {err}"),
+                reason: format!("mev::set_block_status_as errored: {err}"),
             },
         };
     };
@@ -809,7 +860,12 @@ fn attempt_close_with_validator(
         }
     };
 
-    let close_report = match mev::set_block_status(
+    // Drop our own advisory-lock guard before calling into mev's guarded
+    // entry point — see the comment on the early-return branch above for
+    // why holding both at once would self-deadlock.
+    drop(lock_guard);
+
+    let close_report = match mev::set_block_status_as(
         root, key, "closed", true,
         // `scope: None` — the unscoped, fleet-wide regeneration this call has
         // always performed. mev `MV.14.A` added this parameter; it narrows only
@@ -819,12 +875,12 @@ fn attempt_close_with_validator(
         // this is byte-identical to the pre-MV.14.A behaviour. Passing a real
         // `ScopeDependencySet` is deliberate follow-up work on this side; MV.14.A
         // only makes the flag exist.
-        None,
+        None, agent, None, dir,
     ) {
         Ok(report) => report,
         Err(err) => {
             return CloseOutcome::Unvalidated {
-                reason: format!("mev::set_block_status errored: {err}"),
+                reason: format!("mev::set_block_status_as errored: {err}"),
             };
         }
     };
@@ -911,8 +967,16 @@ fn attempt_close_with_validator(
 
 /// Production entry point: [`attempt_close_with_validator`] with real
 /// `mev::validate_brain_state` as the validator.
-fn attempt_close(root: &Path, key: &str, repo_slug: &str, lock_timeout: Duration) -> CloseOutcome {
-    attempt_close_with_validator(root, key, repo_slug, lock_timeout, |root| {
+#[allow(clippy::too_many_arguments)]
+fn attempt_close(
+    root: &Path,
+    dir: &Path,
+    key: &str,
+    repo_slug: &str,
+    agent: Option<&str>,
+    lock_timeout: Duration,
+) -> CloseOutcome {
+    attempt_close_with_validator(root, dir, key, repo_slug, agent, lock_timeout, |root| {
         mev::validate_brain_state(root).map_err(|e| e.to_string())
     })
 }
@@ -936,10 +1000,23 @@ fn attempt_close(root: &Path, key: &str, repo_slug: &str, lock_timeout: Duration
 /// integrated path (see that module's own doc on `close_block`), the same
 /// invariant those skip checks exist to enforce for `SDLC_TASK`/
 /// `SDLC_FLOW`.
+///
+/// No lane identity is threaded through this seam yet — `EN.15.B`'s
+/// identity source is the `SDLC_FLOW`/`SDLC_TASK` event, which orchestration's
+/// integrate step does not carry. Passes `agent: None` and `dir: root`
+/// (there is no separate repo checkout path available here), which
+/// reproduces this call's pre-`EN.15.B` behaviour exactly: an unidentified
+/// caller can never self-exempt a lease, and `dir: root` resolves to no
+/// configured repo slug (`mev::brain::lease::resolve_own_repo` returns
+/// `""` when nothing matches), so a `scope: repo` lease never quiesces it
+/// either — the same unguarded posture this call had before. Threading a
+/// real identity into this seam is out of scope (see the block record's
+/// `out_of_scope`: only `close_block.rs`'s own two call sites are this
+/// task's subject).
 #[must_use]
 pub fn close_block_direct(root: &Path, repo: &str, block_id: &str) -> CloseOutcome {
     let key = format!("{repo}:{block_id}");
-    attempt_close(root, &key, repo, DEFAULT_LOCK_TIMEOUT)
+    attempt_close(root, root, &key, repo, None, DEFAULT_LOCK_TIMEOUT)
 }
 
 impl CloseBlockNode {
@@ -1040,7 +1117,14 @@ impl CloseBlockNode {
 
         let repo = repo_slug(ctx);
         let key = format!("{repo}:{block_id}");
-        attempt_close(&root, &key, &repo, self.lock_timeout)
+        attempt_close(
+            &root,
+            &worktree_path_buf,
+            &key,
+            &repo,
+            self.agent.as_deref(),
+            self.lock_timeout,
+        )
     }
 }
 
@@ -1088,6 +1172,11 @@ impl Node for CloseBlockNode {
 
     fn name(&self) -> &str {
         "CloseBlockNode"
+    }
+
+    /// See `Node::agent`'s doc comment — `EN.15.B` task 1's guard-test seam.
+    fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
     }
 }
 
@@ -1457,6 +1546,24 @@ mod tests {
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "init"]);
         (dir, repo_dir)
+    }
+
+    /// Write one live, `exclusive`, `scope: repo` lease file under
+    /// `<root>/.fleet-locks/leases/` — the on-disk shape
+    /// `mev::brain::lease::check_quiesce` reads (`.claude/workflows/
+    /// lease.schema.json`). `acquired_at` is "now", so the lease is well
+    /// under `mev`'s lease staleness threshold (3h) and is treated as
+    /// live. `EN.15.B` task 2's own real-`.fleet-locks`-tree testing
+    /// strategy: drive the guard through the actual files it reads,
+    /// rather than mocking `mev`.
+    fn write_lease(root: &Path, repo: &str, agent: &str) {
+        let leases_dir = root.join(".fleet-locks").join("leases");
+        std::fs::create_dir_all(&leases_dir).expect("mkdir .fleet-locks/leases");
+        let acquired_at = chrono::Utc::now().to_rfc3339();
+        let raw = format!(
+            r#"{{"repo": "{repo}", "lane": "test-lane", "agent": "{agent}", "acquired_at": "{acquired_at}", "kind": "exclusive", "scope": "repo"}}"#
+        );
+        std::fs::write(leases_dir.join("lease-test.json"), raw).expect("write lease file");
     }
 
     fn ctx_for(
@@ -1975,8 +2082,10 @@ mod tests {
         let call_count = std::cell::Cell::new(0u32);
         let outcome = attempt_close_with_validator(
             &root,
+            &repo_dir,
             "acme:AC.1",
             "acme",
+            None,
             Duration::from_secs(1),
             |_root| {
                 let n = call_count.get();
@@ -2043,8 +2152,10 @@ mod tests {
         // a pre-existingly red corpus must not block the close.
         let outcome = attempt_close_with_validator(
             &root,
+            &repo_dir,
             "acme:AC.1",
             "acme",
+            None,
             Duration::from_secs(1),
             |_root| {
                 Ok(Report {
@@ -2065,5 +2176,131 @@ mod tests {
         let raw =
             std::fs::read_to_string(repo_dir.join("planning").join("state.json")).expect("read");
         assert!(raw.contains("\"closed\""));
+    }
+
+    // --- EN.15.B task 2: closes through mev's guarded `set_block_status_as`,
+    // keyed on lane identity, against a real `.fleet-locks/` tree ---------
+
+    /// A closure attempted under a `scope: repo` lease held by ANOTHER
+    /// agent is refused — the chain HOLDS with the error (an `UNVALIDATED`
+    /// outcome naming `E_QUIESCE_LEASE_HELD`), never a silent close and
+    /// never a `NotFound`-shaped "nothing here" reading. Today's
+    /// permissive-wrapper call was allowed-and-warned for exactly this
+    /// case; this test is the red that behaviour is replaced by.
+    #[tokio::test]
+    async fn close_under_a_foreign_lease_is_refused_and_the_chain_holds() {
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let root = find_brain_root(&repo_dir).expect("brain root resolves");
+        write_lease(&root, "acme", "lane-other-agent");
+
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "done");
+        let node = CloseBlockNode::new().with_agent("lane-mine");
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+
+        let outcome = result["outcome"].as_str().unwrap();
+        assert!(
+            outcome.starts_with("UNVALIDATED:"),
+            "expected UNVALIDATED:..., got {outcome}"
+        );
+        assert!(
+            outcome.contains("E_QUIESCE_LEASE_HELD"),
+            "expected the lease-refusal diagnostic code named in the outcome, got {outcome}"
+        );
+        assert_eq!(result["state_write_validated"], json!(false));
+
+        let raw =
+            std::fs::read_to_string(repo_dir.join("planning").join("state.json")).expect("read");
+        assert!(
+            !raw.contains("\"closed\""),
+            "a refused close must leave the block open on disk"
+        );
+    }
+
+    /// A closure under the chain's OWN lease succeeds — self-exemption —
+    /// while the SAME lease still refuses a close attempted under a
+    /// DIFFERENT identity. Only this pair proves self-exemption rather
+    /// than a disabled guard: a test that only shows the own-identity
+    /// close succeeding would pass equally well if the guard did nothing
+    /// at all.
+    #[tokio::test]
+    async fn close_under_own_lease_succeeds_but_a_different_identity_is_still_refused() {
+        let (_dir, repo_dir) =
+            brain_fixture("acme", &[("AC.1", "open", false), ("AC.2", "open", false)]);
+        let root = find_brain_root(&repo_dir).expect("brain root resolves");
+        write_lease(&root, "acme", "lane-mine");
+
+        // Closing AS the lease's own holder self-exempts and succeeds.
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "done");
+        let node = CloseBlockNode::new().with_agent("lane-mine");
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+        assert_eq!(result["outcome"], json!("CLOSED:acme:AC.1"));
+        assert_eq!(result["state_write_validated"], json!(true));
+
+        // The SAME still-live lease refuses a DIFFERENT identity's close of
+        // the sibling block.
+        let ctx2 = ctx_for(&repo_dir, Some("acme"), Some("AC.2"), "done");
+        let node2 = CloseBlockNode::new().with_agent("lane-someone-else");
+        let out2 = node2.process(ctx2).await.expect("process succeeds");
+        let result2 = get_result(&out2, "CloseBlockNode").expect("stamped");
+        let outcome2 = result2["outcome"].as_str().unwrap();
+        assert!(
+            outcome2.starts_with("UNVALIDATED:"),
+            "expected UNVALIDATED:..., got {outcome2}"
+        );
+        assert!(outcome2.contains("E_QUIESCE_LEASE_HELD"));
+
+        let raw =
+            std::fs::read_to_string(repo_dir.join("planning").join("state.json")).expect("read");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let blocks = parsed["tracks"][0]["blocks"].as_array().expect("blocks");
+        let status_of = |id: &str| {
+            blocks
+                .iter()
+                .find(|b| b["id"] == id)
+                .and_then(|b| b["status"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(status_of("AC.1"), Some("closed".to_string()));
+        assert_eq!(status_of("AC.2"), Some("open".to_string()));
+    }
+
+    /// `close_block.rs` passes the exact identity string
+    /// [`CloseBlockNode::with_agent`] was given straight through to
+    /// [`Node::agent`] — the same accessor `graph.rs`'s
+    /// `registry_for_policy_with_cancellation_threads_one_identity_into_emit_state_and_close_block`
+    /// test reads off the PRODUCTION registry to confirm `EmitStateNode`
+    /// and `CloseBlockNode` carry the SAME one identity. Asserted directly
+    /// here, not by inspection.
+    #[test]
+    fn agent_accessor_returns_exactly_the_identity_with_agent_was_given() {
+        let identity = "lane-engine-rs-en15b";
+        let node = CloseBlockNode::new().with_agent(identity);
+        assert_eq!(Node::agent(&node), Some(identity));
+    }
+
+    /// No identity (the default) must behave exactly like any other
+    /// unidentified caller of `mev::set_block_status_as`: refused by a
+    /// live exclusive lease even one it "owns" by having no identity at
+    /// all — it can never self-exempt.
+    #[tokio::test]
+    async fn close_with_no_agent_is_refused_by_any_live_exclusive_lease() {
+        let (_dir, repo_dir) = brain_fixture("acme", &[("AC.1", "open", false)]);
+        let root = find_brain_root(&repo_dir).expect("brain root resolves");
+        // Whichever agent holds this lease is irrelevant here — a caller
+        // supplying no identity at all can never self-exempt, per
+        // `check_quiesce`'s documented contract.
+        write_lease(&root, "acme", "someone-else");
+
+        let ctx = ctx_for(&repo_dir, Some("acme"), Some("AC.1"), "done");
+        let node = CloseBlockNode::new(); // no with_agent(...) — agent: None
+        let out = node.process(ctx).await.expect("process succeeds");
+        let result = get_result(&out, "CloseBlockNode").expect("stamped");
+        let outcome = result["outcome"].as_str().unwrap();
+        assert!(
+            outcome.starts_with("UNVALIDATED:") && outcome.contains("E_QUIESCE_LEASE_HELD"),
+            "expected an unidentified caller to be refused, got {outcome}"
+        );
     }
 }

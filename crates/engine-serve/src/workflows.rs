@@ -418,10 +418,15 @@ pub fn register_sdlc_flow_with_registry(
             // `POST /events/{run_id}/abort` reaches the exact token the three
             // agent nodes below hold.
             let token = mint_and_publish_run_token();
+            // EN.15.B task 1: thread the event's lane identity (if any) into
+            // the registry so `EmitStateNode` and `CloseBlockNode` self-
+            // exempt a lease this chain holds itself, from the SAME event
+            // field, not a second independently-resolved identity.
             let mut registry =
                 engine_core::workflows::sdlc_flow::graph::registry_for_policy_with_cancellation(
                     &policy,
                     Some(token),
+                    sdlc_event.agent.as_deref(),
                 );
             if let Some(reg) = repo_reg.clone() {
                 registry.register(Box::new(SetupWorktreeNode::new().with_registry(reg)));
@@ -1499,6 +1504,7 @@ pub fn register_builtin_workflows_with_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_core::Node as _;
 
     #[test]
     fn register_sdlc_flow_populates_both_registries() {
@@ -1551,6 +1557,50 @@ mod tests {
             .expect("SDLC_FLOW should dispatch to a runnable Workflow");
 
         let _ = workflow;
+    }
+
+    /// `EN.15.B` task 1: the event's `agent` field must reach the SAME
+    /// identity on both `EmitStateNode` and `CloseBlockNode` in the
+    /// dispatched workflow's registry — proving the dispatch site actually
+    /// threads it, not just that `graph.rs`'s constructor can accept one.
+    #[test]
+    fn dispatch_with_event_threads_the_event_agent_into_emit_state_and_close_block() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_flow(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "SDLC_FLOW",
+                &serde_json::json!({ "spec_slug": "my-spec", "agent": "lane-engine-rs-en15b" }),
+            )
+            .expect("SDLC_FLOW should dispatch to a runnable Workflow");
+
+        let registry = workflow.registry();
+        let emit_state = registry
+            .get("EmitStateNode")
+            .expect("EmitStateNode is always registered");
+        let close_block = registry
+            .get("CloseBlockNode")
+            .expect("CloseBlockNode is always registered");
+
+        assert_eq!(emit_state.agent(), Some("lane-engine-rs-en15b"));
+        assert_eq!(close_block.agent(), Some("lane-engine-rs-en15b"));
+    }
+
+    /// Behavior-stable default: an event with no `agent` field leaves both
+    /// nodes unconfigured — never an empty-string `--agent`.
+    #[test]
+    fn dispatch_with_event_no_agent_leaves_emit_state_and_close_block_unconfigured() {
+        let mut dispatcher = Dispatcher::new();
+        register_sdlc_flow(&mut dispatcher);
+
+        let workflow = dispatcher
+            .dispatch_with_event("SDLC_FLOW", &serde_json::json!({ "spec_slug": "my-spec" }))
+            .expect("SDLC_FLOW should dispatch to a runnable Workflow");
+
+        let registry = workflow.registry();
+        assert_eq!(registry.get("EmitStateNode").unwrap().agent(), None);
+        assert_eq!(registry.get("CloseBlockNode").unwrap().agent(), None);
     }
 
     #[test]

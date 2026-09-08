@@ -413,6 +413,53 @@ conditions. That is tracked separately by carryover
 during this block's investigation) — closing this block does **not** retire that carryover; it is a
 distinct call site in a distinct language, not covered here.
 
+### `EN.15.B` — one identity into both `EmitStateNode` and `CloseBlockNode`, and a guarded close
+
+The block above shipped `EmitStateNode::with_agent`, but only as a builder callers had to invoke
+by hand. `EN.15.B` closes two gaps: getting that identity into a running `SDLC_FLOW` graph
+*without* a hand-built node, and applying the same self-exemption to `CloseBlockNode`, whose
+own `mev` write was previously unguarded entirely.
+
+**Registry-level threading (task 1).** `SDLCFlowEventSchema` now carries an optional
+`agent: Option<String>` field (`schema.rs`) alongside `spec_slug`/`resume`/`repo`. `graph.rs`
+gained a private `registry_with_agent(agent: Option<&str>)` helper, called from
+`registry_for_policy_with_cancellation` (the registry constructor `register_sdlc_flow`'s dispatch
+factory actually uses), which sets the SAME `agent` value onto both `EmitStateNode::with_agent`
+and the new `CloseBlockNode::with_agent` — one identity, two nodes, never one without the other.
+`engine-serve/src/workflows.rs`'s `SDLC_FLOW` factory reads `sdlc_event.agent.as_deref()` and
+passes it straight through. The two zero/single-argument constructors
+(`graph::registry()`, `registry_for_policy(policy)`) are unchanged — their many external test
+callers don't need an agent — so only the cancellation-token-carrying variant gained the
+parameter. A guard test in `engine-serve/src/workflows.rs`
+(`dispatch_with_event_threads_the_event_agent_into_emit_state_and_close_block`) asserts this
+against the actual `Dispatcher`-resolved registry, not a hand-built one, so it fails red if a
+future edit threads the identity into only one of the two nodes; a companion test
+(`dispatch_with_event_no_agent_leaves_emit_state_and_close_block_unconfigured`) pins the
+behavior-stable default.
+
+**`CloseBlockNode`'s guarded close (task 2).** `CloseBlockNode` (`close_block.rs`) previously
+called mev's block-status write directly, unguarded by any lease check. It now closes through
+`mev::set_block_status_as(..., agent, ...)` — the same identity-taking, lease-aware entry point
+`EmitStateNode` uses for `emit-state --write --agent`. Passing `CloseBlockNode`'s own `agent`
+(set via `with_agent`, same as `EmitStateNode`) self-exempts a close made by the lane that holds
+the lease; a close attempted under a lease held by a **different** agent is refused. The refusal
+surfaces as `CloseOutcome::Unvalidated` with a reason string containing `E_QUIESCE_LEASE_HELD` —
+no new `CloseOutcome` variant was added; a lease refusal is just another reason a close comes back
+unvalidated, exactly like a failing `harness.json` gate would. The node's own pre-write
+`.mev-emit.lock` (held for its revision-snapshot + baseline-validate span) is dropped **before**
+calling `set_block_status_as`, since that entry point now acquires the same lockfile internally
+for the duration of its own write — holding both in one process would self-deadlock until mev's
+fixed 3s `DEFAULT_LOCK_TIMEOUT` elapses.
+
+**Left as-is, deliberately:** `close_block_direct` (the `ORCHESTRATION` integrate-step seam) still
+passes `agent: None, dir: root` — no lane identity is available at that call site yet, and
+threading one in was out of task 2's scope (its own two `set_block_status` call sites only). This
+reproduces `close_block_direct`'s pre-existing unguarded behavior exactly: `root` never resolves
+to a configured repo slug, so no `scope:repo` lease can quiesce it either way. Separately,
+`W_MEV_UNGUARDED_WRITER` still names engine-rs after this block — no test asserts otherwise, and
+the block's own record says so; the finding is about `close_block_direct` and any other remaining
+unguarded call sites, not something this block claims to have fully retired.
+
 ## Schedule Source (`EN.6.G`)
 
 `crates/engine-serve/src/schedule.rs` turns a durable cron fire (`engine_core::cron`, `EN.6.M`)
