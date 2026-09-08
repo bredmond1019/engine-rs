@@ -70,6 +70,25 @@ pub struct NodeInvocation {
     /// The node's error message on a `Failed` dispatch. `None` on `Success`.
     #[serde(default)]
     pub error: Option<String>,
+    /// The dispatch's output payload (its own entry in the post-call
+    /// `ctx.nodes`), captured here so a retried node's earlier attempts
+    /// survive `ctx.nodes` overwriting itself (EN.14.G). `None` on a `Failed`
+    /// dispatch — there is no output payload to retain — and possibly `None`
+    /// on `Success` too, if the node's `ctx.nodes` entry was absent.
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// Set when `payload` was replaced by an explicit truncation marker
+    /// because it exceeded `payload_cap_bytes`. A caller must never be able
+    /// to mistake a truncated payload for a short one — see
+    /// `engine_core::invocations::truncate_payload`.
+    #[serde(default)]
+    pub payload_truncated: bool,
+    /// The cap ACTUALLY APPLIED to this row's payload, not merely the
+    /// configured one — recorded even on a `Failed` dispatch (where
+    /// `payload` is `None`) so every row is interpretable on the same terms
+    /// months later.
+    #[serde(default)]
+    pub payload_cap_bytes: u64,
 }
 
 #[cfg(test)]
@@ -87,6 +106,9 @@ mod tests {
             completed_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
             status: NodeInvocationStatus::Success,
             error: None,
+            payload: Some(serde_json::json!({"modified_files": ["a.rs"]})),
+            payload_truncated: false,
+            payload_cap_bytes: 65_536,
         }
     }
 
@@ -147,5 +169,33 @@ mod tests {
         assert_eq!(inv.run_id, None);
         assert_eq!(inv.campaign_id, None);
         assert_eq!(inv.error, None);
+        assert_eq!(inv.payload, None);
+        assert!(!inv.payload_truncated);
+        assert_eq!(inv.payload_cap_bytes, 0);
+    }
+
+    /// An EN.14.F-era entry — written before this block's payload fields
+    /// existed — carries none of `payload`/`payload_truncated`/
+    /// `payload_cap_bytes` and must still deserialize, per this file's
+    /// forward-tolerance discipline.
+    #[test]
+    fn en_14_f_era_entry_without_payload_fields_still_deserializes() {
+        let json = serde_json::json!({
+            "id": Uuid::nil(),
+            "run_id": "run-1",
+            "campaign_id": null,
+            "node": "Implement",
+            "seq": 0,
+            "started_at": "1970-01-01T00:00:00Z",
+            "completed_at": "1970-01-01T00:00:01Z",
+            "status": "success",
+            "error": null,
+        });
+
+        let inv: NodeInvocation = serde_json::from_value(json).unwrap();
+        assert_eq!(inv.node, "Implement");
+        assert_eq!(inv.payload, None);
+        assert!(!inv.payload_truncated);
+        assert_eq!(inv.payload_cap_bytes, 0);
     }
 }

@@ -735,6 +735,19 @@ async fn node_context(
                 "node dispatched"
             );
             let seq = next_seq(&ok_ctx.metadata);
+            // The cap is resolved once per dispatch off the PRE-CALL context
+            // (the policy stamp a node reads on entry, not one it might have
+            // rewritten), then applied to the node's own post-call `ctx.nodes`
+            // entry — its output payload. `ctx.nodes` itself is only read
+            // here, never re-keyed (EN.14.G task 2).
+            let cap_bytes = crate::invocations::payload_cap_from_resolved_policy(&pre_call_ctx);
+            let (payload, payload_truncated) = match ok_ctx.nodes.get(&identity) {
+                Some(raw) => {
+                    let (capped, truncated) = crate::invocations::truncate_payload(raw, cap_bytes);
+                    (Some(capped), truncated)
+                }
+                None => (None, false),
+            };
             append_invocation(
                 &mut ok_ctx.metadata,
                 NodeInvocation {
@@ -747,12 +760,20 @@ async fn node_context(
                     completed_at: Utc::now(),
                     status: NodeInvocationStatus::Success,
                     error: None,
+                    payload,
+                    payload_truncated,
+                    payload_cap_bytes: cap_bytes,
                 },
             );
             on_progress(&ok_ctx);
             (ok_ctx, false)
         }
         Err(err) => {
+            // Resolved off the pre-call snapshot before it is moved into
+            // `err_ctx` below — the cap that WOULD have applied to this
+            // dispatch's (absent) output payload, still recorded so every
+            // row is interpretable on the same terms (EN.14.G task 2).
+            let cap_bytes = crate::invocations::payload_cap_from_resolved_policy(&pre_call_ctx);
             let mut err_ctx = pre_call_ctx;
             // The pre-call snapshot predates anything the node stamped, so a
             // billed-but-failed LLM invocation would be lost with the
@@ -791,6 +812,9 @@ async fn node_context(
                     completed_at: Utc::now(),
                     status: NodeInvocationStatus::Failed,
                     error: Some(err.message.clone()),
+                    payload: None,
+                    payload_truncated: false,
+                    payload_cap_bytes: cap_bytes,
                 },
             );
             on_progress(&err_ctx);

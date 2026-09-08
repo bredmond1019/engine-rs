@@ -184,6 +184,12 @@ pub struct SdlcTaskPolicy {
     /// transport call. Reused type — see
     /// `sdlc_flow::policy::TransportRetry`.
     pub transport_retry: TransportRetry,
+    /// The per-payload retention cap `node_context` applies to a dispatch's
+    /// output before appending it to the `node_invocations` ledger
+    /// (EN.14.G) — same knob and same seam as `sdlc_flow::policy::
+    /// SdlcPolicy::node_invocation_payload_cap_bytes`. Behavior-stable
+    /// default: `crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES`.
+    pub node_invocation_payload_cap_bytes: u64,
 }
 
 impl Default for SdlcTaskPolicy {
@@ -204,6 +210,7 @@ impl Default for SdlcTaskPolicy {
             max_attempts: 3,
             retry_feedback: RetryFeedback::default(),
             transport_retry: TransportRetry::default(),
+            node_invocation_payload_cap_bytes: crate::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
         }
     }
 }
@@ -249,6 +256,7 @@ impl SdlcTaskPolicy {
             retry_feedback: self.retry_feedback,
             transport_retry: self.transport_retry,
             review_diff_max_chars: fallback.review_diff_max_chars,
+            node_invocation_payload_cap_bytes: self.node_invocation_payload_cap_bytes,
         }
     }
 }
@@ -271,6 +279,7 @@ pub struct PartialSdlcTaskPolicy {
     pub max_attempts: Option<u32>,
     pub retry_feedback: Option<PartialRetryFeedback>,
     pub transport_retry: Option<PartialTransportRetry>,
+    pub node_invocation_payload_cap_bytes: Option<u64>,
 }
 
 fn merge_retry_feedback(mut base: RetryFeedback, over: &PartialRetryFeedback) -> RetryFeedback {
@@ -328,6 +337,10 @@ impl crate::policy::Policy for SdlcTaskPolicy {
                 Some(tr) => merge_transport_retry(base.transport_retry, tr),
                 None => base.transport_retry,
             },
+            node_invocation_payload_cap_bytes: merge_opt(
+                base.node_invocation_payload_cap_bytes,
+                over.node_invocation_payload_cap_bytes,
+            ),
         }
     }
 }
@@ -587,6 +600,7 @@ mod tests {
                 max_attempts: Some(3),
                 initial_backoff_ms: Some(200),
             }),
+            node_invocation_payload_cap_bytes: Some(65536),
         };
         let value = serde_json::to_value(&full).expect("serialize PartialSdlcTaskPolicy");
         let expected: std::collections::BTreeSet<String> = value

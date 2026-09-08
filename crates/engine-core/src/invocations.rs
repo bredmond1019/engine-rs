@@ -20,13 +20,81 @@
 //! dispatch gets its own entry, so a retried node leaves as many entries as it
 //! made attempts. `ctx.nodes` itself is unchanged by this module.
 
-use engine_contract::NodeInvocation;
+use engine_contract::{NodeInvocation, TaskContext};
 use serde_json::Value;
+
+use crate::policy::profiles::RESOLVED_POLICY_IDENTITY;
 
 /// The `TaskContext::metadata` key under which the invocation ledger lives.
 /// Sibling to [`crate::sessions::SESSIONS_METADATA_KEY`] and
 /// `workflow::RUN_ID_METADATA_KEY`/`BUDGET_METADATA_KEY`.
 pub const INVOCATIONS_METADATA_KEY: &str = "node_invocations";
+
+/// The `ResolvedPolicy` stamp field a workflow's payload-retention knob is
+/// read from (EN.14.G task 1). Kept as a named constant so the string used to
+/// write the field (in each workflow's `PartialPolicy` -> `serde_json` stamp)
+/// and the string used to read it here can never silently drift apart.
+pub const NODE_INVOCATION_PAYLOAD_CAP_BYTES_FIELD: &str = "node_invocation_payload_cap_bytes";
+
+/// Built-in default for the per-payload retention cap (EN.14.G).
+///
+/// Payload size is entirely unmeasured as of this block — no run with
+/// retained payloads exists anywhere to measure. 64 KiB is a starting point,
+/// not a derived figure: generous enough to hold a typical `modified_files`
+/// list or a small structured result without truncating in the common case,
+/// small enough that a single dispatch's payload cannot make a meaningful
+/// dent in Postgres row size or the in-memory `ctx.metadata` clone this
+/// ledger already piggybacks on. Task 4 measures actual per-run growth on a
+/// multi-node run and records the comparison against EN.14.F's no-payload
+/// baseline; this value is free to move once that measurement exists.
+/// Behavior-stable: this is also the value every named profile's `baseline`
+/// bundle sets explicitly, so introducing the knob changes no existing run.
+pub const DEFAULT_PAYLOAD_CAP_BYTES: u64 = 65_536;
+
+/// Read the per-payload retention cap off the already-resolved policy stamp,
+/// UNTYPED — this is framework-level code with no workflow's policy type in
+/// scope, so it can never call `policy::resolved_policy_strict::<P>` (which
+/// requires a concrete `P`). Instead it looks up
+/// `ctx.nodes[RESOLVED_POLICY_IDENTITY]` as a plain `serde_json::Value` and
+/// reads the optional numeric field
+/// [`NODE_INVOCATION_PAYLOAD_CAP_BYTES_FIELD`] off it.
+///
+/// Falls back to [`DEFAULT_PAYLOAD_CAP_BYTES`] when the stamp is absent, is
+/// not a JSON object, or lacks the field (or the field is present but not a
+/// non-negative integer) — never panics, mirroring this module's existing
+/// "a telemetry channel must not be able to fail a run" discipline.
+#[must_use]
+pub fn payload_cap_from_resolved_policy(ctx: &TaskContext) -> u64 {
+    ctx.nodes
+        .get(RESOLVED_POLICY_IDENTITY)
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(NODE_INVOCATION_PAYLOAD_CAP_BYTES_FIELD))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_PAYLOAD_CAP_BYTES)
+}
+
+/// Cap a dispatch's output payload for retention.
+///
+/// Returns `(value.clone(), false)` unchanged when its serialized byte length
+/// (`serde_json::to_vec`) is within `cap_bytes`. Otherwise returns an
+/// explicit REPLACEMENT value marked as truncated — never a silently
+/// shortened copy of the original shape, so a caller can never mistake a
+/// truncated payload for a short one — paired with `true`.
+#[must_use]
+pub fn truncate_payload(value: &Value, cap_bytes: u64) -> (Value, bool) {
+    let byte_len = serde_json::to_vec(value).map(|bytes| bytes.len() as u64);
+
+    match byte_len {
+        Ok(len) if len <= cap_bytes => (value.clone(), false),
+        _ => (
+            serde_json::json!({
+                "__truncated__": true,
+                "cap_bytes": cap_bytes,
+            }),
+            true,
+        ),
+    }
+}
 
 /// Append one invocation to `metadata`'s ledger, creating it if absent.
 /// Order-preserving.
@@ -94,6 +162,9 @@ mod tests {
             completed_at: DateTime::<Utc>::from_timestamp(seq as i64 + 1, 0).unwrap(),
             status,
             error: None,
+            payload: None,
+            payload_truncated: false,
+            payload_cap_bytes: 0,
         }
     }
 
@@ -201,5 +272,93 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].node, "Implement");
         assert_eq!(entries[1].node, "Review");
+    }
+
+    fn ctx_with_nodes(nodes: std::collections::HashMap<String, Value>) -> TaskContext {
+        TaskContext {
+            event: serde_json::json!({}),
+            nodes,
+            metadata: serde_json::json!({}),
+            node_runs: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn payload_cap_from_resolved_policy_falls_back_to_default_when_stamp_absent() {
+        let ctx = ctx_with_nodes(std::collections::HashMap::new());
+        assert_eq!(
+            payload_cap_from_resolved_policy(&ctx),
+            DEFAULT_PAYLOAD_CAP_BYTES
+        );
+    }
+
+    #[test]
+    fn payload_cap_from_resolved_policy_reads_the_stamped_value() {
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::json!({ NODE_INVOCATION_PAYLOAD_CAP_BYTES_FIELD: 4096 }),
+        );
+        let ctx = ctx_with_nodes(nodes);
+        assert_eq!(payload_cap_from_resolved_policy(&ctx), 4096);
+    }
+
+    #[test]
+    fn payload_cap_from_resolved_policy_falls_back_when_stamp_is_not_an_object() {
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::json!("not an object"),
+        );
+        let ctx = ctx_with_nodes(nodes);
+        assert_eq!(
+            payload_cap_from_resolved_policy(&ctx),
+            DEFAULT_PAYLOAD_CAP_BYTES
+        );
+    }
+
+    #[test]
+    fn payload_cap_from_resolved_policy_falls_back_when_field_is_wrong_typed_or_missing() {
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::json!({ "some_other_field": 1 }),
+        );
+        let ctx = ctx_with_nodes(nodes);
+        assert_eq!(
+            payload_cap_from_resolved_policy(&ctx),
+            DEFAULT_PAYLOAD_CAP_BYTES
+        );
+
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::json!({ NODE_INVOCATION_PAYLOAD_CAP_BYTES_FIELD: "not a number" }),
+        );
+        let ctx = ctx_with_nodes(nodes);
+        assert_eq!(
+            payload_cap_from_resolved_policy(&ctx),
+            DEFAULT_PAYLOAD_CAP_BYTES
+        );
+    }
+
+    #[test]
+    fn truncate_payload_returns_under_cap_payload_unchanged() {
+        let value = serde_json::json!({ "modified_files": ["a.rs", "b.rs"] });
+        let (out, truncated) = truncate_payload(&value, 4096);
+        assert_eq!(out, value);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_payload_marks_over_cap_payload_explicitly_rather_than_shortening_it() {
+        let value = serde_json::json!({ "modified_files": vec!["x"; 10_000] });
+        let (out, truncated) = truncate_payload(&value, 16);
+        assert!(truncated);
+        // The caller must never mistake this for a short copy of the
+        // original shape — it carries no `modified_files` key at all.
+        assert!(out.get("modified_files").is_none());
+        assert_eq!(out.get("__truncated__"), Some(&serde_json::json!(true)));
+        assert_eq!(out.get("cap_bytes"), Some(&serde_json::json!(16)));
     }
 }

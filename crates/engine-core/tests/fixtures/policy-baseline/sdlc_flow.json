@@ -15,6 +15,7 @@
     "review": "sonnet",
     "triage": "sonnet"
   },
+  "node_invocation_payload_cap_bytes": 65536,
   "output_verbosity": "normal",
   "prompt_cache": false,
   "retry_feedback": {

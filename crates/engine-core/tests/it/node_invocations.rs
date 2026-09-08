@@ -183,6 +183,217 @@ async fn a_failed_dispatch_produces_a_failed_ledger_row_carrying_the_error_messa
 }
 
 // ---------------------------------------------------------------------------
+// EN.14.G task 2: payload retention on the invocation record.
+// ---------------------------------------------------------------------------
+
+/// THE BLOCK'S CENTRAL TEST. `RetryNode` writes a DISTINCT `{"count": n}`
+/// payload on each of its three attempts (see its `process` above). Both
+/// attempt 1's and attempt 2's payloads must be retrievable from the ledger
+/// and must differ from each other — the audit `ctx.nodes` alone cannot
+/// answer, because it holds only the LATEST attempt's slot.
+///
+/// POSITIVE CONTROL (carryover `gate-scope-must-be-shown-capable-of-failing`):
+/// the same test asserts that the latest-only view — what `ctx.nodes` itself
+/// holds — canNOT distinguish attempt 1 from attempt 2, proving the ledger
+/// assertion above is actually capable of failing rather than vacuously true.
+#[tokio::test]
+async fn retried_node_ledger_retains_distinct_payloads_per_attempt() {
+    let workflow = Workflow::new(retry_registry(), retry_schema());
+    let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("workflow should complete");
+
+    let invocations = engine_core::invocations::read_invocations(&result.metadata);
+    let retry_invocations: Vec<_> = invocations
+        .iter()
+        .filter(|inv| inv.node == "RetryNode")
+        .collect();
+    assert_eq!(
+        retry_invocations.len(),
+        3,
+        "RetryNode dispatched 3 times in this fixture"
+    );
+
+    let attempt1_payload = retry_invocations[0]
+        .payload
+        .clone()
+        .expect("attempt 1 should have a retained payload");
+    let attempt2_payload = retry_invocations[1]
+        .payload
+        .clone()
+        .expect("attempt 2 should have a retained payload");
+
+    assert_eq!(attempt1_payload, serde_json::json!({ "count": 1 }));
+    assert_eq!(attempt2_payload, serde_json::json!({ "count": 2 }));
+    assert_ne!(
+        attempt1_payload, attempt2_payload,
+        "attempt 1 and attempt 2 must retain DISTINCT payloads — the exact \
+         question the motivating audit (run 88bd80a0) could not answer"
+    );
+
+    // POSITIVE CONTROL: the latest-only view is exactly what `ctx.nodes`
+    // holds for this node identity — its single overwritten slot. Assert it
+    // CANNOT distinguish the two attempts, proving the ledger assertion
+    // above is capable of failing (a regression that stopped writing
+    // per-attempt payloads and instead exposed only the latest one would
+    // pass the naive check below while failing the real one above).
+    let latest_only_view = result
+        .nodes
+        .get("RetryNode")
+        .cloned()
+        .expect("ctx.nodes holds RetryNode's latest slot");
+    assert_eq!(
+        latest_only_view,
+        serde_json::json!({ "count": 3 }),
+        "ctx.nodes holds only the LATEST attempt"
+    );
+    assert_ne!(
+        latest_only_view, attempt1_payload,
+        "the latest-only view must fail to reproduce attempt 1's payload — \
+         this is the control proving the ledger is doing real work"
+    );
+}
+
+/// A node that, on entry, stamps a small `ResolvedPolicy` cap into
+/// `ctx.nodes` — mimicking what `stamp_resolved_policy` (task 3) does for a
+/// real workflow — so the NEXT node's dispatch reads a cap small enough to
+/// force truncation. `payload_cap_from_resolved_policy` reads this off the
+/// PRE-CALL context, and `ctx.nodes` persists across dispatches within one
+/// workflow run, so stamping it here is visible to the following node.
+struct StampSmallCapNode {
+    cap_bytes: u64,
+}
+
+#[async_trait::async_trait]
+impl Node for StampSmallCapNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            engine_core::policy::profiles::RESOLVED_POLICY_IDENTITY.to_string(),
+            serde_json::json!({
+                engine_core::invocations::NODE_INVOCATION_PAYLOAD_CAP_BYTES_FIELD: self.cap_bytes,
+            }),
+        );
+        ctx.nodes.insert(
+            self.name().to_string(),
+            serde_json::json!({ "stamped": true }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "StampSmallCapNode"
+    }
+}
+
+/// A node that writes a payload far larger than any small test cap.
+struct BigPayloadNode;
+
+#[async_trait::async_trait]
+impl Node for BigPayloadNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            self.name().to_string(),
+            serde_json::json!({ "modified_files": vec!["a-long-path/file.rs"; 10_000] }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        "BigPayloadNode"
+    }
+}
+
+/// An over-cap payload must be stored EXPLICITLY marked as truncated — never
+/// silently shortened — with `payload_truncated` true and `payload_cap_bytes`
+/// recording the cap actually applied.
+#[tokio::test]
+async fn over_cap_payload_is_recorded_truncated_not_silently_shortened() {
+    const SMALL_CAP: u64 = 64;
+
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(StampSmallCapNode {
+        cap_bytes: SMALL_CAP,
+    }));
+    registry.register(Box::new(BigPayloadNode));
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        "StampSmallCapNode".to_string(),
+        NodeConfig::new("StampSmallCapNode", vec!["BigPayloadNode".to_string()]),
+    );
+    nodes.insert(
+        "BigPayloadNode".to_string(),
+        NodeConfig::new("BigPayloadNode", vec![]),
+    );
+    let schema = engine_core::WorkflowSchema::new("cap-test", "StampSmallCapNode", nodes);
+    let workflow = Workflow::new(registry, schema);
+    let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("workflow should complete");
+
+    let invocations = engine_core::invocations::read_invocations(&result.metadata);
+    let big = invocations
+        .iter()
+        .find(|inv| inv.node == "BigPayloadNode")
+        .expect("BigPayloadNode should have a ledger row");
+
+    assert!(
+        big.payload_truncated,
+        "an over-cap payload must be marked truncated"
+    );
+    assert_eq!(
+        big.payload_cap_bytes, SMALL_CAP,
+        "the row must record the cap ACTUALLY APPLIED"
+    );
+    let payload = big
+        .payload
+        .as_ref()
+        .expect("a truncated payload is still Some — an explicit replacement, not None");
+    assert!(
+        payload.get("modified_files").is_none(),
+        "the truncated payload must never carry a shortened copy of the \
+         original shape — a caller must never mistake it for a short one"
+    );
+}
+
+/// A dispatch returning `Err` has no output payload, but still records the
+/// cap that WOULD have applied — every row interpretable on the same terms.
+#[tokio::test]
+async fn failed_dispatch_records_no_payload_but_still_records_the_cap() {
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(AlwaysFailsNode));
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        "AlwaysFailsNode".to_string(),
+        NodeConfig::new("AlwaysFailsNode", vec![]),
+    );
+    let schema = engine_core::WorkflowSchema::new("fails", "AlwaysFailsNode", nodes);
+    let workflow = Workflow::new(registry, schema);
+    let on_progress: OnProgress<'_> = Box::new(|_c: &TaskContext| {});
+
+    let result = workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("run should return Ok(ctx) even though the node failed");
+
+    let invocations = engine_core::invocations::read_invocations(&result.metadata);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].payload, None);
+    assert!(!invocations[0].payload_truncated);
+    assert_eq!(
+        invocations[0].payload_cap_bytes,
+        engine_core::invocations::DEFAULT_PAYLOAD_CAP_BYTES,
+        "no ResolvedPolicy stamp exists in this fixture, so the framework \
+         default cap is what would have applied"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Task 5: per-run byte growth on a MULTI-NODE run.
 //
 // The spike's control graph was one node deep, so it could not see the
@@ -341,6 +552,305 @@ async fn per_dispatch_metadata_growth_is_bounded_and_linear_on_a_multi_node_run(
     assert!(
         (total_growth as i64) <= linear_upper_bound,
         "total per-run byte growth ({total_growth} bytes over {CHAIN_LEN} dispatches) exceeds the linear bound ({linear_upper_bound}) — this is the O(n^2) hazard the block's spike could not see"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: per-run byte growth WITH payloads retained, compared against
+// EN.14.F's no-payload baseline above, and the cap's bounding effect on an
+// over-cap run — the two measurements the block record calls out as
+// unaddressed by EN.14.F ("payload size is entirely unmeasured... the figure
+// must come from this task").
+// ---------------------------------------------------------------------------
+
+/// Drives `workflow` capturing every `on_progress` snapshot's `ctx.metadata`,
+/// then reduces to one serialized-byte measurement per NEW ledger row — the
+/// exact reduction
+/// `per_dispatch_metadata_growth_is_bounded_and_linear_on_a_multi_node_run`
+/// performs above, factored out so this task's realistic-payload and
+/// over-cap measurements share one measurement path with that baseline test
+/// rather than re-deriving it.
+async fn measure_per_dispatch_metadata_bytes(workflow: Workflow) -> Vec<usize> {
+    let snapshots: Rc<RefCell<Vec<serde_json::Value>>> = Rc::new(RefCell::new(Vec::new()));
+    let snapshots_handle = snapshots.clone();
+    let on_progress: OnProgress<'_> =
+        Box::new(move |c: &TaskContext| snapshots_handle.borrow_mut().push(c.metadata.clone()));
+
+    workflow
+        .run(serde_json::json!({}), on_progress)
+        .await
+        .expect("workflow should complete");
+
+    let mut per_dispatch_bytes: Vec<usize> = Vec::new();
+    let mut last_len = 0usize;
+    for snap in snapshots.borrow().iter() {
+        let len = engine_core::invocations::read_invocations(snap).len();
+        if len > last_len {
+            let bytes = serde_json::to_vec(snap)
+                .expect("ctx.metadata must always serialize")
+                .len();
+            per_dispatch_bytes.push(bytes);
+            last_len = len;
+        }
+    }
+    per_dispatch_bytes
+}
+
+/// A chain link that retains a REALISTIC, under-cap payload on each dispatch
+/// — a small `modified_files` list plus a one-line summary, the shape the
+/// motivating audit (run `88bd80a0`, "what did tasks 1 and 2 each claim they
+/// modified") actually wanted to retrieve per attempt. Distinct per node name
+/// so payloads are individually identifiable, mirroring a real SDLC task's
+/// per-node output. Well under `DEFAULT_PAYLOAD_CAP_BYTES` (64 KiB), so
+/// nothing here is truncated.
+struct RealisticPayloadChainNode {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl Node for RealisticPayloadChainNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            self.name.clone(),
+            serde_json::json!({
+                "modified_files": [
+                    format!("crates/engine-core/src/workflows/{}/mod.rs", self.name),
+                    format!("crates/engine-core/tests/it/{}.rs", self.name),
+                ],
+                "summary": format!(
+                    "{} completed its dispatch and recorded what it changed",
+                    self.name
+                ),
+            }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Builds a linear chain of `n` [`RealisticPayloadChainNode`]s, mirroring
+/// `chain_registry_and_schema`'s shape exactly but with a payload-bearing
+/// node body.
+fn realistic_payload_chain(n: usize) -> (NodeRegistry, engine_core::WorkflowSchema) {
+    assert!(n >= 2, "a chain needs at least two links to show growth");
+    let names: Vec<String> = (0..n).map(|i| format!("payload-chain-{i}")).collect();
+
+    let mut registry = NodeRegistry::new();
+    let mut nodes = HashMap::new();
+    for (i, name) in names.iter().enumerate() {
+        let next = if i + 1 < names.len() {
+            vec![names[i + 1].clone()]
+        } else {
+            vec![]
+        };
+        registry.register(Box::new(RealisticPayloadChainNode { name: name.clone() }));
+        nodes.insert(name.clone(), NodeConfig::new(name, next));
+    }
+
+    let schema = engine_core::WorkflowSchema::new("payload-chain", &names[0], nodes);
+    (registry, schema)
+}
+
+/// A chain link that always writes a payload far larger than any small
+/// stamped cap — 5,000 repeated file-path entries, tens of kilobytes
+/// serialized — so every dispatch is truncated to the constant
+/// `{"__truncated__": true, "cap_bytes": N}` marker `truncate_payload`
+/// returns.
+struct OverCapChainNode {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl Node for OverCapChainNode {
+    async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        ctx.nodes.insert(
+            self.name.clone(),
+            serde_json::json!({ "modified_files": vec![format!("{}-file.rs", self.name); 5_000] }),
+        );
+        Ok(ctx)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Builds an `n + 1`-dispatch chain: `StampSmallCapNode` first (stamping
+/// `small_cap_bytes` into `ResolvedPolicy`, read off the pre-call context by
+/// every later dispatch — `ctx.nodes` persists across dispatches within one
+/// run), then `n` [`OverCapChainNode`] links, each emitting a payload the
+/// stamped cap truncates.
+fn over_cap_chain(n: usize, small_cap_bytes: u64) -> (NodeRegistry, engine_core::WorkflowSchema) {
+    assert!(
+        n >= 2,
+        "a chain needs at least two over-cap links to show growth"
+    );
+    let names: Vec<String> = (0..n).map(|i| format!("over-cap-chain-{i}")).collect();
+
+    let mut registry = NodeRegistry::new();
+    let mut nodes = HashMap::new();
+    registry.register(Box::new(StampSmallCapNode {
+        cap_bytes: small_cap_bytes,
+    }));
+    nodes.insert(
+        "StampSmallCapNode".to_string(),
+        NodeConfig::new("StampSmallCapNode", vec![names[0].clone()]),
+    );
+    for (i, name) in names.iter().enumerate() {
+        let next = if i + 1 < names.len() {
+            vec![names[i + 1].clone()]
+        } else {
+            vec![]
+        };
+        registry.register(Box::new(OverCapChainNode { name: name.clone() }));
+        nodes.insert(name.clone(), NodeConfig::new(name, next));
+    }
+
+    let schema = engine_core::WorkflowSchema::new("over-cap-chain", "StampSmallCapNode", nodes);
+    (registry, schema)
+}
+
+/// Per-run byte growth WITH REALISTIC, under-cap payloads retained, measured
+/// on the same 12-node linear-chain shape as EN.14.F's own no-payload
+/// baseline above
+/// (`per_dispatch_metadata_growth_is_bounded_and_linear_on_a_multi_node_run`,
+/// measured 2026-09-07: 224-226 bytes/record, 2,714 bytes total across 12
+/// dispatches). Retaining a payload is expected to raise the per-record
+/// delta over that baseline — a real payload is bytes on the wire a
+/// no-payload run never paid — but growth must stay BOUNDED per record and
+/// LINEAR in dispatch count: retention should compound EN.14.F's cost by a
+/// constant per-dispatch factor, never a growing one.
+///
+/// MEASURED 2026-09-07 on this exact 12-node chain, each node retaining a
+/// ~230-byte `modified_files` + `summary` payload: serialized `ctx.metadata`
+/// sizes after each of the 12 dispatches were `[524, 1026, 1528, 2030, 2532,
+/// 3034, 3536, 4038, 4540, 5042, 5549, 6056]` bytes — a per-dispatch delta of
+/// 502-507 bytes (versus EN.14.F's 224-226 byte no-payload baseline for the
+/// same chain shape: payload retention roughly DOUBLED the per-record cost
+/// here), for 6,056 bytes total across 12 dispatches versus EN.14.F's 2,714.
+/// The exact numbers are NOT asserted below — they drift with payload
+/// content and node-name length — but their SHAPE is: bounded per record,
+/// linear in dispatch count, and reliably ABOVE the no-payload baseline
+/// (asserted explicitly, so a regression that stopped retaining payloads at
+/// all would not pass silently).
+#[tokio::test]
+async fn per_dispatch_growth_with_realistic_payloads_is_bounded_and_linear() {
+    const CHAIN_LEN: usize = 12;
+    let (registry, schema) = realistic_payload_chain(CHAIN_LEN);
+    let workflow = Workflow::new(registry, schema);
+
+    let per_dispatch_bytes = measure_per_dispatch_metadata_bytes(workflow).await;
+    assert_eq!(
+        per_dispatch_bytes.len(),
+        CHAIN_LEN,
+        "expected exactly one post-dispatch snapshot per ledger row"
+    );
+
+    let deltas: Vec<i64> = per_dispatch_bytes
+        .windows(2)
+        .map(|w| w[1] as i64 - w[0] as i64)
+        .collect();
+    assert!(!deltas.is_empty(), "need at least one delta to bound");
+
+    let max_delta = *deltas.iter().max().unwrap();
+    let min_delta = *deltas.iter().min().unwrap();
+
+    assert!(
+        min_delta > 0,
+        "each dispatch must strictly grow the serialized ledger: deltas={deltas:?}"
+    );
+    const MAX_DELTA_DRIFT_BYTES: i64 = 256;
+    assert!(
+        max_delta - min_delta <= MAX_DELTA_DRIFT_BYTES,
+        "per-dispatch byte growth with payloads retained is not bounded by a constant: min={min_delta} max={max_delta} deltas={deltas:?}"
+    );
+
+    // Payload retention must actually cost something measurable over
+    // EN.14.F's no-payload baseline (224-226 bytes/record on this exact
+    // chain shape) — otherwise this test would not be measuring the thing it
+    // claims to, and a regression that silently stopped retaining payloads
+    // would pass it.
+    const EN_14_F_NO_PAYLOAD_MAX_DELTA_BYTES: i64 = 226;
+    assert!(
+        min_delta > EN_14_F_NO_PAYLOAD_MAX_DELTA_BYTES,
+        "expected retaining a realistic payload to cost more per record than \
+         EN.14.F's no-payload baseline ({EN_14_F_NO_PAYLOAD_MAX_DELTA_BYTES} bytes): min_delta={min_delta}"
+    );
+
+    let total_growth = per_dispatch_bytes.last().unwrap() - per_dispatch_bytes.first().unwrap();
+    let linear_upper_bound = (CHAIN_LEN as i64 - 1) * (min_delta + MAX_DELTA_DRIFT_BYTES);
+    assert!(
+        (total_growth as i64) <= linear_upper_bound,
+        "total per-run byte growth ({total_growth} bytes over {CHAIN_LEN} dispatches) with payloads retained exceeds the linear bound ({linear_upper_bound})"
+    );
+}
+
+/// THE PROPERTY THE CAP EXISTS FOR, tested end to end on a multi-node run:
+/// nodes emitting OVER-CAP payloads (5,000 repeated file-path entries each,
+/// truncated to the small constant `{"__truncated__": true, "cap_bytes": N}`
+/// marker) must not grow the ledger's per-record byte cost any faster than a
+/// chain whose payloads already fit under the cap, beyond a small recorded
+/// envelope. Without the cap, an oversized payload would dominate the
+/// per-record delta and the bounded/linear growth measured above would no
+/// longer describe anything a real over-budget node could produce.
+///
+/// MEASURED 2026-09-07: an over-cap 12-link chain (5,000-entry
+/// `modified_files` lists, truncated under a 64-byte stamped cap) had
+/// per-dispatch deltas of 329-331 bytes — SMALLER than the realistic
+/// in-cap chain's 502-507 bytes above, because every truncated record
+/// stores the fixed-size `{"__truncated__": true, "cap_bytes": 64}` marker
+/// rather than any part of the oversized original.
+#[tokio::test]
+async fn over_cap_payloads_do_not_grow_faster_per_record_than_in_cap_payloads() {
+    const CHAIN_LEN: usize = 12;
+    const SMALL_CAP: u64 = 64;
+    const ENVELOPE_BYTES: i64 = 256;
+
+    let (fitting_registry, fitting_schema) = realistic_payload_chain(CHAIN_LEN);
+    let fitting_workflow = Workflow::new(fitting_registry, fitting_schema);
+    let fitting_bytes = measure_per_dispatch_metadata_bytes(fitting_workflow).await;
+    let fitting_deltas: Vec<i64> = fitting_bytes
+        .windows(2)
+        .map(|w| w[1] as i64 - w[0] as i64)
+        .collect();
+    let fitting_max_delta = *fitting_deltas.iter().max().unwrap();
+
+    let (over_cap_registry, over_cap_schema) = over_cap_chain(CHAIN_LEN, SMALL_CAP);
+    let over_cap_workflow = Workflow::new(over_cap_registry, over_cap_schema);
+    let over_cap_bytes = measure_per_dispatch_metadata_bytes(over_cap_workflow).await;
+    let over_cap_deltas: Vec<i64> = over_cap_bytes
+        .windows(2)
+        .map(|w| w[1] as i64 - w[0] as i64)
+        .collect();
+    assert!(
+        !over_cap_deltas.is_empty(),
+        "need at least one over-cap delta to bound"
+    );
+    let over_cap_max_delta = *over_cap_deltas.iter().max().unwrap();
+
+    assert!(
+        over_cap_max_delta <= fitting_max_delta + ENVELOPE_BYTES,
+        "an over-cap payload must not grow the ledger faster per record than an \
+         in-cap payload beyond a small constant envelope — the property the cap \
+         exists for: over_cap_max_delta={over_cap_max_delta} fitting_max_delta={fitting_max_delta}"
+    );
+
+    // POSITIVE CONTROL: without the cap, a 5,000-entry `modified_files` list
+    // serializes to tens of kilobytes — far more than any in-cap delta above.
+    // Prove the raw (uncapped) payload really would have blown the bound, so
+    // the assertion above is not vacuously true (a bug that stopped applying
+    // the cap at all would still pass a bound nothing could ever violate).
+    let uncapped_payload =
+        serde_json::json!({ "modified_files": vec!["over-cap-chain-file.rs"; 5_000] });
+    let uncapped_bytes = serde_json::to_vec(&uncapped_payload).unwrap().len() as i64;
+    assert!(
+        uncapped_bytes > fitting_max_delta + ENVELOPE_BYTES,
+        "positive control failed: the raw over-cap payload ({uncapped_bytes} bytes) must exceed \
+         the bound the cap is supposed to prevent, otherwise this test could never catch a \
+         regression that stopped capping payloads"
     );
 }
 
