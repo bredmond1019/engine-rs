@@ -1,0 +1,15 @@
+{
+  "message_id": "abc123",
+  "sender": {
+    "agent_name": "engine-rs-1",
+    "repo": "engine-rs",
+    "lane": "engine-rs",
+    "roadmap": "demo-roadmap"
+  },
+  "sent_at": "2026-09-03T12:30:00Z",
+  "kind": "FINDING",
+  "subject": { "repo": "engine-rs", "block": "EN.15.A" },
+  "body": "coord reader landed.",
+  "durable_home": { "channel": "lane-log", "ref": "engine-rs/planning/lane-log.jsonl" },
+  "verified_by": "cargo nextest run -p engine-core coord"
+}

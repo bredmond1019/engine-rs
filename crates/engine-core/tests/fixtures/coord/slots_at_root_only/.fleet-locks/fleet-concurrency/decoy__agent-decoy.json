@@ -1,0 +1,8 @@
+{
+  "repo": "decoy",
+  "pid": 1,
+  "pid_source": "self",
+  "agent": "decoy",
+  "category": "native-build",
+  "started_at": 0.0
+}
