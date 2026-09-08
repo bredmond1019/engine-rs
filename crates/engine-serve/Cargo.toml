@@ -8,6 +8,10 @@ license.workspace = true
 engine-core = { path = "../engine-core" }
 engine-contract = { path = "../engine-contract" }
 engine-store = { path = "../engine-store" }
+# `EN.15.C` task 6: the eight `/api/coordination/*` write-route request bodies embed
+# `okf_core::LeaseKind`/`LeaseScope` directly (both already `Deserialize`) rather than
+# reinventing a parallel wire enum in this crate — see `http.rs`'s `CoordLeaseBody`.
+okf-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

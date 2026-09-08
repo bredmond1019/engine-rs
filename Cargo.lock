@@ -855,6 +855,7 @@ dependencies = [
  "engine-serve",
  "engine-store",
  "futures",
+ "okf-core",
  "serde",
  "serde_json",
  "sqlx",
