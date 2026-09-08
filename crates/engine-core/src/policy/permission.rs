@@ -39,6 +39,15 @@ pub enum GatedAction {
     PushToMain,
     /// Writing across repos.
     CrossRepoWrite,
+    /// Sending an operator notification (a SWEEP `notification` route becoming an
+    /// `OperatorTransport` ask). Permitted under `Standard` — the only one of the three
+    /// `EN.15.E` actions that is.
+    Notify,
+    /// Waking a lane — nudging another lane's session into action outside the normal
+    /// dependency-clear path.
+    WakeLane,
+    /// Running a drain pass on demand.
+    RunDrain,
 }
 
 /// The three permission levels HQ.5.B authored, ordered tightest to most permissive.
@@ -84,11 +93,11 @@ pub enum Decision {
 /// returns before the per-profile table is consulted at all, not as three separate
 /// per-profile cells, so it cannot be flipped by editing a single profile's row.
 ///
-/// | profile        | mini_install | main_push | cross_repo_write |
-/// |----------------|--------------|-----------|-------------------|
-/// | `locked`       | deny         | deny      | deny              |
-/// | `standard`     | deny         | permit    | permit            |
-/// | `unrestricted` | permit       | permit    | permit            |
+/// | profile        | mini_install | main_push | cross_repo_write | notify | wake_lane | run_drain |
+/// |----------------|--------------|-----------|-------------------|--------|-----------|-----------|
+/// | `locked`       | deny         | deny      | deny              | deny   | deny      | deny      |
+/// | `standard`     | deny         | permit    | permit            | permit | deny      | deny      |
+/// | `unrestricted` | permit       | permit    | permit            | permit | permit    | permit    |
 #[must_use]
 pub fn decide(profile: PermissionProfile, action: GatedAction) -> Decision {
     // The one `never_allowed` entry: unconditional, checked before any per-profile
@@ -103,10 +112,16 @@ pub fn decide(profile: PermissionProfile, action: GatedAction) -> Decision {
         (PermissionProfile::Standard, GatedAction::InstallOnMini) => Decision::Deny,
         (PermissionProfile::Standard, GatedAction::PushToMain) => Decision::Permit,
         (PermissionProfile::Standard, GatedAction::CrossRepoWrite) => Decision::Permit,
+        (PermissionProfile::Standard, GatedAction::Notify) => Decision::Permit,
+        (PermissionProfile::Standard, GatedAction::WakeLane) => Decision::Deny,
+        (PermissionProfile::Standard, GatedAction::RunDrain) => Decision::Deny,
 
         (PermissionProfile::Unrestricted, GatedAction::InstallOnMini) => Decision::Permit,
         (PermissionProfile::Unrestricted, GatedAction::PushToMain) => Decision::Permit,
         (PermissionProfile::Unrestricted, GatedAction::CrossRepoWrite) => Decision::Permit,
+        (PermissionProfile::Unrestricted, GatedAction::Notify) => Decision::Permit,
+        (PermissionProfile::Unrestricted, GatedAction::WakeLane) => Decision::Permit,
+        (PermissionProfile::Unrestricted, GatedAction::RunDrain) => Decision::Permit,
 
         // Unreachable: `ClearOperatorGate` already returned above for every profile.
         (_, GatedAction::ClearOperatorGate) => Decision::Deny,
@@ -295,11 +310,14 @@ mod tests {
         PermissionProfile::Unrestricted,
     ];
 
-    const ALL_ACTIONS: [GatedAction; 4] = [
+    const ALL_ACTIONS: [GatedAction; 7] = [
         GatedAction::ClearOperatorGate,
         GatedAction::InstallOnMini,
         GatedAction::PushToMain,
         GatedAction::CrossRepoWrite,
+        GatedAction::Notify,
+        GatedAction::WakeLane,
+        GatedAction::RunDrain,
     ];
 
     /// AC: table-driven — every `PermissionProfile` x `ClearOperatorGate` cell denies.
@@ -314,30 +332,42 @@ mod tests {
         }
     }
 
-    /// AC: the full 12-cell (3 profiles x 4 actions) grading matrix, asserted
+    /// AC: the full 21-cell (3 profiles x 7 actions) grading matrix, asserted
     /// table-driven against `docs/permission-profiles.md`'s grading table cell-for-cell.
     #[test]
     fn decision_matrix_matches_docs_permission_profiles_grading_table() {
         use Decision::{Deny, Permit};
-        use GatedAction::{ClearOperatorGate, CrossRepoWrite, InstallOnMini, PushToMain};
+        use GatedAction::{
+            ClearOperatorGate, CrossRepoWrite, InstallOnMini, Notify, PushToMain, RunDrain,
+            WakeLane,
+        };
         use PermissionProfile::{Locked, Standard, Unrestricted};
 
-        let expected: [(PermissionProfile, GatedAction, Decision); 12] = [
+        let expected: [(PermissionProfile, GatedAction, Decision); 21] = [
             // locked
             (Locked, ClearOperatorGate, Deny),
             (Locked, InstallOnMini, Deny),
             (Locked, PushToMain, Deny),
             (Locked, CrossRepoWrite, Deny),
+            (Locked, Notify, Deny),
+            (Locked, WakeLane, Deny),
+            (Locked, RunDrain, Deny),
             // standard
             (Standard, ClearOperatorGate, Deny),
             (Standard, InstallOnMini, Deny),
             (Standard, PushToMain, Permit),
             (Standard, CrossRepoWrite, Permit),
+            (Standard, Notify, Permit),
+            (Standard, WakeLane, Deny),
+            (Standard, RunDrain, Deny),
             // unrestricted
             (Unrestricted, ClearOperatorGate, Deny),
             (Unrestricted, InstallOnMini, Permit),
             (Unrestricted, PushToMain, Permit),
             (Unrestricted, CrossRepoWrite, Permit),
+            (Unrestricted, Notify, Permit),
+            (Unrestricted, WakeLane, Permit),
+            (Unrestricted, RunDrain, Permit),
         ];
 
         for (profile, action, want) in expected {
@@ -379,6 +409,9 @@ mod tests {
             GatedAction::InstallOnMini,
             GatedAction::PushToMain,
             GatedAction::CrossRepoWrite,
+            GatedAction::Notify,
+            GatedAction::WakeLane,
+            GatedAction::RunDrain,
         ] {
             let mut saw_permit = false;
             let mut saw_deny = false;
@@ -486,6 +519,75 @@ mod tests {
             for profile in ALL_PROFILES {
                 let _ = decide(profile, action);
             }
+        }
+    }
+
+    // --- EN.15.E task 1: the three sweep GatedAction variants -------------------------
+
+    /// AC: `decide(Standard, WakeLane)` denies and `decide(Standard, Notify)` permits —
+    /// `Notify` is the only one of the three sweep actions `Standard` allows.
+    #[test]
+    fn standard_permits_notify_only_among_the_sweep_actions() {
+        assert_eq!(
+            decide(PermissionProfile::Standard, GatedAction::WakeLane),
+            Decision::Deny
+        );
+        assert_eq!(
+            decide(PermissionProfile::Standard, GatedAction::RunDrain),
+            Decision::Deny
+        );
+        assert_eq!(
+            decide(PermissionProfile::Standard, GatedAction::Notify),
+            Decision::Permit
+        );
+    }
+
+    /// AC: `decide(Unrestricted, RunDrain)` permits; `decide(Locked, Notify)` denies.
+    #[test]
+    fn unrestricted_permits_all_three_locked_denies_all_three() {
+        assert_eq!(
+            decide(PermissionProfile::Unrestricted, GatedAction::RunDrain),
+            Decision::Permit
+        );
+        assert_eq!(
+            decide(PermissionProfile::Locked, GatedAction::Notify),
+            Decision::Deny
+        );
+        for action in [
+            GatedAction::Notify,
+            GatedAction::WakeLane,
+            GatedAction::RunDrain,
+        ] {
+            assert_eq!(
+                decide(PermissionProfile::Unrestricted, action),
+                Decision::Permit,
+                "unrestricted must permit {action:?}"
+            );
+            assert_eq!(
+                decide(PermissionProfile::Locked, action),
+                Decision::Deny,
+                "locked must deny {action:?}"
+            );
+        }
+    }
+
+    /// AC: `decide(_, ClearOperatorGate)` is denied before any profile lookup runs, for
+    /// every profile including `Unrestricted` — the most permissive level does not
+    /// carve out an exception.
+    #[test]
+    fn clear_operator_gate_denied_before_profile_lookup_including_unrestricted() {
+        assert_eq!(
+            decide(
+                PermissionProfile::Unrestricted,
+                GatedAction::ClearOperatorGate
+            ),
+            Decision::Deny
+        );
+        for profile in ALL_PROFILES {
+            assert_eq!(
+                decide(profile, GatedAction::ClearOperatorGate),
+                Decision::Deny
+            );
         }
     }
 
