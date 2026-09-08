@@ -53,6 +53,60 @@ impl Node for WriterBranch {
     }
 }
 
+/// A branch node that always fails with a fixed error message.
+struct FailingBranch {
+    identity: &'static str,
+    message: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Node for FailingBranch {
+    async fn process(&self, _ctx: TaskContext) -> Result<TaskContext, NodeError> {
+        Err(NodeError::new(self.message.to_string()))
+    }
+
+    fn name(&self) -> &str {
+        self.identity
+    }
+}
+
+/// EN.ticket.parallel-node-partial-success task 1: today, `ParallelNode`
+/// discards every successful branch's output the moment ANY branch fails —
+/// `join_all` has already awaited every branch by the time the first `Err`
+/// is found, so the surviving branch's work is thrown away along with it.
+///
+/// This test states the desired `Tolerate` behavior executably: a two-branch
+/// fan-out where one branch fails should still return `Ok` with the
+/// surviving branch's key present in the merged context. It is expected to
+/// FAIL against today's `ParallelNode`, which has no tolerate mode at all
+/// and unconditionally returns the first branch's `Err`.
+#[tokio::test]
+async fn fanout_tolerates_one_failing_branch_and_keeps_survivor_output() {
+    let branches: Vec<Box<dyn Node>> = vec![
+        Box::new(WriterBranch {
+            identity: "SurvivingBranch",
+            write_key: "Survivor",
+            value: serde_json::json!({ "ok": true }),
+        }),
+        Box::new(FailingBranch {
+            identity: "FailingBranch",
+            message: "simulated branch failure",
+        }),
+    ];
+    let fanout = ParallelNode::new("Fanout", branches);
+
+    let out = fanout
+        .process(empty_context())
+        .await
+        .expect("a tolerant fan-out should return Ok even with one failing branch");
+
+    assert_eq!(
+        out.nodes.get("Survivor"),
+        Some(&serde_json::json!({ "ok": true })),
+        "the surviving branch's output should still be present in the merged context"
+    );
+}
+
 #[tokio::test]
 async fn fanout_merge_resolves_key_collision_deterministically() {
     let branches: Vec<Box<dyn Node>> = vec![
