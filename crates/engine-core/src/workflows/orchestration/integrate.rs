@@ -79,6 +79,7 @@ use super::chain::{ChainStep, StepKind};
 use super::checkpoint::{
     read_checkpoint, write_checkpoint, Checkpoint, CheckpointStep, ReadCheckpoint,
 };
+use super::coord_lane::CoordHandle;
 use super::dispatch::{execute_dispatch_step, DispatchStepError};
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
@@ -1420,6 +1421,7 @@ pub async fn integrate_chain(
         close_block,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1477,6 +1479,62 @@ pub async fn integrate_chain_with_journal(
         close_block,
         Some(journal_sink),
         None,
+        None,
+    )
+    .await
+}
+
+/// Identical to [`integrate_chain`], except a [`CoordHandle`] is threaded
+/// in so the chain registers a lane, heartbeats it, and takes/releases the
+/// block-scoped repo lease at each block boundary (`EN.15.D` task 1). `None`
+/// here is behavior-identical to [`integrate_chain`] itself — see
+/// [`integrate_chain_impl`]'s own "With `coord: None`" doc note.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_coord(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    coord: Option<&CoordHandle>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        None,
+        None,
+        coord,
     )
     .await
 }
@@ -1537,8 +1595,27 @@ pub async fn integrate_chain_with_dispatch(
         close_block,
         journal_sink,
         Some(dispatcher),
+        None,
     )
     .await
+}
+
+/// Releases the block-scoped coordination lease when it drops, at the end of
+/// whichever loop iteration constructed it — `EN.15.D` task 1. A step has
+/// several exit paths (a bail's `return`, a cancel's `break`, a dispatch
+/// step's `continue`, or falling off the bottom on normal completion); a
+/// `Drop` guard covers every one of them without duplicating an
+/// `unlease()` call at each site. A no-op when `coord` is `None`.
+struct StepLeaseGuard<'a> {
+    coord: Option<&'a CoordHandle>,
+}
+
+impl Drop for StepLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.coord {
+            let _ = handle.unlease();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1564,6 +1641,14 @@ async fn integrate_chain_impl(
     close_block: &CloseBlockFn,
     journal_sink: Option<&JournalSinkFn>,
     dispatcher: Option<&Dispatcher>,
+    // `EN.15.D` task 1: ADDITIVE. With `coord: None`, every effect below is a no-op and this
+    // loop's observable behaviour is byte-identical to before this parameter existed — the
+    // behavior-stability bar the task record sets. With `Some(handle)`, the chain registers
+    // once before the loop, heartbeats the registry claim at every block boundary, and takes
+    // the block-scoped repo lease immediately before a step runs, releasing it (via
+    // `StepLeaseGuard`'s `Drop`) on every path that leaves that loop iteration — a bail, a
+    // cancel, a dispatch step, or a normal completion alike.
+    coord: Option<&CoordHandle>,
 ) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
     let total_steps = chain.len();
     let mut outcomes = Vec::with_capacity(chain.len());
@@ -1593,6 +1678,24 @@ async fn integrate_chain_impl(
     // decides what to do with the answer, and the decision lives here,
     // not in Synapse.
     let mut pending_skip = false;
+    // `EN.15.D` task 1: register this chain as a lane-agent claim ONCE,
+    // before the loop even starts — a no-op when `coord` is `None`. The
+    // `roadmap` a Rust-driven chain registers under is the first step's
+    // own `roadmap` field (an explicit block list with no roadmap
+    // registers under an empty string, same as a chain with no roadmap
+    // concept at all).
+    if let Some(handle) = coord {
+        let roadmap = chain
+            .first()
+            .and_then(|s| s.roadmap.as_deref())
+            .unwrap_or("");
+        let _ = handle.register(roadmap);
+    }
+    // Every block id in this chain — the yardstick `CoordHandle::lease`'s
+    // per-step `window` is checked against (see `coord::write::lease`'s
+    // own doc: a window naming a block absent from `lane_blocks` is
+    // refused before anything is written).
+    let lane_blocks: Vec<String> = chain.iter().map(|s| s.block_id.clone()).collect();
     for step in chain {
         // A step skipped by the immediately preceding `RECALL` dispatch
         // step's empty result: not executed at all — no dependency check,
@@ -1732,6 +1835,20 @@ async fn integrate_chain_impl(
         // here re-orders relative to other lanes; each lane still only
         // ever acquires one permit, once, for its own step.
         let _permit = admission.acquire_for(step).await;
+
+        // `EN.15.D` task 1: heartbeat the registry claim and take the
+        // block-scoped lease immediately before this step runs — a no-op
+        // pair when `coord` is `None`. `_step_lease_guard` releases the
+        // lease when it drops at the end of THIS loop iteration, on every
+        // path that leaves it (a bail's `return`, a cancel's `break`, a
+        // dispatch step's `continue`, or falling off the bottom on a
+        // normal completion) — see `StepLeaseGuard`'s own doc.
+        if let Some(handle) = coord {
+            let _ = handle.heartbeat(Some(step.block_id.as_str()));
+            let window = [step.block_id.clone()];
+            let _ = handle.lease(okf_core::LeaseKind::Exclusive, Some(&window), &lane_blocks);
+        }
+        let _step_lease_guard = StepLeaseGuard { coord };
 
         let step_lane = lane.unwrap_or(step.repo.as_str());
 
@@ -5034,6 +5151,130 @@ mod tests {
             true,
             uuid::Uuid::new_v4(),
             &|_repo: &str, _id: &str| {},
+        )
+        .await
+        .expect("chain should complete");
+        assert_eq!(outcomes.len(), 1);
+    }
+
+    fn coord_now_iso() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    /// `EN.15.D` task 1's own acceptance criterion: a chain driven with
+    /// `Some(&CoordHandle)` against a temp lock dir writes a registry
+    /// claim at `lane-agents/agent-<agent>.json` and a lease at
+    /// `leases/lease-<repo>.json`.
+    #[tokio::test]
+    async fn a_chain_driven_with_coord_writes_a_registry_claim_and_a_lease() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let lock_dir = tempfile::tempdir().unwrap();
+
+        let coord = CoordHandle::new(
+            lock_dir.path().to_path_buf(),
+            "repo-a",
+            "engine-rs",
+            "engine-rs-1",
+            coord_now_iso,
+        );
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let outcomes = integrate_chain_with_coord(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+            Some(&coord),
+        )
+        .await
+        .expect("chain should complete");
+        assert_eq!(outcomes.len(), 1);
+
+        let claim_path = lock_dir
+            .path()
+            .join("lane-agents")
+            .join("agent-engine-rs-1.json");
+        assert!(
+            claim_path.exists(),
+            "expected a registry claim at {claim_path:?}"
+        );
+
+        // The lease is taken-then-released per step (`StepLeaseGuard`), so
+        // by the time the chain returns the lease file is gone again —
+        // assert on its PARENT directory (`leases/`) instead, which only
+        // ever gets created by a real `lease()` call having run.
+        let leases_dir = lock_dir.path().join("leases");
+        assert!(
+            leases_dir.exists(),
+            "expected a leases/ directory at {leases_dir:?} (lease() must have run)"
+        );
+        let lease_path = leases_dir.join("lease-repo-a.json");
+        assert!(
+            !lease_path.exists(),
+            "expected the per-step lease to be released after the step completed"
+        );
+    }
+
+    /// With `coord: None`, `integrate_chain_with_coord` behaves exactly
+    /// like plain `integrate_chain` — the behavior-stability bar task 1
+    /// sets. Writes nothing under a coordination lock dir at all.
+    #[tokio::test]
+    async fn a_chain_driven_with_no_coord_writes_nothing_coordination_shaped() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let outcomes = integrate_chain_with_coord(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+            None,
         )
         .await
         .expect("chain should complete");
