@@ -193,6 +193,41 @@ diagnostic) is logged via `tracing::warn!` rather than silently swallowed; `clos
 fire-and-forget signature gives the seam no other channel to report through, so the block is simply
 left open in `state.json` and can still be closed by hand or on a later run.
 
+## Fleet coordination: a Rust-driven chain is now visible to `bastion coord status`
+
+Before `EN.ticket.wire-coord-handle-into-orchestration-run-node`, the coordination machinery added
+by `EN.15.D` — register/heartbeat a lane-agent claim, take/release a per-block repo lease, drain a
+coordination inbox at each block boundary — existed only in `integrate::integrate_chain_with_coord`
+and was reachable from tests, never from a real chain: `OrchestrationRunNode::process` always called
+plain `integrate_chain` with `coord: None`. A Rust-driven lane never appeared in `bastion coord
+status`, never answered a `RENDEZVOUS`, and a `LEASE_RELEASE` sent to it did nothing.
+
+`OrchestrationRunNode` now carries an opt-in `coord_agent: Option<String>` field
+(`with_coord_agent(agent)`), mirroring `with_close_block`/`with_resolve_depends_on`. When set,
+`process` builds a real [`CoordHandle`](../../crates/engine-core/src/workflows/orchestration/coord_lane.rs)
+— resolving the lock dir via `crate::coord::resolve_lock_dir(&event.brain_root)`, using
+`coord_now_iso` as its clock seam — once the chain and lane are known, and drives the run through
+`integrate_chain_with_coord(..., coord.as_ref(), ...)` instead of `integrate_chain`. Leaving
+`with_coord_agent` unset (the default on `OrchestrationRunNode::new()`) keeps `coord: None` and the
+pre-fix behavior exactly — nothing regresses for a caller that has not adopted the seam.
+
+Production registration (`register_orchestration_with_registry`, `engine-serve/src/workflows.rs`)
+wires a real identity through `coord_agent_identity()` —
+`<engine_core::build_info::WRITER>-<hostname>-<pid>`, the same `host_stamp()` pattern
+`SdlcFlowState::to_committed_state_json` already uses, unique per process so two Rust-driven chains
+on one host never collide on a single registry claim. With this wired, a chain run through `bastion
+serve` now: registers and heartbeats a lane-agent claim visible in `bastion coord status`, releases
+it on clean exit; takes/releases a per-block repo lease around each step (via `okf_core::LeaseRecord`
+exclusive leases, read back by `QueueHoldSource`); drains its inbox at each block boundary,
+quarantining a malformed message to `processing/` with a receipt rather than skipping it silently;
+answers a `RENDEZVOUS` from a sibling lane; and, if killed mid-run, leaves a registry entry the next
+`coord status` reports `stale` once its heartbeat ages past `okf_core::COORD_STALE_TTL_SECONDS`.
+
+`register_orchestration` (the plain registration path, `engine-serve/src/workflows.rs`) separately
+now passes a real `QueueHoldSource` — backed by the same coordination-tree lease files — instead of
+the placeholder `NeverHeld`, so an operator hold taken through the coordination layer is honored by
+this registration path too.
+
 ## Campaign identity
 
 Every `ORCHESTRATION` run resolves a `campaign_id` (`EN.11.E`) — the event's own `campaign_id` when
