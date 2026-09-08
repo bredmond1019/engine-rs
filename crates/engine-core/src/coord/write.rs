@@ -857,6 +857,125 @@ pub fn complete(
     Ok(true)
 }
 
+/// Every message file left in `<lock_dir>/queue/<repo>/<lane>/processing/` when the writer
+/// starts is re-queued back to `.../inbox/` rather than stranded there by a killed process.
+/// Mirrors `drain`'s directory walk, but in reverse and writing NO new receipt:
+/// `check_messages.py`'s layout invariant requires no receipt for a file sitting in `inbox/`,
+/// and the file's original `inbox->processing` receipt (written before the crash) is still
+/// exactly one, so leaving it untouched is what keeps the tree valid. Appending a SECOND
+/// `inbox->processing` receipt here would read as the duplicate-receipt double-processing
+/// signal the next time this same message is legitimately drained.
+///
+/// A missing `processing/` (nothing was mid-flight for this lane) is not an error -- it is an
+/// empty re-queue. Idempotent: a message already moved back to `inbox/` by an earlier call is no
+/// longer in `processing/`, so a second call against the same tree finds nothing left to move,
+/// and a destination that already exists in `inbox/` is left alone rather than clobbered.
+/// Returns the `message_id` of every file re-queued, in filename order.
+pub fn requeue_processing(
+    lock_dir: &Path,
+    repo: &str,
+    lane: &str,
+) -> Result<Vec<String>, CoordWriteError> {
+    let q_dir = queue_dir(lock_dir, repo, lane);
+    let processing_dir = q_dir.join("processing");
+    let inbox_dir = q_dir.join("inbox");
+
+    let mut files: Vec<PathBuf> = match fs::read_dir(&processing_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect(),
+        Err(_) => return Ok(Vec::new()),
+    };
+    files.sort();
+
+    fs::create_dir_all(&inbox_dir).map_err(|e| CoordWriteError::Io {
+        path: inbox_dir.clone(),
+        source: e,
+    })?;
+
+    let mut requeued = Vec::new();
+    for path in files {
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            // Another re-queuer already won the race for this file -- same at-least-once
+            // filesystem-layer discipline `drain` documents above.
+            Err(_) => continue,
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(message_id) = value.get("message_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let message_id = message_id.to_string();
+        let dest = inbox_dir.join(path.file_name().expect("path built from a dir entry"));
+        if dest.exists() {
+            // Already re-queued (e.g. a duplicate start, or a concurrent re-queuer) -- leave
+            // the processing/ copy alone rather than clobbering the inbox/ copy or erroring.
+            continue;
+        }
+        if fs::rename(&path, &dest).is_err() {
+            continue;
+        }
+        requeued.push(message_id);
+    }
+    Ok(requeued)
+}
+
+/// The "on writer start" driver: walk every `<lock_dir>/queue/<repo>/<lane>/` directory that
+/// exists and re-queue its `processing/` via [`requeue_processing`]. Unlike every other verb in
+/// this module, this one takes no `(repo, lane)` -- a process that was just killed has no way to
+/// know in advance which lanes it had messages mid-flight for, so this discovers them from the
+/// directory tree itself (`queue/<repo>/<lane>/`) rather than requiring a caller to already
+/// know. Returns `(repo, lane, message_id)` for every message re-queued, in directory-then-
+/// filename order.
+///
+/// A missing `<lock_dir>/queue/` (nothing has ever been sent or received anywhere) is not an
+/// error -- it is an empty re-queue.
+pub fn requeue_all_processing(
+    lock_dir: &Path,
+) -> Result<Vec<(String, String, String)>, CoordWriteError> {
+    let queue_root = lock_dir.join("queue");
+    let mut repo_dirs: Vec<PathBuf> = match fs::read_dir(&queue_root) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => return Ok(Vec::new()),
+    };
+    repo_dirs.sort();
+
+    let mut requeued = Vec::new();
+    for repo_dir in repo_dirs {
+        let Some(repo) = repo_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let repo = repo.to_string();
+        let mut lane_dirs: Vec<PathBuf> = match fs::read_dir(&repo_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
+            Err(_) => continue,
+        };
+        lane_dirs.sort();
+        for lane_dir in lane_dirs {
+            let Some(lane) = lane_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let lane = lane.to_string();
+            for message_id in requeue_processing(lock_dir, &repo, &lane)? {
+                requeued.push((repo.clone(), lane.clone(), message_id));
+            }
+        }
+    }
+    Ok(requeued)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2081,6 +2200,166 @@ mod tests {
         assert!(
             output.status.success(),
             "check_messages.py must pass on a tree produced by send/drain/complete\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `processing/` re-queue on start. `EN.15.C` task 5.
+    // -----------------------------------------------------------------------------------------
+
+    /// Puts a message directly into `processing/` with its `inbox->processing` receipt already
+    /// recorded -- exactly the shape a kill-and-restart leaves behind (a real `send` + `drain`,
+    /// simulating the crash by simply not calling `complete`).
+    fn message_stranded_in_processing(
+        lock_dir: &Path,
+        repo: &str,
+        lane: &str,
+        message_id: &str,
+    ) -> PathBuf {
+        send(
+            lock_dir,
+            repo,
+            lane,
+            message_json(message_id, "2026-09-08T10:00:00Z"),
+            None,
+        )
+        .expect("send must succeed");
+        let moved =
+            drain(lock_dir, repo, lane, "2026-09-08T10:05:00Z").expect("drain must succeed");
+        assert_eq!(moved, vec![message_id.to_string()]);
+        queue_dir(lock_dir, repo, lane)
+            .join("processing")
+            .join(format!("20260908T100000Z-{message_id}.json"))
+    }
+
+    #[test]
+    fn requeue_processing_moves_a_stranded_message_back_to_inbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+        let processing_path =
+            message_stranded_in_processing(dir.path(), "bastion", "bastion-lane", message_id);
+        assert!(processing_path.exists(), "must start out stranded");
+
+        let requeued = requeue_processing(dir.path(), "bastion", "bastion-lane")
+            .expect("requeue must succeed");
+        assert_eq!(requeued, vec![message_id.to_string()]);
+
+        assert!(
+            !processing_path.exists(),
+            "must be gone from processing/ after the requeue"
+        );
+        let inbox_path = queue_dir(dir.path(), "bastion", "bastion-lane")
+            .join("inbox")
+            .join(processing_path.file_name().unwrap());
+        assert!(inbox_path.exists(), "must be back in inbox/");
+
+        // The receipt discipline from task 4 survives the requeue: the single
+        // `inbox->processing` receipt from before the crash is still there, and no new receipt
+        // was appended for the requeue itself (a file in inbox/ needs none).
+        let q_dir = queue_dir(dir.path(), "bastion", "bastion-lane");
+        let receipts = read_receipts(&q_dir);
+        assert_eq!(
+            receipts.len(),
+            1,
+            "the requeue must not append a second receipt"
+        );
+        assert_eq!(receipts[0]["from"], "inbox");
+        assert_eq!(receipts[0]["to"], "processing");
+    }
+
+    #[test]
+    fn requeue_processing_on_a_lane_with_nothing_stranded_is_an_empty_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let requeued = requeue_processing(dir.path(), "bastion", "never-crashed")
+            .expect("requeuing an unpopulated lane must not error");
+        assert!(requeued.is_empty());
+    }
+
+    #[test]
+    fn requeue_processing_is_idempotent_and_does_not_duplicate_the_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+        message_stranded_in_processing(dir.path(), "bastion", "bastion-lane", message_id);
+
+        let first = requeue_processing(dir.path(), "bastion", "bastion-lane")
+            .expect("first requeue must succeed");
+        assert_eq!(first, vec![message_id.to_string()]);
+
+        let second = requeue_processing(dir.path(), "bastion", "bastion-lane")
+            .expect("second requeue against the same tree must not error");
+        assert!(
+            second.is_empty(),
+            "starting twice must not requeue (or duplicate) the same message again"
+        );
+
+        let inbox_dir = queue_dir(dir.path(), "bastion", "bastion-lane").join("inbox");
+        let entries: Vec<_> = fs::read_dir(&inbox_dir)
+            .expect("inbox dir must exist")
+            .flatten()
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one copy of the message must sit in inbox/, never two"
+        );
+    }
+
+    #[test]
+    fn requeue_all_processing_discovers_the_repo_and_lane_from_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+        message_stranded_in_processing(dir.path(), "bastion", "bastion-lane", message_id);
+
+        let requeued = requeue_all_processing(dir.path()).expect("requeue-all must succeed");
+        assert_eq!(
+            requeued,
+            vec![(
+                "bastion".to_string(),
+                "bastion-lane".to_string(),
+                message_id.to_string()
+            )]
+        );
+
+        let inbox_path = queue_dir(dir.path(), "bastion", "bastion-lane")
+            .join("inbox")
+            .join(format!("20260908T100000Z-{message_id}.json"));
+        assert!(inbox_path.exists());
+    }
+
+    #[test]
+    fn requeue_all_processing_with_no_queue_tree_at_all_is_an_empty_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let requeued = requeue_all_processing(dir.path()).expect("must not error");
+        assert!(requeued.is_empty());
+    }
+
+    /// The tree after a requeue still satisfies `check_messages.py` -- the receipt discipline
+    /// gate stays green through the crash-recovery path, not just the happy path.
+    #[test]
+    fn the_tree_after_a_requeue_passes_check_messages_py() {
+        let Some(script) = require_messages_parity_environment() else {
+            return;
+        };
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+        message_stranded_in_processing(lock_dir.path(), "bastion", "bastion-lane", message_id);
+
+        requeue_processing(lock_dir.path(), "bastion", "bastion-lane")
+            .expect("requeue must succeed");
+
+        let output = std::process::Command::new("python3")
+            .arg(&script)
+            .arg("--lock-dir")
+            .arg(lock_dir.path())
+            .arg("--repo")
+            .arg("bastion")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn python3 check_messages.py: {e}"));
+        assert!(
+            output.status.success(),
+            "check_messages.py must pass on a tree after a requeue\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
