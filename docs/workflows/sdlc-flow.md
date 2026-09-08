@@ -444,7 +444,19 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
   `resume`; see the fifth case in [Restart vs. resume](#restart-vs-resume--what-resume-actually-does)), `auto_pr` (default
   **`true`**), `branch_name` (defaults to `sdlc/<spec_slug>`), `llm_triage` (default `false`),
   `policy` (optional per-run override), `profile` (optional named policy-profile bundle — see
-  [sdlc-flow-policy.md](sdlc-flow-policy.md)), `repo` (optional, `EN.3.K` — see below).
+  [sdlc-flow-policy.md](sdlc-flow-policy.md)), `repo` (optional, `EN.3.K` — see below), `agent`
+  (optional lane identity, `EN.15.B` — see below).
+- **`agent` — the lane identity threaded into `EmitStateNode` and `CloseBlockNode` (`EN.15.B`).**
+  An optional `Option<String>`. When present, `register_sdlc_flow`'s dispatch factory (in
+  `engine-serve/src/workflows.rs`) passes it into `registry_for_policy_with_cancellation`, which
+  calls `graph.rs`'s private `registry_with_agent` helper to configure the SAME identity onto
+  **both** `EmitStateNode::with_agent` and `CloseBlockNode::with_agent` — never onto only one.
+  This is what lets both nodes' `mev` calls (`emit-state --write --agent <id>` and
+  `set_block_status_as`'s guarded close) self-exempt from an exclusive `scope:repo` lease this
+  same lane already holds, rather than being refused by their own chain's lease. Absent (the
+  default), neither node passes an identity, byte-identical to pre-`EN.15.B` behavior — see
+  [architecture.md § `EmitStateNode` lease self-exemption](../architecture.md#emitstatenode-lease-self-exemption-enticketemit-state-node-must-self-exempt-its-own-lease)
+  for the full mechanism, including `CloseBlockNode`'s guarded close via `mev::set_block_status_as`.
 - **`repo` — the dispatch target, as a registry slug, never a path (`EN.3.K`).** `repo` is an
   `Option<String>` naming an entry in `brain.toml`'s `[[repos]]` list (e.g. `"bastion"`, `"mev"`,
   `"engine-rs"`) — **a slug, never a filesystem path.** This is a deliberate security boundary, not

@@ -114,7 +114,10 @@ reconcile at all.
 
 ### Closing a block also commits what closing it regenerated
 
-`CloseBlockNode` closes the block through `mev::set_block_status` with a write. That call chains
+`CloseBlockNode` closes the block through `mev::set_block_status_as` with a write — as of
+`EN.15.B`, the identity-taking, lease-aware counterpart to `set_block_status`; see
+[architecture.md § `EN.15.B`](../architecture.md#en15b--one-identity-into-both-emitstatenode-and-closeblocknode-and-a-guarded-close)
+for the guarded-close mechanism and the `agent` identity it takes. That call chains
 internally into `emit-state --write`, which regenerates derived surfaces **across the whole fleet** —
 master-plan wave tables, project caches, tier rollups, boards. Until
 `EN.ticket.close-block-node-leaves-derived-output-uncommitted` (2026-08-30) the node wrote all of
