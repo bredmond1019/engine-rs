@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 
-use okf_core::{Coord, HeartbeatValue, PidSource, RegistryClaim, SlotRecord};
+use okf_core::{Coord, HeartbeatValue, LeaseRecord, PidSource, RegistryClaim, SlotRecord};
 
 /// Subdirectory under the lock dir holding pre-overwrite snapshots. Sits inside the
 /// already-gitignored `.fleet-locks/` (see the block record's `notes`), so no `.gitignore`
@@ -471,10 +471,111 @@ pub fn release(lock_dir: &Path, agent_name: &str) -> Result<bool, CoordWriteErro
     Ok(existed)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Lease verbs — lease / unlease. `EN.15.C` task 3.
+// ---------------------------------------------------------------------------------------------
+
+/// `<lock_dir>/leases/lease-<repo>.json` — the exact directory
+/// `mev::brain::lease::check_quiesce` reads (`.claude/workflows/lease.schema.json`'s
+/// `leases/` subdir), so a lease written here is indistinguishable, to mev, from one written by
+/// hand.
+fn lease_path(lock_dir: &Path, repo: &str) -> PathBuf {
+    lock_dir
+        .join("leases")
+        .join(format!("lease-{}.json", safe_component(repo)))
+}
+
+/// Everything a `lease` call needs to acquire (or renew) an exclusive/shared claim on `repo`'s
+/// working tree.
+pub struct LeaseRequest<'a> {
+    pub repo: &'a str,
+    pub lane: &'a str,
+    /// The `ListAgents` nickname taking this lease — the SAME `agent` field
+    /// `mev::brain::lease::check_quiesce`'s self-exemption compares against, and the same one
+    /// `EN.15.B` threads onto `EmitStateNode`/`CloseBlockNode` from
+    /// `engine-serve/src/workflows.rs:429`'s `sdlc_event.agent`. This seam introduces no second
+    /// identity concept — a caller passes whatever string it would otherwise pass to those
+    /// nodes.
+    pub agent: &'a str,
+    pub kind: okf_core::LeaseKind,
+    /// OPTIONAL. Absent means `LeaseScope::Repo`, matching the schema's own documented default.
+    pub scope: Option<okf_core::LeaseScope>,
+    pub host: Option<&'a str>,
+    /// ISO-8601 timestamp with timezone — stamped onto `acquired_at` on a FIRST lease (a
+    /// renewal keeps the existing `acquired_at`) and onto `heartbeat` on every call, matching
+    /// `register`'s own acquisition-timestamp-set-once/heartbeat-every-call semantics.
+    pub now_iso: &'a str,
+    /// The per-block window this lease's exclusivity claims, mirroring `MV.20.C`'s lane-record
+    /// `exclusive_repos: [{repo, blocks}]` window shape. `None` (or an empty slice) is a
+    /// whole-lane lease claiming no window — parity with that shape's plain string form, which
+    /// names no blocks at all. Every block named here is checked against `lane_blocks` BEFORE
+    /// anything is written; this is request-time validation only — `okf_core::LeaseRecord`
+    /// carries no `window` field of its own (`OK.6.A`), so nothing here is persisted to disk.
+    pub window: Option<&'a [String]>,
+    /// The full set of block ids the lane actually owns (its own `blocks[]`) — the yardstick
+    /// `window` is checked against. Caller-supplied: this seam has no reader of its own for a
+    /// lane record.
+    pub lane_blocks: &'a [String],
+}
+
+/// `lease` — acquire or renew an exclusive/shared claim on `req.repo`'s working tree. A
+/// `req.window` naming a block absent from `req.lane_blocks` is refused, naming the absent
+/// block, BEFORE anything is written — mirroring every other refusal in this seam ("a failure
+/// at any step writes nothing").
+pub fn lease(lock_dir: &Path, req: &LeaseRequest) -> Result<(), CoordWriteError> {
+    let path = lease_path(lock_dir, req.repo);
+    if let Some(window) = req.window {
+        for block in window {
+            if !req.lane_blocks.iter().any(|b| b == block) {
+                return Err(CoordWriteError::Invalid {
+                    path,
+                    reason: format!(
+                        "lease window names block `{block}`, which is absent from the lane's \
+                         blocks[]"
+                    ),
+                });
+            }
+        }
+    }
+
+    let existing = read_typed::<LeaseRecord>(&path);
+    let record = LeaseRecord {
+        repo: req.repo.to_string(),
+        lane: req.lane.to_string(),
+        agent: req.agent.to_string(),
+        // `acquired_at` is an acquisition timestamp, set once: a renewal keeps the FIRST
+        // lease's value rather than re-stamping it — same discipline as `register`'s
+        // `started_at`.
+        acquired_at: existing
+            .as_ref()
+            .map(|l| l.acquired_at.clone())
+            .unwrap_or_else(|| req.now_iso.to_string()),
+        kind: req.kind,
+        heartbeat: Some(req.now_iso.to_string()),
+        scope: req.scope,
+        host: None, // stamped by write_coord_json below.
+    };
+    let value = serde_json::to_value(&record).map_err(|e| CoordWriteError::Invalid {
+        path: path.clone(),
+        reason: format!("lease record failed to serialize: {e}"),
+    })?;
+    write_coord_json::<LeaseRecord>(lock_dir, &path, value, req.host)
+}
+
+/// `unlease` — release the lease on `repo`, if any. Idempotent: an already-absent lease
+/// returns `Ok(false)` rather than an error, matching `release`'s own always-succeeds contract.
+pub fn unlease(lock_dir: &Path, repo: &str) -> Result<bool, CoordWriteError> {
+    let path = lease_path(lock_dir, repo);
+    let existed = path.exists();
+    if existed {
+        fs::remove_file(&path).map_err(|e| CoordWriteError::Io { path, source: e })?;
+    }
+    Ok(existed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use okf_core::LeaseRecord;
 
     fn lease_json(heartbeat: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1089,6 +1190,295 @@ mod tests {
             outcome.reason.as_deref(),
             Some(python_reason.as_str()),
             "rust and python refusal messages must be byte-identical"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Lease verbs — lease / unlease. `EN.15.C` task 3.
+    // -----------------------------------------------------------------------------------------
+
+    fn lease_req<'a>(
+        repo: &'a str,
+        lane: &'a str,
+        agent: &'a str,
+        now_iso: &'a str,
+        window: Option<&'a [String]>,
+        lane_blocks: &'a [String],
+    ) -> LeaseRequest<'a> {
+        LeaseRequest {
+            repo,
+            lane,
+            agent,
+            kind: okf_core::LeaseKind::Exclusive,
+            scope: Some(okf_core::LeaseScope::Repo),
+            host: None,
+            now_iso,
+            window,
+            lane_blocks,
+        }
+    }
+
+    #[test]
+    fn lease_writes_a_record_readable_via_read_typed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_blocks: Vec<String> = Vec::new();
+        let req = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "engine-rs-1",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &req).expect("lease must succeed");
+
+        let path = lease_path(dir.path(), "engine-rs");
+        let record: LeaseRecord = read_typed(&path).expect("lease record must be readable");
+        assert_eq!(record.repo, "engine-rs");
+        assert_eq!(record.lane, "engine-rs");
+        assert_eq!(record.agent, "engine-rs-1");
+        assert_eq!(record.acquired_at, "2026-09-08T10:00:00Z");
+        assert_eq!(record.heartbeat.as_deref(), Some("2026-09-08T10:00:00Z"));
+        assert_eq!(record.kind, okf_core::LeaseKind::Exclusive);
+    }
+
+    #[test]
+    fn renewed_lease_restamps_heartbeat_only_and_leaves_acquired_at_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_blocks: Vec<String> = Vec::new();
+        let first = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "engine-rs-1",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &first).expect("first lease must succeed");
+
+        let second = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "engine-rs-1",
+            "2026-09-08T11:30:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &second).expect("renewal must succeed");
+
+        let record: LeaseRecord =
+            read_typed(&lease_path(dir.path(), "engine-rs")).expect("record must be readable");
+        assert_eq!(
+            record.acquired_at, "2026-09-08T10:00:00Z",
+            "acquired_at is set once and must never be re-stamped by a renewal"
+        );
+        assert_eq!(record.heartbeat.as_deref(), Some("2026-09-08T11:30:00Z"));
+    }
+
+    #[test]
+    fn lease_whose_window_names_a_block_absent_from_lane_blocks_is_refused_naming_the_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lane_blocks = vec!["EN.15.A".to_string(), "EN.15.B".to_string()];
+        let window = vec!["EN.99.NOPE".to_string()];
+        let req = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "engine-rs-1",
+            "2026-09-08T10:00:00Z",
+            Some(&window),
+            &lane_blocks,
+        );
+
+        let err = lease(dir.path(), &req).expect_err("a window naming an absent block must refuse");
+        match err {
+            CoordWriteError::Invalid { reason, .. } => {
+                assert!(
+                    reason.contains("EN.99.NOPE"),
+                    "refusal must name the absent block, got: {reason}"
+                );
+            }
+            other => panic!("expected CoordWriteError::Invalid, got {other:?}"),
+        }
+        assert!(
+            !lease_path(dir.path(), "engine-rs").exists(),
+            "a refused lease must write nothing"
+        );
+    }
+
+    #[test]
+    fn lease_whose_window_names_only_blocks_in_lane_blocks_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lane_blocks = vec!["EN.15.A".to_string(), "EN.15.C".to_string()];
+        let window = vec!["EN.15.C".to_string()];
+        let req = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "engine-rs-1",
+            "2026-09-08T10:00:00Z",
+            Some(&window),
+            &lane_blocks,
+        );
+
+        lease(dir.path(), &req).expect("a window fully contained in lane_blocks must succeed");
+        assert!(lease_path(dir.path(), "engine-rs").exists());
+    }
+
+    #[test]
+    fn unlease_removes_the_lease_and_is_idempotent_on_an_already_absent_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_blocks: Vec<String> = Vec::new();
+        let req = lease_req(
+            "engine-rs",
+            "engine-rs",
+            "engine-rs-1",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(dir.path(), &req).expect("lease must succeed");
+        assert!(lease_path(dir.path(), "engine-rs").exists());
+
+        let removed = unlease(dir.path(), "engine-rs").expect("unlease must succeed");
+        assert!(removed);
+        assert!(!lease_path(dir.path(), "engine-rs").exists());
+
+        let removed_again = unlease(dir.path(), "engine-rs").expect("idempotent unlease");
+        assert!(
+            !removed_again,
+            "unleasing an already-absent lease is a no-op, not an error"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The headline criterion: a lease written by this seam is indistinguishable, to the REAL
+    // mev, from one written by hand. Drives `mev::set_block_status_as` end to end against a
+    // real `.fleet-locks/` tree — the same brain-fixture pattern `close_block.rs`'s `EN.15.B`
+    // tests established, reused here rather than re-invented, but with the lease itself written
+    // through THIS seam's own `lease`/`unlease` instead of a hand-authored JSON literal.
+    // -----------------------------------------------------------------------------------------
+
+    /// A minimal brain root: `brain.toml` naming one repo, plus that repo's own
+    /// `planning/state.json` carrying no blocks at all. The quiesce guard is checked BEFORE
+    /// `mev::set_block_status_as` ever looks up the block key, so a nonexistent key is
+    /// sufficient to prove the refusal (or its absence) without depending on — or risking a
+    /// write to — any real block record.
+    fn brain_fixture(repo: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_dir = dir.path().join(repo);
+        fs::create_dir_all(repo_dir.join("planning")).expect("mkdir");
+        fs::write(
+            dir.path().join("brain.toml"),
+            format!("[[repos]]\nslug = \"{repo}\"\nrepo_path = \"{repo}\"\n"),
+        )
+        .expect("write brain.toml");
+        fs::write(
+            repo_dir.join("planning").join("state.json"),
+            format!(
+                r#"{{ "repo": "{repo}", "kind": "project", "updated": "2026-08-20",
+  "focus": {{ "now": [], "next": [], "blocked": [] }},
+  "tracks": [{{ "title": "P1", "blocks": [] }}] }}"#
+            ),
+        )
+        .expect("write state.json");
+        (dir, repo_dir)
+    }
+
+    #[test]
+    fn mev_check_quiesce_refuses_set_block_status_write_after_a_lease_written_by_this_seam_and_allows_it_after_release(
+    ) {
+        let (dir, repo_dir) = brain_fixture("engine-rs");
+        let root = dir.path();
+        // `mev::set_block_status_as`'s own `lock_dir: None` resolves to `<root>/.fleet-locks`
+        // (`mev::brain::lease::resolve_lock_dir`'s default) — this seam's `lease`/`unlease`
+        // take an already-resolved lock dir, so the two must agree on the SAME path here.
+        let lock_dir = root.join(".fleet-locks");
+        let no_blocks: Vec<String> = Vec::new();
+
+        // No lease yet: clear to proceed (block key does not exist, so this reports
+        // E_BLOCK_NOT_FOUND rather than mutating anything — proof the guard itself is clear,
+        // not proof the whole call succeeded).
+        let clear_before = mev::set_block_status_as(
+            root,
+            "engine-rs:EN.99.NOPE",
+            "closed",
+            true,
+            None,
+            Some("engine-rs-holder"),
+            None,
+            &repo_dir,
+        );
+        assert!(
+            clear_before.is_ok(),
+            "with no lease held, set_block_status_as must not be refused by the quiesce guard: {:?}",
+            clear_before.err()
+        );
+
+        // Write the lease through THIS seam.
+        let req = lease_req(
+            "engine-rs",
+            "test-lane",
+            "engine-rs-holder",
+            "2026-09-08T10:00:00Z",
+            None,
+            &no_blocks,
+        );
+        lease(&lock_dir, &req).expect("lease must succeed");
+
+        // A DIFFERENT identity is refused with E_QUIESCE_LEASE_HELD.
+        let refused = mev::set_block_status_as(
+            root,
+            "engine-rs:EN.99.NOPE",
+            "closed",
+            true,
+            None,
+            Some("engine-rs-someone-else"),
+            None,
+            &repo_dir,
+        );
+        let err =
+            refused.expect_err("a different identity must be refused while the lease is live");
+        assert!(
+            err.to_string().contains(mev::E_QUIESCE_LEASE_HELD),
+            "expected E_QUIESCE_LEASE_HELD in the refusal, got: {err}"
+        );
+
+        // The HOLDER's own write passes — self-exemption. Both directions asserted, so this
+        // cannot pass against a disabled guard.
+        let allowed_for_holder = mev::set_block_status_as(
+            root,
+            "engine-rs:EN.99.NOPE",
+            "closed",
+            true,
+            None,
+            Some("engine-rs-holder"),
+            None,
+            &repo_dir,
+        );
+        assert!(
+            allowed_for_holder.is_ok(),
+            "the lease's own holder must self-exempt: {:?}",
+            allowed_for_holder.err()
+        );
+
+        // Release through THIS seam, then re-check: a caller identified as the FORMER
+        // non-holder now proceeds too.
+        let removed = unlease(&lock_dir, "engine-rs").expect("unlease must succeed");
+        assert!(removed);
+
+        let clear_after = mev::set_block_status_as(
+            root,
+            "engine-rs:EN.99.NOPE",
+            "closed",
+            true,
+            None,
+            Some("engine-rs-someone-else"),
+            None,
+            &repo_dir,
+        );
+        assert!(
+            clear_after.is_ok(),
+            "after release, the write must no longer be refused by the quiesce guard: {:?}",
+            clear_after.err()
         );
     }
 }
