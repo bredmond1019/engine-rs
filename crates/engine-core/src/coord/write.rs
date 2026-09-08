@@ -1448,7 +1448,7 @@ mod tests {
     fn find_oracle_script() -> Option<PathBuf> {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let Some(brain_root) = find_brain_root(manifest_dir) else {
-            eprintln!(
+            tracing::warn!(
                 "SKIPPING register capacity parity test: no brain.toml found walking up from {} \
                  (this checkout has no sibling base-template to locate the oracle script in)",
                 manifest_dir.display()
@@ -1457,7 +1457,7 @@ mod tests {
         };
         let script = oracle_script_path(&brain_root);
         if !script.is_file() {
-            eprintln!(
+            tracing::warn!(
                 "SKIPPING register capacity parity test: brain root found at {} but {} does not exist",
                 brain_root.display(),
                 script.display()
@@ -1480,7 +1480,9 @@ mod tests {
 
     fn require_parity_environment() -> Option<PathBuf> {
         if !python3_available() {
-            eprintln!("SKIPPING register capacity parity test: python3 is not available on PATH");
+            tracing::warn!(
+                "SKIPPING register capacity parity test: python3 is not available on PATH"
+            );
             return None;
         }
         find_oracle_script()
@@ -2128,7 +2130,7 @@ mod tests {
     fn find_messages_oracle_script() -> Option<PathBuf> {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let Some(brain_root) = find_brain_root(manifest_dir) else {
-            eprintln!(
+            tracing::warn!(
                 "SKIPPING message parity test: no brain.toml found walking up from {} (this \
                  checkout has no sibling base-template to locate the oracle script in)",
                 manifest_dir.display()
@@ -2137,7 +2139,7 @@ mod tests {
         };
         let script = messages_oracle_script_path(&brain_root);
         if !script.is_file() {
-            eprintln!(
+            tracing::warn!(
                 "SKIPPING message parity test: brain root found at {} but {} does not exist",
                 brain_root.display(),
                 script.display()
@@ -2149,7 +2151,7 @@ mod tests {
 
     fn require_messages_parity_environment() -> Option<PathBuf> {
         if !python3_available() {
-            eprintln!("SKIPPING message parity test: python3 is not available on PATH");
+            tracing::warn!("SKIPPING message parity test: python3 is not available on PATH");
             return None;
         }
         find_messages_oracle_script()
