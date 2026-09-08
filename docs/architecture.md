@@ -180,7 +180,23 @@ engine-rs/
 │   │                         missing lock dir/subdirectory is a legitimate empty-fleet `Live`
 │   │                         state; fleet-concurrency slots are found by non-recursive listing at
 │   │                         the lock-dir root only, so a decoy subdirectory can never be read as
-│   │                         a slot), roadmap_status.rs (`EN.15.H` — a typed `LaneResult` join
+│   │                         a slot), write.rs (`EN.15.C` — the coordination WRITE seam, paired
+│   │                         with `mod.rs`'s read-only view: `write_coord_json`/
+│   │                         `write_heartbeat_file` schema-validate via `okf_core::Coord<T>`'s
+│   │                         Typed/Legacy split, stamp `host`, snapshot any prior file to
+│   │                         `.fleet-locks/.prev/<relative path>`, then write; `register`/
+│   │                         `heartbeat`/`release` cover the lane-agent registry claim plus an
+│   │                         optional heavy-lane fleet-concurrency slot (capacity refusal proven
+│   │                         byte-identical to base-template's `fleet_concurrency_check.py`);
+│   │                         `lease`/`unlease` validate a per-block `window` against a lane's
+│   │                         declared blocks and are proven end-to-end against
+│   │                         `mev::set_block_status_as`; `send`/`drain`/`complete` write
+│   │                         `queue/<repo>/<lane>/{inbox,processing,done}` envelopes with a
+│   │                         recursive forbidden-key scan and gate-enforced `receipts.jsonl`
+│   │                         transitions, proven against base-template's `check_messages.py`;
+│   │                         `requeue_processing`/`requeue_all_processing` re-queue stranded
+│   │                         `processing/` files to `inbox/` on writer start, idempotently and
+│   │                         without a duplicate receipt), roadmap_status.rs (`EN.15.H` — a typed `LaneResult` join
 │   │                         reproducing base-template's Python `roadmap_status_discovery.py`
 │   │                         oracle in Rust: `lane-log.jsonl`, per-repo `orchestration-run`
 │   │                         records, per-spec `sdlc/sdlc-*state.json` liveness, each repo's
@@ -230,7 +246,16 @@ engine-rs/
 │   │                         `engine_core::coord::read_coordination_view` JSON, including
 │   │                         when the view reports `Degraded`; only
 │   │                         `resolve_brain_root()` erroring, e.g. a bad
-│   │                         `ENGINE_BRAIN_ROOT`, returns `5xx`),
+│   │                         `ENGINE_BRAIN_ROOT`, returns `5xx`), POST
+│   │                         /api/coordination/{register,heartbeat,release,lease,unlease,send,
+│   │                         drain,complete} (`EN.15.C` task 6 — no X-API-Key gate, matching
+│   │                         `GET /api/coordination`; thin routes over `engine_core::coord::write`,
+│   │                         wired through the shared `configure()` route table; timestamps and
+│   │                         `pid` are stamped server-side, never trusted from the request body;
+│   │                         `host` is read from an optional `ENGINE_COORD_HOST` env var; an
+│   │                         HTTP-level parity test proves a tree built entirely through these
+│   │                         routes passes base-template's `check_lane_agents.py` and
+│   │                         `check_messages.py`),
 │   │                         stream.rs (GET /events/{event_id}/stream — per-run
 │   │                         tokio::sync::broadcast SSE tee with a terminal-frame cache for late
 │   │                         subscribers, EN.5.F), abort.rs
