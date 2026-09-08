@@ -173,6 +173,115 @@ async fn assert_node_invocations_table_and_index_exist(pool: &PgPool) -> Result<
     Ok(())
 }
 
+/// Assert EN.14.I task 1's `events` table migration
+/// (`0004_create_events.sql`) produced exactly the schema recorded in
+/// `planning/EN.14.I/live-schema-diff.md`: `data`/`task_context` are `json`
+/// (NOT `jsonb`), `created_at`/`updated_at` are `timestamp` WITHOUT time
+/// zone, and `data`/`task_context`/`created_at`/`updated_at` are all
+/// NULLABLE — matching the live table's measured nullability rather than
+/// `EventsRow`'s non-`Option` Rust fields. Mirrors
+/// [`assert_journal_table_and_index_exist`] /
+/// [`assert_node_invocations_table_and_index_exist`] exactly.
+async fn assert_events_table_and_columns_exist(pool: &PgPool) -> Result<(), String> {
+    let columns = sqlx::query(
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+         WHERE table_name = 'events'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("failed to read information_schema.columns for events: {e}"))?;
+
+    if columns.is_empty() {
+        return Err("events table does not exist after migrating".to_string());
+    }
+
+    let mut by_name = std::collections::HashMap::new();
+    for row in &columns {
+        let name: String = row.try_get("column_name").map_err(|e| e.to_string())?;
+        let data_type: String = row.try_get("data_type").map_err(|e| e.to_string())?;
+        let is_nullable: String = row.try_get("is_nullable").map_err(|e| e.to_string())?;
+        by_name.insert(name, (data_type, is_nullable));
+    }
+
+    let expect = |col: &str, expected_type: &str, expected_nullable: &str| -> Result<(), String> {
+        match by_name.get(col) {
+            Some((actual_type, actual_nullable)) => {
+                if actual_type != expected_type {
+                    return Err(format!(
+                        "events.{col} has type \"{actual_type}\", expected \"{expected_type}\""
+                    ));
+                }
+                if actual_nullable != expected_nullable {
+                    return Err(format!(
+                        "events.{col} has is_nullable \"{actual_nullable}\", expected \"{expected_nullable}\""
+                    ));
+                }
+                Ok(())
+            }
+            None => Err(format!("events is missing column \"{col}\"")),
+        }
+    };
+
+    expect("id", "uuid", "NO")?;
+    expect("workflow_type", "character varying", "NO")?;
+    // `json`, NOT `jsonb` — `get_task_context` reads `try_get::<Json<TaskContext>>`
+    // and `list_orphan_candidates` depends on the `->` operator working on
+    // `json` directly (postgres.rs). A `jsonb` column compiles here and then
+    // diverges at read time.
+    expect("data", "json", "YES")?;
+    expect("task_context", "json", "YES")?;
+    // The trap this whole block warns about: WITHOUT time zone, not "timestamp
+    // with time zone" — matches the live schema and the reader's
+    // try_get::<NaiveDateTime>.
+    expect("created_at", "timestamp without time zone", "YES")?;
+    expect("updated_at", "timestamp without time zone", "YES")?;
+
+    Ok(())
+}
+
+/// Assert that `events`, `journal` and `node_invocations` are ALL present, as a
+/// set, queried from `information_schema.tables` — the block's actual
+/// deliverable: an engine database stood up from engine-rs's migrations alone,
+/// with no Synapse checkout and no alembic anywhere in the path. A missing
+/// table names itself in the returned error rather than surfacing only as a
+/// downstream column-lookup failure.
+async fn assert_events_journal_and_node_invocations_all_present(
+    pool: &PgPool,
+) -> Result<(), String> {
+    const EXPECTED: [&str; 3] = ["events", "journal", "node_invocations"];
+
+    let rows = sqlx::query(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = ANY($1)",
+    )
+    .bind(EXPECTED.as_slice())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("failed to read information_schema.tables: {e}"))?;
+
+    let present: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<String, _>("table_name")
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<_, _>>()?;
+
+    let missing: Vec<&str> = EXPECTED
+        .iter()
+        .copied()
+        .filter(|t| !present.contains(*t))
+        .collect();
+
+    if !missing.is_empty() {
+        return Err(format!(
+            "expected tables {EXPECTED:?} to all exist after migrating from empty, but missing: {missing:?}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Build the admin connection string this test was configured with (must be able
 /// to `CREATE DATABASE`/`DROP DATABASE`), and read back the maintenance database's
 /// name so cleanup can reconnect to it.
@@ -230,6 +339,8 @@ async fn migrations_apply_cleanly_to_a_scratch_database_created_from_empty() {
 
         assert_journal_table_and_index_exist(&scratch_pool).await?;
         assert_node_invocations_table_and_index_exist(&scratch_pool).await?;
+        assert_events_table_and_columns_exist(&scratch_pool).await?;
+        assert_events_journal_and_node_invocations_all_present(&scratch_pool).await?;
 
         scratch_pool.close().await;
         Ok(())
@@ -252,4 +363,93 @@ async fn migrations_apply_cleanly_to_a_scratch_database_created_from_empty() {
     );
 
     outcome.expect("migration tooling did not apply cleanly to a scratch database from empty");
+}
+
+/// POSITIVE CONTROL, required by the block and by carryover
+/// `gate-scope-must-be-shown-capable-of-failing`: prove the three-table
+/// assertion above is actually capable of failing, rather than vacuously
+/// passing no matter what. Migrates a scratch database to completion (all
+/// three tables present), then simulates one migration's effect being
+/// absent via a RUNTIME inversion — dropping the `events` table after
+/// migrating, rather than committing a red case by deleting a migration
+/// file from this gated repo — and asserts
+/// [`assert_events_journal_and_node_invocations_all_present`] goes red and
+/// NAMES `events` as the missing table.
+#[tokio::test]
+#[ignore = "requires a live Postgres with CREATEDB; run with DATABASE_URL set and --run-ignored ignored-only (see file header)"]
+async fn three_table_assertion_fails_when_a_migrations_effect_is_absent() {
+    let admin_opts = admin_options();
+    let scratch_db = format!(
+        "engine_store_migrate_control_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+
+    assert_ne!(
+        scratch_db, "orchestration_dev",
+        "scratch database name must never collide with the live shared database"
+    );
+
+    let mut admin_conn = PgConnection::connect_with(&admin_opts)
+        .await
+        .expect("failed to connect to the admin/maintenance database named by DATABASE_URL");
+
+    let create_stmt = format!(r#"CREATE DATABASE "{scratch_db}""#);
+    admin_conn
+        .execute(AssertSqlSafe(create_stmt))
+        .await
+        .expect("failed to CREATE DATABASE for the scratch migration target");
+
+    let scratch_opts = admin_opts.clone().database(&scratch_db);
+    let outcome: Result<(), String> = async {
+        let scratch_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(scratch_opts)
+            .await
+            .map_err(|e| format!("failed to connect to scratch database {scratch_db}: {e}"))?;
+
+        engine_store::run_migrations(&scratch_pool)
+            .await
+            .map_err(|e| format!("migration run failed against an empty database: {e}"))?;
+
+        // Sanity: the full set is present before we simulate the absence.
+        assert_events_journal_and_node_invocations_all_present(&scratch_pool).await?;
+
+        // Simulate 0004_create_events.sql's effect being absent — a runtime
+        // inversion rather than deleting the migration file, which would
+        // commit a red case to a file every later gate runs against.
+        sqlx::query("DROP TABLE events")
+            .execute(&scratch_pool)
+            .await
+            .map_err(|e| format!("failed to drop events table for the positive control: {e}"))?;
+
+        let result = assert_events_journal_and_node_invocations_all_present(&scratch_pool).await;
+        scratch_pool.close().await;
+
+        match result {
+            Ok(()) => Err(
+                "expected the three-table assertion to fail once `events` was dropped, but it passed"
+                    .to_string(),
+            ),
+            Err(msg) if msg.contains("events") => Ok(()),
+            Err(msg) => Err(format!(
+                "assertion failed as expected, but did not name the missing table \"events\": {msg}"
+            )),
+        }
+    }
+    .await;
+
+    let terminate_stmt = format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = '{scratch_db}' AND pid <> pg_backend_pid()"
+    );
+    admin_conn
+        .execute(AssertSqlSafe(terminate_stmt))
+        .await
+        .expect("failed to terminate lingering connections to the scratch database");
+    let drop_stmt = format!(r#"DROP DATABASE IF EXISTS "{scratch_db}""#);
+    admin_conn.execute(AssertSqlSafe(drop_stmt)).await.expect(
+        "failed to DROP DATABASE for the scratch migration target — cleanup must not leak it",
+    );
+
+    outcome.expect("positive control did not observe the three-table assertion fail and name the missing table");
 }

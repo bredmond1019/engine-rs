@@ -13,7 +13,9 @@
 //! `--ignored` run, so an unset `DATABASE_URL` at that point is a hard failure,
 //! not a silent skip.
 //!
-//! The target `events` table is the orchestrator's existing schema (contract §4):
+//! The target `events` table is created by engine-rs's own migration,
+//! `crates/engine-store/migrations/0004_create_events.sql` (EN.14.I task 1),
+//! typed from the live schema rather than authored from the contract doc:
 //! `id uuid, workflow_type varchar(150), data json, task_context json,
 //! created_at timestamp, updated_at timestamp`.
 
