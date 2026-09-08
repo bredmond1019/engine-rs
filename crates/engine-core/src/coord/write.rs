@@ -52,7 +52,9 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 
-use okf_core::{Coord, HeartbeatValue, LeaseRecord, PidSource, RegistryClaim, SlotRecord};
+use okf_core::{
+    Coord, HeartbeatValue, LeaseRecord, MessageRecord, PidSource, RegistryClaim, SlotRecord,
+};
 
 /// Subdirectory under the lock dir holding pre-overwrite snapshots. Sits inside the
 /// already-gitignored `.fleet-locks/` (see the block record's `notes`), so no `.gitignore`
@@ -571,6 +573,288 @@ pub fn unlease(lock_dir: &Path, repo: &str) -> Result<bool, CoordWriteError> {
         fs::remove_file(&path).map_err(|e| CoordWriteError::Io { path, source: e })?;
     }
     Ok(existed)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Message verbs — send / drain / complete, with the receipts the fleet gate now requires.
+// `EN.15.C` task 4.
+//
+// THE RECIPIENT IS THE DIRECTORY: `message.schema.json` carries no `to` field (see
+// `okf_core::coord::message`'s own doc comment and `base-template/scripts/check_messages.py`'s
+// module docstring). `send` chooses the recipient lane's inbox via `repo`/`lane` parameters,
+// never a field written into the envelope.
+//
+// EVERY TRANSITION WRITES ITS RECEIPT, and `check_messages.py`'s `queue-message-receipts` check
+// is gating (2026-09-08): `drain` and `complete` each append exactly one JSON line to
+// `<queue_dir>/receipts.jsonl` — `{message_id, from, to, ts}` — mirroring the Python's own
+// `append_receipt`/`drain_queue`/`complete_message` byte-for-byte, so a tree either side
+// produces is indistinguishable to the checker.
+// ---------------------------------------------------------------------------------------------
+
+/// Keys `check_messages.py`'s `_find_forbidden_keys` refuses anywhere in a message envelope —
+/// the ping contract forbids a sender-declared priority; D43 owns priority in this fleet.
+const FORBIDDEN_MESSAGE_KEYS: &[&str] = &["priority", "urgency"];
+
+/// `<lock_dir>/queue/<repo>/<lane>/` — the recipient lane's queue directory, holding `inbox/`,
+/// `processing/`, `done/` and the append-only `receipts.jsonl` ledger. Not sanitized via
+/// `safe_component` (unlike a lock filename): `repo`/`lane` here are ordinary slugs, and
+/// `check_messages.py`'s own `queue_repo`/discovery walks these exact path components literally.
+fn queue_dir(lock_dir: &Path, repo: &str, lane: &str) -> PathBuf {
+    lock_dir.join("queue").join(repo).join(lane)
+}
+
+/// Recursively scan `value` for a [`FORBIDDEN_MESSAGE_KEYS`] key at any nesting depth (object or
+/// array), returning the first one found. Mirrors `check_messages.py`'s `_find_forbidden_keys`,
+/// which walks the whole envelope rather than only its top level — a `priority` slipped into a
+/// nested object (e.g. `sender.priority`) must be caught exactly like a top-level one.
+fn find_forbidden_message_key(value: &serde_json::Value) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map {
+                if let Some(forbidden) = FORBIDDEN_MESSAGE_KEYS
+                    .iter()
+                    .copied()
+                    .find(|f| *f == key.as_str())
+                {
+                    return Some(forbidden);
+                }
+                if let Some(found) = find_forbidden_message_key(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(find_forbidden_message_key),
+        _ => None,
+    }
+}
+
+/// The exact refusal text for a forbidden key, mirroring `check_messages.py`'s
+/// `FORBIDDEN_KEY_MESSAGE` closely enough that both sides name the same reason for the same
+/// defect (not asserted byte-identical — the Python's is scoped to the JSON path it was found
+/// at, which this seam does not track — but every word of the "why" carries over).
+fn forbidden_message_key_reason(key: &str) -> String {
+    format!(
+        "field `{key}` is not allowed anywhere in a message envelope -- priority is \
+         deliberately absent from message.schema.json: a sender-declared priority inflates to \
+         always-urgent and forks a second rubric alongside D43, which owns priority in this \
+         fleet"
+    )
+}
+
+/// `<ts>` half of a message filename (`<ts>-<uuid>.json`) — the ISO-8601 basic-form UTC stamp
+/// `check_messages.py`'s `FILENAME_RE` requires (`YYYYMMDDTHHMMSSZ`, no colons or dashes),
+/// derived from `sent_at` by stripping the punctuation an ordinary ISO-8601-with-timezone
+/// timestamp carries. `sent_at` and this derived stamp therefore always agree by construction —
+/// there is no second "now" a caller could pass out of step with the envelope's own `sent_at`.
+fn filename_timestamp(sent_at: &str) -> String {
+    sent_at.chars().filter(|c| *c != '-' && *c != ':').collect()
+}
+
+/// Append one transition receipt to `<queue_dir>/receipts.jsonl` — `{message_id, from, to,
+/// ts}`, one JSON object per line, byte-for-byte the shape `check_messages.py`'s own
+/// `append_receipt` writes. Creates `queue_dir` if it does not exist yet (a receipt can be the
+/// very first file written for a lane's queue, e.g. immediately after `send` populated only
+/// `inbox/`).
+fn append_receipt(
+    queue_dir: &Path,
+    message_id: &str,
+    from: &str,
+    to: &str,
+    now_iso: &str,
+) -> Result<(), CoordWriteError> {
+    let receipts_path = queue_dir.join("receipts.jsonl");
+    fs::create_dir_all(queue_dir).map_err(|e| CoordWriteError::Io {
+        path: receipts_path.clone(),
+        source: e,
+    })?;
+    let receipt = serde_json::json!({
+        "message_id": message_id,
+        "from": from,
+        "to": to,
+        "ts": now_iso,
+    });
+    let line = format!(
+        "{}\n",
+        serde_json::to_string(&receipt).map_err(|e| CoordWriteError::Invalid {
+            path: receipts_path.clone(),
+            reason: format!("receipt failed to serialize: {e}"),
+        })?
+    );
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&receipts_path)
+        .map_err(|e| CoordWriteError::Io {
+            path: receipts_path.clone(),
+            source: e,
+        })?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| CoordWriteError::Io {
+            path: receipts_path,
+            source: e,
+        })
+}
+
+/// `send` — write a message envelope into the recipient lane's inbox:
+/// `<lock_dir>/queue/<repo>/<lane>/inbox/<ts>-<message_id>.json`. `value` is the envelope as raw
+/// JSON, scanned FIRST for a forbidden key anywhere in it (before schema validation ever runs,
+/// same "a failure at any step writes nothing" discipline as every other verb in this seam), then
+/// validated against [`MessageRecord`]'s strict typed shape via [`write_coord_json`]. No receipt
+/// is written or required for an inbox arrival — `check_messages.py`'s layout invariant only
+/// requires a receipt once a message LEAVES `inbox/`.
+///
+/// Returns the path the envelope was written to.
+pub fn send(
+    lock_dir: &Path,
+    repo: &str,
+    lane: &str,
+    value: serde_json::Value,
+    host: Option<&str>,
+) -> Result<PathBuf, CoordWriteError> {
+    let inbox_dir = queue_dir(lock_dir, repo, lane).join("inbox");
+
+    if let Some(key) = find_forbidden_message_key(&value) {
+        return Err(CoordWriteError::Invalid {
+            path: inbox_dir,
+            reason: forbidden_message_key_reason(key),
+        });
+    }
+
+    let message_id = value
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoordWriteError::Invalid {
+            path: inbox_dir.clone(),
+            reason: "message envelope is missing a string `message_id`".to_string(),
+        })?
+        .to_string();
+    let sent_at = value
+        .get("sent_at")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoordWriteError::Invalid {
+            path: inbox_dir.clone(),
+            reason: "message envelope is missing a string `sent_at`".to_string(),
+        })?
+        .to_string();
+
+    let filename = format!("{}-{}.json", filename_timestamp(&sent_at), message_id);
+    let path = inbox_dir.join(filename);
+
+    write_coord_json::<MessageRecord>(lock_dir, &path, value, host)?;
+    Ok(path)
+}
+
+/// `drain` — move every message file currently in `<lock_dir>/queue/<repo>/<lane>/inbox/` into
+/// `.../processing/`, appending exactly one `inbox->processing` receipt per file actually moved.
+/// Mirrors `check_messages.py`'s `drain_queue`: files are moved in filename order, and a missing
+/// `inbox/` (nothing ever sent to this lane yet) is not an error — it is an empty drain. Returns
+/// the `message_id` of every file moved, in the order moved.
+pub fn drain(
+    lock_dir: &Path,
+    repo: &str,
+    lane: &str,
+    now_iso: &str,
+) -> Result<Vec<String>, CoordWriteError> {
+    let q_dir = queue_dir(lock_dir, repo, lane);
+    let inbox_dir = q_dir.join("inbox");
+    let processing_dir = q_dir.join("processing");
+
+    let mut files: Vec<PathBuf> = match fs::read_dir(&inbox_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect(),
+        Err(_) => return Ok(Vec::new()),
+    };
+    files.sort();
+
+    fs::create_dir_all(&processing_dir).map_err(|e| CoordWriteError::Io {
+        path: processing_dir.clone(),
+        source: e,
+    })?;
+
+    let mut moved = Vec::new();
+    for path in files {
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            // Another drainer already won the race for this file — at-least-once, not
+            // exactly-once, at the filesystem layer, same as the Python's own FileNotFoundError
+            // handling in `drain_queue`.
+            Err(_) => continue,
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(message_id) = value.get("message_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let message_id = message_id.to_string();
+        let dest = processing_dir.join(path.file_name().expect("path built from a dir entry"));
+        if fs::rename(&path, &dest).is_err() {
+            continue;
+        }
+        append_receipt(&q_dir, &message_id, "inbox", "processing", now_iso)?;
+        moved.push(message_id);
+    }
+    Ok(moved)
+}
+
+/// `complete` — move the file for `message_id` from `<lock_dir>/queue/<repo>/<lane>/processing/`
+/// to `.../done/`, appending exactly one `processing->done` receipt. Mirrors
+/// `check_messages.py`'s `complete_message`: returns `Ok(false)` (never an error) when no
+/// matching file is found in `processing/` — e.g. it was already completed by another drainer —
+/// and matches a file by its filename's `<uuid>` half (`<ts>-<uuid>.json`, split on the FIRST
+/// `-`, since the timestamp half itself never contains one).
+pub fn complete(
+    lock_dir: &Path,
+    repo: &str,
+    lane: &str,
+    message_id: &str,
+    now_iso: &str,
+) -> Result<bool, CoordWriteError> {
+    let q_dir = queue_dir(lock_dir, repo, lane);
+    let processing_dir = q_dir.join("processing");
+    let done_dir = q_dir.join("done");
+
+    let entries = match fs::read_dir(&processing_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(false),
+    };
+    let mut found: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(dash) = stem.find('-') else {
+            continue;
+        };
+        if &stem[dash + 1..] == message_id {
+            found = Some(path);
+            break;
+        }
+    }
+    let Some(path) = found else {
+        return Ok(false);
+    };
+
+    fs::create_dir_all(&done_dir).map_err(|e| CoordWriteError::Io {
+        path: done_dir.clone(),
+        source: e,
+    })?;
+    let dest = done_dir.join(path.file_name().expect("path built from a dir entry"));
+    fs::rename(&path, &dest).map_err(|e| CoordWriteError::Io {
+        path: dest,
+        source: e,
+    })?;
+    append_receipt(&q_dir, message_id, "processing", "done", now_iso)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1479,6 +1763,326 @@ mod tests {
             clear_after.is_ok(),
             "after release, the write must no longer be refused by the quiesce guard: {:?}",
             clear_after.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Message verbs — send / drain / complete. `EN.15.C` task 4.
+    // -----------------------------------------------------------------------------------------
+
+    fn message_json(message_id: &str, sent_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "message_id": message_id,
+            "sender": {
+                "agent_name": "engine-rs-1",
+                "repo": "engine-rs",
+                "lane": "engine-rs",
+                "roadmap": "coordination-layer-port",
+            },
+            "sent_at": sent_at,
+            "kind": "EDGE_RELEASED",
+            "subject": { "repo": "bastion", "block": "BA.21.A" },
+            "body": "bastion:BA.21.A is now unblocked on the engine side.",
+            "durable_home": {
+                "channel": "state-edge",
+                "ref": "bastion/planning/state.json#BA.21.A",
+            },
+            "verified_by": "UNVERIFIED: engine-rs-1",
+        })
+    }
+
+    fn read_receipts(queue_dir: &Path) -> Vec<serde_json::Value> {
+        let text = fs::read_to_string(queue_dir.join("receipts.jsonl"))
+            .expect("receipts.jsonl must exist and be readable");
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("each receipt line must parse as JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn send_lands_the_message_in_the_recipient_inbox_with_no_receipt_required() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+
+        let path = send(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            message_json(message_id, "2026-09-08T10:00:00Z"),
+            Some("brain-mini"),
+        )
+        .expect("send must succeed");
+
+        assert!(path.exists(), "envelope must be written");
+        assert_eq!(
+            path,
+            queue_dir(dir.path(), "bastion", "bastion-lane")
+                .join("inbox")
+                .join(format!("20260908T100000Z-{message_id}.json"))
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read written envelope"))
+                .expect("written envelope must parse as JSON");
+        assert!(
+            value.as_object().unwrap().get("to").is_none(),
+            "THE RECIPIENT IS THE DIRECTORY -- no `to` field must ever be introduced"
+        );
+        assert_eq!(value["host"].as_str(), Some("brain-mini"));
+
+        assert!(
+            !queue_dir(dir.path(), "bastion", "bastion-lane")
+                .join("receipts.jsonl")
+                .exists(),
+            "an inbox arrival needs no receipt"
+        );
+    }
+
+    #[test]
+    fn send_refuses_a_top_level_priority_field_naming_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut message = message_json("id-1", "2026-09-08T10:00:00Z");
+        message["priority"] = serde_json::json!("urgent");
+
+        let err = send(dir.path(), "engine-rs", "engine-rs", message, None)
+            .expect_err("a message carrying priority must be refused");
+        match err {
+            CoordWriteError::Invalid { reason, .. } => {
+                assert!(
+                    reason.contains("priority"),
+                    "refusal must name the field, got: {reason}"
+                );
+            }
+            other => panic!("expected CoordWriteError::Invalid, got {other:?}"),
+        }
+        assert!(
+            !queue_dir(dir.path(), "engine-rs", "engine-rs")
+                .join("inbox")
+                .exists(),
+            "a refused send must write nothing, not even the inbox directory"
+        );
+    }
+
+    #[test]
+    fn send_refuses_a_nested_urgency_field_naming_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut message = message_json("id-2", "2026-09-08T10:00:00Z");
+        message["sender"]["urgency"] = serde_json::json!("high");
+
+        let err = send(dir.path(), "engine-rs", "engine-rs", message, None)
+            .expect_err("a nested urgency field must be refused too");
+        match err {
+            CoordWriteError::Invalid { reason, .. } => {
+                assert!(
+                    reason.contains("urgency"),
+                    "refusal must name the field, got: {reason}"
+                );
+            }
+            other => panic!("expected CoordWriteError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_moves_inbox_to_processing_and_writes_exactly_one_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+        let sent_path = send(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            message_json(message_id, "2026-09-08T10:00:00Z"),
+            None,
+        )
+        .expect("send must succeed");
+
+        let moved = drain(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            "2026-09-08T10:05:00Z",
+        )
+        .expect("drain must succeed");
+        assert_eq!(moved, vec![message_id.to_string()]);
+        assert!(!sent_path.exists(), "file must be gone from inbox/");
+
+        let processing_path = queue_dir(dir.path(), "bastion", "bastion-lane")
+            .join("processing")
+            .join(sent_path.file_name().unwrap());
+        assert!(processing_path.exists(), "file must now sit in processing/");
+
+        let q_dir = queue_dir(dir.path(), "bastion", "bastion-lane");
+        let receipts = read_receipts(&q_dir);
+        assert_eq!(receipts.len(), 1, "exactly one receipt must be written");
+        assert_eq!(receipts[0]["message_id"], message_id);
+        assert_eq!(receipts[0]["from"], "inbox");
+        assert_eq!(receipts[0]["to"], "processing");
+        assert_eq!(receipts[0]["ts"], "2026-09-08T10:05:00Z");
+    }
+
+    #[test]
+    fn drain_on_a_lane_with_no_inbox_yet_is_an_empty_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let moved = drain(
+            dir.path(),
+            "bastion",
+            "never-sent-to",
+            "2026-09-08T10:05:00Z",
+        )
+        .expect("draining an unpopulated lane must not error");
+        assert!(moved.is_empty());
+    }
+
+    #[test]
+    fn complete_moves_processing_to_done_and_writes_exactly_one_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+        let sent_path = send(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            message_json(message_id, "2026-09-08T10:00:00Z"),
+            None,
+        )
+        .expect("send must succeed");
+        drain(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            "2026-09-08T10:05:00Z",
+        )
+        .expect("drain must succeed");
+
+        let completed = complete(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            message_id,
+            "2026-09-08T10:10:00Z",
+        )
+        .expect("complete must succeed");
+        assert!(completed);
+
+        let done_path = queue_dir(dir.path(), "bastion", "bastion-lane")
+            .join("done")
+            .join(sent_path.file_name().unwrap());
+        assert!(done_path.exists(), "file must now sit in done/");
+
+        let q_dir = queue_dir(dir.path(), "bastion", "bastion-lane");
+        let receipts = read_receipts(&q_dir);
+        assert_eq!(
+            receipts.len(),
+            2,
+            "one inbox->processing plus one processing->done receipt"
+        );
+        assert_eq!(receipts[1]["message_id"], message_id);
+        assert_eq!(receipts[1]["from"], "processing");
+        assert_eq!(receipts[1]["to"], "done");
+        assert_eq!(receipts[1]["ts"], "2026-09-08T10:10:00Z");
+    }
+
+    #[test]
+    fn complete_with_no_matching_file_in_processing_returns_false_not_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let completed = complete(
+            dir.path(),
+            "bastion",
+            "bastion-lane",
+            "no-such-message-id",
+            "2026-09-08T10:10:00Z",
+        )
+        .expect("complete on a missing file must not error");
+        assert!(!completed);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Parity with `check_messages.py`. Shells out to the REAL oracle, the same "skip loudly,
+    // never silently pass" pattern the register-capacity parity test above established — never a
+    // Rust reimplementation of the checker asserted against itself.
+    // -----------------------------------------------------------------------------------------
+
+    fn messages_oracle_script_path(brain_root: &Path) -> PathBuf {
+        brain_root
+            .join("base-template")
+            .join("scripts")
+            .join("check_messages.py")
+    }
+
+    fn find_messages_oracle_script() -> Option<PathBuf> {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let Some(brain_root) = find_brain_root(manifest_dir) else {
+            eprintln!(
+                "SKIPPING message parity test: no brain.toml found walking up from {} (this \
+                 checkout has no sibling base-template to locate the oracle script in)",
+                manifest_dir.display()
+            );
+            return None;
+        };
+        let script = messages_oracle_script_path(&brain_root);
+        if !script.is_file() {
+            eprintln!(
+                "SKIPPING message parity test: brain root found at {} but {} does not exist",
+                brain_root.display(),
+                script.display()
+            );
+            return None;
+        }
+        Some(script)
+    }
+
+    fn require_messages_parity_environment() -> Option<PathBuf> {
+        if !python3_available() {
+            eprintln!("SKIPPING message parity test: python3 is not available on PATH");
+            return None;
+        }
+        find_messages_oracle_script()
+    }
+
+    /// The headline parity criterion: a tree produced entirely by `send`/`drain`/`complete`
+    /// passes `check_messages.py` with zero own-repo failures.
+    #[test]
+    fn a_tree_produced_by_send_drain_complete_passes_check_messages_py() {
+        let Some(script) = require_messages_parity_environment() else {
+            return;
+        };
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+
+        send(
+            lock_dir.path(),
+            "bastion",
+            "bastion-lane",
+            message_json(message_id, "2026-09-08T10:00:00Z"),
+            Some("brain-mini"),
+        )
+        .expect("send must succeed");
+        drain(
+            lock_dir.path(),
+            "bastion",
+            "bastion-lane",
+            "2026-09-08T10:05:00Z",
+        )
+        .expect("drain must succeed");
+        complete(
+            lock_dir.path(),
+            "bastion",
+            "bastion-lane",
+            message_id,
+            "2026-09-08T10:10:00Z",
+        )
+        .expect("complete must succeed");
+
+        let output = std::process::Command::new("python3")
+            .arg(&script)
+            .arg("--lock-dir")
+            .arg(lock_dir.path())
+            .arg("--repo")
+            .arg("bastion")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn python3 check_messages.py: {e}"));
+        assert!(
+            output.status.success(),
+            "check_messages.py must pass on a tree produced by send/drain/complete\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
