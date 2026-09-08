@@ -70,6 +70,7 @@ mod sdlc_flow_write_permission;
 mod sdlc_task_e2e;
 mod structured_logging;
 mod suspend_resume;
+mod sweep_replay;
 mod terminal_admission;
 mod terminal_send_await;
 mod validator;
