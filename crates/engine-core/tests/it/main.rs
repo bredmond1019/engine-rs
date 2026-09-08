@@ -24,6 +24,7 @@ mod claim_reaffirm;
 mod claude_code_step;
 mod close_block_commit_manifest;
 mod command_runner_spec;
+mod commander;
 mod content_pipeline_materialize_e2e;
 mod coord_chain;
 mod coord_parity;
