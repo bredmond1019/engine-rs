@@ -35,8 +35,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use okf_core::{LeaseKind, Message, MessageRecord};
+use okf_core::{LeaseKind, LeaseRecord, Message, MessageRecord};
 
+use crate::coord::resolve_lock_dir;
 use crate::coord::write::{
     self, CoordWriteError, HeartbeatRequest, LeaseRequest, RegisterOutcome, RegisterRequest,
 };
@@ -266,6 +267,80 @@ impl CoordHandle {
             None,
         )
     }
+}
+
+/// A [`HoldSource`](super::integrate::HoldSource) backed by the fleet's REAL shared
+/// coordination tree — `EN.15.D` task 3, replacing
+/// [`NeverHeld`](super::integrate::NeverHeld) at both production `register_orchestration`
+/// sites in `engine-serve`.
+///
+/// `is_held` re-reads `<lock_dir>/leases/lease-<repo>.json` fresh on every call — never
+/// cached, matching [`HoldSource::is_held`](super::integrate::HoldSource::is_held)'s own
+/// "re-read on every poll" contract — and reports held whenever an EXCLUSIVE lease is
+/// currently recorded for `repo`: some lane on the fleet's shared tree already claims
+/// exclusivity over that repo's working tree right now, so this chain's own next step must
+/// wait. `block_id` is accepted for trait-shape compatibility but unused —
+/// `okf_core::LeaseRecord` carries no per-block `window` field (see `coord::write::lease`'s
+/// own doc), so a lease's exclusivity is scoped to the whole repo, never to one block within
+/// it. A `Shared` lease, or no lease file at all, is never a hold.
+///
+/// The lock dir is resolved lazily, fresh on every `is_held` call, from
+/// [`crate::brain_root::resolve_brain_root`] rather than captured once at construction:
+/// `register_orchestration` builds this source at process-registration time, before any event
+/// (and its own `brain_root`) has ever been seen, so there is no per-event path to inject
+/// here — mirroring how [`super::integrate::HoldSource::is_held`] is itself re-read on every
+/// poll rather than resolved once. When no brain root resolves (`ENGINE_BRAIN_ROOT` unset and
+/// no `brain.toml` findable from the process cwd) or the lease file is absent or unreadable,
+/// `is_held` reports `false` rather than erroring — the same "an engine that cannot find a
+/// brain root must still serve" discipline
+/// [`init_repo_registry_from_env`](../../../../engine_serve/fn.init_repo_registry_from_env.html)
+/// already follows; a `HoldSource` has no channel to fail loudly through in the first place
+/// (`is_held` returns a plain `bool`, not a `Result`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueueHoldSource;
+
+impl QueueHoldSource {
+    /// Build a queue-backed hold source. Takes no arguments — see the struct doc for why the
+    /// lock dir is resolved lazily per call rather than injected here.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl super::integrate::HoldSource for QueueHoldSource {
+    fn is_held(&self, repo: &str, _block_id: &str) -> bool {
+        let Ok(brain_root) = crate::brain_root::resolve_brain_root() else {
+            return false;
+        };
+        let lock_dir = resolve_lock_dir(&brain_root);
+        let path = lock_dir
+            .join("leases")
+            .join(format!("lease-{}.json", safe_component(repo)));
+        let Ok(text) = fs::read_to_string(&path) else {
+            return false;
+        };
+        match serde_json::from_str::<LeaseRecord>(&text) {
+            Ok(record) => record.kind == LeaseKind::Exclusive,
+            Err(_) => false,
+        }
+    }
+}
+
+/// Sanitize a path component exactly like `crate::coord::write`'s own (module-private)
+/// `safe_component` — duplicated rather than called into, same precedent as
+/// [`append_receipt`] duplicating that module's private `append_receipt` helper: this task's
+/// file scope is `coord_lane.rs`/`workflows.rs` only, and the function this mirrors is not
+/// `pub`.
+fn safe_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// One inbox file this handle's [`CoordHandle::drain`] moved into `processing/`, whether it
@@ -618,5 +693,147 @@ mod tests {
             .expect("reply inbox must exist")
             .collect();
         assert_eq!(entries.len(), 1, "exactly one reply envelope written");
+    }
+
+    // ── `QueueHoldSource` (`EN.15.D` task 3) ────────────────────────────────────────────────
+
+    /// `ENGINE_BRAIN_ROOT` and `FLEET_LOCK_DIR` are process-global env vars — this guard sets
+    /// both for the life of one test and restores whatever was there before on drop, the same
+    /// discipline `crate::coord::mod`'s own tests already use for `FLEET_LOCK_DIR`
+    /// (`nextest` forks a process per test, so no other test observes the mutation).
+    struct EnvGuard {
+        prev_brain_root: Option<String>,
+        prev_lock_dir: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(brain_root: &Path, lock_dir: &Path) -> Self {
+            let prev_brain_root = std::env::var("ENGINE_BRAIN_ROOT").ok();
+            let prev_lock_dir = std::env::var("FLEET_LOCK_DIR").ok();
+            std::env::set_var("ENGINE_BRAIN_ROOT", brain_root);
+            std::env::set_var("FLEET_LOCK_DIR", lock_dir);
+            Self {
+                prev_brain_root,
+                prev_lock_dir,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev_brain_root.take() {
+                Some(v) => std::env::set_var("ENGINE_BRAIN_ROOT", v),
+                None => std::env::remove_var("ENGINE_BRAIN_ROOT"),
+            }
+            match self.prev_lock_dir.take() {
+                Some(v) => std::env::set_var("FLEET_LOCK_DIR", v),
+                None => std::env::remove_var("FLEET_LOCK_DIR"),
+            }
+        }
+    }
+
+    fn write_lease(lock_dir: &Path, repo: &str, kind: LeaseKind) {
+        let path = lock_dir
+            .join("leases")
+            .join(format!("lease-{}.json", safe_component(repo)));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = serde_json::json!({
+            "repo": repo,
+            "lane": "some-other-lane",
+            "agent": "some-other-agent",
+            "acquired_at": "2026-09-08T00:00:00Z",
+            "kind": kind,
+            "heartbeat": "2026-09-08T00:00:00Z",
+        });
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+    }
+
+    /// With no brain root resolvable at all, `is_held` reports `false` rather than erroring —
+    /// a `HoldSource` has no channel to fail loudly through.
+    #[test]
+    fn queue_hold_source_with_unresolvable_brain_root_is_never_held() {
+        let prev_brain_root = std::env::var("ENGINE_BRAIN_ROOT").ok();
+        std::env::set_var(
+            "ENGINE_BRAIN_ROOT",
+            "/definitely/not/a/real/brain/root/anywhere",
+        );
+        let held = super::super::integrate::HoldSource::is_held(
+            &QueueHoldSource::new(),
+            "engine-rs",
+            "EN.15.D",
+        );
+        match prev_brain_root {
+            Some(v) => std::env::set_var("ENGINE_BRAIN_ROOT", v),
+            None => std::env::remove_var("ENGINE_BRAIN_ROOT"),
+        }
+        assert!(!held, "an unresolvable brain root must never report held");
+    }
+
+    /// A resolvable coordination tree with no lease file at all for `repo` is never held.
+    #[test]
+    fn queue_hold_source_with_no_lease_file_is_never_held() {
+        let brain_root = tempfile::tempdir().expect("tempdir");
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(brain_root.path(), lock_dir.path());
+
+        let held = super::super::integrate::HoldSource::is_held(
+            &QueueHoldSource::new(),
+            "engine-rs",
+            "EN.15.D",
+        );
+        assert!(!held, "no lease file at all must never report held");
+    }
+
+    /// An EXCLUSIVE lease recorded on the real coordination tree for `repo` IS a hold — this
+    /// is the "real cross-lane hold is observable" behaviour this task adds in place of
+    /// `NeverHeld`.
+    #[test]
+    fn queue_hold_source_with_an_exclusive_lease_is_held() {
+        let brain_root = tempfile::tempdir().expect("tempdir");
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(brain_root.path(), lock_dir.path());
+        write_lease(lock_dir.path(), "engine-rs", LeaseKind::Exclusive);
+
+        let held = super::super::integrate::HoldSource::is_held(
+            &QueueHoldSource::new(),
+            "engine-rs",
+            "EN.15.D",
+        );
+        assert!(held, "an exclusive lease on the repo must report held");
+    }
+
+    /// A SHARED lease is not exclusivity — it must never report held.
+    #[test]
+    fn queue_hold_source_with_a_shared_lease_is_not_held() {
+        let brain_root = tempfile::tempdir().expect("tempdir");
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(brain_root.path(), lock_dir.path());
+        write_lease(lock_dir.path(), "engine-rs", LeaseKind::Shared);
+
+        let held = super::super::integrate::HoldSource::is_held(
+            &QueueHoldSource::new(),
+            "engine-rs",
+            "EN.15.D",
+        );
+        assert!(!held, "a shared lease must never report held");
+    }
+
+    /// A lease recorded for a DIFFERENT repo must never leak into this repo's hold check.
+    #[test]
+    fn queue_hold_source_with_an_exclusive_lease_on_a_different_repo_is_not_held() {
+        let brain_root = tempfile::tempdir().expect("tempdir");
+        let lock_dir = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(brain_root.path(), lock_dir.path());
+        write_lease(lock_dir.path(), "some-other-repo", LeaseKind::Exclusive);
+
+        let held = super::super::integrate::HoldSource::is_held(
+            &QueueHoldSource::new(),
+            "engine-rs",
+            "EN.15.D",
+        );
+        assert!(
+            !held,
+            "a different repo's exclusive lease must not hold this repo"
+        );
     }
 }
