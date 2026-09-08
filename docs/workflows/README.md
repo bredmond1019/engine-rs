@@ -56,6 +56,20 @@ curl -N  $ENGINE/events/$EVENT_ID/stream           # live progress (SSE)
 curl -X POST $ENGINE/events/$RUN_ID/abort -H "X-API-Key: $ENGINE_EVENTS_API_KEY"
 ```
 
+**The stream carries two distinct SSE event shapes**, distinguishable by the frame's `event:` type
+alone — never by guessing at payload contents:
+
+- A **state frame** (the original shape) carries no `event:` line at all, so it arrives as the SSE
+  default type `message`. Its `data:` payload is a full `{event_id, status, task_context, terminal}`
+  snapshot, sent on every node-boundary transition (RUNNING, then SUCCESS/FAILED).
+- A **progress frame** (`EN.ticket.node-progress-sink`) carries an explicit `event: progress` line.
+  Its `data:` payload is a small typed `{event_id, node, done, total, label}` object — never a
+  `TaskContext` clone — reporting a node's own mid-execution progress (e.g. "3 of 7 queries done").
+  Progress frames are **advisory and droppable**: emitting them is a non-blocking best-effort send
+  that never fails or slows the run, they are **not persisted or replayed** — a client that
+  reconnects mid-run sees the current state frame, not a backfill of past progress — and today no
+  workflow opts a node into emitting them (the seam exists; adoption is separate work).
+
 | Must exist first | Why | If missing |
 |---|---|---|
 | `bastion serve` running with the engine mounted | The engine has no binary of its own — it embeds in `bastion serve` | See [`../deployment-launchd.md`](../deployment-launchd.md) |
