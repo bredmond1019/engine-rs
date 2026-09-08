@@ -82,6 +82,15 @@
 //!   journal has none. Addressed purely by `campaign_id` — no repo, no
 //!   roadmap — so a repo-less run is just as readable as a repo-scoped one.
 //!   See `crate::journal`.
+//! - `GET /api/coordination` (`EN.15.A` task 3) — the fleet's joined
+//!   coordination view (registry, leases, slots, messages, heartbeats,
+//!   escalations, run records), read fresh on every request via
+//!   `engine_core::coord::read_coordination_view`. The first `/api/`-
+//!   prefixed route in this service. No `X-API-Key` gate, matching
+//!   `/workflows` and `/workflows/{type}/graph` above. Always `200` — a
+//!   degraded view is a normal answer, not a fault; a `5xx` is reserved for
+//!   an outright failure to resolve the brain root at all. See
+//!   `get_coordination`.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -285,7 +294,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         // `/events/suspended` and `/approvals/ledger/stats` above), any
         // future literal segment under `/campaigns/` MUST be registered
         // before this route.
-        .route("/campaigns/{id}", web::get().to(get_campaign));
+        .route("/campaigns/{id}", web::get().to(get_campaign))
+        // `EN.15.A` task 3. First `/api/`-prefixed route in this service — see
+        // `get_coordination`'s doc comment for why it carries no `X-API-Key` gate. Collides
+        // with no other registered path, literal or dynamic, so registration order here does
+        // not matter.
+        .route("/api/coordination", web::get().to(get_coordination));
 }
 
 /// `EN.ticket.stamp-engine-sha-on-every-run` task 3: `engine_build_sha` here must equal the
@@ -887,6 +901,36 @@ async fn get_campaign(
     }))
 }
 
+/// `GET /api/coordination` (`EN.15.A` task 3) — the joined fleet coordination view, read fresh
+/// on every request via [`engine_core::coord::read_coordination_view`]. This is the first
+/// `/api/`-prefixed route in this service; every other route above is bare (`/health`,
+/// `/workflows`, `/events/`, `/campaigns/{id}`) — this route does not "normalise" them.
+///
+/// **No `X-API-Key` gate.** This copies `/workflows` and `/workflows/{workflow_type}/graph`
+/// above — the two other GET routes already registered in this file that serve without one —
+/// rather than inventing a third auth policy for this file to carry.
+///
+/// **Always `200`.** A degraded view (an artifact that failed to parse, or a `lifecycle:
+/// active` run record with no matching registry claim) is a normal, useful answer — its
+/// `status`/`degradation_reasons` fields on the returned JSON ARE the thing an operator wants,
+/// not a fault. A `5xx` is reserved for an outright failure to resolve the fleet's brain root
+/// at all (`engine_core::brain_root::resolve_brain_root` erroring — e.g. a malformed
+/// `ENGINE_BRAIN_ROOT` override); a missing or empty lock directory is not that case, since the
+/// reader itself already reports it as `Live` with nothing in it.
+async fn get_coordination() -> impl Responder {
+    let brain_root = match engine_core::brain_root::resolve_brain_root() {
+        Ok(root) => root,
+        Err(err) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("cannot resolve brain root: {err}"),
+            }));
+        }
+    };
+
+    let view = engine_core::coord::read_coordination_view(&brain_root);
+    HttpResponse::Ok().json(view)
+}
+
 #[cfg(test)]
 // `registry_test_lock()`'s std `MutexGuard` is held across `.await` points by design — it
 // serializes tests that share the global suspend registry, not data an async task contends
@@ -1009,6 +1053,138 @@ mod tests {
             .as_str()
             .expect("build.git_sha present and a string");
         assert!(!git_sha.is_empty(), "build.git_sha must be non-empty");
+    }
+
+    /// `crates/engine-serve/tests/fixtures/coordination/<name>` — committed fixture trees for
+    /// `GET /api/coordination`, mirroring `engine_core::coord`'s own
+    /// `crates/engine-core/tests/fixtures/coord/` fixtures (a healthy tree and a tree with a
+    /// corrupt `lane-agents/*.json`) rather than duplicating the reader's own unit coverage.
+    fn coordination_fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/coordination")
+            .join(name)
+    }
+
+    /// `EN.15.A` task 3: a healthy fixture tree returns `200` with `status: "live"` — asserted
+    /// through the shared `configure` route table, not by calling `get_coordination` directly,
+    /// per the acceptance criterion that this route is reachable through the table both the
+    /// serve binary and this test harness share.
+    ///
+    /// Sets `ENGINE_BRAIN_ROOT` to the fixture root (so escalations/run-record discovery, which
+    /// reads from the brain root rather than the lock dir, sees an empty `planning/` tree
+    /// instead of this machine's real one) AND `FLEET_LOCK_DIR` to that fixture's `.fleet-locks`
+    /// (the criterion's own words: "a fixture lock dir set via `FLEET_LOCK_DIR`"). Nextest runs
+    /// each test in its own process (`AGENTS.md` standing rule 8's rationale), so mutating
+    /// process env here does not race a concurrently-running test.
+    #[actix_web::test]
+    async fn coordination_route_reports_live_for_a_healthy_tree() {
+        let fixture = coordination_fixture("healthy");
+        std::env::set_var("ENGINE_BRAIN_ROOT", &fixture);
+        std::env::set_var("FLEET_LOCK_DIR", fixture.join(".fleet-locks"));
+
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/coordination")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "live");
+        assert_eq!(
+            body["degradation_reasons"]
+                .as_array()
+                .expect("degradation_reasons is an array")
+                .len(),
+            0
+        );
+        assert_eq!(
+            body["registry"]
+                .as_array()
+                .expect("registry is an array")
+                .len(),
+            1,
+            "the fixture's single lane-agents claim must be joined into the response"
+        );
+
+        std::env::remove_var("ENGINE_BRAIN_ROOT");
+        std::env::remove_var("FLEET_LOCK_DIR");
+    }
+
+    /// `EN.15.A` task 3: a tree with a corrupt `lane-agents/*.json` still returns `200`, with
+    /// the offending path named in `degradation_reasons` — the degraded status IS the answer,
+    /// never a `5xx`.
+    #[actix_web::test]
+    async fn coordination_route_reports_degraded_with_reasons_in_the_body() {
+        let fixture = coordination_fixture("degraded");
+        std::env::set_var("ENGINE_BRAIN_ROOT", &fixture);
+        std::env::set_var("FLEET_LOCK_DIR", fixture.join(".fleet-locks"));
+
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/coordination")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "a degraded tree must never surface as a 5xx"
+        );
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "degraded");
+        let reasons = body["degradation_reasons"]
+            .as_array()
+            .expect("degradation_reasons is an array");
+        assert!(
+            !reasons.is_empty(),
+            "a degraded response must carry at least one reason"
+        );
+        assert!(
+            reasons.iter().any(|r| {
+                r["path"]
+                    .as_str()
+                    .map(|p| p.contains("agent-broken.json"))
+                    .unwrap_or(false)
+            }),
+            "the corrupt lane-agents path must be named in degradation_reasons, not swallowed: {reasons:?}"
+        );
+
+        std::env::remove_var("ENGINE_BRAIN_ROOT");
+        std::env::remove_var("FLEET_LOCK_DIR");
+    }
+
+    /// `EN.15.A` task 3, "no existing route's path or auth behaviour changed": `/health` (a
+    /// pre-existing, unauthenticated route) is unaffected by this route's addition.
+    #[actix_web::test]
+    async fn adding_the_coordination_route_leaves_health_unauthenticated() {
+        let state = test_app_state();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
     }
 
     // --- EN.ticket.stamp-engine-sha-on-every-run task 3 ---------------------

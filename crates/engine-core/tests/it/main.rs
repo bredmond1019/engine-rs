@@ -25,6 +25,7 @@ mod claude_code_step;
 mod close_block_commit_manifest;
 mod command_runner_spec;
 mod content_pipeline_materialize_e2e;
+mod coord_parity;
 mod corpus_gates_parity;
 mod evals_slice;
 mod fan_out_aggregate;

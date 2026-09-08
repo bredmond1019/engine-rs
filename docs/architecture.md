@@ -168,7 +168,19 @@ engine-rs/
 │   │                         second aggregation path; reduces the resulting `PolicyAggregate`
 │   │                         rows to one JSON record via a field-less `UnitPolicy` grouping
 │   │                         key; `coding_slice()` — a concrete slice scoring
-│   │                         `PolicyAggregate`'s own serialized fields))
+│   │                         `PolicyAggregate`'s own serialized fields)), coord/ (`EN.15.A` task
+│   │                         1 — `mod.rs`: `read_coordination_view(brain_root, lock_dir)` is a
+│   │                         read-only reader over the fleet's `.fleet-locks/` tree, parsing
+│   │                         registry claims, leases, fleet-concurrency slots, cross-lane
+│   │                         messages, commander heartbeats, per-roadmap escalations, and
+│   │                         `orchestration-run` run records (walked under `brain_root`) into
+│   │                         okf-core's coord types; returns a `CoordinationView { status:
+│   │                         Live|Degraded, degradation_reasons: Vec<String>, .. }` — a malformed
+│   │                         record is a named degradation reason, never a silent skip, while a
+│   │                         missing lock dir/subdirectory is a legitimate empty-fleet `Live`
+│   │                         state; fleet-concurrency slots are found by non-recursive listing at
+│   │                         the lock-dir root only, so a decoy subdirectory can never be read as
+│   │                         a slot)
 │   ├── engine-contract/   ← data-contract serde types (events.rs: EventsRow/NodeRun/
 │   │                         NodeRunStatus/Usage; task_context.rs: TaskContext), matching
 │   │                         orchestrator data-contract.md v1.1.0 byte-for-byte (see
@@ -201,6 +213,12 @@ engine-rs/
 │   │                         (now spawns the run and returns 202 {run_id, event_id} immediately,
 │   │                         EN.5.F), GET /health, GET /workflows, GET /workflows/{type}/graph,
 │   │                         GET /events/{event_id} (server-derived status readback, EN.5.F)),
+│   │                         GET /api/coordination (`EN.15.A` task 3 — no X-API-Key gate,
+│   │                         matching /workflows: always `200` with the joined
+│   │                         `engine_core::coord::read_coordination_view` JSON, including
+│   │                         when the view reports `Degraded`; only
+│   │                         `resolve_brain_root()` erroring, e.g. a bad
+│   │                         `ENGINE_BRAIN_ROOT`, returns `5xx`),
 │   │                         stream.rs (GET /events/{event_id}/stream — per-run
 │   │                         tokio::sync::broadcast SSE tee with a terminal-frame cache for late
 │   │                         subscribers, EN.5.F), abort.rs
@@ -792,7 +810,11 @@ block.
   types), `GET /workflows/{type}/graph` (schema graph for a type), `POST /events/` (X-API-Key
   gated; dispatches the event, records live state, and enqueues the durable write), and (EN.5.F)
   `GET /events/{event_id}` (X-API-Key gated readback of a run's canonical shape, served from
-  `LiveStateStore` with no DB query — `404` for an unknown or malformed id). `GET /campaigns/{id}`
+  `LiveStateStore` with no DB query — `404` for an unknown or malformed id). `GET
+  /api/coordination` (`EN.15.A`) is ungated like `GET /workflows` and always returns `200` with
+  `engine_core::coord::read_coordination_view`'s joined fleet-coordination JSON — a degraded read
+  (a malformed lock-tree record) still comes back `200` with `status: "degraded"` and named
+  `degradation_reasons`; only `resolve_brain_root()` erroring returns `5xx`. `GET /campaigns/{id}`
   (`EN.11.E`) is the same X-API-Key gate over `LiveStateStore::list_campaign_runs`: `200
   {campaign_id, runs: [...], total_cost_usd, total_tokens, possibly_truncated}` for a known
   campaign, `404` for both an unknown campaign id and a malformed/non-UUID path segment. The

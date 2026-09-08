@@ -11,6 +11,7 @@ pub mod budget;
 pub mod build_info;
 pub mod cancellation;
 pub mod completion;
+pub mod coord;
 pub mod cron;
 pub mod dispatch;
 pub mod evals;
