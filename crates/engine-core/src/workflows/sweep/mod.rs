@@ -9,20 +9,25 @@
 //!
 //! Submodules, one per pipeline stage — the same section breaks the Python script itself uses:
 //! - [`snapshot`] — `build_raw_snapshot` + `semantic_projection` (task 2)
-//! - [`diff`] — `diff_snapshots` / `build_dedup_history` (task 3, this task)
-//! - `route` — `route_escalation` / `route_non_escalation_diff` + the three `GatedAction`
-//!   integration (task 4, not yet ported)
+//! - [`diff`] — `diff_snapshots` / `build_dedup_history` (task 3)
+//! - [`route`] — `route_escalation` / `route_non_escalation_diff` + the three `GatedAction`
+//!   integration (task 4, this task)
 //!
 //! `crates/engine-serve/src/workflows.rs` registers SWEEP as a dispatchable workflow in task 5;
 //! nothing in this module is wired to a schedule anywhere (Fork 4 is a hard boundary — see the
 //! block record's `out_of_scope`).
 
 pub mod diff;
+pub mod route;
 pub mod snapshot;
 
 pub use diff::{
     build_dedup_history, diff_snapshots, escalation_key, parse_iso, summarize_discovery_diff,
     DedupEntry, DiscoveryDiff, EscalationKey,
+};
+pub use route::{
+    route_escalation, route_non_escalation_diff, Budget, LaneWake, RouteInputs, RouteOutcome,
+    WakeOutcome, DEFAULT_REFIRE_HOURS,
 };
 pub use snapshot::{
     build_raw_snapshot, build_raw_snapshot_with, escalation_stale, git_head_sha,
