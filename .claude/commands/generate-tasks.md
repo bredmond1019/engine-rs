@@ -29,9 +29,9 @@ $ARGUMENTS — one of two input modes:
 > are hoisted here because they are the reason a spec is rejected, and they are easy to skim past
 > in a long procedure.
 >
-> 1. **Compilable task boundaries** — under `/sdlc-flow` and `/sdlc-task` every task must leave the
->    gating suite passing, so a breaking public-surface change may never be split across tasks.
->    This outranks disjoint file ownership: **the tasks merge, not the constraint.**
+> 1. **Gate-passing task boundaries** — under `/sdlc-flow` and `/sdlc-task`, no task may leave any gating check red (`planning/harness.json` → `validation.checks[]` with `gates: true`), so a
+>    breaking public-surface change may never be split across tasks. This outranks disjoint file
+>    ownership: **the tasks merge, not the constraint.**
 > 2. **Un-gateable acceptance criteria must be declared (D64)** — any criterion whose evidence
 >    lives in another process, another repo, a generated artifact, or an **installed** artefact
 >    needs a named failing command or a dedicated fixture-evidence task. A green suite is never
@@ -175,19 +175,19 @@ $ARGUMENTS — one of two input modes:
    - Do not invent work beyond what the block defines.
    - Size tasks to roughly 21 hours spread across Mon/Wed/Fri sessions.
    - Enforce **the project's standing rules** as written in `CLAUDE.md` — do not assume any stack, locale-parity, or content-layout rule unless written there. Every task must leave the project's gated checks (`planning/harness.json` → `validation.checks[]` with `gates: true`) passing.
-   - **Compilable task boundaries.** `/sdlc-flow` and `/sdlc-task` — the only two engines this
+   - **Gate-passing task boundaries.** `/sdlc-flow` and `/sdlc-task` — the only two engines this
      command feeds — run every task **sequentially on one branch/worktree with no inter-task merge
      step** — `sdlc-flow.js`'s own header says so explicitly ("sequential tasks (no inter-task merge
      conflicts)") — and both gate the project's checks after **every single task** (the
      `runTests()` call inside each engine's per-task loop: `sdlc-flow.js`'s and `sdlc-task.js`'s
-     `test-${taskNum}-${attempt}` gate). Under both engines **every task must leave the gating
-     suite passing** — for a compiled or type-checked stack that means the repository must compile
-     (and typecheck) at every task boundary, not just at the end of the spec. When a single logical
-     change cannot be split without leaving an intermediate task non-compiling — a renamed public
-     type, a struct's changed fields, an altered trait/interface signature, and every call site each
-     one touches — do **not** split it across tasks. Put the whole change in **one** task instead.
-     This applies unconditionally: both engines are sequential, so there is no parallel-merge model
-     to weigh it against.
+     `test-${taskNum}-${attempt}` gate). Under both engines, no task may leave any gating check red
+     — compiling (and typechecking) is one stack's instance of that bar, not the whole of it, so for
+     a compiled or type-checked stack the repository must at minimum compile at every task boundary,
+     not just at the end of the spec. When a single logical change cannot be split without leaving
+     an intermediate task failing a gated check — a renamed public type, a struct's changed fields,
+     an altered trait/interface signature, and every call site each one touches — do **not** split
+     it across tasks. Put the whole change in **one** task instead. This applies unconditionally:
+     both engines are sequential, so there is no parallel-merge model to weigh it against.
    - Foundational steps come first; the final step is always Validate.
    - **Write the task list as `tasks.json`, not markdown headings.** Every SDLC engine reads
      `planning/<spec-slug>/tasks.json` directly — a **bare array** of `{task_id, title, description,
@@ -237,7 +237,7 @@ $ARGUMENTS — one of two input modes:
      check failing — a renamed public type, a struct's changed fields, an altered trait/interface
      signature and every call site each one touches; a lint that only passes once the old code path
      is deleted; a test updated in one task for behaviour that lands in the next. If so, this check
-     **fails**: merge those tasks into one before proceeding, per the compilable task boundaries
+     **fails**: merge those tasks into one before proceeding, per the gate-passing task boundaries
      rule in step 6, then re-run this self-check — a task that cannot pass the gate on its own is
      never valid, under either engine.
    - **`dependsOn` ids are all valid** — every id referenced exists as some task's `task_id` in the
@@ -271,6 +271,15 @@ $ARGUMENTS — one of two input modes:
      behaviour — the two diverge, and the divergence is invisible unless named.
    - **Validation Commands are present** (or `planning/harness.json` → `validation.checks[]` supplies
      them as the fallback).
+   - **Every repo-relative script path named in a task's `validation_commands` or `files[]` must
+     exist in this repo, or be created by an earlier task in the same spec** — gated by
+     `spec-validation-command-paths` (`scripts/check_spec_validation_commands.py`). Measured
+     2026-08-24: three specs carried `python3 scripts/check_harness_registration.py` for a script
+     that has never existed anywhere in this fleet, and one of those specs closed with the phantom
+     command still live in two of its tasks — a fabricated load-bearing fact in the plan that
+     nothing caught until it failed mid-run. A path that resolves nowhere (and is not a later
+     `files[]` entry an earlier task in this same spec creates) is a spec error: revise it in place
+     — name the real path, or add the task that creates it — then re-run this self-check.
    - **Every `expect_red` entry is a subset of that same task's own `validation_commands`, and never
      names a project-wide harness check.** A task with no `expect_red` field is unaffected by this
      rule and needs no further check. Where `expect_red` is set, confirm each entry string also
@@ -278,6 +287,17 @@ $ARGUMENTS — one of two input modes:
      spec error, revise it in place — and confirm no entry names one of
      `planning/harness.json` → `validation.checks[]`'s `gates: true` commands; `expect_red` may only
      invert a command the task itself declared, never a harness gate shared by every concurrent lane.
+   - **Non-compiler instance of gate-passing boundaries.** The same shape recurs with no compiler
+     involved: a task that sharpens a detector (a threshold, floor, lint, or schema check) before a
+     later task fixes the artifact it reads. Measured: `BE.ticket.vhs-capture-trustworthiness`
+     sharpened the vhs-fresh per-scene floor in task 3 and re-captured the reference PNGs in task 4;
+     task 3's implementation was correct yet bailed on two identical retries, because the sharper
+     floor correctly failed on the still-blank PNG only task 4 could fix. **A task that fixes a
+     detector must also fix what it detects — merge them.** This also closes the loophole of
+     dodging a gate via a narrow `validation_commands` list: under `/sdlc-task`, per
+     [D63](../../planning/decisions/D63-per-task-validation-commands-augment-gating.md) the engine
+     runs every `gates: true` check's `fastCommand` (or `command` where none is defined) alongside
+     the task's own `validation_commands`, so a gating check left red still fails the task.
    - **No task's `files[]` names a path under `planning/` — can fail.** `planning/` is a symlink
      into the private HQ vault, excluded from this repo's git by `base-template/.gitignore:20` (the
      bare rule `/planning`). Code that references such a path — an `include_str!`, a fixture path,
@@ -511,7 +531,7 @@ tempting and both are wrong:
   something, put that conclusion in task 5's description. One sentence in the spec replaces a file
   read, and unlike a hand-off report it is written once and always present.
 - **Split on the gating boundary, never finer.** Add a task when an intermediate state would fail
-  the gates (see compilable task boundaries above). Splitting beyond that adds a full re-read and
+  the gates (see gate-passing task boundaries above). Splitting beyond that adds a full re-read and
   buys nothing.
 
 ## Session boundary

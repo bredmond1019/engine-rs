@@ -56,6 +56,11 @@
       "format": "date-time",
       "description": "OPTIONAL. ISO-8601 timestamp with timezone marking when the CURRENT block (named by current_block) started -- distinct from started_at, which marks when the lane itself was claimed and never moves. Re-stamped at each block boundary alongside heartbeat. Lets a caller distinguish 'three minutes into a block' (slow, not stuck) from 'three hours into a block' (a candidate), refining the heartbeat-staleness signal rather than replacing it.",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "host": {
+      "type": "string",
+      "description": "OPTIONAL. The machine hostname this lane's agent is running on, when a Rust writer stamps it (engine-rs EN.15.C). Absent on every claim written before this field existed -- a reader must treat absence as 'no signal', never as an error.",
+      "minLength": 1
     }
   }
 }

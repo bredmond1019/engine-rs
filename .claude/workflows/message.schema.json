@@ -106,6 +106,11 @@
       "minLength": 1,
       "description": "Evidence backing this envelope's claim, so a relay's evidence travels with the claim instead of being replaced by an adjective (BT.ticket.messages-must-carry-verified-by). Two accepted shapes, both enforced by pattern: a block containing the literal command that was run and its real output (a command line, then its output on a following line), or the string `UNVERIFIED: <who claimed it>` naming the claimant when the sender is relaying rather than independently checking. Neither an empty string nor a bare adjective such as `measured` satisfies this field -- that is the exact defect this field exists to catch (three relays were caught wrong by their receivers on that word alone; see the block's `why`). An envelope written before this field existed lacks it and fails validation the same as any other envelope missing a required field -- the migration path for the seven pre-existing envelopes is stated, not executed (out of scope).",
       "pattern": "^(UNVERIFIED: \\S[\\s\\S]*|[\\s\\S]*\\S[\\s\\S]*\\n[\\s\\S]*\\S[\\s\\S]*)$"
+    },
+    "host": {
+      "type": "string",
+      "description": "OPTIONAL. The machine hostname the sending lane's agent is running on, when a Rust writer stamps it (engine-rs EN.15.C). Absent on every message written before this field existed -- a reader must treat absence as 'no signal', never as an error.",
+      "minLength": 1
     }
   }
 }

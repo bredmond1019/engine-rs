@@ -260,6 +260,32 @@ value), tierPrefix (the TIER_PREFIX: value, "" when invoking at the repo root), 
 }
 // <</shared:resolveRepoRoot>>
 
+// WORKTREE-LIST GROUND TRUTH (BT.ticket.sdlc-task-worktree-flag-is-intermittently-ignored, task 2) —
+// parses `git worktree list --porcelain` stdout entirely IN JS, never trusting the setup agent's own
+// parsed conclusion about which entry is "its" worktree. Porcelain format is blocks of lines
+// separated by a blank line, each block starting with "worktree <path>" and (for a non-detached
+// worktree) containing a "branch refs/heads/<name>" line. Returns [{ path, branch }, ...] with
+// branch === null for a detached entry (no "branch" line in its block) — callers treat that as "no
+// branch", never as a match for any expected name.
+function parseWorktreeListPorcelain(porcelain) {
+  const entries = []
+  const blocks = String(porcelain || '').split(/\r?\n\r?\n/)
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/)
+    const worktreeLine = lines.find(l => l.startsWith('worktree '))
+    if (!worktreeLine) continue
+    const path = worktreeLine.slice('worktree '.length).trim()
+    const branchLine = lines.find(l => l.startsWith('branch '))
+    // branch lines report "refs/heads/<name>" — strip the prefix; a bare/unexpected form is kept
+    // verbatim rather than dropped, so a mismatch is still visible in a bail message.
+    const branch = branchLine
+      ? branchLine.slice('branch '.length).trim().replace(/^refs\/heads\//, '')
+      : null
+    entries.push({ path, branch })
+  }
+  return entries
+}
+
 // BINDING / BRAIN-ROOT / POPULATION checks (BT.ticket.worktree-setup-can-adopt-the-brain-root-as-repo-root,
 // task 4) — run immediately after the setup agent returns and BEFORE the enumerate/per-task stages, so a
 // misbound or unpopulated checkout is caught before any task's implement stage touches it. Covers BOTH the
@@ -999,12 +1025,15 @@ log(`Spec: ${blockId} (resolving block record first, tasks.md fallback) | mode: 
 // ================================================================
 const SETUP_SCHEMA = {
   type: 'object',
-  required: ['runDir', 'branchName', 'baseSha'],
+  required: ['runDir', 'branchName', 'currentBranch', 'baseSha', 'worktreeFailed'],
   properties: {
     runDir:         { type: 'string', description: 'Absolute path the pipeline runs from (worktree path under --worktree; else the repo root)' },
     branchName:     { type: 'string', description: 'The branch commits land on (a new worktree branch under --worktree; else the current branch)' },
+    currentBranch:  { type: 'string', description: 'STEP 1: the branch HEAD was on when setup started (rev-parse --abbrev-ref HEAD via GIT), captured BEFORE any worktree work. Reported in both modes so the engine can deterministically detect a --worktree run that silently resolved to the current branch (BT.ticket.sdlc-task-worktree-flag-is-intermittently-ignored).' },
     baseSha:        { type: 'string', description: 'The HEAD short sha AFTER setup, BEFORE any task commit — the emoji-gate diff base' },
     wasCreated:     { type: 'boolean', description: 'true if a new worktree was created (--worktree only)' },
+    worktreeFailed: { type: 'boolean', description: '--worktree only: true iff the worktree could not be resolved or created and setup stopped rather than falling back to the current branch — either no free candidate name was found among "<base>" through "<base>-10", or the worktree-add/creation step itself errored. Always false in in-place mode.' },
+    worktreeFailureReason: { type: 'string', description: 'Empty unless worktreeFailed is true. Names the spec slug, every candidate branch name tried, and (for a creation failure) the exact command output.' },
     specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
     specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
     tierPrefix:     { type: 'string', description: 'The invoking directory\'s path relative to the git root, with a trailing slash (e.g. "business/"), or "" when /sdlc-task was invoked at the git root. This is the CANDIDATE tier location checked in STEP 4a — reported regardless of whether the spec was actually found there.' },
@@ -1013,6 +1042,7 @@ const SETUP_SCHEMA = {
     specThin:       { type: 'boolean', description: 'D19: true on a fresh (non-resume) run with a structurally-valid but substantively-thin spec; false on resume or a healthy spec.' },
     thinReason:     { type: 'string', description: 'D19: the specific thin-spec failures when specThin; empty string otherwise.' },
     envFilesCopied: { type: 'array', items: { type: 'string' }, description: '--worktree only: repo-root-relative paths of every gitignored env-shaped file seeded into the worktree (from ENV_COPIED: lines); empty array if none existed to copy.' },
+    worktreeListPorcelain: { type: 'string', description: '--worktree only (task 2): the COMPLETE, UNMODIFIED stdout from the worktree list porcelain command captured in STEP 2d, after the worktree was created/resolved. The engine parses this itself and treats it as ground truth for runDir/branchName rather than trusting the agent\'s own STEP 2/2b bookkeeping — a worktree absent from this listing, or one whose listed path/branch does not match what setup intended, is a bail. Empty string in in-place mode. "COMMAND_FAILED: <output>" if the listing command itself errored.' },
     notes:          { type: 'string' }
   }
 }
@@ -1896,7 +1926,9 @@ STEP 1 — repoRoot and candidateTierPrefix are GIVEN, not derived. The engine a
   Use both values VERBATIM everywhere below. Do NOT re-derive repoRoot with \`${GIT} rev-parse
   --show-toplevel\` or any other command, and do NOT cd outside repoRoot at any point in this
   recipe — re-deriving it is exactly the failure this step exists to prevent.
-  Also run: ${GIT} rev-parse --abbrev-ref HEAD       (store as currentBranch)
+  Also run: ${GIT} rev-parse --abbrev-ref HEAD       (store as currentBranch — report this verbatim
+    in the final StructuredOutput call regardless of mode; it is how the engine detects a --worktree
+    run that silently resolved to the current branch)
 ${useWorktree ? `
 WORKTREE MODE (--worktree) — create or reuse an isolated worktree:
 ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if present:
@@ -1917,6 +1949,12 @@ ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if presen
       ${GIT} branch --list "<candidate>"
     If BOTH return nothing → the candidate is free; use it. Otherwise try "${baseBranchName}-2",
     "${baseBranchName}-3", … up to "-10". Store the chosen name as branchName.
+    FAIL CLOSED — if NONE of "${baseBranchName}" through "${baseBranchName}-10" come back free (all
+    10 are already a worktree and/or a branch), do NOT fall back to currentBranch or invent an
+    unlisted name. STOP here: set worktreeFailed=true, worktreeFailureReason naming the spec slug
+    "${blockId}" and every candidate tried (e.g. "${baseBranchName} through ${baseBranchName}-10 all
+    taken"), and skip straight to the final StructuredOutput call with runDir/branchName left as
+    whatever was last computed — the engine bails on worktreeFailed before using them.
 
   STEP 2b — Create the worktree (replace [branchName] with the chosen name):
     a. mkdir -p trees
@@ -1938,6 +1976,11 @@ ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if presen
        # "empty index against a non-empty HEAD" signal cannot fire here; --allow-empty is orthogonal.
        ${GIT} -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"
     Set wasCreated=true.
+    FAIL CLOSED — if ANY command in this step (a-g) errors or exits non-zero (in particular
+    \`${GIT} worktree add\`), STOP immediately. Do NOT fall back to running the rest of this pipeline
+    on the current branch in the main tree. Set worktreeFailed=true, worktreeFailureReason with the
+    failing command and its exact error output, and skip straight to the final StructuredOutput call
+    without attempting STEP 2c or STEP 3.
 
   STEP 2c — Fix the planning/ symlink for the worktree (run from the MAIN repo root, for ALL worktree
     paths — fresh create, re-attach, or reuse). In brain-vaulted repos the MAIN repo's \`planning\` is
@@ -1955,9 +1998,20 @@ ${resumeMode ? `  RESUME — reuse the existing worktree for this spec if presen
       fi
     If \`planning\` is a real tracked directory (non-vaulted repo), the sparse-checkout already
     populated it — do nothing.
+
+  STEP 2d — Capture the ACTUAL worktree listing (run from the MAIN repo root, for ALL worktree paths
+    — fresh create, re-attach, or reuse; this is what makes the intermittent silent main-tree
+    fallback impossible rather than merely unlikely — BT.ticket.sdlc-task-worktree-flag-is-
+    intermittently-ignored, task 2). Do NOT trust your own STEP 2/2b bookkeeping of branchName/runDir
+    for the final report — capture ground truth instead:
+      ${GIT} worktree list --porcelain
+    Report the COMPLETE, UNMODIFIED stdout of that command as worktreeListPorcelain (every line,
+    every worktree entry — do not filter it down to the one you think is relevant; the engine parses
+    it itself). If the command errors, report worktreeListPorcelain as the literal string
+    "COMMAND_FAILED: " followed by the error output.
 ` : `
-IN-PLACE MODE — no worktree. branchName=currentBranch, wasCreated=false. runDir=${repoRoot}
-  (repoRoot is GIVEN from STEP 1 — do not recompute it).
+IN-PLACE MODE — no worktree. branchName=currentBranch, wasCreated=false, worktreeFailed=false,
+  worktreeFailureReason="". runDir=${repoRoot} (repoRoot is GIVEN from STEP 1 — do not recompute it).
 `}
 STEP 3 — Compute runDir (repoRoot is GIVEN as ${repoRoot} — use it verbatim, never recompute it):
   ${useWorktree ? `runDir = "${repoRoot}" + "/trees/" + branchName` : `runDir = "${repoRoot}"`}
@@ -2006,14 +2060,68 @@ STEP 5 — Capture the emoji-gate diff base — the HEAD short sha as it stands 
   cd <runDir> && ${GIT} rev-parse --short HEAD     (store as baseSha)
 
 Return your result using the StructuredOutput tool:
-  runDir, branchName, baseSha, wasCreated, specFileExists, specSource, tierPrefix, specFoundInTier, blockStatus, specThin, thinReason,${useWorktree ? ' envFilesCopied,' : ''} notes.
+  runDir, branchName, currentBranch, baseSha, wasCreated, worktreeFailed, worktreeFailureReason, specFileExists, specSource, tierPrefix, specFoundInTier, blockStatus, specThin, thinReason,${useWorktree ? ' envFilesCopied, worktreeListPorcelain,' : ''} notes.
+  ${useWorktree ? 'If worktreeFailed is true, runDir/branchName/baseSha may be whatever was last computed before stopping — the engine ignores them and bails on worktreeFailed alone. Do NOT report mode:"worktree" success fields (a clean runDir/branchName) when worktreeFailed is true.' : ''}
 `, withModel({ label: 'setup', schema: SETUP_SCHEMA, phase: 'Setup' }, MODEL.setup))
 
 if (!setupResult) {
   log('Setup agent returned null — aborting pipeline')
   return { error: 'Setup failed', blockId }
 }
-const { runDir, branchName, baseSha } = setupResult
+let { runDir, branchName } = setupResult
+const { baseSha } = setupResult
+
+// WORKTREE FAIL-CLOSED GUARD (BT.ticket.sdlc-task-worktree-flag-is-intermittently-ignored, task 1) —
+// decided HERE IN JS, never left to the setup agent's own self-report, exactly like the binding/
+// brain-root guards below. Two independent checks, either one alone is enough to bail:
+//   1. worktreeFailed: the agent explicitly reported it could not resolve a free branch name (all
+//      10 candidates taken) or a worktree-creation command errored, and correctly stopped rather
+//      than falling back — this trusts the self-report ONLY for the fail case, never the success case.
+//   2. A cause-independent cross-check that catches a fallback the agent did NOT self-report: if
+//      --worktree was requested but the reported branchName/runDir match the branch/root the run
+//      STARTED on, worktree mode silently resolved to the main tree — the exact measured defect
+//      (mode:"worktree" with branch:"main", runDir:<main tree>). This does not rely on the model
+//      noticing its own failure, so it also catches a future prompt regression.
+// This must run BEFORE any state is recorded and BEFORE the binding/brain-root/population guards,
+// so a failed-closed worktree run never gets as far as touching the main tree.
+if (useWorktree) {
+  if (setupResult.worktreeFailed) {
+    log(`WORKTREE SETUP FAILED CLOSED for ${blockId}: ${setupResult.worktreeFailureReason || '(setup agent reported worktreeFailed=true with no reason)'} — refusing to run against the main tree.`)
+    return { error: 'Worktree setup failed', reason: setupResult.worktreeFailureReason || 'worktree resolution/creation failed', blockId }
+  }
+  if (branchName === setupResult.currentBranch || runDir === repoRoot) {
+    log(`WORKTREE FAIL-CLOSED for ${blockId}: --worktree was requested but setup resolved to the main tree instead of an isolated worktree (branchName="${branchName}", currentBranch="${setupResult.currentBranch}", runDir="${runDir}", repoRoot="${repoRoot}") — this is the measured intermittent defect; bailing rather than silently committing onto the current branch.`)
+    return { error: 'Worktree setup failed closed', reason: `branchName/runDir resolved to the main tree (branchName=${branchName}, currentBranch=${setupResult.currentBranch}, runDir=${runDir}, repoRoot=${repoRoot})`, blockId }
+  }
+
+  // WORKTREE-LIST CROSS-CHECK (task 2) — stop ASSUMING the setup agent's own runDir/branchName are
+  // real and read them back from `git worktree list --porcelain` ground truth instead. This is what
+  // makes the intermittent silent main-tree fallback impossible rather than merely unlikely: even a
+  // setup agent that fabricated a plausible-looking runDir/branchName without ever actually creating
+  // the worktree is caught here, because no such entry exists in the real listing.
+  const worktreeListRaw = setupResult.worktreeListPorcelain || ''
+  if (!worktreeListRaw || worktreeListRaw.startsWith('COMMAND_FAILED:')) {
+    log(`WORKTREE FAIL-CLOSED for ${blockId}: \`git worktree list --porcelain\` was not captured or errored during setup (worktreeListPorcelain=${JSON.stringify(worktreeListRaw)}) — cannot verify the worktree actually exists; refusing to run against an unverified path.`)
+    return { error: 'Worktree setup failed closed', reason: `worktree listing missing or failed: ${worktreeListRaw || '(empty)'}`, blockId }
+  }
+  const worktreeEntries = parseWorktreeListPorcelain(worktreeListRaw)
+  const listedEntry = worktreeEntries.find(e => e.path === runDir)
+  if (!listedEntry) {
+    log(`WORKTREE FAIL-CLOSED for ${blockId}: expected worktree at runDir="${runDir}" is ABSENT from the worktree list porcelain output (listed paths: ${worktreeEntries.map(e => e.path).join(', ') || '(none)'}) — the setup agent's reported runDir does not correspond to a real worktree; bailing rather than running against it.`)
+    return { error: 'Worktree setup failed closed', reason: `expected runDir ${runDir} absent from worktree list (listed: ${worktreeEntries.map(e => e.path).join(', ') || '(none)'})`, blockId }
+  }
+  if (listedEntry.branch !== branchName) {
+    log(`WORKTREE FAIL-CLOSED for ${blockId}: worktree at runDir="${runDir}" is on branch "${listedEntry.branch}" per \`git worktree list --porcelain\`, but setup reported branchName="${branchName}" — expected vs. observed mismatch; bailing rather than trusting the mismatched self-report.`)
+    return { error: 'Worktree setup failed closed', reason: `branch mismatch at runDir ${runDir}: expected branchName=${branchName}, observed=${listedEntry.branch}`, blockId }
+  }
+  // Ground truth confirmed the self-report exactly; re-assign from the listed entry anyway so
+  // downstream state is derived from `git worktree list`, never merely "assumed correct because it
+  // matched" (acceptance criterion: "read back ... rather than assumed").
+  runDir = listedEntry.path
+  branchName = listedEntry.branch
+  log(`WORKTREE-LIST CROSS-CHECK passed for ${blockId}: runDir and branchName confirmed against \`git worktree list --porcelain\` ground truth.`)
+}
+
 state.branch = branchName
 state.base_sha = baseSha
 state.worktree_path = useWorktree ? runDir : ''

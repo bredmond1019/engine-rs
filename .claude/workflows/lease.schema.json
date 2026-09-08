@@ -49,6 +49,11 @@
       "type": "string",
       "description": "OPTIONAL. How far an `exclusive` lease's refusal reaches. Absent means `repo`: the lease only refuses a register naming this same `repo` — an ordinary lane protecting its own working tree. `fleet` means the whole fleet is quiesced: the lease refuses every register, in any repo, until it is released or goes stale. Most leases should omit this field or set `repo`; `fleet` is reserved for the rare case (e.g. a cross-repo write through the vault symlinks) that genuinely needs every other lane parked.",
       "enum": ["repo", "fleet"]
+    },
+    "host": {
+      "type": "string",
+      "description": "OPTIONAL. The machine hostname holding this lease, when a Rust writer stamps it (engine-rs EN.15.C). Absent on every lease written before this field existed -- a reader must treat absence as 'no signal', never as an error.",
+      "minLength": 1
     }
   }
 }

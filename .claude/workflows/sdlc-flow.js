@@ -987,11 +987,12 @@ log(`Spec: ${blockId} (resolving block record first, tasks.md fallback) | branch
 // ================================================================
 const SETUP_SCHEMA = {
   type: 'object',
-  required: ['branchName', 'worktreePath', 'wasCreated'],
+  required: ['branchName', 'worktreePath', 'wasCreated', 'baseSha'],
   properties: {
     branchName:     { type: 'string', description: 'Actual branch name used (may have -2, -3 suffix if base was taken)' },
     worktreePath:   { type: 'string', description: 'Absolute path to the worktree directory' },
     wasCreated:     { type: 'boolean', description: 'true if a new worktree was created, false if an existing one was reused' },
+    baseSha:        { type: 'string', description: 'The HEAD short sha AFTER setup, BEFORE any task commit — the emoji-gate diff base' },
     specFileExists: { type: 'boolean', description: 'true if EITHER the block record or the legacy tasks.md exists (D65 stage 2)' },
     specSource:     { type: 'string', enum: ['block-record', 'tasks-md', 'missing'], description: "D65 stage 2: 'block-record' if planning/blocks/<BlockID>.json exists (preferred), else 'tasks-md' if the legacy spec file exists, else 'missing'. Evaluated at the WINNING location (root if the spec exists there, else tier) — see specFoundInTier." },
     tierPrefix:     { type: 'string', description: 'The invoking directory\'s path relative to the git root, with a trailing slash (e.g. "business/"), or "" when /sdlc-flow was invoked at the git root. This is the CANDIDATE tier location checked in STEP 6a — reported regardless of whether the spec was actually found there.' },
@@ -1710,6 +1711,9 @@ const state = {
   branch: baseBranchName,
   mode: useWorktree ? 'worktree' : 'branch',
   worktree_path: '',
+  // The HEAD short sha AFTER setup, BEFORE any task commit — the emoji-gate diff base (mirrors
+  // sdlc-task.js's state.base_sha). Set once setupResult returns; null until then.
+  base_sha: null,
   status: 'running',
   current_task: null,
   // Resolved by BT.ticket.engine-terminal-state-needs-evidence task 2: emitStateRan was declared,
@@ -1944,7 +1948,11 @@ STEP 4 — Verify:
   Confirm it contains the tracked top-level directories — at minimum planning/ (real dir or the fixed
   symlink) and .claude/. Confirm planning/ resolves: ls trees/[branchName]/planning/ >/dev/null 2>&1 && echo "PLANNING_OK".
 
-STEP 5 — worktreePath = "${repoRoot}/trees/" + branchName  (repoRoot is GIVEN — do not recompute it)`
+STEP 5 — worktreePath = "${repoRoot}/trees/" + branchName  (repoRoot is GIVEN — do not recompute it)
+
+STEP 5.5 — Capture the emoji-gate diff base — the HEAD short sha as it stands NOW, in the worktree
+  you just created/reused/re-attached, BEFORE any task commit:
+    ${GIT} -C trees/[branchName] rev-parse --short HEAD     (store as baseSha)`
 
 const branchRecipe = `${resumeMode ? `
 RESUME MODE IS ON — reuse the existing branch for this spec instead of creating a fresh one.
@@ -1973,10 +1981,22 @@ STEP 2 — Find a free branch name. FIRST check the exact base candidate "${base
 
 STEP 3 — Create the branch and check it out IN THE MAIN WORKING TREE (no worktree, no trees/ dir):
   a. Guard against a dirty tree — uncommitted changes would ride onto the branch and into the run's
-     commits. Run: ${GIT} status --porcelain
-     If it prints ANYTHING, STOP: do NOT create the branch. Set wasCreated=false and
+     commits. At the brain root (BRAIN_TOML_AT_ROOT=${brainTomlAtRoot}), repoRoot is the whole vault
+     and every sibling repo's planning/ symlinks into HQ's own git index under a _planning/ path —
+     dirt confined there belongs to another lane's in-flight work, not this run, so it is excluded
+     from the check; dirt anywhere outside a _planning/ path still blocks exactly as before, and at a
+     non-brain root (BRAIN_TOML_AT_ROOT=false) this exception does not apply. Run:
+       export BRAIN_TOML_AT_ROOT=${brainTomlAtRoot}
+       # CLEAN_TREE_GUARD_START
+       if [ "$BRAIN_TOML_AT_ROOT" = "true" ]; then
+         DIRTY="$(${GIT} status --porcelain | grep -v '_planning/' || true)"
+       else
+         DIRTY="$(${GIT} status --porcelain)"
+       fi
+       # CLEAN_TREE_GUARD_END
+     If $DIRTY is non-empty, STOP: do NOT create the branch. Set wasCreated=false and
      setupError="Working tree is not clean — commit or stash your changes, then re-run (or use --worktree
-     for an isolated checkout). Dirty paths: <the porcelain output>". Then skip to STEP 6 and return.
+     for an isolated checkout). Dirty paths: <$DIRTY>". Then skip to STEP 6 and return.
   b. ${GIT} checkout -b [branchName]
   No sparse-checkout, no env copy, no init commit — this is the real repo checkout, so the working tree
   (including any relative planning/ symlink) is already fully present and intact.
@@ -1985,7 +2005,11 @@ STEP 4 — Verify:
   Run: ${GIT} branch --show-current      (must print [branchName])
   Run: ls planning/ .claude/ >/dev/null 2>&1 && echo "TREE_OK" || echo "TREE_MISSING"
 
-STEP 5 — worktreePath = "${repoRoot}"  (GIVEN — branch mode runs in the main working tree, so there is no separate worktree dir; do not recompute repoRoot)`
+STEP 5 — worktreePath = "${repoRoot}"  (GIVEN — branch mode runs in the main working tree, so there is no separate worktree dir; do not recompute repoRoot)
+
+STEP 5.5 — Capture the emoji-gate diff base — the HEAD short sha as it stands NOW, in the checked-out
+  branch, BEFORE any task commit:
+    ${GIT} rev-parse --short HEAD     (store as baseSha)`
 
 const setupResult = await tracedAgent(`
 You are the setup agent. ${useWorktree
@@ -2061,10 +2085,11 @@ if (setupResult.setupError) {
   log(`Setup aborted: ${setupResult.setupError}`)
   return { error: 'Setup aborted', reason: setupResult.setupError, blockId }
 }
-const { branchName, worktreePath } = setupResult
+const { branchName, worktreePath, baseSha } = setupResult
 state.branch = branchName
 state.worktree_path = worktreePath
-log(`${useWorktree ? 'Worktree' : 'Branch'} ready: ${worktreePath} (branch: ${branchName})`)
+state.base_sha = baseSha
+log(`${useWorktree ? 'Worktree' : 'Branch'} ready: ${worktreePath} (branch: ${branchName}) | base: ${baseSha}`)
 
 // BINDING / BRAIN-ROOT / POPULATION GUARDS — run before any task work, before even the
 // enumerate stage. See verifySetupBinding() above for why the decision is made here in JS.

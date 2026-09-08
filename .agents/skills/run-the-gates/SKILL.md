@@ -84,6 +84,35 @@ reads as a failed corpus gate rather than a missing file, so a lane that copies 
 fleet is red. Measured 2026-08-28: four lanes hit this in one night, and one then reached for the
 path that does exist and ran the writer as its closing check.
 
+## 3b. A waiver against an unowned repo is not a green gate
+
+`mev`'s `scripts/consumer-gate-waivers.txt` is well designed: three mandatory fields, and a waived
+consumer returning to pass makes the waiver itself fail as stale. But its design **assumes the fix
+lives in another lane's repo** — i.e. that someone is actually holding that repo. Nobody checks that
+assumption at read time, so it silently fails when it's false.
+
+**The rule: a waiver naming a repo that holds no live lane lease must NOT read as a passing gate.**
+A waiver against an unowned repo is an unowned break wearing a ticket, not a mitigated one.
+
+Measured instance: `.fleet-locks/leases/` held `base-template`, `engine-rs` and `mev` only. A waiver
+was written against `bastion` — a repo with no lease held by anyone — and the gate went green.
+`cargo install --path core/bastion` stayed broken fleet-wide until an unrelated lane tried to
+rebuild it, which `derive-state-safely` instructs every lane to do before any `--write`.
+
+**What to do when you hit a waived-consumer green:** before trusting it, check whether the waiver's
+named repo has a live lease in `.fleet-locks/leases/`. No lease held there means nobody is actually
+working the fix — treat the waiver as an open break, not a passing check, and surface it rather than
+proceeding on the green.
+
+**Scope of this fix, here:** no liveness-check script is added by this block — building the
+mechanism is out of scope; this section only fixes the *reading* discipline. If one is ever added,
+it must first be shown capable of **failing**: it must flag a waiver naming a repo with no lease
+file, and — the positive control — it must **not** flag a waiver whose repo has a live lease. A
+liveness check that flags everything is exactly as useless as one that flags nothing.
+
+`mev`'s waiver format itself is unchanged by this — only how a reader trusts a waived-consumer green
+changes.
+
 ## 4. Know which checks do not gate
 
 HQ's `planning/harness.json` is the authority (the table in `CLAUDE.md` is a convenience copy and has
@@ -140,3 +169,4 @@ session builds on it.
 - [ ] `git worktree list` checked before trusting a root-level test/lint result
 - [ ] Non-gating checks (`conformance`) not treated as blockers — and vice versa
 - [ ] Any skipped check named explicitly in the report
+- [ ] A waived-consumer green checked against `.fleet-locks/leases/` for the named repo before trusting it

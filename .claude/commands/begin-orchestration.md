@@ -132,6 +132,21 @@ that directory holds **no** `roadmap.md` and **no** lane records, which is exact
 `scripts/lane_log_watermark.py`'s `is_roadmap_dir()` already distinguishes a roadmap from
 something else, so nothing downstream mistakes it for one.
 
+**`planning/roadmaps/<slug>/` resolves at `BRAIN_ROOT`, not at the invoking repo.** In every
+vaulted repo `planning/` is a symlink into `_planning/<repo>/`, so a lane driven from a leaf repo
+must NOT read this path relative to that repo — the lane log and escalations file belong at the
+brain root's `planning/roadmaps/<slug>/`, full stop. The mechanism: `scripts/check_escalations.py`
+and `scripts/lane_log_watermark.py` both resolve their directory by walking up for `brain.toml`
+and joining `planning/roadmaps` onto whatever directory holds it — never onto the invoking repo's
+own `planning/`. This is safe rather than a layering violation: attribution is by each record's
+own `repo` field, not by file location, so a leaf repo's lane-log and escalation records living at
+HQ are correctly attributed and read by every gate that scans them (escalations-schema's own
+observed_red evidence includes the `--repo` attribution control). **Contrast this deliberately
+with Step 1E**: `run_record_dir` (`planning/orchestration-run/<slug>/`) IS repo-local and stays
+that way — the two paths look alike (both keyed by `<slug>`, both under `planning/`) but resolve
+in opposite places on purpose, and conflating them sends a lane's escalations to a directory no
+gate ever reads.
+
 **E. `run_record_dir`** = `planning/orchestration-run/<slug>/` in **this repo**, where `<slug>` is
 as defined in D — the roadmap's directory name, or the `--run` value. Create the directory if absent; if it
 already exists, **append** to its `notes.md` / `review.md` rather than creating new ones. **No
@@ -243,9 +258,23 @@ still bears on the *why*:
 | the brain root (HQ) | **`--no-worktree`, always** | `validate-brain` inside a worktree resolves the gitignored sub-repos against the worktree's own `brain.toml` and they are absent from any checkout. Measured: 64 structure / 601 state errors versus 0/0 in the main tree. Worktree creation is clean — it is the corpus gates that cannot pass. |
 | anything else | `--no-worktree` | Cheaper. Use `--worktree` when a change deserves quarantine — available again fleet-wide since the D81 lift. |
 | any repo that already has another session live in it | **`--worktree`** | The first three rows assume one session per repo. Two chains sharing a working tree share one git index, so each sees the other's uncommitted files: a tree-wide `validation_command` bails on a sibling's edits, `git status` reads as dirty for reasons you did not cause, and a `git checkout`/branch switch by either one moves the other's tree underneath it. Cheap detection before Step 4: `git -C <repo> status --short` showing edits you did not make, a branch you did not create (`git -C <repo> branch --show-current`), or the roadmap's lane records naming another live lane in this repo. When in doubt, take the worktree — except for the two rows above, where a worktree cannot pass the gates at all; there, do not start a second concurrent chain. |
+| a session live in a repo THIS repo path-depends on (Cargo `path = "../<repo>"`), or a session live in a repo that path-depends on THIS one | **`--worktree` mitigates NEITHER direction** | A Cargo path dependency of the form `../<repo>` resolves outside the worktree, straight to the sibling's main checkout — a worktree isolates this repo's own tree, never the tree its manifest reaches into. Measured fleet edge list (dependent → dependencies, depth ≤3): `core/engine-rs → mev, okf-core`; `core/mev → okf-core`; `core/bastion → bella, mev, okf-core, engine-rs`. Read it both ways: `okf-core` has no dependencies of its own yet is a compile-time input to three lanes at once (engine-rs, mev, bastion) — a lane there looks harmless and is not; `bastion` is the widest dependent, taking uncommitted source from four sibling repos at once. Measured cost: engine-rs was fully unable to compile for ~25 minutes because mev-a8 was mid-task in `../mev`, and engine-rs's chain had to pause. The lever that actually works is a path-dependency-aware quiesce, or a pinned sibling checkout — a design question, not a flag; this table does not resolve it, it only says `--worktree` will not. |
 
 An explicit `--isolation` that contradicts either of the first two rows → **stop and report.** Do
 not run a chain whose gates cannot pass.
+
+**Three measured control failures make this row necessary, not merely a caveat** — cited verbatim,
+not paraphrased as general advice (full narrative:
+`core/engine-rs/planning/orchestration-run/context-handling-between-nodes/notes.md`):
+
+- An sdlc-task engine "verified" two test failures were pre-existing by rebuilding at engine-rs's
+  base commit in a sibling worktree — which held `okf-core`'s working tree at an already-changed
+  version, because a worktree does not isolate a path dependency.
+- A lane chose `--no-worktree` because no session was live IN its own repo, never checking whether
+  one was live in a repo it path-depends on.
+- A lane disproved a test's existence with `rg -l <name> core/` run at the brain root, where every
+  sub-repo is gitignored — its positive control happened to name a path inside the ignored subtree,
+  returned a match, and read as proof the instrument worked when it had tested nothing.
 
 **Re-verify the caveat before you plan on it.** The isolation table above isn't policy handed down
 once — it's
@@ -335,25 +364,53 @@ behavior this replaces, never a hard failure. Full design:
 `planning/decisions/D66-tiered-heavy-lane-concurrency.md` (in `base-template`).
 
 **At lane close, release both the repo lease and the registry claim taken in Step 4, alongside
-this fleet-concurrency slot release** — delete `<lock_dir>/leases/lease-<repo>.json` and
-`<lock_dir>/lane-agents/agent-<agent_name>.json`. All three releases happen together, on success,
-failure, or abandonment, so a reader looking for "what does this lane give back on exit" finds it
-in one place.
+this fleet-concurrency slot release.** All three releases happen together, on success, failure, or
+abandonment, so a reader looking for "what does this lane give back on exit" finds it in one
+place.
+
+#### Bastion coord (preferred)
+
+If `bastion` is on PATH, release the lease and the registry claim with `bastion coord unlease
+--repo <this-repo-name>` and `bastion coord release --agent-name <this lane's agent identity>`.
+Both are idempotent — each exits 0 whether or not the lease/claim existed, so it is always safe to
+call on abandonment even if the earlier acquire never confirmed. This is what removes this lane's
+row from the joined coordination view (`bastion coord status`) — nothing further to delete by
+hand.
+
+#### Fallback: hand-written JSON (no bastion binary)
+
+If `bastion` is not on PATH, delete `<lock_dir>/leases/lease-<repo>.json` and
+`<lock_dir>/lane-agents/agent-<agent_name>.json` directly. This fallback is permanent, not a
+migration step — keep it working even once the coord path is the default.
+
+#### Quiescing (either path)
 
 **Taking any exclusive lease quiesces this repo's `mev` write verbs for the length of the chain.** While a `kind: exclusive` lease is held — whether the ordinary per-lane lease Step 4 takes for every real lane, or an additional lease taken here for a repo named in `exclusive_repos` — every `mev` write verb for that leased repo (`set-block-status --write`, `emit-state --write`, and the other write verbs) is refused with `E_QUIESCE_LEASE_HELD`. This is a declared quiet window, distinct from `E_EMIT_LOCK_HELD` contention: do NOT retry — either wait for the lease to be released, or, if this lane is the holder, pass `--agent <this lane's agent identity>` as the self-exemption on the write verb, exactly as `register`/`release` already require it above. The lease Step 4 makes this lane take is one of the leases this section's own `register` check consults — `--agent` is what lets the holder's own `register`/`release`/write calls through without being refused by its own lease. (The holder's own re-register is never refused: both `fleet_concurrency_check.py` and `mev` skip a lease whose `agent` matches the requester.)
 
 **Fleet-exclusive lanes (`exclusive_repos`).** If the lane record's `exclusive_repos` array is
-non-empty, before the first block starts, write an additional `kind: exclusive` lease at
-`<lock_dir>/leases/lease-<repo>.json` for **each** repo named in `exclusive_repos` — same shape as
-any other lease record (`repo`, `lane`, `agent`, `acquired_at`, `kind: exclusive`; no new field).
-`scope` absent defaults to `repo`: a repo-scoped exclusive lease refuses `register` (and the
-`mev` write verbs above) only for a requester whose own repo the lease names — not every other
-agent. Only `scope: fleet` quiesces the whole fleet; the leases this paragraph writes for each
-`exclusive_repos` entry are repo-scoped, one per named repo, so together they close
-registration on exactly those repos. This is admission control only, never pre-emption of a
-lane already running. Remove every lease written this way at lane close — success, failure, or
-abandonment — alongside the ordinary lease and registry releases. `exclusive_repos` is read only
-here; no new field is added to `.claude/workflows/lane.schema.json` or to the lease record.
+non-empty, before the first block starts, take an additional `kind: exclusive` lease for **each**
+repo named in `exclusive_repos` — same shape as any other lease record (`repo`, `lane`, `agent`,
+`acquired_at`, `kind: exclusive`; no new field). `scope` absent defaults to `repo`: a repo-scoped
+exclusive lease refuses `register` (and the `mev` write verbs above) only for a requester whose
+own repo the lease names — not every other agent. Only `scope: fleet` quiesces the whole fleet; the
+leases below are repo-scoped, one per named repo, so together they close registration on exactly
+those repos. This is admission control only, never pre-emption of a lane already running. Remove
+every lease taken this way at lane close — success, failure, or abandonment — alongside the
+ordinary lease and registry releases (bastion coord's `unlease`/`release` above, or the
+fallback delete). `exclusive_repos` is read only here; no new field is added to
+`.claude/workflows/lane.schema.json` or to the lease record.
+
+##### Bastion coord (preferred)
+
+If `bastion` is on PATH, take each `exclusive_repos` lease with `bastion coord lease --repo <repo>
+--lane <this-lane> --agent-name <this lane's agent identity> --kind exclusive` (verify flag names
+against `bastion coord lease --help` before use — `--scope` and `--window` are optional and unused
+for this whole-lane exclusive lease).
+
+##### Fallback: hand-written JSON (no bastion binary)
+
+If `bastion` is not on PATH, write the lease record by hand at
+`<lock_dir>/leases/lease-<repo>.json` for each repo named in `exclusive_repos`.
 
 ## Step 4 — Confirm
 
@@ -368,11 +425,31 @@ Print, and stop for confirmation unless `--execute`:
 - **operator gates** — any block the roadmap marks as waiting on a human, with which item
 - the log path
 
-**Before any block runs**, claim this lane's identity in the registry and take the repo lease:
+**Before any block runs**, claim this lane's identity in the registry and take the repo lease.
+Resolve `<lock_dir>` exactly as `scripts/check_lane_agents.py` does — `--lock-dir`, else
+`FLEET_LOCK_DIR`, else a `brain.toml` walk-up joined with `.fleet-locks` — see that script for
+the precedence rather than re-deriving it here; `bastion coord`'s own `--lock-dir` mirrors the
+same precedence.
 
-- Resolve `<lock_dir>` exactly as `scripts/check_lane_agents.py` does — `--lock-dir`, else
-  `FLEET_LOCK_DIR`, else a `brain.toml` walk-up joined with `.fleet-locks` — see that script for
-  the precedence rather than re-deriving it here.
+#### Bastion coord (preferred)
+
+If `bastion` is on PATH, claim the identity and take the lease with two calls:
+
+- `bastion coord register --agent-name <this lane's agent identity> --repo <this-repo-name>
+  --lane <this-lane> --roadmap <roadmap-slug>` — writes the lane-agent registry claim.
+- `bastion coord lease --repo <this-repo-name> --lane <this-lane> --agent-name <this lane's
+  agent identity> --kind exclusive` — takes the repo lease. `exclusive` for a lane that will
+  commit — every real lane.
+
+Both calls happen before the first block launches. If either fails, stop; do not start the chain
+holding only one of the two. Re-stamp the claim's heartbeat with `bastion coord heartbeat
+--agent-name <this lane's agent identity>` (optionally `--current-block`/`--block-started-at`)
+at each block boundary rather than hand-editing the file — see the re-stamp rule below.
+
+#### Fallback: hand-written JSON (no bastion binary)
+
+If `bastion` is not on PATH, write both records by hand:
+
 - Write a lane-agent registry record, per `.claude/workflows/lane-agent.schema.json`
   (`agent_name`, `repo`, `lane`, `roadmap`, `started_at`, `heartbeat`), to
   `<lock_dir>/lane-agents/agent-<agent_name>.json`.
@@ -384,6 +461,17 @@ Print, and stop for confirmation unless `--execute`:
   once that ages past the threshold, however live its holder actually is.
 - Both writes happen before the first block launches. If either write fails, stop; do not start
   the chain holding only one of the two.
+
+**The repo lease is advisory, not a lock — nothing reads it at commit time today.** Taking it
+here does not prevent another session from committing to this repo while it is held; it only
+gives a session that chooses to look something to look at. Observed twice: 2026-09-05, commit
+d89093f (9 files) landed in base-template mid-chain while `lease-base-template.json` named agent
+`base-template-cb`, kind `exclusive`, with a fresh heartbeat; and 2026-09-07, commit 8b49968
+landed mid-chain while lane `base-template-5c` held the same lease, deleting a
+`docs/workflows/index.md` marker that running lane had cited an hour earlier. `scripts/
+check_repo_lease.py` exists to make a held lease visible on demand — printing the holder, its
+lane and current block, and the heartbeat age — but nothing invokes it automatically; it must be
+run by hand.
 
 **Agent identity comes from the transport, never from self-report.** `agent_name` is the
 ListAgents nickname this session is currently reachable at, taken from the transport-stamped
@@ -547,15 +635,25 @@ Each has already cost a real run in this fleet.
    roadmap: <driving-roadmap-slug>    # the --roadmap value resolved in Step 1C
    lane: <lane-name>
    run_started: YYYY-MM-DD
-   run_ended: YYYY-MM-DD              # stamped at lane close
-   lifecycle: active | lane-complete | consolidated
+   run_ended: null                    # leave null/absent while the lane runs
+   lifecycle: active | paused | lane-complete | consolidated
    ```
+
+   **`run_ended` is not a field you fill in when you create the record.** Create an active record
+   with `run_ended` absent or explicitly `null` — never a fill-in-now date. `run_ended` is
+   stamped at lane close, once the run is actually done, not before. **A record carrying
+   `lifecycle: active` alongside a non-null `run_ended` now FAILS the gated
+   `orchestration-run-contract-tests` check**
+   (`scripts/test_orchestration_run_contract.py`) — this template used to invite exactly that
+   shape by showing `run_ended: YYYY-MM-DD` as something to fill in immediately, which is the
+   source of the drift this rule now gates against, not a hypothetical.
 
    `doc_id: <repo-slug>-orchestration-run-<roadmap-slug>` — unqualified ids collide corpus-wide and
    a corpus-wide `--graph` error red-gates every concurrent lane, not just this one. `lifecycle`
-   replaces `status: archived`: `active` while the lane is running, `lane-complete` once this
-   repo's part is done (the roadmap itself may still be open), `consolidated` once a consolidation
-   run has consumed the record.
+   replaces `status: archived`: `active` while the lane is running, `paused` when the run has
+   halted without finishing — so a paused run is not forced to choose between lying `active` and
+   lying `lane-complete` — `lane-complete` once this repo's part is done (the roadmap itself may
+   still be open), `consolidated` once a consolidation run has consumed the record.
 
    **The per-block ledger table in the run record carries an `origin_roadmap` column**, defaulting
    to the record's own `roadmap` and set explicitly only when a block was adopted from a different

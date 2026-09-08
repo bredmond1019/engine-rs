@@ -107,35 +107,43 @@ fi
 
 CURRENT_BRANCH=$(git branch --show-current)
 if [ "$CURRENT_BRANCH" = "$RESOLVED_BASE" ]; then
-  # HEAD IS the resolved base — a two-dot/three-dot diff against it is empty by definition. The
-  # only real evidence left is a merge commit (e.g. --auto-merge's `gh pr merge --merge`): its
-  # first parent is the pre-merge base, so HEAD^1..HEAD is what the merge actually brought in.
-  if git rev-parse --verify -q HEAD^2 >/dev/null 2>&1; then
-    RANGE="HEAD^1..HEAD"
-    echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' via a merge commit — scoping to what it brought in: $RANGE"
-  else
-    # /sdlc-task in its default in-place mode commits straight onto the current (often base)
-    # branch — no merge commit to scope from. It persists its own pre-task HEAD as `base_sha` in
-    # planning/<spec>/sdlc/sdlc-task-state.json for exactly this case.
-    #
-    # Take the EARLIEST base of the current run, not the most recent. An /orchestrate chain runs
-    # several blocks in place on one branch, each writing its own state file whose `base_sha` is
-    # the HEAD it started from — so the newest file's base_sha is the last BLOCK's base, and
-    # scoping to it silently drops every earlier block in the chain from the emoji gate and the
-    # coverage sweep. Measured 2026-08-28: a three-block chain resolved to block 3's base and would
-    # have reviewed one block of three while reporting a clean close-out.
-    #
-    # "Of the current run" is bounded two ways, because the oldest base_sha on disk is often a
-    # months-old spec that would over-scope just as badly:
-    #   - the candidate must still be an ancestor of HEAD (a stale or abandoned base is not), and
-    #   - it must belong to the same run, approximated as within RUN_WINDOW_HOURS of the newest
-    #     candidate's timestamp.
-    # Among what survives, pick the base furthest back — the most commits between it and HEAD.
-    TASK_BASE=$(python3 -c "
+  # HEAD IS the resolved base — a two-dot/three-dot diff against it is empty by definition. Both
+  # ways HEAD can end up here need the SAME candidate resolution, not two divergent paths: a merge
+  # commit's first parent is a FLOOR (what the last merge alone brought in), never the answer on
+  # its own — a multi-block /orchestrate chain that lands most blocks IN PLACE and merges only the
+  # last one scopes to that one block if the floor is taken unconditionally (measured 2026-09-04:
+  # 1 block of 6). And a bare `branch` match with no other tie to this session is not evidence
+  # either — a stale sibling state file left by an unrelated, already-closed run on the same branch
+  # name must be rejected, not accepted (measured 2026-08-19, bastion-web BW.16).
+  #
+  # /sdlc-task's default in-place mode and /sdlc-flow both persist their own pre-run HEAD as
+  # `base_sha` — in planning/<spec>/sdlc/sdlc-task-state.json and sdlc-flow-state.json
+  # respectively — for exactly this case. Collect candidates from BOTH engines' state files; a
+  # file with no `base_sha` key (every historical sdlc-flow-state.json on disk, before flow
+  # started recording it) is simply "no candidate from this file," never an error.
+  #
+  # Take the EARLIEST base of the current run, not the most recent. An /orchestrate chain runs
+  # several blocks in place on one branch, each writing its own state file whose `base_sha` is
+  # the HEAD it started from — so the newest file's base_sha is the last BLOCK's base, and
+  # scoping to it silently drops every earlier block in the chain from the emoji gate and the
+  # coverage sweep. Measured 2026-08-28: a three-block chain resolved to block 3's base and would
+  # have reviewed one block of three while reporting a clean close-out.
+  #
+  # A candidate is accepted only when it ties to THIS session, checked three ways:
+  #   - it must still be an ancestor of HEAD (a stale or abandoned base is not);
+  #   - it must belong to the same run, approximated as within RUN_WINDOW_HOURS of the newest
+  #     surviving candidate's timestamp (groups a multi-block chain's several state files); and
+  #   - its own timestamp must be within SESSION_TIE_HOURS of right now — a `branch` match alone,
+  #     with no other tie, is exactly what let a months-old, already-closed sibling get accepted
+  #     as this session's base (BW.16). A candidate from weeks or months ago is a different,
+  #     already-closed session wearing the same branch name, not this one.
+  # Among what survives, pick the base furthest back — the most commits between it and HEAD.
+  TASK_BASE=$(python3 -c "
 import glob, json, subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 RUN_WINDOW_HOURS = 24
+SESSION_TIE_HOURS = 24 * 7  # a candidate older than this, vs. right now, is not this session
 
 def parse(ts):
     try:
@@ -152,22 +160,26 @@ def distance(sha):
                        capture_output=True, text=True)
     return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else -1
 
+now = datetime.now(timezone.utc)
 cands = []
-for f in glob.glob('planning/*/sdlc/sdlc-task-state.json'):
-    try:
-        d = json.load(open(f))
-    except Exception:
-        continue
-    sha = d.get('base_sha')
-    if d.get('branch') != '$CURRENT_BRANCH' or not sha:
-        continue
-    ts = parse(d.get('updated_at') or d.get('started_at') or '')
-    if ts is None or not is_ancestor(sha):
-        continue
-    dist = distance(sha)
-    if dist <= 0:          # base_sha == HEAD, or unreadable: nothing to scope
-        continue
-    cands.append((ts, dist, sha))
+for pattern in ('planning/*/sdlc/sdlc-task-state.json', 'planning/*/sdlc/sdlc-flow-state.json'):
+    for f in glob.glob(pattern):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        sha = d.get('base_sha')
+        if d.get('branch') != '$CURRENT_BRANCH' or not sha:
+            continue   # no base_sha (e.g. every historical sdlc-flow-state.json) = no candidate from this file, not an error
+        ts = parse(d.get('updated_at') or d.get('started_at') or '')
+        if ts is None or not is_ancestor(sha):
+            continue
+        if now - ts > timedelta(hours=SESSION_TIE_HOURS):
+            continue   # too old to be tied to this session -- a branch-name match alone is not enough
+        dist = distance(sha)
+        if dist <= 0:          # base_sha == HEAD, or unreadable: nothing to scope
+            continue
+        cands.append((ts, dist, sha))
 
 print('')
 if cands:
@@ -175,11 +187,33 @@ if cands:
     window = [c for c in cands if newest - c[0] <= timedelta(hours=RUN_WINDOW_HOURS)]
     print(max(window, key=lambda c: c[1])[2])
 " | tail -1)
+
+  if git rev-parse --verify -q HEAD^2 >/dev/null 2>&1; then
+    # HEAD is the base via a merge commit (e.g. --auto-merge's `gh pr merge --merge`). Its first
+    # parent is a FLOOR — what that one merge brought in — not the answer: if a candidate above
+    # reaches further back than the floor (an in-place chain landed before the merge), use it.
+    FLOOR_DIST=$(git rev-list --count HEAD^1..HEAD)
+    if [ -n "$TASK_BASE" ] && git rev-parse --verify -q "$TASK_BASE" >/dev/null 2>&1; then
+      TASK_DIST=$(git rev-list --count "${TASK_BASE}..HEAD")
+      if [ "$TASK_DIST" -gt "$FLOOR_DIST" ]; then
+        RANGE="${TASK_BASE}..HEAD"
+        echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' via a merge commit — recovered base_sha=$TASK_BASE spanning the whole run: $RANGE"
+      else
+        RANGE="HEAD^1..HEAD"
+        echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' via a merge commit — no candidate reaches further back than the merge parent; scoping to what it brought in: $RANGE"
+      fi
+    else
+      RANGE="HEAD^1..HEAD"
+      echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' via a merge commit — no tied base_sha candidate found; scoping to what it brought in: $RANGE"
+    fi
+  else
+    # No merge commit to scope from at all — a candidate tied to this session is the only
+    # evidence left.
     if [ -n "$TASK_BASE" ] && git rev-parse --verify -q "$TASK_BASE" >/dev/null 2>&1 && [ "$(git rev-parse "$TASK_BASE")" != "$(git rev-parse HEAD)" ]; then
       RANGE="${TASK_BASE}..HEAD"
-      echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' with no merge commit — recovered base_sha=$TASK_BASE from an /sdlc-task run's state file: $RANGE"
+      echo "CLOSE-OUT: HEAD is base '$RESOLVED_BASE' with no merge commit — recovered base_sha=$TASK_BASE from an /sdlc-task or /sdlc-flow run's state file: $RANGE"
     else
-      echo "CLOSE-OUT: HEAD IS the base branch '$RESOLVED_BASE' with no merge commit to scope from, and no /sdlc-task state file for this branch names a usable base_sha. Refusing to report a vacuous clean. Re-run with --base <ref> naming the commit this session's work started from, or run /close-out from the feature branch before it merges. Aborting."
+      echo "CLOSE-OUT: HEAD IS the base branch '$RESOLVED_BASE' with no merge commit to scope from, and no /sdlc-task or /sdlc-flow state file for this branch names a base_sha tied to this session. Refusing to report a vacuous clean. Re-run with --base <ref> naming the commit this session's work started from, or run /close-out from the feature branch before it merges. Aborting."
       exit 1
     fi
   fi

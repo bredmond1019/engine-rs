@@ -72,7 +72,12 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
 1. **Setup — plain branch, or isolated worktree with `--worktree`**:
    - **Without `--worktree` (default):** check out branch `<spec-slug>-flow` IN THE MAIN WORKING
      TREE — no sparse-checkout worktree, so a relative `planning/` symlink (brain-vaulted repos) stays
-     intact. `main` stays on the branch until the PR merges; refuse to start on a dirty working tree.
+     intact. `main` stays on the branch until the PR merges; refuse to start on a dirty working tree —
+     **except** at a brain root (`brain.toml` present at `repoRoot`), where dirt confined entirely to a
+     sibling repo's vaulted `_planning/<repo>/` path (`git status --porcelain | grep -v '_planning/'`
+     comes back empty) does not count, since that dirt belongs to another lane's in-flight work, not
+     this run — dirt outside `_planning/`, and any dirt at a non-brain root, still blocks exactly as
+     before.
    - **With `--worktree`:** create (or, with `--resume`, reuse/re-attach) an isolated sparse-checkout
      worktree, mirroring `/sdlc-task`'s Steps 1b/1c (see `.agents/skills/sdlc-task/SKILL.md`) with the
      branch name `<spec-slug>-flow` instead of `<blockId>-task`:
@@ -115,6 +120,11 @@ When the user asks you to run `/sdlc-flow <spec-slug> [range]`, do NOT run `sdlc
        five example paths.
      Log each guard's verdict, pass or fail — the transcript must show the check ran, not merely
      that nothing exploded.
+   - Capture the **emoji-gate diff base**: `baseSha = git -C <runDir> rev-parse --short HEAD` — the
+     HEAD sha as it stands right now, in the worktree/branch you just created/reused/re-attached,
+     BEFORE any task commit. Persist it as `state.base_sha` (mirrors `/sdlc-task`'s Step 1d capture —
+     see `.agents/skills/sdlc-task/SKILL.md`). Never persist `prBase`/`diffBase` (the PR base branch
+     name, e.g. `main`) into this field — it is a branch tip, not a sha pinned to this run's start.
 2. **D16 preflight lint — do not guess the task structure.**
    - If the spec's `tasks.json` already exists, skip to task execution.
    - If it is missing but `tasks.md` has derivable step content, derive a FRESH `tasks.json` from

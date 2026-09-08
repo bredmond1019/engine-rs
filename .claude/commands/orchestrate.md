@@ -105,6 +105,24 @@ Each of these exists because it has already caused a real failure in this fleet.
    The log lives at **`planning/roadmaps/<slug>/lane-log.jsonl`** — resolve `<slug>` via
    `/begin-orchestration`'s Step 1D rule: the driving roadmap's directory name, or the operator's
    `--run <slug>` verbatim when the chain has no roadmap. Never a hardcoded `planning/<slug>/`.
+   **A slug present at both `planning/roadmaps/<slug>/` and the legacy `planning/<slug>/` is an
+   error — stop and report rather than silently choosing one**; that ambiguity is exactly how a
+   lane ends up appending to the wrong lane log.
+
+   **This path resolves at `BRAIN_ROOT`, not at the invoking repo.** In every vaulted repo
+   `planning/` is a symlink into `_planning/<repo>/`, so a lane driven from a leaf repo must NOT
+   read `planning/roadmaps/<slug>/` relative to that repo — the lane log and escalations file
+   belong at the brain root's `planning/roadmaps/<slug>/`, full stop. The mechanism:
+   `scripts/check_escalations.py` and `scripts/lane_log_watermark.py` both resolve their directory
+   by walking up for `brain.toml` and joining `planning/roadmaps` onto whatever directory holds it
+   — never onto the invoking repo's own `planning/`. This is safe rather than a layering
+   violation: attribution is by each record's own `repo` field, not by file location, so a leaf
+   repo's lane-log and escalation records living at HQ are correctly attributed and read by every
+   gate that scans them (escalations-schema's own observed_red evidence includes the `--repo`
+   attribution control). **Contrast this deliberately with rule 9's `run_record_dir`**
+   (`planning/orchestration-run/<slug>/`), which IS repo-local and stays that way — the two paths
+   look alike (both keyed by `<slug>`, both under `planning/`) but resolve in opposite places on
+   purpose, and conflating them sends a lane's escalations to a directory no gate ever reads.
 
    **A run with no roadmap is still a run and still leaves a lane log.** It takes its slug from
    `/begin-orchestration --run <slug>` — an operator-named flag, never derived here. **Do not invent
@@ -196,24 +214,54 @@ Each of these exists because it has already caused a real failure in this fleet.
    and the entry points at it.
 
 10. **Hold the repo lease across a block, never across a boundary; drain the inbox only at the
-    boundary.** `/begin-orchestration` Step 4 takes the repo lease
-    (`<lock_dir>/leases/lease-<repo>.json`) and the registry claim
-    (`<lock_dir>/lane-agents/agent-<agent_name>.json`) before this chain starts. At the block
-    boundary — step 10 below, "Re-check the next block's dependencies, then launch it" — **release
-    the lease, drain this lane's inbox, then re-take the lease before launching the next block**.
-    The boundary and not mid-block, because a lane stopped mid-block loses exactly the context
-    that cannot be written down (base-template standing rule 10) — the lease release and the
-    drain both wait for a point where nothing is in flight.
+    boundary.** `/begin-orchestration` Step 4 takes the repo lease and the registry claim before
+    this chain starts. At the block boundary — step 10 below, "Re-check the next block's
+    dependencies, then launch it" — **release the lease, drain this lane's inbox, then re-take the
+    lease before launching the next block**. The boundary and not mid-block, because a lane
+    stopped mid-block loses exactly the context that cannot be written down (base-template
+    standing rule 10) — the lease release and the drain both wait for a point where nothing is in
+    flight.
 
-    **Draining**: this lane's queue is `<lock_dir>/queue/<repo>/<lane>/{inbox,processing,done}`.
-    Use `scripts/check_messages.py`'s `drain_queue()` to move everything from `inbox/` to
-    `processing/`, then `complete_message()` per message once triaged — do not restate the queue
-    layout or receipts ledger here, `BT.6.B` owns both.
+#### Bastion coord (preferred)
+
+    If `bastion` is on PATH, take the lease and registry claim with `bastion coord lease --repo
+    <this-repo-name> --lane <this-lane> --agent-name <this lane's agent identity> --kind
+    exclusive` and `bastion coord register --agent-name <this lane's agent identity> --repo
+    <this-repo-name> --lane <this-lane> --roadmap <roadmap-slug>`, released at the boundary with
+    `bastion coord unlease --repo <this-repo-name>` and `bastion coord release --agent-name <this
+    lane's agent identity>` — both idempotent, exiting 0 whether or not the lease/claim existed.
+
+#### Fallback: hand-written JSON (no bastion binary)
+
+    If `bastion` is not on PATH, take the repo lease at `<lock_dir>/leases/lease-<repo>.json` and
+    the registry claim at `<lock_dir>/lane-agents/agent-<agent_name>.json` directly, and delete
+    both files at the boundary. This fallback is permanent, not a migration step — keep it working
+    even once the coord path is the default.
+
+    **The lease is advisory, not a lock — nothing reads it at commit time today.** Holding it
+    across a block does not stop another session from committing to this repo while it is held;
+    it only gives a session that chooses to check something to check. A concurrent commit through
+    a live exclusive lease has been observed twice: 2026-09-05 (commit d89093f, 9 files, landed
+    mid-chain against a fresh `base-template-cb` lease) and 2026-09-07 (commit 8b49968 landed
+    mid-chain against this lane's own held lease, deleting a doc marker the lane had cited an hour
+    earlier). `scripts/check_repo_lease.py` makes a held lease visible on demand, but nothing
+    invokes it automatically at commit time.
+
+    **Draining (either path)**: this lane's queue is
+    `<lock_dir>/queue/<repo>/<lane>/{inbox,processing,done}`. If `bastion` is on PATH, drain with
+    `bastion coord drain --repo <repo> --lane <lane>`, which moves every inbox message into
+    `processing/` in one call and reports `{"moved":[...],"failed":[...]}`. Otherwise (fallback),
+    use `scripts/check_messages.py`'s `drain_queue()` to move everything from `inbox/` to
+    `processing/`. Either way, `complete_message()` per message once triaged — do not restate the
+    queue layout or receipts ledger here, `BT.6.B` owns both.
 
     **Re-stamp both heartbeats at this same boundary.** Before releasing, update the registry
-    claim's `heartbeat` field (`<lock_dir>/lane-agents/agent-<agent_name>.json`) to the current
-    time; after re-taking, update the lease's `heartbeat` field
-    (`<lock_dir>/leases/lease-<repo>.json`) the same way. **At that same claim update, if the claim
+    claim's `heartbeat` field; after re-taking, update the lease's `heartbeat` field the same way.
+    With `bastion` on PATH, re-stamp the claim with `bastion coord heartbeat --agent-name <this
+    lane's agent identity>` (optionally `--current-block`/`--block-started-at`) and re-take the
+    lease (its `heartbeat` is set by the `bastion coord lease` call itself). In the fallback, edit
+    `<lock_dir>/lane-agents/agent-<agent_name>.json` and `<lock_dir>/leases/lease-<repo>.json` by
+    hand. **At that same claim update, if the claim
     carries the optional `current_block` and `block_started_at` fields, re-stamp them too** — set
     `current_block` to the id of the block about to launch and `block_started_at` to the current
     time, in the same write as `heartbeat`, not a separate one. Both fields are optional; a claim
@@ -446,15 +494,27 @@ itself is unavailable (no brain root found, unwritable), the script reports `"de
 `planning/decisions/D66-tiered-heavy-lane-concurrency.md` for the full design.
 
 **Fleet-exclusive lanes (`exclusive_repos`).** If the lane record's `exclusive_repos` array is
-non-empty, before the first block starts, write an additional `kind: exclusive` lease at
-`<lock_dir>/leases/lease-<repo>.json` for **each** repo named in `exclusive_repos` — same shape as
-any other lease record (`repo`, `lane`, `agent`, `acquired_at`, `kind: exclusive`; no new field).
-While any such lease is held, every other agent's `fleet_concurrency_check.py register` call is
-refused with exit `3` regardless of category or heaviness, so a lane that must run with the fleet
-quiesced can actually hold it — this is admission control only, never pre-emption of a lane
-already running. Remove every lease written this way at lane close — success, failure, or
-abandonment — alongside the ordinary lease and registry releases. `exclusive_repos` is read only
-here; no new field is added to `.claude/workflows/lane.schema.json` or to the lease record.
+non-empty, before the first block starts, take an additional `kind: exclusive` lease for **each**
+repo named in `exclusive_repos` — same shape as any other lease record (`repo`, `lane`, `agent`,
+`acquired_at`, `kind: exclusive`; no new field). While any such lease is held, every other agent's
+`fleet_concurrency_check.py register` call is refused with exit `3` regardless of category or
+heaviness, so a lane that must run with the fleet quiesced can actually hold it — this is
+admission control only, never pre-emption of a lane already running. Remove every lease taken
+this way at lane close — success, failure, or abandonment — alongside the ordinary lease and
+registry releases (`bastion coord unlease`/`release` above, or the fallback delete).
+`exclusive_repos` is read only here; no new field is added to `.claude/workflows/lane.schema.json`
+or to the lease record.
+
+##### Bastion coord (preferred)
+
+If `bastion` is on PATH, take each `exclusive_repos` lease with `bastion coord lease --repo <repo>
+--lane <this-lane> --agent-name <this lane's agent identity> --kind exclusive` (`--scope` and
+`--window` are optional and unused for this whole-lane exclusive lease).
+
+##### Fallback: hand-written JSON (no bastion binary)
+
+If `bastion` is not on PATH, write the lease record by hand at
+`<lock_dir>/leases/lease-<repo>.json` for each repo named in `exclusive_repos`.
 
 ### 6. Launch the engine — do not wait idly
 Invoke the workflow **in this session**:
@@ -633,14 +693,28 @@ as a clean pass.
 Cheap, and it catches anything that changed outside the chain.
 
 **This is the block boundary — release the lease, drain the inbox, re-take the lease, and
-re-stamp both heartbeats** (rule 10): before releasing, re-stamp the registry claim's `heartbeat`
-(`<lock_dir>/lane-agents/agent-<agent_name>.json`) — and, if the claim carries the optional
-`current_block`/`block_started_at` fields, re-stamp those too, to the next block's id and now,
-in the same write; release
-`<lock_dir>/leases/lease-<repo>.json`; drain `<lock_dir>/queue/<repo>/<lane>/` via
-`drain_queue()`/`complete_message()`; re-take the lease and re-stamp its `heartbeat` before
-launching the next engine. Leave `started_at` and `acquired_at` untouched — see rule 10. If
-`--stop-after` has been reached, or `--autonomy` says this is a stopping point, release the lease
+re-stamp both heartbeats** (rule 10): before releasing, re-stamp the registry claim's
+`heartbeat` — and, if the claim carries the optional `current_block`/`block_started_at` fields,
+re-stamp those too, to the next block's id and now, in the same write; release the lease; drain
+the queue at `<lock_dir>/queue/<repo>/<lane>/`; re-take the lease and re-stamp its `heartbeat`
+before launching the next engine. Leave `started_at` and `acquired_at` untouched — see rule 10.
+
+#### Bastion coord (preferred)
+
+If `bastion` is on PATH: `bastion coord heartbeat --agent-name <this lane's agent identity>`
+(optionally `--current-block`/`--block-started-at`); `bastion coord unlease --repo
+<this-repo-name>`; `bastion coord drain --repo <repo> --lane <lane>`; then re-take with `bastion
+coord lease --repo <this-repo-name> --lane <this-lane> --agent-name <this lane's agent identity>
+--kind exclusive`.
+
+#### Fallback: hand-written JSON (no bastion binary)
+
+If `bastion` is not on PATH: re-stamp `<lock_dir>/lane-agents/agent-<agent_name>.json` by hand;
+release `<lock_dir>/leases/lease-<repo>.json`; drain `<lock_dir>/queue/<repo>/<lane>/` via
+`drain_queue()`/`complete_message()`; re-take the lease and re-stamp its `heartbeat` by hand
+before launching the next engine.
+
+If `--stop-after` has been reached, or `--autonomy` says this is a stopping point, release the lease
 and registry claim as at lane close and stop here instead of continuing to step 6. Otherwise
 return to step 6.
 

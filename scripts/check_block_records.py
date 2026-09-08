@@ -47,7 +47,20 @@ import os
 import re
 import sys
 
-ID_RE = re.compile(r"^[A-Z]{2,4}\.(?:\d+[A-Z]?|ticket|chore)\.[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Canonical form is `<PFX>.<phase|ticket|chore>.<name>`. Two legacy shapes are also accepted per
+# base-template/planning/decisions/D85-authoring-contract-rulings.md ruling (b): a bare letter
+# block id predating the phase-numbered convention (`SY.B`, `SY.N1` — measured 2026-09-07: 28 live
+# in bastion/bastion-web/synapse's state.json), and engine-rs's early `<N>-plan.<letter>` phase
+# spelling (`EN.1-plan.A` — 5 live). A fleet-wide rename was rejected as high-blast-radius for a
+# cosmetic mismatch; accept both shapes rather than reject ids the graph still carries.
+ID_RE = re.compile(
+    r"^[A-Z]{2,4}\."
+    r"(?:"
+    r"(?:\d+[A-Z]?|ticket|chore)\.[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"|\d+-plan\.[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"|[A-Za-z][A-Za-z0-9]?"
+    r")$"
+)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 DIGEST_RE = re.compile(r"^[a-z0-9]+:[0-9a-f]+$")

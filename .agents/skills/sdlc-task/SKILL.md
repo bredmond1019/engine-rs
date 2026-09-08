@@ -166,6 +166,13 @@ re-attach, Steps 1b/1c).
      `git branch --list "<candidate>"`. If both are empty, the candidate is free — use it. Otherwise
      try `<baseBranchName>-2`, `-3`, … up to `-10` and stop (do not go beyond `-10`). Call the winner
      `branchName`.
+     - **FAIL CLOSED (BT.ticket.sdlc-task-worktree-flag-is-intermittently-ignored).** If NONE of
+       `baseBranchName` through `<baseBranchName>-10` come back free, do **not** fall back to
+       `currentBranch` or invent an unlisted name — that silent fallback (reporting `mode: "worktree"`
+       while actually running against the main tree on the current branch) is the exact measured
+       defect this fixes. Stop here: set `worktreeFailed = true`, `worktreeFailureReason` naming the
+       spec slug and every candidate tried, and report via StructuredOutput without proceeding to
+       Step 1b.
 3. **Step 1b — create the worktree** (replace `[branchName]` with the chosen name):
    ```
    mkdir -p trees
@@ -192,6 +199,11 @@ re-attach, Steps 1b/1c).
       a confusing downstream failure).
    g. `git -C trees/[branchName] commit --allow-empty -m "chore: init worktree [branchName]"`.
       `wasCreated = true`.
+   - **FAIL CLOSED.** If ANY command in Step 1b (including `git worktree add` itself) errors or
+     exits non-zero, stop immediately — do **not** fall back to running the rest of the pipeline on
+     the current branch in the main tree. Set `worktreeFailed = true`, `worktreeFailureReason` with
+     the failing command and its exact error output, and report via StructuredOutput without
+     attempting Step 1c.
 4. **Step 1c — repair the `planning/` symlink inside the worktree** (run from the MAIN repo root, for
    every worktree path — fresh create, re-attach, or reuse alike). Detect vaulting first:
    ```
@@ -210,9 +222,41 @@ re-attach, Steps 1b/1c).
    - If `planning` is a plain tracked directory (not vaulted), do nothing — sparse-checkout already
      populated it.
 5. **In-place mode** (no `--worktree`): `branchName = currentBranch`, `wasCreated = false`,
-   `runDir = repoRoot`. Skip Steps 1b/1c entirely.
+   `worktreeFailed = false`, `worktreeFailureReason = ""`. `runDir = repoRoot`. Skip Steps 1b/1c
+   entirely.
 6. **Compute `runDir`**: `repoRoot/trees/<branchName>` under `--worktree`, else `repoRoot`.
-7. **Report pipeline-start inputs**, all run from `runDir`:
+7. **WORKTREE FAIL-CLOSED CROSS-CHECK (`--worktree` only, run this deterministically yourself —
+   never skip it even when nothing above reported a failure).** After computing `branchName` and
+   `runDir`, before doing anything else with them: if `worktreeFailed` is true, abort now —
+   `Worktree setup failed`, reason = `worktreeFailureReason`. Otherwise, independently verify the
+   result actually is an isolated worktree: if `branchName == currentBranch` OR `runDir == repoRoot`,
+   **abort** — `Worktree setup failed closed`, reason naming all four values
+   (`branchName`, `currentBranch`, `runDir`, `repoRoot`) — this is the cause-independent check that
+   catches a silent fallback even when none of the steps above self-reported one (the measured
+   defect: reporting `mode: "worktree"` with `branch: "main"`, `runDir: <main tree>`). Do this check
+   BEFORE Step 1d's binding/brain-root/population guards, so a failed-closed run never touches the
+   main tree.
+7b. **`git worktree list` ground truth (`--worktree` only, task 2 — do not skip even after 7
+   passes).** Your own `branchName`/`runDir` bookkeeping from Steps 1b/1c is a claim, not a fact —
+   verify it against the real listing before trusting it for anything downstream:
+   ```
+   git worktree list --porcelain
+   ```
+   Parse the complete output yourself (do not eyeball just the entry you expect): it is a series of
+   blocks separated by a blank line, each starting with `worktree <path>` and (for a non-detached
+   worktree) containing a `branch refs/heads/<name>` line.
+   - If **no block's `worktree` path equals `runDir`**, abort — `Worktree setup failed closed`,
+     reason: `expected runDir <runDir> absent from git worktree list`, naming every path the listing
+     actually showed. This is the check that catches a fabricated-looking `runDir`/`branchName` that
+     was never backed by a real `git worktree add` — Step 7 alone cannot catch this, since a
+     completely invented path is neither `currentBranch` nor `repoRoot`.
+   - If the matching block's `branch` (with any `refs/heads/` prefix stripped) does **not** equal
+     `branchName`, abort — `Worktree setup failed closed`, reason naming both the expected
+     `branchName` and the observed branch from the listing.
+   - Otherwise, re-assign `runDir`/`branchName` to the exact values from the matched listing entry
+     (even though they should already be equal) before continuing — every later step must use these
+     ground-truth values, never the Step 1b/1c bookkeeping directly.
+8. **Report pipeline-start inputs**, all run from `runDir`:
    - **Spec source AND location (D65 stage 2 + tier resolution)** — the block record is checked
      FIRST and is preferred; `tasks.md` is only a fallback for a legacy spec that predates the
      block-record migration. Check the **root** first — it always wins whenever the spec exists at
@@ -256,7 +300,7 @@ re-attach, Steps 1b/1c).
   "the engine looked in the wrong place". Tell the user to run `/generate-tasks <blockId>` (and
   `/breakdown`), commit, then re-run.
 
-8. **Step 1d — Binding / brain-root / population guards** (BT.ticket.worktree-setup-can-adopt-the-brain-root-as-repo-root).
+9. **Step 1d — Binding / brain-root / population guards** (BT.ticket.worktree-setup-can-adopt-the-brain-root-as-repo-root).
    Run these BEFORE Step 2 (Plan) and before any task work — a misbound or unpopulated checkout must
    never reach the per-task loop. Compare against `repoRoot` as computed in Step 1.1, never re-derive it:
    - **BINDING GUARD.** Compute `runGitCommonDir = git -C <runDir> rev-parse --path-format=absolute
