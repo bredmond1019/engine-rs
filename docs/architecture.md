@@ -487,7 +487,14 @@ that shape — this section's own `README.md` included — is ignored by the mig
 `0001_create_journal.sql` is the initial revision: the `journal` table plus its
 `(campaign_id, created_at)` composite index (see "Journal" below), derived from the live DDL stated
 in `crates/engine-store/src/postgres.rs`'s `insert_journal_row`/`list_journal_rows_for_campaign`
-doc comment, not from `docs/data-contract.md`.
+doc comment, not from `docs/data-contract.md`. `0004_create_events.sql` (`EN.14.I`) adds engine-rs's
+own `events` table — the same workflow-dispatch table Synapse's alembic migrations also create for
+its own runtime (brain D84 + Amendment 1: the table is shared by contract, not by migration source,
+and this migration does not touch anything under `../synapse/`) — so an engine database can be stood
+up from engine-rs's own migrations alone. Its column types and nullability were diffed against the
+live `orchestration_dev` schema rather than authored from `docs/data-contract.md`
+(`planning/EN.14.I/live-schema-diff.md`): `data`/`task_context` are `json` (not `jsonb`), and
+`data`/`task_context`/`created_at`/`updated_at` are all nullable.
 
 Apply pending migrations programmatically with `engine_store::run_migrations(&pool)`, or from the
 command line with `sqlx-cli`:
@@ -500,9 +507,12 @@ sqlx migrate run --source crates/engine-store/migrations --database-url "$DATABA
 test itself — never `orchestration_dev`, and never `orchestration_sandbox` unless the test can
 guarantee it only touches what it created.** `crates/engine-store/tests/migrations_apply_cleanly.rs`
 is the pattern: it `CREATE DATABASE`s a uniquely-named scratch database, runs the migrations against
-it twice (proving the second run is a no-op, not an error), asserts the `journal` table's columns
-and index match the live schema exactly, then drops the scratch database in a cleanup path that
-always runs, migration failure or not.
+it twice (proving the second run is a no-op, not an error), asserts that `events`, `journal`, and
+`node_invocations` all exist together with their columns, nullability, and indexes matching the
+live schema exactly, then drops the scratch database in a cleanup path that always runs, migration
+failure or not. A runtime-inversion positive control (`DROP TABLE events` after a full migration,
+then re-run the assertion) proves the three-table check can actually fail and names the table it is
+missing, rather than passing vacuously.
 
 **CI-Postgres consequence: none, so far.** engine-rs's CI (`.github/workflows/ci.yml`) still runs no
 Postgres service — `migrations_apply_cleanly.rs`'s scratch-database test is `#[ignore]`d for the same
