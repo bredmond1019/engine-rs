@@ -1463,12 +1463,57 @@ pub fn register_claim_reaffirm(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `SWEEP` workflow (`engine_core::workflows::sweep`,
+/// `EN.15.E` task 5) with `dispatcher`'s placeholder seams
+/// ([`engine_core::workflows::sweep::NoopOperatorTransport`] /
+/// [`engine_core::workflows::sweep::NoopLaneWake`]) — no production
+/// `OperatorTransport`/`LaneWake` exists anywhere in `engine-core` yet (see
+/// that module's own doc comment); wiring one in is a later task's
+/// concern. Like [`register_terminal_probe`]/[`register_recall`], this
+/// factory resolves no policy and seeds no policy stamp: `SweepNode` calls
+/// no model and reads no `harness.json` policy section. Registering makes
+/// `SWEEP` dispatchable via `POST /events/` (or any other
+/// `Dispatcher::dispatch_with_event` caller); it does **not** schedule it
+/// anywhere — `planning/harness.json`'s `schedule.entries` stays `[]`
+/// (Fork 4, restated in the block record's `out_of_scope`).
+pub fn register_sweep(dispatcher: &mut Dispatcher) {
+    register_sweep_with(
+        dispatcher,
+        Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
+        Arc::new(engine_core::workflows::sweep::NoopLaneWake),
+    );
+}
+
+/// Register `SWEEP` with explicit transport/waker seams — the entry point
+/// a later task (once a production `OperatorTransport`/`LaneWake` exists)
+/// or a test injects through, mirroring
+/// [`register_orchestration_with_registry`]'s per-event-factory-closure
+/// shape. The seams are cloned once per dispatch (the same "one Arc, many
+/// closure invocations" pattern `register_builtin_workflows_with_registry`
+/// already uses for `repo_reg`), so the SAME injected fake observes every
+/// `SWEEP` run this dispatcher ever serves.
+pub fn register_sweep_with(
+    dispatcher: &mut Dispatcher,
+    transport: Arc<dyn engine_core::operator::transport::OperatorTransport>,
+    waker: Arc<dyn engine_core::workflows::sweep::LaneWake>,
+) {
+    dispatcher.register(
+        engine_core::workflows::sweep::schema(),
+        Box::new(move |_event: &serde_json::Value| {
+            Ok(Workflow::new(
+                engine_core::workflows::sweep::registry_with(transport.clone(), waker.clone()),
+                engine_core::workflows::sweep::schema(),
+            ))
+        }),
+    );
+}
+
 /// Register every builtin workflow known to this crate: `SDLC_FLOW`,
 /// `SDLC_TASK`, `RESEARCH_AGENT`, `DIAGNOSTIC_INTAKE`, `PROPOSAL_GENERATOR`,
 /// `CONTENT_PIPELINE`, `LINKEDIN_POST`, `OPPORTUNITY_SET_STAGE`,
 /// `OPPORTUNITY_ADD_ACTION`, `HARVEST_APPROVE`, `LEAD_INGEST`,
 /// `APPROVE_AND_RUN`, `TERMINAL_PROBE`, `RECALL`, `ORCHESTRATION`,
-/// `DEBRIEF`, and `CLAIM_REAFFIRM`; future
+/// `DEBRIEF`, `CLAIM_REAFFIRM`, and `SWEEP`; future
 /// builtins register here too.
 ///
 /// Keeps its one-argument signature unchanged (EN.3.K) — `bastion` calls
@@ -1517,6 +1562,7 @@ pub fn register_builtin_workflows_with_registry(
     register_orchestration(dispatcher);
     register_debrief(dispatcher);
     register_claim_reaffirm(dispatcher);
+    register_sweep(dispatcher);
 }
 
 #[cfg(test)]
@@ -3146,6 +3192,7 @@ mod tests {
             "ORCHESTRATION",
             "DEBRIEF",
             "CLAIM_REAFFIRM",
+            "SWEEP",
         ]
         .to_vec();
         expected.sort_unstable();
@@ -3191,6 +3238,90 @@ mod tests {
         register_recall(&mut dispatcher);
 
         assert!(dispatcher.is_registered("RECALL"));
+    }
+
+    #[test]
+    fn register_sweep_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_sweep(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("SWEEP"));
+
+        let schema = dispatcher
+            .resolve_schema("SWEEP")
+            .expect("SWEEP schema should resolve");
+        assert_eq!(schema.start_node, "SweepNode");
+    }
+
+    #[test]
+    fn register_builtin_workflows_registers_sweep() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("SWEEP"));
+    }
+
+    #[test]
+    fn dispatch_sweep_builds_a_runnable_workflow_and_writes_a_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let roadmap_dir = root.path().join("planning/roadmaps/demo-roadmap");
+        std::fs::create_dir_all(&roadmap_dir).unwrap();
+        std::fs::write(roadmap_dir.join("lane-log.jsonl"), "").unwrap();
+
+        let mut dispatcher = Dispatcher::new();
+        register_sweep(&mut dispatcher);
+
+        let _workflow = dispatcher
+            .dispatch_with_event(
+                "SWEEP",
+                &serde_json::json!({
+                    "root": root.path().to_string_lossy(),
+                    "roadmap": "demo-roadmap",
+                    "now": "2026-09-08T00:00:00Z",
+                }),
+            )
+            .expect("SWEEP should dispatch to a runnable Workflow");
+
+        let sweeps_dir = root.path().join("planning/roadmaps/demo-roadmap/sweeps");
+        assert!(
+            engine_core::workflows::sweep::list_snapshot_files(&sweeps_dir).is_empty(),
+            "dispatch alone must not run the workflow -- only building it"
+        );
+    }
+
+    #[test]
+    fn register_sweep_with_injects_a_distinct_seam_from_the_bare_default() {
+        // The bare `register_sweep` uses the placeholder `NoopOperatorTransport`/
+        // `NoopLaneWake` seams; `register_sweep_with` accepts an explicit pair, mirroring
+        // `register_orchestration_with_registry`'s injection shape. This just confirms the
+        // explicit-seam entry point compiles and registers correctly with a distinct type.
+        #[derive(Debug, Clone, Copy, Default)]
+        struct AlwaysInvokedWake;
+        impl engine_core::workflows::sweep::LaneWake for AlwaysInvokedWake {
+            fn wake(
+                &self,
+                _repo: &str,
+                _lane: &str,
+                _reason: &str,
+                _context: &serde_json::Value,
+            ) -> engine_core::workflows::sweep::WakeOutcome {
+                engine_core::workflows::sweep::WakeOutcome {
+                    invoked: true,
+                    error: None,
+                }
+            }
+        }
+
+        let mut dispatcher = Dispatcher::new();
+        register_sweep_with(
+            &mut dispatcher,
+            Arc::new(engine_core::workflows::sweep::NoopOperatorTransport),
+            Arc::new(AlwaysInvokedWake),
+        );
+
+        assert!(dispatcher.is_registered("SWEEP"));
     }
 
     #[test]
