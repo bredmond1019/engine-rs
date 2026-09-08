@@ -319,6 +319,11 @@ impl Node for EmitStateNode {
     fn name(&self) -> &str {
         "EmitStateNode"
     }
+
+    /// See `Node::agent`'s doc comment — `EN.15.B` task 1's guard-test seam.
+    fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
+    }
 }
 
 #[cfg(test)]

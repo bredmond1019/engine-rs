@@ -278,6 +278,17 @@ pub const DEFAULT_STATE_SOURCE: &str = "WrapUpNode";
 pub struct CloseBlockNode {
     lock_timeout: Duration,
     state_source: &'static str,
+    /// Lane identity this node will pass to mev's guarded `set_block_status`
+    /// entry point so its own closure self-exempts a `scope: repo` lease it
+    /// holds, while a lease held by a DIFFERENT agent still refuses it
+    /// (`EN.15.B`). Threaded here in task 1 so `graph.rs`'s registry
+    /// constructors can wire the SAME identity string into this node and
+    /// `EmitStateNode` from one source; task 2 is what makes the node's own
+    /// `mev::set_block_status` call sites actually read this field instead
+    /// of calling the permissive wrapper. `None` (the default) preserves
+    /// today's behavior exactly — this field is inert until task 2 wires it
+    /// into the mev call.
+    agent: Option<String>,
 }
 
 impl CloseBlockNode {
@@ -286,6 +297,7 @@ impl CloseBlockNode {
         Self {
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
             state_source: DEFAULT_STATE_SOURCE,
+            agent: None,
         }
     }
 
@@ -308,6 +320,17 @@ impl CloseBlockNode {
     #[must_use]
     pub fn with_state_source(mut self, source: &'static str) -> Self {
         self.state_source = source;
+        self
+    }
+
+    /// Set the lane identity this node passes to mev's guarded
+    /// `set_block_status_as` entry point (task 2), so this node's own
+    /// closure self-exempts an exclusive lease it holds while a lease held
+    /// by a different agent still refuses it. Leaving this unset keeps
+    /// today's behavior exactly — see the field's own doc comment.
+    #[must_use]
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
         self
     }
 }
@@ -1088,6 +1111,11 @@ impl Node for CloseBlockNode {
 
     fn name(&self) -> &str {
         "CloseBlockNode"
+    }
+
+    /// See `Node::agent`'s doc comment — `EN.15.B` task 1's guard-test seam.
+    fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
     }
 }
 

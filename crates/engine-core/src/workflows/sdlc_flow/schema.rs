@@ -233,6 +233,19 @@ pub struct SDLCFlowEventSchema {
     /// downstream of this field.
     #[serde(default)]
     pub repo: Option<String>,
+    /// Optional lane identity for this run (`EN.15.B`), threaded to the
+    /// registry constructors (`graph::registry_for_policy_with_cancellation`)
+    /// so `EmitStateNode` and `CloseBlockNode` pass the SAME `--agent`
+    /// string to mev's guarded write entry points, letting a chain's own
+    /// terminal writes self-exempt an exclusive lease it holds while a
+    /// lease held by a DIFFERENT agent still refuses them. **It is a lane
+    /// identity string, compared for equality against a lease record's
+    /// `agent` field — never a path and never a credential; it grants
+    /// nothing on its own.** `None`/absent preserves today's behavior
+    /// exactly: no `--agent` flag is emitted at all (not an empty one), and
+    /// mev's guard refuses even a lease this run holds itself.
+    #[serde(default)]
+    pub agent: Option<String>,
     /// Optional task-range filter, e.g. `"1-3,5"` (1-indexed, inclusive).
     #[serde(default)]
     pub task_range: Option<String>,
@@ -1286,6 +1299,7 @@ mod tests {
         let event: SDLCFlowEventSchema =
             serde_json::from_value(json).expect("deserializes with defaults");
         assert_eq!(event.repo, None);
+        assert_eq!(event.agent, None);
         assert_eq!(event.task_range, None);
         assert!(!event.resume);
         assert!(event.auto_pr);
@@ -1327,6 +1341,29 @@ mod tests {
         let event: SDLCFlowEventSchema =
             serde_json::from_value(json).expect("deserializes with repo slug");
         assert_eq!(event.repo, Some("bastion".to_string()));
+    }
+
+    /// `EN.15.B` task 1: the new `agent` field is additive and
+    /// `#[serde(default)]` — an event JSON without it deserializes exactly
+    /// as before this field existed.
+    #[test]
+    fn sdlc_flow_event_schema_deserializes_without_agent_unchanged() {
+        let json = serde_json::json!({ "spec_slug": "EN.15.B", "resume": true });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes without agent");
+        assert_eq!(event.agent, None);
+        assert!(event.resume);
+    }
+
+    #[test]
+    fn sdlc_flow_event_schema_deserializes_agent_identity() {
+        let json = serde_json::json!({
+            "spec_slug": "EN.15.B",
+            "agent": "lane-engine-rs-0f",
+        });
+        let event: SDLCFlowEventSchema =
+            serde_json::from_value(json).expect("deserializes with agent identity");
+        assert_eq!(event.agent, Some("lane-engine-rs-0f".to_string()));
     }
 
     #[test]

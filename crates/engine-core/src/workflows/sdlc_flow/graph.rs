@@ -371,7 +371,25 @@ fn real_cloud_transport() -> ModelTransport {
 /// `local` model tier has nothing on it to rewire.
 #[must_use]
 pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
-    registry_for_policy_with_cancellation(policy, None)
+    registry_for_policy_with_cancellation(policy, None, None)
+}
+
+/// Build a `NodeRegistry` identical to [`registry`], except `EmitStateNode`
+/// and `CloseBlockNode` are re-registered with `agent` wired in via their
+/// respective `with_agent` builders (`EN.15.B`) — the same one identity
+/// string on both, so a chain's own terminal writes self-exempt an
+/// exclusive lease it holds while a lease held by a DIFFERENT agent still
+/// refuses them (mev's guarded `set_block_status_as` / the `EmitStateNode`
+/// self-exemption). `agent: None` is a strict no-op: [`registry`] is
+/// returned untouched, and both nodes keep their default (`None`) identity
+/// — byte-identical to [`registry`] itself, per standing rule 6.
+fn registry_with_agent(agent: Option<&str>) -> NodeRegistry {
+    let mut registry = registry();
+    if let Some(agent) = agent {
+        registry.register(Box::new(EmitStateNode::new().with_agent(agent)));
+        registry.register(Box::new(CloseBlockNode::new().with_agent(agent)));
+    }
+    registry
 }
 
 /// Like [`registry_for_policy`], but additionally wires `token` — when
@@ -380,8 +398,15 @@ pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
 /// `with_cancellation_token` builder (`EN.ticket.abort-must-interrupt-an-
 /// in-flight-agent-node`), so a served run's abort interrupts an in-flight
 /// model call instead of only taking effect at the next node boundary.
-/// `token: None` reproduces [`registry_for_policy`] exactly — this function
-/// is additive, not a behavior change for any existing caller.
+/// `token: None, agent: None` reproduces [`registry_for_policy`] exactly —
+/// this function is additive, not a behavior change for any existing
+/// caller.
+///
+/// `agent` (`EN.15.B`) is the lane identity threaded onto `EmitStateNode`
+/// and `CloseBlockNode` via [`registry_with_agent`] — see that function's
+/// doc comment. It is orthogonal to `token` and to the local-tier
+/// `meta_transport` rewiring below: independent builder fields on
+/// independent nodes.
 ///
 /// Applying the token is orthogonal to the local-tier `meta_transport`
 /// rewiring above: both are independent builder fields on the same node, so
@@ -392,8 +417,9 @@ pub fn registry_for_policy(policy: &SdlcPolicy) -> NodeRegistry {
 pub fn registry_for_policy_with_cancellation(
     policy: &SdlcPolicy,
     token: Option<CancellationToken>,
+    agent: Option<&str>,
 ) -> NodeRegistry {
-    let mut registry = registry();
+    let mut registry = registry_with_agent(agent);
 
     let triage_local = policy.model_tiers.triage == ModelTier::Local;
     if triage_local || token.is_some() {
@@ -453,6 +479,7 @@ pub fn workflow() -> Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::Node as _;
     use crate::validate::WorkflowValidator;
 
     #[test]
@@ -607,7 +634,7 @@ mod tests {
         // additive/optional contract this ticket requires.
         let policy = SdlcPolicy::default();
         let plain = registry_for_policy(&policy);
-        let with_none = registry_for_policy_with_cancellation(&policy, None);
+        let with_none = registry_for_policy_with_cancellation(&policy, None, None);
 
         assert_eq!(plain.len(), with_none.len());
         assert!(with_none.contains("ImplementTaskNode"));
@@ -632,7 +659,7 @@ mod tests {
         let policy = SdlcPolicy::default();
         let plain = registry_for_policy(&policy);
         let token = CancellationToken::new();
-        let with_token = registry_for_policy_with_cancellation(&policy, Some(token));
+        let with_token = registry_for_policy_with_cancellation(&policy, Some(token), None);
 
         assert_eq!(plain.len(), with_token.len());
         assert!(with_token.contains("ImplementTaskNode"));
@@ -657,7 +684,7 @@ mod tests {
         };
         let token = CancellationToken::new();
 
-        let registry = registry_for_policy_with_cancellation(&policy, Some(token));
+        let registry = registry_for_policy_with_cancellation(&policy, Some(token), None);
 
         assert!(registry.contains("ImplementTaskNode"));
         assert!(registry.contains("TriageTaskNode"));
@@ -716,6 +743,65 @@ mod tests {
 
         let registry = registry_for_policy(&policy);
         assert!(registry.contains("ImplementTaskNode"));
+    }
+
+    // --- EN.15.B task 1: agent identity threading ---
+
+    /// The deliverable this task exists to satisfy: go through the
+    /// PRODUCTION registry constructor — not a hand-built `EmitStateNode`/
+    /// `CloseBlockNode` — and confirm the SAME identity string landed on
+    /// both. A test that hand-builds either node can never observe what
+    /// `registry_for_policy_with_cancellation` actually constructs; that is
+    /// exactly the gap that let `EN.ticket.emit-state-node-must-self-
+    /// exempt-its-own-lease`'s thorough, all-passing tests miss the bare
+    /// production `EmitStateNode::new()` call site.
+    #[test]
+    fn registry_for_policy_with_cancellation_threads_one_identity_into_emit_state_and_close_block()
+    {
+        let policy = SdlcPolicy::default();
+        let identity = "lane-engine-rs-en15b";
+
+        let registry = registry_for_policy_with_cancellation(&policy, None, Some(identity));
+
+        let emit_state = registry
+            .get("EmitStateNode")
+            .expect("EmitStateNode is always registered");
+        let close_block = registry
+            .get("CloseBlockNode")
+            .expect("CloseBlockNode is always registered");
+
+        assert_eq!(emit_state.agent(), Some(identity));
+        assert_eq!(close_block.agent(), Some(identity));
+    }
+
+    /// Behavior-stable default (standing rule 6): `agent: None` must leave
+    /// both nodes exactly as bare [`registry`] constructs them — `None` —
+    /// not an empty string and not a stale identity from a prior call.
+    #[test]
+    fn registry_for_policy_with_cancellation_none_agent_leaves_both_nodes_unconfigured() {
+        let policy = SdlcPolicy::default();
+
+        let with_none_agent = registry_for_policy_with_cancellation(&policy, None, None);
+
+        assert_eq!(with_none_agent.get("EmitStateNode").unwrap().agent(), None);
+        assert_eq!(with_none_agent.get("CloseBlockNode").unwrap().agent(), None);
+
+        // And it must match the plain, agent-oblivious `registry()` exactly
+        // on this axis too.
+        let plain = registry();
+        assert_eq!(plain.get("EmitStateNode").unwrap().agent(), None);
+        assert_eq!(plain.get("CloseBlockNode").unwrap().agent(), None);
+    }
+
+    /// `registry_for_policy` (no cancellation token, no agent parameter of
+    /// its own) must still reproduce the `agent: None` case exactly — it
+    /// has no way to accept an identity, so it must never leak a stale one.
+    #[test]
+    fn registry_for_policy_leaves_both_agent_nodes_unconfigured() {
+        let registry = registry_for_policy(&SdlcPolicy::default());
+
+        assert_eq!(registry.get("EmitStateNode").unwrap().agent(), None);
+        assert_eq!(registry.get("CloseBlockNode").unwrap().agent(), None);
     }
 
     #[test]
