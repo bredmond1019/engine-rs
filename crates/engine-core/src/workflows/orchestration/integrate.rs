@@ -81,6 +81,10 @@ use super::checkpoint::{
 };
 use super::coord_lane::CoordHandle;
 use super::dispatch::{execute_dispatch_step, DispatchStepError};
+use super::escalate::{
+    append_bail_line, append_escalation_line, BailEntry, EscalationChannel, EscalationKind,
+    EscalationRecord, EscalationSeverity, NewBailEntry, NewEscalation,
+};
 use super::execute::{execute_step, EngineKind, ExecuteError, ExecutionOutcome, FlowRunner};
 use super::gates::{check_dependencies, AdmissionGate, DependencyEdge, GateError};
 use crate::nodes::brain_client::RECALL_NODE_NAME;
@@ -259,6 +263,151 @@ fn state_path_for(repo_path: &Path, block_id: &str, engine: EngineKind) -> PathB
         .join(block_id)
         .join("sdlc")
         .join(filename)
+}
+
+/// The subject repo's own short git SHA — never the brain root's, per
+/// `escalation.schema.json`'s `verified_at_sha` field docs (a brain SHA would make every
+/// cross-repo escalation look permanently stale). Runs `git rev-parse --short=7 HEAD`
+/// inside `repo_path`; `None` on any failure (not a git checkout, no `git` on `PATH`, a
+/// non-UTF8 or empty result) — the caller treats that as "cannot compose this escalation
+/// right now" rather than fabricating a placeholder SHA that would fail
+/// [`EscalationRecord::new`]'s own SHA-shape check anyway.
+fn subject_repo_short_sha(repo_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+/// `EN.15.G` Task 2: compose and best-effort append a schema-valid escalation line
+/// (`escalations.jsonl`) plus a `bails[]` entry (`bails.jsonl`) for a step that bailed on
+/// the BAIL path (`execute_step` failed) or the HOLD path (`wait_for_clearance` timed out
+/// or lost a cancellation race). Both writes are **best-effort**, matching every other
+/// write in this loop's bail handling (`let _ = append_lane_log_line(...)`,
+/// `let _ = write_checkpoint(...)`): a failure to compose or append either record is
+/// logged via `tracing::warn!` and swallowed — it must never mask, replace, or delay
+/// propagating the real [`IntegrateError`] the step already failed with. Appends only,
+/// via [`append_escalation_line`]/[`append_bail_line`] — never rewrites or truncates
+/// either file, since agent lanes append their own lines to the same `escalations.jsonl`
+/// by design.
+fn record_bail_escalation(
+    roadmap_dir: &Path,
+    registry: &RepoRegistry,
+    step: &ChainStep,
+    lane: &str,
+    check_id: &str,
+    engine: EngineKind,
+    err_display: &str,
+) {
+    let roadmap = step.roadmap.as_deref().unwrap_or("no-roadmap");
+    let gate_id = format!("{roadmap}/{}/{}", step.repo, step.block_id);
+    let state_relpath = state_path_for(Path::new(""), &step.block_id, engine)
+        .to_string_lossy()
+        .into_owned();
+    let failing_artifact = format!("{}/{state_relpath}", step.repo);
+
+    let Ok(repo_path) = registry.resolve(&step.repo) else {
+        tracing::warn!(
+            repo = %step.repo,
+            block_id = %step.block_id,
+            "EN.15.G: could not resolve repo path; skipping bail escalation and bails[] entry"
+        );
+        return;
+    };
+    let Some(sha) = subject_repo_short_sha(&repo_path) else {
+        tracing::warn!(
+            repo = %step.repo,
+            block_id = %step.block_id,
+            "EN.15.G: could not resolve subject repo sha; skipping bail escalation"
+        );
+        return;
+    };
+
+    let summary: String = err_display
+        .chars()
+        .take(super::escalate::SUMMARY_MAX_CHARS)
+        .collect();
+    let verified_by = format!(
+        "integrate_chain step {}::{}\n{err_display}",
+        step.repo, step.block_id
+    );
+
+    match EscalationChannel::session(lane) {
+        Ok(channel) => match EscalationRecord::new(NewEscalation {
+            ts_utc: Utc::now().to_rfc3339(),
+            repo: step.repo.clone(),
+            lane: lane.to_string(),
+            kind: EscalationKind::Bail,
+            severity: EscalationSeverity::Blocking,
+            channel,
+            block: Some(step.block_id.clone()),
+            gate_id: gate_id.clone(),
+            summary,
+            verified_by,
+            durable_home: serde_json::json!({
+                "channel": "lane-log",
+                "ref": format!(
+                    "{}/planning/orchestration-run/{roadmap}/lane-log.jsonl#block={}",
+                    step.repo, step.block_id
+                ),
+            }),
+            verified_at_sha: sha,
+            clears_when: None,
+            host: None,
+        }) {
+            Ok(record) => {
+                let path = roadmap_dir.join("escalations.jsonl");
+                if let Err(err) = append_escalation_line(&path, &record) {
+                    tracing::warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "EN.15.G: failed to append escalations.jsonl line"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "EN.15.G: refused to compose bail escalation");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "EN.15.G: refused to compose bail escalation channel");
+        }
+    }
+
+    match BailEntry::new(NewBailEntry {
+        occurred_at: Utc::now().to_rfc3339(),
+        block_id: step.block_id.clone(),
+        check_id: check_id.to_string(),
+        failing_artifact: failing_artifact.clone(),
+        declared_files: vec![failing_artifact],
+        bail_class: None,
+        reason: err_display.to_string(),
+    }) {
+        Ok(entry) => {
+            let path = roadmap_dir.join("bails.jsonl");
+            if let Err(err) = append_bail_line(&path, &entry) {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "EN.15.G: failed to append bails.jsonl line"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "EN.15.G: refused to compose bails[] entry");
+        }
+    }
 }
 
 /// Read the state file `outcome`'s block should have written and confirm
@@ -1829,14 +1978,24 @@ async fn integrate_chain_impl(
         )
         .await
         {
-            let entry =
-                LaneLogEntry::bailed(step, lane.unwrap_or(step.repo.as_str()), err.to_string())
-                    .with_identity(None)
-                    .with_permission_profile(Some(resolved_permission_profile_identifier(
-                        registry,
-                    )));
+            let hold_lane = lane.unwrap_or(step.repo.as_str());
+            let entry = LaneLogEntry::bailed(step, hold_lane, err.to_string())
+                .with_identity(None)
+                .with_permission_profile(Some(resolved_permission_profile_identifier(registry)));
             let _ = append_lane_log_line(roadmap_dir, &entry);
             let _ = write_checkpoint(roadmap_dir, &checkpoint);
+            // `EN.15.G` task 2: the HOLD path — a hold that timed out (or lost a
+            // cancellation race) leaves no trail an agent lane leaves without this. See
+            // `record_bail_escalation`'s own doc for why every effect here is best-effort.
+            record_bail_escalation(
+                roadmap_dir,
+                registry,
+                step,
+                hold_lane,
+                "operator-hold",
+                resolve_engine(&step.repo, &step.block_id),
+                &err.to_string(),
+            );
             return Err(err);
         }
 
@@ -2071,6 +2230,19 @@ async fn integrate_chain_impl(
                     )));
                 let _ = append_lane_log_line(roadmap_dir, &entry);
                 let _ = write_checkpoint(roadmap_dir, &checkpoint);
+                // `EN.15.G` task 2: the BAIL path — a bail that leaves no escalation and
+                // no `bails[]` entry is precisely the trail-less behaviour this block
+                // exists to end. See `record_bail_escalation`'s own doc for why every
+                // effect here is best-effort.
+                record_bail_escalation(
+                    roadmap_dir,
+                    registry,
+                    step,
+                    step_lane,
+                    "orchestration-step",
+                    resolve_engine(&step.repo, &step.block_id),
+                    &integrate_err.to_string(),
+                );
                 // `EN.12.D` task 4: no child `ctx` exists for a step whose
                 // `execute_step` call itself failed — the row keys on a
                 // fresh id, same as the pre-dispatch decision points above.

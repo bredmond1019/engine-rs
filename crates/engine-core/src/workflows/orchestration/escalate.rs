@@ -572,6 +572,241 @@ impl EscalationRecord {
     }
 }
 
+/// Append one already-composed [`EscalationRecord`] to `path` — `EN.15.G` Task 2's writing
+/// half of Task 1's composition. **Append-only, by design**: this opens with
+/// [`std::fs::OpenOptions::append`], never `truncate`, because TWO WRITERS share
+/// `escalations.jsonl` — agent lanes append their own lines to this exact file today, and
+/// this function must never rewrite, truncate, or dedup across them. Creates the file (and
+/// nothing else — the parent directory must already exist) on first write.
+pub fn append_escalation_line(
+    path: &std::path::Path,
+    record: &EscalationRecord,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(record.to_jsonl_line().as_bytes())
+}
+
+/// Whether a bail's [`BailEntry::failing_artifact`] belongs to the step that bailed, or to
+/// something else — the `record-a-bail` skill's `ownership` field. `SelfOwned` when
+/// `failing_artifact` is present in the caller-supplied `declared_files` set (the exact
+/// set-intersection the skill specifies — "compute this with the exact set-intersection
+/// ... do not reimplement the comparison by hand, and in particular do not eyeball 'this
+/// looks like my file'"), `Foreign` otherwise. There is no third, guessed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BailOwnership {
+    SelfOwned,
+    Foreign,
+}
+
+impl BailOwnership {
+    /// The wire value this ownership serializes to.
+    #[must_use]
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            BailOwnership::SelfOwned => "self",
+            BailOwnership::Foreign => "foreign",
+        }
+    }
+
+    /// Classify `failing_artifact` against `declared_files` by exact-string membership —
+    /// the one comparison the `record-a-bail` skill sanctions. Never a substring match,
+    /// never a "looks like the same area" heuristic.
+    #[must_use]
+    pub fn classify(failing_artifact: &str, declared_files: &[String]) -> Self {
+        if declared_files.iter().any(|f| f == failing_artifact) {
+            BailOwnership::SelfOwned
+        } else {
+            BailOwnership::Foreign
+        }
+    }
+}
+
+impl fmt::Display for BailOwnership {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_str())
+    }
+}
+
+/// One of the five numbered immediate-bail reasons the `record-a-bail` skill's
+/// `bail_class` field records verbatim — mirrors `BAIL_REASONS` in `sdlc-task.js` /
+/// `sdlc-flow.js`. Kept as a plain bounded integer (not an enum) because the JS side's
+/// numbering is the wire contract this mirrors; a Rust enum would just be a second
+/// definition of the same five numbers to keep in lockstep by hand.
+pub const MIN_BAIL_CLASS: u8 = 1;
+pub const MAX_BAIL_CLASS: u8 = 5;
+
+/// Builder-style construction args for [`BailEntry::new`] — see the `record-a-bail` skill
+/// for the full field-by-field rationale.
+pub struct NewBailEntry {
+    pub occurred_at: String,
+    /// The block this bail happened on. The `record-a-bail` skill's own shape names this
+    /// `task_id` (an integer, from a spec's `tasks.json`); at the orchestration-chain
+    /// layer there is no `tasks.json` task number in scope, only the chain step's own
+    /// `block_id` — so this field carries that instead, named for what it actually is
+    /// rather than forcing a task-shaped value that does not exist here.
+    pub block_id: String,
+    pub check_id: String,
+    /// The artifact the failing check actually named. **Required** — unlike the general
+    /// skill (which allows `null` when a check names no path), `EN.15.G` Task 2's own
+    /// acceptance criteria are stricter: "A `bails[]` entry missing `failing_artifact`
+    /// must be REFUSED — the failing artifact is the cluster key the whole record is
+    /// sorted by." [`BailEntry::new`] enforces that here, at construction time.
+    pub failing_artifact: String,
+    /// The step's own declared files, to classify [`BailOwnership`] against — never
+    /// guessed, per [`BailOwnership::classify`].
+    pub declared_files: Vec<String>,
+    /// One of the five numbered reasons (see [`MIN_BAIL_CLASS`]/[`MAX_BAIL_CLASS`]), or
+    /// `None` when the bail happened outside a triage call that could name one — the
+    /// skill's own example is "the terminal reconcile-stage bail, which has no task and no
+    /// triage call."
+    pub bail_class: Option<u8>,
+    pub reason: String,
+}
+
+/// Why a [`BailEntry`] failed to compose. Every variant means the entry was refused before
+/// a line was ever written, mirroring [`EscalationError`]'s own "refused before written"
+/// discipline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BailEntryError {
+    EmptyField(&'static str),
+    /// `failing_artifact` was empty — refused per [`NewBailEntry::failing_artifact`]'s doc.
+    MissingFailingArtifact,
+    /// `bail_class` was present but outside `[MIN_BAIL_CLASS, MAX_BAIL_CLASS]`.
+    InvalidBailClass(u8),
+}
+
+impl fmt::Display for BailEntryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BailEntryError::EmptyField(field) => {
+                write!(f, "bails[] field `{field}` must not be empty")
+            }
+            BailEntryError::MissingFailingArtifact => write!(
+                f,
+                "bails[] entry refused: `failing_artifact` is missing — it is the cluster key the whole record is sorted by"
+            ),
+            BailEntryError::InvalidBailClass(value) => write!(
+                f,
+                "bails[] `bail_class` = {value} is outside the valid range {MIN_BAIL_CLASS}..={MAX_BAIL_CLASS}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BailEntryError {}
+
+/// A composed `bails[]` entry, per the `record-a-bail` skill's record shape, adapted for
+/// the orchestration-chain layer (see [`NewBailEntry::block_id`]'s doc for the one field
+/// that differs from the skill's own JSON example). The only way to obtain one is
+/// [`BailEntry::new`] succeeding, so a value in hand is guaranteed to carry a non-empty
+/// `failing_artifact`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BailEntry {
+    occurred_at: String,
+    block_id: String,
+    check_id: String,
+    failing_artifact: String,
+    ownership: BailOwnership,
+    bail_class: Option<u8>,
+    reason: String,
+}
+
+impl BailEntry {
+    /// Compose and validate a `bails[]` entry. Refuses an empty `occurred_at`, `check_id`,
+    /// or `reason`; refuses an empty `failing_artifact` outright
+    /// ([`BailEntryError::MissingFailingArtifact`]); refuses a `bail_class` outside
+    /// `1..=5`. `ownership` is derived, never accepted as an argument, so a caller cannot
+    /// hand-wave past [`BailOwnership::classify`]'s exact-set-intersection rule.
+    pub fn new(args: NewBailEntry) -> Result<Self, BailEntryError> {
+        if args.occurred_at.is_empty() {
+            return Err(BailEntryError::EmptyField("occurred_at"));
+        }
+        if args.block_id.is_empty() {
+            return Err(BailEntryError::EmptyField("block_id"));
+        }
+        if args.check_id.is_empty() {
+            return Err(BailEntryError::EmptyField("check_id"));
+        }
+        if args.failing_artifact.is_empty() {
+            return Err(BailEntryError::MissingFailingArtifact);
+        }
+        if args.reason.is_empty() {
+            return Err(BailEntryError::EmptyField("reason"));
+        }
+        if let Some(class) = args.bail_class {
+            if !(MIN_BAIL_CLASS..=MAX_BAIL_CLASS).contains(&class) {
+                return Err(BailEntryError::InvalidBailClass(class));
+            }
+        }
+        let ownership = BailOwnership::classify(&args.failing_artifact, &args.declared_files);
+        Ok(Self {
+            occurred_at: args.occurred_at,
+            block_id: args.block_id,
+            check_id: args.check_id,
+            failing_artifact: args.failing_artifact,
+            ownership,
+            bail_class: args.bail_class,
+            reason: args.reason,
+        })
+    }
+
+    #[must_use]
+    pub fn ownership(&self) -> BailOwnership {
+        self.ownership
+    }
+
+    #[must_use]
+    pub fn failing_artifact(&self) -> &str {
+        &self.failing_artifact
+    }
+
+    /// Render to a JSON object mirroring the `record-a-bail` skill's shape:
+    /// `occurred_at`, `check_id`, `failing_artifact`, `ownership`, `bail_class`, `reason`,
+    /// `resolution` — plus `block_id` in place of the skill's `task_id` (see
+    /// [`NewBailEntry::block_id`]). `resolution` is always written `null` here: the skill
+    /// is explicit that it is "written later, never at bail time."
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "occurred_at": self.occurred_at,
+            "block_id": self.block_id,
+            "check_id": self.check_id,
+            "failing_artifact": self.failing_artifact,
+            "ownership": self.ownership.as_wire_str(),
+            "bail_class": self.bail_class,
+            "reason": self.reason,
+            "resolution": Value::Null,
+        })
+    }
+
+    /// Render as one `.jsonl` line — compact JSON followed by a trailing newline, ready to
+    /// append to a `bails.jsonl` file.
+    #[must_use]
+    pub fn to_jsonl_line(&self) -> String {
+        format!(
+            "{}\n",
+            serde_json::to_string(&self.to_json()).expect("BailEntry always serializes")
+        )
+    }
+}
+
+/// Append one already-composed [`BailEntry`] to `path`. **Append-only**, same discipline as
+/// [`append_escalation_line`] — the array (well, the file's line count) must never
+/// decrease, per the `record-a-bail` skill: "a successful retry used to erase the bail that
+/// preceded it ... The array's length must never decrease."
+pub fn append_bail_line(path: &std::path::Path, entry: &BailEntry) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(entry.to_jsonl_line().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +1017,97 @@ mod tests {
         args.block = None;
         let record = EscalationRecord::new(args).expect("valid record");
         assert!(record.to_json().get("block").is_none());
+    }
+
+    #[test]
+    fn append_escalation_line_creates_the_file_and_appends_without_truncating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("escalations.jsonl");
+        // Simulate an agent lane's pre-existing line — TWO WRITERS share this file by
+        // design, and appending must never disturb it.
+        std::fs::write(&path, "{\"agent\":\"already-here\"}\n").expect("seed file");
+
+        let record = EscalationRecord::new(valid_args()).expect("valid record");
+        append_escalation_line(&path, &record).expect("append succeeds");
+
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "the seeded line must survive: {contents}");
+        assert_eq!(lines[0], "{\"agent\":\"already-here\"}");
+        let parsed: Value = serde_json::from_str(lines[1]).expect("appended line is valid json");
+        assert_eq!(parsed["kind"], json!("bail"));
+    }
+
+    fn valid_bail_args() -> NewBailEntry {
+        NewBailEntry {
+            occurred_at: "2026-09-08T18:03:11Z".to_string(),
+            block_id: "EN.15.G".to_string(),
+            check_id: "orchestration-step".to_string(),
+            failing_artifact: "engine-rs/planning/EN.15.G/sdlc/sdlc-flow-state.json".to_string(),
+            declared_files: vec!["engine-rs/planning/EN.15.G/sdlc/sdlc-flow-state.json".to_string()],
+            bail_class: Some(1),
+            reason: "child run never wrote a state file".to_string(),
+        }
+    }
+
+    #[test]
+    fn bail_entry_missing_failing_artifact_is_refused() {
+        let mut args = valid_bail_args();
+        args.failing_artifact = String::new();
+        let err = BailEntry::new(args).expect_err("empty failing_artifact must be refused");
+        assert_eq!(err, BailEntryError::MissingFailingArtifact);
+    }
+
+    #[test]
+    fn bail_entry_ownership_is_self_when_artifact_is_declared() {
+        let entry = BailEntry::new(valid_bail_args()).expect("valid entry");
+        assert_eq!(entry.ownership(), BailOwnership::SelfOwned);
+        assert_eq!(entry.to_json()["ownership"], json!("self"));
+    }
+
+    #[test]
+    fn bail_entry_ownership_is_foreign_when_artifact_is_not_declared() {
+        let mut args = valid_bail_args();
+        args.declared_files = vec!["some/other/repo/file.rs".to_string()];
+        let entry = BailEntry::new(args).expect("valid entry");
+        assert_eq!(entry.ownership(), BailOwnership::Foreign);
+        assert_eq!(entry.to_json()["ownership"], json!("foreign"));
+    }
+
+    #[test]
+    fn bail_entry_out_of_range_bail_class_is_refused() {
+        let mut args = valid_bail_args();
+        args.bail_class = Some(6);
+        let err = BailEntry::new(args).expect_err("bail_class out of range must be refused");
+        assert_eq!(err, BailEntryError::InvalidBailClass(6));
+    }
+
+    #[test]
+    fn bail_entry_resolution_is_always_null_at_creation() {
+        let entry = BailEntry::new(valid_bail_args()).expect("valid entry");
+        assert_eq!(entry.to_json()["resolution"], Value::Null);
+    }
+
+    #[test]
+    fn bail_entry_jsonl_line_is_valid_json_with_trailing_newline() {
+        let entry = BailEntry::new(valid_bail_args()).expect("valid entry");
+        let line = entry.to_jsonl_line();
+        assert!(line.ends_with('\n'));
+        let parsed: Value = serde_json::from_str(line.trim_end()).expect("valid json");
+        assert_eq!(parsed["check_id"], json!("orchestration-step"));
+    }
+
+    #[test]
+    fn append_bail_line_appends_without_truncating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bails.jsonl");
+        std::fs::write(&path, "{\"pre-existing\":true}\n").expect("seed file");
+
+        let entry = BailEntry::new(valid_bail_args()).expect("valid entry");
+        append_bail_line(&path, &entry).expect("append succeeds");
+
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(contents.lines().count(), 2);
+        assert!(contents.starts_with("{\"pre-existing\":true}\n"));
     }
 }
