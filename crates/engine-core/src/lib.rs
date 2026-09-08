@@ -23,6 +23,7 @@ pub mod nodes;
 pub mod operator;
 pub mod parallel;
 pub mod policy;
+pub mod progress;
 pub mod repo_registry;
 pub mod roadmap_status;
 pub mod routing;
@@ -53,6 +54,9 @@ pub use node::{Identified, InputBinding, Node, NodeError, NodeExt, NodeRegistry,
 pub use nodes::ClaudeCodeStep;
 pub use nodes::{BrainConfig, BrainConfigError, HttpGet};
 pub use parallel::{BranchFailure, BranchOutcome, ParallelNode};
+pub use progress::{
+    noop_progress_sink, NodeProgress, NoopProgressSink, ProgressSink, RecordingProgressSink,
+};
 pub use routing::{dispatch_route, Router};
 pub use schema::{NodeConfig, WorkflowSchema};
 pub use suspend::{
