@@ -30,10 +30,12 @@
 //! is not one of the heavy-lane categories `fleet_concurrency_check.py` gates, so there is
 //! nothing for this handle to enforce a capacity cap against.
 
-use std::path::PathBuf;
+use std::fs;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use okf_core::LeaseKind;
+use okf_core::{LeaseKind, Message, MessageRecord};
 
 use crate::coord::write::{
     self, CoordWriteError, HeartbeatRequest, LeaseRequest, RegisterOutcome, RegisterRequest,
@@ -154,11 +156,182 @@ impl CoordHandle {
     }
 
     /// Drain this handle's own inbox (`<lock_dir>/queue/<repo>/<lane>/inbox/` ->
-    /// `.../processing/`), returning the `message_id` of every file moved.
-    pub fn drain(&self) -> Result<Vec<String>, CoordWriteError> {
+    /// `.../processing/`), returning one [`DrainedMessage`] per file moved, in filename order.
+    ///
+    /// `EN.15.D` task 2. This does NOT delegate to [`write::drain`]: that function silently
+    /// leaves a malformed file (invalid JSON, or valid JSON missing `message_id`) sitting in
+    /// `inbox/` forever — never moved, never receipted — which is exactly the silent-skip this
+    /// task's acceptance criteria forbid ("a malformed inbox file must be quarantined into
+    /// `processing/` WITH a receipt, never silently skipped"). This method instead quarantines
+    /// EVERY file it finds, whether it parses or not: a well-formed envelope is moved with its
+    /// own `message_id` and carries its parsed [`MessageRecord`] in [`DrainedMessage::record`];
+    /// a malformed one is moved just the same, with a receipt keyed on its filename (there is
+    /// no `message_id` to key on) and `record: None`. A caller that only cares about the
+    /// well-formed case can simply filter on `record.is_some()`.
+    pub fn drain(&self) -> Result<Vec<DrainedMessage>, CoordWriteError> {
         let now = (self.now_iso)();
-        write::drain(&self.lock_dir, &self.repo, &self.lane, &now)
+        let queue_dir = self
+            .lock_dir
+            .join("queue")
+            .join(&self.repo)
+            .join(&self.lane);
+        let inbox_dir = queue_dir.join("inbox");
+        let processing_dir = queue_dir.join("processing");
+
+        let mut files: Vec<PathBuf> = match fs::read_dir(&inbox_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                .collect(),
+            // Nothing has ever been sent to this lane yet — an empty drain, not an error,
+            // mirroring `write::drain`'s own contract.
+            Err(_) => return Ok(Vec::new()),
+        };
+        files.sort();
+
+        fs::create_dir_all(&processing_dir).map_err(|e| CoordWriteError::Io {
+            path: processing_dir.clone(),
+            source: e,
+        })?;
+
+        let mut drained = Vec::new();
+        for path in files {
+            let text = match fs::read_to_string(&path) {
+                Ok(t) => t,
+                // Another drainer already won the race for this file.
+                Err(_) => continue,
+            };
+            let record = serde_json::from_str::<Message>(&text)
+                .ok()
+                .and_then(|m| m.typed().cloned());
+            let filename = path
+                .file_name()
+                .expect("path built from a dir entry")
+                .to_owned();
+            // A well-formed envelope quarantines under its own `message_id`; a malformed file
+            // has none, so its filename stands in — still unique, still enough for the receipt
+            // ledger to name exactly which file moved.
+            let message_id = record
+                .as_ref()
+                .map(|r| r.message_id.clone())
+                .unwrap_or_else(|| filename.to_string_lossy().into_owned());
+
+            let dest = processing_dir.join(&filename);
+            if fs::rename(&path, &dest).is_err() {
+                // Race lost against another drainer — leave it be, same as above.
+                continue;
+            }
+            append_receipt(&queue_dir, &message_id, "inbox", "processing", &now)?;
+            drained.push(DrainedMessage { message_id, record });
+        }
+        Ok(drained)
     }
+
+    /// Reply to a RENDEZVOUS with a RENDEZVOUS of our own, addressed at the ORIGINAL sender's
+    /// own `repo`/`lane` inbox — resolved from `received.sender`, never guessed or hardcoded.
+    /// `EN.15.D` task 2.
+    pub fn reply_rendezvous(
+        &self,
+        received: &MessageRecord,
+        body: impl Into<String>,
+    ) -> Result<PathBuf, CoordWriteError> {
+        let now = (self.now_iso)();
+        let envelope = serde_json::json!({
+            "message_id": uuid_v4_string(),
+            "sender": {
+                "agent_name": self.agent,
+                "repo": self.repo,
+                "lane": self.lane,
+                "roadmap": received.sender.roadmap,
+            },
+            "sent_at": now,
+            "kind": "RENDEZVOUS",
+            "subject": {
+                "repo": received.sender.repo,
+                "block": received.subject.block,
+            },
+            "body": body.into(),
+            "durable_home": {
+                "channel": "lane-log",
+                "ref": format!("reply to message {}", received.message_id),
+            },
+            "verified_by": "engine-rs coord_lane::reply_rendezvous",
+        });
+        write::send(
+            &self.lock_dir,
+            &received.sender.repo,
+            &received.sender.lane,
+            envelope,
+            None,
+        )
+    }
+}
+
+/// One inbox file this handle's [`CoordHandle::drain`] moved into `processing/`, whether it
+/// parsed as a valid envelope or not — see that method's doc for why a malformed file is
+/// quarantined rather than skipped.
+#[derive(Debug, Clone)]
+pub struct DrainedMessage {
+    /// The `message_id` this file's receipt was keyed on — the envelope's own id when
+    /// [`record`](DrainedMessage::record) is `Some`, or a filename-derived fallback otherwise.
+    pub message_id: String,
+    /// The strict typed envelope, when this file parsed as one. `None` for a malformed file —
+    /// quarantined exactly the same way, just with nothing left to interpret.
+    pub record: Option<MessageRecord>,
+}
+
+/// A fresh v4 UUID string for an outgoing reply's `message_id`. Not a wall-clock timestamp, so
+/// this needs no clock-seam treatment — every call produces a fresh, unique id regardless of
+/// when it runs, and nothing downstream compares it against a staleness window.
+fn uuid_v4_string() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Append one transition receipt to `<queue_dir>/receipts.jsonl` — `{message_id, from, to,
+/// ts}`, one JSON object per line. Byte-for-byte the same shape `crate::coord::write`'s own
+/// (private) `append_receipt` writes to the SAME file, so a receipt this method appends is
+/// indistinguishable, to `check_messages.py` or a sibling reader, from one `write::drain`
+/// itself would have written. Duplicated rather than called into: `write::write`'s helper is
+/// module-private and this task's file scope is `coord_lane.rs`/`integrate.rs` only.
+fn append_receipt(
+    queue_dir: &Path,
+    message_id: &str,
+    from: &str,
+    to: &str,
+    now_iso: &str,
+) -> Result<(), CoordWriteError> {
+    let receipts_path = queue_dir.join("receipts.jsonl");
+    fs::create_dir_all(queue_dir).map_err(|e| CoordWriteError::Io {
+        path: receipts_path.clone(),
+        source: e,
+    })?;
+    let receipt = serde_json::json!({
+        "message_id": message_id,
+        "from": from,
+        "to": to,
+        "ts": now_iso,
+    });
+    let line = format!(
+        "{}\n",
+        serde_json::to_string(&receipt).map_err(|e| CoordWriteError::Invalid {
+            path: receipts_path.clone(),
+            reason: format!("receipt failed to serialize: {e}"),
+        })?
+    );
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&receipts_path)
+        .map_err(|e| CoordWriteError::Io {
+            path: receipts_path.clone(),
+            source: e,
+        })?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| CoordWriteError::Io {
+            path: receipts_path,
+            source: e,
+        })
 }
 
 /// Epoch seconds for [`RegisterRequest::now_epoch`] — a real clock read, never a frozen
@@ -263,5 +436,187 @@ mod tests {
         let h = handle(dir.path().to_path_buf());
         let moved = h.drain().expect("drain");
         assert!(moved.is_empty());
+    }
+
+    fn inbox_dir_for(h: &CoordHandle) -> PathBuf {
+        h.lock_dir
+            .join("queue")
+            .join(&h.repo)
+            .join(&h.lane)
+            .join("inbox")
+    }
+
+    fn well_formed_envelope(message_id: &str, kind: &str, sent_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "message_id": message_id,
+            "sender": {
+                "agent_name": "base-template-4c",
+                "repo": "base-template",
+                "lane": "types",
+                "roadmap": "coordination-layer-port",
+            },
+            "sent_at": sent_at,
+            "kind": kind,
+            "subject": {
+                "repo": "engine-rs",
+                "block": "EN.15.D",
+            },
+            "body": "test envelope",
+            "durable_home": {
+                "channel": "lane-log",
+                "ref": "lane-log.jsonl#1",
+            },
+            "verified_by": "test fixture",
+        })
+    }
+
+    /// A well-formed envelope drains with its own `message_id` and a parsed [`MessageRecord`],
+    /// and lands in `processing/` with exactly one `inbox->processing` receipt.
+    #[test]
+    fn drain_moves_a_well_formed_message_and_returns_its_parsed_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = handle(dir.path().to_path_buf());
+        let inbox = inbox_dir_for(&h);
+        std::fs::create_dir_all(&inbox).unwrap();
+        let envelope = well_formed_envelope(
+            "70ef6ce8-abcd-4e21-9f10-0000000000aa",
+            "RENDEZVOUS",
+            "2026-09-08T00:00:00Z",
+        );
+        std::fs::write(
+            inbox.join("20260908T000000Z-70ef6ce8-abcd-4e21-9f10-0000000000aa.json"),
+            serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let drained = h.drain().expect("drain");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].message_id,
+            "70ef6ce8-abcd-4e21-9f10-0000000000aa"
+        );
+        let record = drained[0].record.as_ref().expect("must have parsed");
+        assert_eq!(record.kind, okf_core::MessageKind::Rendezvous);
+
+        let processing = h
+            .lock_dir
+            .join("queue")
+            .join(&h.repo)
+            .join(&h.lane)
+            .join("processing");
+        assert_eq!(std::fs::read_dir(&processing).unwrap().count(), 1);
+        let receipts = std::fs::read_to_string(
+            h.lock_dir
+                .join("queue")
+                .join(&h.repo)
+                .join(&h.lane)
+                .join("receipts.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(receipts.lines().count(), 1);
+        assert!(receipts.contains("\"from\":\"inbox\""));
+        assert!(receipts.contains("\"to\":\"processing\""));
+    }
+
+    /// A malformed inbox file (not even valid JSON) is quarantined into `processing/` WITH a
+    /// receipt, never silently left in `inbox/` — the acceptance criterion this task adds,
+    /// proven as a runtime inversion: this same assertion FAILS against `write::drain` (which
+    /// leaves the file in `inbox/` untouched), and PASSES against `CoordHandle::drain`. A
+    /// well-formed file sent alongside it still round-trips normally — the positive control.
+    #[test]
+    fn drain_quarantines_a_malformed_file_with_a_receipt_and_still_drains_a_good_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = handle(dir.path().to_path_buf());
+        let inbox = inbox_dir_for(&h);
+        std::fs::create_dir_all(&inbox).unwrap();
+
+        // Malformed: not valid JSON at all.
+        std::fs::write(inbox.join("20260908T000001Z-bad.json"), b"{ not json").unwrap();
+
+        // Well-formed, sent alongside the malformed file.
+        let good = well_formed_envelope(
+            "8b1e0e5a-1111-4e21-9f10-0000000000bb",
+            "LEASE_RELEASE",
+            "2026-09-08T00:00:02Z",
+        );
+        std::fs::write(
+            inbox.join("20260908T000002Z-8b1e0e5a-1111-4e21-9f10-0000000000bb.json"),
+            serde_json::to_string(&good).unwrap(),
+        )
+        .unwrap();
+
+        let drained = h.drain().expect("drain");
+        assert_eq!(drained.len(), 2, "both files must be quarantined");
+
+        let processing = h
+            .lock_dir
+            .join("queue")
+            .join(&h.repo)
+            .join(&h.lane)
+            .join("processing");
+        assert!(!inbox.join("20260908T000001Z-bad.json").exists());
+        assert!(processing.join("20260908T000001Z-bad.json").exists());
+        assert_eq!(
+            std::fs::read_dir(&processing).unwrap().count(),
+            2,
+            "both the malformed and the well-formed file must have moved"
+        );
+
+        let receipts = std::fs::read_to_string(
+            h.lock_dir
+                .join("queue")
+                .join(&h.repo)
+                .join(&h.lane)
+                .join("receipts.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(receipts.lines().count(), 2, "one receipt per file moved");
+
+        let malformed = drained
+            .iter()
+            .find(|d| d.record.is_none())
+            .expect("one entry must be the malformed file");
+        assert_eq!(malformed.message_id, "20260908T000001Z-bad.json");
+
+        let well_formed = drained
+            .iter()
+            .find(|d| d.record.is_some())
+            .expect("one entry must be the well-formed file");
+        assert_eq!(
+            well_formed.message_id,
+            "8b1e0e5a-1111-4e21-9f10-0000000000bb"
+        );
+        assert_eq!(
+            well_formed.record.as_ref().unwrap().kind,
+            okf_core::MessageKind::LeaseRelease
+        );
+    }
+
+    /// `reply_rendezvous` addresses its reply at the ORIGINAL sender's own `repo`/`lane`
+    /// inbox, resolved from the received envelope's own `sender` field.
+    #[test]
+    fn reply_rendezvous_lands_in_the_original_senders_inbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = handle(dir.path().to_path_buf());
+        let received: MessageRecord = serde_json::from_value(well_formed_envelope(
+            "9a111111-2222-4e21-9f10-0000000000cc",
+            "RENDEZVOUS",
+            "2026-09-08T00:00:03Z",
+        ))
+        .expect("fixture must parse");
+
+        h.reply_rendezvous(&received, "engine-rs-1 answered")
+            .expect("reply must send");
+
+        let reply_inbox = dir
+            .path()
+            .join("queue")
+            .join(&received.sender.repo)
+            .join(&received.sender.lane)
+            .join("inbox");
+        let entries: Vec<_> = std::fs::read_dir(&reply_inbox)
+            .expect("reply inbox must exist")
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one reply envelope written");
     }
 }

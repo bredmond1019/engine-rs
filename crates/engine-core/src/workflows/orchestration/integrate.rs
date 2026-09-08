@@ -1697,6 +1697,40 @@ async fn integrate_chain_impl(
     // refused before anything is written).
     let lane_blocks: Vec<String> = chain.iter().map(|s| s.block_id.clone()).collect();
     for step in chain {
+        // `EN.15.D` task 2: drain this chain's own inbox at EVERY block boundary — the very
+        // top of this loop, before anything else for `step` runs (including the
+        // `pending_skip` short-circuit below). A no-op when `coord` is `None`. Because this is
+        // the ONLY place a drained message is ever acted on, a message delivered while a step
+        // is in flight is never injected mid-block — it simply waits in the inbox until the
+        // loop comes back around to this point, i.e. the NEXT block boundary.
+        //
+        // LEASE_RELEASE: release our lease right here, at the boundary (idempotent — the
+        // per-step `StepLeaseGuard` may already have released it when the prior step's
+        // iteration ended, in which case this is a no-op confirmation rather than a new
+        // effect). RENDEZVOUS: answer immediately with a reply envelope addressed at the
+        // sender's own `repo`/`lane`, resolved from the received envelope itself. Every other
+        // kind, and a malformed file (already quarantined by `drain` itself — see
+        // `CoordHandle::drain`'s own doc), is drained and otherwise ignored; interpreting the
+        // other three kinds is out of this block's scope.
+        if let Some(handle) = coord {
+            for drained in handle.drain().unwrap_or_default() {
+                match drained.record.as_ref().map(|r| r.kind) {
+                    Some(okf_core::MessageKind::LeaseRelease) => {
+                        let _ = handle.unlease();
+                    }
+                    Some(okf_core::MessageKind::Rendezvous) => {
+                        if let Some(record) = drained.record.as_ref() {
+                            let _ = handle.reply_rendezvous(
+                                record,
+                                format!("{} answered your RENDEZVOUS", handle.agent),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // A step skipped by the immediately preceding `RECALL` dispatch
         // step's empty result: not executed at all — no dependency check,
         // no hold wait, no admission permit, no `lane-log.jsonl` line, no
@@ -5279,5 +5313,223 @@ mod tests {
         .await
         .expect("chain should complete");
         assert_eq!(outcomes.len(), 1);
+    }
+
+    // ── `EN.15.D` task 2: drain at every block boundary ─────────────────
+
+    /// Writes a message envelope directly into `<lock_dir>/queue/<repo>/<lane>/inbox/`, for
+    /// tests to simulate delivery from a sibling lane.
+    fn write_inbox_message(
+        lock_dir: &Path,
+        repo: &str,
+        lane: &str,
+        message_id: &str,
+        kind: &str,
+        sent_at: &str,
+    ) {
+        let inbox = lock_dir.join("queue").join(repo).join(lane).join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let envelope = json!({
+            "message_id": message_id,
+            "sender": {
+                "agent_name": "base-template-4c",
+                "repo": "base-template",
+                "lane": "types",
+                "roadmap": "coordination-layer-port",
+            },
+            "sent_at": sent_at,
+            "kind": kind,
+            "subject": {
+                "repo": repo,
+            },
+            "body": "test envelope",
+            "durable_home": {
+                "channel": "lane-log",
+                "ref": "lane-log.jsonl#1",
+            },
+            "verified_by": "test fixture",
+        });
+        let filename_ts: String = sent_at.chars().filter(|c| *c != '-' && *c != ':').collect();
+        std::fs::write(
+            inbox.join(format!("{filename_ts}-{message_id}.json")),
+            serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A LEASE_RELEASE delivered WHILE a step is in flight (from inside that step's own
+    /// `FlowRunner` invocation) is never acted on mid-block: it sits in the inbox until this
+    /// loop comes back around to the top for the NEXT step, and is only honoured there. By the
+    /// time the chain finishes, the message has been drained (moved out of `inbox/` into
+    /// `processing/`, proving it actually got processed) and no lease file remains.
+    #[tokio::test]
+    async fn a_lease_release_delivered_mid_chain_is_honoured_at_the_next_boundary_only() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        write_done_state(&dir.path().join("repo-a"), "A.2");
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_dir_path = lock_dir.path().to_path_buf();
+
+        let message_id = "11111111-1111-4e21-9f10-000000000001";
+        let sent_at = "2026-09-08T00:00:00Z";
+        let runner: FlowRunner = Arc::new(move |invocation| {
+            let lock_dir_path = lock_dir_path.clone();
+            let block_id = invocation.block_id.clone();
+            Box::pin(async move {
+                if block_id == "A.1" {
+                    // Simulate a sibling lane's LEASE_RELEASE arriving while THIS step is
+                    // still running -- the loop must not see it until A.2's boundary.
+                    write_inbox_message(
+                        &lock_dir_path,
+                        "repo-a",
+                        "engine-rs",
+                        message_id,
+                        "LEASE_RELEASE",
+                        sent_at,
+                    );
+                }
+                Ok(engine_contract::TaskContext {
+                    event: json!({}),
+                    nodes: std::collections::HashMap::new(),
+                    metadata: json!({}),
+                    node_runs: std::collections::HashMap::new(),
+                })
+            })
+        });
+
+        let coord = CoordHandle::new(
+            lock_dir.path().to_path_buf(),
+            "repo-a",
+            "engine-rs",
+            "engine-rs-1",
+            coord_now_iso,
+        );
+
+        let chain = vec![step("repo-a", "A.1"), step("repo-a", "A.2")];
+
+        let outcomes = integrate_chain_with_coord(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+            Some(&coord),
+        )
+        .await
+        .expect("chain should complete");
+        assert_eq!(outcomes.len(), 2);
+
+        let queue_dir = lock_dir
+            .path()
+            .join("queue")
+            .join("repo-a")
+            .join("engine-rs");
+        let filename = format!("20260908T000000Z-{message_id}.json");
+        assert!(
+            !queue_dir.join("inbox").join(&filename).exists(),
+            "message must no longer sit in inbox/"
+        );
+        assert!(
+            queue_dir.join("processing").join(&filename).exists(),
+            "message must have been drained into processing/ at a block boundary"
+        );
+
+        let lease_path = lock_dir.path().join("leases").join("lease-repo-a.json");
+        assert!(
+            !lease_path.exists(),
+            "the LEASE_RELEASE must leave no lease file behind"
+        );
+    }
+
+    /// A RENDEZVOUS delivered mid-chain is answered with a reply envelope in the SENDER's own
+    /// inbox, addressed from the received envelope's own `sender` field.
+    #[tokio::test]
+    async fn a_rendezvous_delivered_mid_chain_is_answered_in_the_senders_inbox() {
+        let (dir, registry) = two_repo_registry();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+        let (runner, _calls) = recording_runner();
+        let resolve_engine = |_repo: &str, _id: &str| EngineKind::Flow;
+        let resolve_deps = |_repo: &str, _id: &str| Vec::new();
+        let is_met = |_repo: &str, _id: &str| true;
+        let admission = AdmissionGate::with_default_policy();
+        let roadmap_dir = tempfile::tempdir().unwrap();
+        let lock_dir = tempfile::tempdir().unwrap();
+
+        write_inbox_message(
+            lock_dir.path(),
+            "repo-a",
+            "engine-rs",
+            "22222222-2222-4e21-9f10-000000000002",
+            "RENDEZVOUS",
+            "2026-09-08T00:00:00Z",
+        );
+
+        let coord = CoordHandle::new(
+            lock_dir.path().to_path_buf(),
+            "repo-a",
+            "engine-rs",
+            "engine-rs-1",
+            coord_now_iso,
+        );
+
+        let chain = vec![step("repo-a", "A.1")];
+
+        let outcomes = integrate_chain_with_coord(
+            &chain,
+            &resolve_deps,
+            &is_met,
+            &admission,
+            &NeverHeld,
+            Duration::from_millis(1),
+            None,
+            None,
+            None,
+            &resolve_engine,
+            &registry,
+            &runner,
+            roadmap_dir.path(),
+            None,
+            &|_: &StepProgress| {},
+            false,
+            true,
+            uuid::Uuid::new_v4(),
+            &|_repo: &str, _id: &str| {},
+            Some(&coord),
+        )
+        .await
+        .expect("chain should complete");
+        assert_eq!(outcomes.len(), 1);
+
+        // The RENDEZVOUS was sent by base-template/types (see `write_inbox_message`'s fixed
+        // sender fixture) -- the reply must land there, never in our own inbox.
+        let reply_inbox = lock_dir
+            .path()
+            .join("queue")
+            .join("base-template")
+            .join("types")
+            .join("inbox");
+        let replies: Vec<_> = std::fs::read_dir(&reply_inbox)
+            .expect("reply inbox must exist")
+            .collect();
+        assert_eq!(replies.len(), 1, "exactly one reply envelope written");
     }
 }
