@@ -101,6 +101,39 @@
 //!   one whose `lane-log.jsonl` carries a malformed line
 //!   (`malformed_lines` is populated, not a fault); `404` for an unknown or
 //!   ambiguous roadmap slug. See `get_roadmap_status`.
+//! - `POST /api/coordination/{register,heartbeat,release,lease,unlease,send,drain,complete}`
+//!   (`EN.15.C` task 6) — the eight write verbs onto `engine_core::coord::write`'s single seam
+//!   (schema-validate, stamp `host`, snapshot to `.prev/`, then write; `EN.15.C` tasks 1-5),
+//!   exposed over HTTP for the first time. Every handler resolves the lock directory the same
+//!   way `get_coordination` above does (`engine_core::brain_root::resolve_brain_root` then
+//!   `engine_core::coord::resolve_lock_dir`) and stamps `host` from `ENGINE_COORD_HOST` when
+//!   set (`None` otherwise — `write_coord_json` already treats that as "stamp nothing").
+//!
+//!   **No `X-API-Key` gate.** Copies `/api/coordination` and `/api/roadmaps/{slug}/status`
+//!   immediately above — the only two `/api/`-prefixed routes this file carried before this
+//!   one — rather than inventing a third auth policy under `/api/`. Per `bastion-36`'s
+//!   2026-09-08 probe, `/api/coordination` (and everything under it) already sits behind an
+//!   `X-API-Key` check at the `bastion serve` reverse-proxy layer this crate is embedded in,
+//!   not this crate's own `check_api_key`; adding a second, redundant gate here would only let
+//!   the two drift.
+//!
+//!   Every path segment under `/api/coordination/` is a literal (`register`, `heartbeat`, …)
+//!   colliding with no dynamic extractor anywhere in this file, so — unlike `/events/suspended`
+//!   vs `/events/{event_id}` above — registration order among these eight does not matter.
+//!   `/api/coordination` (GET, above) vs `/api/coordination/register` (POST, here) never
+//!   shadow each other either — different HTTP methods on overlapping literal prefixes are not
+//!   the shadowing hazard this file's other comments guard against, which is specifically a
+//!   dynamic extractor swallowing a literal segment.
+//!
+//!   `register`/`heartbeat`/`lease` echo `engine_core::coord::write`'s own success/refusal
+//!   shape (`200` with the outcome body; `409` for a `register` capacity refusal; `400` for a
+//!   validation refusal such as an out-of-window lease block or a `priority` key in a message
+//!   envelope; `404` for a `heartbeat` naming an agent with no existing claim). `release` and
+//!   `unlease` always `200` with `{"removed": bool}` — both are idempotent by design
+//!   (`engine_core::coord::write::release`/`unlease` never error on an already-absent record).
+//!   `drain`/`complete` always `200` — an empty drain and a `complete` that matched nothing are
+//!   both normal answers, not faults, matching those functions' own `Ok` contracts. See
+//!   `coord_register` and its seven siblings below.
 
 use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -316,7 +349,22 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/api/roadmaps/{slug}/status",
             web::get().to(get_roadmap_status),
-        );
+        )
+        // `EN.15.C` task 6. Eight literal path segments under `/api/coordination/`, colliding
+        // with no dynamic extractor anywhere in this file — registration order among them (and
+        // relative to `GET /api/coordination` above, a different HTTP method) does not matter.
+        // See this file's module doc comment for the full route contract.
+        .route("/api/coordination/register", web::post().to(coord_register))
+        .route(
+            "/api/coordination/heartbeat",
+            web::post().to(coord_heartbeat),
+        )
+        .route("/api/coordination/release", web::post().to(coord_release))
+        .route("/api/coordination/lease", web::post().to(coord_lease))
+        .route("/api/coordination/unlease", web::post().to(coord_unlease))
+        .route("/api/coordination/send", web::post().to(coord_send))
+        .route("/api/coordination/drain", web::post().to(coord_drain))
+        .route("/api/coordination/complete", web::post().to(coord_complete));
 }
 
 /// `EN.ticket.stamp-engine-sha-on-every-run` task 3: `engine_build_sha` here must equal the
@@ -980,6 +1028,322 @@ async fn get_roadmap_status(path: web::Path<String>) -> impl Responder {
         Err(err) => HttpResponse::NotFound().json(serde_json::json!({
             "error": err.to_string(),
         })),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `POST /api/coordination/*` — the eight write verbs onto `engine_core::coord::write`'s single
+// seam. `EN.15.C` task 6. See this file's module doc comment for the full route contract.
+// ---------------------------------------------------------------------------------------------
+
+/// Resolve the lock directory the same way `get_coordination`/`get_roadmap_status` resolve the
+/// brain root, then hand back a `500` (as raw JSON) on failure so every write-route handler can
+/// `?`-style bail with `let lock_dir = match resolve_coord_lock_dir() { Ok(d) => d, Err(resp) =>
+/// return resp };` — no separate error type needed, since an actix handler must return an
+/// `impl Responder` either way.
+fn resolve_coord_lock_dir() -> Result<std::path::PathBuf, HttpResponse> {
+    let brain_root = engine_core::brain_root::resolve_brain_root().map_err(|err| {
+        HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("cannot resolve brain root: {err}"),
+        }))
+    })?;
+    Ok(engine_core::coord::resolve_lock_dir(&brain_root))
+}
+
+/// The `host` every coord write route stamps, when `ENGINE_COORD_HOST` is set and non-empty.
+/// `None` otherwise — `engine_core::coord::write::write_coord_json` already treats that as
+/// "stamp nothing" (every coord record's `host` field is optional and omitted-not-null).
+fn coord_host() -> Option<String> {
+    std::env::var("ENGINE_COORD_HOST")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// A `CoordWriteError` turned into the `400`/`404` this route surfaces it as. `Invalid` is a
+/// caller-fixable refusal (bad shape, forbidden key, out-of-window block) — `400`.
+/// `Io` is this process's own filesystem trouble — `500`, since the caller did nothing wrong.
+fn coord_write_error_response(err: engine_core::coord::write::CoordWriteError) -> HttpResponse {
+    use engine_core::coord::write::CoordWriteError;
+    match err {
+        CoordWriteError::Invalid { .. } => HttpResponse::BadRequest().json(serde_json::json!({
+            "error": err.to_string(),
+        })),
+        CoordWriteError::Io { .. } => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": err.to_string(),
+        })),
+    }
+}
+
+/// `POST /api/coordination/register` body — owned `String`s (an HTTP body must own its data)
+/// mirroring `engine_core::coord::write::RegisterRequest`'s fields one-for-one, minus the
+/// timestamps/pid this route stamps itself (see `coord_register`) rather than trusting a
+/// caller-supplied clock.
+#[derive(Debug, Deserialize)]
+struct CoordRegisterBody {
+    agent_name: String,
+    repo: String,
+    lane: String,
+    roadmap: String,
+    /// Heavy-lane category (`"browser-automation"` / `"native-build"`), or absent for a light
+    /// repo carrying no capacity gate — matches `RegisterRequest::category`'s own `Option`.
+    #[serde(default)]
+    category: Option<String>,
+}
+
+/// `POST /api/coordination/register` — write the lane-agent registry claim and, when
+/// `category` is present, enforce and write the heavy-lane capacity slot first. `200` with the
+/// outcome body on success (`{"allowed": true}`); `409` with `{"allowed": false, "reason",
+/// "active"}` on a capacity refusal — `engine_core::coord::write::register`'s own
+/// all-or-nothing contract (a refusal writes nothing).
+async fn coord_register(body: web::Json<CoordRegisterBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let now = Utc::now();
+    let now_iso = now.to_rfc3339();
+    let now_epoch = now.timestamp() as f64 + f64::from(now.timestamp_subsec_nanos()) / 1e9;
+    let host = coord_host();
+
+    let req = engine_core::coord::write::RegisterRequest {
+        agent_name: &body.agent_name,
+        repo: &body.repo,
+        lane: &body.lane,
+        roadmap: &body.roadmap,
+        host: host.as_deref(),
+        category: body.category.as_deref(),
+        now_iso: &now_iso,
+        now_epoch,
+        pid: std::process::id() as i64,
+    };
+
+    match engine_core::coord::write::register(&lock_dir, &req) {
+        Ok(outcome) if outcome.allowed => {
+            HttpResponse::Ok().json(serde_json::json!({ "allowed": true }))
+        }
+        Ok(outcome) => HttpResponse::Conflict().json(serde_json::json!({
+            "allowed": false,
+            "reason": outcome.reason,
+            "active": outcome.active,
+        })),
+        Err(err) => coord_write_error_response(err),
+    }
+}
+
+/// `POST /api/coordination/heartbeat` body — mirrors
+/// `engine_core::coord::write::HeartbeatRequest`, minus the timestamp this route stamps itself.
+#[derive(Debug, Deserialize)]
+struct CoordHeartbeatBody {
+    agent_name: String,
+    #[serde(default)]
+    current_block: Option<String>,
+    #[serde(default)]
+    block_started_at: Option<String>,
+}
+
+/// `POST /api/coordination/heartbeat` — re-stamp an existing registry claim's `heartbeat`
+/// field. `200 {"ok": true}` on success; `404` when `agent_name` names no existing claim —
+/// `engine_core::coord::write::heartbeat`'s own refusal, surfaced as "nothing to heartbeat"
+/// rather than the generic `400` other validation refusals get, since the caller's body was
+/// well-formed and the problem is purely "no such agent".
+async fn coord_heartbeat(body: web::Json<CoordHeartbeatBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let now_iso = Utc::now().to_rfc3339();
+    let host = coord_host();
+
+    let req = engine_core::coord::write::HeartbeatRequest {
+        agent_name: &body.agent_name,
+        host: host.as_deref(),
+        now_iso: &now_iso,
+        current_block: body.current_block.as_deref(),
+        block_started_at: body.block_started_at.as_deref(),
+    };
+
+    match engine_core::coord::write::heartbeat(&lock_dir, &req) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(err) => match err {
+            engine_core::coord::write::CoordWriteError::Invalid { .. } => {
+                HttpResponse::NotFound().json(serde_json::json!({ "error": err.to_string() }))
+            }
+            other => coord_write_error_response(other),
+        },
+    }
+}
+
+/// `POST /api/coordination/release` body.
+#[derive(Debug, Deserialize)]
+struct CoordReleaseBody {
+    agent_name: String,
+}
+
+/// `POST /api/coordination/release` — remove `agent_name`'s registry claim, if any. Always
+/// `200 {"removed": bool}` — idempotent by design (`engine_core::coord::write::release` never
+/// errors on an already-absent claim).
+async fn coord_release(body: web::Json<CoordReleaseBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    match engine_core::coord::write::release(&lock_dir, &body.agent_name) {
+        Ok(removed) => HttpResponse::Ok().json(serde_json::json!({ "removed": removed })),
+        Err(err) => coord_write_error_response(err),
+    }
+}
+
+/// `POST /api/coordination/lease` body — mirrors `engine_core::coord::write::LeaseRequest`.
+/// `kind`/`scope` are `okf_core::LeaseKind`/`LeaseScope` directly (both already `Deserialize`,
+/// `rename_all = "lowercase"`) rather than a parallel wire enum this crate would have to keep
+/// in sync by hand. `lane_blocks` defaults to empty — a lease with no `window` never consults
+/// it, so an empty default costs a caller nothing on the common whole-lane-lease path.
+#[derive(Debug, Deserialize)]
+struct CoordLeaseBody {
+    repo: String,
+    lane: String,
+    agent: String,
+    kind: okf_core::LeaseKind,
+    #[serde(default)]
+    scope: Option<okf_core::LeaseScope>,
+    #[serde(default)]
+    window: Option<Vec<String>>,
+    #[serde(default)]
+    lane_blocks: Vec<String>,
+}
+
+/// `POST /api/coordination/lease` — acquire or renew an exclusive/shared claim on `repo`'s
+/// working tree. `200 {"ok": true}` on success; `400` when `window` names a block absent from
+/// `lane_blocks` — `engine_core::coord::write::lease`'s own request-time refusal, before
+/// anything is written.
+async fn coord_lease(body: web::Json<CoordLeaseBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let now_iso = Utc::now().to_rfc3339();
+    let host = coord_host();
+
+    let req = engine_core::coord::write::LeaseRequest {
+        repo: &body.repo,
+        lane: &body.lane,
+        agent: &body.agent,
+        kind: body.kind,
+        scope: body.scope,
+        host: host.as_deref(),
+        now_iso: &now_iso,
+        window: body.window.as_deref(),
+        lane_blocks: &body.lane_blocks,
+    };
+
+    match engine_core::coord::write::lease(&lock_dir, &req) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Err(err) => coord_write_error_response(err),
+    }
+}
+
+/// `POST /api/coordination/unlease` body.
+#[derive(Debug, Deserialize)]
+struct CoordUnleaseBody {
+    repo: String,
+}
+
+/// `POST /api/coordination/unlease` — release the lease on `repo`, if any. Always
+/// `200 {"removed": bool}` — idempotent, matching `coord_release`'s own contract.
+async fn coord_unlease(body: web::Json<CoordUnleaseBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    match engine_core::coord::write::unlease(&lock_dir, &body.repo) {
+        Ok(removed) => HttpResponse::Ok().json(serde_json::json!({ "removed": removed })),
+        Err(err) => coord_write_error_response(err),
+    }
+}
+
+/// `POST /api/coordination/send` body. `envelope` is the message envelope as raw JSON — the
+/// recipient `repo`/`lane` sit alongside it rather than inside it, since `message.schema.json`
+/// carries no `to` field (`okf_core::coord::message`'s own doc comment): the inbox a message is
+/// written into IS its address.
+#[derive(Debug, Deserialize)]
+struct CoordSendBody {
+    repo: String,
+    lane: String,
+    envelope: serde_json::Value,
+}
+
+/// `POST /api/coordination/send` — write a message envelope into the recipient lane's inbox.
+/// `200 {"path": ..}` on success; `400` on a forbidden key (`priority`/`urgency`) or a shape
+/// that fails `MessageRecord`'s strict schema — `engine_core::coord::write::send`'s own
+/// refusal, before anything is written.
+async fn coord_send(body: web::Json<CoordSendBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let host = coord_host();
+    match engine_core::coord::write::send(
+        &lock_dir,
+        &body.repo,
+        &body.lane,
+        body.envelope.clone(),
+        host.as_deref(),
+    ) {
+        Ok(path) => HttpResponse::Ok().json(serde_json::json!({ "path": path })),
+        Err(err) => coord_write_error_response(err),
+    }
+}
+
+/// `POST /api/coordination/drain` body.
+#[derive(Debug, Deserialize)]
+struct CoordDrainBody {
+    repo: String,
+    lane: String,
+}
+
+/// `POST /api/coordination/drain` — move every message currently in the recipient lane's
+/// `inbox/` into `processing/`, appending one receipt per file moved. Always `200
+/// {"moved": [message_id, ...]}` — an empty drain (nothing in `inbox/`) is a normal answer, not
+/// a fault, matching `engine_core::coord::write::drain`'s own `Ok(Vec::new())` contract.
+async fn coord_drain(body: web::Json<CoordDrainBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let now_iso = Utc::now().to_rfc3339();
+    match engine_core::coord::write::drain(&lock_dir, &body.repo, &body.lane, &now_iso) {
+        Ok(moved) => HttpResponse::Ok().json(serde_json::json!({ "moved": moved })),
+        Err(err) => coord_write_error_response(err),
+    }
+}
+
+/// `POST /api/coordination/complete` body.
+#[derive(Debug, Deserialize)]
+struct CoordCompleteBody {
+    repo: String,
+    lane: String,
+    message_id: String,
+}
+
+/// `POST /api/coordination/complete` — move `message_id`'s file from `processing/` to `done/`,
+/// appending one receipt. Always `200 {"completed": bool}` — `false` when no matching file was
+/// found (e.g. already completed by another drainer), never an error, matching
+/// `engine_core::coord::write::complete`'s own `Ok(false)` contract.
+async fn coord_complete(body: web::Json<CoordCompleteBody>) -> impl Responder {
+    let lock_dir = match resolve_coord_lock_dir() {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let now_iso = Utc::now().to_rfc3339();
+    match engine_core::coord::write::complete(
+        &lock_dir,
+        &body.repo,
+        &body.lane,
+        &body.message_id,
+        &now_iso,
+    ) {
+        Ok(completed) => HttpResponse::Ok().json(serde_json::json!({ "completed": completed })),
+        Err(err) => coord_write_error_response(err),
     }
 }
 
@@ -3880,6 +4244,463 @@ mod tests {
             let budget = budget_from_env_vars(Some(" 2.5 "), Some(" 10 "));
             assert_eq!(budget.max_cost_usd, Some(2.5));
             assert_eq!(budget.max_total_tokens, Some(10));
+        }
+    }
+
+    // --- `EN.15.C` task 6: `POST /api/coordination/*` write routes ---------------------------
+
+    mod coord_write_routes {
+        use super::*;
+
+        /// Point `ENGINE_BRAIN_ROOT`/`FLEET_LOCK_DIR` at a scratch tempdir so this test's writes
+        /// never touch this machine's real `.fleet-locks` and never race a concurrently-running
+        /// test — same isolation technique `coordination_route_reports_live_for_a_healthy_tree`
+        /// above uses on the read side, applied here to the write side. `nextest` runs each test
+        /// in its own process (`AGENTS.md` standing rule 8), so mutating process env is safe.
+        fn set_coord_env(lock_dir: &std::path::Path) {
+            std::env::set_var("ENGINE_BRAIN_ROOT", lock_dir);
+            std::env::set_var("FLEET_LOCK_DIR", lock_dir.join(".fleet-locks"));
+        }
+
+        fn clear_coord_env() {
+            std::env::remove_var("ENGINE_BRAIN_ROOT");
+            std::env::remove_var("FLEET_LOCK_DIR");
+        }
+
+        fn message_envelope(message_id: &str, sent_at: &str) -> serde_json::Value {
+            serde_json::json!({
+                "message_id": message_id,
+                "sender": {
+                    "agent_name": "engine-rs-1",
+                    "repo": "engine-rs",
+                    "lane": "engine-rs",
+                    "roadmap": "coordination-layer-port",
+                },
+                "sent_at": sent_at,
+                "kind": "QUERY",
+                "subject": { "repo": "bastion" },
+                "body": "does bastion still need this lease?",
+                "durable_home": {
+                    "channel": "lane-log",
+                    "ref": "engine-rs/planning/roadmaps/coordination-layer-port/lane-log.jsonl",
+                },
+                "verified_by": "UNVERIFIED: engine-rs-1",
+            })
+        }
+
+        /// Build and dispatch a `POST` with a JSON body through `app` (whatever concrete
+        /// `test::init_service(App::new().configure(configure))` produced) — a macro rather
+        /// than a generic function, since the service's own associated `Response` type is not
+        /// nameable outside its call site without pinning down `test::init_service`'s opaque
+        /// return type.
+        macro_rules! post_json {
+            ($app:expr, $uri:expr, $body:expr $(,)?) => {{
+                let req = test::TestRequest::post()
+                    .uri($uri)
+                    .set_json(&$body)
+                    .to_request();
+                test::call_service($app, req).await
+            }};
+        }
+
+        /// The wiring criterion: all eight routes are reachable through the shared `configure`
+        /// table (not called directly), and each behaves per its own contract — including the
+        /// idempotent `release`/`unlease` re-call and the `heartbeat`-with-no-claim `404`.
+        #[actix_web::test]
+        async fn all_eight_coordination_write_routes_are_reachable_through_configure() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            set_coord_env(tmp.path());
+            let app = test::init_service(App::new().configure(configure)).await;
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/register",
+                serde_json::json!({
+                    "agent_name": "engine-rs-1",
+                    "repo": "engine-rs",
+                    "lane": "engine-rs",
+                    "roadmap": "coordination-layer-port",
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["allowed"], true);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/heartbeat",
+                serde_json::json!({ "agent_name": "engine-rs-1" }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/heartbeat",
+                serde_json::json!({ "agent_name": "no-such-agent" }),
+            );
+            assert_eq!(
+                resp.status(),
+                404,
+                "heartbeating an agent with no existing claim must 404, not error silently"
+            );
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/release",
+                serde_json::json!({ "agent_name": "engine-rs-1" }),
+            );
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["removed"], true);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/release",
+                serde_json::json!({ "agent_name": "engine-rs-1" }),
+            );
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(
+                body["removed"], false,
+                "releasing an already-absent claim must report removed: false, not error"
+            );
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/lease",
+                serde_json::json!({
+                    "repo": "engine-rs",
+                    "lane": "engine-rs",
+                    "agent": "engine-rs-1",
+                    "kind": "exclusive",
+                    "lane_blocks": ["EN.15.C"],
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/lease",
+                serde_json::json!({
+                    "repo": "engine-rs",
+                    "lane": "engine-rs",
+                    "agent": "engine-rs-1",
+                    "kind": "exclusive",
+                    "window": ["EN.99.Z"],
+                    "lane_blocks": ["EN.15.C"],
+                }),
+            );
+            assert_eq!(
+                resp.status(),
+                400,
+                "a window naming a block absent from lane_blocks must be refused"
+            );
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/unlease",
+                serde_json::json!({ "repo": "engine-rs" }),
+            );
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["removed"], true);
+
+            let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+            let resp = post_json!(
+                &app,
+                "/api/coordination/send",
+                serde_json::json!({
+                    "repo": "bastion",
+                    "lane": "bastion-lane",
+                    "envelope": message_envelope(message_id, "2026-09-08T10:00:00Z"),
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/send",
+                serde_json::json!({
+                    "repo": "bastion",
+                    "lane": "bastion-lane",
+                    "envelope": {
+                        "message_id": "aa000000-0000-0000-0000-00000000000b",
+                        "priority": "urgent",
+                    },
+                }),
+            );
+            assert_eq!(
+                resp.status(),
+                400,
+                "a `priority` key anywhere in the envelope must be refused"
+            );
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/drain",
+                serde_json::json!({ "repo": "bastion", "lane": "bastion-lane" }),
+            );
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["moved"], serde_json::json!([message_id]));
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/complete",
+                serde_json::json!({
+                    "repo": "bastion",
+                    "lane": "bastion-lane",
+                    "message_id": message_id,
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["completed"], true);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/complete",
+                serde_json::json!({
+                    "repo": "bastion",
+                    "lane": "bastion-lane",
+                    "message_id": message_id,
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(
+                body["completed"], false,
+                "completing an already-completed message must report completed: false"
+            );
+
+            clear_coord_env();
+        }
+
+        /// "No existing route's path or auth behaviour changed": `/health` and `GET
+        /// /api/coordination` are unaffected by these eight new routes' addition.
+        #[actix_web::test]
+        async fn adding_the_write_routes_leaves_health_and_get_coordination_unaffected() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            set_coord_env(tmp.path());
+            let app = test::init_service(App::new().configure(configure)).await;
+
+            let resp =
+                test::call_service(&app, test::TestRequest::get().uri("/health").to_request())
+                    .await;
+            assert_eq!(resp.status(), 200);
+
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/api/coordination")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["status"], "live");
+
+            clear_coord_env();
+        }
+
+        // -------------------------------------------------------------------------------------
+        // Schema-validity parity: a record built by ANY of these routes passes the matching
+        // base-template Python checker. Shells out to the REAL oracle scripts, resolved by an
+        // EXPLICIT `base-template/scripts/...` path — the `oracle_is_the_canonical_copy_not_hqs_
+        // deprecated_fork` pattern `EN.15.H`'s `roadmap_status.rs` established, applied here:
+        // unlike that block's oracle, neither `check_lane_agents.py` nor `check_messages.py` has
+        // a same-named deprecated fork anywhere in this fleet (verified 2026-09-08 — the only
+        // copy of each lives under `base-template/scripts/`), so no "which copy" ambiguity
+        // exists to guard against beyond confirming the resolved file is genuinely that script
+        // (its own module docstring, asserted below) rather than an empty or truncated read.
+        // -------------------------------------------------------------------------------------
+
+        fn find_brain_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+            let mut dir = Some(start);
+            while let Some(d) = dir {
+                if d.join("brain.toml").is_file() {
+                    return Some(d.to_path_buf());
+                }
+                dir = d.parent();
+            }
+            None
+        }
+
+        fn python3_available() -> bool {
+            match std::process::Command::new("python3")
+                .arg("--version")
+                .output()
+            {
+                Ok(output) => output.status.success(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => panic!("python3 --version failed unexpectedly: {e}"),
+            }
+        }
+
+        /// Resolve both checkers by an explicit `base-template/scripts/...` path and assert
+        /// each is the canonical copy (its own module docstring is present) before this test
+        /// trusts it. Returns `None` (skipping, never failing) when this checkout has no
+        /// sibling `base-template` to find them in.
+        fn require_coord_checkers() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+            if !python3_available() {
+                println!(
+                    "SKIPPING coord write-route parity test: python3 is not available on PATH"
+                );
+                return None;
+            }
+            let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let Some(brain_root) = find_brain_root(manifest_dir) else {
+                println!(
+                    "SKIPPING coord write-route parity test: no brain.toml found walking up \
+                     from {} (this checkout has no sibling base-template to locate the \
+                     checkers in)",
+                    manifest_dir.display()
+                );
+                return None;
+            };
+            let lane_agents = brain_root
+                .join("base-template")
+                .join("scripts")
+                .join("check_lane_agents.py");
+            let messages = brain_root
+                .join("base-template")
+                .join("scripts")
+                .join("check_messages.py");
+            if !lane_agents.is_file() || !messages.is_file() {
+                println!(
+                    "SKIPPING coord write-route parity test: brain root found at {} but a \
+                     checker is missing (lane_agents={}, messages={})",
+                    brain_root.display(),
+                    lane_agents.display(),
+                    messages.display()
+                );
+                return None;
+            }
+            let lane_agents_text = std::fs::read_to_string(&lane_agents).unwrap_or_default();
+            assert!(
+                lane_agents_text.contains("Validate lane-agent registry claims and repo leases"),
+                "resolved {} does not carry check_lane_agents.py's own module docstring — this \
+                 is not the canonical base-template copy",
+                lane_agents.display()
+            );
+            let messages_text = std::fs::read_to_string(&messages).unwrap_or_default();
+            assert!(
+                messages_text.contains(
+                    "Validate cross-lane message envelopes and the inbox/processing/done queue \
+                     layout"
+                ),
+                "resolved {} does not carry check_messages.py's own module docstring — this is \
+                 not the canonical base-template copy",
+                messages.display()
+            );
+            Some((lane_agents, messages))
+        }
+
+        /// The headline acceptance criterion: a tree built entirely through the eight HTTP
+        /// routes (never by calling `engine_core::coord::write` directly) passes both
+        /// `check_lane_agents.py` and `check_messages.py` with zero own-repo failures.
+        #[actix_web::test]
+        async fn a_tree_built_by_the_http_routes_passes_both_base_template_checkers() {
+            let Some((lane_agents_script, messages_script)) = require_coord_checkers() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().expect("tempdir");
+            set_coord_env(tmp.path());
+            let lock_dir = tmp.path().join(".fleet-locks");
+            let app = test::init_service(App::new().configure(configure)).await;
+
+            // A registry claim and a lease, left in place (never released) so the checker has
+            // something to validate.
+            let resp = post_json!(
+                &app,
+                "/api/coordination/register",
+                serde_json::json!({
+                    "agent_name": "engine-rs-1",
+                    "repo": "engine-rs",
+                    "lane": "engine-rs",
+                    "roadmap": "coordination-layer-port",
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/lease",
+                serde_json::json!({
+                    "repo": "engine-rs",
+                    "lane": "engine-rs",
+                    "agent": "engine-rs-1",
+                    "kind": "shared",
+                    "lane_blocks": [],
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            // A message, sent/drained/completed entirely through the routes, exercising every
+            // receipt transition `check_messages.py`'s `queue-message-receipts` check gates on.
+            let message_id = "70ef6ce8-abcd-4e21-9f10-0000000000aa";
+            let resp = post_json!(
+                &app,
+                "/api/coordination/send",
+                serde_json::json!({
+                    "repo": "bastion",
+                    "lane": "bastion-lane",
+                    "envelope": message_envelope(message_id, "2026-09-08T10:00:00Z"),
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/drain",
+                serde_json::json!({ "repo": "bastion", "lane": "bastion-lane" }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            let resp = post_json!(
+                &app,
+                "/api/coordination/complete",
+                serde_json::json!({
+                    "repo": "bastion",
+                    "lane": "bastion-lane",
+                    "message_id": message_id,
+                }),
+            );
+            assert_eq!(resp.status(), 200);
+
+            let output = std::process::Command::new("python3")
+                .arg(&lane_agents_script)
+                .arg("--lock-dir")
+                .arg(&lock_dir)
+                .arg("--repo")
+                .arg("engine-rs")
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn python3 check_lane_agents.py: {e}"));
+            assert!(
+                output.status.success(),
+                "check_lane_agents.py must pass with zero own-repo failures on a tree built by \
+                 the HTTP routes\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let output = std::process::Command::new("python3")
+                .arg(&messages_script)
+                .arg("--lock-dir")
+                .arg(&lock_dir)
+                .arg("--repo")
+                .arg("bastion")
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn python3 check_messages.py: {e}"));
+            assert!(
+                output.status.success(),
+                "check_messages.py must pass with zero own-repo failures on a tree built by the \
+                 HTTP routes\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            clear_coord_env();
         }
     }
 }

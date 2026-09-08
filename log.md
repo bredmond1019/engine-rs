@@ -16,6 +16,22 @@ related: [status, context]
 
 ## [run: 2026-09-08]
 
+### EN.15.C — `coord` write side, with an HTTP face (PASS)
+- **What:** Ran `/sdlc-flow` on branch `EN.15.C-flow` through all 6 tasks, PASS review. Task 1 added `crates/engine-core/src/coord/write.rs`, the single write seam (`write_coord_json` + `write_heartbeat_file`) that schema-validates via `okf_core::Coord<T>`, stamps `host`, and snapshots any prior file to `.fleet-locks/.prev/<relative path>` before overwriting. Task 2 added register/heartbeat/release verbs, folding the lane-registry claim write with an optional fleet-concurrency slot write, refusing at capacity with the same message as `fleet_concurrency_check.py`. Task 3 added lease/unlease with per-block window validation and a headline test driving `mev::set_block_status_as` end to end (self-exemption, refusal, release). Task 4 added send/drain/complete message verbs with gate-enforced `receipts.jsonl` transitions, a recursive priority/urgency refusal, and a real-oracle parity test against base-template's `check_messages.py`. Task 5 added `requeue_processing`/`requeue_all_processing` so stranded `processing/` files are re-queued to `inbox/` on writer start, idempotently. Task 6 registered `POST /api/coordination/{register,heartbeat,release,lease,unlease,send,drain,complete}` in `engine-serve`, with an HTTP-level parity test proving a tree built entirely through these routes passes both `check_lane_agents.py` and `check_messages.py`. Closes `EN.15.C`. `docs/architecture.md` updated.
+- **Deviation from spec (recorded to the block's Amendment Log):** the spec's file plan named three new files — `crates/engine-core/src/coord/lease.rs`, `crates/engine-core/src/coord/queue.rs`, and route additions to `crates/engine-serve/src/coordination.rs` — plus a modification to `crates/engine-core/src/workflows/orchestration/chain.rs` for the `exclusive_repos` window shape. None of the four tasks 1-6 (verified against `files_changed` and `git diff --stat ec97cd0~1..cf10a1d`) touched `lease.rs`, `queue.rs`, `coordination.rs`, or `chain.rs` — the entire ~2367-line write-side implementation landed in `write.rs`, and the eight HTTP handlers landed in `crates/engine-serve/src/http.rs` instead of `coordination.rs`. The `chain.rs` window-shape change is not present anywhere in the diff — that scope item appears to have been dropped, not merely relocated. Review (PASS, 0 findings) did not catch either the file-plan or the `chain.rs` omission.
+
+```
+cf10a1d docs: update docs for EN.15.C
+69d9474 fix: review pass 1 for EN.15.C
+9993fa3 feat: implement EN.15.C-task6
+5488222 feat: implement EN.15.C-task5
+f6c722a feat: implement EN.15.C-task4
+eb13b53 feat: implement EN.15.C-task3
+ba53096 feat: implement EN.15.C-task2
+ec97cd0 feat: implement EN.15.C-task1
+```
+
+
 ### EN.15.H — `ROADMAP_STATUS` as a route (PASS)
 - **What:** Ran `/sdlc-flow` on branch `EN.15.H-flow` through both tasks, PASS review. Task 1 added `engine_core::roadmap_status`, a typed `LaneResult` join over `lane-log.jsonl`, per-repo orchestration-run records, per-spec `sdlc-*state.json`, per-repo `state.json` (operator gates + carryover), and `coord`'s registry/leases/queue-depth, with cached-parent realpath dedup and byte-offset-reported malformed lane-log lines. Task 2 registered `GET /api/roadmaps/{slug}/status` in `engine-serve`, extended the join with `validate_brain`/`coverage_caveat`/full `MessageQueueState` parity fields, and added a live parity test suite shelling out to base-template's canonical 1382-line `roadmap_status_discovery.py` oracle (asserted not to be HQ's 891-line deprecated fork), agreeing field-for-field except the one deliberate `malformed_lines` divergence. Notable decisions: message-queue depth for task 1 deliberately reuses `engine_core::coord`'s flat reader rather than the Python's nested per-repo/per-lane layout, reconciled only in task 2's dedicated `discover_queue_state()`; `resolve_block_to_spec_slug` ported via a `std::sync::OnceLock`-cached regex; `sdlc_state` liveness compared as a bucketed "live"/"stale" string rather than raw age to avoid wall-clock flakiness. Closes `EN.15.H`. `docs/architecture.md` updated.
 
