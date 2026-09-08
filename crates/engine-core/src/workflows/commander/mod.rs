@@ -13,9 +13,11 @@
 //!   with the `git add -A` mutation test (task 2).
 //! - [`drain_log`] — the drain-log append that never skips (a `roadmap: null` row when no
 //!   roadmap resolves, never a skipped append) and the commander heartbeat in the pinned bare
-//!   epoch-seconds format (task 3, this task).
-//! - `triage` (task 4) lands in a later task of this same block; this module does not yet
-//!   declare it.
+//!   epoch-seconds format (task 3).
+//! - [`triage`] — the commander's single gated `ClaudeCodeStep` (task 4, this task): orphan
+//!   classification plus the `planning/open-work/index.md` check, gated on
+//!   `GatedAction::RunDrain` and never invoked with a permissions bypass. Registration into
+//!   the workflow graph itself is a later task of this same block.
 //!
 //! **THIS BLOCK'S CENTRAL SCAR, restated because it is the reason [`drain`] exists at all:**
 //! the Python commander drained only its own inbox and reported "drained 0" for THIRTEEN
@@ -30,3 +32,4 @@
 pub mod drain;
 pub mod drain_log;
 pub mod emit_commit;
+pub mod triage;
