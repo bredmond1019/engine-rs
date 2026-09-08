@@ -78,7 +78,7 @@ alone — never by guessing at payload contents:
 
 ## The workflows
 
-Eighteen registered types, grouped by what you'd use them for. The registration list in
+Nineteen registered types, grouped by what you'd use them for. The registration list in
 `crates/engine-serve/src/workflows.rs` (`register_builtin_workflows`) is the source of truth; this
 table is a reader's copy.
 
@@ -123,6 +123,7 @@ table is a reader's copy.
 | Workflow | What it does | Detail |
 |---|---|---|
 | `CLAIM_REAFFIRM` | Re-checks every stale distilled D35 claim (`knowledge.md`/`memory.md`) against fresh corpus evidence via a queue-drain loop, and writes one reviewable markdown proposal report — never a write-back. | [claim-reaffirm.md](claim-reaffirm.md) |
+| `SWEEP` | The roadmap-status sweep, ported field-for-field from `scripts/roadmap_sweep.py`: snapshots fleet state, diffs it against the last sweep, and routes what changed (notify, wake a lane, or nothing) under a permission profile. Dispatchable, not scheduled — the Python script stays the oracle. | [sweep.md](sweep.md) |
 
 ## Where a workflow's prompts live
 

@@ -533,12 +533,15 @@ than inferring it from a green source-tree suite.
 Every chain runs under a `PermissionProfile` — a closed, three-level enum (`locked` \|
 `standard` \| `unrestricted`, wire-serialized snake_case) that grades what a step is allowed to do
 without an operator in the loop, defined alongside a closed `GatedAction` enum
-(`crates/engine-core/src/policy/permission.rs`) covering `ClearOperatorGate`,
-`InstallOnMini`, `PushToMain`, and `CrossRepoWrite`. `permission::decide(profile, action)` is a
+(`crates/engine-core/src/policy/permission.rs`) covering `ClearOperatorGate`, `InstallOnMini`,
+`PushToMain`, `CrossRepoWrite`, and — added for the `SWEEP` workflow's routing (`EN.15.E`) —
+`Notify`, `WakeLane`, and `RunDrain`. `permission::decide(profile, action)` is a
 pure grading matrix over those two enums; `ClearOperatorGate` is denied for every profile via an
 early return before the matrix is even consulted — no profile row can flip it, so an operator gate
 can never be cleared from inside a chain run, matching the Gate stage's rule above that only mev
-can clear one.
+can clear one. `Standard` permits `Notify` but denies `WakeLane`/`RunDrain`; `Unrestricted` permits
+all three; `Locked` denies all three — see the grading table in `permission.rs`'s own doc comment
+for the full six-action matrix.
 
 **Resolving the active profile.** `resolve_permission_profile` (and its config-only sibling
 `resolve_permission_profile_from_config`) reads the `[permission_profiles]` table from a repo's

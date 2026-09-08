@@ -41,6 +41,7 @@ pub mod recall;
 pub mod research_agent;
 pub mod sdlc_flow;
 pub mod sdlc_task;
+pub mod sweep;
 pub mod terminal_probe;
 pub mod transport_slot;
 

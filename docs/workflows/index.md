@@ -37,6 +37,7 @@ English, and how to trigger one. This page is just the file listing.
 | [opportunity-edit.md](opportunity-edit.md) | The `OPPORTUNITY_SET_STAGE` / `OPPORTUNITY_ADD_ACTION` micro-workflows — payloads, the seam operation, and the error surface |
 | [approve-and-run.md](approve-and-run.md) | The `APPROVE_AND_RUN` micro-workflow — draining pending records, resolving a verdict into a ledger row plus an authorized execution |
 | [terminal-probe.md](terminal-probe.md) | The `TERMINAL_PROBE` graph — the read-only session/observe diagnostic for the terminal stack |
+| [sweep.md](sweep.md) | The `SWEEP` workflow — the roadmap sweep ported field-for-field from `roadmap_sweep.py`, its single-node shape, and the permission-profile-gated routing |
 
 Docs for capabilities that are **not** workflows — the crate architecture, the CLI, the data
 contract, terminal internals, suspend/resume, the harvest gate — are one level up in
