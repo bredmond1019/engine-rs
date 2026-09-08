@@ -265,6 +265,13 @@ mod tests {
         // `^\s*pub(\(crate\))? fn .*(&str|: String)` on 2026-08-18.
         const SANCTIONED_STRING_TAKING_FNS: &[(&str, &[&str])] = &[
             ("chain.rs", &[]),
+            // `register`'s `roadmap: &str` and `heartbeat`'s `current_block: Option<&str>`
+            // are a coordination-record field and a block id passed straight through to
+            // `coord::write`'s existing `RegisterRequest`/`HeartbeatRequest` — corpus/coord
+            // identifiers, not a runner-name escape hatch (`EN.15.D` task 1). `new`'s
+            // `impl Into<String>` params and `lease`'s multi-line signature never land on a
+            // single `&str`/`: String` line, so the scan below never reaches them.
+            ("coord_lane.rs", &["register", "heartbeat"]),
             // No string-typed pub fn: `checkpoint_path`/`write_checkpoint`/
             // `read_checkpoint` take `&Path`/`Uuid`/`&Checkpoint`, never a
             // bare `&str` runner name.

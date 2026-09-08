@@ -1026,10 +1026,15 @@ pub fn register_recall(dispatcher: &mut Dispatcher) {
 /// choose between here. See `planning/EN.10.B/tasks.md`, Task 5.
 ///
 /// Delegates to [`register_orchestration_with_registry`] using whatever repo
-/// registry (EN.3.K) is currently installed via [`repo_registry`] and
-/// [`NeverHeld`](engine_core::workflows::orchestration::integrate::NeverHeld)
-/// as the hold source — see that function's doc for why `NeverHeld` is still
-/// the production default. **`EN.ticket.orchestration-production-gates-unwired`
+/// registry (EN.3.K) is currently installed via [`repo_registry`] and a
+/// [`QueueHoldSource`](engine_core::workflows::orchestration::coord_lane::QueueHoldSource) —
+/// `EN.15.D` task 3: production no longer registers with
+/// [`NeverHeld`](engine_core::workflows::orchestration::integrate::NeverHeld), a hold source
+/// that can never hold. `QueueHoldSource` answers `is_held` from the fleet's real shared
+/// coordination tree (an exclusive lease on `repo`, resolved lazily per call — see that
+/// struct's own doc for why it takes no lock-dir argument here), so an operator hold placed on
+/// this repo through the coordination layer is now actually observable by a Rust-driven chain.
+/// **`EN.ticket.orchestration-production-gates-unwired`
 /// Task 2: this is now the wired registration** — `graph::registry()`'s bare
 /// [`OrchestrationRunNode::new`](engine_core::workflows::orchestration::graph::OrchestrationRunNode::new)
 /// is no longer what production runs.
@@ -1037,7 +1042,7 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
     register_orchestration_with_registry(
         dispatcher,
         repo_registry(),
-        Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+        Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
     );
 }
 
@@ -1080,13 +1085,12 @@ pub fn register_orchestration(dispatcher: &mut Dispatcher) {
 /// names the repo and path [`CorpusGatesError`](engine_core::workflows::orchestration::corpus_gates::CorpusGatesError)
 /// carries.
 ///
-/// `hold_source` is a parameter rather than a hardcoded [`NeverHeld`]
-/// because no production `HoldSource` exists yet, and none can be written
-/// until there is a `(repo, block_id)`-keyed hold surface — the blocked-edge
-/// sink `engine-core` already reads (`operator/queue/source.rs`) is keyed by
-/// tmux session and host, not by block. [`register_orchestration`] still
-/// passes `NeverHeld` as its argument; that is a known, named gap, not an
-/// oversight.
+/// `hold_source` is a parameter rather than a hardcoded [`NeverHeld`] so tests can substitute
+/// a double (e.g. `AlwaysHeld`) without touching production wiring.
+/// **`EN.15.D` task 3:** [`register_orchestration`] no longer passes `NeverHeld` as its
+/// argument — it passes a
+/// [`QueueHoldSource`](engine_core::workflows::orchestration::coord_lane::QueueHoldSource),
+/// backed by the fleet's real shared coordination tree, closing the gap this doc used to name.
 ///
 /// `EN.ticket.orchestration-abort-and-progress` task 4: the factory also
 /// mints this run's `CancellationToken` and step-progress fan-out cell and
@@ -1140,6 +1144,19 @@ fn build_close_block_seam(
             );
         }
     })
+}
+
+/// The registry-nickname identity a Rust-driven chain registers,
+/// heartbeats, leases, and drains its inbox as
+/// (`EN.ticket.wire-coord-handle-into-orchestration-run-node`) —
+/// `<engine_core::build_info::WRITER>-<hostname>-<pid>`, unique per running
+/// process the same way `host_stamp()`'s other callers (e.g.
+/// `SdlcFlowState::to_committed_state_json`) already stamp process
+/// identity, so two Rust-driven chains on the same host never collide on
+/// one registry claim.
+fn coord_agent_identity() -> String {
+    let (hostname, pid) = engine_core::build_info::host_stamp();
+    format!("{}-{hostname}-{pid}", engine_core::build_info::WRITER)
 }
 
 pub fn register_orchestration_with_registry(
@@ -1288,6 +1305,7 @@ pub fn register_orchestration_with_registry(
                 .with_campaign_id(campaign_id)
                 .with_conductor(conductor_seam)
                 .with_close_block(close_block_seam)
+                .with_coord_agent(coord_agent_identity())
                 .with_resolve_depends_on(Arc::new(move |repo: &str, block_id: &str| {
                     let edges = depends_on_gates.resolve_depends_on(repo, block_id);
                     if let Some(err) = depends_on_gates.take_error() {
@@ -3666,10 +3684,13 @@ mod tests {
     fn register_orchestration_with_registry_dispatches_a_runnable_workflow() {
         let dir = orchestration_brain_root(open_block_state_json());
         let mut dispatcher = Dispatcher::new();
+        // `EN.15.D` task 3: exercises the same `QueueHoldSource` production now registers
+        // with, not `NeverHeld` — this is "the test" the block record names alongside the
+        // production `register_orchestration` site as the two places `NeverHeld` had to go.
         register_orchestration_with_registry(
             &mut dispatcher,
             None,
-            Arc::new(engine_core::workflows::orchestration::integrate::NeverHeld),
+            Arc::new(engine_core::workflows::orchestration::coord_lane::QueueHoldSource::new()),
         );
 
         let workflow = dispatcher

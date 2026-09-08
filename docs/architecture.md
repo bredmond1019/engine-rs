@@ -1031,6 +1031,20 @@ block.
   `spawn_durable_writer(Some(pool))` site) is out of this repo and still needs a companion
   `core/bastion`-side change. With no handle installed, the reader self-skips to an empty campaign
   and the sink drops the row, exactly as both did before this wiring.
+- Fleet coordination for a Rust-driven chain (`crates/engine-core/src/workflows/orchestration/
+  coord_lane.rs`, `EN.15.D` + `EN.ticket.wire-coord-handle-into-orchestration-run-node`) — `CoordHandle`
+  registers/heartbeats a lane-agent claim, takes/releases a per-block repo lease, and drains a
+  coordination inbox (quarantining a malformed message to `processing/` with a receipt) at each
+  `integrate_chain` block boundary. `OrchestrationRunNode::with_coord_agent(agent)` is the opt-in
+  seam that wires a real `CoordHandle` into `process` (`coord: None`, i.e. no coordination
+  footprint, remains the default on `OrchestrationRunNode::new()`); production registration
+  (`register_orchestration_with_registry`, `crates/engine-serve/src/workflows.rs`) sets it via
+  `coord_agent_identity()` (`<WRITER>-<hostname>-<pid>`), so a chain run through `bastion serve` now
+  shows up in `bastion coord status` and answers a sibling lane's `RENDEZVOUS`. `QueueHoldSource`
+  (same module) is a real `HoldSource` reading the coordination tree's own exclusive lease files,
+  now wired in place of the placeholder `NeverHeld` on both `register_orchestration` and
+  `register_orchestration_with_registry`. See [`workflows/orchestration.md`](workflows/orchestration.md)
+  § "Fleet coordination" for the full mechanics.
 - `TaskContext` — `{event, nodes: {<ClassName>: output}, metadata, node_runs: {<ClassName>: NodeRun}}`
   — the preserved data-contract shape (see `docs/data-contract.md`, pinned to canonical v1.1.0).
 - `NodeRun` — `status` (`pending|running|success|failed`), `started_at`/`completed_at`, `error`,

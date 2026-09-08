@@ -113,11 +113,12 @@ use crate::workflow::Workflow;
 
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
 use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome};
+use super::coord_lane::CoordHandle;
 use super::execute::{default_flow_runner, EngineKind, FlowRunner};
 use super::gates::{AdmissionGate, DependencyEdge};
 use super::integrate::{
-    integrate_chain, resolve_roadmap_dir, CloseBlockFn, HoldSource, JournalSinkFn, NeverHeld,
-    StepProgress,
+    integrate_chain_with_coord, resolve_roadmap_dir, CloseBlockFn, HoldSource, JournalSinkFn,
+    NeverHeld, StepProgress,
 };
 
 /// The registered workflow type string, used both to register the workflow
@@ -131,6 +132,14 @@ pub const NODE_NAME: &str = "OrchestrationRunNode";
 /// The `harness.json` section key this workflow's policy/profiles live
 /// under (`orchestration.policy` / `orchestration.profiles`).
 const WORKFLOW_KEY: &str = "orchestration";
+
+/// The clock seam a [`CoordHandle`] built in [`OrchestrationRunNode::process`]
+/// reads "now" through — see [`CoordHandle`]'s own module doc's "clock seam"
+/// section for why this must be a real RFC3339 timestamp, never a frozen
+/// literal.
+fn coord_now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
 
 // ── Policy ───────────────────────────────────────────────────────────────
 
@@ -676,6 +685,20 @@ pub struct OrchestrationRunNode {
     /// even constructed. Reached ONLY by the conductor branch above; an
     /// explicit or lane chain never touches it.
     journal_sink: Option<Arc<JournalSinkFn>>,
+    /// `EN.ticket.wire-coord-handle-into-orchestration-run-node`: the
+    /// registry-nickname identity a Rust-driven chain registers,
+    /// heartbeats, leases, and drains its inbox as, once this run's
+    /// [`CoordHandle`] is constructed in [`Self::process`] (`lock_dir`
+    /// from the event's own `brain_root`, `repo` from the resolved
+    /// chain's first step, `lane` from the resolved lane — falling back
+    /// to that same `repo`, matching the existing "single-repo lines
+    /// where `lane == repo`" convention right above `resolved_lane`).
+    /// `None` (the default, [`Self::new`]) is fully behavior-stable: no
+    /// [`CoordHandle`] is ever built, and `process` drives the chain
+    /// through [`integrate::integrate_chain_with_coord`] with `coord:
+    /// None` — byte-identical to the pre-task call through plain
+    /// [`integrate::integrate_chain`]. See [`Self::with_coord_agent`].
+    coord_agent: Option<String>,
 }
 
 impl fmt::Debug for OrchestrationRunNode {
@@ -707,6 +730,7 @@ impl OrchestrationRunNode {
             campaign_id: None,
             conductor: None,
             journal_sink: None,
+            coord_agent: None,
         }
     }
 
@@ -830,6 +854,21 @@ impl OrchestrationRunNode {
     #[must_use]
     pub fn with_journal_sink(mut self, journal_sink: Arc<JournalSinkFn>) -> Self {
         self.journal_sink = Some(journal_sink);
+        self
+    }
+
+    /// Enable fleet coordination for this run: `process` builds a real
+    /// [`CoordHandle`] (once the chain and lane are resolved) and drives
+    /// it through [`integrate::integrate_chain_with_coord`], so the chain
+    /// registers a lane-agent claim, heartbeats it, takes/releases the
+    /// block-scoped repo lease at every block boundary, and drains its own
+    /// inbox — see [`Self::new`]'s `coord_agent` field doc for exactly how
+    /// `repo`/`lane` are resolved. With no agent set (the default), no
+    /// handle is ever built and this run's coordination footprint is
+    /// unchanged from before this seam existed.
+    #[must_use]
+    pub fn with_coord_agent(mut self, agent: impl Into<String>) -> Self {
+        self.coord_agent = Some(agent.into());
         self
     }
 }
@@ -1047,6 +1086,31 @@ impl Node for OrchestrationRunNode {
         // cloned the same way — `Arc` clone, `Send + Sync + 'static`.
         let close_block = self.close_block.clone();
 
+        // `EN.ticket.wire-coord-handle-into-orchestration-run-node`: build
+        // the real `CoordHandle` for this run now that `chain` and
+        // `resolved_lane` are both known — `None` when no agent identity
+        // was ever wired via `with_coord_agent` (the default), which keeps
+        // `integrate_chain_with_coord` byte-identical to plain
+        // `integrate_chain` below. `repo` is the resolved chain's first
+        // step (a `CoordHandle` represents one lane driving one repo, per
+        // its own doc); `lane` falls back to that same `repo` for an
+        // explicit `blocks` chain, mirroring `resolved_lane`'s own
+        // "single-repo lines where `lane == repo`" convention above.
+        let coord: Option<CoordHandle> = self.coord_agent.as_ref().map(|agent| {
+            let repo = chain
+                .first()
+                .map(|step| step.repo.clone())
+                .unwrap_or_default();
+            let lane = resolved_lane.clone().unwrap_or_else(|| repo.clone());
+            CoordHandle::new(
+                crate::coord::resolve_lock_dir(&event.brain_root),
+                repo,
+                lane,
+                agent.clone(),
+                coord_now_iso,
+            )
+        });
+
         // `execute::FlowFuture` is deliberately not `Send` (see its own doc
         // comment: `Workflow::run`'s `OnProgress` callback is not `Send`),
         // so `integrate_chain`'s future is not `Send` either — but `Node`'s
@@ -1087,7 +1151,7 @@ impl Node for OrchestrationRunNode {
                     .map_err(|err| {
                         NodeError::new(format!("failed to start orchestration runtime: {err}"))
                     })?;
-                rt.block_on(integrate_chain(
+                rt.block_on(integrate_chain_with_coord(
                     &chain,
                     &move |repo, block_id| resolve_depends_on(repo, block_id),
                     &move |repo, block_id| is_edge_met(repo, block_id),
@@ -1122,6 +1186,12 @@ impl Node for OrchestrationRunNode {
                     // an un-injected `OrchestrationRunNode::new()` falls
                     // back to a no-op, exactly the pre-task-2 behavior.
                     close_block.as_ref(),
+                    // `EN.ticket.wire-coord-handle-into-orchestration-run-node`:
+                    // `None` here (the default, no `with_coord_agent` set)
+                    // is behavior-identical to the old plain
+                    // `integrate_chain` call this replaces — see the
+                    // `coord` binding's own doc above.
+                    coord.as_ref(),
                 ))
                 .map_err(|err| NodeError::new(err.to_string()))
             })
@@ -1773,6 +1843,64 @@ mod tests {
         assert_eq!(lines[1]["lane"], lines[1]["repo"]);
         assert_eq!(lines[0]["repo"], "repo-a");
         assert_eq!(lines[1]["repo"], "repo-b");
+    }
+
+    /// `EN.ticket.wire-coord-handle-into-orchestration-run-node`: this is
+    /// the production entry point's own regression for the review finding
+    /// that `CoordHandle`/`integrate_chain_with_coord` were shipped but
+    /// never reachable outside a test — with `with_coord_agent` wired (the
+    /// way `engine-serve`'s `register_orchestration_with_registry` now
+    /// wires it), a `process()` run through THIS node, not a direct
+    /// `integrate_chain_with_coord` call, leaves a registry claim and a
+    /// lease behind while it runs.
+    #[tokio::test]
+    async fn process_with_coord_agent_writes_a_registry_claim_and_a_lease() {
+        let dir = two_repo_brain_root();
+        write_done_state(&dir.path().join("repo-a"), "A.1");
+
+        let run_flow: FlowRunner = Arc::new(|invocation| {
+            Box::pin(async move {
+                Ok(TaskContext {
+                    event: json!({}),
+                    nodes: HashMap::new(),
+                    metadata: json!({ "ran": invocation.block_id }),
+                    node_runs: HashMap::new(),
+                })
+            })
+        });
+
+        let node = OrchestrationRunNode::new()
+            .with_run_flow(run_flow)
+            .with_coord_agent("engine-rs-test-1");
+        let ctx = base_ctx(json!({
+            "brain_root": dir.path(),
+            "blocks": [
+                { "repo": "repo-a", "block_id": "A.1" }
+            ],
+            "roadmap_slug": "my-roadmap",
+        }));
+
+        let out = node.process(ctx).await.expect("process should succeed");
+        assert_eq!(out.nodes[NODE_NAME]["steps_integrated"], 1);
+
+        let lock_dir = dir.path().join(".fleet-locks");
+        let registry_claim = lock_dir
+            .join("lane-agents")
+            .join("agent-engine-rs-test-1.json");
+        assert!(
+            registry_claim.exists(),
+            "expected a registry claim at {registry_claim:?} — process() never built a \
+             CoordHandle from with_coord_agent"
+        );
+        // The block-scoped lease is released by the time the chain
+        // finishes (`StepLeaseGuard`'s `Drop`) — its absence here is
+        // itself evidence a real lease was taken and released, not that
+        // none was ever taken.
+        let lease_file = lock_dir.join("leases").join("lease-repo-a.json");
+        assert!(
+            !lease_file.exists(),
+            "expected the lease to be released after a clean exit, found {lease_file:?}"
+        );
     }
 
     #[tokio::test]

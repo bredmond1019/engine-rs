@@ -61,10 +61,17 @@
 //!   `CommandRunner` convention `policy::emit_state::EmitStateNode` already
 //!   uses. Later tasks turn these into a slate-constrained, justified chain
 //!   proposal and journal write.
+//! - [`coord_lane`] (`EN.15.D` Task 1) — `CoordHandle`: the identifiers and
+//!   clock seam a Rust-driven chain needs to register a lane, heartbeat it,
+//!   and take/release the block-scoped repo lease through the existing
+//!   `coord::write` seam (`EN.15.C`). [`integrate`]'s
+//!   `integrate_chain_impl` calls it at the block boundaries; with no
+//!   handle at all (`coord: None`), the loop behaves exactly as before.
 
 pub mod chain;
 pub mod checkpoint;
 pub mod conductor;
+pub mod coord_lane;
 pub mod corpus_gates;
 pub mod debrief;
 pub mod dispatch;
