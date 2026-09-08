@@ -1256,6 +1256,31 @@ pub type StepObserverFn = dyn Fn(&StepProgress) + Send + Sync;
 /// additive over the pre-`EN.12.D` behavior.
 pub type JournalSinkFn = dyn Fn(engine_contract::JournalRow) + Send + Sync;
 
+/// A lifecycle transition a driven chain has reached (`EN.15.G` task 3) — fired around the
+/// whole [`integrate_chain_impl`] call so a caller can maintain a D57 run record
+/// (`notes.md`/`review.md`) whose `lifecycle:` frontmatter field self-heals: `Started` fires
+/// exactly once before any step is looked at, `Terminal` fires exactly once immediately
+/// before the call returns — `Ok` or `Err` alike, a bail included, since a bail still reaches
+/// this function's own return. A record rewritten to `Started` and never rewritten to
+/// `Terminal` is a run that was killed before it could return at all (`kill -9`, not a bail or
+/// a cancel) — exactly the shape `mev lanes` needs to report a dead run `degraded` rather than
+/// `live`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunRecordLifecycle {
+    Started,
+    Terminal,
+}
+
+/// An injected "maintain this chain's D57 run record" seam (`EN.15.G` task 3) — mirrors
+/// [`JournalSinkFn`]'s shape and rationale exactly: `engine-core` cannot depend on
+/// `engine-serve` (the crate that owns `render_notes_md`/`render_review_md` and does the
+/// actual file write), so the renderer is injected here rather than called directly.
+/// Production wiring (`engine_serve::journal`) hands this a closure that re-renders and
+/// rewrites `notes.md`/`review.md` on every call; tests substitute a closure that records
+/// into a `Vec`/`Mutex` instead. Reached only through [`integrate_chain_with_run_record`] —
+/// every other `integrate_chain*` entry point passes `None`, making this strictly additive.
+pub type RunRecordSinkFn = dyn Fn(RunRecordLifecycle) + Send + Sync;
+
 /// An injected "close this block in `planning/state.json`" seam
 /// (`EN.ticket.orchestration-close-block-node-not-wired` task 1) — called
 /// with `(repo, block_id)` exactly once per successfully-completed
@@ -1571,6 +1596,7 @@ pub async fn integrate_chain(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1629,6 +1655,7 @@ pub async fn integrate_chain_with_journal(
         Some(journal_sink),
         None,
         None,
+        None,
     )
     .await
 }
@@ -1684,6 +1711,7 @@ pub async fn integrate_chain_with_coord(
         None,
         None,
         coord,
+        None,
     )
     .await
 }
@@ -1745,6 +1773,66 @@ pub async fn integrate_chain_with_dispatch(
         journal_sink,
         Some(dispatcher),
         None,
+        None,
+    )
+    .await
+}
+
+/// Identical to [`integrate_chain_with_coord`], plus a [`RunRecordSinkFn`] fired at chain
+/// start and again at the terminal node (`EN.15.G` task 3) — the injection seam
+/// `engine-serve`'s `journal.rs` uses to keep a D57 run record's `lifecycle:` field
+/// self-healing across a kill mid-run. See [`RunRecordSinkFn`]'s own doc for why this is
+/// injected rather than `engine-core` calling `render_notes_md`/`render_review_md` directly.
+/// `run_record_sink: None` is behavior-identical to [`integrate_chain_with_coord`] itself.
+#[allow(clippy::too_many_arguments)]
+pub async fn integrate_chain_with_run_record(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    journal_sink: Option<&JournalSinkFn>,
+    coord: Option<&CoordHandle>,
+    run_record_sink: Option<&RunRecordSinkFn>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    integrate_chain_impl(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        journal_sink,
+        None,
+        coord,
+        run_record_sink,
     )
     .await
 }
@@ -1767,8 +1855,76 @@ impl Drop for StepLeaseGuard<'_> {
     }
 }
 
+/// `EN.15.G` task 3: thin lifecycle wrapper over [`integrate_chain_impl_inner`] — fires
+/// `run_record_sink`'s [`RunRecordLifecycle::Started`] before the real loop starts and
+/// [`RunRecordLifecycle::Terminal`] the instant it returns, `Ok` or `Err` alike. Kept
+/// separate from the loop itself (rather than threading the sink through every one of its
+/// many early-return paths) precisely so `Terminal` is guaranteed to fire on every return
+/// this function has — the only way to observe `Started` without a matching `Terminal` is
+/// for the process to die before this `async fn` ever resumes, which is the "killed mid-run"
+/// case the sink's own doc names.
 #[allow(clippy::too_many_arguments)]
 async fn integrate_chain_impl(
+    chain: &[ChainStep],
+    resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
+    is_edge_met: &dyn Fn(&str, &str) -> bool,
+    admission: &AdmissionGate,
+    hold_source: &dyn HoldSource,
+    poll_interval: Duration,
+    hold_deadline: Option<Duration>,
+    cancellation_token: Option<&crate::cancellation::CancellationToken>,
+    campaign_budget: Option<&Budget>,
+    resolve_engine: &dyn Fn(&str, &str) -> EngineKind,
+    registry: &RepoRegistry,
+    run_flow: &FlowRunner,
+    roadmap_dir: &Path,
+    lane: Option<&str>,
+    step_observer: &StepObserverFn,
+    default_use_worktree: bool,
+    default_auto_pr: bool,
+    campaign_id: uuid::Uuid,
+    close_block: &CloseBlockFn,
+    journal_sink: Option<&JournalSinkFn>,
+    dispatcher: Option<&Dispatcher>,
+    coord: Option<&CoordHandle>,
+    run_record_sink: Option<&RunRecordSinkFn>,
+) -> Result<Vec<ExecutionOutcome>, IntegrateError> {
+    if let Some(sink) = run_record_sink {
+        sink(RunRecordLifecycle::Started);
+    }
+    let result = integrate_chain_impl_inner(
+        chain,
+        resolve_depends_on,
+        is_edge_met,
+        admission,
+        hold_source,
+        poll_interval,
+        hold_deadline,
+        cancellation_token,
+        campaign_budget,
+        resolve_engine,
+        registry,
+        run_flow,
+        roadmap_dir,
+        lane,
+        step_observer,
+        default_use_worktree,
+        default_auto_pr,
+        campaign_id,
+        close_block,
+        journal_sink,
+        dispatcher,
+        coord,
+    )
+    .await;
+    if let Some(sink) = run_record_sink {
+        sink(RunRecordLifecycle::Terminal);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn integrate_chain_impl_inner(
     chain: &[ChainStep],
     resolve_depends_on: &dyn Fn(&str, &str) -> Vec<DependencyEdge>,
     is_edge_met: &dyn Fn(&str, &str) -> bool,
