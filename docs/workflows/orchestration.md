@@ -38,13 +38,13 @@ schema, registered with that same registry so `SetupWorktreeNode` resolves `even
 between steps.
 
 Claude Code sessions *do* happen — one layer down. `SDLC_FLOW`'s own model-bearing nodes
-(`ClaudeCodeStep` -> `claude_code_rs::execute`, per `D4`) spawn them for the implement, review and
+(`AgentCodeStep` -> `claude_code_rs::execute`, per `D4`) spawn them for the implement, review and
 docs stages. So the call stack is:
 
 ```
 ORCHESTRATION (Rust)
   └─ per block: SDLC_FLOW (Rust, fresh instance, cwd = that block's repo)
-       └─ per stage: ClaudeCodeStep -> a Claude Code session
+       └─ per stage: AgentCodeStep -> a Claude Code session
 ```
 
 Both layers read a repo's harness and `CLAUDE.md` from the **working directory**, which is why a

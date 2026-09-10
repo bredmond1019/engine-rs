@@ -80,7 +80,7 @@ Eight nodes: `WorkSourceNode`, `PostDraftNode`, `PostCandidateSelectNode`, `Bran
   Runs entirely over an injectable `CommandRunner` + file/dir-reader seam, so tests never touch a
   real git checkout. An empty or inverted date range (`since > until`) short-circuits before any
   seam is called.
-- **`PostDraftNode`** — a model node (`ClaudeCodeStep`) that proposes `candidate_count` post
+- **`PostDraftNode`** — a model node (`AgentCodeStep`) that proposes `candidate_count` post
   candidates from the gathered sources, carrying `business/docs/brand.md`'s voice constraints in
   the prompt. Enforces traceability twice: the prompt asks the model not to emit an empty-sources
   candidate, and `process()` additionally filters any that slip through. Also surfaces any

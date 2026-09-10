@@ -35,7 +35,7 @@ both the start node and the sole (terminal) node — there is no router.
 
 | Node | Kind | What it does |
 |---|---|---|
-| `IntakeExtractNode` | **Model** (Sonnet by default, tunable via policy; the only stage in this workflow, and the only one across `sdlc_flow`/`research_agent`/`diagnostic_intake` that is Local-eligible) | Wraps `ClaudeCodeStep` with **no** `WebSearch`/`WebFetch` tools (pure extraction) and a `DiagnosticIntake` `json_schema`. Resolves the run's `DiagnosticIntakePolicy`, applies `extract`-stage tier/prompt-cache/verbosity shaping, parses the reply into a `DiagnosticIntake`, stamps it + usage onto `ctx`, and persists `diagnostic-intake-state.json`. |
+| `IntakeExtractNode` | **Model** (Sonnet by default, tunable via policy; the only stage in this workflow, and the only one across `sdlc_flow`/`research_agent`/`diagnostic_intake` that is Local-eligible) | Wraps `AgentCodeStep` with **no** `WebSearch`/`WebFetch` tools (pure extraction) and a `DiagnosticIntake` `json_schema`. Resolves the run's `DiagnosticIntakePolicy`, applies `extract`-stage tier/prompt-cache/verbosity shaping, parses the reply into a `DiagnosticIntake`, stamps it + usage onto `ctx`, and persists `diagnostic-intake-state.json`. |
 
 ## Event schema (`DiagnosticIntakeEventSchema`)
 

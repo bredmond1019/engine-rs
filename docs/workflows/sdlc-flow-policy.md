@@ -241,7 +241,7 @@ inside every `SDLC_FLOW` run itself.
 ## Structured-output adoption
 
 Every cloud-side model node that expects a specific JSON reply shape sets `Config.json_schema`
-on its `claude_code_rs::Config` before calling `ClaudeCodeStep`/`execute()` — `GenerateTasksNode`
+on its `claude_code_rs::Config` before calling `AgentCodeStep`/`execute()` — `GenerateTasksNode`
 (`setup.rs`, `generated_tasks_schema()`), `ImplementTaskNode`, `TriageTaskNode`, and
 `ConsolidatedReviewNode`'s review call (`task_loop.rs`, `implement_output_schema()` /
 `triage_output_schema()` / `review_output_schema()`), and `PatchDocsNode` (`docs.rs`,
@@ -319,7 +319,7 @@ matters to `model_tier_used`.
   from `ctx.node_runs`, while the two cache channels are read from `ctx.nodes[<stage>]`. That split
   exists so the fix stayed non-breaking — widening `engine_contract::task_context::Usage` would be a
   D78 data-contract change requiring a version bump here plus re-pinned consumer views in
-  `orchestrator` and `bastion`. `ClaudeCodeStep` stamps them into the same free-form `ctx.nodes`
+  `orchestrator` and `bastion`. `AgentCodeStep` stamps them into the same free-form `ctx.nodes`
   object that already carries `cost_usd`/`model`/`transport`.
 - `model_tier_used` — per-stage tier actually **called**, not the resolved policy's intent (see
   below).
@@ -337,9 +337,9 @@ caller-supplied `model_tier_used` entry for that same stage. A stage that ran no
 simply has no observed entry, leaving the caller-supplied value, if any, as the only source for
 that key. Before `EN.ticket.wire-meta-transport-telemetry`, a node that only exposed the plain,
 non-meta `with_transport` seam would stamp a generic `"cloud"`-tier `TransportInfo` regardless of
-which transport actually ran (per `ClaudeCodeStep`'s doc comment); every `registry_for_policy`
+which transport actually ran (per `AgentCodeStep`'s doc comment); every `registry_for_policy`
 call site across `sdlc_flow`/`content_pipeline`/`proposal_generator`/`diagnostic_intake` (10 in
-total) now composes its `ClaudeCodeStep` via the shared `TransportSlot` and exposes
+total) now composes its `AgentCodeStep` via the shared `TransportSlot` and exposes
 `with_meta_transport`, so this generic-stamp caveat no longer applies to any wired Local-eligible
 stage.
 

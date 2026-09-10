@@ -56,8 +56,8 @@ engine-rs/
 │   │                         (ParallelNode fan-out/merge), validate.rs (WorkflowValidator graph
 │   │                         validator), cancellation.rs (CancellationToken, watch-backed,
 │   │                         + stamp_cancelled(), EN.2.B), budget.rs (Budget config + BudgetLedger
-│   │                         + pre-dispatch check() gate, EN.2.B), nodes/ (claude_code_step.rs —
-│   │                         ClaudeCodeStep, a reusable Node wrapping core/claude-code-rs's
+│   │                         + pre-dispatch check() gate, EN.2.B), nodes/ (agent_code_step.rs —
+│   │                         AgentCodeStep, a reusable Node wrapping core/claude-code-rs's
 │   │                         execute(), EN.2.A; now cancellation-aware via
 │   │                         with_cancellation_token(), EN.2.B; http_post.rs — the injectable
                          `HttpPost` trait seam + `reqwest`-backed live impl + `StubHttpPost` test
@@ -722,7 +722,7 @@ block.
   (tokens) plus an optional per-call `cost_usd`, folded in separately since `engine_contract::Usage`
   carries no cost field per the data contract. **EN.4.0:** `Workflow::run_with` now supplies that
   `cost_usd` itself — after each node completes, `node_cost_usd(&ctx, &identity)` (`workflow.rs`)
-  reads the node's own `ctx.nodes[identity]["cost_usd"]` (the same field shape `ClaudeCodeStep`
+  reads the node's own `ctx.nodes[identity]["cost_usd"]` (the same field shape `AgentCodeStep`
   writes, and that `policy::telemetry::total_cost_usd` reads for SDLC's cost-bearing stages) and
   folds it into `ledger.record(...)` alongside token usage, so `Budget::max_cost_usd` actually
   gates a run the same way `max_total_tokens` already did. A node with no `cost_usd` in its output
@@ -1051,7 +1051,7 @@ block.
   `input`, `usage` (`{input_tokens, output_tokens, model}` for LLM nodes). Stamped RUNNING →
   SUCCESS/FAILED by the framework-owned `node_context` envelope in `workflow.rs`, not by the node
   itself.
-- `ClaudeCodeStep` (`engine-core::nodes::claude_code_step`, EN.2.A) — a reusable `Node` that spawns
+- `AgentCodeStep` (`engine-core::nodes::agent_code_step`, EN.2.A) — a reusable `Node` that spawns
   a Claude Code session via `claude_code_rs::execute` and maps its `Outcome` into the node's
   `TaskContext::nodes` output (`{content, cost_usd, model, structured}` — `structured` is
   `outcome.structured_output`, the SDK's parsed JSON when the caller set `config.json_schema` and
@@ -1115,7 +1115,7 @@ block.
    `policy::telemetry::RunTelemetry` snapshot into `metadata.run_telemetry` (`EN.5.D`) — wall-clock,
    token/cost totals, review verdicts, and `model_tier_used` harvested from whatever identities
    `ctx.nodes` carries by that point. `model_tier_used` prefers each stage's **observed** transport
-   stamp (`ctx.nodes[stage]["transport"]["tier"]`, written by `ClaudeCodeStep`/
+   stamp (`ctx.nodes[stage]["transport"]["tier"]`, written by `AgentCodeStep`/
    `openai_compat_transport`'s tier-aware `MetaTransport` seam) over the resolved policy's intent,
    so a `local`-tier stage that silently fell back to cloud (endpoint unreachable) is reported as
    what actually ran, not what the policy asked for. **Four of this snapshot's fields —
