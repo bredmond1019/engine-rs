@@ -3249,6 +3249,7 @@ mod tests {
             "TERMINAL_PROBE",
             "RECALL",
             "ORCHESTRATION",
+            "HELD_SESSION",
             "DEBRIEF",
             "CLAIM_REAFFIRM",
             "SWEEP",
