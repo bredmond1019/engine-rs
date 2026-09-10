@@ -106,10 +106,12 @@ use serde_json::json;
 
 use crate::cancellation::{stamp_cancelled, CancellationToken};
 use crate::node::{Node, NodeError, NodeRegistry};
+use crate::nodes::terminal::HeldSessionNode;
 use crate::policy::{read_harness_policy_defaults_from, resolve_profile_from, PolicyConfigSource};
 use crate::repo_registry::RepoRegistry;
 use crate::schema::{NodeConfig, WorkflowSchema};
 use crate::workflow::Workflow;
+use term_core::driver::TerminalDriver;
 
 use super::chain::{resolve_explicit_chain, resolve_lane_chain, ChainStep};
 use super::conductor::{ConductorProposalError, DroppedCandidate, ProposalOutcome};
@@ -1429,6 +1431,81 @@ pub fn debrief_registry(
     let mut registry = NodeRegistry::new();
     registry.register(Box::new(node));
     registry
+}
+
+// ── `HELD_SESSION` workflow assembly (`EN.15.I` task 1) ─────────────────
+//
+// `HeldSessionNode` (`EN.10.A`) has ZERO production registrations before
+// this task — compiling was never evidence it ran (see the block record's
+// `notes`). Registered here as its own micro-workflow, mirroring
+// `DEBRIEF`'s shape exactly (above): a single node, both start and
+// terminal, under its own `workflow_type` string, so an `EN.12.E` dispatch
+// step — or a future orchestration-chain hold point — can name it. Wiring
+// this registry into `engine-serve`'s dispatcher alongside the
+// orchestration workflow (so a running `bastion serve` actually exposes
+// it) is task 2's job, following the same `register_debrief`-style
+// call-site convention; wiring the held session into the chain's own
+// "now waiting for a human" point is task 3's.
+
+/// `HELD_SESSION`'s registered workflow type string — the wire spelling an
+/// `EN.12.E` dispatch step's `block_id` would name, mirroring
+/// [`DEBRIEF_WORKFLOW_TYPE`]'s convention exactly.
+pub const HELD_SESSION_WORKFLOW_TYPE: &str = "HELD_SESSION";
+
+/// Build the declared `WorkflowSchema` for `HELD_SESSION`: a single node
+/// ([`HeldSessionNode`], keyed by its own `Node::name()` identity,
+/// `crate::nodes::terminal::held_session::NODE_NAME`), both start and
+/// terminal — mirrors [`debrief_schema`]'s micro-workflow shape.
+#[must_use]
+pub fn held_session_schema() -> WorkflowSchema {
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        crate::nodes::terminal::held_session::NODE_NAME.to_string(),
+        NodeConfig::new(crate::nodes::terminal::held_session::NODE_NAME, vec![]),
+    );
+    WorkflowSchema::new(
+        HELD_SESSION_WORKFLOW_TYPE,
+        crate::nodes::terminal::held_session::NODE_NAME,
+        nodes,
+    )
+}
+
+/// Build a fresh `NodeRegistry` for `HELD_SESSION`: one [`HeldSessionNode`]
+/// constructed against `driver`, registered under its default
+/// `Node::name()` identity — the first production registration this node
+/// has ever had. `driver` is threaded through rather than baked in here so
+/// a caller (a live `TerminalDriver` in production, a
+/// `term_core::driver::StubTerminalDriver` in a test) supplies its own,
+/// mirroring [`debrief_registry`]'s injected-seam convention.
+#[must_use]
+pub fn held_session_registry(driver: Arc<dyn TerminalDriver>) -> NodeRegistry {
+    let mut registry = NodeRegistry::new();
+    registry.register(Box::new(HeldSessionNode::new(driver)));
+    registry
+}
+
+/// Derive the tmux session name a held chain's human-attach point uses for
+/// `repo`/`lane`: exactly `lane-<repo>-<lane>`, so `bastion attach
+/// lane-<repo>-<lane>` can resolve a session from a lane name alone.
+///
+/// **Deliberately NOT**
+/// [`crate::nodes::terminal::identity::session_name_for`]'s
+/// `eng-<run_id>_<node_identity>` scheme — that function names the
+/// per-node scripted sessions `TerminalSessionNode`/`TerminalObserveNode`
+/// create and let lapse; a held session instead needs a name an operator
+/// (or `bastion attach`) can predict from the lane alone, without knowing
+/// this run's `run_id`.
+///
+/// `repo`/`lane` are exactly the two fields
+/// [`OrchestrationRunNode::process`] already resolves to build this run's
+/// [`CoordHandle`] (`chain.first()`'s own `repo`; `lane` falling back to
+/// that same `repo` for an explicit `blocks` chain with no
+/// `roadmap`+`lane` pair, mirroring `resolved_lane`'s own "single-repo
+/// lines where `lane == repo`" convention) — callers should derive their
+/// arguments the identical way rather than inventing a second convention.
+#[must_use]
+pub fn held_session_name(repo: &str, lane: &str) -> String {
+    format!("lane-{repo}-{lane}")
 }
 
 #[cfg(test)]
@@ -2816,5 +2893,88 @@ mod tests {
             .iter()
             .all(|s| s.kind == super::super::chain::StepKind::Block));
         assert!(steps.iter().all(|s| s.block_id != DEBRIEF_WORKFLOW_TYPE));
+    }
+
+    // ── `HELD_SESSION` workflow assembly (`EN.15.I` task 1) ──────────────
+
+    #[test]
+    fn held_session_schema_declares_the_held_session_workflow_type_and_single_node() {
+        let schema = held_session_schema();
+        assert_eq!(schema.workflow_type, HELD_SESSION_WORKFLOW_TYPE);
+        assert_eq!(HELD_SESSION_WORKFLOW_TYPE, "HELD_SESSION");
+        assert_eq!(
+            schema.start_node,
+            crate::nodes::terminal::held_session::NODE_NAME
+        );
+        assert_eq!(schema.nodes.len(), 1);
+    }
+
+    /// AC1: `HeldSessionNode` has at least one production registration —
+    /// verified by NAME (`registry.contains(...)`), not merely by this
+    /// module compiling. Before this task the node had zero registrations
+    /// anywhere (see its own module doc).
+    #[test]
+    fn held_session_registry_contains_the_node_by_name() {
+        let driver = Arc::new(term_core::driver::StubTerminalDriver::new());
+        let registry = held_session_registry(driver);
+        assert!(registry.contains(crate::nodes::terminal::held_session::NODE_NAME));
+        assert_eq!(registry.len(), 1);
+    }
+
+    /// A `held_session_registry` + `held_session_schema` pair builds a
+    /// runnable, validated `Workflow` — mirroring
+    /// `register_orchestration_with_registry_dispatches_a_runnable_workflow`'s
+    /// own "not just declared, actually assemblable" check for `DEBRIEF`.
+    #[test]
+    fn held_session_workflow_assembles_and_validates() {
+        let driver = Arc::new(term_core::driver::StubTerminalDriver::new());
+        let registry = held_session_registry(driver);
+        let _workflow = Workflow::new_validated(registry, held_session_schema())
+            .expect("HELD_SESSION declared graph must pass WorkflowValidator::validate");
+    }
+
+    /// AC4 (naming half): session names for a held chain follow
+    /// `lane-<repo>-<lane>` exactly, derived from a sample
+    /// `OrchestrationEventSchema`-shaped chain the same way
+    /// `OrchestrationRunNode::process` already derives its `CoordHandle`'s
+    /// `repo`/`lane` (`chain.first()`'s own `repo`; `resolved_lane` falling
+    /// back to that same `repo`) — not asserted by inspection.
+    #[test]
+    fn held_session_name_follows_lane_repo_lane_exactly_for_a_resolved_roadmap_lane_chain() {
+        // Mirrors a real ORCHESTRATION event: no explicit `blocks`, a
+        // `roadmap`+`lane` pair instead, resolved into a chain whose first
+        // step's `repo` is what `process` feeds `CoordHandle::new` today.
+        let event = OrchestrationEventSchema {
+            brain_root: PathBuf::from("/tmp/brain"),
+            roadmap: Some("coordination-layer-port".to_string()),
+            lane: Some("lane-1".to_string()),
+            blocks: None,
+            roadmap_slug: None,
+            policy: None,
+            profile: None,
+            campaign_id: None,
+        };
+        let chain = resolve_explicit_chain(vec![("engine-rs".to_string(), "EN.15.I".to_string())]);
+        let repo = chain.first().map(|step| step.repo.clone()).unwrap();
+        let lane = event.lane.clone().unwrap_or_else(|| repo.clone());
+
+        assert_eq!(held_session_name(&repo, &lane), "lane-engine-rs-lane-1");
+    }
+
+    /// AC4 (fallback half): an explicit `blocks` chain has no `roadmap`+
+    /// `lane` pair to resolve a lane from — `resolved_lane` falls back to
+    /// the chain's own `repo` (the same "single-repo lines where `lane ==
+    /// repo`" convention `OrchestrationRunNode::process` already documents
+    /// for `CoordHandle`), so the held-session name degrades to
+    /// `lane-<repo>-<repo>` rather than panicking or inventing a third
+    /// scheme.
+    #[test]
+    fn held_session_name_falls_back_to_repo_as_lane_for_an_explicit_blocks_chain() {
+        let chain = resolve_explicit_chain(vec![("bastion".to_string(), "BA.1.A".to_string())]);
+        let repo = chain.first().map(|step| step.repo.clone()).unwrap();
+        let resolved_lane: Option<String> = None;
+        let lane = resolved_lane.unwrap_or_else(|| repo.clone());
+
+        assert_eq!(held_session_name(&repo, &lane), "lane-bastion-bastion");
     }
 }
