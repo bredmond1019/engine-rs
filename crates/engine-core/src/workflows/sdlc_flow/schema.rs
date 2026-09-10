@@ -1077,16 +1077,20 @@ impl TerminalSignal {
 }
 
 /// Derive the D31 committed-state `status` string
-/// (`"running"|"review"|"docs"|"wrapup"|"blocked"|"done"|"reconcile_failed"`)
+/// (`"running"|"review"|"docs"|"wrapup"|"blocked"|"done"|"reconcile_failed"|"criteria_refused"`)
 /// from a state snapshot and an optional [`TerminalSignal`].
 ///
 /// A `Some(TerminalSignal::ReconcileFailed(_))` yields `"reconcile_failed"`
 /// (base-template D56 CALL 2) — only SDLC_TASK's reconcile gate produces
-/// this variant. Every other `Some` terminal signal yields `"blocked"` — the
-/// one other real terminal-failure value this engine ever writes (there is
-/// no `"bailed"` anywhere in the codebase; see `run-sdlc-flow.sh`). Absent a
-/// terminal signal, every task reaching `Done`/`Skipped` yields `"done"`;
-/// anything else yields `"running"`.
+/// this variant. A `Some(TerminalSignal::EndReviewFail(_))` yields
+/// `"criteria_refused"` (base-template D86) — a post-completion
+/// acceptance-criteria refusal under `ReviewMode::EndOnly` is materially
+/// different from a mid-run bail and gets its own status rather than
+/// collapsing into `"blocked"`. Every other `Some` terminal signal yields
+/// `"blocked"` — the one other real terminal-failure value this engine ever
+/// writes (there is no `"bailed"` anywhere in the codebase; see
+/// `run-sdlc-flow.sh`). Absent a terminal signal, every task reaching
+/// `Done`/`Skipped` yields `"done"`; anything else yields `"running"`.
 ///
 /// `"review"`/`"docs"`/`"wrapup"` are base-template JS-engine-only
 /// intermediate-phase markers: that engine writes committed state at each of
@@ -1104,6 +1108,9 @@ pub fn derive_committed_status(
 ) -> &'static str {
     if let Some(TerminalSignal::ReconcileFailed(_)) = terminal_signal {
         return "reconcile_failed";
+    }
+    if let Some(TerminalSignal::EndReviewFail(_)) = terminal_signal {
+        return "criteria_refused";
     }
     if terminal_signal.is_some() {
         return "blocked";
@@ -2179,7 +2186,6 @@ mod tests {
             TerminalSignal::ReviewFail("review FAIL, 0 issues".to_string()),
             TerminalSignal::StructuralFail("review PARTIAL, 12 issues".to_string()),
             TerminalSignal::FinalValidationFailed("cargo clippy".to_string()),
-            TerminalSignal::EndReviewFail("criterion X not met".to_string()),
         ] {
             assert_eq!(derive_committed_status(&state, Some(&signal)), "blocked");
         }
@@ -2198,6 +2204,17 @@ mod tests {
         assert_eq!(
             derive_committed_status(&state, Some(&reconcile_signal)),
             "reconcile_failed"
+        );
+
+        // `EndReviewFail` is likewise not "blocked" — it maps to its own
+        // "criteria_refused" status (base-template D86): a post-completion
+        // acceptance-criteria refusal under `ReviewMode::EndOnly`, distinct
+        // from a mid-run bail.
+        let end_review_fail_signal =
+            TerminalSignal::EndReviewFail("criterion X not met".to_string());
+        assert_eq!(
+            derive_committed_status(&state, Some(&end_review_fail_signal)),
+            "criteria_refused"
         );
     }
 
