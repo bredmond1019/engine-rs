@@ -329,8 +329,18 @@ mod tests {
             // campaign `Uuid` from an event's optional `campaign_id` string field —
             // exposed so `engine-serve`'s factory can resolve the SAME id up front
             // and register it for campaign-scoped abort. A UUID parse, not a runner
-            // selector.
-            ("graph.rs", &["profile_by_name", "resolve_campaign_id"]),
+            // selector. `held_session_name` (`EN.15.I` task 1) composes a
+            // `lane-<repo>-<lane>` session-name string from a resolved `repo`/`lane`
+            // pair for a HELD-UNTIL token — a session-name composition utility, not a
+            // runner-selection entry point.
+            (
+                "graph.rs",
+                &[
+                    "profile_by_name",
+                    "resolve_campaign_id",
+                    "held_session_name",
+                ],
+            ),
             // `resolve_roadmap_dir` resolves a roadmap slug to its planning directory —
             // a path lookup, not a runner. `closed`/`bailed`/`cancelled`/`budget_halted`
             // are `LaneLogEntry` constructors taking a `lane: &str` and a

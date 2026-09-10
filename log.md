@@ -16,6 +16,70 @@ related: [status, context]
 
 ## [run: 2026-09-10]
 
+`/sdlc-flow` on branch `EN.15.I-flow` completed all 3 tasks, PASS review — `EN.15.I` is closed.
+`HeldSessionNode` is registered in production as its own `HELD_SESSION` micro-workflow in
+`graph.rs` (schema+registry, mirroring `DEBRIEF`), with `held_session_name(repo, lane) ->
+"lane-<repo>-<lane>"` giving `bastion attach` a resolvable session name. `engine-serve` now
+registers `HELD_SESSION` (`register_held_session`) against a live `TmuxDriver`, pulling `term-core`
+in as a direct dependency. Task 3's fix pass closed out a prior bail: `held_session_name` was
+missing from `engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` allowlist (a one-line addition) and
+`HELD_SESSION` was missing from `engine-serve`'s `register_builtin_workflows_registers_every_known_workflow_type`
+expected list — both fixed, turning the guard tests green. `tests/it/escalate.rs` gained adversarial
+real-tmux coverage: attaching pauses sends, killing the tmux server is classified as `session_lost`
+(discovered empirically that killing the whole server surfaces through `LeaseLost`/"no tmux server
+running", not `ExternallyKilled`, so the classifier matches both), and a real `tmux -C`
+control-mode client proves `#{session_attached}` genuinely counts. Full harness suite green (fmt,
+clippy `-D warnings`, nextest --workspace --all-features, release build). `docs/terminal-crates.md`
+updated. Next: `EN.15.J` — a chain raises an operator gate it cannot clear.
+
+```
+c159b45 docs: update docs for EN.15.I
+9dbf3b8 fix: implement EN.15.I-task3
+104dea1 chore: wrap up EN.15.I
+047dce4 fix: fix pass 1 for EN.15.I-task3
+c5e7449 feat: implement EN.15.I-task3
+5247999 feat: implement EN.15.I-task2
+9afd164 feat: implement EN.15.I-task1
+ab0bd0a docs: log EN.16.A + quiesce-test close-out session
+```
+
+## [run: 2026-09-10]
+
+`/sdlc-flow` on branch `EN.15.I-flow` ran tasks 1-3, BAILED at task 3. Task 1 registered
+`HeldSessionNode` as its own HELD_SESSION micro-workflow in `graph.rs` (schema+registry, mirroring
+DEBRIEF) and added `held_session_name(repo, lane) -> "lane-<repo>-<lane>"`. Task 2 wired
+`engine-serve` to register HELD_SESSION (`register_held_session`) against a live `TmuxDriver`,
+adding `term-core` as a direct `engine-serve` dependency. Task 3 built out the real-tmux escalate
+coverage (`tests/it/escalate.rs`) and, on its fix pass, added `held_session_name` to
+`engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` allowlist — a one-line, well-understood fix that
+makes the guard test pass — but the run BAILED anyway: `engine_kind.rs` is not in task 3's declared
+`files[]` (`escalate.rs`, `graph.rs`), so the work assertion refused to confirm the fix as in-scope.
+The allowlist gap was left by task 1 (which added `held_session_name` without registering it), and
+closing it requires editing a file task 3's own spec scope excludes — no bounded retry within scope
+can pass the terminal work assertion. Needs re-scoping (add `engine_kind.rs` to task 3's `files[]`,
+or fold the allowlist fix into task 1) rather than another retry. A second, unrelated pre-existing
+gap in `crates/engine-serve/src/workflows.rs` (from task 2 — HELD_SESSION registered but missing
+from `register_builtin_workflows_registers_every_known_workflow_type`'s hardcoded `expected` list)
+also still blocks the full `cargo nextest run --workspace --all-features` gate and is likewise out
+of task 3's scope.
+
+Next: re-scope EN.15.I's task 3 `files[]` to include `engine_kind.rs` (or move the allowlist fix
+into task 1's scope), and separately fix `crates/engine-serve/src/workflows.rs`'s stale `expected`
+workflow-type list before re-running `/sdlc-flow`.
+
+```
+047dce4 fix: fix pass 1 for EN.15.I-task3
+c5e7449 feat: implement EN.15.I-task3
+5247999 feat: implement EN.15.I-task2
+9afd164 feat: implement EN.15.I-task1
+ab0bd0a docs: log EN.16.A + quiesce-test close-out session
+4f36ab0 docs: rename ClaudeCodeStep -> AgentCodeStep in living reference docs (EN.16.A follow-up)
+d608ce3 feat: implement EN.16.A-task1 (content)
+9126068 feat: implement EN.16.A-task1
+```
+
+## [run: 2026-09-10]
+
 ### Closed EN.16.A + the quiesce-test hermeticity fix; docs re-synced; /close-out run
 - **What:** Two per-block `/begin-orchestration` sessions closed
   `EN.ticket.coord-quiesce-test-is-environment-dependent-and-now-red` (made `coord::write`'s test
