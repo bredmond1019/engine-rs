@@ -29,6 +29,17 @@ use crate::policy::permission::{self, Decision, GatedAction, PermissionProfile};
 
 use super::chain::ChainStep;
 
+/// The production `author_operator_edge` seam [`check_permission_gate`] takes — a
+/// real caller builds this from an [`OperatorEdgeAuthorConfig`] and passes the result
+/// straight through, with no test-stub closure of its own. `EN.15.J` Task 1 built the
+/// implementation in [`operator_edge`](super::operator_edge); this re-export is the
+/// public path a chain caller actually uses to reach it, following this file's own
+/// `pub use`/`pub fn` surface rather than a bespoke wrapper. Re-exporting does not
+/// pull in any reference to mev's gate-closing verb — see
+/// `gates_rs_never_references_the_gate_closing_verb` below, which still passes
+/// unmodified.
+pub use super::operator_edge::{make_author_operator_edge, OperatorEdgeAuthorConfig};
+
 // ── Dependency gate ─────────────────────────────────────────────────────
 
 /// One `depends_on` edge a block declares. Widened (`EN.11.J` Task 1) beyond the
