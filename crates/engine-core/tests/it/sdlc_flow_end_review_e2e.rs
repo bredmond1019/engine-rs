@@ -551,11 +551,12 @@ async fn trivial_skip_full_run_makes_zero_end_review_calls() {
 }
 
 /// Verdict test: a FAIL from the end review reaches `WrapUpNode` (never
-/// `PatchDocsNode`) with a blocked terminal status whose `bail_reason`
-/// names the unmet criteria, driven through the real assembled graph
-/// rather than `WrapUpNode::process` in isolation.
+/// `PatchDocsNode`) with the `criteria_refused` terminal status
+/// (base-template D86) whose `bail_reason` names the unmet criteria,
+/// driven through the real assembled graph rather than
+/// `WrapUpNode::process` in isolation.
 #[tokio::test]
-async fn end_only_fail_verdict_routes_to_wrap_up_with_blocked_status_and_bail_reason() {
+async fn end_only_fail_verdict_routes_to_wrap_up_with_criteria_refused_status_and_bail_reason() {
     let worktree = temp_worktree("end-only-fail");
     write_fixture_files(&worktree, 3);
 
@@ -600,7 +601,7 @@ async fn end_only_fail_verdict_routes_to_wrap_up_with_blocked_status_and_bail_re
     );
 
     let state = read_state(&worktree);
-    assert_eq!(state["status"], json!("blocked"));
+    assert_eq!(state["status"], json!("criteria_refused"));
     let bail_reason = state["bail_reason"]
         .as_str()
         .expect("bail_reason should be populated");

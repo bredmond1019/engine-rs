@@ -1,17 +1,17 @@
 //! `TransportSlot` — the plain-or-meta transport override shared by every
-//! model node under `workflows/` that composes a `ClaudeCodeStep`
+//! model node under `workflows/` that composes a `AgentCodeStep`
 //! (`EN.ticket.wire-meta-transport-telemetry` task 1).
 //!
 //! All 10 local-eligible nodes rewired by each workflow's
 //! `registry_for_policy` are structurally identical in exactly the respect
 //! that matters here: one `Option<ModelTransport>` field, one
 //! `with_transport` builder that assigns it, and one short conditional
-//! forward into a freshly-constructed `ClaudeCodeStep` inside `process`.
-//! `ClaudeCodeStep` itself already distinguishes a plain [`ModelTransport`]
+//! forward into a freshly-constructed `AgentCodeStep` inside `process`.
+//! `AgentCodeStep` itself already distinguishes a plain [`ModelTransport`]
 //! (which can't report what it actually called, so `process` stamps a
 //! generic `"cloud"`-tier `TransportInfo`) from a [`MetaTransport`] (which
 //! reports its own [`TransportInfo`] and takes precedence when both are
-//! set) — see `nodes/claude_code_step.rs:158-190`. `TransportSlot` holds
+//! set) — see `nodes/agent_code_step.rs:158-190`. `TransportSlot` holds
 //! both halves of that pair once so no node needs to duplicate the builder
 //! pair and forward logic itself.
 //!
@@ -20,14 +20,14 @@
 //! under `workflows/` — putting it in `nodes/` would make the lower layer
 //! depend on the higher one for no benefit.
 
-use crate::nodes::claude_code_step::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::agent_code_step::{AgentCodeStep, MetaTransport};
 
 use super::ModelTransport;
 
 /// Holds an optional plain [`ModelTransport`] and an optional
-/// [`MetaTransport`] override for a node that composes a `ClaudeCodeStep`.
+/// [`MetaTransport`] override for a node that composes a `AgentCodeStep`.
 /// [`Self::apply`] forwards whichever is set onto the step, with `meta`
-/// taking precedence — matching `ClaudeCodeStep::with_meta_transport`'s own
+/// taking precedence — matching `AgentCodeStep::with_meta_transport`'s own
 /// documented precedence over `with_transport`.
 #[derive(Clone, Default)]
 pub struct TransportSlot {
@@ -49,7 +49,7 @@ impl TransportSlot {
     /// Apply whichever override is set to `step`, meta winning when both
     /// are set. Neither set leaves `step` unchanged.
     #[must_use]
-    pub fn apply(&self, step: ClaudeCodeStep) -> ClaudeCodeStep {
+    pub fn apply(&self, step: AgentCodeStep) -> AgentCodeStep {
         if let Some(meta) = &self.meta {
             let meta = meta.clone();
             return step.with_meta_transport(move |config, prompt| (meta)(config, prompt));
@@ -65,7 +65,7 @@ impl TransportSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nodes::claude_code_step::TransportInfo;
+    use crate::nodes::agent_code_step::TransportInfo;
     use claude_code_rs::{Config, Outcome};
     use engine_contract::TaskContext;
     use futures::future::BoxFuture;
@@ -111,8 +111,8 @@ mod tests {
         })
     }
 
-    fn make_step() -> ClaudeCodeStep {
-        ClaudeCodeStep::new("TransportSlotTest", Config::default(), "prompt")
+    fn make_step() -> AgentCodeStep {
+        AgentCodeStep::new("TransportSlotTest", Config::default(), "prompt")
     }
 
     fn empty_context() -> TaskContext {
@@ -124,7 +124,7 @@ mod tests {
         }
     }
 
-    async fn run_step(step: ClaudeCodeStep) -> TaskContext {
+    async fn run_step(step: AgentCodeStep) -> TaskContext {
         use crate::node::Node;
         step.process(empty_context())
             .await
@@ -165,7 +165,7 @@ mod tests {
             .get("TransportSlotTest")
             .and_then(|value| value.get("transport"))
             .expect("transport stamp present");
-        // A plain transport can't report its own tier, so ClaudeCodeStep
+        // A plain transport can't report its own tier, so AgentCodeStep
         // falls back to a generic "cloud" stamp — this is the exact
         // behavior this ticket exists to move nodes off of, and is asserted
         // here only to pin TransportSlot's plain-only forwarding behavior.

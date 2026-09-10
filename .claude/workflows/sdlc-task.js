@@ -438,7 +438,7 @@ import json
 d = json.load(open('${tasksJsonPath}'))
 t = [x for x in d if x.get('task_id') == ${taskNum}]
 print(chr(10).join(t[0].get('files', []) if t else []))
-"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi`
+"); WA_MATCH=0; WA_BADDEL=""; while IFS=$'\t' read -r WA_ST WA_P1 WA_P2; do WA_CHK="$WA_P1"; case "$WA_ST" in R*) WA_CHK="$WA_P2" ;; esac; if printf '%s\n' "$WA_DECLARED" | grep -qFx "$WA_CHK"; then WA_MATCH=1; else case "$WA_ST" in D*) WA_BADDEL="$WA_CHK" ;; esac; fi; done <<< "$NAME_STATUS"; if [ -z "$WA_DECLARED" ]; then WA_MATCH=1; fi; if [ "$WA_MATCH" -eq 0 ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit's changed paths do not intersect declared files[] (condition 2) - declared: [$WA_DECLARED] - changed: [$NAME_STATUS]"; exit 1; fi; if [ -n "$WA_BADDEL" ]; then echo "WORK_ASSERTION_ABORT: task ${taskNum} commit deletes undeclared file '$WA_BADDEL' not present in files[] (condition 3) - declared: [$WA_DECLARED]"; exit 1; fi`
 }
 // <</shared:renderWorkAssertion>>
 
@@ -578,19 +578,31 @@ PYEOF`
 // exactly as before. Rewriting emit-state's own worktree-deferral behavior is out of scope for this
 // ticket; this decision only says which route THIS script takes.
 //
-// mev ABSENT, or this repo unregistered in brain.toml (no repo slug resolves), MUST DEGRADE, NEVER
-// BAIL: these engines ship to 18+ downstream repos with no brain.toml and no `mev` on PATH (D5,
-// standing rule 1: mechanism, never stack defaults). Both of those cases fall back to the identical
-// validated hand-edit the worktree case uses -- see the adjacent `emit-state` call site's identical
-// contract.
+// Repo UNREGISTERED in brain.toml (no repo slug resolves) but mev IS on PATH still DEGRADES, NEVER
+// BAILS: falls to the same validated hand-edit the worktree case uses (validated via
+// `mev validate-brain --state` before/after diagnostics -- see the adjacent `emit-state` call
+// site's identical contract).
+//
+// mev ABSENT is different (D86 / BT.ticket.sdlc-state-status-vocabulary task 3): this fallback
+// used to silently write an UNVALIDATED status straight into state.json's JSON whenever `mev`
+// could not be found on PATH, with no signal beyond an easily-missed "UNVALIDATED:" output line --
+// bypassing `mev set-block-status`'s validation at the moment of write entirely. It now REFUSES
+// instead of writing: "FLIP_REFUSED: <id>" followed by "MEV_OUTPUT: <line>" (exit 1) -- the SAME
+// refusal contract the deterministic path above already uses for a failed `mev set-block-status`
+// call, so a caller that already handles that contract needs no new branch. These engines still
+// ship to downstream repos with no `mev` on PATH (D5, standing rule 1: mechanism, never stack
+// defaults); a block closed through this fallback route in such a repo now requires installing
+// `mev` rather than landing an unvalidated write.
 //
 // Machine-readable result lines a caller's bookkeep prompt copies verbatim, never re-derives:
 //   deterministic path  -- "FLIPPED: <repo>:<id>" (exit 0) or "FLIP_REFUSED: <repo>:<id>" followed
 //                          by "MEV_OUTPUT: <line>" lines (exit 1) -- both read from mev's own exit
 //                          code, never from mev's stdout wording.
-//   hand-edit fallback  -- unchanged from before this ticket: "NOT_FOUND" (exit 0), "FLIPPED:<id>"
-//                          with an optional "UNVALIDATED:" line (exit 0), or "REJECTED:<id>" with
-//                          "NET_NEW:" lines (exit 1).
+//   hand-edit fallback  -- "NOT_FOUND" (exit 0); "FLIPPED:<id>" (exit 0, mev on PATH: validated via
+//                          `mev validate-brain --state` before/after diagnostics); "REJECTED:<id>"
+//                          with "NET_NEW:" lines (exit 1, net-new validate-brain errors); or, when
+//                          `mev` is not on PATH, "FLIP_REFUSED:<id>" with "MEV_OUTPUT:" lines
+//                          (exit 1, D86 -- no more silent unvalidated write).
 //
 // `indent` exists only because the two prompts nest it at different depths.
 async function renderStateFlipScript({ runRoot, indent, runningInWorktree = false }) {
@@ -654,12 +666,9 @@ def diagnostics():
     return set(l for l in lines if l.strip().startswith('[E_') or l.strip().startswith('[W_'))
 
 if not mev_available:
-    with open(path, 'w') as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-        fh.write(chr(10))
-    print('FLIPPED:' + bid)
-    print('UNVALIDATED: mev not on PATH -- schema check skipped, write landed with only json.load-level parsing')
-    sys.exit(0)
+    print('FLIP_REFUSED:' + bid)
+    print('MEV_OUTPUT: mev is not on PATH -- refusing to write an unvalidated status directly into state.json (D86). Install mev and re-run, or close this block by hand with a reviewed \`mev set-block-status\` once mev is available.')
+    sys.exit(1)
 
 baseline = diagnostics()
 
@@ -1232,7 +1241,7 @@ const BOOKKEEP_SCHEMA = {
     statusWriteRejected: { type: 'boolean', description: 'true if the planning/status.md mutation introduced net-new corpus errors and was rolled back byte-exact; status.md on disk is unchanged from before this step ran' },
     tasksMarked:        { type: 'boolean', description: 'true if tasks.md task markers were updated' },
     blockStatusFlipped: { type: 'string', description: 'the state.json tracks[].blocks[].id whose flip to "closed" was reported by `mev set-block-status`\'s own exit code (deterministic route) or by the degraded hand-edit fallback, transcribed from the flip script\'s stdout — never agent-authored; "" if none (partial run, no state.json, block not found, `mev set-block-status` refused via FLIP_REFUSED, or the fallback write was rejected by validation)' },
-    stateWriteValidated: { type: 'boolean', description: 'true when the deterministic `mev set-block-status --write` route ran and reported FLIPPED (mev\'s own exit code validated the write), or when the fallback hand-edit passed `mev validate-brain --state` (before/after diff, net-new only); false when the fallback wrote with only json.load-level parsing because mev was unavailable — a degrade, not a pass' },
+    stateWriteValidated: { type: 'boolean', description: 'true when the deterministic `mev set-block-status --write` route ran and reported FLIPPED (mev\'s own exit code validated the write), or when the fallback hand-edit passed `mev validate-brain --state` (before/after diff, net-new only); false otherwise — since D86 no route writes an unvalidated status (mev absent makes the fallback refuse via FLIP_REFUSED instead of writing)' },
     stateWriteRejected: { type: 'boolean', description: 'true if the state.json mutation introduced net-new schema errors and was rolled back byte-exact; the block was NOT flipped to closed this run' },
     emitStateRan:       { type: 'boolean', description: 'true if mev emit-state --write ran successfully (false when skipped: worktree mode or mev/brain.toml absent)' },
     postEmitHookRan:    { type: 'boolean', description: 'true if planning/harness.json\'s postEmitCommitCommand was configured AND invoked this run (in-place only, and only when emitStateRan is true); false when absent, or skipped (worktree mode / emit-state did not run)' },
@@ -3458,10 +3467,11 @@ ${await renderStateFlipScript({ runRoot: runDir, indent: '     ', runningInWorkt
        - "FLIPPED:<id>" with NO "UNVALIDATED:" line (exit 0, fallback route) → mev validated the
          write and found no net-new diagnostics. Set blockStatusFlipped to that id and
          stateWriteValidated=true.
-       - "FLIPPED:<id>" WITH an "UNVALIDATED:" line (exit 0, fallback route) → mev is not installed;
-         the write landed unchecked (json.load-level parse only, matching how the harness degrades
-         other absent tooling). Set blockStatusFlipped to that id, stateWriteValidated=false, and
-         copy the UNVALIDATED line verbatim into notes — this is a DEGRADE, not a silent pass.
+       - "FLIP_REFUSED:<id>" followed by one or more "MEV_OUTPUT:" lines (exit 1, fallback route) →
+         mev is not on PATH, so the script REFUSED to write an unvalidated status into state.json
+         (D86) and the file is byte-unchanged. Set blockStatusFlipped to "", and copy every
+         "MEV_OUTPUT:" line verbatim into notes — this MUST be reported, never silently swallowed. The
+         block stays open until mev is installed and a validated write lands on a later run.
        - "REJECTED:<id>" (exit 1, fallback route) → the write introduced net-new schema errors and
          was rolled back; state.json on disk is now byte-identical to its content before this step
          ran. Set blockStatusFlipped to "", stateWriteRejected=true, and copy every "NET_NEW:" line
@@ -3537,7 +3547,7 @@ Return via StructuredOutput: statusUpdated, statusWriteValidated, statusWriteRej
   if (bookkeepResult?.stateWriteRejected) {
     log(`state.json: write REJECTED — net-new schema error(s) from mev validate-brain --state; rolled back byte-exact, block NOT closed this run. ${bookkeepResult?.notes || ''}`)
   } else if (bookkeepResult?.blockStatusFlipped) {
-    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed (${bookkeepResult.stateWriteValidated ? 'deterministic: mev set-block-status --write exit code, or fallback validated via mev validate-brain --state net-new only' : 'UNVALIDATED: mev not available, json.load-level parse only'})${bookkeepResult.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : useWorktree ? '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree runs `mev emit-state --write` on merge.' : '.'}`)
+    log(`state.json: block "${bookkeepResult.blockStatusFlipped}" → closed (${bookkeepResult.stateWriteValidated ? 'deterministic: mev set-block-status --write exit code, or fallback validated via mev validate-brain --state net-new only' : 'stateWriteValidated=false reported -- unexpected since D86 (mev absent refuses rather than writing); check bookkeep notes'})${bookkeepResult.emitStateRan ? '; derived surfaces (incl. focus.next) regenerated (mev emit-state --write).' : useWorktree ? '; focus.next is DEFERRED — it still points at the pre-close state until /clean-worktree runs `mev emit-state --write` on merge.' : '.'}`)
   } else if (blockDone) {
     log(`Bookkeep: no state.json block flipped (${bookkeepResult?.notes || 'no state.json, or block not found'}).`)
   }

@@ -1,6 +1,6 @@
-//! Integration tests for `ClaudeCodeStep` (`EN.2.A` task 3).
+//! Integration tests for `AgentCodeStep` (`EN.2.A` task 3).
 //!
-//! Hermetic (gated) tests drive `ClaudeCodeStep` through `Workflow::run` with
+//! Hermetic (gated) tests drive `AgentCodeStep` through `Workflow::run` with
 //! a stubbed transport (the injectable seam from `EN.2.A` task 2), covering
 //! the success path (RUNNING -> SUCCESS, usage stamped, output round-trips),
 //! the failure path (FAILED + error, walk halted), and full-context
@@ -20,11 +20,11 @@ use claude_code_rs::{Config, Outcome};
 use engine_contract::{NodeRunStatus, TaskContext};
 use engine_core::workflows::sdlc_flow::policy::TransportRetry;
 use engine_core::{
-    CancellationToken, ClaudeCodeStep, Node, NodeConfig, NodeRegistry, RunOptions, Workflow,
+    AgentCodeStep, CancellationToken, Node, NodeConfig, NodeRegistry, RunOptions, Workflow,
     WorkflowSchema, CANCELLATION_METADATA_KEY,
 };
 
-const NODE_NAME: &str = "ClaudeCodeStep";
+const NODE_NAME: &str = "AgentCodeStep";
 
 fn stub_outcome() -> Outcome {
     Outcome {
@@ -65,7 +65,7 @@ fn single_node_schema() -> WorkflowSchema {
 
 #[tokio::test]
 async fn workflow_run_stamps_success_usage_and_round_trips_context() {
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_transport(|_config, _prompt| Box::pin(async { Ok(stub_outcome()) }));
 
     let mut registry = NodeRegistry::new();
@@ -110,7 +110,7 @@ async fn workflow_run_stamps_success_usage_and_round_trips_context() {
 
 #[tokio::test]
 async fn workflow_run_maps_sdk_error_to_failed_status_and_halts() {
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_transport(|_config, _prompt| Box::pin(async { Err(claude_code_rs::Error::Timeout) }));
 
     let mut registry = NodeRegistry::new();
@@ -142,7 +142,7 @@ async fn workflow_run_maps_sdk_error_to_failed_status_and_halts() {
 /// A retry policy with negligible backoff, used across the retry tests below
 /// so the hermetic suite stays fast — the retry *count* and *outcome* are
 /// under test here, not real backoff timing (that's `MAX_TRANSPORT_BACKOFF_MS`
-/// in `claude_code_step.rs`).
+/// in `agent_code_step.rs`).
 fn fast_retry(max_attempts: u32) -> TransportRetry {
     TransportRetry {
         max_attempts,
@@ -187,7 +187,7 @@ fn counting_stub_transport(
 #[tokio::test]
 async fn transient_failure_recovers_and_stamps_success() {
     let calls = Arc::new(AtomicU32::new(0));
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_retry_policy(fast_retry(3))
         .with_transport(counting_stub_transport(calls.clone(), 1, || {
             claude_code_rs::Error::Timeout
@@ -239,7 +239,7 @@ async fn transient_failure_recovers_and_stamps_success() {
 #[tokio::test]
 async fn persistent_failure_still_halts_with_underlying_message() {
     let calls = Arc::new(AtomicU32::new(0));
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_retry_policy(fast_retry(3))
         .with_transport(counting_stub_transport(calls.clone(), u32::MAX, || {
             claude_code_rs::Error::Timeout
@@ -278,13 +278,13 @@ async fn persistent_failure_still_halts_with_underlying_message() {
 }
 
 /// Attempt count is bounded by the policy's `max_attempts`, not open-ended —
-/// asserted directly against `ClaudeCodeStep::process` (bypassing the
+/// asserted directly against `AgentCodeStep::process` (bypassing the
 /// workflow harness) with a timeout so a future regression that retries
 /// unboundedly fails loudly rather than hanging the suite.
 #[tokio::test]
 async fn attempt_count_is_bounded_and_does_not_hang() {
     let calls = Arc::new(AtomicU32::new(0));
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_retry_policy(fast_retry(5))
         .with_transport(counting_stub_transport(calls.clone(), u32::MAX, || {
             claude_code_rs::Error::Api {
@@ -330,7 +330,7 @@ async fn attempt_count_is_bounded_and_does_not_hang() {
 #[tokio::test]
 async fn happy_path_invokes_transport_exactly_once() {
     let calls = Arc::new(AtomicU32::new(0));
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_retry_policy(fast_retry(3))
         .with_transport(counting_stub_transport(calls.clone(), 0, || {
             claude_code_rs::Error::Timeout
@@ -378,7 +378,7 @@ async fn pre_cancelled_token_is_never_retried_into_the_transport() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_cancellation_token(token)
         .with_retry_policy(fast_retry(5))
         .with_transport(counting_stub_transport(calls.clone(), u32::MAX, || {
@@ -410,13 +410,13 @@ async fn pre_cancelled_token_is_never_retried_into_the_transport() {
     );
 }
 
-// Blast radius (AC9 / Task 3 AC6): `ClaudeCodeStep` backs five call sites —
+// Blast radius (AC9 / Task 3 AC6): `AgentCodeStep` backs five call sites —
 // implement, triage, review, generate, and docs — and the retry above is a
 // property of the node itself, applied uniformly to all constructors
-// (`ClaudeCodeStep::new` / `with_prompt_builder`) rather than gated to any
+// (`AgentCodeStep::new` / `with_prompt_builder`) rather than gated to any
 // one caller's identity. Every test above exercises the node directly
 // through its public `process`/`with_transport`/`with_retry_policy` surface
-// with no per-caller branching anywhere in `claude_code_step.rs`, so the
+// with no per-caller branching anywhere in `agent_code_step.rs`, so the
 // same bounded retry-with-backoff applies identically regardless of which
 // of the five stages constructs the step — there is no code path by which
 // e.g. triage's calls would retry while implement's did not, or vice versa.
@@ -433,7 +433,7 @@ impl Drop for DropSignal {
     }
 }
 
-/// Builds a `ClaudeCodeStep::with_transport` stub whose future never
+/// Builds a `AgentCodeStep::with_transport` stub whose future never
 /// resolves on its own (`std::future::pending`) but reports via `dropped`
 /// once it is dropped — i.e. once something raced it away rather than
 /// awaiting it out.
@@ -451,7 +451,7 @@ fn never_resolving_transport_step(
     }
 }
 
-/// `ClaudeCodeStep::process` called directly with a `CancellationToken`
+/// `AgentCodeStep::process` called directly with a `CancellationToken`
 /// (task 4): a cancel that lands mid-await must return promptly with `Ok`,
 /// and the stub transport future must have actually been dropped rather than
 /// polled to completion.
@@ -460,7 +460,7 @@ async fn process_cancels_promptly_and_drops_in_flight_transport_future() {
     let dropped = Arc::new(AtomicBool::new(false));
     let token = CancellationToken::new();
 
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_cancellation_token(token.clone())
         .with_transport(never_resolving_transport_step(dropped.clone()));
 
@@ -502,7 +502,7 @@ async fn process_cancels_promptly_and_drops_in_flight_transport_future() {
 
 /// A trivial second node — its only role in the cancellation test below is
 /// to give the run loop a next boundary to re-check the cancellation token
-/// at, after the cancelled `ClaudeCodeStep` returns.
+/// at, after the cancelled `AgentCodeStep` returns.
 struct NoopNode;
 
 #[async_trait::async_trait]
@@ -517,7 +517,7 @@ impl Node for NoopNode {
 }
 
 /// Full `Workflow::run_with` integration (task 3 + task 4 together): a
-/// cancel that lands mid-flight inside `ClaudeCodeStep` must not be recorded
+/// cancel that lands mid-flight inside `AgentCodeStep` must not be recorded
 /// as a FAILED `NodeRun`, and the run loop's own next-boundary check (task 3)
 /// is what stamps the cancelled terminal marker and leaves the downstream
 /// node PENDING.
@@ -526,7 +526,7 @@ async fn workflow_run_with_mid_flight_cancel_does_not_mark_the_node_failed() {
     let dropped = Arc::new(AtomicBool::new(false));
     let token = CancellationToken::new();
 
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_cancellation_token(token.clone())
         .with_transport(never_resolving_transport_step(dropped.clone()));
 
@@ -602,8 +602,8 @@ async fn workflow_run_with_mid_flight_cancel_does_not_mark_the_node_failed() {
 /// authenticated.
 #[tokio::test]
 #[ignore]
-async fn live_claude_code_step_produces_populated_usage() {
-    let step = ClaudeCodeStep::new(
+async fn live_agent_code_step_produces_populated_usage() {
+    let step = AgentCodeStep::new(
         NODE_NAME,
         Config::default(),
         "Reply with the single word: ok",
@@ -675,7 +675,7 @@ fn api_error_with_session(session_id: &'static str) -> claude_code_rs::Error {
 /// (per-stage, latest invocation) and the run-scoped ledger (every invocation).
 #[tokio::test]
 async fn successful_call_records_its_session_in_the_ledger_and_node_result() {
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_transport(|_c, _p| Box::pin(async { Ok(outcome_with_session("sess-success")) }));
 
     let ctx = TaskContext {
@@ -708,7 +708,7 @@ async fn successful_call_records_its_session_in_the_ledger_and_node_result() {
 /// This test asserted the opposite when the ledger only carried ids and costs lived elsewhere.
 #[tokio::test]
 async fn a_call_without_a_session_id_is_still_recorded_for_its_cost() {
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_transport(|_c, _p| Box::pin(async { Ok(stub_outcome()) }));
 
     let ctx = TaskContext {
@@ -741,7 +741,7 @@ async fn a_call_without_a_session_id_is_still_recorded_for_its_cost() {
 #[tokio::test]
 async fn a_billed_failed_attempt_is_recorded_before_the_retry_that_succeeded() {
     let calls = Arc::new(AtomicU32::new(0));
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_retry_policy(fast_retry(3))
         .with_transport(move |_c, _p| {
             let calls = calls.clone();
@@ -789,7 +789,7 @@ async fn a_billed_failed_attempt_is_recorded_before_the_retry_that_succeeded() {
 /// directly, because the discard only happens on that path.
 #[tokio::test]
 async fn a_failing_node_still_contributes_its_billed_sessions_to_the_ledger() {
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_retry_policy(fast_retry(1))
         .with_transport(|_c, _p| {
             Box::pin(async {
@@ -824,12 +824,12 @@ async fn a_failing_node_still_contributes_its_billed_sessions_to_the_ledger() {
 /// End-to-end on the undercount this ledger exists to fix.
 ///
 /// One node, one `process` call, three CLI invocations: two billed failures then a success. The
-/// old accounting read `ctx.nodes["ClaudeCodeStep"]["cost_usd"]` — the LAST value written — and
+/// old accounting read `ctx.nodes["AgentCodeStep"]["cost_usd"]` — the LAST value written — and
 /// would report only the success, 0.02 of the 0.52 actually spent. The ledger holds all three.
 #[tokio::test]
 async fn a_retried_stage_reports_every_attempt_it_was_billed_for() {
     let calls = Arc::new(AtomicU32::new(0));
-    let step = ClaudeCodeStep::new(NODE_NAME, Config::default(), "do the thing")
+    let step = AgentCodeStep::new(NODE_NAME, Config::default(), "do the thing")
         .with_retry_policy(fast_retry(4))
         .with_transport(move |_c, _p| {
             let calls = calls.clone();

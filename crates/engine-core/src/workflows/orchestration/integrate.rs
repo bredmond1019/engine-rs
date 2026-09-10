@@ -1351,7 +1351,7 @@ fn journal_run_id(ctx: Option<&engine_contract::TaskContext>) -> uuid::Uuid {
 ///   child actually reported — empty if none did, a single string if every
 ///   node agrees, a list if they diverge.
 /// - `transport` is folded the same way from every node output's
-///   `"transport"."tier"` stamp — the same convention `ClaudeCodeStep`/
+///   `"transport"."tier"` stamp — the same convention `AgentCodeStep`/
 ///   `task_loop.rs` nodes already use (see e.g. `task_loop.rs`'s
 ///   `TriageTaskNode` transport-tier tests).
 /// - `executor` is the sanctioned engine the chain actually resolved and
@@ -5389,7 +5389,7 @@ mod tests {
             Box::pin(async move {
                 let mut node_runs = std::collections::HashMap::new();
                 node_runs.insert(
-                    "ClaudeCodeStep".to_string(),
+                    "AgentCodeStep".to_string(),
                     engine_contract::NodeRun {
                         status: engine_contract::NodeRunStatus::Success,
                         started_at: None,
@@ -5407,7 +5407,7 @@ mod tests {
                 );
                 let mut nodes = std::collections::HashMap::new();
                 nodes.insert(
-                    "ClaudeCodeStep".to_string(),
+                    "AgentCodeStep".to_string(),
                     json!({ "transport": { "tier": "cloud", "endpoint": null } }),
                 );
                 Ok(engine_contract::TaskContext {

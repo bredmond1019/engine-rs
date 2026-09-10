@@ -106,9 +106,9 @@ Python shape and engine-rs's Rust shape — engine-rs's own node names come from
 | `model` (string, required) | `Usage.model: String` |
 
 `model` is a required `String` on the wire even though the underlying Claude Code SDK can report no
-model (`Outcome::primary_model()` returns `None`); `ClaudeCodeStep` supplies the literal `"unknown"`
+model (`Outcome::primary_model()` returns `None`); `AgentCodeStep` supplies the literal `"unknown"`
 in that case rather than loosening the contract type — see `docs/architecture.md` §
-`ClaudeCodeStep` and `planning/decisions/D20-shared-data-contract.md` (brain-level contract
+`AgentCodeStep` and `planning/decisions/D20-shared-data-contract.md` (brain-level contract
 ownership decision).
 
 ### Run-level `metadata` annotations (new in v1.1.0)
@@ -214,7 +214,7 @@ re-run, a stage the task loop ran six times contributed only its sixth call: a s
 **undercount that grew with the number of retries and review rounds**, worst on exactly the runs
 whose cost mattered most. The scan survives as the fallback for an EMPTY ledger, which is not the
 same as a free run — a state written before this ledger existed, or a workflow whose cost-bearing
-nodes are not `ClaudeCodeStep` and stamp `cost_usd` themselves, both land there.
+nodes are not `AgentCodeStep` and stamp `cost_usd` themselves, both land there.
 
 `session_id` is `Option`: an invocation that established no Claude session (a local
 OpenAI-compatible transport) is still recorded, because it still cost money — only its transcript
@@ -223,7 +223,7 @@ recorded **nowhere**: nothing about its cost is known, and a zero-cost entry wou
 measurement never made.
 
 **A LIST, never a scalar — an engine-rs run is 1:N with Claude sessions.** Every LLM stage is a
-separate headless `claude` invocation (`ClaudeCodeStep`, which never passes `--resume`), so one
+separate headless `claude` invocation (`AgentCodeStep`, which never passes `--resume`), so one
 `SDLC_FLOW` run spans one session per stage per attempt. A single "the run's session id" would name
 one segment and silently lose the rest, and the segment it named would look exact, so nothing would
 appear wrong. Entries are append-only and in invocation order, which is what makes per-stage cost

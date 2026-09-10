@@ -651,7 +651,7 @@ fn registry_for_policy_rewires_opportunity_review_revise_but_never_research() {
     let policy_registry = graph::registry_for_policy(&policy);
 
     // Rewiring never changes the registry's node count/identity set — only
-    // the transport those nodes' composed `ClaudeCodeStep` uses.
+    // the transport those nodes' composed `AgentCodeStep` uses.
     assert_eq!(policy_registry.len(), default_registry.len());
     for identity in [
         "ProposalCompanyResearchNode",

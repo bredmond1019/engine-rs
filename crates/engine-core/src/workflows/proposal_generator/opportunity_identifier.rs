@@ -3,7 +3,7 @@
 //! fields when present, else falls back to the web brief.
 //!
 //! A non-terminal, Local-eligible model node (single-shot judgment)
-//! wrapping `crate::nodes::claude_code_step::ClaudeCodeStep`. No
+//! wrapping `crate::nodes::agent_code_step::AgentCodeStep`. No
 //! WebSearch/WebFetch — this stage only ever reasons over already-gathered
 //! evidence. On `process`:
 //! 1. read the run's [`super::policy::ProposalGeneratorPolicy`] stamped once
@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
     get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
 };
@@ -42,7 +42,7 @@ use super::policy::ProposalGeneratorPolicy;
 use super::schema::{composite_score, PriorityTier, ProposalGeneratorEventSchema, RankedCandidate};
 
 /// The `Node::name()` identity `OpportunityIdentifierNode` runs its
-/// composed `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key
+/// composed `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key
 /// its output/usage are stamped onto. Read by `ProposalWriterNode`.
 pub const NODE_NAME: &str = "OpportunityIdentifierNode";
 
@@ -214,7 +214,7 @@ impl OpportunityIdentifierNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -224,7 +224,7 @@ impl OpportunityIdentifierNode {
     }
 
     /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// reports the [`crate::nodes::agent_code_step::TransportInfo`] of
     /// whichever call actually executed (e.g. local vs. cloud fallback),
     /// taking precedence over a plain transport set via
     /// [`Self::with_transport`].
@@ -262,7 +262,7 @@ impl Node for OpportunityIdentifierNode {
 
         let step = self
             .transport
-            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
+            .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -275,7 +275,7 @@ impl Node for OpportunityIdentifierNode {
             .to_string();
         // `put_result` below replaces this node's whole `ctx.nodes` entry,
         // which would otherwise silently drop the `"transport"` stamp
-        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `AgentCodeStep::process` just wrote — the exact tier-telemetry
         // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
         // reads back out by this same node name.
         let transport_stamp = ctx

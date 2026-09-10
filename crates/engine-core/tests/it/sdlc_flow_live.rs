@@ -2,7 +2,7 @@
 //! nodes (`ImplementTaskNode`, `TriageTaskNode`'s `llm_triage` branch,
 //! `ConsolidatedReviewNode`) — the actual `claude` CLI, not a stubbed
 //! transport, mirroring the `#[ignore]` + manual-run convention already
-//! used by `crates/engine-core/tests/claude_code_step.rs` and
+//! used by `crates/engine-core/tests/agent_code_step.rs` and
 //! `core/claude-code-rs/src/execute.rs`'s live tests.
 //!
 //! **Ignored by default** so the gated `cargo test` suite (and CI) never
@@ -597,7 +597,7 @@ async fn live_triage_task_node_llm_branch_real_call() {
         .node_runs
         .get("TriageTaskNode")
         .expect("TriageTaskNode should have run");
-    // No `status == Success` assertion here: `ClaudeCodeStep` only ever
+    // No `status == Success` assertion here: `AgentCodeStep` only ever
     // stamps `Running` into `node_runs` on its own — finalizing a node's
     // status to `Success`/`Failed` is `Workflow::run_with`'s job (see
     // `workflow.rs`), which this test deliberately bypasses to drive

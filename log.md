@@ -5,7 +5,7 @@ description: Chronological log of work completed for engine-rs.
 doc_id: log
 layer: [factory]
 status: active
-timestamp: "2026-09-03T06:25:27Z"
+timestamp: "2026-09-10T22:26:09Z"
 keywords: [work log, session history, development log]
 related: [status, context]
 ---
@@ -13,6 +13,99 @@ related: [status, context]
 # Log — engine-rs
 
 *Append-only working log. One dated entry per session. Newest entries at the top.*
+
+## [run: 2026-09-10]
+
+`/sdlc-flow` on branch `EN.15.I-flow` completed all 3 tasks, PASS review — `EN.15.I` is closed.
+`HeldSessionNode` is registered in production as its own `HELD_SESSION` micro-workflow in
+`graph.rs` (schema+registry, mirroring `DEBRIEF`), with `held_session_name(repo, lane) ->
+"lane-<repo>-<lane>"` giving `bastion attach` a resolvable session name. `engine-serve` now
+registers `HELD_SESSION` (`register_held_session`) against a live `TmuxDriver`, pulling `term-core`
+in as a direct dependency. Task 3's fix pass closed out a prior bail: `held_session_name` was
+missing from `engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` allowlist (a one-line addition) and
+`HELD_SESSION` was missing from `engine-serve`'s `register_builtin_workflows_registers_every_known_workflow_type`
+expected list — both fixed, turning the guard tests green. `tests/it/escalate.rs` gained adversarial
+real-tmux coverage: attaching pauses sends, killing the tmux server is classified as `session_lost`
+(discovered empirically that killing the whole server surfaces through `LeaseLost`/"no tmux server
+running", not `ExternallyKilled`, so the classifier matches both), and a real `tmux -C`
+control-mode client proves `#{session_attached}` genuinely counts. Full harness suite green (fmt,
+clippy `-D warnings`, nextest --workspace --all-features, release build). `docs/terminal-crates.md`
+updated. Next: `EN.15.J` — a chain raises an operator gate it cannot clear.
+
+```
+c159b45 docs: update docs for EN.15.I
+9dbf3b8 fix: implement EN.15.I-task3
+104dea1 chore: wrap up EN.15.I
+047dce4 fix: fix pass 1 for EN.15.I-task3
+c5e7449 feat: implement EN.15.I-task3
+5247999 feat: implement EN.15.I-task2
+9afd164 feat: implement EN.15.I-task1
+ab0bd0a docs: log EN.16.A + quiesce-test close-out session
+```
+
+## [run: 2026-09-10]
+
+`/sdlc-flow` on branch `EN.15.I-flow` ran tasks 1-3, BAILED at task 3. Task 1 registered
+`HeldSessionNode` as its own HELD_SESSION micro-workflow in `graph.rs` (schema+registry, mirroring
+DEBRIEF) and added `held_session_name(repo, lane) -> "lane-<repo>-<lane>"`. Task 2 wired
+`engine-serve` to register HELD_SESSION (`register_held_session`) against a live `TmuxDriver`,
+adding `term-core` as a direct `engine-serve` dependency. Task 3 built out the real-tmux escalate
+coverage (`tests/it/escalate.rs`) and, on its fix pass, added `held_session_name` to
+`engine_kind.rs`'s `SANCTIONED_STRING_TAKING_FNS` allowlist — a one-line, well-understood fix that
+makes the guard test pass — but the run BAILED anyway: `engine_kind.rs` is not in task 3's declared
+`files[]` (`escalate.rs`, `graph.rs`), so the work assertion refused to confirm the fix as in-scope.
+The allowlist gap was left by task 1 (which added `held_session_name` without registering it), and
+closing it requires editing a file task 3's own spec scope excludes — no bounded retry within scope
+can pass the terminal work assertion. Needs re-scoping (add `engine_kind.rs` to task 3's `files[]`,
+or fold the allowlist fix into task 1) rather than another retry. A second, unrelated pre-existing
+gap in `crates/engine-serve/src/workflows.rs` (from task 2 — HELD_SESSION registered but missing
+from `register_builtin_workflows_registers_every_known_workflow_type`'s hardcoded `expected` list)
+also still blocks the full `cargo nextest run --workspace --all-features` gate and is likewise out
+of task 3's scope.
+
+Next: re-scope EN.15.I's task 3 `files[]` to include `engine_kind.rs` (or move the allowlist fix
+into task 1's scope), and separately fix `crates/engine-serve/src/workflows.rs`'s stale `expected`
+workflow-type list before re-running `/sdlc-flow`.
+
+```
+047dce4 fix: fix pass 1 for EN.15.I-task3
+c5e7449 feat: implement EN.15.I-task3
+5247999 feat: implement EN.15.I-task2
+9afd164 feat: implement EN.15.I-task1
+ab0bd0a docs: log EN.16.A + quiesce-test close-out session
+4f36ab0 docs: rename ClaudeCodeStep -> AgentCodeStep in living reference docs (EN.16.A follow-up)
+d608ce3 feat: implement EN.16.A-task1 (content)
+9126068 feat: implement EN.16.A-task1
+```
+
+## [run: 2026-09-10]
+
+### Closed EN.16.A + the quiesce-test hermeticity fix; docs re-synced; /close-out run
+- **What:** Two per-block `/begin-orchestration` sessions closed
+  `EN.ticket.coord-quiesce-test-is-environment-dependent-and-now-red` (made `coord::write`'s test
+  hermetic by passing an explicit `lock_dir` instead of relying on ambient `.fleet-locks/` state,
+  `d8499d4`) and `EN.16.A` (the `ClaudeCodeStep` -> `AgentCodeStep` rename across all 63 Rust call
+  sites, all 7 ACs + all 7 harness gates met, `9126068`/`d608ce3`). Then ran `/close-out`: full
+  9-check harness suite + emoji gate green on the recovered range `fe7b12c..HEAD`; a coverage scan
+  found no blocking gaps; `/update-docs --patch` re-synced 14 docs to the new type/module name
+  (`4f36ab0`), deliberately leaving `docs/data-contract.md`'s two dated changelog rows saying the
+  old name, per D20's append-only discipline. Deleted the
+  `agent-code-step-rename-leaves-doc-prose-naming-the-old-type` carryover entry (work done; its
+  `clears_when` predicate couldn't account for the append-only exception and would never have
+  fired). Both orchestration-run sessions left the full four-artifact set (`notes.md`, `review.md`,
+  `verification-ledger.json`/`.md`) under `planning/orchestration-run/pluggable-code-agent-transport/`,
+  contract-checked.
+- **Why:** Operator authorized autonomous execution of the already-planned `EN.16.A` after
+  generating its tasks; the prior handoff's plan-review gate was resolved before this session
+  opened. `EN.16.B` stays held on `coordination-layer-port`'s `EN.17.I/J` (operator-sequenced
+  first) plus an operator gate (`install-pi-and-capture-a-real-cli-run`) — not started this
+  session.
+- **Refs:** `planning/handoff.md`, `planning/orchestration-run/pluggable-code-agent-transport/review.md`
+
+### Planned phase 16 — pluggable code-agent transport (EN.16.A/B/C)
+- **What:** Authored the initiative narrative (`planning/open-work/pre-plan/pluggable-code-agent-transport/plan.md`, in HQ) and three block records from the existing `/assess` -> `/seams` -> `/sequence` pre-plan, with no departures from its cut. EN.16.A renames `ClaudeCodeStep` -> `AgentCodeStep` (zero behaviour change, 24 instantiation files, 5 of them outside engine-core); EN.16.B adds the `agent_backend` policy knob, a new `AgentOutcome` type, `PiTransport` and a `BudgetLedger` unknown-cost flag; EN.16.C adds Aider reusing B's scaffolding. Registered at phase 16, waves 362/363/364 (asserted unused first), `depends_on` mirrored between records and `state.json`. Ran `emit-state` via the wrapper — 16 surfaces, 0 staging failures, wave table spliced, A derives `open` and B/C derive `blocked`. Committed locally as `fc4844546`; not pushed. Two adversarial passes ran against the block records rather than the narrative: a handoff test on EN.16.A failed then passed after 11 holes were closed, and a red team landed 9 of 10 findings, each verified against source. Filed one carryover for the doc sweep EN.16.A scopes out. Wrote `planning/handoff.md` for the next session.
+- **Why:** The operator confirmed on 2026-09-09 that this transport was always meant to be backend-agnostic and that the Claude Code subscription was a temporary simplification to isolate complexity, not the design's scope. Today every implement-stage token is billed and there is no knob to route elsewhere. Two red-team findings are worth remembering because both would have shipped silently: EN.16.B's cost-honesty acceptance criterion was **unachievable as written** (`claude_code_rs::Outcome.cost_usd` is a bare `f64` written unconditionally, and the writer file was missing from `files.modified`), and the stated dispatch guidance named the wrong pattern — `ImplementTaskNode` registers at `if let Some(t) = token`, not the local-tier shape, so `agent_backend: pi` with `token: None` would have fallen back to the billed Claude node. Also corrected the harness gate count in all three records: engine-rs has SEVEN `gates: true` checks, not the familiar four. One attack was rejected — demoting EN.16.C — because Fork 1 records the operator wanting both backends; the rejection is in the cut list with its reason. The roadmap-vs-lane driving decision is deliberately left open for review: this cut is one repo with zero cross-repo edges, which is precisely what `/generate-roadmap` exists to coordinate and has none of.
+- **Refs:** `planning/blocks/EN.16.{A,B,C}.json`; `planning/handoff.md`; HQ `planning/open-work/pre-plan/pluggable-code-agent-transport/`
 
 ## [run: 2026-09-08]
 

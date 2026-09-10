@@ -3,7 +3,7 @@
 //! task 5), following `content_pipeline::revise::ReviseNode`.
 //!
 //! A non-terminal, Local-eligible model node wrapping
-//! `crate::nodes::claude_code_step::ClaudeCodeStep`. On `process`:
+//! `crate::nodes::agent_code_step::AgentCodeStep`. On `process`:
 //! 1. read the current draft (its own prior pass first, via `NODE_NAME` —
 //!    a later loop pass revises the previous revision rather than
 //!    re-deriving from scratch, mirroring `content_pipeline::revise.rs`'s
@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::node::{InputBinding, Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
 
 use super::brand_critic;
@@ -40,7 +40,7 @@ use super::policy::LinkedInPostPolicy;
 use super::schema::WorkSource;
 
 /// The `Node::name()` identity `ReviseNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes` key its output is stamped
+/// `AgentCodeStep` under, and the `ctx.nodes` key its output is stamped
 /// onto. Read by `BrandCriticNode` as its read-preference fallback ahead
 /// of the bound draft identity.
 pub const NODE_NAME: &str = "ReviseNode";
@@ -173,7 +173,7 @@ impl ReviseNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -218,7 +218,7 @@ impl Node for ReviseNode {
             crate::policy::apply_model_tier(config, policy.model_tiers.draft, &policy.local.model);
         let prompt = build_prompt(&draft_text, &issues);
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
+        let mut step = AgentCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }

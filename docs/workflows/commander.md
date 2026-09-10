@@ -78,7 +78,7 @@ flowchart TD
    - Stamp the commander heartbeat at `<lock_dir>/commander-heartbeats/<heartbeat_name>.heartbeat`
      as a bare epoch-second integer. `commander_drain.sh` may still stamp the same file;
      last-writer-wins by design.
-2. **`CommanderTriageNode`** (terminal) — the block's **one** gated `ClaudeCodeStep`: orphan
+2. **`CommanderTriageNode`** (terminal) — the block's **one** gated `AgentCodeStep`: orphan
    classification against the manifest from step 1, plus a check against
    `planning/open-work/index.md` before filing anything fresh.
 
@@ -91,7 +91,7 @@ baked into the graph at registration. It checks `GatedAction::RunDrain` via
 | Profile | `RunDrain` | What happens |
 |---|---|---|
 | `Standard`, `Locked` | `Deny` | The step is skipped and **recorded**, not dropped: `ctx.nodes["commander-triage"] = {"suppressed_by_profile": true}` |
-| `Unrestricted` | `Permit` | The one real `ClaudeCodeStep` runs |
+| `Unrestricted` | `Permit` | The one real `AgentCodeStep` runs |
 
 The constructed `claude_code_rs::Config` never sets `dangerously_skip_permissions` — this step is
 never invoked with a permissions bypass, checked independently of the gate outcome via
@@ -99,7 +99,7 @@ never invoked with a permissions bypass, checked independently of the gate outco
 
 ## What is deliberately not here
 
-- **No second `ClaudeCodeStep`.** Every other judgement step the old `/orchestration-commander`
+- **No second `AgentCodeStep`.** Every other judgement step the old `/orchestration-commander`
   prompt performed is out of scope for this port (see the block record's `out_of_scope`) — this
   module must never grow one.
 - **Real orphan detection is the triage step's job, not the drain node's.** `CommanderDrainNode`'s

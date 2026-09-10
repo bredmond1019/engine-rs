@@ -49,7 +49,7 @@ second run of the same work opens a second record instead of appending to the fi
 | `--isolation <worktree\|no-worktree\|auto>` | no | `auto` | `auto` applies the policy table below. |
 | `--plan-file <path>` | no | — | Spec source for `/generate-tasks --from`, when the blocks are not in `master-plan.md`. |
 | `--engine <task\|flow>` | no | per-block | Force one engine for the whole chain. |
-| `--log <path>` | no | `planning/roadmaps/<slug>/lane-log.jsonl` | Where to report integrated blocks, `<slug>` per Step 1D. `--log none` disables. |
+| `--log <path>` | no | `<roadmap_dir>/lane-log.jsonl` | Where to report integrated blocks. **Derived from the `roadmap_dir` Step 1C resolved, NOT re-derived as `planning/roadmaps/<slug>/`** — see Step 1D. `--log none` disables. |
 | `--execute` | no | off | Skip the dry-run confirmation and start immediately. |
 | `--continue-on-fail` | no | off | Passed through to `/orchestrate`. |
 
@@ -125,8 +125,19 @@ below that reads a file *inside* `roadmap_dir` (a lane record, a roadmap documen
 
 **The `<slug>` position, once, for both modes.** Everything downstream takes `<slug>` = the
 roadmap's directory name under `--roadmap`, or the `--run` value verbatim: the run record
-directory (E), the lane log (`<slug>/lane-log.jsonl`), and the escalations file
-(`planning/roadmaps/<slug>/escalations.jsonl`). A `--run` chain therefore creates
+directory (E), the lane log (`<roadmap_dir>/lane-log.jsonl`), and the escalations file
+(`<roadmap_dir>/escalations.jsonl`).
+
+**Both paths hang off the RESOLVED `roadmap_dir`, never off a re-derived
+`planning/roadmaps/<slug>/`.** This matters for every single-repo `/plan --lane` initiative, which
+is the common shape: `/plan` never creates a `planning/roadmaps/<slug>/`, so Step 1C rule 2
+resolves such a lane to the legacy `planning/<slug>/`. Re-deriving the log path from the slug would
+write into — and thereby **create** — a `planning/roadmaps/<slug>/` that holds a lane log and no
+lane record. On the next run, rule 1 above would then prefer that new directory, and `--lane`
+would stop resolving: **the first run silently breaks the second.** Deriving from `roadmap_dir`
+also keeps this in step with `scripts/lane_log_watermark.py`, which already resolves the same two
+locations in the same order and counts a legacy dir holding `lane-log.jsonl` as a roadmap — so a
+log written there is found by consolidation, not orphaned. A `--run` chain therefore creates
 `planning/roadmaps/<slug>/` to hold its lane log and escalations even though it is not a roadmap;
 that directory holds **no** `roadmap.md` and **no** lane records, which is exactly how
 `scripts/lane_log_watermark.py`'s `is_roadmap_dir()` already distinguishes a roadmap from
@@ -686,7 +697,11 @@ Each has already cost a real run in this fleet.
    verified — that is the post-run verifier's job. Like the run record itself, a ledger is
    addressed per (repo × roadmap) (D57) — a second wave against an existing ledger **appends** to
    it, it never overwrites the file, which is exactly the clobber a sibling lane hit and repaired
-   in commit `559f1039d`.
+   in commit `559f1039d`. Before handoff, a lane may optionally run
+   `python3 scripts/check_verification_ledger.py` (run from BRAIN_ROOT) against its own ledger — it
+   is purely informational, exit code is always 0, and it never gates; it flags things worth a
+   second look (an unusually large per-block entry count, a likely-duplicate pair, overlong prose)
+   before the ledger is reviewed.
 
    **When a capability this lane shipped is found BROKEN, the remediation half of the ledger
    contract is what to write — not a note, not a ping.** File the ticket, then record

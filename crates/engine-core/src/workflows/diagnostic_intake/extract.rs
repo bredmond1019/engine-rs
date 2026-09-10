@@ -2,7 +2,7 @@
 //! extraction node (pure extraction; no `WebSearch`/`WebFetch`).
 //!
 //! A terminal model node (no forward connection) wrapping
-//! `crate::nodes::claude_code_step::ClaudeCodeStep`, authored fresh from
+//! `crate::nodes::agent_code_step::AgentCodeStep`, authored fresh from
 //! `agentic-portfolio/business/docs/diagnostic/intake.md`'s interview
 //! groups + evidence discipline (client's own words; empty axes flagged,
 //! not invented) and the São Paulo SMB priors (§5). On `process`:
@@ -14,7 +14,7 @@
 //! 3. await the (injectable) transport and parse its reply into a
 //!    [`super::schema::DiagnosticIntake`];
 //! 4. stamp the parsed intake + usage onto `ctx` (via the composed
-//!    `ClaudeCodeStep`) and harvest + persist a
+//!    `AgentCodeStep`) and harvest + persist a
 //!    `diagnostic-intake-state.json` telemetry record;
 //! 5. return `ctx` unchanged otherwise — this node is a graph exit point,
 //!    both the start and the terminal node (no router).
@@ -27,7 +27,7 @@ use serde_json::json;
 
 use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
-use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{
     get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
@@ -37,7 +37,7 @@ use super::policy::{DiagnosticIntakePolicy, ModelTier};
 use super::schema::{diagnostic_intake_json_schema, DiagnosticIntake, DiagnosticIntakeEventSchema};
 
 /// The `Node::name()` identity `IntakeExtractNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
+/// `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
 /// output/usage are stamped onto.
 const NODE_NAME: &str = "IntakeExtractNode";
 
@@ -54,7 +54,7 @@ const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/extract.md");
 const VERDICT_STAGES: [&str; 0] = [];
 
 /// The model-node identities whose `ctx.nodes` output may carry a
-/// `"cost_usd"` field (`ClaudeCodeStep`'s output shape).
+/// `"cost_usd"` field (`AgentCodeStep`'s output shape).
 const COST_BEARING_STAGES: [&str; 1] = [NODE_NAME];
 
 /// Deserialize the inbound `DIAGNOSTIC_INTAKE` event from `ctx.event`.
@@ -208,7 +208,7 @@ impl IntakeExtractNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`. The Local-tier rewire
     /// (`graph::registry_for_policy`) uses [`Self::with_meta_transport`]
@@ -221,7 +221,7 @@ impl IntakeExtractNode {
     }
 
     /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// reports the [`crate::nodes::agent_code_step::TransportInfo`] of
     /// whichever call actually executed (e.g. local vs. cloud fallback),
     /// taking precedence over a plain transport set via
     /// [`Self::with_transport`].
@@ -261,7 +261,7 @@ impl Node for IntakeExtractNode {
 
         let step = self
             .transport
-            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
+            .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -274,7 +274,7 @@ impl Node for IntakeExtractNode {
             .to_string();
         // `put_result` below replaces this node's whole `ctx.nodes` entry,
         // which would otherwise silently drop the `"transport"` stamp
-        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `AgentCodeStep::process` just wrote — the exact tier-telemetry
         // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
         // reads back out by this same node name.
         let transport_stamp = ctx

@@ -14,7 +14,7 @@
 //! - [`drain_log`] — the drain-log append that never skips (a `roadmap: null` row when no
 //!   roadmap resolves, never a skipped append) and the commander heartbeat in the pinned bare
 //!   epoch-seconds format (task 3).
-//! - [`triage`] — the commander's single gated `ClaudeCodeStep` (task 4, this task): orphan
+//! - [`triage`] — the commander's single gated `AgentCodeStep` (task 4, this task): orphan
 //!   classification plus the `planning/open-work/index.md` check, gated on
 //!   `GatedAction::RunDrain` and never invoked with a permissions bypass. Registration into
 //!   the workflow graph itself is a later task of this same block.
@@ -34,7 +34,7 @@
 //! [`schema`]/[`registry`] assemble the declared two-node `COMMANDER` graph —
 //! [`CommanderDrainNode`] (start: discover-drain-route-complete, the scoped emit + manifest-only
 //! commit, and the drain-log append + heartbeat stamp, all composed from the earlier tasks'
-//! functions) feeding [`CommanderTriageNode`] (terminal: the block's one gated `ClaudeCodeStep`,
+//! functions) feeding [`CommanderTriageNode`] (terminal: the block's one gated `AgentCodeStep`,
 //! resolved fresh from `ctx.event`'s `profile`/`model` on every run so a `Deny`d profile is
 //! recorded as [`triage::TriageOutcome::SuppressedByProfile`] rather than the step being baked
 //! into the graph unconditionally). `crates/engine-serve/src/workflows.rs` registers this as a
@@ -267,14 +267,14 @@ impl Node for CommanderDrainNode {
     }
 }
 
-/// The `COMMANDER` workflow's terminal node: the block's ONE gated `ClaudeCodeStep`. Resolves
+/// The `COMMANDER` workflow's terminal node: the block's ONE gated `AgentCodeStep`. Resolves
 /// `profile`/`model` fresh from `ctx.event` on every run (never baked into the graph at
 /// registration time) and delegates to [`triage::build_triage_step`] — a `Deny`d profile is
 /// recorded onto `ctx.nodes[triage::TRIAGE_STEP_NAME]` as `{"suppressed_by_profile": true}`
 /// (the same "recorded, never dropped" discipline [`crate::workflows::sweep::route`]'s
 /// `suppressed_by_profile` uses), a `Permit`d one actually runs the one constructed
-/// `ClaudeCodeStep`. This node's registered name IS [`triage::TRIAGE_STEP_NAME`] — there is
-/// exactly one `ClaudeCodeStep`-shaped node anywhere in this graph.
+/// `AgentCodeStep`. This node's registered name IS [`triage::TRIAGE_STEP_NAME`] — there is
+/// exactly one `AgentCodeStep`-shaped node anywhere in this graph.
 pub struct CommanderTriageNode;
 
 impl CommanderTriageNode {
@@ -319,7 +319,7 @@ impl Node for CommanderTriageNode {
 }
 
 /// Build the declared `WorkflowSchema` for `COMMANDER`: [`CommanderDrainNode`] (start) feeding
-/// [`CommanderTriageNode`] (terminal) — the exactly-one-`ClaudeCodeStep` graph this block's
+/// [`CommanderTriageNode`] (terminal) — the exactly-one-`AgentCodeStep` graph this block's
 /// acceptance criteria require.
 #[must_use]
 pub fn schema() -> WorkflowSchema {

@@ -10,7 +10,27 @@ $ARGUMENTS — free-text description of the feature, experiment, or body of work
 | `--founding` | This is the project's founding roadmap — a new repo's first blocks. Adds the Goal / Destination / Architecture framing and writes to `planning/founding/`. Invoked by `/new-project`. |
 | `--clarify` | Force the clarify gate on regardless of `planning/harness.json`. |
 | `--no-redteam` | Skip the adversarial pass (step 10). For a small, low-risk initiative only. |
-| `--lane` | Also emit `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/lane-<slug>.json` (D71), authored against `.claude/workflows/lane.schema.json`, so `/begin-orchestration --roadmap <slug> --lane <slug>` can drive this initiative's blocks in dependency order — the same mechanism `/generate-roadmap` gives a multi-repo program. **Opt-in, not the default**: most `/plan` output is never meant to be orchestrated (small initiatives run block-by-block, by hand, on purpose), and silently emitting an extra artifact every time would surprise that far more common caller. See step 7c and the Output Format below. |
+| `--lane` | Also emit **`$BRAIN_ROOT/planning/<slug>/lane-<slug>.json`** (D71) — note `$BRAIN_ROOT`, and note it is **not** under `open-work/` — authored against `.claude/workflows/lane.schema.json`, so `/begin-orchestration` can drive this initiative's blocks in dependency order, the same mechanism `/generate-roadmap` gives a multi-repo program. **RECOMMEND THIS unless the operator says otherwise** — see "Recommending `--lane`" below; step 7c has the exact path, the two traps, and the run command. |
+
+### Recommending `--lane`
+
+**Default to recommending it.** In this fleet's current workflow, a single-repo initiative is
+normally worked by `/begin-orchestration` driving the chain, not block-by-block by hand — so the
+lane record is usually wanted, and an initiative without one has to be re-planned or hand-authored
+later to get it. (This reverses earlier guidance here that called `--lane` a rare opt-in and warned
+that emitting it would surprise the caller. It does not; the common case is the reverse.)
+
+So:
+
+- **`--lane` passed** — emit it (step 7c), no question needed.
+- **`--lane` NOT passed** — still author the plan and the block records in full. Then, in the
+  report, **recommend it in one line and give the exact command to add it**, so the operator can
+  take it without re-reading this file. Do not silently emit it: the flag is the operator's, and a
+  lane record is a live orchestration input, not a harmless extra file.
+- **Skip the recommendation** only when the initiative is genuinely hand-work — a single block, or
+  blocks the operator has said they want to drive one at a time.
+
+The recommendation costs one line. Omitting the record costs a re-plan.
 
 > **Where this writes — resolve `BRAIN_ROOT` first.** Walk **up** from the current working
 > directory until you find a `brain.toml` (its first line begins `# brain.toml`); that directory is
@@ -45,9 +65,10 @@ Output is two things, plus a third when `--lane` is passed:
   architecture framing, the cut list. Everything true of the *set* rather than of any one block.
 - `planning/blocks/<BlockID>.json` — one **block record** per block. The definition of each
   member.
-- `planning/<slug>/lane-<slug>.json` (only with `--lane`) — the **lane record** `/begin-orchestration`
-  drives: the same blocks, in dependency order, in the one shape `.claude/workflows/lane.schema.json`
-  defines. See the scope ladder below and step 7c.
+- `$BRAIN_ROOT/planning/<slug>/lane-<slug>.json` (only with `--lane`) — the **lane record**
+  `/begin-orchestration` drives: the same blocks, in dependency order, in the one shape
+  `.claude/workflows/lane.schema.json` defines. **`$BRAIN_ROOT`, and never under `open-work/` or
+  `roadmaps/`** — step 7c has the three ways to get this path wrong and why each fails silently.
 
 `/plan` does **not** write `tasks.json`. Task decomposition is deferred to
 `/generate-tasks <BlockID>`, run later, per block — because a later block's tasks depend on an
@@ -61,8 +82,9 @@ re-derived anyway (D65).
 > **Orchestrating the result.** A `/plan` initiative can be driven the same way a `/generate-roadmap`
 > program is — `/begin-orchestration` knocking out its blocks in dependency order, with the same
 > notes, run records and documentation discipline. Pass `--lane` to also emit a lane record
-> (step 7c); without it, `/plan` produces only the narrative and block records, and the initiative
-> is worked block-by-block by hand, as most `/plan` output is meant to be.
+> (step 7c). **This is the common case in this fleet and you should recommend it** — see
+> "Recommending `--lane`" above. Without it, `/plan` produces only the narrative and block records
+> and the initiative has to be worked block-by-block by hand.
 >
 > **Upstream.** For work on an existing system large enough that the cut is not obvious, the
 > pre-plan pipeline runs first: `/assess` → `/seams` → `/sequence`. Its output,
@@ -186,23 +208,61 @@ re-derived anyway (D65).
    work left in prose with no row in `state.json`. Report what it
    found — including "nothing", which on a multi-block initiative is a claim.
 
-7c. **When `--lane` is set, emit the lane record** — `planning/<slug>/lane-<slug>.json`, authored
-   against `.claude/workflows/lane.schema.json` (D71). One repo, one lane: this command scopes to a
-   single repo, so the lane needs no cross-repo assignment, just the blocks in dependency order.
+7c. **When `--lane` is set, emit the lane record.** Authored against
+   `.claude/workflows/lane.schema.json` (D71). One repo, one lane: this command scopes to a single
+   repo, so the lane needs no cross-repo assignment, just the blocks in dependency order.
+
+   **The path — get this exactly right, it is the one thing here that fails silently:**
+
+   ```
+   $BRAIN_ROOT/planning/<slug>/lane-<slug>.json
+   ```
+
+   Three ways to get it wrong, all of which produce a schema-valid file that nothing can find:
+
+   - **NOT the current repo's `planning/`.** Even when you invoked `/plan` from a leaf repo, this
+     goes to the **brain root**. mev's `discover_lane_files` (`core/mev/src/brain/lane_segments.rs`)
+     reads `<brain-root>/planning` and nothing else, so a record under a repo's own vaulted
+     `planning/` is never discovered. **Measured 2026-09-10:** the fleet's one leaf-repo lane record
+     (`side/_planning/price-scout/home-ready/lane-home-ready.json`) returns **zero** hits from
+     `mev lanes`, against **eight** for a brain-root control lane — schema-valid, on disk, and
+     completely unreachable for months. `check_lane_records.py` passes it, because that script
+     validates whatever `--planning` path you hand it; **schema-valid and reachable are different
+     claims** and only the second one matters here.
+   - **NOT under `open-work/`** (HQ D87). `open-work` is in `NON_ROADMAP_DIR_NAMES`, so a record
+     left there is skipped outright. An earlier version of this command's own flag table named that
+     path; it was wrong and is fixed.
+   - **NOT under `planning/roadmaps/<slug>/`.** That is `/generate-roadmap`'s output directory. A
+     `/plan` initiative uses the legacy sibling `planning/<slug>/`, which is the fallback
+     `/begin-orchestration` Step 1C rule 2 resolves to.
+
+   The narrative and the machine record deliberately live apart, per D65: `plan.md` goes to
+   `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/`, the lane record to
+   `$BRAIN_ROOT/planning/<slug>/`.
 
    - `lane` = `<slug>`. `roadmap` = `<slug>` — this is what makes the initiative resolve the same
      way a roadmap does: `/begin-orchestration`'s bare-slug resolution checks
      `planning/roadmaps/<slug>/` first, then falls back to legacy `planning/<slug>/`. No change to
      `/begin-orchestration` is needed or permitted; this only works because that fallback exists.
 
-   - **The lane record is the one artifact that does NOT move into `open-work/` (HQ D87).** The
-     narrative goes to `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/plan.md`; the lane record stays at
-     `planning/<slug>/lane-<slug>.json`. That split is deliberate and follows D65's rule that
-     authored narrative and machine records live apart: `planning/<slug>/` is the only location
-     both `/begin-orchestration`'s fallback AND mev's `discover_lane_files` read, and `open-work/`
-     is explicitly excluded from the latter (`NON_ROADMAP_DIR_NAMES`, `lane_segments.rs`) so a
-     record left there would be attributed to the slug `open-work` rather than to this initiative.
-     Writing the lane record under `open-work/` therefore makes it unreachable — do not do it.
+   - **The lane log lands in the resolved `roadmap_dir`, which for a `/plan` initiative is
+     `planning/<slug>/`** — so the plain run command below is correct and needs no `--log`
+     override:
+
+     ```
+     /begin-orchestration --roadmap <slug> --lane <slug>
+     ```
+
+     This is worth a sentence because it was briefly broken and the failure was silent.
+     `/begin-orchestration`'s `--log` default used to be hardcoded to
+     `planning/roadmaps/<slug>/lane-log.jsonl` while Step 1C resolved a single-repo lane to the
+     legacy `planning/<slug>/`. Taking the default **created** the roadmaps directory; on the next
+     run Step 1C rule 1 preferred it, found no lane record there, and `--lane` stopped resolving —
+     the first run silently broke the second. Fixed 2026-09-10: both the log and the escalations
+     path now derive from the resolved `roadmap_dir`. **If you ever see that default re-derived from
+     the slug again, that is the regression** — `scripts/lane_log_watermark.py` already resolves the
+     same two locations in the same order, and the two must stay in step.
+
    - `blocks[]` — every block written in step 7, **in dependency order** (the order later blocks
      depend on earlier ones, matching the Sequence Table), each as
      `{"id": "<BlockID>", "origin_roadmap": "<slug>", "repo": "<this repo's slug>"}`. IDs must be
@@ -258,9 +318,14 @@ re-derived anyway (D65).
      an operator/approval edge, a `carryover[]` entry, a `reference[]` fact, a backlog row — or a
      cut-list line with a reason. Those are the only two destinations. Prose gates nothing and
      surfaces on no board, so an item held only here is lost, not deferred.
-   - **When `--lane` was passed, the lane record (7c) validates** —
+   - **When `--lane` was passed, the lane record (7c) validates AND is reachable** — two separate
+     checks, because the first cannot detect the path mistake that step 7c warns about.
      `check_lane_records.py` clean, every `blocks[].id` matching a real `planning/blocks/<ID>.json`,
-     and array order matching the Sequence Table's dependency order.
+     and array order matching the Sequence Table's dependency order. **Then prove mev can actually
+     see it:** `mev lanes` names the lane and reports its first block. If the lane is absent from
+     that output, the record is in the wrong directory — re-read step 7c's path block. A green
+     `check_lane_records.py` on an unreachable file is the exact false-clean this pairing exists to
+     catch.
    - **The consistency pass (7b) ran and is reported** — C1–C6, with what it found and what was
      left standing deliberately. Specifically: no `depends_on` edge is `{"type": "external"}` for
      work that lives in a fleet repo; every block whose `files[]` reach outside its own repo's tree
@@ -338,7 +403,8 @@ Handoff written to planning/handoff.md.
 - `planning/blocks/` — block records; `$BRAIN_ROOT/planning/open-work/pre-plan/<slug>/` — initiative narratives
 - `.claude/workflows/block.schema.json` — the block record field contract
 - `.claude/workflows/block-registration.md` — the shared registration procedure
-- `.claude/workflows/lane.schema.json` — the lane record field contract (`--lane` output, D71)
+- `.claude/workflows/lane.schema.json` — the lane record field contract (`--lane` output, D71).
+  The record itself goes to `$BRAIN_ROOT/planning/<slug>/`, NOT this repo's `planning/` — step 7c
 - `scripts/check_lane_records.py` — validates a lane record; run it before handing over a `--lane` run
 
 Read `CLAUDE.md` for the project's actual stack and conventions — do not assume any framework,
@@ -434,7 +500,8 @@ cut is a decision with a date on it. Make this list longer than is comfortable.>
 $BRAIN_ROOT/planning/open-work/pre-plan/<slug>/plan.md            (<N> phases, <M> blocks)
 planning/blocks/                   <M> block records written
 state.json: <created | already existed>, <M> blocks registered
-planning/<slug>/lane-<slug>.json   <written, <M> blocks | not requested (--lane not passed)>
+$BRAIN_ROOT/planning/<slug>/lane-<slug>.json
+                                   <written, <M> blocks, mev lanes discovers it | not requested>
 
 Blocks ready to decompose:
   - <ID> — <name>
@@ -448,7 +515,12 @@ Red team: <x> attacks landed, <y> rejected
 Next (turn the first block into a runnable spec):
   /generate-tasks <ID>
 
-<If --lane was passed:>
+<If --lane was passed — ALWAYS include the --log flag, see step 7c:>
 Or drive the whole initiative through the SDLC engines in order:
-  /begin-orchestration --roadmap <slug> --lane <slug>
+  /begin-orchestration --roadmap <slug> --lane <slug> --log planning/<slug>/lane-log.jsonl
+
+<If --lane was NOT passed, and the work is not deliberate hand-work — recommend it in one line:>
+No lane record (--lane not passed). This initiative's <M> blocks are sequential, so
+/begin-orchestration can drive them; to add the record without re-planning:
+  /plan --lane "<the same description>"
 ```

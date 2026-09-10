@@ -33,7 +33,7 @@ invents no new persistence layer of its own.
 
 ## Policy (`EN.8.D` task 2)
 
-Three knobs, no model tier (this workflow drives no `ClaudeCodeStep`):
+Three knobs, no model tier (this workflow drives no `AgentCodeStep`):
 
 | Knob | Default | Meaning |
 |---|---|---|

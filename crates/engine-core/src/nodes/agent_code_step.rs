@@ -1,4 +1,4 @@
-//! `ClaudeCodeStep` — a reusable `Node` that spawns a Claude Code session via
+//! `AgentCodeStep` — a reusable `Node` that spawns a Claude Code session via
 //! `claude_code_rs::execute` and maps its `Outcome` into `NodeRun`/`TaskContext`
 //! (`EN.2.A`).
 //!
@@ -130,7 +130,7 @@ async fn race_one_attempt<T>(
 ///
 /// - A cancelled token wins immediately, on the first attempt or any later
 ///   one, and is never retried past — matches
-///   [`ClaudeCodeStep::with_cancellation_token`]'s documented semantics.
+///   [`AgentCodeStep::with_cancellation_token`]'s documented semantics.
 /// - A transient error (per [`is_retryable_transport_error`]) is retried,
 ///   with exponential backoff (capped at [`MAX_TRANSPORT_BACKOFF_MS`]), until
 ///   `retry.max_attempts` is exhausted. The backoff wait itself re-checks the
@@ -208,7 +208,7 @@ where
 /// The injectable transport signature: takes an owned `Config` + prompt and
 /// returns a boxed future resolving to a `claude_code_rs::Result<Outcome>`.
 /// Defaults to `claude_code_rs::execute`; tests substitute a stub via
-/// [`ClaudeCodeStep::with_transport`] so the gated suite never spawns a real
+/// [`AgentCodeStep::with_transport`] so the gated suite never spawns a real
 /// subprocess.
 type Transport = Arc<
     dyn Fn(Config, String) -> BoxFuture<'static, claude_code_rs::Result<Outcome>> + Send + Sync,
@@ -236,7 +236,7 @@ pub struct TransportInfo {
 /// The injectable transport signature for transports that know their own
 /// [`TransportInfo`] (e.g. `openai_compat_transport`, which alone knows
 /// whether a given call actually hit the local endpoint or silently fell
-/// back to cloud). Additive alongside [`Transport`]: a `ClaudeCodeStep`
+/// back to cloud). Additive alongside [`Transport`]: a `AgentCodeStep`
 /// with no [`MetaTransport`] set falls back to a generic `"cloud"`-tier
 /// `TransportInfo` derived from the plain `Transport`'s `Outcome`, so every
 /// existing `with_transport` caller keeps compiling and behaving unchanged.
@@ -246,7 +246,7 @@ pub type MetaTransport = Arc<
         + Sync,
 >;
 
-/// Where a `ClaudeCodeStep`'s prompt text comes from: either a fixed string
+/// Where a `AgentCodeStep`'s prompt text comes from: either a fixed string
 /// decided at construction, or a closure built fresh from the live
 /// `TaskContext` on each `process` call.
 #[derive(Clone)]
@@ -272,7 +272,7 @@ impl fmt::Debug for PromptSource {
 /// implement/test/triage/review), a `claude_code_rs::Config`, and a prompt
 /// source (fixed string or a builder closure over `&TaskContext`).
 #[derive(Clone)]
-pub struct ClaudeCodeStep {
+pub struct AgentCodeStep {
     name: String,
     config: Config,
     prompt: PromptSource,
@@ -284,13 +284,13 @@ pub struct ClaudeCodeStep {
     /// [`TransportRetry::default`] — behavior-stable on the success path
     /// (see that type's docs), so every existing caller keeps compiling and
     /// behaving unchanged unless it opts into a different budget via
-    /// [`ClaudeCodeStep::with_retry_policy`].
+    /// [`AgentCodeStep::with_retry_policy`].
     retry: TransportRetry,
 }
 
-impl fmt::Debug for ClaudeCodeStep {
+impl fmt::Debug for AgentCodeStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClaudeCodeStep")
+        f.debug_struct("AgentCodeStep")
             .field("name", &self.name)
             .field("config", &self.config)
             .field("prompt", &self.prompt)
@@ -308,7 +308,7 @@ fn default_transport(
     Box::pin(async move { claude_code_rs::execute(&config, &prompt).await })
 }
 
-impl ClaudeCodeStep {
+impl AgentCodeStep {
     /// Construct a step with a fixed prompt string.
     pub fn new(name: impl Into<String>, config: Config, prompt: impl Into<String>) -> Self {
         Self {
@@ -415,7 +415,7 @@ impl ClaudeCodeStep {
 }
 
 #[async_trait::async_trait]
-impl Node for ClaudeCodeStep {
+impl Node for AgentCodeStep {
     async fn process(&self, mut ctx: TaskContext) -> Result<TaskContext, NodeError> {
         let prompt = match &self.prompt {
             PromptSource::Fixed(prompt) => prompt.clone(),
@@ -426,7 +426,7 @@ impl Node for ClaudeCodeStep {
         // because `process` may return `Err` below, and `workflow::node_context` discards the
         // context on `Err` — they ride out on the `NodeError` instead (see `NodeError::sessions`).
         let mut failed_sessions: Vec<ClaudeSession> = Vec::new();
-        // The requested model, from the same source `ClaudeCodeStep::config` uses for every
+        // The requested model, from the same source `AgentCodeStep::config` uses for every
         // attempt in a retry loop (no per-attempt model info exists on the transport error
         // envelope, so a failed attempt is attributed to what was asked for).
         let requested_model = self
@@ -647,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn success_maps_output_and_usage() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| Box::pin(async { Ok(stub_outcome()) }));
 
         let ctx = step
@@ -657,14 +657,14 @@ mod tests {
 
         let output = ctx
             .nodes
-            .get("ClaudeCodeStep")
+            .get("AgentCodeStep")
             .expect("output present under node identity");
         assert_eq!(output["content"], "ok");
         assert_eq!(output["model"], "claude-sonnet-4-5");
 
         let run = ctx
             .node_runs
-            .get("ClaudeCodeStep")
+            .get("AgentCodeStep")
             .expect("node_runs entry present");
         let usage = run.usage.as_ref().expect("usage stamped");
         assert_eq!(usage.input_tokens, Some(12));
@@ -677,7 +677,7 @@ mod tests {
     /// rather than panic or drop the `NodeRun`.
     #[tokio::test]
     async fn absent_model_usage_falls_back_to_unknown_model() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| {
                 Box::pin(async { Ok(stub_outcome_with_models(&[])) })
             });
@@ -687,12 +687,9 @@ mod tests {
             .await
             .expect("an empty modelUsage must not fail the node");
 
-        let run = ctx
-            .node_runs
-            .get("ClaudeCodeStep")
-            .expect("node_runs entry");
+        let run = ctx.node_runs.get("AgentCodeStep").expect("node_runs entry");
         assert_eq!(run.usage.as_ref().expect("usage stamped").model, "unknown");
-        assert_eq!(ctx.nodes["ClaudeCodeStep"]["model"], "unknown");
+        assert_eq!(ctx.nodes["AgentCodeStep"]["model"], "unknown");
     }
 
     /// A single call can bill several models. Attribution follows the SDK's
@@ -700,7 +697,7 @@ mod tests {
     /// a chatty cheap one.
     #[tokio::test]
     async fn multi_model_usage_attributes_to_the_primary_model() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| {
                 Box::pin(async {
                     Ok(stub_outcome_with_models(&[
@@ -715,10 +712,7 @@ mod tests {
             .await
             .expect("process should succeed");
 
-        let run = ctx
-            .node_runs
-            .get("ClaudeCodeStep")
-            .expect("node_runs entry");
+        let run = ctx.node_runs.get("AgentCodeStep").expect("node_runs entry");
         assert_eq!(
             run.usage.as_ref().expect("usage stamped").model,
             "claude-opus-4-8"
@@ -732,7 +726,7 @@ mod tests {
     /// sub-object for free.
     #[tokio::test]
     async fn plain_transport_stamps_generic_cloud_tier_transport_info() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| Box::pin(async { Ok(stub_outcome()) }));
 
         let ctx = step
@@ -740,7 +734,7 @@ mod tests {
             .await
             .expect("process should succeed");
 
-        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        let output = ctx.nodes.get("AgentCodeStep").expect("output present");
         assert_eq!(output["transport"]["tier"], "cloud");
         assert_eq!(output["transport"]["model"], "claude-sonnet-4-5");
         assert!(output["transport"]["endpoint"].is_null());
@@ -751,7 +745,7 @@ mod tests {
     /// `"cloud"` fallback.
     #[tokio::test]
     async fn meta_transport_info_is_stamped_onto_the_transport_sub_object() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_meta_transport(|_config, _prompt| {
                 Box::pin(async {
                     Ok((
@@ -770,7 +764,7 @@ mod tests {
             .await
             .expect("process should succeed");
 
-        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        let output = ctx.nodes.get("AgentCodeStep").expect("output present");
         assert_eq!(output["transport"]["tier"], "local");
         assert_eq!(output["transport"]["model"], "qwen2.5-coder:7b");
         assert_eq!(output["transport"]["endpoint"], "http://localhost:11434");
@@ -786,7 +780,7 @@ mod tests {
     /// input/output already stamped there.
     #[tokio::test]
     async fn nonzero_cache_channels_are_stamped_into_ctx_nodes() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| {
                 Box::pin(async {
                     let mut outcome = stub_outcome();
@@ -801,7 +795,7 @@ mod tests {
             .await
             .expect("process should succeed");
 
-        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        let output = ctx.nodes.get("AgentCodeStep").expect("output present");
         assert_eq!(output["cache_read_input_tokens"], 500);
         assert_eq!(output["cache_creation_input_tokens"], 77);
     }
@@ -810,7 +804,7 @@ mod tests {
     /// never a panic.
     #[tokio::test]
     async fn zero_cache_channels_stamp_as_zero_not_null() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| Box::pin(async { Ok(stub_outcome()) }));
 
         let ctx = step
@@ -818,7 +812,7 @@ mod tests {
             .await
             .expect("process should succeed");
 
-        let output = ctx.nodes.get("ClaudeCodeStep").expect("output present");
+        let output = ctx.nodes.get("AgentCodeStep").expect("output present");
         assert_eq!(output["cache_read_input_tokens"], 0);
         assert_eq!(output["cache_creation_input_tokens"], 0);
         assert!(!output["cache_read_input_tokens"].is_null());
@@ -829,7 +823,7 @@ mod tests {
     /// cache stamping — pinning the existing telemetry-facing shape.
     #[tokio::test]
     async fn node_runs_uncached_usage_unchanged_by_cache_stamping() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| {
                 Box::pin(async {
                     let mut outcome = stub_outcome();
@@ -846,7 +840,7 @@ mod tests {
 
         let run = ctx
             .node_runs
-            .get("ClaudeCodeStep")
+            .get("AgentCodeStep")
             .expect("node_runs entry present");
         let usage = run.usage.as_ref().expect("usage stamped");
         assert_eq!(usage.input_tokens, Some(12));
@@ -855,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn sdk_error_maps_to_node_error() {
-        let step = ClaudeCodeStep::new("ClaudeCodeStep", Config::default(), "do the thing")
+        let step = AgentCodeStep::new("AgentCodeStep", Config::default(), "do the thing")
             .with_transport(|_config, _prompt| {
                 Box::pin(async { Err(claude_code_rs::Error::Timeout) })
             });
@@ -870,8 +864,8 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_builder_receives_live_context() {
-        let step = ClaudeCodeStep::with_prompt_builder(
-            "ClaudeCodeStep",
+        let step = AgentCodeStep::with_prompt_builder(
+            "AgentCodeStep",
             Config::default(),
             |ctx: &TaskContext| format!("event was: {}", ctx.event),
         )
@@ -888,7 +882,7 @@ mod tests {
 
         let out = step.process(ctx).await.expect("process should succeed");
 
-        let output = out.nodes.get("ClaudeCodeStep").expect("output present");
+        let output = out.nodes.get("AgentCodeStep").expect("output present");
         assert!(output["content"]
             .as_str()
             .unwrap()

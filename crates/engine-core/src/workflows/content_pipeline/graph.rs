@@ -517,7 +517,7 @@ mod tests {
         let registry = registry_for_policy(&policy);
 
         // Rewiring must not change the registry's node count or identity
-        // set — only the transport those nodes' composed `ClaudeCodeStep`
+        // set — only the transport those nodes' composed `AgentCodeStep`
         // uses.
         assert_eq!(registry.len(), super::registry().len());
         for identity in ALL_NODE_IDENTITIES {

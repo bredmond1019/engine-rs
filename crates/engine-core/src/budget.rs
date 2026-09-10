@@ -12,7 +12,7 @@
 //! channels, so token spend is folded in from `NodeRun.usage` directly
 //! while cost spend and cache-token spend are folded in separately via
 //! [`BudgetLedger::record`]'s `cost_usd` and `cache_tokens` parameters —
-//! callers that have those figures (e.g. `ClaudeCodeStep`'s SDK
+//! callers that have those figures (e.g. `AgentCodeStep`'s SDK
 //! `Outcome::cost_usd` and the `cache_read_input_tokens` /
 //! `cache_creation_input_tokens` keys it writes into `ctx.nodes`, deliberately
 //! routed there rather than into the contract's `Usage` shape) pass them

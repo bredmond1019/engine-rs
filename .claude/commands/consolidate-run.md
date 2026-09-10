@@ -259,6 +259,8 @@ results row and every `remediation` ref points at.
 **An id already in the catalogue is a merge, not a skip and not an overwrite.** 47 of the first
 pass's ledger ids already existed there from an earlier hand-consolidation; the catalogue row was the
 curated one and the ledger row carried the provenance and the finding flag. Enrich, keeping both.
+Check whether an id already exists with `python3 scripts/query_test_catalogue.py --id <id>` (from
+`BRAIN_ROOT`) rather than reading the whole file.
 
 **Statuses in a ledger are results, not catalogue data.** A ledger's `status`/`last_verified` say
 what happened when that lane checked it, in that place. They go to
@@ -284,14 +286,18 @@ A **failing** ledger entry (`status: failed` or `blocked`) may carry an optional
   consolidating writer is the whole point of keeping the ledger-side object un-numbered.
 - **Write `coverage: [{test_id, env}]`** from the ledger entry's own `id`/`env` (the test_id must
   already resolve in `test-catalogue.json` — promote the ledger entry there first, per Step 5b
-  above, if it is not yet catalogued).
+  above, if it is not yet catalogued). Check resolution with
+  `python3 scripts/query_test_catalogue.py --id <id>` (from `BRAIN_ROOT`) rather than reading the
+  whole file.
 - **Set `status`** to `filed` when the `remediation.block` is still OPEN in that repo's
   `planning/state.json`, and `fixed` when it is CLOSED. `status: filed` has never been used across
   the existing entries, and `scripts/check_remediation.py` check 7 only demands a *closed* block
   for `fixed` — it imposes nothing on `filed` — so `filed` against an open block is a valid,
   gate-passing state, not a special case to work around.
 - **Add the reverse link**: the matching `test-catalogue.json` entry's `remediation` list must name
-  the new remediation id (check 10 validates this both ways).
+  the new remediation id (check 10 validates this both ways). Find that entry with
+  `python3 scripts/query_test_catalogue.py --id <id>` (from `BRAIN_ROOT`) rather than reading the
+  whole file.
 - Carry `remediation.note` into the new entry's `issue`, and `remediation.opened_at` forward
   verbatim; do not invent a `verify` recipe beyond what the ledger entry's own `how_to_verify`
   already gives.

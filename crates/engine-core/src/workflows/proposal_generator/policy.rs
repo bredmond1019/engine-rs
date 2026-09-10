@@ -12,7 +12,7 @@
 //! `opportunity` (Local-eligible, `OpportunityIdentifierNode`), `writer`
 //! (cloud-default, `ProposalWriterNode`), `review` (Local-eligible,
 //! `ProposalReviewNode`), `revise` (Local-eligible, `ProposalReviseNode`).
-//! `research` never resolves to `ModelTier::Local` — it wraps `ClaudeCodeStep`
+//! `research` never resolves to `ModelTier::Local` — it wraps `AgentCodeStep`
 //! with WebSearch/WebFetch tools granted, which a local single-shot endpoint
 //! cannot serve.
 

@@ -2,9 +2,9 @@
 //! INTERACTIVE `claude` session inside the ALREADY-HELD tmux session
 //! (`held_session.rs`, task 1), mid-run.
 //!
-//! # Why this is not `ClaudeCodeStep` again
+//! # Why this is not `AgentCodeStep` again
 //!
-//! `ClaudeCodeStep`/`nodes/claude_code_step.rs` (`EN.2.A`, per `D4`) is the
+//! `AgentCodeStep`/`nodes/agent_code_step.rs` (`EN.2.A`, per `D4`) is the
 //! HEADLESS transport: `claude_code_rs::execute` spawns `claude -p <prompt>
 //! --output-format json` as a child of the `engine-core` process itself,
 //! captures its stdout, and returns when the call is done. That subprocess
@@ -27,10 +27,10 @@
 //! Claude Code — it never calls `Command::new`/`tokio::process` itself, and
 //! it never duplicates `claude_code_rs::execute`'s spawn/wait/parse
 //! machinery, which stays entirely inside `core/claude-code-rs` per `D4`.
-//! What it DOES reuse from the `claude_code_rs`/`claude_code_step.rs` seam
+//! What it DOES reuse from the `claude_code_rs`/`agent_code_step.rs` seam
 //! is the shared `claude_code_rs::Config` type (`with_config`) so a caller
 //! configures model/resume/continue identically to a headless
-//! `ClaudeCodeStep`, and [`resolve_binary_name`] mirrors
+//! `AgentCodeStep`, and [`resolve_binary_name`] mirrors
 //! `claude_code_rs::execute`'s own (private) `CLAUDE_BINARY`-env-var-first
 //! precedence exactly — necessarily duplicated rather than imported, since
 //! that function is private to `claude_code_rs` and the actual PROCESS
@@ -87,7 +87,7 @@ fn now_ms() -> u64 {
 /// name `claude`. Kept as a two-line, obviously-correct mirror rather than
 /// an import because `resolve_binary` is private to `claude_code_rs` and
 /// this module must never own the actual subprocess spawn (see the module
-/// doc's "why this is not `ClaudeCodeStep` again").
+/// doc's "why this is not `AgentCodeStep` again").
 #[must_use]
 fn resolve_binary_name() -> String {
     std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string())
@@ -114,7 +114,7 @@ fn shell_quote(s: &str) -> String {
 /// Build the INTERACTIVE argv tail from `config` — deliberately NOT
 /// `claude_code_rs::Config::build_args`, which always prepends `-p
 /// <prompt>` and appends `--output-format json`: that is the headless
-/// contract `ClaudeCodeStep` needs and an interactive session must never
+/// contract `AgentCodeStep` needs and an interactive session must never
 /// carry (there is no prompt to pass positionally, and JSON-only output
 /// would defeat the whole point of an attached, human-usable session).
 /// Only the flags that make sense for an interactive launch are carried
@@ -180,7 +180,7 @@ pub struct LiveClaudeSessionNode {
     /// `resume`. Every other `Config` field (prompt-shaping, tool allow/deny,
     /// `json_schema`, `dangerously_skip_permissions`, `timeout`, ...) is
     /// headless-only and has no interactive equivalent, so it is accepted
-    /// here (for a caller sharing one `Config` with a sibling `ClaudeCodeStep`)
+    /// here (for a caller sharing one `Config` with a sibling `AgentCodeStep`)
     /// but silently has no effect on the typed command — see
     /// [`interactive_argv`].
     config: Config,

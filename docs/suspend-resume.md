@@ -82,7 +82,7 @@ its run must not leak a stuck "paused" state onto a new one. Both are backed by 
 **The loop-top granularity limit.** Pause never interrupts an in-flight node — the walk only checks
 `PauseSignal`/`suspension.requested` at node *boundaries*. Pause latency therefore equals the
 remaining duration of whatever node is running when the signal is set. For a long-running node (an
-SDLC `ClaudeCodeStep`, for example) that can be minutes, not milliseconds. This is why the surface
+SDLC `AgentCodeStep`, for example) that can be minutes, not milliseconds. This is why the surface
 needs a `pausing` status distinct from `suspended`: `pausing` means the signal is set but the walk
 hasn't reached a boundary yet; `suspended` means it has and the marker is stamped.
 

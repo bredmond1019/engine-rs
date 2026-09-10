@@ -17,7 +17,7 @@
 //! ## `TranslateNode`
 //!
 //! A non-terminal, Local-eligible model node wrapping
-//! `crate::nodes::claude_code_step::ClaudeCodeStep`, stage `"translate"`.
+//! `crate::nodes::agent_code_step::AgentCodeStep`, stage `"translate"`.
 //! On `process`:
 //! 1. read whichever of `SummarizeNode`/`ReviseNode` most recently stored a
 //!    `SummaryResult` (bound `summary_input` [`InputBinding`], falling back
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::node::{InputBinding, Node, NodeError};
-use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::routing::Router;
 use crate::workflows::{
     get_result, parse_structured_or_fenced, put_result, ModelTransport, TransportSlot,
@@ -62,7 +62,7 @@ use super::summarize;
 pub const SKIP_ROUTER_NODE_NAME: &str = "TranslateSkipRouterNode";
 
 /// The `Node::name()` identity `TranslateNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
+/// `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
 /// output/usage are stamped onto. Read by `DigestRenderNode`.
 pub const NODE_NAME: &str = "TranslateNode";
 
@@ -237,7 +237,7 @@ impl TranslateNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -247,7 +247,7 @@ impl TranslateNode {
     }
 
     /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// reports the [`crate::nodes::agent_code_step::TransportInfo`] of
     /// whichever call actually executed (e.g. local vs. cloud fallback),
     /// taking precedence over a plain transport set via
     /// [`Self::with_transport`].
@@ -295,7 +295,7 @@ impl Node for TranslateNode {
 
         let step = self
             .transport
-            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
+            .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
         let mut ctx = step.process(ctx).await?;
 
@@ -308,7 +308,7 @@ impl Node for TranslateNode {
             .to_string();
         // `put_result` below replaces this node's whole `ctx.nodes` entry,
         // which would otherwise silently drop the `"transport"` stamp
-        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `AgentCodeStep::process` just wrote — the exact tier-telemetry
         // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
         // reads back out by this same node name.
         let transport_stamp = ctx

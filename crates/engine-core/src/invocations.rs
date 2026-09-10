@@ -5,7 +5,7 @@
 //! A row appended here records a node **dispatch** — one pass through
 //! [`crate::workflow`]'s single dispatch choke point (`node_context`). It is
 //! NOT a record of an LLM call: 22 production node bodies dispatch an inner
-//! `ClaudeCodeStep` *outside* `node_context`, so `claude_sessions`
+//! `AgentCodeStep` *outside* `node_context`, so `claude_sessions`
 //! ([`crate::sessions`]) is the per-CALL view and this is the per-DISPATCH
 //! view. The two are different cardinalities and both are correct — a single
 //! dispatch of a node whose body makes three Claude calls contributes one row

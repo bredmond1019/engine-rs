@@ -15,13 +15,13 @@
 //! Do NOT add a new `tests/*.rs` file at this level — that silently reintroduces a second binary.
 
 mod action_dispatch_e2e;
+mod agent_code_step;
 mod approve_and_run;
 mod artifact_identity;
 mod brain_client;
 mod budget;
 mod cancellation;
 mod claim_reaffirm;
-mod claude_code_step;
 mod close_block_commit_manifest;
 mod command_runner_spec;
 mod commander;

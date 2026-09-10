@@ -2,7 +2,7 @@
 //! `CriticEvaluation` (EN.5.A task 7).
 //!
 //! A non-terminal, Local-eligible model node wrapping
-//! `crate::nodes::claude_code_step::ClaudeCodeStep`. On `process`:
+//! `crate::nodes::agent_code_step::AgentCodeStep`. On `process`:
 //! 1. read whichever of `SummarizeNode`/`ReviseNode` most recently stored a
 //!    `SummaryResult` (`ReviseNode` overwrites the `summarize`-stage output
 //!    on the loop's back-edge, per `summarize.rs`'s doc comment) via the
@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{InputBinding, Node, NodeError};
-use crate::nodes::{ClaudeCodeStep, MetaTransport};
+use crate::nodes::{AgentCodeStep, MetaTransport};
 use crate::workflows::{
     get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
     ModelTransport, TransportSlot,
@@ -41,7 +41,7 @@ use super::source_router;
 use super::summarize;
 
 /// The `Node::name()` identity `SelfCriticNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
+/// `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
 /// output/usage are stamped onto. Read by `CriticRouterNode`.
 pub const NODE_NAME: &str = "SelfCriticNode";
 
@@ -191,7 +191,7 @@ impl SelfCriticNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -201,7 +201,7 @@ impl SelfCriticNode {
     }
 
     /// Override the transport with a tier-aware [`MetaTransport`] that
-    /// reports the [`crate::nodes::claude_code_step::TransportInfo`] of
+    /// reports the [`crate::nodes::agent_code_step::TransportInfo`] of
     /// whichever call actually executed (e.g. local vs. cloud fallback),
     /// taking precedence over a plain transport set via
     /// [`Self::with_transport`].
@@ -254,11 +254,11 @@ impl Node for SelfCriticNode {
 
         let step = self
             .transport
-            .apply(ClaudeCodeStep::new(NODE_NAME, config, prompt));
+            .apply(AgentCodeStep::new(NODE_NAME, config, prompt));
 
         // Baseline taken immediately before the billed call, per EN.14.C —
         // any wrapper `Err` returned below carries whatever the inner
-        // `ClaudeCodeStep` appended to the ledger, so this critic wrapper's
+        // `AgentCodeStep` appended to the ledger, so this critic wrapper's
         // billed session survives a post-billed-call parse/serialize failure.
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;
@@ -272,7 +272,7 @@ impl Node for SelfCriticNode {
             .to_string();
         // `put_result` below replaces this node's whole `ctx.nodes` entry,
         // which would otherwise silently drop the `"transport"` stamp
-        // `ClaudeCodeStep::process` just wrote — the exact tier-telemetry
+        // `AgentCodeStep::process` just wrote — the exact tier-telemetry
         // `RunTelemetry`/`observed_model_tiers` (`policy/telemetry.rs`)
         // reads back out by this same node name.
         let transport_stamp = ctx

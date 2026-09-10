@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 
 use super::task_loop::{apply_policy_config, resolved_policy, worktree_path, Stage};
 use super::{parse_structured_or_fenced, ModelTransport};
@@ -111,7 +111,7 @@ fn patch_docs_output_schema() -> serde_json::Value {
 pub(super) const DOCS_STABLE_PROMPT: &str = include_str!("prompts/docs.md");
 
 /// Model node (Sonnet): patches documentation referencing the task's
-/// modified files. Composes a `ClaudeCodeStep` under the `PatchDocsNode`
+/// modified files. Composes a `AgentCodeStep` under the `PatchDocsNode`
 /// identity so it can post-process the model's JSON output.
 pub struct PatchDocsNode {
     config: Config,
@@ -131,7 +131,7 @@ impl PatchDocsNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -210,7 +210,7 @@ impl Node for PatchDocsNode {
         config.cwd = Some(std::path::PathBuf::from(&worktree));
 
         let verbosity = policy.output_verbosity;
-        let mut step = ClaudeCodeStep::with_prompt_builder(
+        let mut step = AgentCodeStep::with_prompt_builder(
             "PatchDocsNode",
             config,
             move |ctx: &TaskContext| {

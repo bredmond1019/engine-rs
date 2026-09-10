@@ -11,7 +11,7 @@
 //! # Why a ledger and not a single id
 //!
 //! **An engine-rs run is 1:N with Claude sessions, never 1:1.** Every LLM stage is a separate
-//! headless `claude` invocation ([`crate::nodes::claude_code_step::ClaudeCodeStep`], which never
+//! headless `claude` invocation ([`crate::nodes::agent_code_step::AgentCodeStep`], which never
 //! passes `--resume`), so one `SDLC_FLOW` run spans one session per stage per attempt. A scalar
 //! "the run's session id" would name one of them and silently lose the rest — and the segment it
 //! did name would look exact, so nothing would appear wrong.
@@ -76,7 +76,7 @@ pub struct ClaudeSession {
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
     /// The model tier this invocation ran under, taken from the same expression
-    /// `ClaudeCodeStep` stamps into `ctx.nodes` (`outcome.primary_model().unwrap_or(UNKNOWN_MODEL)`)
+    /// `AgentCodeStep` stamps into `ctx.nodes` (`outcome.primary_model().unwrap_or(UNKNOWN_MODEL)`)
     /// so the ledger entry and the node entry can never disagree. Empty string when unknown, not
     /// absent — an entry written before this field existed deserializes to `""` via
     /// `#[serde(default)]`, same tolerance as every other field here.

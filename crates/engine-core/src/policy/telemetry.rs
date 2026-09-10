@@ -124,7 +124,7 @@ pub struct RunTelemetryInputs<'a> {
     pub model_tier_used: BTreeMap<String, String>,
     /// The stage identities to harvest an **observed** tier from via
     /// `ctx.nodes[stage]["transport"]["tier"]` (the shape
-    /// `ClaudeCodeStep`/`openai_compat_transport` stamp per `EN.5.D` task 9)
+    /// `AgentCodeStep`/`openai_compat_transport` stamp per `EN.5.D` task 9)
     /// — normally the same list as [`cost_bearing_stages`]. For any stage
     /// that actually ran a model this run, the observed tier overrides
     /// [`model_tier_used`]'s caller-supplied entry keyed by that same stage
@@ -183,9 +183,9 @@ pub fn total_cost_usd(ctx: &TaskContext, cost_bearing_stages: &[&str]) -> f64 {
 ///
 /// Deliberately a *different* source than [`total_tokens`]'s uncached
 /// input/output, which reads `ctx.node_runs[*].usage` (contract §6 `Usage`,
-/// which this ticket does not widen — see `ClaudeCodeStep`'s module docs).
+/// which this ticket does not widen — see `AgentCodeStep`'s module docs).
 /// The two cache channels instead come from `ctx.nodes`, the free-form JSON
-/// object `ClaudeCodeStep` already stamps with `cost_usd`/`model`/
+/// object `AgentCodeStep` already stamps with `cost_usd`/`model`/
 /// `transport` — task 1's non-breaking seam. Reading uncached tokens from
 /// `node_runs` and cache tokens from `nodes` is intentional, not
 /// inconsistent: it is the whole reason this ticket avoided a data-contract
@@ -225,7 +225,7 @@ pub fn review_verdicts(ctx: &TaskContext, verdict_stages: &[&str]) -> Vec<String
 }
 
 /// Read the tier actually called for each `stages` entry out of
-/// `ctx.nodes[stage]["transport"]["tier"]` — the shape `ClaudeCodeStep::
+/// `ctx.nodes[stage]["transport"]["tier"]` — the shape `AgentCodeStep::
 /// process` stamps for every call (`EN.5.D` task 9), with
 /// `openai_compat_transport`'s `MetaTransport` overriding it to the cloud
 /// tier on a silent local-endpoint fallback. A stage that never ran this run
@@ -270,7 +270,7 @@ pub fn harvest(
     //
     // The scans remain the fallback for an empty ledger, which is not the same as a free run: a
     // state written before the ledger existed, or a workflow whose cost-bearing nodes are not
-    // `ClaudeCodeStep` and stamp `cost_usd` themselves, both land here. Preferring a populated
+    // `AgentCodeStep` and stamp `cost_usd` themselves, both land here. Preferring a populated
     // ledger and falling back otherwise keeps every such caller reporting exactly what it did
     // before.
     let ledger = crate::sessions::ledger_totals(&ctx.metadata);
@@ -410,7 +410,7 @@ mod tests {
     /// `total_output_tokens: 3076` across 3 tasks and 5 attempts. 92
     /// uncached input tokens is not a broken meter -- it is `node_runs`'
     /// uncached-input channel alone, because before this ticket
-    /// `ClaudeCodeStep` never stamped `cache_read_input_tokens` /
+    /// `AgentCodeStep` never stamped `cache_read_input_tokens` /
     /// `cache_creation_input_tokens` into `ctx.nodes` at all, so
     /// `total_cache_tokens` had nothing to sum. This test reconstructs that
     /// run's numbers and asserts the *combined* input picture (uncached +
@@ -421,7 +421,7 @@ mod tests {
     /// assertion.
     ///
     /// Observed red before task 1/2 landed: with the cache fields absent
-    /// from `ctx.nodes` (the exact pre-fix shape -- `ClaudeCodeStep` wrote
+    /// from `ctx.nodes` (the exact pre-fix shape -- `AgentCodeStep` wrote
     /// no such keys), `total_cache_tokens` returns `(0, 0)`, the combined
     /// picture is `92`, and `92 / 3076 ~= 0.03` fails `ratio > 1.0` below.
     /// `cache_channels_absent_reproduces_the_pre_fix_undercount` re-asserts
@@ -474,7 +474,7 @@ mod tests {
     }
 
     /// Direct pin of the pre-fix shape: when `ctx.nodes` carries no cache
-    /// fields at all (exactly what `ClaudeCodeStep` produced before task 1),
+    /// fields at all (exactly what `AgentCodeStep` produced before task 1),
     /// the same 92/3076 fixture's combined-input-vs-output ratio is small --
     /// this is the failing assertion `cache_channels_prevent_the_measured_92_vs_3076_undercount`
     /// was observed to hit before task 1/2 landed, kept here so the red

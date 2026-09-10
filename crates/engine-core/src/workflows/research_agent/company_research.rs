@@ -2,7 +2,7 @@
 //! in task 5. Re-exported from `research_agent::mod` for `EN.4.C` reuse.
 //!
 //! A terminal model node (no forward connection) wrapping
-//! `crate::nodes::claude_code_step::ClaudeCodeStep`, ported from
+//! `crate::nodes::agent_code_step::AgentCodeStep`, ported from
 //! `orchestrator`'s RESEARCH_AGENT company-brief mode and broadened onto the
 //! EN.4.0 policy framework. On `process`:
 //! 1. read the run's [`super::policy::ResearchAgentPolicy`] stamped once at
@@ -13,7 +13,7 @@
 //! 3. await the (injectable) transport and parse its reply into a
 //!    [`super::schema::CompanyBrief`];
 //! 4. stamp the parsed brief + usage onto `ctx` (via the composed
-//!    `ClaudeCodeStep`) and harvest + persist a `research-agent-state.json`
+//!    `AgentCodeStep`) and harvest + persist a `research-agent-state.json`
 //!    telemetry record;
 //! 5. return `ctx` unchanged otherwise — this node is a graph exit point.
 
@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::locale::{language_directive, Locale};
 use crate::node::{Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::policy::telemetry::RunTelemetryInputs;
 use crate::workflows::{
     get_result, parse_structured_or_fenced, put_result, session_baseline, sessions_since,
@@ -36,7 +36,7 @@ use super::policy::{ContactDepth, GroundingDepth, ModelTier, ResearchAgentPolicy
 use super::schema::{company_brief_json_schema, CompanyBrief, ResearchAgentEventSchema};
 
 /// The `Node::name()` identity `CompanyResearchNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
+/// `AgentCodeStep` under, and the `ctx.nodes`/`ctx.node_runs` key its
 /// output/usage are stamped onto.
 const NODE_NAME: &str = "CompanyResearchNode";
 
@@ -49,11 +49,11 @@ const STABLE_SYSTEM_PROMPT: &str = include_str!("prompts/company_research.md");
 
 /// The verdict-bearing model-judgment stages this node's telemetry snapshot
 /// inspects. `CompanyResearchNode` has no downstream review stage — the
-/// composed `ClaudeCodeStep` run under [`NODE_NAME`] is the only one.
+/// composed `AgentCodeStep` run under [`NODE_NAME`] is the only one.
 const VERDICT_STAGES: [&str; 0] = [];
 
 /// The model-node identities whose `ctx.nodes` output may carry a
-/// `"cost_usd"` field (`ClaudeCodeStep`'s output shape).
+/// `"cost_usd"` field (`AgentCodeStep`'s output shape).
 const COST_BEARING_STAGES: [&str; 1] = [NODE_NAME];
 
 /// Deserialize the inbound `RESEARCH_AGENT` event from `ctx.event`.
@@ -290,7 +290,7 @@ impl CompanyResearchNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`.
     #[must_use]
@@ -336,14 +336,14 @@ impl Node for CompanyResearchNode {
             policy.output_verbosity,
         );
 
-        let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
+        let mut step = AgentCodeStep::new(NODE_NAME, config, prompt);
         if let Some(transport) = self.transport.clone() {
             step = step.with_transport(move |config, prompt| (transport)(config, prompt));
         }
 
         // Baseline taken immediately before the billed call, per EN.14.C —
         // any wrapper `Err` returned below carries whatever the inner
-        // `ClaudeCodeStep` appended to the ledger, so this research wrapper's
+        // `AgentCodeStep` appended to the ledger, so this research wrapper's
         // billed session survives a post-billed-call failure.
         let baseline = session_baseline(&ctx);
         let mut ctx = step.process(ctx).await?;

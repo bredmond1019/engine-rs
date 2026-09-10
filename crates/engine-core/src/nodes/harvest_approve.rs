@@ -14,7 +14,7 @@
 //! got indexed.
 //!
 //! Model-free, like `MaterializeDocNode`/`OpportunityEditNode`: no
-//! `ClaudeCodeStep`, no `ModelTier`, nothing for a policy layer to resolve.
+//! `AgentCodeStep`, no `ModelTier`, nothing for a policy layer to resolve.
 //! Stamps under `self.name()` rather than the bare [`NODE_NAME`] const,
 //! mirroring `MaterializeDocNode`, so an identity override
 //! (`crate::node::NodeExt::with_identity`) never collides with another

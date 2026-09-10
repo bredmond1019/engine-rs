@@ -1,7 +1,7 @@
 //! Fixture 3-node linear workflow integration test for the budget gate
 //! (EN.2.B task 3).
 //!
-//! `UsageNode` reports `NodeRun.usage` the same way `ClaudeCodeStep` does
+//! `UsageNode` reports `NodeRun.usage` the same way `AgentCodeStep` does
 //! (setting it on its own `ctx.node_runs` entry inside `process`).
 //! `Workflow::run_with` folds each completed node's usage into the
 //! `BudgetLedger` and consults it *before* dispatching the next node, so a
@@ -18,9 +18,9 @@ use engine_core::{
 };
 
 /// A node that stamps a marker into `TaskContext::nodes` and reports token
-/// usage on its own `NodeRun`, mirroring `ClaudeCodeStep`'s pattern.
+/// usage on its own `NodeRun`, mirroring `AgentCodeStep`'s pattern.
 /// Optionally also stamps a `"cost_usd"` field into its own `ctx.nodes`
-/// output, the same shape `ClaudeCodeStep` writes from `Outcome::cost_usd`
+/// output, the same shape `AgentCodeStep` writes from `Outcome::cost_usd`
 /// (EN.4.0 task 6) — `Workflow::run_with` reads it back out to fold into
 /// the `BudgetLedger` alongside token usage.
 struct UsageNode {

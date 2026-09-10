@@ -192,7 +192,7 @@ mod tests {
 
         // Rewiring IntakeExtractNode's transport must not change the
         // registry's node count or identity set — only the transport its
-        // composed `ClaudeCodeStep` uses.
+        // composed `AgentCodeStep` uses.
         assert_eq!(registry.len(), 1);
         assert!(registry.contains("IntakeExtractNode"));
     }

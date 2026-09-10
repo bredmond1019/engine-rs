@@ -1418,6 +1418,40 @@ pub fn register_debrief(dispatcher: &mut Dispatcher) {
     );
 }
 
+/// Register the `HELD_SESSION` workflow
+/// (`engine_core::workflows::orchestration::graph::held_session_schema`/
+/// `held_session_registry`, `EN.15.I` task 1) with `dispatcher`, populating
+/// both the `workflow_registry` and the `schema_registry` — this is the
+/// call site that actually exposes `HeldSessionNode` (`EN.10.A`) from a
+/// running `engine-serve` instance; task 1 only assembled the workflow, it
+/// never wired it into a dispatcher.
+///
+/// A **model-free** workflow, mirroring [`register_terminal_probe`] /
+/// [`register_recall`]: `HeldSessionNode` calls no model and reads no
+/// `harness.json` policy section, so this factory resolves no policy and
+/// seeds no policy stamp — there is no `resolve_policy_for_run_from` call
+/// and no `seed_resolved_policy` call.
+///
+/// The factory builds a live `term_core::driver::TmuxDriver` (its
+/// `Default`, matching [`engine_core::workflows::terminal_probe::graph::registry`]'s
+/// own live-driver default) fresh per dispatch — real `tmux` process
+/// invocations, never a `StubTerminalDriver`; tests inject their own driver
+/// directly through `held_session_registry` instead of going through this
+/// registration call site.
+pub fn register_held_session(dispatcher: &mut Dispatcher) {
+    dispatcher.register(
+        engine_core::workflows::orchestration::graph::held_session_schema(),
+        Box::new(|_event: &serde_json::Value| {
+            let driver: Arc<dyn term_core::driver::TerminalDriver> =
+                Arc::new(term_core::driver::TmuxDriver::default());
+            Ok(Workflow::new(
+                engine_core::workflows::orchestration::graph::held_session_registry(driver),
+                engine_core::workflows::orchestration::graph::held_session_schema(),
+            ))
+        }),
+    );
+}
+
 /// Register the `CLAIM_REAFFIRM` workflow
 /// (`engine_core::workflows::claim_reaffirm::graph`, `EN.6.L` task 3) with
 /// `dispatcher`, populating both the `workflow_registry` and the
@@ -1512,7 +1546,7 @@ pub fn register_sweep_with(
 /// the drain-as-a-workflow port — discover every lane's inbox under the fleet lock dir, route
 /// by kind and complete with receipts, run the scoped emit + manifest-ONLY commit, append the
 /// drain-log without ever skipping, stamp the heartbeat, then the block's one gated
-/// `ClaudeCodeStep` (`GatedAction::RunDrain`). Neither graph node here takes an injectable
+/// `AgentCodeStep` (`GatedAction::RunDrain`). Neither graph node here takes an injectable
 /// placeholder transport/waker (unlike `SWEEP`), so — mirroring `register_recall`/
 /// `register_terminal_probe`'s shape rather than `register_sweep`'s — there is a single
 /// registration entry point. Registering makes `COMMANDER` dispatchable via
@@ -1584,6 +1618,7 @@ pub fn register_builtin_workflows_with_registry(
     register_recall(dispatcher);
     register_orchestration(dispatcher);
     register_debrief(dispatcher);
+    register_held_session(dispatcher);
     register_claim_reaffirm(dispatcher);
     register_sweep(dispatcher);
     register_commander(dispatcher);
@@ -3214,6 +3249,7 @@ mod tests {
             "TERMINAL_PROBE",
             "RECALL",
             "ORCHESTRATION",
+            "HELD_SESSION",
             "DEBRIEF",
             "CLAIM_REAFFIRM",
             "SWEEP",
@@ -3468,6 +3504,40 @@ mod tests {
         crate::journal::clear_journal_durable_handle();
 
         result.expect("DEBRIEF should still dispatch with a journal durable handle installed");
+    }
+
+    // ── `HELD_SESSION` (`EN.15.I` task 2) ────────────────────────────────
+
+    /// AC: engine-serve's workflow registration includes the held-session
+    /// path task 1 wired — verified by dispatching the registered
+    /// `HELD_SESSION` workflow type and confirming it builds a runnable
+    /// `Workflow`, not by assuming task 1's change is automatically picked
+    /// up.
+    #[test]
+    fn register_held_session_populates_both_registries() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_held_session(&mut dispatcher);
+
+        assert!(dispatcher.is_registered("HELD_SESSION"));
+
+        let workflow = dispatcher
+            .dispatch_with_event(
+                "HELD_SESSION",
+                &serde_json::json!("00000000-0000-0000-0000-000000000000"),
+            )
+            .expect("HELD_SESSION should dispatch to a runnable Workflow");
+
+        let _ = workflow;
+    }
+
+    #[test]
+    fn register_held_session_is_included_in_builtin_workflows() {
+        let mut dispatcher = Dispatcher::new();
+
+        register_builtin_workflows_with_registry(&mut dispatcher, None);
+
+        assert!(dispatcher.is_registered("HELD_SESSION"));
     }
 
     #[test]

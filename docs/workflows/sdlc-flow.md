@@ -275,7 +275,7 @@ X-API-Key: <BASTION_ENGINE_API_KEY>
 What happens after that: `Workflow::run_with` checks the token **at every node boundary**, before
 dispatching the next node. On a positive check it stamps `metadata.cancellation`, emits a final
 progress snapshot, and returns — any node not yet reached stays `Pending`. A model call in
-`ClaudeCodeStep` (used by `ImplementTaskNode`/`TriageTaskNode`/`ConsolidatedReviewNode`/
+`AgentCodeStep` (used by `ImplementTaskNode`/`TriageTaskNode`/`ConsolidatedReviewNode`/
 `PatchDocsNode`/`GenerateTasksNode`) races the cancellation token against its own transport call,
 so an in-flight model call is dropped promptly rather than waiting for it to finish. A node
 without cancellation wiring (e.g. `TestTaskNode`'s subprocess loop, `SetupWorktreeNode`'s `git
@@ -539,7 +539,7 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
   `WorkflowError` type is reserved for graph-shape problems (e.g. an unresolvable node identity),
   which would surface at registration/dispatch time, not mid-run.
 - **Transport-level retry (`ticket-implement-node-transport-retry`)**: before a `claude_code_rs`
-  transport failure ever reaches the halt-on-`Err` behavior above, `ClaudeCodeStep::process`
+  transport failure ever reaches the halt-on-`Err` behavior above, `AgentCodeStep::process`
   retries it in place, bounded by a `TransportRetry` budget (attempt cap + exponential backoff,
   capped at `MAX_TRANSPORT_BACKOFF_MS`). Only the transient/cheap-to-retry
   `claude_code_rs::Error` variants (`Spawn`, `Timeout`, `Cli`, `Api`) are retried; the
@@ -548,15 +548,15 @@ cumulative attempt/pass/fail counts; `policy`/`outcomes` are only present if the
   exhausts it and becomes a `NodeError`, which still halts the walk exactly as before — this is a
   deferral of the halt, not a removal of it. A cancellation already in effect is checked before
   the first attempt and between retries, so a cancelled run is never resurrected by a retry. This
-  is a property of `ClaudeCodeStep` itself, not of any one caller — it applies uniformly to all
+  is a property of `AgentCodeStep` itself, not of any one caller — it applies uniformly to all
   five nodes built on it (`ImplementTaskNode`, `TriageTaskNode`, `ConsolidatedReviewNode`,
   `GenerateTasksNode`, `PatchDocsNode`), since none of them currently pass a per-stage override to
-  `ClaudeCodeStep::with_retry_policy` and every constructor defaults to the same
+  `AgentCodeStep::with_retry_policy` and every constructor defaults to the same
   `TransportRetry::default()` budget. `SdlcPolicy::transport_retry`
   (`crates/engine-core/src/workflows/sdlc_flow/policy.rs`) exists as the future
   four-layer-resolved override surface for this budget, but as of this writing no call site wires
   it in yet — every stage runs the same built-in default. See
-  `crates/engine-core/src/nodes/claude_code_step.rs` and this
+  `crates/engine-core/src/nodes/agent_code_step.rs` and this
   ticket's Amendment Log (`planning/ticket-implement-node-transport-retry/tasks.md`) for the full
   retryable/non-retryable classification and the reasoning for applying the retry to all five
   consumers rather than implement-only.

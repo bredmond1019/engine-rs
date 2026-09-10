@@ -55,7 +55,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::node::{InputBinding, Node, NodeError};
-use crate::nodes::ClaudeCodeStep;
+use crate::nodes::AgentCodeStep;
 use crate::workflows::content_pipeline::increment_critic_iteration;
 use crate::workflows::content_pipeline::schema::{CriticEvaluation, CriticVerdict};
 use crate::workflows::{get_result, parse_structured_or_fenced, put_result, ModelTransport};
@@ -64,7 +64,7 @@ use super::policy::LinkedInPostPolicy;
 use super::{draft, revise};
 
 /// The `Node::name()` identity `BrandCriticNode` runs its composed
-/// `ClaudeCodeStep` under, and the `ctx.nodes` key its output is stamped
+/// `AgentCodeStep` under, and the `ctx.nodes` key its output is stamped
 /// onto. Read by `ReviseNode` (`revise.rs`) and, once task 6 wires it, the
 /// linkedin_post critic router.
 pub const NODE_NAME: &str = "BrandCriticNode";
@@ -307,7 +307,7 @@ impl BrandCriticNode {
         }
     }
 
-    /// Override the transport used by the composed `ClaudeCodeStep`. Tests
+    /// Override the transport used by the composed `AgentCodeStep`. Tests
     /// use this to stub a real subprocess call with a canned `Outcome`, so
     /// the gated suite never spawns a real `claude`. Only reached when the
     /// deterministic scan finds nothing — a draft the scan already caught
@@ -370,7 +370,7 @@ impl Node for BrandCriticNode {
             );
             let prompt = build_prompt(&draft);
 
-            let mut step = ClaudeCodeStep::new(NODE_NAME, config, prompt);
+            let mut step = AgentCodeStep::new(NODE_NAME, config, prompt);
             if let Some(transport) = self.transport.clone() {
                 step = step.with_transport(move |config, prompt| (transport)(config, prompt));
             }
@@ -617,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn deterministic_scan_short_circuits_without_calling_the_transport() {
         // No transport is configured at all; if the node tried to call
-        // one, `ClaudeCodeStep`'s default (real subprocess) path would be
+        // one, `AgentCodeStep`'s default (real subprocess) path would be
         // exercised and this test would hang/fail in CI. Reaching a
         // Revise verdict here proves the scan alone decided the outcome.
         let node = BrandCriticNode::new();

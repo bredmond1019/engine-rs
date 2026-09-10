@@ -14,7 +14,7 @@
 //! between them: read each moved message's `kind`, look up its priority, and complete every
 //! message regardless of what that priority is (task 1 files nothing per-kind beyond the
 //! priority annotation — the one judgement step this workflow gains, orphan triage, is a later
-//! task's `GatedAction::RunDrain`-gated `ClaudeCodeStep`).
+//! task's `GatedAction::RunDrain`-gated `AgentCodeStep`).
 //!
 //! ## The priority lookup
 //!

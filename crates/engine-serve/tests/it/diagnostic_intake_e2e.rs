@@ -296,7 +296,7 @@ fn registry_for_policy_rewires_extract_to_local_under_local_tier_policy() {
     let default_registry = graph::registry();
     let local_registry = graph::registry_for_policy(&local_policy);
 
-    // The Local-tier rewire changes the composed `ClaudeCodeStep`'s
+    // The Local-tier rewire changes the composed `AgentCodeStep`'s
     // transport, not the registry's node identity set.
     assert_eq!(local_registry.len(), default_registry.len());
     assert!(local_registry.contains("IntakeExtractNode"));

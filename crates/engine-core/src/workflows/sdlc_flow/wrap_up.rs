@@ -590,7 +590,7 @@ fn total_retries(state: &SDLCState) -> u32 {
 const VERDICT_STAGES: [&str; 2] = ["TriageTaskNode", "ConsolidatedReviewNode"];
 
 /// The model-node identities whose `ctx.nodes` output may carry a
-/// `"cost_usd"` field (`ClaudeCodeStep`'s output shape). Passed to the
+/// `"cost_usd"` field (`AgentCodeStep`'s output shape). Passed to the
 /// generic `crate::policy::telemetry::harvest` as
 /// `RunTelemetryInputs::cost_bearing_stages` (EN.4.0).
 pub(crate) const COST_BEARING_STAGES: [&str; 4] = [
@@ -2216,13 +2216,13 @@ mod tests {
     }
 
     /// `EndReviewNode`'s FAIL verdict (`EN.ticket.review-mode-endonly-reviews-nothing`)
-    /// must produce a blocked terminal status with a `bail_reason` naming
-    /// the unmet criteria — the review's summary and issue list — and the
-    /// end review's verdict/summary/issues must land in the committed
-    /// state's `review` block, since under `EndOnly` it is the run's ONLY
-    /// review record.
+    /// must produce the `criteria_refused` terminal status (base-template
+    /// D86) with a `bail_reason` naming the unmet criteria — the review's
+    /// summary and issue list — and the end review's verdict/summary/issues
+    /// must land in the committed state's `review` block, since under
+    /// `EndOnly` it is the run's ONLY review record.
     #[tokio::test]
-    async fn wrap_up_writes_end_review_fail_as_blocked_status_with_review_block() {
+    async fn wrap_up_writes_end_review_fail_as_criteria_refused_status_with_review_block() {
         let worktree = temp_worktree();
 
         let mut state = SDLCState::new("EN.ticket.review-mode-endonly-reviews-nothing-fixture");
@@ -2255,7 +2255,7 @@ mod tests {
         let on_disk = std::fs::read_to_string(saved_to).unwrap();
         let value: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
 
-        assert_eq!(value["status"], json!("blocked"));
+        assert_eq!(value["status"], json!("criteria_refused"));
         let bail_reason = value["bail_reason"].as_str().unwrap();
         assert!(bail_reason.contains("criteria unmet"));
         assert!(bail_reason.contains("task 1's criterion X was not satisfied"));

@@ -182,10 +182,10 @@ pub struct PartialRetryFeedback {
     pub max_chars: Option<u32>,
 }
 
-/// Bounded in-node retry-with-backoff budget for `ClaudeCodeStep`'s transport
+/// Bounded in-node retry-with-backoff budget for `AgentCodeStep`'s transport
 /// call (`ticket-implement-node-transport-retry`, shape (A) — see that
 /// ticket's Amendment Log). Applies uniformly across all five
-/// `ClaudeCodeStep` consumers (implement/triage/review/generate/docs — one
+/// `AgentCodeStep` consumers (implement/triage/review/generate/docs — one
 /// knob, not six, per CLAUDE.md standing rule 6) rather than being
 /// implement-only: a transient transport blip is exactly as disruptive to a
 /// cheap triage call as to an implement call, since either still halts the
@@ -198,7 +198,7 @@ pub struct PartialRetryFeedback {
 ///
 /// **Deliberate deviation from CLAUDE.md standing rule 6's "behavior-stable
 /// built-in default"** — mirrors [`RetryFeedback`]'s precedent. On the
-/// success path (`ClaudeCodeStep::process` AC7) the default is exactly
+/// success path (`AgentCodeStep::process` AC7) the default is exactly
 /// behavior-stable: a first-attempt success invokes the transport once,
 /// byte-identical to today. On the *failure* path it is not: today a single
 /// transient transport error halts the run; the default here retries it.
@@ -211,7 +211,7 @@ pub struct TransportRetry {
     /// failure path).
     pub max_attempts: u32,
     /// Backoff before the second attempt, in milliseconds; doubles on each
-    /// subsequent retry (capped — see `nodes::claude_code_step`'s
+    /// subsequent retry (capped — see `nodes::agent_code_step`'s
     /// `MAX_TRANSPORT_BACKOFF_MS`) so a persistent failure defers the halt
     /// briefly rather than hammering a dead transport or, worse, compounding
     /// a `Timeout` variant's already-expensive wait.
@@ -295,7 +295,7 @@ pub struct SdlcPolicy {
     /// Whether the previous attempt's failure output is fed back into
     /// `ImplementTaskNode`'s retry prompt, and how large that block may get.
     pub retry_feedback: RetryFeedback,
-    /// Bounded in-node retry-with-backoff budget for `ClaudeCodeStep`'s
+    /// Bounded in-node retry-with-backoff budget for `AgentCodeStep`'s
     /// transport call, applied uniformly to all five consumers. See
     /// [`TransportRetry`].
     pub transport_retry: TransportRetry,
@@ -1517,7 +1517,7 @@ mod tests {
         ),
         (
             "transport_retry",
-            "task_loop.rs (implement/triage/review ClaudeCodeStep), docs.rs, end_review.rs, setup.rs — all five with_retry_policy call sites",
+            "task_loop.rs (implement/triage/review AgentCodeStep), docs.rs, end_review.rs, setup.rs — all five with_retry_policy call sites",
         ),
         (
             "review_diff_max_chars",

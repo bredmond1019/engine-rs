@@ -175,8 +175,8 @@ stage and no docs stage, so neither node is registered in its graph.
 
 | Field | Built-in default | Node that reads it (via the projection below) |
 |---|---|---|
-| `output_verbosity` | `Normal` | Every `ClaudeCodeStep`-driven node's output shaping |
-| `prompt_cache` | `false` | Every `ClaudeCodeStep`-driven node's prompt-cache header |
+| `output_verbosity` | `Normal` | Every `AgentCodeStep`-driven node's output shaping |
+| `prompt_cache` | `false` | Every `AgentCodeStep`-driven node's prompt-cache header |
 | `test_depth` | `Full` | `TestTaskNode` (per-task check depth) and `FinalValidationNode` (reconcile skip — see the caveat below) |
 | `model_tiers.implement` | `Sonnet` | `ImplementTaskNode` |
 | `model_tiers.triage` | `Sonnet` | `TriageTaskNode` |
@@ -188,7 +188,7 @@ stage and no docs stage, so neither node is registered in its graph.
 | `llm_triage` | `false` | `TriageTaskNode`'s model-triage branch |
 | `max_attempts` | `3` | The task-loop retry ceiling (a task-declared value always wins; this is the default for a task that omits it) |
 | `retry_feedback` | `RetryFeedback::default()` | `ImplementTaskNode`'s retry prompt (whether/how much prior failure output is fed back) |
-| `transport_retry` | `TransportRetry::default()` | `ClaudeCodeStep`'s bounded retry-with-backoff budget |
+| `transport_retry` | `TransportRetry::default()` | `AgentCodeStep`'s bounded retry-with-backoff budget |
 | `node_invocation_payload_cap_bytes` | `65536` (64 KiB — `invocations::DEFAULT_PAYLOAD_CAP_BYTES`) | `node_context`'s per-record cap on a dispatch's output payload before it's appended to the `node_invocations` ledger (`EN.14.G`); this policy field is read back untyped off the `ResolvedPolicy` stamp by the framework-level `invocations::payload_cap_from_resolved_policy`, so `node_context` never depends on `sdlc_task`'s policy type directly |
 
 Deliberately **not** carried: `review_mode`, `review_skip_max_files`,
